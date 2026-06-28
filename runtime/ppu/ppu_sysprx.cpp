@@ -35,6 +35,21 @@ static void sys_initialize_tls(ppu_context* ctx)
     uint32_t seg_size = (uint32_t)ctx->gpr[5];
     uint32_t mem_size = (uint32_t)ctx->gpr[6];
 
+    /* Main-thread no-op: the loader (ppu_run) already built the main thread's
+     * TLS image from the ELF PT_TLS template and pointed r13 at it. PS3 _start
+     * calls sys_initialize_tls(0,0,0) for the main thread, expecting the kernel
+     * to have already done this. If we instead create a fresh zeroed block and
+     * repoint r13, we LOSE the .tdata template -> every TLS variable reads zero
+     * -> the C++ runtime / custom allocator sees null per-thread state and the
+     * first operator new throws bad_alloc. So when no template is supplied, keep
+     * the loader's r13 / TLS image untouched. */
+    if (!seg_addr && !seg_size && !mem_size) {
+        ctx->gpr[3] = 0;   /* CELL_OK */
+        fprintf(stderr, "[crt] sys_initialize_tls: main-thread no-op, keep r13=0x%08X\n",
+                (uint32_t)ctx->gpr[13]);
+        return;
+    }
+
     uint32_t block = s_tls_next;
     uint32_t total = ((mem_size + 0x7000u + 0x1000u) + 0xFFFu) & ~0xFFFu;
     s_tls_next += total;
