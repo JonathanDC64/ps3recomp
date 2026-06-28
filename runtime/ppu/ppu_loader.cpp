@@ -23,6 +23,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>  /* host backtrace for boot debugging */
+#endif
+
+/* Print a host RVA backtrace (lifted bl = real C calls). Symbolize with
+ * llvm-symbolizer --obj=des_boot.exe --relative-address <rva...>. */
+#ifdef _WIN32
+static void dbg_host_bt(const char* tag)
+{
+    void* frames[40];
+    unsigned short n = RtlCaptureStackBackTrace(0, 40, frames, nullptr);
+    HMODULE self = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&dbg_host_bt, &self);
+    for (unsigned short i = 0; i < n; i++) {
+        HMODULE m = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)frames[i], &m);
+        if (m == self)
+            fprintf(stderr, "[bt-%s] rva=0x%llX\n", tag,
+                    (unsigned long long)((char*)frames[i] - (char*)self));
+    }
+    fflush(stderr);
+}
+#endif
 
 extern "C" uint8_t* vm_base;   /* defined by the host */
 
@@ -329,6 +356,9 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
                     vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
         ctx->gpr[3] = 0;
+#ifdef _WIN32
+        { static int once = 0; if (!once) { once = 1; dbg_host_bt("mem352"); } }
+#endif
         return;
     }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
