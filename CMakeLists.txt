@@ -39,6 +39,10 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+# Exclude sceNpCommerce.c: it is a pure duplicate of sceNpCommerce2.c (defines the
+# same sceNpCommerce2* symbols, no v1 API of its own). MSVC lib only warned
+# (LNK4006) but lld-link errors on the duplicate symbols when linking an exe.
+list(FILTER HLE_SOURCES EXCLUDE REGEX "/sceNpCommerce\\.c$")
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES

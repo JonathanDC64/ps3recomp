@@ -169,7 +169,12 @@ extern "C" __declspec(thread) ppu_context* g_active_ctx = nullptr;
  * -----------------------------------------------------------------------*/
 typedef void (*ppu_fn)(ppu_context*);
 
-#define PPU_HASH_BITS 16
+/* Must exceed the game's function count with headroom (open addressing wants a
+ * load factor well under 1). 16 bits (65,536) was sized for ~14k-function games
+ * (Uncharted); a large title like Demon's Souls lifts 106k+ functions, which
+ * OVERFLOWED the table and made ppu_register_function spin forever probing a
+ * full table. 19 bits = 524,288 slots handles 100k+ functions at ~0.2 load. */
+#define PPU_HASH_BITS 19
 #define PPU_HASH_SIZE (1u << PPU_HASH_BITS)
 #define PPU_HASH_MASK (PPU_HASH_SIZE - 1)
 
@@ -181,11 +186,16 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
     uint32_t a = (uint32_t)addr;
     uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
-    for (;;) {
+    /* Bounded probe: never loop more than the table size. A full table would
+     * otherwise spin forever (the bug that bit the 106k-function Demon's Souls
+     * lift against the old 64k table). */
+    for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
         if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
         if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
         i = (i + 1) & PPU_HASH_MASK;
     }
+    fprintf(stderr, "[ppu] FATAL: function registry full (%u/%u) registering "
+            "0x%08X -- raise PPU_HASH_BITS\n", g_fn_count, PPU_HASH_SIZE, a);
 }
 
 static ppu_fn ppu_lookup(uint32_t a)
