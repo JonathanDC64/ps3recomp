@@ -230,6 +230,13 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     if (addr == 0)
         return;
 
+    /* Env-gated indirect-call trace (YDKJ_ICTRACE): the temporal sequence of
+     * indirect targets is reliable even when host backtraces aren't (tail-call
+     * trampolines unwind the host stack). During static init each constructor is
+     * dispatched here, so the last targets before a fatal abort pinpoint it. */
+    { static int en = -1; if (en < 0) { const char* e = getenv("YDKJ_ICTRACE"); en = e ? 1 : 0; }
+      if (en) { fprintf(stderr, "[ic] 0x%08X\n", addr); fflush(stderr); } }
+
     ppu_fn fn = ppu_lookup(addr);
     if (fn) {
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
