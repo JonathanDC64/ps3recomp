@@ -165,7 +165,7 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
-    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "You Don't Know Jack (ps3recomp)") == 0);
+    int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "Demon's Souls (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     for (;;) {
         Sleep(16);            /* ~60 Hz */
