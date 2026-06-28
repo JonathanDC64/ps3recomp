@@ -945,7 +945,7 @@ class PPULifter:
                     return f"/* bl -> non-code 0x{tgt:08X} */;"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
-                return f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
+                return f"ctx->cia = 0x{addr:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
 
@@ -974,8 +974,8 @@ class PPULifter:
                 and (mn.endswith("ctr") or mn.endswith("ctrl"))):
             cond = self._branch_condition(mn, ops)
             if mn.endswith("ctrl"):   # link = call: keep executing after it
-                return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
-            return f"if ({cond}) {{ ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
+                return f"if ({cond}) {{ ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); }}"
+            return f"if ({cond}) {{ ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx); return; }}"
 
         # Conditional branches
         if mn.startswith("b") and mn not in ("bl", "b", "blr", "bctr", "bctrl"):
@@ -1008,13 +1008,13 @@ class PPULifter:
                 return f"/* {mn} {insn.operands} */;"
 
         if mn == "bctr":
-            return "ps3_indirect_call(ctx); return;"
+            return f"ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); return;"
 
         if mn == "bctrl":
             # Indirect call through CTR register. The CTR value is a GUEST
             # address (or OPD pointer). We dispatch through a hash table
             # that maps guest addresses to host function pointers.
-            return "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
+            return f"ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);"
 
         # ------- SPR -------
         if mn == "mflr":

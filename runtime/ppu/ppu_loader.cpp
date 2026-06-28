@@ -180,8 +180,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_
 void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
-      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40)
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0)); } }
+      if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
+        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
+        if (ea==(uint32_t)w) { extern void ds_dump_bt(const char*); ds_dump_bt(v? "vtbl-set" : "ZERO"); } } } }
     v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
 void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
 }
@@ -307,7 +308,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         return;   /* don't spam the log on a tight retry loop */
     }
     last = cur; streak = 0;
-    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X\n", (uint32_t)ctx->ctr);
+    fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X  (cia/probe=0x%08X)\n", (uint32_t)ctx->ctr, (uint32_t)ctx->cia);
     static int dumped = 0;
     if (dumped < 3) {
         dumped++;
@@ -322,6 +323,28 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
             fprintf(stderr, "      r%-2d: %08X %08X %08X %08X %08X %08X %08X %08X\n", r,
                 (uint32_t)ctx->gpr[r+0],(uint32_t)ctx->gpr[r+1],(uint32_t)ctx->gpr[r+2],(uint32_t)ctx->gpr[r+3],
                 (uint32_t)ctx->gpr[r+4],(uint32_t)ctx->gpr[r+5],(uint32_t)ctx->gpr[r+6],(uint32_t)ctx->gpr[r+7]);
+        /* Virtual-dispatch chain dump: r3 is usually the C++ 'this'. Show the
+         * vtable (*this) and its slots, so we can see whether the bad target is
+         * the vtable address itself (one-level-too-shallow dispatch). */
+        { void* bt[48]; USHORT n = CaptureStackBackTrace(0, 48, bt, NULL);
+          HMODULE m=NULL; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)bt[0],&m);
+          fprintf(stderr, "      --- host backtrace (%u frames, rva) ---\n", n);
+          for (USHORT i=0;i<n;i++) fprintf(stderr,"        #%u rva=0x%llX\n", i, (unsigned long long)((uintptr_t)bt[i]-(uintptr_t)m)); }
+        uint32_t obj = (uint32_t)ctx->gpr[3];
+        if (obj && obj < 0x40000000u) {
+            uint32_t vt = vm_read32(obj + 0);
+            fprintf(stderr, "      this=0x%08X  *this(vtable)=0x%08X  *(this+4)=0x%08X\n",
+                    obj, vt, vm_read32(obj + 4));
+            if (vt && vt < 0x40000000u) {
+                fprintf(stderr, "      vtable[0..7] @0x%08X:", vt);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " %08X", vm_read32(vt + i*4));
+                fprintf(stderr, "\n");
+                uint32_t slotC = vm_read32(vt + 0xC);            /* vtable[3] */
+                fprintf(stderr, "      vtable[3]=0x%08X -> *=0x%08X (would-be code)\n",
+                        slotC, slotC ? vm_read32(slotC) : 0);
+            }
+        }
+        fflush(stderr);
     }
 }
 
@@ -336,6 +359,19 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
         fprintf(stderr, "[ppu] call to unlifted function 0x%08X\n", (uint32_t)addr);
         logged++;
     }
+}
+
+/* Debug: current OS thread id, for lifted-code probes. */
+extern "C" unsigned ds_tid(void) { return (unsigned)GetCurrentThreadId(); }
+
+/* Debug: dump a host backtrace (rva) on demand from lifted code. */
+extern "C" void ds_dump_bt(const char* tag)
+{
+    void* bt[40]; USHORT n = CaptureStackBackTrace(0, 40, bt, NULL);
+    HMODULE m=NULL; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)bt[0],&m);
+    fprintf(stderr, "      --- bt[%s] (%u frames, rva) ---\n", tag, n);
+    for (USHORT i=0;i<n;i++) fprintf(stderr,"        #%u rva=0x%llX\n", i, (unsigned long long)((uintptr_t)bt[i]-(uintptr_t)m));
+    fflush(stderr);
 }
 
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */

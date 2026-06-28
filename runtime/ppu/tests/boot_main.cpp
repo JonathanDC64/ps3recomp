@@ -64,8 +64,8 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
         fprintf(stderr, "[CRASH] %s fault address 0x%llX\n",
                 er->ExceptionInformation[0] ? "write" : "read",
                 (unsigned long long)er->ExceptionInformation[1]);
-    if (g_active_ctx) fprintf(stderr, "[CRASH] guest ctr=0x%08X lr=0x%08X r3=0x%08X\n",
-          (uint32_t)g_active_ctx->ctr, (uint32_t)g_active_ctx->lr, (uint32_t)g_active_ctx->gpr[3]);
+    if (g_active_ctx) fprintf(stderr, "[CRASH] guest cia=0x%08X ctr=0x%08X lr=0x%08X r3=0x%08X\n",
+          (uint32_t)g_active_ctx->cia, (uint32_t)g_active_ctx->ctr, (uint32_t)g_active_ctx->lr, (uint32_t)g_active_ctx->gpr[3]);
     HMODULE mod = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
