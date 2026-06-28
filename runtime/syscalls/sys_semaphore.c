@@ -161,6 +161,7 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu SEMA_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
@@ -267,6 +268,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu SEMA_POST id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 

@@ -196,6 +196,7 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVQ_RECV id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
@@ -712,6 +713,7 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVF_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
@@ -892,6 +894,7 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
 
 int64_t sys_event_flag_set(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVF_SET id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 

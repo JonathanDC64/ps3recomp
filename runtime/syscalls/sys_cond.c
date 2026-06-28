@@ -145,6 +145,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_wait(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
@@ -225,6 +226,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_signal(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_SIG id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
@@ -250,6 +252,7 @@ int64_t sys_cond_signal(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_signal_all(ppu_context* ctx)
 {
+    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_SIGALL id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
