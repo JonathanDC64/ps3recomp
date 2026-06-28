@@ -128,10 +128,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * loads (the C++ ctor list, globals, ...) read garbage -> boot corruption. */
     vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]);
 
+    /* Trace EVERY hle call (all resolution paths: prx / ctx / generic), not just
+     * the generic one. Cached getenv. Resolve nid->name afterward if needed. */
+    static int hletrace = -1;
+    if (hletrace < 0) hletrace = getenv("YDKJ_HLETRACE") ? 1 : 0;
+    if (hletrace)
+        fprintf(stderr, "[hle] nid=0x%08X r3=%08X r4=%08X r5=%08X r6=%08X\n", nid,
+                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
+
     /* Real libsre (loaded PRX) takes priority over the HLE stub. */
     {
         uint32_t opd = prx_resolve_export(nid);
         if (opd) {
+            if (hletrace) fprintf(stderr, "[hle]   -> prx export\n");
             uint32_t code = vm_read32(opd);
             uint32_t toc  = vm_read32(opd + 4);
             ctx->gpr[2] = toc;            /* libsre's own TOC */
@@ -142,7 +152,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
 
     for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) { g_ctx[i].fn(ctx); return; }
+        if (g_ctx[i].nid == nid) {
+            if (hletrace) fprintf(stderr, "[hle]   -> ctx handler\n");
+            g_ctx[i].fn(ctx); return;
+        }
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {

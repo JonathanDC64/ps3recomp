@@ -353,8 +353,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
                    * info = { u32 total_user_memory; u32 available_user_memory } */
         uint32_t info = (uint32_t)ctx->gpr[3];
-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
+        /* Match real PS3 game-mode values (verified against RPCS3 booting DeS):
+         * Total=0x0D500000 (213 MB), Avail=0x0B650000 (~182 MB). The previous
+         * 256/192 MB was wrong -- game mode hands the title ~213 MB, and the
+         * engine's heap sizing depends on these exact figures. */
+        if (info) { vm_write32(info + 0, 0x0D500000u);   /* 213 MB total user mem */
+                    vm_write32(info + 4, 0x0B650000u); } /* ~182 MB available */
         ctx->gpr[3] = 0;
 #ifdef _WIN32
         { static int once = 0; if (!once) { once = 1; dbg_host_bt("mem352"); } }
