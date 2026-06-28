@@ -159,6 +159,9 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; uint32_t v
           uint32_t b2=(bi+1)&(NB-1); for(uint32_t i=0;i<NB;i++) if(i!=bi && cnt[i]>cnt[b2]) b2=i;
           fprintf(stderr,"[HOTMAP] hottest read32: 0x%08X (%ux)  2nd: 0x%08X (%ux)\n",
                   addr[bi],cnt[bi],addr[b2],cnt[b2]);
+#ifdef _WIN32
+          { static int _n=0; if (_n++ < 3) dbg_host_bt("hotmap"); }  /* who is scanning? */
+#endif
           for(uint32_t i=0;i<NB;i++) cnt[i]=0; } } }
     /* Hot-poll detector: a thread spinning on the same address (e.g. a GCM FIFO
      * get-pointer / label waiting on RSX) reads it thousands of times in a row. */
