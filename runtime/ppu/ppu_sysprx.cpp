@@ -96,35 +96,59 @@ static void sys_process_is_stack(ppu_context* ctx)
 #define LWM_OWNER  0x00
 #define LWM_ATTR   0x08
 #define LWM_RECUR  0x0C
-#define LWM_TID    1u   /* single-thread boot: one fixed owner id */
+#define SYS_SYNC_RECURSIVE 0x10u
+#define CELL_EDEADLK       0x80010008u   /* recursive lock of a non-recursive mutex */
 
+extern "C" unsigned ds_tid(void);        /* current OS thread id (always > 0) */
+
+/* Match real PS3 / RPCS3 semantics. The crucial behavior vs the old no-op stamp:
+ * a same-thread re-lock of a NON-recursive lwmutex returns CELL_EDEADLK. The CRT's
+ * C++ thread-safe-static-init guard relies on that error to detect recursive
+ * initialization; without it, a recursive guard acquire "succeeds" and the
+ * half-constructed object/registry is handed back -> the use-during-construction
+ * spins we were chasing. The recursive flag lives in the attribute struct at +4. */
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
     uint32_t attr = (uint32_t)ctx->gpr[4];
-    uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
-    vm_write32(lwm + 0x00, 0);          /* owner */
-    vm_write32(lwm + 0x04, 0);          /* waiter */
-    vm_write32(lwm + LWM_ATTR, protocol);
-    vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
-    vm_write32(lwm + 0x10, 0);          /* sleep_queue */
+    uint32_t protocol  = attr ? vm_read32(attr + 0) : 0;
+    uint32_t recursive = attr ? vm_read32(attr + 4) : 0;   /* SYS_SYNC_RECURSIVE / _NOT_ */
+    vm_write32(lwm + LWM_OWNER, 0);                  /* owner = free */
+    vm_write32(lwm + 0x04, 0);                       /* waiter */
+    vm_write32(lwm + LWM_ATTR, protocol | recursive);/* combined attribute */
+    vm_write32(lwm + LWM_RECUR, 0);                  /* recursive_count */
+    vm_write32(lwm + 0x10, 0);                       /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
     ctx->gpr[3] = 0;
 }
 static void sys_lwmutex_lock(ppu_context* ctx)
 {
-    uint32_t lwm = (uint32_t)ctx->gpr[3];
-    vm_write32(lwm + LWM_OWNER, LWM_TID);
-    vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
-    ctx->gpr[3] = 0;   /* CELL_OK */
+    uint32_t lwm   = (uint32_t)ctx->gpr[3];
+    uint32_t owner = vm_read32(lwm + LWM_OWNER);
+    uint32_t attr  = vm_read32(lwm + LWM_ATTR);
+    uint32_t tid   = ds_tid();
+    if (owner == 0) {                                /* free -> acquire */
+        vm_write32(lwm + LWM_OWNER, tid);
+        ctx->gpr[3] = 0;
+    } else if (owner == tid) {                       /* same thread re-lock */
+        if (attr & SYS_SYNC_RECURSIVE) {
+            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
+            ctx->gpr[3] = 0;
+        } else {
+            ctx->gpr[3] = CELL_EDEADLK;              /* <-- recursion detection */
+        }
+    } else {                                         /* held by another thread */
+        vm_write32(lwm + LWM_OWNER, tid);            /* boot is effectively serial; take it */
+        ctx->gpr[3] = 0;
+    }
 }
 static void sys_lwmutex_trylock(ppu_context* ctx) { sys_lwmutex_lock(ctx); }
 static void sys_lwmutex_unlock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t rc = vm_read32(lwm + LWM_RECUR);
-    if (rc) vm_write32(lwm + LWM_RECUR, rc - 1);
-    if (rc <= 1) vm_write32(lwm + LWM_OWNER, 0);
+    uint32_t rc  = vm_read32(lwm + LWM_RECUR);
+    if (rc > 0) vm_write32(lwm + LWM_RECUR, rc - 1); /* unwind one recursion level */
+    else        vm_write32(lwm + LWM_OWNER, 0);      /* fully released -> free */
     ctx->gpr[3] = 0;
 }
 
