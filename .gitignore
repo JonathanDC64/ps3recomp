@@ -93,3 +93,6 @@ _drill/
 
 # Local Claude Code settings
 .claude/
+
+# Game-derived lifted SPU C (Demon's Souls port) — never commit (copyright firewall)
+/work_spu/
