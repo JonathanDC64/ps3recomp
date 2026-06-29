@@ -244,6 +244,32 @@ static ppu_fn ppu_lookup(uint32_t a)
 
 extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
 
+/* Host function pointer -> guest address (reverse of ppu_lookup). Linear scan of
+ * the registry; only used by the YDKJ_TRTRACE diagnostic (rare), so O(n) is fine.
+ * Returns 0 if the pointer isn't a registered lifted function. */
+static uint32_t ppu_reverse_lookup(ppu_fn fn)
+{
+    if (!fn) return 0;
+    for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
+        if (g_fn[i] == fn) return g_addr[i];
+    return 0;
+}
+
+/* YDKJ_DTTRACE diagnostic: called from the lifted DRAIN_TRAMPOLINE macro before
+ * each tail-call hop. Logs ONLY null-`this` (r3==0) hops, so a use-before-
+ * construction null-object method call (and the tail-call chain reaching it) is
+ * isolated from the flood of normal trampolines. */
+extern "C" void ppu_tr_log(void* tf, void* ctxv)
+{
+    static int en = -1; if (en < 0) { const char* e = getenv("YDKJ_DTTRACE"); en = e ? 1 : 0; }
+    if (!en) return;
+    ppu_context* ctx = (ppu_context*)ctxv;
+    if ((uint32_t)ctx->gpr[3] != 0) return;
+    fprintf(stderr, "[dt] -> 0x%08X r3=0 r4=0x%08X\n",
+            ppu_reverse_lookup((ppu_fn)tf), (uint32_t)ctx->gpr[4]);
+    fflush(stderr);
+}
+
 /* Bridge the lifter-emitted function_table[] (declared in ppu_recomp.h) into the
  * address->function hash map. The host boot harness calls this once at startup. */
 extern "C" void ppu_recomp_register(void)
@@ -294,6 +320,9 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
             g_trampoline_fn = 0;
+            { static int tr = -1; if (tr < 0) { const char* e = getenv("YDKJ_TRTRACE"); tr = e ? 1 : 0; }
+              if (tr) { uint32_t ga = ppu_reverse_lookup((ppu_fn)tf);
+                        fprintf(stderr, "[tr] -> 0x%08X r3=0x%08X\n", ga, (uint32_t)ctx->gpr[3]); fflush(stderr); } }
             tf(ctx);
         }
         s_depth--;
