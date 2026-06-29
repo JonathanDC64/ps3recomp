@@ -487,11 +487,31 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
+
+                /* SPURS auto-allocates the task context save area when the title
+                 * passes eaContext==0 (a valid SPURS pattern). Our HLE does the
+                 * same: hand the SPU task a zeroed guest context buffer so its
+                 * entry DMAs a clean fresh-task descriptor instead of reading
+                 * address 0 (which gave a garbage context -> bad computed
+                 * branches). Bump-allocate from a reserved guest region. */
+                uint32_t ctx_ea = (uint32_t)(uintptr_t)context;
+                if (ctx_ea == 0) {
+                    extern uint8_t* vm_base;
+                    static uint32_t s_ctx_bump = 0x03100000u;  /* reserved task-context region */
+                    uint32_t csz = sizeContext;
+                    if (csz == 0 || csz > 0x40000u) csz = 0x40000u;  /* default = full LS */
+                    csz = (csz + 0x7Fu) & ~0x7Fu;                    /* 128-byte align */
+                    ctx_ea = s_ctx_bump;
+                    s_ctx_bump += csz;
+                    memset(vm_base + ctx_ea, 0, csz);                /* zero = fresh task */
+                    printf("[cellSpurs] CreateTask: eaContext==0 -> auto-allocated "
+                           "context 0x%08X (size 0x%X)\n", ctx_ea, csz);
+                }
+
                 if (sz)
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    spu_workload_dispatch_async(host_elf, (uint32_t)sz, ctx_ea);
             }
             return CELL_OK;
         }
