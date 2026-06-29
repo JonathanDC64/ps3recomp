@@ -181,8 +181,9 @@ void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v =
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
-        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  ra=%p\n", ea, v, __builtin_return_address(0));
-        if (ea==(uint32_t)w) { extern void ds_dump_bt(const char*); ds_dump_bt(v? "vtbl-set" : "ZERO"); } } } }
+        void* ra=__builtin_return_address(0); static HMODULE _m=0;
+        if(!_m) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&_m);
+        fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  rva=0x%llX\n", ea, v, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m)); } } }
     v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
 void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
 }
