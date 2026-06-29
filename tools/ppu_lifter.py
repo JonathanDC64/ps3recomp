@@ -2238,12 +2238,21 @@ class PPULifter:
             "#else\n"
             "  #define DS_TLS __thread\n"
             "#endif\n"
-            'extern "C" { extern DS_TLS unsigned g_ds_sp; extern DS_TLS unsigned g_ds_stk[8192]; }\n'
-            "struct DsFrame { DsFrame(unsigned a){ if (g_ds_sp < 8192u) g_ds_stk[g_ds_sp] = a; ++g_ds_sp; }\n"
-            "                 ~DsFrame(){ if (g_ds_sp) --g_ds_sp; } };\n"
-            "#define DS_FRAME(a) DsFrame _dsf((a))\n"
+            'extern "C" {\n'
+            "  extern DS_TLS unsigned g_ds_sp; extern DS_TLS unsigned g_ds_stk[8192];\n"
+            "  extern DS_TLS unsigned g_ds_ring_pos; extern DS_TLS unsigned g_ds_ring_a[1024];\n"
+            "  extern DS_TLS unsigned g_ds_ring_r3[1024];\n"
+            "}\n"
+            "struct DsFrame {\n"
+            "  DsFrame(unsigned a, unsigned r3){\n"
+            "    if (g_ds_sp < 8192u) g_ds_stk[g_ds_sp] = a; ++g_ds_sp;\n"
+            "    unsigned p = g_ds_ring_pos++ & 1023u; g_ds_ring_a[p] = a; g_ds_ring_r3[p] = r3;\n"
+            "  }\n"
+            "  ~DsFrame(){ if (g_ds_sp) --g_ds_sp; }\n"
+            "};\n"
+            "#define DS_FRAME(a, ctx) DsFrame _dsf((a), (unsigned)(ctx)->gpr[3])\n"
             "#else\n"
-            "#define DS_FRAME(a) ((void)0)\n"
+            "#define DS_FRAME(a, ctx) ((void)0)\n"
             "#endif")
         # Forward declarations
         for func in self.functions:
@@ -2331,7 +2340,7 @@ class PPULifter:
         if label:
             lines.append(f"/* {label} */")
         lines.append(f"void {func.name}(ppu_context* ctx) {{")
-        lines.append(f"    DS_FRAME(0x{func.start_addr:08X});")
+        lines.append(f"    DS_FRAME(0x{func.start_addr:08X}, ctx);")
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 

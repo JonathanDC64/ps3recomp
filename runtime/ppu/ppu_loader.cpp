@@ -290,16 +290,29 @@ extern "C" void ppu_recomp_register(void)
 #else
   #define DS_TLS __thread
 #endif
-extern "C" { DS_TLS unsigned g_ds_sp = 0; DS_TLS unsigned g_ds_stk[8192]; }
+extern "C" {
+    DS_TLS unsigned g_ds_sp = 0; DS_TLS unsigned g_ds_stk[8192];
+    /* Per-entry ring (addr,this), never popped: the temporal call sequence,
+     * including tail-callers the stack pops -- reveals where `this` goes 0. */
+    DS_TLS unsigned g_ds_ring_pos = 0; DS_TLS unsigned g_ds_ring_a[1024];
+    DS_TLS unsigned g_ds_ring_r3[1024];
+}
 
 extern "C" void ds_dump_shadow(void)
 {
     unsigned n = g_ds_sp; if (n > 8192u) n = 8192u;
     fprintf(stderr, "[shadow] guest call stack depth=%u (innermost first):\n", g_ds_sp);
-    unsigned shown = n < 48u ? n : 48u;
+    unsigned shown = n < 32u ? n : 32u;
     for (unsigned i = 0; i < shown; i++)
         fprintf(stderr, "   #%u 0x%08X\n", i, g_ds_stk[n - 1 - i]);
-    if (n == 0) fprintf(stderr, "   (empty -- lift without --shadow-stack?)\n");
+    if (n == 0) { fprintf(stderr, "   (empty -- lift without --shadow-stack?)\n"); fflush(stderr); return; }
+    /* Temporal ring with `this`: find where this transitions valid->0. */
+    unsigned win = g_ds_ring_pos < 64u ? g_ds_ring_pos : 64u;
+    fprintf(stderr, "[shadow] last %u entries (addr this) -- watch this:valid->0:\n", win);
+    for (unsigned i = 0; i < win; i++) {
+        unsigned idx = (g_ds_ring_pos - win + i) & 1023u;
+        fprintf(stderr, "   0x%08X this=0x%08X\n", g_ds_ring_a[idx], g_ds_ring_r3[idx]);
+    }
     fflush(stderr);
 }
 
