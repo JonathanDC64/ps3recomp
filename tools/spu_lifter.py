@@ -503,6 +503,13 @@ class SPULifter:
         if mn in ("biz", "binz", "bihz", "bihnz"):
             cond = self._cond(mn[1:], _reg(ops[0]))   # strip leading 'b' -> iz/inz...
             tgt_reg = _reg(ops[1])
+            # $r0 = link register: a conditional indirect branch to it is a
+            # CONDITIONAL RETURN (e.g. `binz $r3,$r0`). Translate to a host return
+            # so call/return discipline matches the C nesting from brsl -- otherwise
+            # it routes through spu_indirect_branch(r0) where r0 is a mid-caller
+            # return address (not a registered function) -> "unknown LS address".
+            if tgt_reg == "0":
+                return f"if ({cond}) return;"
             return (f"if ({cond}) {{ ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"spu_indirect_branch(ctx); return; }}")
 
@@ -638,6 +645,52 @@ def main() -> None:
         if args.base != 0:
             base = args.base  # caller override
         bounds = funcs
+
+        # Seed function-pointer targets from the DATA segments. SPU code calls
+        # through fn-ptr tables (vtables): `bisl rX` where rX is a word loaded from
+        # LS data (lqd/lqx + rotqby). Those targets aren't reachable by static
+        # br/brsl, so the boundary detector misses them and spu_indirect_branch
+        # halts ("unknown LS address"). Scan every non-text PT_LOAD segment for
+        # 4-aligned big-endian words that fall in the text range and seed them as
+        # function starts (splitting the containing function). Analog of the PPU
+        # PIC jump-table fix.
+        def _be16(o): return (elf_buf[o] << 8) | elf_buf[o + 1]
+        def _be32(o): return ((elf_buf[o] << 24) | (elf_buf[o + 1] << 16)
+                              | (elf_buf[o + 2] << 8) | elf_buf[o + 3])
+        text_lo, text_hi = base, base + size
+        e_phoff, e_phnum, e_phentsize = _be32(0x1C), _be16(0x2C), _be16(0x2A)
+        seeds = set()
+        for k in range(e_phnum):
+            po = e_phoff + k * e_phentsize
+            if _be32(po) != 1:                       # PT_LOAD only
+                continue
+            p_off, p_vaddr, p_filesz = _be32(po + 0x04), _be32(po + 0x08), _be32(po + 0x10)
+            if p_vaddr == base:                      # skip the text segment itself
+                continue
+            for o in range(p_off, min(p_off + p_filesz, len(elf_buf)) - 3, 4):
+                v = _be32(o)
+                if text_lo <= v < text_hi and (v & 3) == 0:
+                    seeds.add(v)
+        starts = {s for s, e in bounds}
+        added = 0
+        for t in sorted(seeds - starts):
+            placed = False
+            for i, (s, e) in enumerate(bounds):
+                if s < t < e:                        # split the containing function
+                    bounds[i:i + 1] = [(s, t), (t, e)]
+                    added += 1
+                    placed = True
+                    break
+            if not placed:
+                # t falls in a gap detect_functions classified as data/padding but
+                # which is really a fn-ptr-only target -> new function from t to the
+                # next boundary (the trailing bytes lift as data if any).
+                nxt = [s for s, e in bounds if s > t]
+                bounds.append((t, min(nxt) if nxt else text_hi))
+                added += 1
+        if added:
+            bounds.sort()
+            print(f"  fn-ptr seeds: +{added} function start(s) from data-segment code pointers")
     else:
         with open(args.input, "rb") as f:
             data = f.read()
