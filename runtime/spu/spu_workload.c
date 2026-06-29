@@ -246,10 +246,25 @@ static void spu_async_run(spu_async_job* j)
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
              * overwriting the stack-allocated context. */
-            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                                j->abi, j->have_r3 ? j->r3 : 0);
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
-                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            fprintf(stderr, "[spu_workload] async image=%d ENTER run\n", j->image_id);
+            fflush(stderr);
+            int32_t rc = -999;
+#if defined(_WIN32) && defined(_MSC_VER)
+            __try {
+                rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                            j->abi, j->have_r3 ? j->r3 : 0);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                fprintf(stderr, "[spu_workload] async image=%d *** SEH FAULT 0x%08lX *** "
+                        "(SPU task crashed -- caught, not propagated)\n",
+                        j->image_id, (unsigned long)GetExceptionCode());
+                fflush(stderr);
+            }
+#else
+            rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                        j->abi, j->have_r3 ? j->r3 : 0);
+#endif
+            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d\n", j->image_id, rc);
+            fflush(stderr);
         }
         free(ls);
     }
@@ -301,7 +316,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         (unsigned long long)fp, args_ea, image_id);
 
 #ifdef _WIN32
-    HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
+    /* 256 MB stack RESERVE (committed on demand). A lifted SPU job's guest `brsl`
+     * calls become real nested host C calls, and an SPU task's call chain can be
+     * far deeper than the default 1 MB host stack holds -- overflowing it silently
+     * terminates the whole process (a stack-overflow SE can't run the unhandled
+     * filter, so there's no crash log; exit code reads 0). Reserving 256 MB lets
+     * the task run to its real depth. */
+    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j, 0, NULL);
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
 #else
@@ -337,8 +358,14 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
     fprintf(stderr, "[spu_workload] task dispatch (async) fp=0x%016llX "
             "r3={0x%08X,0x%08X,0x%08X,0x%08X} tasksetEA=0x%08X image=%d\n",
             (unsigned long long)fp, arg[0], arg[1], arg[2], arg[3], taskset_ea, image_id);
+    /* Controlled diagnostic: SPU_TASK_OFF suppresses the actual SPU thread spawn
+     * (the task is "created" but never runs) to isolate whether the concurrent SPU
+     * task is what terminates the process after CreateTask. */
+    { const char* off = getenv("SPU_TASK_OFF");
+      if (off && off[0] != '0') { fprintf(stderr, "[spu_workload] SPU_TASK_OFF: thread NOT spawned\n");
+                                  fflush(stderr); free(j); return 1; } }
 #ifdef _WIN32
-    { HANDLE th = CreateThread(NULL, 1u << 20, spu_async_thread, j, 0, NULL);
+    { HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j, 0, NULL);
       if (!th) { free(j); return 0; } CloseHandle(th); }
 #else
     { pthread_t th;

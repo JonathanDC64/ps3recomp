@@ -523,6 +523,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
             logged++;
         }
+        /* A syscall number far outside the lv2 range (> 2048) means r11 holds
+         * garbage -> the PPU has diverged (executing a corrupted return / data as
+         * code). Pin it: print the guest LR/SP + host RVA chain ONCE so the bad
+         * call site maps to a lifted func_XXXX. */
+        if (num > 2048) {
+#ifdef _WIN32
+            static int bt_once = 0;
+            if (!bt_once) {
+                bt_once = 1;
+                fprintf(stderr, "[ppu] GARBAGE syscall num=0x%llX -> PPU diverged; "
+                        "guest lr=0x%08X sp=0x%08X\n", (unsigned long long)num,
+                        (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1]);
+                dbg_host_bt("badsc");
+            }
+#endif
+        }
         ctx->gpr[3] = 0;   /* CELL_OK */
         return;
     }

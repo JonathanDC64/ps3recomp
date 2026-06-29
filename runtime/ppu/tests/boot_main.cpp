@@ -53,6 +53,35 @@ extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
 extern "C" const char* g_last_hle_name;
 
 extern "C" __declspec(thread) ppu_context* g_active_ctx;
+/* atexit probe: the process is terminating via a clean exit() (not a crash or
+ * abort) somewhere after the SPURS task dispatch, with no unwind log. Capture a
+ * host backtrace at exit so the exit() caller (a guest sys_process_exit, a CRT
+ * path, or cellGameExitToShelf) maps to a lifted func_XXXX / HLE symbol. */
+static void boot_atexit(void)
+{
+    fprintf(stderr, "\n[boot] *** exit() reached; last HLE NID 0x%08X (%s) ***\n",
+            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+    if (g_active_ctx)
+        fprintf(stderr, "[boot]   guest cia=0x%08X lr=0x%08X ctr=0x%08X r3=0x%08X\n",
+                (uint32_t)g_active_ctx->cia, (uint32_t)g_active_ctx->lr,
+                (uint32_t)g_active_ctx->ctr, (uint32_t)g_active_ctx->gpr[3]);
+    void* frames[40];
+    USHORT n = RtlCaptureStackBackTrace(0, 40, frames, NULL);
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&boot_atexit, &self);
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE m = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m);
+        if (m == self)
+            fprintf(stderr, "[boot-exit]   #%-2u rva=0x%llX\n", i,
+                    (unsigned long long)((char*)frames[i] - (char*)m));
+    }
+    fflush(stderr);
+}
+
 static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
 {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
@@ -304,6 +333,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     SetUnhandledExceptionFilter(ydkj_crash_filter);
     signal(SIGABRT, ydkj_abort_handler);
+    atexit(boot_atexit);                /* catch clean exit() paths */
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: don't lose prints on kill */
 #endif
 
