@@ -291,11 +291,36 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
     return NULL;
 }
 
+/* spu_indirect_branch lifts a `bisl`/`bi rX` to a real nested host C call
+ * (fn(ctx)). If a guest TAIL-call or a loop-back `bi` is mis-lifted as a CALL
+ * (instead of a jump/goto), each "iteration" nests another host frame and the
+ * stack grows without bound -> the whole process dies on stack overflow with no
+ * log. Guard the nesting depth: a chain thousands deep is always such a bug, so
+ * pin the recursive target (LS addr + link reg) and halt the job cleanly
+ * (longjmp out) instead of crashing the process. */
+static SPU_TLS int s_ind_depth = 0;
+
 void spu_indirect_branch(spu_context* ctx)
 {
     spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
     if (fn) {
+        if (++s_ind_depth > 6000) {
+            static int reported = 0;
+            if (!reported) {
+                reported = 1;
+                fprintf(stderr, "[SPU] *** indirect-branch recursion depth %d at LS 0x%05X "
+                        "(image %d, link/r0=0x%05X) -- a tail-call/loop `bi` lifted as a CALL; "
+                        "halting job ***\n", s_ind_depth, ctx->pc & SPU_LS_MASK, ctx->image_id,
+                        ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                fflush(stderr);
+            }
+            s_ind_depth--;
+            ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+            spu_halt(ctx);   /* longjmp back to spu_run_with_halt */
+            return;
+        }
         fn(ctx);
+        s_ind_depth--;
         return;
     }
     fprintf(stderr, "[SPU] indirect branch to unknown LS address 0x%05X (image %d)\n",

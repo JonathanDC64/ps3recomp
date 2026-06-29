@@ -277,6 +277,22 @@ static DWORD WINAPI spu_async_thread(LPVOID p) { spu_async_run((spu_async_job*)p
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
+/* SPU task thread stack size (bytes). A lifted SPU job's guest `brsl` calls become
+ * real nested host C calls. Guest LOOPS that branch to another lifted function are
+ * forced tail calls (SPU_TAILCALL/musttail in the lifter) so they iterate in O(1)
+ * host stack -- without that they overflowed and silently killed the process (a
+ * stack-overflow SE can't run the unhandled filter; exit code reads 0). Genuine
+ * call nesting is bounded by the guest's own stack discipline; 64 MB RESERVE
+ * (committed on demand) is ample headroom. env SPU_STACK_MB overrides (also a probe
+ * for runaway recursion: if crash time scales with this, something still nests). */
+static size_t spu_task_stack_bytes(void)
+{
+    const char* e = getenv("SPU_STACK_MB");
+    unsigned mb = e ? (unsigned)strtoul(e, NULL, 10) : 0;
+    if (mb == 0) mb = 64;
+    return (size_t)mb << 20;
+}
+
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {
@@ -316,13 +332,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         (unsigned long long)fp, args_ea, image_id);
 
 #ifdef _WIN32
-    /* 256 MB stack RESERVE (committed on demand). A lifted SPU job's guest `brsl`
-     * calls become real nested host C calls, and an SPU task's call chain can be
-     * far deeper than the default 1 MB host stack holds -- overflowing it silently
-     * terminates the whole process (a stack-overflow SE can't run the unhandled
-     * filter, so there's no crash log; exit code reads 0). Reserving 256 MB lets
-     * the task run to its real depth. */
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j, 0, NULL);
+    HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
     if (!th) { free(j); return 0; }
     CloseHandle(th);   /* detached */
 #else
@@ -365,7 +375,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
       if (off && off[0] != '0') { fprintf(stderr, "[spu_workload] SPU_TASK_OFF: thread NOT spawned\n");
                                   fflush(stderr); free(j); return 1; } }
 #ifdef _WIN32
-    { HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j, 0, NULL);
+    { HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
       if (!th) { free(j); return 0; } CloseHandle(th); }
 #else
     { pthread_t th;
