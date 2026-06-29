@@ -152,62 +152,49 @@ s32 cellSysutilCheckCallback(void)
 
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
 {
-    if (!value)
+    /* `value` arrives as a raw GUEST address (the HLE dispatch passes r4 verbatim), NOT a
+     * host pointer. Translate it into the VM and write the result big-endian (PS3 is BE).
+     * Dereferencing it directly faulted (guest addr used as host addr). */
+    extern uint8_t* vm_base;
+    uint32_t gaddr = (uint32_t)(uintptr_t)value;
+    if (!gaddr)
         return CELL_SYSUTIL_ERROR_VALUE;
 
+    s32 v;
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        *value = CELL_SYSUTIL_LANG_ENGLISH_US;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
-        *value = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:
-        *value = 0; /* YYYYMMDD */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:
-        *value = 0; /* 24-hour */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:
-        *value = 0; /* UTC */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:
-        *value = 0; /* No DST */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:
-        *value = 0; /* No restriction */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT:
-        *value = 0;
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:
-        *value = 1; /* Has NP account */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:
-        *value = 0; /* 60Hz */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:
-        *value = 1; /* Rumble on */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:
-        *value = 0; /* US/101 */
-        break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:
-        *value = 0; /* Disabled */
-        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:                        v = CELL_SYSUTIL_LANG_ENGLISH_US; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:                v = 0; break; /* YYYYMMDD */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:                v = 0; break; /* 24-hour */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:                   v = 0; break; /* UTC */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:                 v = 0; break; /* No DST */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:        v = 0; break; /* No restriction */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT: v = 1; break; /* Has NP account */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:              v = 0; break; /* 60Hz */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:                 v = 1; break; /* Rumble on */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:              v = 0; break; /* US/101 */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:                v = 0; break; /* Disabled */
     default:
         printf("[cellSysutil] GetSystemParamInt: unknown id 0x%04X\n", id);
-        *value = 0;
+        v = 0;
         break;
     }
 
+    /* big-endian store into guest memory */
+    uint8_t* p = vm_base + gaddr;
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
+s32 cellSysutilGetSystemParamString(s32 id, char* buf_guest, u32 bufsize)
 {
-    if (!buf || bufsize == 0)
+    /* buf_guest is a raw GUEST address; translate into the VM. (byte string -> no bswap) */
+    extern uint8_t* vm_base;
+    if (!(uint32_t)(uintptr_t)buf_guest || bufsize == 0)
         return CELL_SYSUTIL_ERROR_VALUE;
+    char* buf = (char*)(vm_base + (uint32_t)(uintptr_t)buf_guest);
 
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME:
@@ -282,12 +269,14 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
-s32 cellSysCacheMount(char* cachePath)
+s32 cellSysCacheMount(char* cachePath_g)
 {
+    extern uint8_t* vm_base;
     printf("[cellSysutil] SysCacheMount()\n");
 
-    if (!cachePath)
+    if (!(uint32_t)(uintptr_t)cachePath_g)
         return CELL_EINVAL;
+    char* cachePath = (char*)(vm_base + (uint32_t)(uintptr_t)cachePath_g); /* guest addr -> host */
 
     /* Provide a temp directory path */
     strncpy(s_cache_path, "/dev_hdd1/caches", CELL_SYSCACHE_PATH_MAX - 1);
@@ -311,14 +300,19 @@ s32 cellSysCacheClear(void)
  * Disc game check
  * -----------------------------------------------------------------------*/
 
-s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
+s32 cellDiscGameGetBootDiscInfo(u32* type_g, char* titleId_g, u32 titleIdSize)
 {
+    extern uint8_t* vm_base;
     printf("[cellSysutil] DiscGameGetBootDiscInfo()\n");
 
-    if (type)
-        *type = CELL_DISCGAME_TYPE_HDD; /* pretend HDD game */
+    if ((uint32_t)(uintptr_t)type_g) {
+        uint8_t* p = vm_base + (uint32_t)(uintptr_t)type_g;     /* BE u32 store */
+        uint32_t t = CELL_DISCGAME_TYPE_HDD;
+        p[0]=(uint8_t)(t>>24); p[1]=(uint8_t)(t>>16); p[2]=(uint8_t)(t>>8); p[3]=(uint8_t)t;
+    }
 
-    if (titleId && titleIdSize > 0) {
+    if ((uint32_t)(uintptr_t)titleId_g && titleIdSize > 0) {
+        char* titleId = (char*)(vm_base + (uint32_t)(uintptr_t)titleId_g);
         strncpy(titleId, "GAME00000", titleIdSize - 1);
         titleId[titleIdSize - 1] = '\0';
     }
