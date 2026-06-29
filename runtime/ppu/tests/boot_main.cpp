@@ -171,9 +171,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         Sleep(16);            /* ~60 Hz */
         cellGcmTickVBlank();
         cellGcmTickFlip();
+        cellGcm_rsx_process_fifo();          /* drain FIFO (get->put) + run commands;
+                                              * needed even with no window so the title's
+                                              * get==put FIFO waits complete */
         if (rsx_ok) {
             if (rsx_d3d12_backend_pump_messages() != 0) { rsx_ok = 0; }
-            cellGcm_rsx_process_fifo();      /* execute the game's GCM commands */
             rsx_d3d12_backend_present();     /* present the frame */
         }
     }

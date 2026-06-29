@@ -156,6 +156,14 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 #define GCM_LABEL_STRIDE      0x10u
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 
+/* FIFO control block (put@0/get@4/ref@8) in GUEST memory, same rationale as the
+ * label window: the recompiled game reads/writes it via vm_read32/vm_write32, so
+ * cellGcmGetControlRegister must return a GUEST EA — &s_control (a host pointer)
+ * read as a guest offset is garbage, which makes the title's "wait until the RSX
+ * has drained the FIFO" (get==put) loops spin forever (e.g. func_009F7518). The
+ * vblank consumer (cellGcm_rsx_process_fifo) advances get->put each tick. */
+#define GCM_CONTROL_GUEST_EA  0x03002000u
+
 /* ---------------------------------------------------------------------------
  * Internal helpers
  * -----------------------------------------------------------------------*/
@@ -300,6 +308,12 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mapping_count = 1;
     }
 
+    /* FIFO control block in GUEST memory (the EA cellGcmGetControlRegister hands
+     * back). Start drained: put==get==0. */
+    vm_write32(GCM_CONTROL_GUEST_EA + 0, 0);   /* put */
+    vm_write32(GCM_CONTROL_GUEST_EA + 4, 0);   /* get */
+    vm_write32(GCM_CONTROL_GUEST_EA + 8, 0);   /* ref */
+
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -356,7 +370,11 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
 /* NID: 0x8572A8E0 */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
-    return &s_control;
+    /* Return the GUEST EA of the FIFO control block (put/get/ref), NOT &s_control
+     * (host). The recompiled game uses this value as a guest address to poll
+     * get/put; a host pointer read as a guest offset is garbage and makes its
+     * "RSX drained the FIFO" (get==put) wait spin forever (func_009F7518). */
+    return (CellGcmControl*)(uintptr_t)GCM_CONTROL_GUEST_EA;
 }
 
 /* ---------------------------------------------------------------------------
@@ -439,6 +457,13 @@ void cellGcm_rsx_process_fifo(void)
     static rsx_state s_state;
     static int  s_inited = 0;
     static u32  s_get    = 0;     /* guest EA we've drained up to */
+
+    /* Acknowledge the FIFO control block: advance get -> put so the title's
+     * "wait until the RSX has consumed all submitted commands" (get==put) loops
+     * complete. Done unconditionally (even before a context exists) since the
+     * game may poll get/put during early GCM bring-up. */
+    { u32 put = vm_read32(GCM_CONTROL_GUEST_EA + 0);
+      vm_write32(GCM_CONTROL_GUEST_EA + 4, put); }
 
     if (!s_gcm_context_ea) return;
     if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
