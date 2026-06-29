@@ -77,6 +77,20 @@ static inline u128 spu_nand(u128 a, u128 b){ u128 r; r._u64[0]=~(a._u64[0]&b._u6
 static inline u128 spu_nor(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]|b._u64[0]); r._u64[1]=~(a._u64[1]|b._u64[1]); return r; }
 static inline u128 spu_andc(u128 a, u128 b){ u128 r; r._u64[0]=a._u64[0]&~b._u64[0]; r._u64[1]=a._u64[1]&~b._u64[1]; return r; }
 static inline u128 spu_orc(u128 a, u128 b) { u128 r; r._u64[0]=a._u64[0]|~b._u64[0]; r._u64[1]=a._u64[1]|~b._u64[1]; return r; }
+static inline u128 spu_eqv(u128 a, u128 b) { u128 r; r._u64[0]=~(a._u64[0]^b._u64[0]); r._u64[1]=~(a._u64[1]^b._u64[1]); return r; }
+/* sumb: sum the 4 bytes of each word; RA's sum -> odd (low) halfword, RB's -> even (high)
+ * halfword of that word. Byte sums are order-independent so LE byte indexing is fine.
+ * (RA->odd / RB->even per SPU ISA; if a trace-diff vs RPCS3 ever disagrees, swap the two.) */
+static inline u128 spu_sumb(u128 a, u128 b) {
+    u128 r;
+    for (int w = 0; w < 4; w++) {
+        uint16_t sa = (uint16_t)(a._u8[4*w]+a._u8[4*w+1]+a._u8[4*w+2]+a._u8[4*w+3]);
+        uint16_t sb = (uint16_t)(b._u8[4*w]+b._u8[4*w+1]+b._u8[4*w+2]+b._u8[4*w+3]);
+        r._u16[2*w]   = sa;   /* odd halfword (low 16 bits of word) <- RA */
+        r._u16[2*w+1] = sb;   /* even halfword (high 16 bits)       <- RB */
+    }
+    return r;
+}
 static inline u128 spu_andi(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]&(uint32_t)imm; return r; }
 static inline u128 spu_ori(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]|(uint32_t)imm; return r; }
 static inline u128 spu_xori(u128 a, int32_t imm){ u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]^(uint32_t)imm; return r; }
@@ -198,6 +212,7 @@ static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i+
 /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
 static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._s32[i]=((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
 static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
+static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1] * (uint32_t)b._u16[2*i+1]; return r; }
 static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
 static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
 static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++){ float fa=fabsf(a._f32[i]),fb=fabsf(b._f32[i]); r._u32[i]=(fa==fb)?0xFFFFFFFFu:0; } return r; }

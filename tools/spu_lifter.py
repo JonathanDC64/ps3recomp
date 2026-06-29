@@ -322,11 +322,12 @@ class SPULifter:
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",
             "and": "spu_and", "or": "spu_or", "xor": "spu_xor",
             "nand": "spu_nand", "nor": "spu_nor", "andc": "spu_andc", "orc": "spu_orc",
+            "eqv": "spu_eqv", "sumb": "spu_sumb",
             "ceq": "spu_ceq", "ceqh": "spu_ceqh", "ceqb": "spu_ceqb",
             "cgt": "spu_cgt", "cgth": "spu_cgth", "cgtb": "spu_cgtb",
             "clgt": "spu_clgt", "clgth": "spu_clgth", "clgtb": "spu_clgtb",
             "mpy": "spu_mpy", "mpyu": "spu_mpyu",
-            "mpyh": "spu_mpyh", "mpyhh": "spu_mpyhh", "mpys": "spu_mpys",
+            "mpyh": "spu_mpyh", "mpyhh": "spu_mpyhh", "mpyhhu": "spu_mpyhhu", "mpys": "spu_mpys",
             "fa": "spu_fa", "fs": "spu_fs", "fm": "spu_fm",
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
