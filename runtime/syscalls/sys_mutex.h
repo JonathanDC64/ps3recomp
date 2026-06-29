@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define SYS_MUTEX_MAX  256
+#define SYS_MUTEX_MAX  8192   /* PS3 lv2 default; Dantelion2 creates many mutexes during init */
 
 /* Protocol types */
 #define SYS_SYNC_FIFO            0x1

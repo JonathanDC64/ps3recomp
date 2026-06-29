@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define SYS_COND_MAX  256
+#define SYS_COND_MAX  8192   /* pairs 1:1 with mutexes; raise alongside SYS_MUTEX_MAX */
 
 typedef struct sys_cond_info {
     int      active;
