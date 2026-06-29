@@ -268,7 +268,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
      * trampolines unwind the host stack). During static init each constructor is
      * dispatched here, so the last targets before a fatal abort pinpoint it. */
     { static int en = -1; if (en < 0) { const char* e = getenv("YDKJ_ICTRACE"); en = e ? 1 : 0; }
-      if (en) { fprintf(stderr, "[ic] 0x%08X\n", addr); fflush(stderr); } }
+      if (en) { fprintf(stderr, "[ic] 0x%08X r3=0x%08X r4=0x%08X\n", addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]); fflush(stderr); } }
 
     ppu_fn fn = ppu_lookup(addr);
     if (fn) {
