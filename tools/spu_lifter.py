@@ -684,6 +684,30 @@ def main() -> None:
                 v = _be32(o)
                 if text_lo <= v < text_hi and (v & 3) == 0:
                     seeds.add(v)
+
+        # Inline jump tables embedded IN .text. A SPURS task command dispatcher
+        # does `bi rX` where rX = LS[table_base + opcode*4] and the table sits in
+        # the code segment between functions (e.g. spu_0001's 37-entry handler
+        # table at LS 0x475C). The non-text scan above can't see it. Detect a RUN
+        # of >= MIN_RUN consecutive 4-aligned words that ALL point into .text --
+        # random code words almost never form such a run, so this reliably picks
+        # out jump tables -- and seed each entry as a function start.
+        MIN_RUN = 6
+        run: list[int] = []
+        text_end_off = text_off + size
+        o = text_off
+        while o + 4 <= min(text_end_off, len(elf_buf)):
+            v = _be32(o)
+            if base < v < text_hi and (v & 3) == 0:
+                run.append(v)
+            else:
+                if len(run) >= MIN_RUN:
+                    seeds.update(run)
+                run = []
+            o += 4
+        if len(run) >= MIN_RUN:
+            seeds.update(run)
+
         starts = {s for s, e in bounds}
         added = 0
         for t in sorted(seeds - starts):

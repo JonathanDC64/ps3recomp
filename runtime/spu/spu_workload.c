@@ -374,6 +374,14 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
     { const char* off = getenv("SPU_TASK_OFF");
       if (off && off[0] != '0') { fprintf(stderr, "[spu_workload] SPU_TASK_OFF: thread NOT spawned\n");
                                   fflush(stderr); free(j); return 1; } }
+    /* Diagnostic: SPU_INLINE runs the task on THIS (PPU) thread instead of a
+     * worker, so the boot's hang_watchdog -- which samples every OTHER thread's
+     * RIP -- pins exactly which lifted SPU function the task loops in. Deadlocks
+     * the boot (the task can't get PPU-side signals), but that's fine for a probe. */
+    { const char* inl = getenv("SPU_INLINE");
+      if (inl && inl[0] != '0') {
+          fprintf(stderr, "[spu_workload] SPU_INLINE: running task on PPU thread\n");
+          fflush(stderr); spu_async_run(j); return 1; } }
 #ifdef _WIN32
     { HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
       if (!th) { free(j); return 0; } CloseHandle(th); }
