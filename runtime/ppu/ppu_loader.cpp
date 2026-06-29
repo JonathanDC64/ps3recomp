@@ -279,6 +279,30 @@ extern "C" void ppu_recomp_register(void)
 }
 
 /* Indirect call (bctrl/bctr): CTR holds the already-OPD-resolved code address. */
+/* Shadow call stack backing store. The lifted DS_FRAME guard (emitted per
+ * function by a --shadow-stack lift) pushes/pops guest function addresses here,
+ * giving a reliable guest backtrace where host backtraces and the guest
+ * back-chain both fail (tail-call trampolines, Dantelion2 frames). Defined
+ * unconditionally so it links regardless of whether the lift enabled DS_FRAME;
+ * if disabled, the stack simply stays empty. */
+#if defined(_MSC_VER)
+  #define DS_TLS __declspec(thread)
+#else
+  #define DS_TLS __thread
+#endif
+extern "C" { DS_TLS unsigned g_ds_sp = 0; DS_TLS unsigned g_ds_stk[8192]; }
+
+extern "C" void ds_dump_shadow(void)
+{
+    unsigned n = g_ds_sp; if (n > 8192u) n = 8192u;
+    fprintf(stderr, "[shadow] guest call stack depth=%u (innermost first):\n", g_ds_sp);
+    unsigned shown = n < 48u ? n : 48u;
+    for (unsigned i = 0; i < shown; i++)
+        fprintf(stderr, "   #%u 0x%08X\n", i, g_ds_stk[n - 1 - i]);
+    if (n == 0) fprintf(stderr, "   (empty -- lift without --shadow-stack?)\n");
+    fflush(stderr);
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     g_active_ctx = ctx;
@@ -343,6 +367,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     static int dumped = 0;
     if (dumped < 3) {
         dumped++;
+        ds_dump_shadow();   /* reliable guest backtrace (no-op/empty unless --shadow-stack lift) */
         { void* ra = __builtin_return_address(0); HMODULE m=NULL;
           GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&m);
           fprintf(stderr, "      host_ra=%p rva=0x%llX (llvm-symbolizer --obj=ydkj_boot.exe)\n",

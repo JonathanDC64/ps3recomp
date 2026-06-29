@@ -306,6 +306,11 @@ class PPULifter:
         # discover_jump_tables; empty = no static jump-table dispatch (bctr -> the
         # plain indirect-call path).
         self.jump_tables: dict[int, list[int]] = {}
+        # --shadow-stack: emit a per-function DS_FRAME RAII guard + define
+        # DS_SHADOW_STACK, so the runtime maintains a thread-local guest call
+        # stack (reliable backtrace where host/back-chain walks fail on tail-call
+        # trampolines). Off by default -> DS_FRAME is a no-op (zero overhead).
+        self.shadow_stack: bool = False
         # Optional executable-code window [code_lo, code_hi). When set, branch /
         # call targets that fall outside it are NOT promoted to func_X (they are
         # data the boundary detector mis-read as code -- e.g. .rodata living in
@@ -2219,6 +2224,27 @@ class PPULifter:
                                             self.prefix + "function_table")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
+        # Shadow call stack (reliable guest backtrace). DS_FRAME is a no-op unless
+        # DS_SHADOW_STACK is defined (emitted only for a --shadow-stack lift). The
+        # backing storage (g_ds_sp/g_ds_stk) + ds_dump_shadow() live in the runtime
+        # (ppu_loader.cpp) so they exist regardless; here we only declare/define the
+        # zero-cost guard the chunks emit per function.
+        if self.shadow_stack:
+            lines.append("#define DS_SHADOW_STACK 1")
+        lines.append(
+            "#ifdef DS_SHADOW_STACK\n"
+            "#if defined(_MSC_VER)\n"
+            "  #define DS_TLS __declspec(thread)\n"
+            "#else\n"
+            "  #define DS_TLS __thread\n"
+            "#endif\n"
+            'extern "C" { extern DS_TLS unsigned g_ds_sp; extern DS_TLS unsigned g_ds_stk[8192]; }\n'
+            "struct DsFrame { DsFrame(unsigned a){ if (g_ds_sp < 8192u) g_ds_stk[g_ds_sp] = a; ++g_ds_sp; }\n"
+            "                 ~DsFrame(){ if (g_ds_sp) --g_ds_sp; } };\n"
+            "#define DS_FRAME(a) DsFrame _dsf((a))\n"
+            "#else\n"
+            "#define DS_FRAME(a) ((void)0)\n"
+            "#endif")
         # Forward declarations
         for func in self.functions:
             lines.append(f"void {func.name}(ppu_context* ctx);")
@@ -2305,6 +2331,7 @@ class PPULifter:
         if label:
             lines.append(f"/* {label} */")
         lines.append(f"void {func.name}(ppu_context* ctx) {{")
+        lines.append(f"    DS_FRAME(0x{func.start_addr:08X});")
         for bline in func.body_lines:
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -2686,6 +2713,13 @@ def main() -> None:
                              "function's body is replaced with a tail call to the "
                              "host symbol, letting a title swap out e.g. its "
                              "allocator for a clean host implementation.")
+    parser.add_argument("--shadow-stack", action="store_true",
+                        help="Emit a per-function shadow-call-stack guard (DS_FRAME) "
+                             "and define DS_SHADOW_STACK, so the runtime keeps a "
+                             "thread-local guest call stack for a reliable backtrace "
+                             "(ds_dump_shadow). For debugging use-before-construction "
+                             "bugs where host/back-chain walks fail on tail calls. "
+                             "Adds per-call overhead; off by default (DS_FRAME no-op).")
     args = parser.parse_args()
 
     override_funcs: dict[int, str] = {}
@@ -2952,6 +2986,7 @@ def main() -> None:
 
     lifter = PPULifter(prefix=args.symbol_prefix)
     lifter.code_hi = args.code_end
+    lifter.shadow_stack = args.shadow_stack
     lifter.hle_stub_nids = hle_stubs
     lifter.override_funcs = override_funcs
     lifter.function_entries = _func_entries
