@@ -54,7 +54,20 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * negative -> garbage stack -> null function pointers -> branch to LS 0. */
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;   /* 0x3FFF0 for a 256KB LS */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);  /* job's LS in */
-    if (spurs_task_abi) {
+    if (spurs_task_abi == 2) {
+        /* SPURS task-START ABI (what the taskset policy module hands a fresh leaf
+         * task): r3 = the 16-byte CellSpursTaskArgument (verbatim, big-endian
+         * lanes); r4 = {tasksetEA (doubleword 0), taskset.args (doubleword 1)} --
+         * here args_ea carries the tasksetEA (32-bit -> d0 low word). The task
+         * body reads r3 as its argument quadword; passing 0 makes it loop. */
+        if (r3_override) {
+            ctx.gpr[3]._u32[0] = r3_override[0];
+            ctx.gpr[3]._u32[1] = r3_override[1];
+            ctx.gpr[3]._u32[2] = r3_override[2];
+            ctx.gpr[3]._u32[3] = r3_override[3];
+        }
+        ctx.gpr[4]._u32[1] = args_ea;   /* tasksetEA in d0's low word */
+    } else if (spurs_task_abi) {
         if (r3_override) {
             ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
             ctx.gpr[3]._u32[1] = args_ea;          /* eaContext (DMA'd first) */

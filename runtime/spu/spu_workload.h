@@ -84,6 +84,13 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea);
 
+/* Dispatch a SPURS leaf task with the task-START ABI: r3 = the 16-byte task
+ * argument (4 big-endian words), r4 = tasksetEA. Use this (not _async, which uses
+ * the kernel-marker ABI) for cellSpursCreateTask so the task body gets its real
+ * argument instead of a null one (which makes it loop). Runs on a host thread. */
+int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
+                               const uint32_t arg[4], uint32_t taskset_ea);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

@@ -146,7 +146,8 @@ struct CellSpursTaskAttribute {
     u32  sizeContext;
     u64  eaContext;
     u64  eaElf;        /* SPU task ELF guest EA (set by _cellSpursTaskAttributeInitialize) */
-    u8   _padding[56];
+    u64  eaArgument;   /* guest EA of the 16-byte CellSpursTaskArgument (r10 of the init) */
+    u8   _padding[48];
 };
 
 /* Event flag -- SPURS-level event synchronization */

@@ -441,7 +441,16 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
                         CellSpursTaskAttribute* attr)
 {
-    (void)context; (void)sizeContext; (void)attr;
+    (void)context; (void)sizeContext;
+
+    /* Capture the raw guest EAs before translation: the taskset EA (-> r4 of the
+     * task-start ABI) and the task argument EA (from the attribute). */
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+    uint32_t arg_ea = 0;
+    if (attr) {
+        CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
+        arg_ea = (uint32_t)attr_h->eaArgument;
+    }
 
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
      * guest EAs (handled below — elf is translated for load, context kept EA). */
@@ -508,10 +517,25 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                            "context 0x%08X (size 0x%X)\n", ctx_ea, csz);
                 }
 
-                if (sz)
-                    /* Async: SPURS tasks are persistent workers — running them
-                     * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz, ctx_ea);
+                if (sz) {
+                    /* Task-start ABI: a SPURS leaf task expects r3 = its 16-byte
+                     * argument (the body reads fields out of it; passing the
+                     * kernel-marker/null arg makes it loop) and r4 = tasksetEA.
+                     * Read the argument quadword (4 big-endian words) from the
+                     * attribute's argument EA. Dispatch on a host thread. */
+                    extern uint8_t* vm_base;
+                    uint32_t arg[4] = {0, 0, 0, 0};
+                    if (arg_ea) {
+                        const uint8_t* a = vm_base + arg_ea;
+                        for (int k = 0; k < 4; k++)
+                            arg[k] = ((uint32_t)a[k*4]<<24)|((uint32_t)a[k*4+1]<<16)|
+                                     ((uint32_t)a[k*4+2]<<8)|a[k*4+3];
+                    }
+                    printf("[cellSpurs] CreateTask dispatch: arg_ea=0x%08X arg={0x%08X,0x%08X,"
+                           "0x%08X,0x%08X} tasksetEA=0x%08X\n", arg_ea, arg[0], arg[1], arg[2],
+                           arg[3], taskset_ea);
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz, arg, taskset_ea);
+                }
             }
             return CELL_OK;
         }
@@ -530,7 +554,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
                                       u32 sizeContext, const void* lsPattern,
                                       const void* argument)
 {
-    (void)sdkVersion; (void)lsPattern; (void)argument;
+    (void)sdkVersion; (void)lsPattern;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTaskAttribute*);
     memset(attr, 0, sizeof(CellSpursTaskAttribute));
@@ -538,8 +562,9 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
     attr->sizeContext = sizeContext;
     attr->eaContext   = eaContext;
     attr->eaElf       = eaElf;
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext);
+    attr->eaArgument  = (u64)(uintptr_t)argument;   /* r10: guest EA of the task argument */
+    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u arg=0x%08X)\n",
+           (u32)eaElf, (u32)eaContext, sizeContext, (u32)(uintptr_t)argument);
     return CELL_OK;
 }
 
