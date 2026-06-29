@@ -128,6 +128,7 @@ static void vm_hotmap(uint32_t ea, int width)
     }
 }
 extern "C" __declspec(thread) ppu_context* g_active_ctx;
+extern "C" void ds_dump_shadow(void);   /* defined below; used by the HOTREAD64 spin probe */
 extern "C" {
 uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
 #ifdef VM_SAMPLE_READS
@@ -175,7 +176,7 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
     { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
 #endif
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
-      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
+      if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) cia=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), g_active_ctx?(uint32_t)g_active_ctx->cia:0); { static int _sd=0; if(_sd++<2) ds_dump_shadow(); } n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap64(v); }
 void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_base[(uint32_t)a] = v; }
 void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
@@ -383,7 +384,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         ds_dump_shadow();   /* reliable guest backtrace (no-op/empty unless --shadow-stack lift) */
         { void* ra = __builtin_return_address(0); HMODULE m=NULL;
           GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&m);
-          fprintf(stderr, "      host_ra=%p rva=0x%llX (llvm-symbolizer --obj=ydkj_boot.exe)\n",
+          fprintf(stderr, "      host_ra=%p rva=0x%llX (llvm-symbolizer --obj=des_boot.exe)\n",
                 ra, (unsigned long long)((uintptr_t)ra-(uintptr_t)m)); }
         fprintf(stderr, "      lr=0x%08X r2=0x%08X r3=0x%08X r11=0x%08X r12=0x%08X\n",
                 (uint32_t)ctx->lr, (uint32_t)ctx->gpr[2], (uint32_t)ctx->gpr[3],

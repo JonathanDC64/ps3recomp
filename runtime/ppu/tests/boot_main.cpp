@@ -70,7 +70,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)er->ExceptionAddress, &mod);
-    fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=ydkj_boot.exe 0x%llX)\n",
+    fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=des_boot.exe 0x%llX)\n",
             (void*)mod, (unsigned long long)((char*)er->ExceptionAddress - (char*)mod),
             (unsigned long long)((char*)er->ExceptionAddress - (char*)mod));
     /* Host call stack (RVAs) so the lifted caller can be symbolized. */
