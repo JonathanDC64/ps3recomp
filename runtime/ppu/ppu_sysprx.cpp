@@ -207,8 +207,13 @@ static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
  * object table and calls heap addresses as function pointers. */
 extern "C" int64_t sys_ppu_thread_create(ppu_context* ctx);
 extern "C" int64_t sys_ppu_thread_exit(ppu_context* ctx);
-static void hle_ppu_thread_create(ppu_context* ctx) { sys_ppu_thread_create(ctx); }
-static void hle_ppu_thread_exit(ppu_context* ctx)   { sys_ppu_thread_exit(ctx); }
+/* Propagate the return value into r3: the ctx-handler HLE path (ppu_hle.cpp) invokes
+ * fn(ctx) WITHOUT assigning gpr[3] from the return (unlike the generic path), so these
+ * wrappers must set it themselves. Without this, _sys_ppu_thread_create's caller saw r3
+ * = its first arg (a pointer) instead of CELL_OK=0, took the error/assert path, and that
+ * assert helper clobbered the TOC (r2) -> garbage C++ singleton -> boot hang. */
+static void hle_ppu_thread_create(ppu_context* ctx) { ctx->gpr[3] = sys_ppu_thread_create(ctx); }
+static void hle_ppu_thread_exit(ppu_context* ctx)   { ctx->gpr[3] = sys_ppu_thread_exit(ctx); }
 
 /* _cellGcmInitBody (NID 0x15BAE46B) -- the GCM init every PS3 game calls via the
  * cellGcmInit() SDK macro. cellGcmSys.c provides the layout-correct core
