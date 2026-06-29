@@ -196,6 +196,10 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
     uint32_t v = 0;
+    { static uint32_t last = 0xFFFFFFFFu, n = 0;
+      if (channel == last) { if (++n == 4000000u) {
+          fprintf(stderr, "[SPU] spinning on rdch channel %u (img-task waiting for kernel feed)\n", channel);
+          n = 0; } } else { last = channel; n = 0; } }
 
     if (channel_is_mfc(channel)) {
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
@@ -223,6 +227,14 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    /* Spin detector: a SPURS task busy-polling a channel count (e.g. waiting for
+     * the SPURS kernel to push work to SPU_RdInMbox / a signal) reads the same
+     * channel millions of times with no progress. Log it so we know what the job
+     * is waiting on (the kernel work-feed our HLE doesn't yet provide). */
+    { static uint32_t last = 0xFFFFFFFFu, n = 0;
+      if (channel == last) { if (++n == 4000000u) {
+          fprintf(stderr, "[SPU] spinning on rchcnt channel %u (img-task waiting for kernel feed)\n", channel);
+          n = 0; } } else { last = channel; n = 0; } }
     switch (channel) {
     case SPU_RdInMbox:       return ctx->ch_in_mbox.count;                 /* readable */
     case SPU_WrOutMbox:      return SPU_MBOX_DEPTH - ctx->ch_out_mbox.count; /* free slots */
