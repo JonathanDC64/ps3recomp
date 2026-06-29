@@ -297,6 +297,15 @@ class PPULifter:
         # callee's epilogue runs against the caller's frame (frame drift). Set by
         # main() from the disassembly; empty = legacy (range-based routing only).
         self.function_entries: set[int] = set()
+        # Discovered computed-`bctr` switch dispatchers: {bctr_addr: [case addrs]}.
+        # Lifted IN-FUNCTION as `switch ((uint32_t)ctx->ctr) { case ADDR: goto
+        # loc_ADDR; ... }` so the dispatcher and its case bodies stay one function
+        # (switch-in-a-loop dispatchers share back-edges/labels with their cases —
+        # splitting cases into separate functions breaks those gotos). Falls back to
+        # ps3_indirect_call for unknown targets. Populated by main() from
+        # discover_jump_tables; empty = no static jump-table dispatch (bctr -> the
+        # plain indirect-call path).
+        self.jump_tables: dict[int, list[int]] = {}
         # Optional executable-code window [code_lo, code_hi). When set, branch /
         # call targets that fall outside it are NOT promoted to func_X (they are
         # data the boundary detector mis-read as code -- e.g. .rodata living in
@@ -371,6 +380,17 @@ class PPULifter:
                                 internal_targets.add(target)
                         except ValueError:
                             pass
+
+        # Computed-`bctr` switch case targets that land inside this function need
+        # `loc_ADDR:` labels so the in-function `switch (...ctr) { case: goto }`
+        # (emitted at the dispatcher's bctr in _translate) resolves. Dispatchers
+        # for this range are any jump_tables key in [start, end).
+        if self.jump_tables:
+            for disp_addr, case_addrs in self.jump_tables.items():
+                if start <= disp_addr < end:
+                    for c in case_addrs:
+                        if start <= c < end:
+                            internal_targets.add(c)
 
         emitted_labels: set[int] = set()
         for insn in instructions:
@@ -1008,6 +1028,30 @@ class PPULifter:
                 return f"/* {mn} {insn.operands} */;"
 
         if mn == "bctr":
+            # Static switch dispatch: the PIC table computation already left the
+            # absolute case address in CTR (`add target, off, base; mtctr; bctr`),
+            # so dispatch on it directly. In-range cases jump to a local label
+            # (keeps switch-in-loop dispatchers whole); out-of-range cases tail-call
+            # the case function. Unknown CTR values fall back to the indirect-call
+            # resolver. Without this, the runtime indirect-call lands on an unlifted
+            # mid-function case address ("unresolved indirect call").
+            cases = self.jump_tables.get(addr)
+            if cases:
+                lines = ["switch ((uint32_t)ctx->ctr) {"]
+                for c in cases:
+                    if func.start_addr <= c < func.end_addr:
+                        # in-range: label comes from the internal_targets pre-pass
+                        lines.append(f"    case 0x{c:08X}u: goto loc_{c:08X};")
+                    else:
+                        # out-of-range case body: must be a callable function;
+                        # register it so the mid-function pass materializes it.
+                        self.branch_targets.add(c)
+                        lines.append(
+                            f"    case 0x{c:08X}u: {{ {self.prefix}func_{c:08X}(ctx); return; }}")
+                lines.append(
+                    f"    default: ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); return;")
+                lines.append("    }")
+                return "\n    ".join(lines)
             return f"ctx->cia = 0x{addr:08X}; ps3_indirect_call(ctx); return;"
 
         if mn == "bctrl":
@@ -2386,7 +2430,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
     for i in range(n):
         if all_insns[i].mnemonic != 'bctr':
             continue
-        win = all_insns[max(0, i - 30):i]
+        win = all_insns[max(0, i - 120):i]
         # the ctr source register (last mtctr before the bctr)
         rC = None
         for w in reversed(win):
@@ -2405,30 +2449,54 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         # `lwzx rD, rA, rB` computes MEM(rA + rB); the table-base register may be
         # EITHER operand — gcc emits both `lwzx rD, base, idx` and the swapped
-        # `lwzx rD, idx, base`. Try each candidate; the real base is the one
-        # loaded TOC-relative via `lwz base, disp(r2)`. (Hardcoding p[2] as the
-        # base silently skipped every dispatcher with the operands swapped.)
+        # `lwzx rD, idx, base`.
         r_val = p[0]
-        disp = None; r_base = None
-        for cand in (p[1], p[2]):
+
+        # Resolve a register's runtime ADDRESS value by walking back to its
+        # defining load (stopping at the function's terminators). Handles:
+        #   (1) single TOC load   `lwz base, dispA(r2)`            -> MEM(toc+dispA)
+        #   (2) two-level TOC load `lwz mid, dispA(r2);             -> MEM(MEM(toc+dispA)+dispB)
+        #                           lwz base, dispB(mid)`
+        # The two-level form is what DeS/gcc emits for switch tables behind a
+        # secondary data anchor (lwz rM,disp(r2); lwz base,disp(rM)) — the prior
+        # single-level-only resolver silently skipped every such dispatcher.
+        def _reg_load(cand):
             for w in reversed(win):
-                if w.mnemonic == 'lwz':
+                if w.mnemonic in ('bctr', 'bctrl', 'blr', 'bl', 'blrl'):
+                    break
+                if w.mnemonic in ('lwz', 'ld'):
                     a = [x.strip() for x in w.operands.split(',')]
-                    if len(a) == 2 and a[0] == cand and '(r2)' in a[1]:
-                        disp = mem_disp(a[1]); r_base = cand; break
-            if disp is not None:
-                break
-        if disp is None or not toc:
-            continue
-        # offset table iff an `add rC, *, r_base` combines the loaded value + base
-        is_offset = any(
-            w.mnemonic == 'add' and
-            [x.strip() for x in w.operands.split(',')][0] == rC and
-            r_base in [x.strip() for x in w.operands.split(',')][1:]
-            for w in win)
-        table_base = read_u32((toc + disp) & 0xFFFFFFFF)
-        if table_base is None:
-            continue
+                    if len(a) == 2 and a[0] == cand and '(' in a[1]:
+                        return (mem_disp(a[1]), a[1].split('(')[1].rstrip(')'))
+            return None
+
+        def _base_addr(cand):
+            ld = _reg_load(cand)
+            if ld is None:
+                return None
+            d, rA = ld
+            if d is None:
+                return None
+            if rA == 'r2':
+                return read_u32((toc + d) & 0xFFFFFFFF) if toc else None
+            mid = _reg_load(rA)
+            if mid is None or mid[1] != 'r2' or mid[0] is None or not toc:
+                return None
+            m = read_u32((toc + mid[0]) & 0xFFFFFFFF)
+            if m is None:
+                return None
+            return read_u32((m + d) & 0xFFFFFFFF)
+
+        # offset table iff an `add rC, *, base` combines the loaded value + base.
+        addw = next((w for w in reversed(win)
+                     if w.mnemonic == 'add'
+                     and [x.strip() for x in w.operands.split(',')][0] == rC), None)
+        is_offset = addw is not None
+        base_cands = [p[1], p[2]]
+        if is_offset:
+            adds = [x.strip() for x in addw.operands.split(',')][1:]
+            base_cands = [c for c in (p[1], p[2]) if c in adds] or base_cands
+
         # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`
         count = None
         for w in reversed(win):
@@ -2438,22 +2506,44 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 except ValueError:
                     count = None
                 break
-        if count is None or count < 0 or count > 4096:
+        count_known = count is not None and 0 <= count <= 4096
+        if not count_known:
             count = 256
-        targets = []
-        for k in range(count + 1):
-            v = read_u32((table_base + k * 4) & 0xFFFFFFFF)
-            if v is None:
+
+        def _read_targets(tb):
+            out = []
+            for k in range(count + 1):
+                v = read_u32((tb + k * 4) & 0xFFFFFFFF)
+                if v is None:
+                    break
+                if is_offset:
+                    off = v - (1 << 32) if (v & 0x80000000) else v
+                    t = (tb + off) & 0xFFFFFFFF
+                else:
+                    t = v
+                if text_lo <= t < text_hi and t % 4 == 0:
+                    out.append(t)
+                else:
+                    break
+            return out
+
+        table_base = None
+        for cand in base_cands:
+            a = _base_addr(cand)
+            if a is not None:
+                table_base = a
                 break
-            if is_offset:
-                off = v - (1 << 32) if (v & 0x80000000) else v
-                t = (table_base + off) & 0xFFFFFFFF
-            else:
-                t = v
-            if text_lo <= t < text_hi and t % 4 == 0:
-                targets.append(t)
-            else:
-                break
+        targets = _read_targets(table_base) if table_base is not None else []
+        # Fallback: gcc PIC switch tables are emitted INLINE immediately after the
+        # dispatching `bctr`; when the base register can't be resolved statically
+        # (e.g. anchored through a register we lost), the table is at bctr+4. Only
+        # for offset tables and only if it yields a (near-)complete valid table, so
+        # a non-table `bctr` followed by real code isn't misread as a jump table.
+        if (not targets) and is_offset:
+            fb = (all_insns[i].addr + 4) & 0xFFFFFFFF
+            cand = _read_targets(fb)
+            if count_known and len(cand) >= count:
+                targets = cand
         if targets:
             tables[all_insns[i].addr] = sorted(set(targets))
     return tables
@@ -2473,13 +2563,14 @@ _WORKER_STATE: dict = {}
 
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
-                 override_funcs=None):
+                 override_funcs=None, jump_tables=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
     _WORKER_STATE["prefix"] = prefix
     _WORKER_STATE["hle_stub_nids"] = hle_stub_nids or {}
     _WORKER_STATE["override_funcs"] = override_funcs or {}
+    _WORKER_STATE["jump_tables"] = jump_tables or {}
 
 
 def _worker_lift(task):
@@ -2491,6 +2582,7 @@ def _worker_lift(task):
     # real code and bctrl's to garbage. (Single-threaded lift set this directly.)
     lifter.hle_stub_nids = _WORKER_STATE.get("hle_stub_nids", {})
     lifter.override_funcs = _WORKER_STATE.get("override_funcs", {})
+    lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -2523,7 +2615,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
     # close() (no new tasks) + join() (graceful worker exit) avoids the deadlock.
     pool = mp.Pool(processes=jobs, initializer=_worker_init,
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
-                             lifter.hle_stub_nids, lifter.override_funcs))
+                             lifter.hle_stub_nids, lifter.override_funcs,
+                             lifter.jump_tables))
     try:
         for idx0, results, ct, bt, osyms in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -2796,6 +2889,7 @@ def main() -> None:
     # extend the dispatcher function over the case block: the mid-entry tail
     # mechanism lifts target..func_end, so a far end explodes the output.)
     jt_targets = set()
+    _jump_tables = {}
     if not args.raw:
         try:
             seg_map = [(ph.p_vaddr, ph.p_vaddr + ph.p_filesz,
@@ -2816,19 +2910,17 @@ def main() -> None:
             tables = discover_jump_tables(all_insns, _read_u32, toc, text_lo, text_hi)
             for ts in tables.values():
                 jt_targets.update(ts)
-            import bisect
-            fb = dict(func_bounds)
-            allstarts = sorted(set(fb) | jt_targets)
-            added = 0
-            for t in sorted(jt_targets):
-                if t in fb:
-                    continue
-                k = bisect.bisect_right(allstarts, t)
-                fb[t] = allstarts[k] if k < len(allstarts) else text_hi
-                added += 1
-            func_bounds = sorted(fb.items())
-            print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets, "
-                  f"+{added} case funcs")
+            # Do NOT split functions at case targets. The dispatcher is lifted with
+            # an in-function `switch ((uint32_t)ctx->ctr)` (see PPULifter.jump_tables
+            # / the bctr handler in _translate), so case bodies must stay inside the
+            # dispatcher's function for the `goto loc_ADDR` to resolve and for
+            # switch-in-loop back-edges/shared labels to keep working. (The old model
+            # promoted each case to its own func_X and routed the bctr through the
+            # runtime indirect-call resolver — which breaks loop dispatchers and
+            # leaves PIC tables the resolver can't see as "unresolved indirect call".)
+            _jump_tables = tables
+            print(f"  jump tables: {len(tables)} dispatchers, {len(jt_targets)} case targets "
+                  f"(in-function switch dispatch)")
         except Exception as exc:
             print(f"  jump-table discovery skipped: {exc}", file=sys.stderr)
 
@@ -2863,6 +2955,7 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.override_funcs = override_funcs
     lifter.function_entries = _func_entries
+    lifter.jump_tables = _jump_tables
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
