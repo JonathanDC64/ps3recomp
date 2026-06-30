@@ -15,6 +15,7 @@
 #include "spu_dma.h"
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv (SPU_DISPATCH_LOG diagnostic) */
 #include <setjmp.h>
 
 #ifdef __cplusplus
@@ -104,6 +105,49 @@ static volatile long g_resv_lock = 0;
 static void resv_lock(void)   { while (_InterlockedExchange(&g_resv_lock, 1)) { } }
 static void resv_unlock(void) { _InterlockedExchange(&g_resv_lock, 0); }
 
+/* Cross-agent lock-line reservation registry. A SPURS task that getllar's a control
+ * line and waits on SPU_EVENT_LR (0x400) only wakes when ANOTHER agent (the PPU, or
+ * another SPU's putllc) writes that line. To deliver LR we track which SPU contexts
+ * hold a reservation, and the write paths (PPU vm_write*, SPU putllc/putlluc) call
+ * spu_reservation_notify_write(ea): any context reserving that 128 B line gets
+ * event_status |= SPU_EVENT_LR and its reservation invalidated. g_spu_resv_count is a
+ * non-static fast-path gate so the hot PPU vm_write path skips the call when no SPU
+ * holds a reservation. */
+#define SPU_MAX_RESV 8
+static spu_context* s_resv_ctx[SPU_MAX_RESV];
+volatile long       g_spu_resv_count = 0;   /* read by the PPU vm_write hook */
+
+static void resv_register(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_MAX_RESV; i++) if (s_resv_ctx[i] == ctx) return;   /* already */
+    for (int i = 0; i < SPU_MAX_RESV; i++)
+        if (!s_resv_ctx[i]) { s_resv_ctx[i] = ctx; _InterlockedIncrement(&g_spu_resv_count); return; }
+}
+static void resv_unregister(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_MAX_RESV; i++)
+        if (s_resv_ctx[i] == ctx) { s_resv_ctx[i] = NULL; _InterlockedDecrement(&g_spu_resv_count); return; }
+}
+
+/* Notify reservers that the 128 B line containing `ea` was written -> deliver LR.
+ * Must be called WITHOUT g_resv_lock held (it takes it). */
+void spu_reservation_notify_write(uint32_t ea)
+{
+    if (g_spu_resv_count == 0) return;                 /* fast path: no reservations */
+    uint32_t line = ea & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    resv_lock();
+    for (int i = 0; i < SPU_MAX_RESV; i++) {
+        spu_context* c = s_resv_ctx[i];
+        if (c && c->resv_valid && c->resv_ea == line) {
+            c->event_status |= SPU_EVENT_LR;           /* RdEventStat masks by event_mask */
+            c->resv_valid = 0;
+            s_resv_ctx[i] = NULL;
+            _InterlockedDecrement(&g_spu_resv_count);
+        }
+    }
+    resv_unlock();
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -118,28 +162,37 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 0;
+        resv_register(ctx);                            /* track for LR delivery */
         resv_unlock();
         return 1;
 
-    case MFC_PUTLLC_CMD:
+    case MFC_PUTLLC_CMD: {
+        int committed;
         resv_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+            committed = 1;
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+            committed = 0;
         }
         ctx->resv_valid = 0;                           /* reservation consumed */
+        resv_unregister(ctx);
         resv_unlock();
+        if (committed) spu_reservation_notify_write(ea);  /* lost others' reservations */
         return 1;
+    }
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
         resv_lock();
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         ctx->resv_valid = 0; ctx->atomic_stat = 0;
+        resv_unregister(ctx);
         resv_unlock();
+        spu_reservation_notify_write(ea);              /* lost others' reservations */
         return 1;
 
     default:
@@ -212,7 +265,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
     case SPU_RdSigNotify2:  v = spu_channel_read(&ctx->ch_sig_notify[1]); break;
     case SPU_RdDec:         v = ctx->decrementer;                       break;
     case SPU_RdEventMask:   v = ctx->event_mask;                        break;
-    case SPU_RdEventStat:   v = ctx->event_status;                      break;
+    case SPU_RdEventStat:   v = ctx->event_status & ctx->event_mask;    break;
     case SPU_RdMachStat:    v = (ctx->status == SPU_STATUS_RUNNING) ? 1 : 0; break;
     case SPU_RdSRR0:        v = ctx->srr0;                              break;
     default:

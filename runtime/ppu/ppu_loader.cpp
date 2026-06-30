@@ -178,16 +178,23 @@ uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap(
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD64] spinning on 0x%08X (=0x%016llX) cia=0x%08X\n", (uint32_t)a, (unsigned long long)__builtin_bswap64(v), g_active_ctx?(uint32_t)g_active_ctx->cia:0); { static int _sd=0; if(_sd++<2) ds_dump_shadow(); } n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap64(v); }
-void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_base[(uint32_t)a] = v; }
-void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); }
+/* SPU lock-line reservation lost (SPU_EVENT_LR): a PPU write to a line an SPU has
+ * getllar'd must wake that SPU. g_spu_resv_count gates the call so the hot write path
+ * pays nothing when no SPU holds a reservation. (Defined in runtime/spu/spu_channels.c.) */
+extern volatile long g_spu_resv_count;
+void spu_reservation_notify_write(uint32_t ea);
+#define VM_LR_NOTIFY(a) do { if (g_spu_resv_count) spu_reservation_notify_write((uint32_t)(a)); } while (0)
+
+void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_base[(uint32_t)a] = v; VM_LR_NOTIFY(a); }
+void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); VM_LR_NOTIFY(a); }
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
         void* ra=__builtin_return_address(0); static HMODULE _m=0;
         if(!_m) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&_m);
         fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  rva=0x%llX\n", ea, v, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m)); } } }
-    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); }
-void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); }
+    v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); VM_LR_NOTIFY(a); }
+void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); VM_LR_NOTIFY(a); }
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */

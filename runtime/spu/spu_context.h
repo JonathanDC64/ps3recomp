@@ -149,9 +149,22 @@ typedef struct spu_context {
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask */
+    /* Event status / mask. SPU event bits (SPU_RdEventStat / SPU_WrEventMask),
+     * values per the CBE ISA (cross-checked vs RPCS3 SPUThread.h): */
     uint32_t event_status;
     uint32_t event_mask;
+    #define SPU_EVENT_MS  0x1000  /* multisource sync                       */
+    #define SPU_EVENT_A   0x0800  /* privileged attention                   */
+    #define SPU_EVENT_LR  0x0400  /* lock-line reservation lost             */
+    #define SPU_EVENT_S1  0x0200  /* signal notification 1 available        */
+    #define SPU_EVENT_S2  0x0100  /* signal notification 2 available        */
+    #define SPU_EVENT_LE  0x0080  /* SPU outbound mailbox available         */
+    #define SPU_EVENT_ME  0x0040  /* SPU outbound interrupt mailbox avail.  */
+    #define SPU_EVENT_TM  0x0020  /* SPU decrementer negative               */
+    #define SPU_EVENT_MB  0x0010  /* SPU inbound mailbox available          */
+    #define SPU_EVENT_QV  0x0008  /* MFC SPU command queue available        */
+    #define SPU_EVENT_SN  0x0002  /* MFC list command stall-and-notify      */
+    #define SPU_EVENT_TG  0x0001  /* MFC tag-group status update            */
 
     /* Channels */
     spu_channel ch_out_mbox;        /* SPU -> PPU outbound mailbox */
