@@ -18,6 +18,10 @@
 #include <stdlib.h>   /* getenv (SPU_DISPATCH_LOG diagnostic) */
 #include <setjmp.h>
 
+/* SPU_QLOG diagnostic: -1 = env not yet read, 0 = off, 1 = on. Read lazily in
+ * mfc_do_transfer (spu_dma.h) to trace the leaf's command-queue DMA sources. */
+int g_spu_qlog = -1;
+
 #ifdef __cplusplus
 extern "C" {
 #endif

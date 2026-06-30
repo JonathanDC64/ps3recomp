@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv (SPU_QLOG diagnostic) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,6 +135,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
+    /* SPU_QLOG: trace the leaf's command-queue DMAs -- image 2 (the SPURS leaf)
+     * transfers touching the queue-ring LS window [0x13000,0x13600). Reveals the
+     * main-memory queue base the leaf derives from r4/SPURS. */
+    { extern int g_spu_qlog; const char* qe;
+      if (g_spu_qlog && spu->image_id == 2 && lsa >= 0x13000 && lsa < 0x13600) {
+        if (g_spu_qlog < 0) { qe = getenv("SPU_QLOG"); g_spu_qlog = (qe && *qe!='0') ? 1 : 0; }
+        if (g_spu_qlog)
+          fprintf(stderr, "[qlog] img2 %s lsa=0x%05X ea=0x%08X size=%u\n",
+                  mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+      } }
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
