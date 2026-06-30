@@ -595,14 +595,24 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * game-written here or computed wrong on the SPU. First 32 bytes of arg[0..2]. */
     if (have_arg_val && getenv("SPU_QLOG")) {
         extern uint8_t* vm_base;
+        /* Dump arg[0..2] (32B each) and recurse ONE level into any embedded word that
+         * looks like a guest pointer -- to locate where the bad 0xA73400E8 image=7
+         * derefs originates (immediate args were valid; the bad ptr is deeper). */
+        #define DUMP32(label,ptr) do { uint32_t _p=(ptr); const uint8_t* _d=vm_base+_p; \
+            printf("[argdump] %s 0x%08X:", (label), _p); \
+            for (int b=0;b<32;b++) printf("%s%02X",(b%4)?"":" ",_d[b]); printf("\n"); } while(0)
         for (int s = 0; s < 3; s++) {
             uint32_t p = arg_val[s];
             if (!p) continue;
+            DUMP32("arg", p);
             const uint8_t* d = vm_base + p;
-            printf("[argdump] arg[%d]=0x%08X:", s, p);
-            for (int b = 0; b < 32; b++) printf("%s%02X", (b%4)?"":" ", d[b]);
-            printf("\n");
+            for (int w = 0; w < 8; w++) {
+                uint32_t v = ((u32)d[w*4]<<24)|((u32)d[w*4+1]<<16)|((u32)d[w*4+2]<<8)|d[w*4+3];
+                if (v >= 0x00010000u && v < 0x50000000u)   /* plausible guest pointer */
+                    DUMP32("  ->", v);
+            }
         }
+        #undef DUMP32
     }
     return spurs_create_task_core(taskset, taskId, elf, context, sizeContext,
                                   arg_val, have_arg_val, /*exitcode*/0);
