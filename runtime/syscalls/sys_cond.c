@@ -151,6 +151,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
 
+    /* EXPERIMENT (FORCE_COND_DONE=N): make cond_wait on cond N return immediately
+     * (CELL_OK, no block) -- simulates the awaited signals. Probes whether a never-
+     * signaled barrier (e.g. the Havok cond-9 barrier MAIN parks on) is the boot gate:
+     * if the game advances, that barrier's missing completions are the cause. */
+    { static int fc = -2; if (fc == -2) { const char* e = getenv("FORCE_COND_DONE"); fc = e ? (int)strtol(e,0,0) : -1; }
+      if (fc >= 0 && cond_id == (uint32_t)fc) return CELL_OK; }
+
     /* One-shot guest backtrace for the hot cond=2 waiter (Frontier #11): walk the
      * PPC64 stack back-chain (*(r1)=prev SP, saved LR at prev+0x10) to identify which
      * guest function is blocked and what it's waiting for. */

@@ -394,6 +394,15 @@ int main(int argc, char** argv)
      * we can probe whether a different return unblocks the loading state. */
     ps3_hle_register_ctx(0x36D0C2C5u, "sceNp_0x36D0C2C5_probe", [](ppu_context* c){
         static long v = -2; if (v == -2) { const char* e = getenv("NP_36_RET"); v = e ? strtol(e,0,0) : 0; }
+        static int n = 0; if (n < 4) { n++;
+            fprintf(stderr, "[np36] call r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
+                    (uint32_t)c->gpr[3], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5], (uint32_t)c->gpr[6]); }
+        /* NP_36_WRITE=0xVAL: if r3 looks like a guest pointer, write VAL (BE u32) there --
+         * tests the "getter whose out-param we never fill" hypothesis. */
+        { static long w = -2; static uint32_t wv = 0;
+          if (w == -2) { const char* e = getenv("NP_36_WRITE"); w = e ? 1 : 0; if (e) wv = (uint32_t)strtoul(e,0,0); }
+          if (w) { uint32_t p = (uint32_t)c->gpr[3];
+              if (p >= 0x10000 && p < 0xE0000000u) { extern void vm_write32(uint64_t,uint32_t); vm_write32(p, wv); } } }
         c->gpr[3] = (uint64_t)(int64_t)v;
     });
 
