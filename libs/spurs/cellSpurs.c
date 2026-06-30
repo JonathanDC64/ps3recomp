@@ -590,6 +590,20 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     }
     printf("[cellSpurs] CreateTask(direct) argPtr=0x%08X arg={0x%08X,0x%08X,0x%08X,0x%08X}\n",
            argPtr, arg_val[0], arg_val[1], arg_val[2], arg_val[3]);
+    /* DIAG (SPU_QLOG): dump the arg-pointed structures the SPU task will DMA, to see
+     * whether their embedded pointers (e.g. the bad 0xA73400E8 image=7 reads) are
+     * game-written here or computed wrong on the SPU. First 32 bytes of arg[0..2]. */
+    if (have_arg_val && getenv("SPU_QLOG")) {
+        extern uint8_t* vm_base;
+        for (int s = 0; s < 3; s++) {
+            uint32_t p = arg_val[s];
+            if (!p) continue;
+            const uint8_t* d = vm_base + p;
+            printf("[argdump] arg[%d]=0x%08X:", s, p);
+            for (int b = 0; b < 32; b++) printf("%s%02X", (b%4)?"":" ", d[b]);
+            printf("\n");
+        }
+    }
     return spurs_create_task_core(taskset, taskId, elf, context, sizeContext,
                                   arg_val, have_arg_val, /*exitcode*/0);
 }
