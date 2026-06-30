@@ -149,6 +149,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (log)
           fprintf(stderr, "[qlog] img%d %s lsa=0x%05X ea=0x%08X size=%u\n",
                   spu->image_id, mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+        /* Provenance snapshot: image 7 issuing a DMA with an OUT-OF-RANGE EA (the bad
+         * 0xA73400E8 / null) -- dump GPR preferred slots + LS window around lsa so we can
+         * see which register/LS field produced the bad EA (lifter-bug vs data). Once. */
+        if (spu->image_id == 7 && ((uint32_t)ea >= 0x50000000u || (uint32_t)ea == 0)) {
+            extern int g_qlog7_prov; if (g_qlog7_prov > 0) { g_qlog7_prov--;
+                fprintf(stderr, "[prov] img7 BAD-EA GET ea=0x%08X lsa=0x%05X size=%u -- GPR[0..95].w0:\n",
+                        (uint32_t)ea, lsa, size);
+                for (int r = 0; r < 96; r++) {
+                    fprintf(stderr, " r%-3d=%08X", r, spu->gpr[r]._u32[0]);
+                    if ((r & 7) == 7) fprintf(stderr, "\n");
+                }
+            }
+        }
       } }
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */
