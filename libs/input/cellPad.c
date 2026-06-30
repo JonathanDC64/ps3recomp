@@ -11,9 +11,15 @@
  */
 
 #include "cellPad.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+
+/* Guest pointers reach these HLE entries as raw 32-bit guest effective addresses
+ * (the generic adapter passes GPRs verbatim); translate to host before deref.
+ * NULL guest EA -> NULL host. Matches the cellSpurs convention. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -375,6 +381,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
 
     if (port_no >= s_max_connect || !data)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    data = GUEST_PTR(data, CellPadData*);   /* guest EA -> host */
 
     memset(data, 0, sizeof(CellPadData));
 
@@ -445,6 +452,7 @@ s32 cellPadGetInfo2(CellPadInfo2* info)
 
     if (!info)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    info = GUEST_PTR(info, CellPadInfo2*);   /* guest EA -> host */
 
     /* Poll to get latest connection state */
     pad_poll_backend();
@@ -495,6 +503,7 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
 
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !info)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    info = GUEST_PTR(info, CellPadCapabilityInfo*);   /* guest EA -> host */
 
     memset(info, 0, sizeof(CellPadCapabilityInfo));
 
@@ -515,6 +524,7 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     if (port_no >= CELL_PAD_MAX_PORT_NUM || !param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    param = GUEST_PTR(param, CellPadActParam*);   /* guest EA -> host */
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */
