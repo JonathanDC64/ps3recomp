@@ -234,6 +234,7 @@ typedef struct {
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
     int                 abi;          /* spu_run_lifted_job_abi mode: 1=kernel, 2=task-start */
+    uint32_t            exitcode_ea;  /* CellSpursTaskExitCode container EA (0 = none) */
 } spu_async_job;
 
 static void spu_async_run(spu_async_job* j)
@@ -252,7 +253,7 @@ static void spu_async_run(spu_async_job* j)
 #if defined(_WIN32) && defined(_MSC_VER)
             __try {
                 rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                            j->abi, j->have_r3 ? j->r3 : 0);
+                                            j->abi, j->have_r3 ? j->r3 : 0, j->exitcode_ea);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 fprintf(stderr, "[spu_workload] async image=%d *** SEH FAULT 0x%08lX *** "
                         "(SPU task crashed -- caught, not propagated)\n",
@@ -261,7 +262,7 @@ static void spu_async_run(spu_async_job* j)
             }
 #else
             rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                        j->abi, j->have_r3 ? j->r3 : 0);
+                                        j->abi, j->have_r3 ? j->r3 : 0, j->exitcode_ea);
 #endif
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d\n", j->image_id, rc);
             fflush(stderr);
@@ -313,6 +314,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id; j->abi = 1;   /* kernel marker ABI */
+    j->exitcode_ea = 0;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
@@ -348,7 +350,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
  * Unlike dispatch_async (kernel-marker ABI), this passes the real task argument
  * the task body reads -- without it the body processes a null arg and loops. */
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
-                               const uint32_t arg[4], uint32_t taskset_ea)
+                               const uint32_t arg[4], uint32_t taskset_ea,
+                               uint32_t exitcode_ea)
 {
     if (!image || image_size == 0) return 0;
     uint64_t fp = spu_workload_fingerprint(image, image_size);
@@ -365,6 +368,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
     j->image = image; j->image_size = image_size; j->args_ea = taskset_ea;
     j->fn = fn; j->image_id = image_id; j->abi = 2;   /* task-start ABI */
     j->r3[0]=arg[0]; j->r3[1]=arg[1]; j->r3[2]=arg[2]; j->r3[3]=arg[3]; j->have_r3 = 1;
+    j->exitcode_ea = exitcode_ea;     /* CellSpursTaskExitCode container (0 = none) */
     fprintf(stderr, "[spu_workload] task dispatch (async) fp=0x%016llX "
             "r3={0x%08X,0x%08X,0x%08X,0x%08X} tasksetEA=0x%08X image=%d\n",
             (unsigned long long)fp, arg[0], arg[1], arg[2], arg[3], taskset_ea, image_id);

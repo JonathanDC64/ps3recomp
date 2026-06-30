@@ -447,9 +447,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * task-start ABI) and the task argument EA (from the attribute). */
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     uint32_t arg_ea = 0;
+    uint32_t exitcode_ea = 0;
     if (attr) {
         CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
-        arg_ea = (uint32_t)attr_h->eaArgument;
+        arg_ea      = (uint32_t)attr_h->eaArgument;
+        exitcode_ea = (uint32_t)attr_h->eaExitCode;   /* CellSpursTaskExitCode container */
     }
 
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
@@ -532,9 +534,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                                      ((uint32_t)a[k*4+2]<<8)|a[k*4+3];
                     }
                     printf("[cellSpurs] CreateTask dispatch: arg_ea=0x%08X arg={0x%08X,0x%08X,"
-                           "0x%08X,0x%08X} tasksetEA=0x%08X\n", arg_ea, arg[0], arg[1], arg[2],
-                           arg[3], taskset_ea);
-                    spu_workload_dispatch_task(host_elf, (uint32_t)sz, arg, taskset_ea);
+                           "0x%08X,0x%08X} tasksetEA=0x%08X exitCode=0x%08X\n", arg_ea, arg[0],
+                           arg[1], arg[2], arg[3], taskset_ea, exitcode_ea);
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz, arg, taskset_ea, exitcode_ea);
                 }
             }
             return CELL_OK;

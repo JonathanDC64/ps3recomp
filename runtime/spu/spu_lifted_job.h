@@ -37,12 +37,16 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * eaContext+0x10 descriptor: {0x40-marker handle, eaContext, queue/lock EA,
  * ...}). The claim CAS computes its atomic EA from r3.word2/3 & 0xFFFFFF80, so a
  * zero there locks address 0 and the runtime finds "no ready task". */
+/* exitcode_ea: when nonzero and the task EXITs (`stop 0`), its exit code is
+ * written to this guest EA (the CellSpursTaskExitCode container the game
+ * registered). See spurs_task.c. */
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
                                              int image_id,
                                              int spurs_task_abi,
-                                             const uint32_t* r3_override)
+                                             const uint32_t* r3_override,
+                                             uint32_t exitcode_ea)
 {
     if (!entry) return -1;
     spu_context ctx;
@@ -83,6 +87,13 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
       spu_run_with_halt(entry, &ctx); }                         /* run with halt pad   */
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+    /* SPURS task EXIT: if the task stopped via `stop 0`, hand its exit code to the
+     * registered container (emulating the taskset PM's on-task-exit step). */
+    if (exitcode_ea) {
+        extern int spu_spurs_task_write_exit_code(spu_context*, uint32_t);
+        if (spu_spurs_task_write_exit_code(&ctx, exitcode_ea))
+            return (int32_t)ctx.gpr[3]._u32[0];                 /* exit code */
+    }
     return 0;
 }
 
@@ -91,7 +102,7 @@ static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
                                              uint32_t args_ea,
                                              int image_id)
 {
-    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0);
+    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0, 0);
 }
 
 static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,

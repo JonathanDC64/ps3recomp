@@ -89,7 +89,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
  * the kernel-marker ABI) for cellSpursCreateTask so the task body gets its real
  * argument instead of a null one (which makes it loop). Runs on a host thread. */
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
-                               const uint32_t arg[4], uint32_t taskset_ea);
+                               const uint32_t arg[4], uint32_t taskset_ea,
+                               uint32_t exitcode_ea);
 
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
