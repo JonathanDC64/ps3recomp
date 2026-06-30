@@ -168,7 +168,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             if (ea != last && n < 30) { last = ea; n++;
               const uint8_t* m = vm_base + ea;
               fprintf(stderr, "[resv] image=%d GETLLAR line=0x%08X content:", ctx->image_id, ea);
-              for (int b = 0; b < 32; b++) fprintf(stderr, " %02X", m[b]);
+              for (int b = 0; b < 16; b++) fprintf(stderr, " %02X", m[b]);
+              /* LS queue pointers that drive the getllar EA computation */
+              fprintf(stderr, " | LS[0x13400]:");
+              for (int b = 0; b < 16; b++) fprintf(stderr, " %02X", ctx->ls[0x13400 + b]);
+              fprintf(stderr, " LS[0x13480]:");
+              for (int b = 0; b < 16; b++) fprintf(stderr, " %02X", ctx->ls[0x13480 + b]);
               fprintf(stderr, "\n"); fflush(stderr); } } }
         resv_lock();
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
