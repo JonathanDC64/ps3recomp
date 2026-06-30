@@ -207,6 +207,27 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     memcpy(spurs->prefix, attr->prefix, sizeof(spurs->prefix));
 
     memset(s_workloads, 0, sizeof(s_workloads));
+
+    /* P2 (docs/15): create the real lv2 SPU thread group + threads and write them into the
+     * REAL CellSpurs layout (offsets far from our simplified fields), so the SPURS service
+     * registers the SPU threads (by lv2 id) -- the prerequisite for SPU->PPU USER events to
+     * be dispatched (handler B looks the thread up by lv2 id). Flag-gated (SPURS_LV2THREADS)
+     * so it can't regress the working boot until proven. spuPort=1 -> the event selector
+     * picks handler B (the work path). Event queue/port are wired in P3. */
+    { const char* e = getenv("SPURS_LV2THREADS");
+      if (e && e[0] != '0') {
+        extern uint32_t lv2_spu_make_group(uint32_t, uint32_t*);
+        extern void cellspurs_write_substrate(uint32_t, uint32_t, const uint32_t*, uint32_t,
+                                              uint8_t, uint32_t, uint32_t);
+        uint32_t nspu = attr->nSpus ? (uint32_t)attr->nSpus : 2;
+        if (nspu > 8) nspu = 8;
+        uint32_t tids[8] = {0};
+        uint32_t grp = lv2_spu_make_group(nspu, tids);
+        cellspurs_write_substrate(spurs_ea, grp, tids, nspu,
+                                  /*spuPort*/1, /*eventQueue*/0, /*eventPort*/0);
+        printf("[cellSpurs] P2: lv2 substrate -> group=0x%X spus[0]=0x%X spus[1]=0x%X "
+               "(written to CellSpurs @0x%08X)\n", grp, tids[0], tids[1], spurs_ea);
+      } }
     return CELL_OK;
 }
 

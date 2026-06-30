@@ -233,6 +233,31 @@ static spu_thread_t* spu_alloc_thread(void)
     return NULL;
 }
 
+/* C-level helper for the SPURS HLE (docs/15 P2): create an SPU thread group with `nThreads`
+ * threads (real lv2 ids), fill out_tids[0..nThreads-1] with the thread ids, and return the
+ * group id (0 = failure). Records the same group/thread state that
+ * sys_spu_thread_group_create + sys_spu_thread_initialize would, so cellSpurs can populate
+ * the real CellSpurs layout (spuTG, spus[]) -> the SPURS service registers the threads. */
+uint32_t lv2_spu_make_group(uint32_t nThreads, uint32_t* out_tids)
+{
+    if (nThreads > 8) nThreads = 8;
+    spu_group_t* g = spu_alloc_group();
+    if (!g) return 0;
+    g->num_threads = nThreads;
+    g->state = 0;
+    for (uint32_t i = 0; i < nThreads; i++) {
+        spu_thread_t* t = spu_alloc_thread();
+        if (!t) { g->num_threads = i; break; }
+        t->group_id = g->id;
+        t->index    = i;
+        g->thread_indices[i] = (uint32_t)(t - s_spu_threads);
+        if (out_tids) out_tids[i] = t->tid;
+    }
+    fprintf(stderr, "[SPU] lv2_spu_make_group: group=0x%X nThreads=%u\n", g->id, g->num_threads);
+    fflush(stderr);
+    return g->id;
+}
+
 static void vm_write_be32(uint32_t guest_addr, uint32_t val)
 {
     extern uint8_t* vm_base;
