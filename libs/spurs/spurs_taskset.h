@@ -120,4 +120,12 @@ enum {
     CELL_SPURS_TASK_SYSCALL_RECV_WKL_FLAG = 4,
 };
 
+/* ---- create-path layout builders (spurs_taskset.c, phase B2) ------------- */
+void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
+                        uint32_t wid, uint32_t size, uint32_t evf1, uint32_t evf2);
+void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
+                            uint64_t context, const uint32_t arg[4],
+                            const uint32_t ls_pattern[4]);
+void spurs_taskset_set_exit_handler(uint32_t taskset_ea, uint64_t handler_ea);
+
 #endif /* SPURS_TASKSET_H */
