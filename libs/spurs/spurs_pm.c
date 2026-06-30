@@ -51,6 +51,16 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     #define LS_BE32(off, v) do { uint32_t _v=(v); ls[(off)+0]=(uint8_t)(_v>>24); ls[(off)+1]=(uint8_t)(_v>>16); \
                                  ls[(off)+2]=(uint8_t)(_v>>8); ls[(off)+3]=(uint8_t)_v; } while(0)
     #define LS_BE64(off, v) do { uint64_t _w=(v); LS_BE32((off), (uint32_t)(_w>>32)); LS_BE32((off)+4,(uint32_t)_w); } while(0)
+
+    /* Copy the CellSpursTaskset HEADER (first 0x80 bytes: the 6 bitsets, spurs@0x60,
+     * args@0x68, wid@0x74, x78@0x78) from the main-memory taskset into LS 0x2700. RPCS3
+     * spursTasksetStartTask reads taskset->spurs / taskset->args from LS 0x2700+0x60/0x68
+     * to build the leaf's r4 = {args (d0), spurs EA (d1)}; without this the leaf gets a
+     * garbage SPURS base and DMAs from a bad address. The STC fields written below sit at
+     * offsets >= 0x80 (TaskInfo array region in the union view) so they don't overlap. */
+    for (int o = 0; o < 0x80; o += 4)
+        LS_BE32(STC_BASE + o, vm_read32(taskset_ea + o));
+
     LS_BE64(STC_TASKSET_PTR,  (uint64_t)taskset_ea);
     LS_BE32(STC_SPU_NUM,      spuNum);
     LS_BE32(STC_DMA_TAG_ID,   dmaTagId);

@@ -61,16 +61,29 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     if (spurs_task_abi == 2) {
         /* SPURS task-START ABI (what the taskset policy module hands a fresh leaf
          * task): r3 = the 16-byte CellSpursTaskArgument (verbatim, big-endian
-         * lanes); r4 = {tasksetEA (doubleword 0), taskset.args (doubleword 1)} --
-         * here args_ea carries the tasksetEA (32-bit -> d0 low word). The task
-         * body reads r3 as its argument quadword; passing 0 makes it loop. */
+         * lanes); r4 = {taskset->args (doubleword 0), taskset->spurs EA (doubleword
+         * 1)}. The task body reads r3 as its argument quadword; passing 0 makes it
+         * loop. r4 is built from the taskset HEADER the PM copied into LS 0x2700. */
         if (r3_override) {
             ctx.gpr[3]._u32[0] = r3_override[0];
             ctx.gpr[3]._u32[1] = r3_override[1];
             ctx.gpr[3]._u32[2] = r3_override[2];
             ctx.gpr[3]._u32[3] = r3_override[3];
         }
-        ctx.gpr[4]._u32[1] = args_ea;   /* tasksetEA in d0's low word */
+        /* r4 = {taskset->args (d0, bytes 0-7), taskset->spurs EA (d1, bytes 8-15)},
+         * read from the header spurs_pm_build_context placed at LS 0x2700 (+0x68 args,
+         * +0x60 spurs, both big-endian u64). RPCS3 spursTasksetStartTask does exactly
+         * this; the leaf uses r4's SPURS base to find what to DMA, so the bare tasksetEA
+         * we used before made it DMA from a bad address. Our gpr lanes are big-endian
+         * order: _u32[0]=bytes0-3 ... _u32[3]=bytes12-15. */
+        {
+            const uint8_t* ts = ctx.ls + 0x2700;
+            ctx.gpr[4]._u32[0] = ((uint32_t)ts[0x68]<<24)|((uint32_t)ts[0x69]<<16)|((uint32_t)ts[0x6A]<<8)|ts[0x6B]; /* args hi */
+            ctx.gpr[4]._u32[1] = ((uint32_t)ts[0x6C]<<24)|((uint32_t)ts[0x6D]<<16)|((uint32_t)ts[0x6E]<<8)|ts[0x6F]; /* args lo */
+            ctx.gpr[4]._u32[2] = ((uint32_t)ts[0x60]<<24)|((uint32_t)ts[0x61]<<16)|((uint32_t)ts[0x62]<<8)|ts[0x63]; /* spurs hi */
+            ctx.gpr[4]._u32[3] = ((uint32_t)ts[0x64]<<24)|((uint32_t)ts[0x65]<<16)|((uint32_t)ts[0x66]<<8)|ts[0x67]; /* spurs lo */
+        }
+        (void)args_ea;
     } else if (spurs_task_abi) {
         if (r3_override) {
             ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */

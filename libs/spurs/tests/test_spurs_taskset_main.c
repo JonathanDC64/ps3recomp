@@ -127,6 +127,15 @@ int main(void) {
     CHECK(rd32_ls(STC_TEMP_TASKINFO + TI_ARGS) == 0x00A662C8u, "build_context: TaskInfo args DMA'd to 0x2780");
     CHECK(((uint64_t)rd32_ls(STC_TEMP_TASKINFO+TI_ELF)<<32 | rd32_ls(STC_TEMP_TASKINFO+TI_ELF+4)) == 0x0177C201ull,
           "build_context: TaskInfo elf DMA'd");
+    /* Header copy: taskset->spurs/args must land at LS 0x2700+0x60/0x68 so the task-start
+     * ABI can build r4 = {args (d0), spurs EA (d1)} (RPCS3 spursTasksetStartTask). */
+    CHECK(rd32_ls(STC_BASE + CSTS_SPURS + 4) == 0x01B92E00u, "build_context: spurs EA @LS 0x2760 (r4.d1)");
+    CHECK(rd32_ls(STC_BASE + CSTS_SPURS + 0) == 0u,          "build_context: spurs EA hi word zero");
+    CHECK(rd32_ls(STC_BASE + CSTS_ARGS  + 0) == 0u && rd32_ls(STC_BASE + CSTS_ARGS + 4) == 0u,
+          "build_context: taskset args @LS 0x2768 (r4.d0)");
+    CHECK(rd32_ls(STC_BASE + CSTS_ENABLED) == vm_read32(TS + CSTS_ENABLED) &&
+          rd32_ls(STC_BASE + CSTS_ENABLED) != 0,
+          "build_context: enabled bitset copied verbatim into LS header");
 
     if (!fails) printf("  PASS: SPURS taskset BE layout + create-path + PM select/dispatch correct.\n");
     return fails ? 1 : 0;
