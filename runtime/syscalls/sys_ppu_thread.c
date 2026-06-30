@@ -80,6 +80,16 @@ static void* ppu_host_thread_proc(void* param)
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr);
 
+    /* DIAG: the common thread wrapper (func_00C3A878) runs the thread's functor only
+     * if *(arg+0x18) != 0. DsSaveLoadMan exits early (functor ptr null?) instead of
+     * calling cellGameDataCheckCreate2 (per RPCS3 diff). Dump the arg object header. */
+    if (strstr(info->name, "DsSaveLoadMan") || strstr(info->name, "SLSession")) {
+        extern uint32_t vm_read32(uint64_t);
+        uint32_t a = (uint32_t)info->ctx.gpr[3];
+        fprintf(stderr, "[thr-arg] %s arg=0x%08X [+0=0x%08X +0x18(functor)=0x%08X +0x1C=0x%08X +0x58=0x%08X]\n",
+                info->name, a, vm_read32(a+0x0), vm_read32(a+0x18), vm_read32(a+0x1C), vm_read32(a+0x58));
+    }
+
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
         g_ppu_thread_entry_trampoline(&info->ctx);
