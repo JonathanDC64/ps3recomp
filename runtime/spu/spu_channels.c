@@ -166,8 +166,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { const char* e = getenv("SPU_RESV_LOG");
           if (e && e[0] != '0') { static uint32_t last = 0; static int n = 0;
             if (ea != last && n < 30) { last = ea; n++;
-              fprintf(stderr, "[resv] image=%d GETLLAR line=0x%08X\n", ctx->image_id, ea);
-              fflush(stderr); } } }
+              const uint8_t* m = vm_base + ea;
+              fprintf(stderr, "[resv] image=%d GETLLAR line=0x%08X content:", ctx->image_id, ea);
+              for (int b = 0; b < 32; b++) fprintf(stderr, " %02X", m[b]);
+              fprintf(stderr, "\n"); fflush(stderr); } } }
         resv_lock();
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
