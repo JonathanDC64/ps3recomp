@@ -5,6 +5,7 @@
 #include "sys_semaphore.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>   /* getenv/strtol (FORCE_SEMA probe; avoid ptr-truncating implicit decls) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -166,6 +167,12 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
+
+    /* EXPERIMENT (FORCE_SEMA=N): make sys_semaphore_wait on sema N return immediately
+     * (probe whether a never-posted semaphore, e.g. SLSession's sema 2, gates the
+     * cellSaveDataAutoLoad2 dialog). */
+    { static int fs = -2; if (fs == -2) { const char* e = getenv("FORCE_SEMA"); fs = e ? (int)strtol(e,0,0) : -1; }
+      if (fs >= 0 && sem_id == (uint32_t)fs) return CELL_OK; }
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
