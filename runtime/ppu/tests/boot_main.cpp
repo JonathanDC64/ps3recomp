@@ -258,10 +258,25 @@ static void dump_threads(const char* label, HMODULE self)
                  * "running" workers (no tracked lv2 wait) are actually blocked.
                  * Some false positives expected (stale stack slots). */
                 {
-                    uint64_t* sp = (uint64_t*)ctx.Rsp;
+                    /* Bound the scan to the committed stack region containing Rsp --
+                     * reading past it (into the guard page / unmapped memory) faults.
+                     * VirtualQuery gives the region [base, base+size); scan up from Rsp
+                     * (stack grows down, so higher addrs toward the stack base are
+                     * committed) but never past region_end. */
+                    uint64_t rsp = ctx.Rsp;
+                    uint64_t scan_end = rsp + 0x10000;
+                    MEMORY_BASIC_INFORMATION mbi;
+                    if (VirtualQuery((LPCVOID)rsp, &mbi, sizeof mbi) &&
+                        (mbi.State == MEM_COMMIT) &&
+                        !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                        uint64_t region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
+                        if (region_end < scan_end) scan_end = region_end;
+                    } else {
+                        scan_end = rsp;   /* Rsp not in a readable committed region: skip */
+                    }
                     int found = 0;
-                    for (int k = 0; k < 0x10000 / 8 && found < 12; k++) {
-                        uint64_t v = sp[k];
+                    for (uint64_t a = rsp; a + 8 <= scan_end && found < 12; a += 8) {
+                        uint64_t v = *(const uint64_t*)a;
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;
                         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

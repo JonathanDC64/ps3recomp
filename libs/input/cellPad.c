@@ -328,12 +328,57 @@ static void pad_shutdown_backend(void)
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
 
+#ifdef _WIN32
+/* Keyboard fallback (default on): when no XInput controller occupies port 0
+ * (e.g. a DualSense over Bluetooth, which isn't XInput), present port 0 as a
+ * connected pad driven by the keyboard, so menus/dialogs are usable without a
+ * controller. GetAsyncKeyState is global (no window focus needed). Disable with
+ * DES_NO_KBD=1. Keymap printed once. */
+static void pad_poll_keyboard(void)
+{
+    static int dis = -1;
+    if (dis < 0) { dis = getenv("DES_NO_KBD") ? 1 : 0;
+        if (!dis) fprintf(stderr, "[cellPad] keyboard fallback ON (port 0): "
+            "Enter=START  Space/J=CROSS(X)  K=CIRCLE(O)  L=TRIANGLE  H=SQUARE  "
+            "Arrows=Dpad  RShift=SELECT  U=L1 I=R1  (DES_NO_KBD=1 to disable)\n"); }
+    if (dis) return;
+    if (s_host_state[0].connected) return;   /* a real XInput pad owns port 0 */
+
+    #define KD(vk) ((GetAsyncKeyState(vk) & 0x8000) != 0)
+    u16 b = 0;
+    if (KD(VK_RETURN))                 b |= CELL_PAD_CTRL_START;
+    if (KD(VK_RSHIFT))                 b |= CELL_PAD_CTRL_SELECT;
+    if (KD(VK_UP))                     b |= CELL_PAD_CTRL_UP;
+    if (KD(VK_DOWN))                   b |= CELL_PAD_CTRL_DOWN;
+    if (KD(VK_LEFT))                   b |= CELL_PAD_CTRL_LEFT;
+    if (KD(VK_RIGHT))                  b |= CELL_PAD_CTRL_RIGHT;
+    if (KD('J') || KD(VK_SPACE))       b |= CELL_PAD_CTRL_CROSS;
+    if (KD('K'))                       b |= CELL_PAD_CTRL_CIRCLE;
+    if (KD('L'))                       b |= CELL_PAD_CTRL_TRIANGLE;
+    if (KD('H'))                       b |= CELL_PAD_CTRL_SQUARE;
+    if (KD('U'))                       b |= CELL_PAD_CTRL_L1;
+    if (KD('I'))                       b |= CELL_PAD_CTRL_R1;
+    #undef KD
+
+    s_host_state[0].connected = 1;
+    s_host_state[0].analog_lx = s_host_state[0].analog_ly = 128;
+    s_host_state[0].analog_rx = s_host_state[0].analog_ry = 128;
+    { static u16 prev = 0; if (b != prev) { prev = b;
+        if (b) fprintf(stderr, "[cellPad] KBD port 0 buttons=0x%04X (D1=0x%02X D2=0x%02X)\n",
+                       (unsigned)b, (unsigned)(b & 0xFF), (unsigned)((b >> 8) & 0xFF)); } }
+    s_host_state[0].buttons = b;
+}
+#endif
+
 static void pad_poll_backend(void)
 {
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
+#endif
+#ifdef _WIN32
+    pad_poll_keyboard();
 #endif
 }
 
