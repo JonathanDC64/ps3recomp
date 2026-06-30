@@ -59,6 +59,29 @@ static SpursWorkload s_workloads[CELL_SPURS_MAX_WORKLOAD];
 static SpursTask     s_tasks[CELL_SPURS_MAX_TASK];
 static u32           s_next_task_id = 0;
 
+/* Host-side registry of created taskset EAs + a per-taskset task counter. The
+ * create-task "initialized" check can't read guest memory: Option-B
+ * spurs_taskset_init() overwrites the simplified CellSpursTaskset (incl. its
+ * `initialized` field) on the first dispatch, which then rejected EVERY later
+ * task on a multi-task taskset (e.g. the ~4 Havok tasks) -> only one ran ->
+ * the N-completion barrier could never be satisfied. Track creation host-side. */
+typedef struct { uint32_t ea; uint32_t spurs_ea; int inited; uint32_t ntasks; } SpursTasksetReg;
+static SpursTasksetReg s_taskset_reg[CELL_SPURS_MAX_TASKSET];
+static int             s_taskset_reg_count = 0;
+static SpursTasksetReg* taskset_reg_get(uint32_t ea) {
+    if (!ea) return 0;
+    for (int i = 0; i < s_taskset_reg_count; i++) if (s_taskset_reg[i].ea == ea) return &s_taskset_reg[i];
+    return 0;
+}
+static SpursTasksetReg* taskset_reg_add(uint32_t ea) {
+    SpursTasksetReg* r = taskset_reg_get(ea);
+    if (r) { r->inited = 0; r->ntasks = 0; return r; }
+    if (s_taskset_reg_count >= CELL_SPURS_MAX_TASKSET) return 0;
+    r = &s_taskset_reg[s_taskset_reg_count++];
+    r->ea = ea; r->spurs_ea = 0; r->inited = 0; r->ntasks = 0;
+    return r;
+}
+
 /* ---------------------------------------------------------------------------
  * Event flag sync side table
  *
@@ -380,6 +403,8 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 {
     (void)args; (void)priority; (void)maxContention;
 
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;   /* guest EA before translation */
+
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
     spurs   = GUEST_PTR(spurs, CellSpurs*);
@@ -394,8 +419,9 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     memset(taskset, 0, sizeof(CellSpursTaskset));
     taskset->initialized = 1;
     taskset->spurs = spurs;
+    taskset_reg_add(taskset_ea);   /* survives the Option-B layout clobber */
 
-    printf("[cellSpurs] CreateTaskset()\n");
+    printf("[cellSpurs] CreateTaskset() ea=0x%08X\n", taskset_ea);
     return CELL_OK;
 }
 
@@ -481,11 +507,20 @@ static s32 spurs_create_task_core(CellSpursTaskset* taskset, CellSpursTaskId* ta
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     CellSpursTaskId* taskId_h = GUEST_PTR(taskId, CellSpursTaskId*);
 
-    if (!taskset)
+    if (!taskset) {
+        printf("[cellSpurs] create_task_core: NULL taskset (ea=0x%08X) -> reject\n", taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    }
 
-    if (!taskset->initialized)
+    /* Use the host-side registry (taskset->initialized in guest memory gets
+     * clobbered by Option-B spurs_taskset_init on the first task). */
+    SpursTasksetReg* tsreg = taskset_reg_get(taskset_ea);
+    if (!tsreg && taskset->initialized) tsreg = taskset_reg_add(taskset_ea); /* created pre-registry */
+    if (!tsreg) {
+        printf("[cellSpurs] create_task_core: taskset 0x%08X NOT created -> reject "
+               "(elf=0x%08X)\n", taskset_ea, (uint32_t)(uintptr_t)elf);
         return CELL_SPURS_TASK_ERROR_STAT;
+    }
 
     /* Find a free task slot */
     for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
@@ -566,11 +601,18 @@ static s32 spurs_create_task_core(CellSpursTaskset* taskset, CellSpursTaskId* ta
                      * reads valid shared-memory structures. The spurs object EA is recovered
                      * from the simplified taskset->spurs (a host ptr) BEFORE we overwrite the
                      * taskset memory with the real layout. (DeS uses one task -> slot 0.) */
-                    uint32_t spurs_ea = taskset->spurs
-                        ? (uint32_t)((const uint8_t*)taskset->spurs - vm_base) : 0;
-                    uint32_t slot = 0;
-                    spurs_taskset_init(taskset_ea, spurs_ea, /*args*/0, /*wid*/0,
-                                       /*size*/10496, /*evf1*/0, /*evf2*/0);
+                    /* Capture spurs_ea on the FIRST task (taskset->spurs is valid only
+                     * before spurs_taskset_init clobbers the taskset memory); init the
+                     * real layout ONCE; give each task a DISTINCT slot. */
+                    if (!tsreg->inited) {
+                        tsreg->spurs_ea = taskset->spurs
+                            ? (uint32_t)((const uint8_t*)taskset->spurs - vm_base) : 0;
+                        spurs_taskset_init(taskset_ea, tsreg->spurs_ea, /*args*/0, /*wid*/0,
+                                           /*size*/10496, /*evf1*/0, /*evf2*/0);
+                        tsreg->inited = 1;
+                    }
+                    uint32_t spurs_ea = tsreg->spurs_ea;
+                    uint32_t slot = tsreg->ntasks++;
                     spurs_taskset_add_task(taskset_ea, slot, (uint64_t)(uint32_t)(uintptr_t)elf,
                                            (uint64_t)ctx_ea, arg, /*ls_pattern*/0);
                     printf("[cellSpurs] Option-B taskset built: spurs=0x%08X task slot=%u "
