@@ -128,4 +128,10 @@ void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_e
                             const uint32_t ls_pattern[4]);
 void spurs_taskset_set_exit_handler(uint32_t taskset_ea, uint64_t handler_ea);
 
+/* ---- PM logic (spurs_pm.c, phase B3) ------------------------------------- */
+int      spurs_pm_select_task(uint32_t taskset_ea, uint32_t last_scheduled_task);
+void     spurs_pm_mark_running(uint32_t taskset_ea, uint32_t taskId);
+uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskId,
+                                uint32_t spuNum, uint32_t dmaTagId);
+
 #endif /* SPURS_TASKSET_H */

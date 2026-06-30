@@ -95,6 +95,39 @@ int main(void) {
     CHECK(vm_read64(spurs_taskset_taskinfo_ea(TS,1) + TI_ELF) == 0x0177CF00ull,
           "add_task: task1 elf at its own slot");
 
-    if (!fails) printf("  PASS: SPURS taskset BE layout + create-path build (init/add_task) correct.\n");
+    /* ---- B3 PM: select_task / mark_running / build_context ---- */
+    memset(g_mem, 0, sizeof g_mem);
+    spurs_taskset_init(TS, 0x01B92E00u, 0, 7, 10496, 0, 0);
+    spurs_taskset_add_task(TS, 0, 0x0177C200ull, 0x03100000ull, arg, 0);  /* ready+enabled */
+    /* select with last_scheduled=127 -> wraps to 0 -> picks task 0 */
+    CHECK(spurs_pm_select_task(TS, 127) == 0, "select: picks the only ready task (0)");
+    /* mark task0 running -> no longer selectable; add task1 -> select picks 1 */
+    spurs_pm_mark_running(TS, 0);
+    CHECK(!spurs_bitset_test(TS + CSTS_READY, 0) && spurs_bitset_test(TS + CSTS_RUNNING, 0),
+          "mark_running: task0 ready->running");
+    CHECK(g_mem[TS + 0x73] == 0, "mark_running: last_scheduled_task=0 @0x73");
+    spurs_taskset_add_task(TS, 1, 0x0177CF00ull, 0, 0, 0);
+    CHECK(spurs_pm_select_task(TS, 0) == 1, "select: skips running task0, picks ready task1");
+    /* no ready task -> -1 */
+    spurs_pm_mark_running(TS, 1);
+    CHECK(spurs_pm_select_task(TS, 1) == -1, "select: none ready -> -1");
+
+    /* build_context: SpursTasksetContext @LS 0x2700 fields + DMA'd TaskInfo @0x2780 */
+    static uint8_t ls[0x40000];
+    memset(ls, 0, sizeof ls);
+    memset(g_mem, 0, sizeof g_mem);
+    spurs_taskset_init(TS, 0x01B92E00u, 0, 7, 10496, 0, 0);
+    spurs_taskset_add_task(TS, 0, 0x0177C201ull /*elf|flag1*/, 0x03100000ull, arg, 0);
+    uint64_t elf = spurs_pm_build_context(ls, TS, 0, /*spuNum*/0, /*dmaTag*/1);
+    #define rd32_ls(o) (((uint32_t)ls[o]<<24)|((uint32_t)ls[(o)+1]<<16)|((uint32_t)ls[(o)+2]<<8)|(uint32_t)ls[(o)+3])
+    CHECK(elf == 0x0177C201ull, "build_context: returns task ELF EA (with flags)");
+    CHECK(rd32_ls(STC_TASK_ID) == 0, "build_context: taskId @0x27D4");
+    CHECK(rd32_ls(STC_DMA_TAG_ID) == 1, "build_context: dmaTagId @0x27D0");
+    CHECK(rd32_ls(STC_TASKSET_PTR + 4) == TS, "build_context: taskset ptr low @0x27BC");
+    CHECK(rd32_ls(STC_TEMP_TASKINFO + TI_ARGS) == 0x00A662C8u, "build_context: TaskInfo args DMA'd to 0x2780");
+    CHECK(((uint64_t)rd32_ls(STC_TEMP_TASKINFO+TI_ELF)<<32 | rd32_ls(STC_TEMP_TASKINFO+TI_ELF+4)) == 0x0177C201ull,
+          "build_context: TaskInfo elf DMA'd");
+
+    if (!fails) printf("  PASS: SPURS taskset BE layout + create-path + PM select/dispatch correct.\n");
     return fails ? 1 : 0;
 }
