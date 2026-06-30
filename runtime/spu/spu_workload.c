@@ -235,7 +235,14 @@ typedef struct {
     int                 have_r3;
     int                 abi;          /* spu_run_lifted_job_abi mode: 1=kernel, 2=task-start */
     uint32_t            exitcode_ea;  /* CellSpursTaskExitCode container EA (0 = none) */
+    uint32_t            taskset_ea;   /* CellSpursTaskset EA (Option B PM), 0 = none */
+    uint32_t            taskId;       /* taskset slot for the PM SpursTasksetContext */
 } spu_async_job;
+
+/* Option B PM: build the SpursTasksetContext @LS 0x2700 for the selected task before
+ * running it (spurs_pm.c). Returns the task ELF EA (low bits = flags). */
+extern uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskId,
+                                       uint32_t spuNum, uint32_t dmaTagId);
 
 static void spu_async_run(spu_async_job* j)
 {
@@ -243,6 +250,16 @@ static void spu_async_run(spu_async_job* j)
     if (ls) {
         uint32_t entry = 0;
         if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
+            /* Option B: before running the leaf, build the SpursTasksetContext at LS
+             * 0x2700 (the reimplemented PM) so the leaf reads valid taskset/context
+             * state instead of zeros. Requires the taskset's real layout (built in
+             * cellSpursCreateTask) to be in place -- it is, by dispatch time. */
+            if (j->taskset_ea) {
+                spurs_pm_build_context(ls, j->taskset_ea, j->taskId, /*spuNum*/0, /*dmaTag*/0);
+                fprintf(stderr, "[spu_workload] PM context built @LS 0x2700 (taskset=0x%08X "
+                        "taskId=%u)\n", j->taskset_ea, j->taskId);
+                fflush(stderr);
+            }
             /* Async dispatch is the SPURS-task path: the entry expects the SPURS
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
@@ -314,7 +331,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id; j->abi = 1;   /* kernel marker ABI */
-    j->exitcode_ea = 0;
+    j->exitcode_ea = 0; j->taskset_ea = 0; j->taskId = 0;
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
@@ -351,7 +368,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
  * the task body reads -- without it the body processes a null arg and loops. */
 int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
                                const uint32_t arg[4], uint32_t taskset_ea,
-                               uint32_t exitcode_ea)
+                               uint32_t exitcode_ea, uint32_t taskId)
 {
     if (!image || image_size == 0) return 0;
     uint64_t fp = spu_workload_fingerprint(image, image_size);
@@ -369,6 +386,8 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
     j->fn = fn; j->image_id = image_id; j->abi = 2;   /* task-start ABI */
     j->r3[0]=arg[0]; j->r3[1]=arg[1]; j->r3[2]=arg[2]; j->r3[3]=arg[3]; j->have_r3 = 1;
     j->exitcode_ea = exitcode_ea;     /* CellSpursTaskExitCode container (0 = none) */
+    j->taskset_ea  = taskset_ea;      /* Option B: PM builds SpursTasksetContext from this */
+    j->taskId      = taskId;
     fprintf(stderr, "[spu_workload] task dispatch (async) fp=0x%016llX "
             "r3={0x%08X,0x%08X,0x%08X,0x%08X} tasksetEA=0x%08X image=%d\n",
             (unsigned long long)fp, arg[0], arg[1], arg[2], arg[3], taskset_ea, image_id);

@@ -11,6 +11,7 @@
 
 #include "cellSpurs.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+#include "spurs_taskset.h"  /* Option B: real taskset layout + PM (BE-safe) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
@@ -538,7 +539,25 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                     printf("[cellSpurs] CreateTask dispatch: arg_ea=0x%08X arg={0x%08X,0x%08X,"
                            "0x%08X,0x%08X} tasksetEA=0x%08X exitCode=0x%08X\n", arg_ea, arg[0],
                            arg[1], arg[2], arg[3], taskset_ea, exitcode_ea);
-                    spu_workload_dispatch_task(host_elf, (uint32_t)sz, arg, taskset_ea, exitcode_ea);
+
+                    /* Option B: build the REAL CellSpursTaskset layout + register this task
+                     * so the reimplemented PM (spu_async_run) can schedule it and the leaf
+                     * reads valid shared-memory structures. The spurs object EA is recovered
+                     * from the simplified taskset->spurs (a host ptr) BEFORE we overwrite the
+                     * taskset memory with the real layout. (DeS uses one task -> slot 0.) */
+                    uint32_t spurs_ea = taskset->spurs
+                        ? (uint32_t)((const uint8_t*)taskset->spurs - vm_base) : 0;
+                    uint32_t slot = 0;
+                    spurs_taskset_init(taskset_ea, spurs_ea, /*args*/0, /*wid*/0,
+                                       /*size*/10496, /*evf1*/0, /*evf2*/0);
+                    spurs_taskset_add_task(taskset_ea, slot, (uint64_t)(uint32_t)(uintptr_t)elf,
+                                           (uint64_t)ctx_ea, arg, /*ls_pattern*/0);
+                    printf("[cellSpurs] Option-B taskset built: spurs=0x%08X task slot=%u "
+                           "elf=0x%08X ctx=0x%08X (ready|enabled)\n",
+                           spurs_ea, slot, (uint32_t)(uintptr_t)elf, ctx_ea);
+
+                    spu_workload_dispatch_task(host_elf, (uint32_t)sz, arg, taskset_ea,
+                                               exitcode_ea, slot);
                 }
             }
             return CELL_OK;
