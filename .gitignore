@@ -96,3 +96,4 @@ _drill/
 
 # Game-derived lifted SPU C (Demon's Souls port) — never commit (copyright firewall)
 /work_spu/
+runtime/spu/tests/out_*/
