@@ -111,6 +111,16 @@ enum {
     STC_STRUCT_END        = 0x3000,
 };
 
+/* Fixed LS addresses of the taskset Policy Module entry points (RPCS3 cellSpurs.h).
+ * A SPURS task calls its taskset PM's syscall entry via the SpursTasksetContext
+ * syscallAddr field (STC_SYSCALL_ADDR), which the kernel sets to this address.
+ * Our HLE intercepts a branch to CELL_SPURS_TASKSET_PM_SYSCALL_ADDR (spu_channels.c)
+ * to process the task syscall, since we don't have the real PM code resident in LS. */
+enum {
+    CELL_SPURS_TASKSET_PM_ENTRY_ADDR   = 0xA00,
+    CELL_SPURS_TASKSET_PM_SYSCALL_ADDR = 0xA70,
+};
+
 /* CELL_SPURS_TASK_SYSCALL_* (leaf-task `stop <code>` operand low nibble). */
 enum {
     CELL_SPURS_TASK_SYSCALL_EXIT          = 0,

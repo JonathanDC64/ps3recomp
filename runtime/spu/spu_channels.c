@@ -376,8 +376,43 @@ static spu_fn spu_lookup(uint32_t addr, int image_id)
  * (longjmp out) instead of crashing the process. */
 static SPU_TLS int s_ind_depth = 0;
 
+/* HLE of the taskset Policy Module's task-syscall entry (CELL_SPURS_TASKSET_PM_SYSCALL_ADDR
+ * = LS 0xA70). A SPURS task branches here (via the SpursTasksetContext syscallAddr that
+ * spurs_pm_build_context plants) to perform a task syscall. RPCS3 runs the real PM code
+ * here; we don't have it resident, so we HLE: read syscallNum (r3 preferred slot) + args
+ * (r4), act, and either resume the task (return -> the lifted caller continues at its link)
+ * or end it (EXIT -> halt; the post-run exit-code write + completion then fire). The 0x10
+ * bit selects the "2" variant (no implicit wait); we mask it off for the dispatch. */
+static void spu_spurs_taskset_syscall(spu_context* ctx)
+{
+    uint32_t raw  = ctx->gpr[3]._u32[0];
+    uint32_t args = ctx->gpr[4]._u32[0];
+    uint32_t num  = raw & 0x0F;
+    fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d "
+            "link/r0=0x%05X\n", num, raw, args, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    fflush(stderr);
+    switch (num) {
+    case 0: /* CELL_SPURS_TASK_SYSCALL_EXIT: the task is done. Mark a clean `stop 0` and
+             * halt; spu_run_lifted_job_abi's post-run path writes the exit code + the
+             * completion handler runs. */
+        ctx->stop_code = 0;
+        ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+        spu_halt(ctx);          /* longjmp out to spu_run_with_halt */
+        return;
+    default: /* YIELD(1)/WAIT_SIGNAL(2)/POLL(3)/RECV_WKL_FLAG(4): for our single-task model
+              * report success and resume (return -> lifted caller continues at its link).
+              * Refine per-syscall (e.g. real WAIT_SIGNAL blocking) when a task needs it. */
+        ctx->gpr[3]._u32[0] = 0;
+        return;
+    }
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* Taskset PM task-syscall entry (LS 0xA70): HLE it instead of branching into
+     * (absent) PM code. The task reaches here via the context syscallAddr. */
+    if ((ctx->pc & SPU_LS_MASK) == 0xA70u) { spu_spurs_taskset_syscall(ctx); return; }
+
     /* Diagnostic (SPU_DISPATCH_LOG): trace the SPURS command dispatcher's handler
      * jumps (image 2, target in the 0x4804..0x5098 handler-table range) so we can
      * see whether the task processes a finite stream of real commands or loops on

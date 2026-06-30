@@ -67,6 +67,14 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
     LS_BE32(STC_TASK_ID,      taskId);
     LS_BE32(STC_TASKSET_MGMT_ADDR, STC_BASE);
     LS_BE64(STC_X2FC0, 0);
+    /* Task-syscall path: a SPURS task reads syscallAddr from its context and branches to
+     * it (e.g. to EXIT). The real kernel sets it to the PM's in-LS syscall entry (0xA70);
+     * we don't have the PM resident, so we set the same address and INTERCEPT a branch to
+     * it in spu_indirect_branch (spu_channels.c) to HLE the syscall. Without this the task
+     * branches to 0 -> null call -> halt (image=7's NULL_POINTER cascade). kernelMgmtAddr
+     * -> the SPURS kernel context (LS 0x100). */
+    LS_BE32(STC_KERNEL_MGMT_ADDR, 0x100);
+    LS_BE32(STC_SYSCALL_ADDR,     CELL_SPURS_TASKSET_PM_SYSCALL_ADDR);
 
     /* DMA the selected task's TaskInfo (48 bytes) into LS 0x2780 (the kernel temp area).
      * Read each word BE and re-store BE -> the raw bytes are preserved verbatim. */
