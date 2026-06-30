@@ -123,10 +123,14 @@ static void pad_poll_xinput(void)
 
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
+            if (s_host_state[i].connected)
+                fprintf(stderr, "[cellPad] XInput port %d DISCONNECTED\n", i);
             s_host_state[i].connected = 0;
             continue;
         }
 
+        if (!s_host_state[i].connected)
+            fprintf(stderr, "[cellPad] XInput port %d CONNECTED (Xbox-compatible pad detected)\n", i);
         s_host_state[i].connected = 1;
         XINPUT_GAMEPAD* gp = &state.Gamepad;
 
@@ -148,6 +152,12 @@ static void pad_poll_xinput(void)
         if (gp->wButtons & XINPUT_GAMEPAD_B)              btns |= CELL_PAD_CTRL_CIRCLE;
         if (gp->wButtons & XINPUT_GAMEPAD_A)              btns |= CELL_PAD_CTRL_CROSS;
         if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
+
+        /* Log button-state changes so input flow is visible in the console. */
+        { static u16 prev[PAD_MAX_HOST_PORTS] = {0};
+          if (btns != prev[i]) { prev[i] = btns;
+              if (btns) fprintf(stderr, "[cellPad] port %d buttons=0x%04X (D1=0x%02X D2=0x%02X)\n",
+                                i, (unsigned)btns, (unsigned)(btns & 0xFF), (unsigned)((btns >> 8) & 0xFF)); } }
 
         s_host_state[i].buttons = btns;
 
