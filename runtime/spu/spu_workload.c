@@ -283,6 +283,21 @@ static void spu_async_run(spu_async_job* j)
 #endif
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d\n", j->image_id, rc);
             fflush(stderr);
+
+            /* EXPERIMENT (SPURS_DONE_EVQ=N): on task completion, post a SPURS USER
+             * event to event queue N so the PPU completion handler (e.g. hkSpuUtil
+             * Helper on evq 12) wakes and signals the barrier the game waits on.
+             * Tests whether wiring SPU-completion -> PPU-event unblocks pre-title
+             * loading. Params overridable: SPURS_DONE_SPUP, SPURS_DONE_DATA. */
+            { const char* qe = getenv("SPURS_DONE_EVQ");
+              if (qe) { extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
+                  uint32_t q = (uint32_t)strtoul(qe, 0, 0);
+                  uint32_t spup = 0; { const char* e = getenv("SPURS_DONE_SPUP"); if (e) spup = (uint32_t)strtoul(e,0,0); }
+                  uint64_t d3 = (uint64_t)j->taskset_ea; { const char* e = getenv("SPURS_DONE_DATA"); if (e) d3 = strtoull(e,0,0); }
+                  fprintf(stderr, "[spu_workload] POST completion USER event q=%u spup=%u data3=0x%llX (image=%d)\n",
+                          q, spup, (unsigned long long)d3, j->image_id);
+                  int r = sys_spu_thread_post_user_event(q, 1, spup, 0, d3);
+                  fprintf(stderr, "[spu_workload] post_user_event -> %d\n", r); } }
         }
         free(ls);
     }
