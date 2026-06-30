@@ -177,8 +177,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (cond_id == 2) { static int probed = 0;
         if (!probed && getenv("SPURS_EVTEST")) { probed = 1;
             extern int sys_event_queue_push_by_id(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t);
-            fprintf(stderr, "[evtest] posting SPURS USER event (src=0xFFFFFFFF53505501) to q=1\n");
-            int r = sys_event_queue_push_by_id(1u, 0xFFFFFFFF53505501ull, 0, 0, 0);
+            /* data1 = the work item the DLSpursManager SPU task published (0x45A4B280,
+             * the deterministic job/result object). SPURS_EVDATA overrides for sweeping. */
+            uint64_t d1 = 0x45A4B280ull;
+            { const char* e = getenv("SPURS_EVDATA"); if (e) d1 = strtoull(e, 0, 0); }
+            fprintf(stderr, "[evtest] posting SPURS USER event src=0xFFFFFFFF53505501 data1=0x%llX to q=1\n",
+                    (unsigned long long)d1);
+            int r = sys_event_queue_push_by_id(1u, 0xFFFFFFFF53505501ull, d1, 0, 0);
             fprintf(stderr, "[evtest] push_by_id(q=1) -> %d\n", r);
         }
     }
