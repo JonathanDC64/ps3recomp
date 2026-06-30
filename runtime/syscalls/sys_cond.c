@@ -154,6 +154,17 @@ int64_t sys_cond_wait(ppu_context* ctx)
     /* One-shot guest backtrace for the hot cond=2 waiter (Frontier #11): walk the
      * PPC64 stack back-chain (*(r1)=prev SP, saved LR at prev+0x10) to identify which
      * guest function is blocked and what it's waiting for. */
+    if (cond_id == 9) { static int once9 = 0; if (!once9) { once9 = 1;
+        extern uint32_t vm_read32(uint64_t);
+        extern uint8_t* vm_base;
+        uint32_t obj = (uint32_t)ctx->gpr[31];
+        char nm[33]; for (int i = 0; i < 32; i++) { uint8_t b = vm_base[(obj + 0x18 + i) & 0x1FFFFFFF]; nm[i] = (b >= 32 && b < 127) ? (char)b : '.'; } nm[32] = 0;
+        fprintf(stderr, "[cond9-bt] MAIN waiter cia=0x%08X lr=0x%08X obj(gpr31)=0x%08X "
+                "hdr[+0=0x%08X +4=0x%08X +8=0x%08X +C=0x%08X] name@+0x18=\"%s\"\n",
+                (uint32_t)ctx->cia, (uint32_t)ctx->lr, obj,
+                vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8), vm_read32(obj+0xC), nm);
+    } }
+
     if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
         extern uint64_t vm_read64(uint64_t);
         fprintf(stderr, "[cond2-bt] cia=0x%08X lr=0x%08X r1=0x%08X\n",
@@ -225,11 +236,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->owner_tid = 0;
     m->lock_count = 0;
 
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("cond", cond_id); }
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
 
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
+    { extern void thrdiag_wake(void); thrdiag_wake(); }
 
     /* Restore ownership */
     m->owner_tid = saved_owner;

@@ -61,6 +61,8 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13): covers poll-loops (e.g. func_00A31158) */
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { static int n=0; if (n++ < 30) fprintf(stderr, "[WAIT] timer_usleep(%llu us)\n", (unsigned long long)usec); }
+    { extern void thrdiag_wait(const char*, uint32_t); extern void thrdiag_wake(void);
+      thrdiag_wait("usleep", (uint32_t)usec); /* wake recorded by next wait; usleep is brief */ }
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */

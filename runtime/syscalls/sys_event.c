@@ -230,6 +230,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("evq", queue_id); }
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
@@ -237,6 +238,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         while (q->count == 0 && q->active) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
+        { extern void thrdiag_wake(void); thrdiag_wake(); }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
         if (ms == 0) ms = 1;
@@ -765,6 +767,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("evflag", flag_id); }
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 
@@ -772,6 +775,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
+        { extern void thrdiag_wake(void); thrdiag_wake(); }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
         if (ms == 0) ms = 1;

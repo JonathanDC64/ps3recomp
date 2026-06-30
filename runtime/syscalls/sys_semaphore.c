@@ -174,11 +174,13 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("sema", sem_id); }
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
 
     DWORD result = WaitForSingleObject(s->sem_handle, ms);
+    { extern void thrdiag_wake(void); thrdiag_wake(); }
     if (result == WAIT_TIMEOUT) {
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }

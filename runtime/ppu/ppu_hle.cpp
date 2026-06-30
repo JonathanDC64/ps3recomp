@@ -65,6 +65,7 @@ void vm_write64(uint64_t addr, uint64_t val);
  * host AV inside an HLE handler names the culprit NID/function. */
 extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
+extern "C" void thrdiag_hle(const char*);   /* thread_diag.c */
 
 /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our
@@ -165,6 +166,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    thrdiag_hle(e->name);
     hle_generic fn = (hle_generic)e->handler;
     int trace = (getenv("YDKJ_HLETRACE") != nullptr);
     if (trace)

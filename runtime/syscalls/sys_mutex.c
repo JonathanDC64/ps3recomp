@@ -194,10 +194,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("mutex", mutex_id); }
 #ifdef _WIN32
     if (timeout_us == 0) {
         /* Infinite wait */
         EnterCriticalSection(&m->cs);
+        { extern void thrdiag_wake(void); thrdiag_wake(); }
     } else {
         /* Timed lock via TryEnterCriticalSection + spin/sleep */
         DWORD timeout_ms = (DWORD)(timeout_us / 1000);

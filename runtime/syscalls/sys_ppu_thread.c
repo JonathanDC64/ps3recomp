@@ -73,6 +73,9 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
+    { extern void thrdiag_set_name(const char*);
+      thrdiag_set_name(info->name[0] ? info->name : "(unnamed)"); }
+
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
             (unsigned long long)info->ctx.thread_id,
             (unsigned long long)info->entry_addr);
@@ -314,8 +317,10 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     table_unlock();
 
     /* Wait for completion */
+    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("join", (uint32_t)tid); }
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
+    { extern void thrdiag_wake(void); thrdiag_wake(); }
 #else
     pthread_mutex_lock(&t->finish_mutex);
     while (!t->finished) {

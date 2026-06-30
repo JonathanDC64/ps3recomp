@@ -178,6 +178,8 @@ extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
 typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSysutil.c */
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+extern "C" void thrdiag_set_name(const char*);   /* thread_diag.c */
+extern "C" void thrdiag_dump(void);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
 
@@ -226,6 +228,7 @@ static void dump_threads(const char* label, HMODULE self)
 {
     fprintf(stderr, "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+    thrdiag_dump();
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -329,6 +332,8 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 int main(int argc, char** argv)
 {
     if (argc < 2) { printf("usage: %s <EBOOT.elf>\n", argv[0]); return 2; }
+
+    thrdiag_set_name("MAIN");
 
 #ifdef _WIN32
     SetUnhandledExceptionFilter(ydkj_crash_filter);
