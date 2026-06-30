@@ -659,6 +659,9 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
 {
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve((uint32_t)ctx->cia, &code, &toc);
+    { static int en = -1; if (en < 0) en = getenv("YDKJ_THREADLOG") ? 1 : 0;
+      if (en) fprintf(stderr, "[ppu] thread entry OPD 0x%08X -> code 0x%08X (func_%08X)\n",
+                      (uint32_t)ctx->cia, code, code); }
     if (toc) ctx->gpr[2] = toc;
     if (!ctx->gpr[13]) ctx->gpr[13] = PPU_TLS_TP;   /* share main TLS for now */
     ppu_fn fn = ppu_lookup(code);
