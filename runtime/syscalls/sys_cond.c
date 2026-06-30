@@ -168,6 +168,17 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     } }
 
+    /* cond=2 predicate probe: the waiter is func_009E0370, which sets gpr[31]=r3
+     * (the shared sync/queue object) at entry and re-waits while *(obj+0xC) stays
+     * in the wait-state. Dump the object header [0..0x10] on the first ~12 waits to
+     * see whether the producer ever moves the predicate field +0xC. */
+    if (cond_id == 2) { static int n = 0; if (n++ < 12) {
+        extern uint32_t vm_read32(uint64_t);
+        uint32_t obj = (uint32_t)ctx->gpr[31];
+        fprintf(stderr, "[cond2-pred] #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X\n",
+                n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8), vm_read32(obj+0xC));
+    } }
+
     /* PROBE (SPURS_EVTEST=1): one-shot chain test for Frontier #11. The parked
      * SPURuntimeService (q=1) waits for a SPURS USER event (source 0xFFFFFFFF53505501,
      * handler selected by (data2>>32)&0xFF). Post one to q=1 to see if it wakes the
@@ -294,6 +305,23 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
 {
     { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_SIGALL id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+
+    /* One-shot guest backtrace for the cond=2 signaler (the lwmutex hog livelocking the
+     * coordinator). Mirrors the cond2-bt probe in sys_cond_wait. */
+    if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
+        extern uint64_t vm_read64(uint64_t);
+        fprintf(stderr, "[cond2-sig] tid=%lu cia=0x%08X lr=0x%08X r1=0x%08X\n",
+                (unsigned long)GetCurrentThreadId(),
+                (uint32_t)ctx->cia, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1]);
+        uint32_t sp = (uint32_t)ctx->gpr[1];
+        for (int i = 0; i < 12 && sp >= 0x10000 && sp < 0xE0000000u; i++) {
+            uint32_t bc = (uint32_t)vm_read64(sp);
+            if (bc <= sp || bc < 0x10000 || bc >= 0xE0000000u) break;
+            uint32_t lr = (uint32_t)vm_read64(bc + 0x10);
+            fprintf(stderr, "[cond2-sig]   #%d lr=0x%08X\n", i, lr);
+            sp = bc;
+        }
+    } }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
