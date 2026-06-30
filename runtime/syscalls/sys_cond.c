@@ -151,6 +151,23 @@ int64_t sys_cond_wait(ppu_context* ctx)
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
 
+    /* One-shot guest backtrace for the hot cond=2 waiter (Frontier #11): walk the
+     * PPC64 stack back-chain (*(r1)=prev SP, saved LR at prev+0x10) to identify which
+     * guest function is blocked and what it's waiting for. */
+    if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
+        extern uint64_t vm_read64(uint64_t);
+        fprintf(stderr, "[cond2-bt] cia=0x%08X lr=0x%08X r1=0x%08X\n",
+                (uint32_t)ctx->cia, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1]);
+        uint32_t sp = (uint32_t)ctx->gpr[1];
+        for (int i = 0; i < 10 && sp >= 0x10000 && sp < 0xE0000000u; i++) {
+            uint32_t bc = (uint32_t)vm_read64(sp);
+            if (bc <= sp || bc < 0x10000 || bc >= 0xE0000000u) break;
+            uint32_t lr = (uint32_t)vm_read64(bc + 0x10);
+            fprintf(stderr, "[cond2-bt]   #%d lr=0x%08X\n", i, lr);
+            sp = bc;
+        }
+    } }
+
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
