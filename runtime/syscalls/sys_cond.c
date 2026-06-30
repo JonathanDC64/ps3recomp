@@ -168,6 +168,21 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     } }
 
+    /* PROBE (SPURS_EVTEST=1): one-shot chain test for Frontier #11. The parked
+     * SPURuntimeService (q=1) waits for a SPURS USER event (source 0xFFFFFFFF53505501,
+     * handler selected by (data2>>32)&0xFF). Post one to q=1 to see if it wakes the
+     * service -> dispatches handler A -> enqueues a job -> cond_signal(2) -> coordinator
+     * advances. Confirms (or refutes) the SPU->PPU event-delivery chain before building it
+     * properly. data1=0 (handler stores, doesn't immediately deref). */
+    if (cond_id == 2) { static int probed = 0;
+        if (!probed && getenv("SPURS_EVTEST")) { probed = 1;
+            extern int sys_event_queue_push_by_id(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t);
+            fprintf(stderr, "[evtest] posting SPURS USER event (src=0xFFFFFFFF53505501) to q=1\n");
+            int r = sys_event_queue_push_by_id(1u, 0xFFFFFFFF53505501ull, 0, 0, 0);
+            fprintf(stderr, "[evtest] push_by_id(q=1) -> %d\n", r);
+        }
+    }
+
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
