@@ -92,6 +92,13 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
                                const uint32_t arg[4], uint32_t taskset_ea,
                                uint32_t exitcode_ea, uint32_t taskId);
 
+/* Run all tasks registered by spu_workload_dispatch_task but deferred (not yet run).
+ * Call this from the PPU blocking/poll syscalls (sys_event_queue_receive, sys_cond_wait,
+ * sys_semaphore_wait, sys_timer_usleep): by the time the game waits for a result, it has
+ * populated per-task data, so the deferred tasks can safely run. Idempotent / no-op when
+ * nothing is pending. See docs/13 (deferred SPURS task scheduling). */
+void spu_pending_flush(void);
+
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 

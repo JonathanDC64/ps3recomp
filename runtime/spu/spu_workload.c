@@ -311,6 +311,100 @@ static size_t spu_task_stack_bytes(void)
     return (size_t)mb << 20;
 }
 
+/* Spawn a detached host thread to run job `j` (takes ownership of `j`). */
+static int spu_spawn_job_thread(spu_async_job* j)
+{
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
+    if (!th) { free(j); return 0; }
+    CloseHandle(th);   /* detached */
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
+    pthread_detach(th);
+#endif
+    return 1;
+}
+
+/* ---- Deferred SPURS-task scheduling (docs/13 Part A) -----------------------
+ * RPCS3 does NOT run a SPURS task at cellSpursCreateTask -- it marks it ready and
+ * the SPU kernel schedules it LATER, after the game has populated per-task data.
+ * We model that by REGISTERING created tasks as pending and FLUSHING them (spawning
+ * their threads) the first time the creating PPU thread WAITS (event-queue receive,
+ * cond/sema wait, or the timer-usleep poll loop) -- by which point setup is done.
+ * Without this, a task races ahead of its data (image=7 read a NULL ptr from its
+ * still-zero arg struct -> CELL_SPURS_TASK_ERROR_NULL_POINTER). */
+#define SPU_PENDING_MAX 64
+static spu_async_job* s_pending[SPU_PENDING_MAX];
+static int            s_pending_count = 0;
+#ifdef _WIN32
+static CRITICAL_SECTION s_pending_cs;
+static volatile long    s_pending_cs_init = 0;   /* 0=uninit, 1=initializing, 2=ready */
+static void pending_lock(void)   {
+    if (_InterlockedCompareExchange(&s_pending_cs_init, 1, 0) == 0) {
+        InitializeCriticalSection(&s_pending_cs);
+        _InterlockedExchange(&s_pending_cs_init, 2);
+    } else {
+        while (s_pending_cs_init != 2) { /* spin until the initializer finishes */ }
+    }
+    EnterCriticalSection(&s_pending_cs);
+}
+static void pending_unlock(void) { LeaveCriticalSection(&s_pending_cs); }
+#else
+static pthread_mutex_t s_pending_mx = PTHREAD_MUTEX_INITIALIZER;
+static void pending_lock(void)   { pthread_mutex_lock(&s_pending_mx); }
+static void pending_unlock(void) { pthread_mutex_unlock(&s_pending_mx); }
+#endif
+
+/* Register a created-but-not-yet-run task. Takes ownership of `j`. */
+static int spu_pending_register(spu_async_job* j)
+{
+    pending_lock();
+    int ok = (s_pending_count < SPU_PENDING_MAX);
+    if (ok) s_pending[s_pending_count++] = j;
+    pending_unlock();
+    if (!ok) { fprintf(stderr, "[spu_workload] pending registry FULL -- running task eagerly\n");
+               return spu_spawn_job_thread(j); }
+    fprintf(stderr, "[spu_workload] task REGISTERED pending image=%d taskset=0x%08X taskId=%u "
+            "(run deferred to next PPU wait)\n", j->image_id, j->taskset_ea, j->taskId);
+    return 1;
+}
+
+/* Q2 diagnostic (SPU_QLOG): at flush time the PPU is blocked waiting for completion,
+ * so the game's setup is done -- re-dump a pending task's arg-pointed structs to see
+ * whether the data it will read is NOW populated (vs zero at create time). */
+static void spu_pending_dump_args(const spu_async_job* j)
+{
+    if (!getenv("SPU_QLOG")) return;
+    extern uint8_t* vm_base;
+    for (int s = 0; s < 3; s++) {
+        uint32_t p = j->r3[s];
+        if (p < 0x00010000u || p >= 0x50000000u) continue;
+        const uint8_t* d = vm_base + p;
+        fprintf(stderr, "[flush-argdump] image=%d r3[%d]=0x%08X:", j->image_id, s, p);
+        for (int b = 0; b < 32; b++) fprintf(stderr, "%s%02X", (b%4)?"":" ", d[b]);
+        fprintf(stderr, "\n");
+    }
+}
+
+/* Run all pending tasks now. Called from the PPU blocking/poll syscalls. Idempotent
+ * (no-op when empty), so it is cheap to call on every wait. */
+void spu_pending_flush(void)
+{
+    spu_async_job* batch[SPU_PENDING_MAX];
+    int n = 0;
+    pending_lock();
+    n = s_pending_count; s_pending_count = 0;
+    for (int i = 0; i < n; i++) batch[i] = s_pending[i];
+    pending_unlock();
+    if (n == 0) return;
+    fprintf(stderr, "[spu_workload] pending FLUSH: running %d deferred task(s)\n", n);
+    for (int i = 0; i < n; i++) {
+        spu_pending_dump_args(batch[i]);     /* Q2: is the data populated now? */
+        spu_spawn_job_thread(batch[i]);
+    }
+}
+
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                                 uint32_t args_ea)
 {
@@ -350,16 +444,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
 
-#ifdef _WIN32
-    HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
-    if (!th) { free(j); return 0; }
-    CloseHandle(th);   /* detached */
-#else
-    pthread_t th;
-    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
-    pthread_detach(th);
-#endif
-    return 1;
+    return spu_spawn_job_thread(j);
 }
 
 /* Dispatch a SPURS leaf task with the task-START ABI (what the taskset policy
@@ -405,13 +490,11 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
       if (inl && inl[0] != '0') {
           fprintf(stderr, "[spu_workload] SPU_INLINE: running task on PPU thread\n");
           fflush(stderr); spu_async_run(j); return 1; } }
-#ifdef _WIN32
-    { HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
-      if (!th) { free(j); return 0; } CloseHandle(th); }
-#else
-    { pthread_t th;
-      if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
-      pthread_detach(th); }
-#endif
-    return 1;
+    /* DEFERRED scheduling (docs/13 Part A): register the task as pending and run it
+     * when the creating PPU thread next WAITS (spu_pending_flush in the wait syscalls),
+     * by which point the game has populated per-task data. SPU_TASK_EAGER=1 forces the
+     * old run-on-create behaviour for A/B comparison. */
+    { const char* eager = getenv("SPU_TASK_EAGER");
+      if (eager && eager[0] != '0') return spu_spawn_job_thread(j); }
+    return spu_pending_register(j);
 }

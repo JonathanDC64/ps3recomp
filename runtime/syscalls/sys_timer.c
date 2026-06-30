@@ -58,6 +58,7 @@ static void write_be64(uint32_t addr, uint64_t val)
  * -----------------------------------------------------------------------*/
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
+    { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13): covers poll-loops (e.g. func_00A31158) */
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     { static int n=0; if (n++ < 30) fprintf(stderr, "[WAIT] timer_usleep(%llu us)\n", (unsigned long long)usec); }
 
