@@ -396,11 +396,17 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
      * DES_PAD_BTN defaults to START if set to 0 or non-numeric. */
     { static int en = -1; static unsigned mask = 0;
       if (en < 0) { const char* e = getenv("DES_PAD_BTN"); en = e ? 1 : 0;
-                    if (e) { mask = (unsigned)strtoul(e, 0, 0); if (!mask) mask = CELL_PAD_CTRL_START; } }
+                    if (e) { mask = (unsigned)strtoul(e, 0, 0); if (!mask) mask = CELL_PAD_CTRL_START;
+                             fprintf(stderr, "[cellPad] DES_PAD_BTN synthetic input: mask=0x%04X\n", mask); } }
       if (en && port_no == 0) {
           static unsigned ctr = 0; ctr++;
           s_host_state[0].connected = 1;
-          s_host_state[0].buttons   = ((ctr / 30) & 1) ? (u16)mask : 0;   /* pulse */
+          /* Pressed 40 of every 60 polls, starting pressed (ctr=1) -- gives both a
+           * held state and periodic press/release edges, firing immediately. */
+          s_host_state[0].buttons   = ((ctr % 60) < 40) ? (u16)mask : 0;
+          { static unsigned logged = 0; if (logged < 3 && s_host_state[0].buttons) {
+                logged++; fprintf(stderr, "[cellPad] INJECT btn=0x%04X -> D1=0x%02X D2=0x%02X (poll #%u)\n",
+                                  (unsigned)mask, (unsigned)(mask & 0xFF), (unsigned)((mask>>8)&0xFF), ctr); } }
       } }
 
     if (port_no >= PAD_MAX_HOST_PORTS || !s_host_state[port_no].connected) {
