@@ -139,11 +139,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * transfers touching the queue-ring LS window [0x13000,0x13600). Reveals the
      * main-memory queue base the leaf derives from r4/SPURS. */
     { extern int g_spu_qlog; const char* qe;
-      if (g_spu_qlog && spu->image_id == 2 && lsa >= 0x13000 && lsa < 0x13600) {
-        if (g_spu_qlog < 0) { qe = getenv("SPU_QLOG"); g_spu_qlog = (qe && *qe!='0') ? 1 : 0; }
-        if (g_spu_qlog)
-          fprintf(stderr, "[qlog] img2 %s lsa=0x%05X ea=0x%08X size=%u\n",
-                  mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
+      if (g_spu_qlog < 0) { qe = getenv("SPU_QLOG"); g_spu_qlog = (qe && *qe!='0') ? 1 : 0; }
+      if (g_spu_qlog) {
+        /* image 2: the result-handoff ring window; image 7: all transfers (capped) to
+         * map its argument-data processing / dispatch-table source. */
+        int log = 0;
+        if (spu->image_id == 2 && lsa >= 0x13000 && lsa < 0x13600) log = 1;
+        else if (spu->image_id == 7) { extern int g_qlog7_budget; if (g_qlog7_budget > 0) { g_qlog7_budget--; log = 1; } }
+        if (log)
+          fprintf(stderr, "[qlog] img%d %s lsa=0x%05X ea=0x%08X size=%u\n",
+                  spu->image_id, mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size);
       } }
     if (mfc_is_get(cmd)) {
         /* GET: main memory -> local store */

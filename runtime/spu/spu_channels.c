@@ -21,6 +21,7 @@
 /* SPU_QLOG diagnostic: -1 = env not yet read, 0 = off, 1 = on. Read lazily in
  * mfc_do_transfer (spu_dma.h) to trace the leaf's command-queue DMA sources. */
 int g_spu_qlog = -1;
+int g_qlog7_budget = 60;   /* cap image-7 DMA log lines (it transfers a lot) */
 
 #ifdef __cplusplus
 extern "C" {
