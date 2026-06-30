@@ -185,8 +185,16 @@ extern volatile long g_spu_resv_count;
 void spu_reservation_notify_write(uint32_t ea);
 #define VM_LR_NOTIFY(a) do { if (g_spu_resv_count) spu_reservation_notify_write((uint32_t)(a)); } while (0)
 
-void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_base[(uint32_t)a] = v; VM_LR_NOTIFY(a); }
-void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); VM_LR_NOTIFY(a); }
+/* Generic write watchpoint: log any guest store into [YDKJ_WWATCH, +0x40) with size +
+ * caller RVA, across all widths (write32 has its own inline variant below). */
+static inline void vm_watch(uint64_t a, uint64_t v, int sz, void* ra) {
+    static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
+    if (w<0) return; uint32_t ea=(uint32_t)a; if (ea<(uint32_t)w || ea>=(uint32_t)w+0x40) return;
+    static HMODULE _m=0; if(!_m) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&_m);
+    fprintf(stderr,"[WWATCH] write%d 0x%08X = 0x%llX  rva=0x%llX\n", sz, ea, (unsigned long long)v, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m));
+}
+void vm_write8 (uint64_t a, uint8_t  v) { if (vm_oob((uint32_t)a,1)) return; vm_watch(a,v,8,__builtin_return_address(0)); vm_base[(uint32_t)a] = v; VM_LR_NOTIFY(a); }
+void vm_write16(uint64_t a, uint16_t v) { if (vm_oob((uint32_t)a,2)) return; vm_watch(a,v,16,__builtin_return_address(0)); v = __builtin_bswap16(v); memcpy(vm_base + (uint32_t)a, &v, 2); VM_LR_NOTIFY(a); }
 void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
     { static int64_t w=-2; if (w==-2) { const char* e=getenv("YDKJ_WWATCH"); w = e?(int64_t)strtoul(e,0,0):-1; }
       if (w>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)w && ea<(uint32_t)w+0x40) {
@@ -194,7 +202,7 @@ void vm_write32(uint64_t a, uint32_t v) { if (vm_oob((uint32_t)a,4)) return;
         if(!_m) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&_m);
         fprintf(stderr,"[WWATCH] write32 0x%08X = 0x%08X  rva=0x%llX\n", ea, v, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m)); } } }
     v = __builtin_bswap32(v); memcpy(vm_base + (uint32_t)a, &v, 4); VM_LR_NOTIFY(a); }
-void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); VM_LR_NOTIFY(a); }
+void vm_write64(uint64_t a, uint64_t v) { if (vm_oob((uint32_t)a,8)) return; vm_watch(a,v,64,__builtin_return_address(0)); v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)a, &v, 8); VM_LR_NOTIFY(a); }
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
