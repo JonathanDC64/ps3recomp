@@ -14,6 +14,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv/strtoul (DES_PAD_BTN synthetic-input probe) */
 #include <math.h>
 
 /* Guest pointers reach these HLE entries as raw 32-bit guest effective addresses
@@ -387,6 +388,20 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
 
     /* Poll fresh state */
     pad_poll_backend();
+
+    /* Synthetic-input probe (DES_PAD_BTN=0xMASK): when no real controller is
+     * attached, force port 0 connected and PULSE the given button bitmask
+     * (~0.5s held / ~0.5s released) so the game sees press+release edges. Used
+     * to test whether the boot stall is a title/menu waiting for input.
+     * DES_PAD_BTN defaults to START if set to 0 or non-numeric. */
+    { static int en = -1; static unsigned mask = 0;
+      if (en < 0) { const char* e = getenv("DES_PAD_BTN"); en = e ? 1 : 0;
+                    if (e) { mask = (unsigned)strtoul(e, 0, 0); if (!mask) mask = CELL_PAD_CTRL_START; } }
+      if (en && port_no == 0) {
+          static unsigned ctr = 0; ctr++;
+          s_host_state[0].connected = 1;
+          s_host_state[0].buttons   = ((ctr / 30) & 1) ? (u16)mask : 0;   /* pulse */
+      } }
 
     if (port_no >= PAD_MAX_HOST_PORTS || !s_host_state[port_no].connected) {
         data->len = 0;

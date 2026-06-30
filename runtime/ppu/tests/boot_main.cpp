@@ -245,16 +245,22 @@ static void dump_threads(const char* label, HMODULE self)
                 GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCSTR)ctx.Rip, &m);
-                if (m == self) {
-                    fprintf(stderr, "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
-                            (unsigned long)te.th32ThreadID,
-                            (unsigned long long)((char*)ctx.Rip - (char*)self));
-                    /* Scan the suspended thread's stack for boot-module return
-                     * addresses to reconstruct the call chain when there's no
-                     * OOB backtrace to lean on (some false positives expected). */
+                char path[MAX_PATH] = "?";
+                if (m) GetModuleFileNameA(m, path, sizeof path);
+                const char* base = strrchr(path, '\\');
+                fprintf(stderr, "[WATCHDOG]   tid %5lu in %s%s\n",
+                        (unsigned long)te.th32ThreadID,
+                        (m == self) ? "des_boot" : (base ? base + 1 : path),
+                        (m == self) ? " (lifted/runtime)" : "");
+                /* ALWAYS scan the suspended thread's stack for boot-module return
+                 * addresses to reconstruct the lifted/runtime call chain -- even when
+                 * the thread is currently parked in a Win32 wait (ntdll). Reveals where
+                 * "running" workers (no tracked lv2 wait) are actually blocked.
+                 * Some false positives expected (stale stack slots). */
+                {
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
                     int found = 0;
-                    for (int k = 0; k < 0x8000 / 8 && found < 16; k++) {
+                    for (int k = 0; k < 0x10000 / 8 && found < 12; k++) {
                         uint64_t v = sp[k];
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;
@@ -267,12 +273,6 @@ static void dump_threads(const char* label, HMODULE self)
                             found++;
                         }
                     }
-                } else {
-                    char path[MAX_PATH] = "?";
-                    if (m) GetModuleFileNameA(m, path, sizeof path);
-                    const char* base = strrchr(path, '\\');
-                    fprintf(stderr, "[WATCHDOG]   tid %5lu in %s\n",
-                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
                 }
             }
             ResumeThread(th);
