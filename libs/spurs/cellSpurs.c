@@ -440,28 +440,20 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task
  * =====================================================================*/
 
-s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
-                        void* elf, void* context, u32 sizeContext,
-                        CellSpursTaskAttribute* attr)
+/* Shared task-create core. Both public entries (the direct cellSpursCreateTask and
+ * cellSpursCreateTaskWithAttribute) marshal their differing ABIs down to this:
+ * the resolved 16-byte task argument (arg_val[4], BE words; have_arg_val=1 if real)
+ * and the exit-code container EA. Finds a slot, builds the real CellSpursTaskset
+ * layout, and dispatches the lifted SPU image. */
+static s32 spurs_create_task_core(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                                  void* elf, void* context, u32 sizeContext,
+                                  const uint32_t arg_val[4], int have_arg_val,
+                                  uint32_t exitcode_ea)
 {
     (void)context; (void)sizeContext;
 
-    /* Capture the raw guest EAs before translation: the taskset EA (-> r4 of the
-     * task-start ABI) and the task argument EA (from the attribute). */
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    uint32_t arg_ea = 0;
-    uint32_t exitcode_ea = 0;
-    uint32_t arg_val[4] = {0,0,0,0};
-    int have_arg_val = 0;
-    if (attr) {
-        CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
-        arg_ea      = (uint32_t)attr_h->eaArgument;
-        exitcode_ea = (uint32_t)attr_h->eaExitCode;   /* CellSpursTaskExitCode container */
-        if (attr_h->hasArgValue) {                    /* copied at init (the ptr is stale now) */
-            for (int k = 0; k < 4; k++) arg_val[k] = attr_h->argValue[k];
-            have_arg_val = 1;
-        }
-    }
+    uint32_t arg_ea = 0;   /* legacy fallback path unused now (callers pass arg_val) */
 
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
      * guest EAs (handled below — elf is translated for load, context kept EA). */
@@ -575,6 +567,33 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
+/* Direct cellSpursCreateTask (NID 0xBEB600AC). REAL SDK ABI (RPCS3 cellSpurs.cpp):
+ *   r3=taskset r4=taskId r5=elf r6=context r7=size r8=lsPattern r9=argument
+ * argument (r9) is a POINTER to the 16-byte CellSpursTaskArgument (read it now; the
+ * dispatch happens synchronously here so the pointer is valid). Our old signature
+ * mistook r8 (lsPattern) for an attribute and never read r9 -> the task got a null
+ * argument (e.g. image=7 branched to LS 0). lsPattern unused by our PM for now. */
+s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+                        void* elf, void* context, u32 sizeContext,
+                        const void* lsPattern, const void* argument)
+{
+    (void)lsPattern;
+    uint32_t arg_val[4] = {0,0,0,0};
+    int have_arg_val = 0;
+    uint32_t argPtr = (uint32_t)(uintptr_t)argument;
+    if (argPtr) {
+        extern uint8_t* vm_base;
+        const uint8_t* a = vm_base + argPtr;          /* 16-byte CellSpursTaskArgument, BE */
+        for (int k = 0; k < 4; k++)
+            arg_val[k] = ((u32)a[k*4]<<24)|((u32)a[k*4+1]<<16)|((u32)a[k*4+2]<<8)|a[k*4+3];
+        have_arg_val = 1;
+    }
+    printf("[cellSpurs] CreateTask(direct) argPtr=0x%08X arg={0x%08X,0x%08X,0x%08X,0x%08X}\n",
+           argPtr, arg_val[0], arg_val[1], arg_val[2], arg_val[3]);
+    return spurs_create_task_core(taskset, taskId, elf, context, sizeContext,
+                                  arg_val, have_arg_val, /*exitcode*/0);
+}
+
 /* The SDK's versioned task-attribute initializer. ABI (8 GPR args):
  *   r3=attr r4=revision r5=sdkVersion r6=eaElf r7=eaContext r8=sizeContext
  *   r9=lsPattern r10=argument
@@ -625,14 +644,22 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
 {
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
-    /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
+    /* taskset/taskId forwarded raw (core translates); elf/context are guest EAs. The
+     * argument was copied into attr->argValue at _cellSpursTaskAttributeInitialize. */
     if (attr_h->eaExitCode)
         printf("[cellSpurs] CreateTaskWithAttribute: task exit-code container @0x%08X\n",
                (u32)attr_h->eaExitCode);
-    return cellSpursCreateTask(taskset, taskId,
-                               (void*)(uintptr_t)(u32)attr_h->eaElf,
-                               (void*)(uintptr_t)(u32)attr_h->eaContext,
-                               attr_h->sizeContext, attr);
+    uint32_t arg_val[4] = {0,0,0,0};
+    int have_arg_val = 0;
+    if (attr_h->hasArgValue) {
+        for (int k = 0; k < 4; k++) arg_val[k] = attr_h->argValue[k];
+        have_arg_val = 1;
+    }
+    return spurs_create_task_core(taskset, taskId,
+                                  (void*)(uintptr_t)(u32)attr_h->eaElf,
+                                  (void*)(uintptr_t)(u32)attr_h->eaContext,
+                                  attr_h->sizeContext, arg_val, have_arg_val,
+                                  (uint32_t)attr_h->eaExitCode);
 }
 
 /* ---- SPURS task exit-code mechanism -------------------------------------- *

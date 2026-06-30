@@ -226,9 +226,11 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task functions
  * -----------------------------------------------------------------------*/
 
+/* Direct cellSpursCreateTask ABI: (taskset, taskId, elf, context, size, lsPattern,
+ * argument). argument (r9) is a guest pointer to the 16-byte CellSpursTaskArgument. */
 s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
-                        CellSpursTaskAttribute* attr);
+                        const void* lsPattern, const void* argument);
 s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
                       s32* exitCode);
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
