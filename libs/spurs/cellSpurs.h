@@ -146,9 +146,12 @@ struct CellSpursTaskAttribute {
     u32  sizeContext;
     u64  eaContext;
     u64  eaElf;        /* SPU task ELF guest EA (set by _cellSpursTaskAttributeInitialize) */
-    u64  eaArgument;   /* guest EA of the 16-byte CellSpursTaskArgument (r10 of the init) */
+    u64  eaArgument;   /* guest EA the init was handed for the 16-byte CellSpursTaskArgument */
     u64  eaExitCode;   /* guest EA of the CellSpursTaskExitCode container (SetExitCodeContainer) */
-    u8   _padding[40];
+    u32  argValue[4];  /* the 16-byte task argument, COPIED at init (the src ptr is a caller
+                        * stack buffer that won't survive to CreateTask). Big-endian words. */
+    u8   hasArgValue;  /* 1 if argValue[] was captured from the init's argument pointer */
+    u8   _padding[15];
 };
 
 /* Event flag -- SPURS-level event synchronization */

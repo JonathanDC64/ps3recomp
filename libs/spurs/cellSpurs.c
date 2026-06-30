@@ -451,10 +451,16 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     uint32_t arg_ea = 0;
     uint32_t exitcode_ea = 0;
+    uint32_t arg_val[4] = {0,0,0,0};
+    int have_arg_val = 0;
     if (attr) {
         CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
         arg_ea      = (uint32_t)attr_h->eaArgument;
         exitcode_ea = (uint32_t)attr_h->eaExitCode;   /* CellSpursTaskExitCode container */
+        if (attr_h->hasArgValue) {                    /* copied at init (the ptr is stale now) */
+            for (int k = 0; k < 4; k++) arg_val[k] = attr_h->argValue[k];
+            have_arg_val = 1;
+        }
     }
 
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
@@ -530,7 +536,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                      * attribute's argument EA. Dispatch on a host thread. */
                     extern uint8_t* vm_base;
                     uint32_t arg[4] = {0, 0, 0, 0};
-                    if (arg_ea) {
+                    if (have_arg_val) {              /* preferred: value copied at init */
+                        for (int k = 0; k < 4; k++) arg[k] = arg_val[k];
+                    } else if (arg_ea) {             /* fallback: re-read from the EA */
                         const uint8_t* a = vm_base + arg_ea;
                         for (int k = 0; k < 4; k++)
                             arg[k] = ((uint32_t)a[k*4]<<24)|((uint32_t)a[k*4+1]<<16)|
@@ -574,20 +582,37 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
  * dispatch the SPU job. */
 s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision,
                                       u32 sdkVersion, u64 eaElf, u64 eaContext,
-                                      u32 sizeContext, const void* lsPattern,
+                                      u32 argPtr, const void* lsPattern,
                                       const void* argument)
 {
-    (void)sdkVersion; (void)lsPattern;
+    /* REAL ABI (decoded from the two DeS call sites of NID 0xB8474EFF, docs/09 15q):
+     *   r3=attr r4=revision r5=sdkVersion(0x250001) r6=eaElf r7=eaContext r8=argument
+     * i.e. SIX args, and the 6th (r8) is a POINTER to the 16-byte CellSpursTaskArgument
+     * -- NOT sizeContext. (r9/r10 are clobbered/stale at the call; our old 8-arg mapping
+     * read the argument from the stale r10 -> garbage {callbacks}.) The argument lives in
+     * a CALLER STACK buffer, so it must be COPIED here (it won't survive to CreateTask).
+     * sizeContext/lsPattern aren't passed by this variant -> 0 (CreateTask auto-allocates
+     * the context, default full-LS). */
+    (void)sdkVersion; (void)lsPattern; (void)argument;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursTaskAttribute*);
     memset(attr, 0, sizeof(CellSpursTaskAttribute));
     attr->revision    = revision;
-    attr->sizeContext = sizeContext;
+    attr->sizeContext = 0;                           /* not in this ABI -> auto */
     attr->eaContext   = eaContext;
     attr->eaElf       = eaElf;
-    attr->eaArgument  = (u64)(uintptr_t)argument;   /* r10: guest EA of the task argument */
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u arg=0x%08X)\n",
-           (u32)eaElf, (u32)eaContext, sizeContext, (u32)(uintptr_t)argument);
+    attr->eaArgument  = (u64)argPtr;                 /* r8: guest EA of the task argument */
+    if (argPtr) {
+        extern uint8_t* vm_base;
+        const uint8_t* a = vm_base + (u32)argPtr;    /* copy the 16-byte arg NOW (BE words) */
+        for (int k = 0; k < 4; k++)
+            attr->argValue[k] = ((u32)a[k*4]<<24)|((u32)a[k*4+1]<<16)|
+                                ((u32)a[k*4+2]<<8)|a[k*4+3];
+        attr->hasArgValue = 1;
+    }
+    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X argPtr=0x%08X "
+           "arg={0x%08X,0x%08X,0x%08X,0x%08X})\n", (u32)eaElf, (u32)eaContext, (u32)argPtr,
+           attr->argValue[0], attr->argValue[1], attr->argValue[2], attr->argValue[3]);
     return CELL_OK;
 }
 
