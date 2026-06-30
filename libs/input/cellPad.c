@@ -422,9 +422,14 @@ s32 cellPadGetData(u32 port_no, CellPadData* data)
     data->button[0] = (u16)len;
     data->button[1] = 0; /* reserved */
 
-    /* Digital buttons */
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = hs->buttons;
-    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0; /* PS button etc. */
+    /* Digital buttons. The CELL_PAD_CTRL_* macros pack the two PS3 button bytes
+     * into one 16-bit value: bits 0-7 = DIGITAL1 (SELECT/L3/R3/START/dpad),
+     * bits 8-15 = DIGITAL2 (L2/R2/L1/R1/TRIANGLE/CIRCLE/CROSS/SQUARE). They must
+     * be split into the two report bytes -- writing the whole 16-bit value into
+     * DIGITAL1 (and 0 into DIGITAL2) lost EVERY face button (X/O/Tri/Sq), so the
+     * game never saw CROSS to dismiss dialogs / advance menus. */
+    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
+    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
 
     /* Analog sticks */
     data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = hs->analog_rx;
