@@ -302,6 +302,22 @@ static SPU_TLS int s_ind_depth = 0;
 
 void spu_indirect_branch(spu_context* ctx)
 {
+    /* Diagnostic (SPU_DISPATCH_LOG): trace the SPURS command dispatcher's handler
+     * jumps (image 2, target in the 0x4804..0x5098 handler-table range) so we can
+     * see whether the task processes a finite stream of real commands or loops on
+     * garbage from an un-set-up queue. Capped so it can't flood. */
+    if (ctx->image_id == 2 && ctx->pc >= 0x4804 && ctx->pc < 0x5098) {
+        static int dl = 0;
+        const char* e = getenv("SPU_DISPATCH_LOG");
+        if (e && e[0] != '0' && dl < 80) {
+            dl++;
+            uint32_t qhead = *(uint32_t*)&ctx->ls[0x13400];
+            uint32_t qtail = *(uint32_t*)&ctx->ls[0x13480];
+            fprintf(stderr, "[spu_dispatch] #%d handler=0x%05X head@13400=0x%08X tail@13480=0x%08X\n",
+                    dl, ctx->pc & SPU_LS_MASK, qhead, qtail);
+            fflush(stderr);
+        }
+    }
     spu_fn fn = spu_lookup(ctx->pc, ctx->image_id);
     if (fn) {
         if (++s_ind_depth > 6000) {
