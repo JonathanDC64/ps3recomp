@@ -180,6 +180,7 @@ extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSys
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void thrdiag_set_name(const char*);   /* thread_diag.c */
 extern "C" void thrdiag_dump(void);
+extern "C" void ps3_hle_register_ctx(unsigned, const char*, void(*)(ppu_context*));  /* ppu_hle.cpp */
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
 
@@ -386,6 +387,16 @@ int main(int argc, char** argv)
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
+
+    /* EXPERIMENT: the engine (NexusRevolution Main) hammers unresolved sceNp NID
+     * 0x36D0C2C5 forever (returns 0 by default) and never advances past pre-title
+     * loading. Register a stub returning an env-configurable value (NP_36_RET) so
+     * we can probe whether a different return unblocks the loading state. */
+    ps3_hle_register_ctx(0x36D0C2C5u, "sceNp_0x36D0C2C5_probe", [](ppu_context* c){
+        static long v = -2; if (v == -2) { const char* e = getenv("NP_36_RET"); v = e ? strtol(e,0,0) : 0; }
+        c->gpr[3] = (uint64_t)(int64_t)v;
+    });
+
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
     ppu_fs_register();       /* cellFs VFS over the real game directory */
     lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
