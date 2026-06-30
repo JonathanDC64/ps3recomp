@@ -143,6 +143,10 @@ void spu_reservation_notify_write(uint32_t ea)
             c->resv_valid = 0;
             s_resv_ctx[i] = NULL;
             _InterlockedDecrement(&g_spu_resv_count);
+            { const char* e = getenv("SPU_RESV_LOG"); static int n = 0;
+              if (e && e[0] != '0' && n < 30) { n++;
+                fprintf(stderr, "[resv] LR fired: line 0x%08X written -> image=%d woken\n",
+                        line, c->image_id); fflush(stderr); } }
         }
     }
     resv_unlock();
@@ -158,6 +162,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     switch (cmd) {
     case MFC_GETLLAR_CMD:
+        /* Diagnostic (SPU_RESV_LOG): which main-memory line the coordinator watches. */
+        { const char* e = getenv("SPU_RESV_LOG");
+          if (e && e[0] != '0') { static uint32_t last = 0; static int n = 0;
+            if (ea != last && n < 30) { last = ea; n++;
+              fprintf(stderr, "[resv] image=%d GETLLAR line=0x%08X\n", ctx->image_id, ea);
+              fflush(stderr); } } }
         resv_lock();
         memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
         memcpy(ctx->resv_line, mem, MFC_ATOMIC_LINE);  /* snapshot for compare */
