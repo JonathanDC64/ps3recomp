@@ -1,0 +1,2 @@
+# Link the SPURS leaf-task EXIT helper (the runtime mechanism under test).
+EXTRA="-I $RUNTIME_SPU $RUNTIME_SPU/spurs_task.c"
