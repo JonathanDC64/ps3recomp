@@ -262,6 +262,12 @@ typedef struct rsx_state {
     int stencil_dirty;
     int texture_dirty;
     int vertex_dirty;
+
+    /* Semaphore / label write (NV4097 SET_SEMAPHORE_OFFSET 0x1D6C +
+     * BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70 / TEXTURE_READ_SEMAPHORE_RELEASE 0x1D88):
+     * the offset is into the GCM label area; on release we write the label so PPU
+     * label-polls (e.g. func_009F94A8 on label 255) complete. */
+    u32 sema_offset;
 } rsx_state;
 
 /* ---------------------------------------------------------------------------

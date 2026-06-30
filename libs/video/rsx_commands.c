@@ -17,6 +17,7 @@
 #include "rsx_commands.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv (RSX_MLOG diagnostic) */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -256,6 +257,26 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    /* NV4097 semaphore / GCM label write. The game sets the offset (0x1D6C) into the
+     * GCM label area (base 0x03000000), then a RELEASE (0x1D70 back-end / 0x1D88 texture)
+     * writes the value -- which the RSX would do after executing the command buffer.
+     * Emulate it so PPU label-polls complete (e.g. func_009F94A8 waits on label 255 =
+     * offset 0xFF0). vm_write32 stores big-endian; the game reads via vm_read32 (BE->host),
+     * so writing `data` round-trips to `data` for the poll comparison. */
+    if (method == 0x1D6C) {            /* NV4097_SET_SEMAPHORE_OFFSET */
+        state->sema_offset = data;
+        return 1;
+    }
+    if (method == 0x1D70 || method == 0x1D88) {   /* (BACK_END|TEXTURE_READ)_WRITE_SEMAPHORE_RELEASE */
+        extern void vm_write32(unsigned long long, unsigned int);
+        u32 addr = 0x03000000u + (state->sema_offset & 0x0000FFFFu);
+        vm_write32(addr, data);
+        { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
+            fprintf(stderr, "[rsx-sema] write label @0x%08X (off=0x%X) = 0x%08X\n",
+                    addr, state->sema_offset, data); } }
+        return 1;
+    }
+
     /* Surface configuration */
     if (method >= 0x200 && method <= 0x23C)
         return process_surface_method(state, method, data);
@@ -576,11 +597,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
+int g_rsx_mlog = -1;   /* RSX_MLOG diagnostic budget (-1 = read env on first use) */
+
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
+
+    if (g_rsx_mlog < 0) { const char* e = getenv("RSX_MLOG"); g_rsx_mlog = (e && *e != '0') ? 300 : 0; }
 
     while (pos < count) {
         u32 header = buf[pos++];
@@ -596,15 +621,28 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             for (u32 i = 0; i < num_data && pos < count; i++) {
                 u32 data = buf[pos++];
                 u32 m = increasing ? (method + i * 4) : method;
+                /* RSX_MLOG: trace methods to find the label-255 write (semaphore/report
+                 * methods: SET_SEMAPHORE_OFFSET 0x1d6c, BACK_END_WRITE_SEMAPHORE_RELEASE
+                 * 0x1d70, TEXTURE_READ_SEMAPHORE_RELEASE 0x1d88, SET_REFERENCE 0x50, or
+                 * NV406E semaphore). Capped. */
+                { extern int g_rsx_mlog; if (g_rsx_mlog > 0 &&
+                    (m == 0x1d6c || m == 0x1d70 || m == 0x1d88 || m == 0x1d94 || m == 0x50 ||
+                     m == 0x64 || m == 0x68 || m == 0x6c || m == 0x10 || m == 0x14)) {
+                    g_rsx_mlog--;
+                    fprintf(stderr, "[rsx-mlog] method=0x%04X data=0x%08X\n", m, data); } }
                 rsx_process_method(state, m, data);
                 methods_processed++;
             }
         } else if (type == 1) {
             /* Jump — change command buffer read position */
             /* In recomp context, this is handled by the caller */
+            { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
+                fprintf(stderr, "[rsx-mlog] JUMP -> 0x%08X (not followed)\n", header & 0x1FFFFFFCu); } }
             break;
         } else {
             /* Unknown type, skip */
+            { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
+                fprintf(stderr, "[rsx-mlog] type=%u header=0x%08X (CALL/RET?) -- stop\n", type, header); } }
             break;
         }
     }
