@@ -8,6 +8,8 @@
 #include "sceNp.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv (NP_FIRE_CB experiment) */
+#include <stdint.h>
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -199,6 +201,31 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
 
 static SceNpManagerCallback s_npmgr_cb = NULL;
 static void*                s_npmgr_cb_arg = NULL;
+static u32                  s_npmgr_cb_opd = 0;   /* raw guest OPD of the callback */
+static u32                  s_npmgr_cb_arg_ea = 0;/* raw guest EA of the user arg */
+
+/* On real NP, after a game registers its manager callback the firmware delivers
+ * an initial status event so the game's NP state machine leaves "initializing"
+ * and settles (offline, signed-in-but-disconnected, etc.). We never fired it, so
+ * event-driven titles (DeS polls sceNpManagerGetNpId/GetStatus every frame but
+ * only ADVANCES on the callback event) stall before the title screen. Fire the
+ * callback once with the OFFLINE status. Flag-gated (NP_FIRE_CB) so it can't
+ * regress the working boot until proven. Invoked from GetStatus (the game's NP
+ * poll thread = a valid guest context), one-shot, re-entrancy guarded. */
+static void np_fire_manager_cb_once(void)
+{
+    static int fired = 0, in_fire = 0;
+    if (fired || in_fire) return;
+    if (!s_npmgr_cb_opd) return;
+    if (!getenv("NP_FIRE_CB")) return;
+    extern uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+    in_fire = 1; fired = 1;
+    fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=OFFLINE arg=0x%08X\n",
+            s_npmgr_cb_opd, s_npmgr_cb_arg_ea);
+    ppu_guest_call(s_npmgr_cb_opd, (uint64_t)(int64_t)SCE_NP_MANAGER_STATUS_OFFLINE,
+                   0, (uint64_t)s_npmgr_cb_arg_ea, 0);
+    in_fire = 0;
+}
 
 s32 sceNpManagerGetStatus(s32* status)
 {
@@ -208,6 +235,7 @@ s32 sceNpManagerGetStatus(s32* status)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
     *status = SCE_NP_MANAGER_STATUS_OFFLINE;   /* -1, endian-safe */
     printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
+    np_fire_manager_cb_once();
     return CELL_OK;
 }
 
@@ -218,7 +246,10 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
     /* Stored for bookkeeping; we never transition online so never fire it. */
     s_npmgr_cb     = callback;
     s_npmgr_cb_arg = arg;
-    printf("[sceNp] ManagerRegisterCallback()\n");
+    s_npmgr_cb_opd    = (u32)(size_t)callback;   /* raw guest OPD */
+    s_npmgr_cb_arg_ea = (u32)(size_t)arg;
+    printf("[sceNp] ManagerRegisterCallback(opd=0x%08X arg=0x%08X)\n",
+           s_npmgr_cb_opd, s_npmgr_cb_arg_ea);
     return CELL_OK;
 }
 
