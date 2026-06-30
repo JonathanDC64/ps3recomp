@@ -802,6 +802,9 @@ u32* cellGcmGetLabelAddress(u8 index)
         printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
         return NULL;
     }
+    { static int n = 0; if (n++ < 24)
+        printf("[cellGcmSys] GetLabelAddress(index=%u) -> 0x%08X\n",
+               index, GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE); }
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
 
