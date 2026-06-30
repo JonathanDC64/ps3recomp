@@ -176,19 +176,17 @@ int64_t sys_cond_wait(ppu_context* ctx)
      * properly. data1=0 (handler stores, doesn't immediately deref). */
     if (cond_id == 2) { static int probed = 0;
         if (!probed && getenv("SPURS_EVTEST")) { probed = 1;
-            extern int sys_event_queue_push_by_id(uint32_t,uint64_t,uint64_t,uint64_t,uint64_t);
-            /* data1 = the work item the DLSpursManager SPU task published (0x45A4B280,
-             * the deterministic job/result object). SPURS_EVDATA overrides for sweeping. */
-            uint64_t d1 = 0x45A4B280ull;
-            { const char* e = getenv("SPURS_EVDATA"); if (e) d1 = strtoull(e, 0, 0); }
-            /* selector byte (data2>>32)&0xFF picks the handler: 0 -> func_00C5BE78 (A),
-             * 1 -> func_00C5D6D8 (B, likely the work-dispatch path). SPURS_EVSEL sets it. */
-            uint64_t sel = 0; { const char* e = getenv("SPURS_EVSEL"); if (e) sel = strtoull(e, 0, 0); }
-            uint64_t d2 = (sel & 0xFFull) << 32;
-            fprintf(stderr, "[evtest] posting USER event src=0xFFFFFFFF53505501 data1=0x%llX data2=0x%llX (sel=%llu) to q=1\n",
-                    (unsigned long long)d1, (unsigned long long)d2, (unsigned long long)sel);
-            int r = sys_event_queue_push_by_id(1u, 0xFFFFFFFF53505501ull, d1, d2, 0);
-            fprintf(stderr, "[evtest] push_by_id(q=1) -> %d\n", r);
+            extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
+            /* Correct contract layout (docs/14): data1=spu lv2 id, data2=(spup<<32)|data0,
+             * data3=payload. spup selects the handler (1 -> handler B work path).
+             * SPURS_EVLV2 = spu lv2 id, SPURS_EVSEL = spup, SPURS_EVDATA = data3 payload. */
+            uint64_t lv2 = 1; { const char* e = getenv("SPURS_EVLV2"); if (e) lv2 = strtoull(e,0,0); }
+            uint32_t spup = 1; { const char* e = getenv("SPURS_EVSEL"); if (e) spup = (uint32_t)strtoul(e,0,0); }
+            uint64_t d3 = 0x45A4B280ull; { const char* e = getenv("SPURS_EVDATA"); if (e) d3 = strtoull(e,0,0); }
+            fprintf(stderr, "[evtest] USER event q=1 lv2id=0x%llX spup=%u data3=0x%llX\n",
+                    (unsigned long long)lv2, spup, (unsigned long long)d3);
+            int r = sys_spu_thread_post_user_event(1u, lv2, spup, 0, d3);
+            fprintf(stderr, "[evtest] post_user_event(q=1) -> %d\n", r);
         }
     }
 

@@ -566,6 +566,21 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     return event_queue_push(q, &evt);
 }
 
+/* Post a SYS_SPU_THREAD_EVENT_USER event exactly as the lv2 kernel does for an SPU's
+ * sys_spu_thread_send_event(spup, data0, data) -- the SPURS kernel uses this to notify the
+ * PPU event-helper (SPURuntimeService). Decoded from RPCS3 (SPUThread.cpp / lv2/sys_event.h,
+ * docs/14): event = { source=0xFFFFFFFF53505501, data1=spu_lv2_id, data2=(spup<<32)|data0,
+ * data3=data }. The PPU helper dispatches by spup (the SPU port) and reads data1 (the SPU
+ * thread lv2 id, which it looks up) + data3 (the payload). */
+int sys_spu_thread_post_user_event(uint32_t queue_id, uint64_t spu_lv2_id,
+                                   uint32_t spup, uint32_t data0, uint64_t data)
+{
+    return sys_event_queue_push_by_id(queue_id, 0xFFFFFFFF53505501ull,
+                                      spu_lv2_id,
+                                      ((uint64_t)spup << 32) | (data0 & 0x00FFFFFFu),
+                                      data);
+}
+
 int64_t sys_event_port_send(ppu_context* ctx)
 {
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
