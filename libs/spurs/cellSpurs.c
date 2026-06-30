@@ -193,9 +193,11 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     if (!spurs || !attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
+    uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;   /* guest EA before translation */
     spurs = GUEST_PTR(spurs, CellSpurs*);
     attr  = GUEST_PTR(attr, const CellSpursAttribute*);
-    printf("[cellSpurs] InitializeWithAttribute(prefix=\"%.15s\")\n", attr->prefix);
+    printf("[cellSpurs] InitializeWithAttribute(prefix=\"%.15s\") spurs_ea=0x%08X\n",
+           attr->prefix, spurs_ea);
 
     memset(spurs, 0, sizeof(CellSpurs));
     spurs->initialized = 1;
