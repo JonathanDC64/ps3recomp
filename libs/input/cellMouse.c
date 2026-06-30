@@ -9,8 +9,14 @@
  */
 
 #include "cellMouse.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
+
+/* Guest pointers reach these HLE entries as raw 32-bit guest effective addresses
+ * (the generic adapter passes GPRs verbatim); translate to host before deref.
+ * NULL guest EA -> NULL host. Matches the cellSpurs convention. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -150,6 +156,8 @@ s32 cellMouseGetData(u32 port_no, CellMouseData* data)
     if (port_no >= s_mouse_max_connect || !data)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
 
+    data = GUEST_PTR(data, CellMouseData*);   /* guest EA -> host */
+
     MousePortState* ms = &s_mouse_ports[port_no];
 
     if (!ms->connected) {
@@ -189,6 +197,8 @@ s32 cellMouseGetDataList(u32 port_no, CellMouseDataList* data)
 
     if (port_no >= s_mouse_max_connect || !data)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
+
+    data = GUEST_PTR(data, CellMouseDataList*);   /* guest EA -> host */
 
     MousePortState* ms = &s_mouse_ports[port_no];
 
@@ -230,6 +240,8 @@ s32 cellMouseGetInfo(CellMouseInfo* info)
 
     if (!info)
         return CELL_MOUSE_ERROR_INVALID_PARAMETER;
+
+    info = GUEST_PTR(info, CellMouseInfo*);   /* guest EA -> host */
 
     memset(info, 0, sizeof(CellMouseInfo));
     info->max_connect = s_mouse_max_connect;

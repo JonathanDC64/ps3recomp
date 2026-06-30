@@ -7,10 +7,16 @@
  */
 
 #include "cellRtc.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>   /* abs */
 #include <time.h>
+
+/* Guest pointers reach these HLE entries as raw 32-bit guest effective addresses
+ * (the generic adapter passes GPRs verbatim); translate to host before deref.
+ * NULL guest EA -> NULL host. Matches the cellSpurs convention. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -109,6 +115,8 @@ s32 cellRtcGetCurrentTick(CellRtcTick* pTick)
     if (!pTick)
         return CELL_EINVAL;
 
+    pTick = GUEST_PTR(pTick, CellRtcTick*);   /* guest EA -> host */
+
     u64 unix_usec = get_host_time_usec();
     pTick->tick = unix_usec + PS3_UNIX_EPOCH_DIFF * USEC_PER_SEC;
 
@@ -119,6 +127,8 @@ s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock)
 {
     if (!pClock)
         return CELL_EINVAL;
+
+    pClock = GUEST_PTR(pClock, CellRtcDateTime*);   /* guest EA -> host */
 
     u64 host_usec = get_host_time_usec();
     time_t t = (time_t)(host_usec / USEC_PER_SEC);
@@ -140,6 +150,8 @@ s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock)
     if (!pClock)
         return CELL_EINVAL;
 
+    pClock = GUEST_PTR(pClock, CellRtcDateTime*);   /* guest EA -> host */
+
     u64 host_usec = get_host_time_usec();
     time_t t = (time_t)(host_usec / USEC_PER_SEC);
     u32 usec = (u32)(host_usec % USEC_PER_SEC);
@@ -160,6 +172,9 @@ s32 cellRtcGetTime_t(const CellRtcTick* pTick, s64* pTime)
     if (!pTick || !pTime)
         return CELL_EINVAL;
 
+    pTick = GUEST_PTR(pTick, const CellRtcTick*);   /* guest EA -> host */
+    pTime = GUEST_PTR(pTime, s64*);                 /* guest EA -> host */
+
     *pTime = tick_to_time_t(pTick->tick);
     return CELL_OK;
 }
@@ -169,25 +184,35 @@ s32 cellRtcSetTime_t(CellRtcTick* pTick, s64 iTime)
     if (!pTick)
         return CELL_EINVAL;
 
+    pTick = GUEST_PTR(pTick, CellRtcTick*);   /* guest EA -> host */
+
     pTick->tick = time_t_to_tick(iTime);
     return CELL_OK;
 }
+
+/* Defined below; declared here so the Tick-arithmetic entries can call the
+ * host-pointer workers directly with their host stack CellRtcDateTime (`dt`)
+ * after translating their OWN guest tick pointers -- never re-translating `&dt`. */
+static void rtc_set_tick_h(CellRtcDateTime* pDateTime, const CellRtcTick* pTick);
+static void rtc_get_tick_h(const CellRtcDateTime* pDateTime, CellRtcTick* pTick);
 
 s32 cellRtcTickAddYears(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
 {
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);              /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);
 
-    /* Convert tick to datetime, add years, convert back */
+    /* Convert tick to datetime, add years, convert back (dt is a HOST stack var). */
     CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
+    rtc_set_tick_h(&dt, pTick1);
     dt.year = (u16)((s32)dt.year + iAdd);
 
     /* Clamp Feb 29 -> Feb 28 if not leap year */
     if (dt.month == 2 && dt.day == 29 && !is_leap_year(dt.year))
         dt.day = 28;
 
-    cellRtcGetTick(&dt, pTick0);
+    rtc_get_tick_h(&dt, pTick0);
     return CELL_OK;
 }
 
@@ -195,9 +220,11 @@ s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAd
 {
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);              /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);
 
     CellRtcDateTime dt;
-    cellRtcSetTick(&dt, pTick1);
+    rtc_set_tick_h(&dt, pTick1);
 
     s32 total_months = (s32)(dt.year - 1) * 12 + (s32)(dt.month - 1) + iAdd;
     if (total_months < 0) total_months = 0;
@@ -210,7 +237,7 @@ s32 cellRtcTickAddMonths(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAd
     if (dt.day > (u16)max_day)
         dt.day = (u16)max_day;
 
-    cellRtcGetTick(&dt, pTick0);
+    rtc_get_tick_h(&dt, pTick0);
     return CELL_OK;
 }
 
@@ -218,6 +245,9 @@ s32 cellRtcTickAddDays(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd)
 {
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
+
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);         /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);   /* guest EA -> host */
 
     pTick0->tick = pTick1->tick + (s64)iAdd * 24LL * 3600LL * USEC_PER_SEC;
     return CELL_OK;
@@ -228,6 +258,9 @@ s32 cellRtcTickAddHours(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iAdd
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);         /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);   /* guest EA -> host */
+
     pTick0->tick = pTick1->tick + (s64)iAdd * 3600LL * USEC_PER_SEC;
     return CELL_OK;
 }
@@ -236,6 +269,9 @@ s32 cellRtcTickAddMinutes(CellRtcTick* pTick0, const CellRtcTick* pTick1, s32 iA
 {
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
+
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);         /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);   /* guest EA -> host */
 
     pTick0->tick = pTick1->tick + (s64)iAdd * 60LL * USEC_PER_SEC;
     return CELL_OK;
@@ -246,6 +282,9 @@ s32 cellRtcTickAddSeconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s64 iA
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);         /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);   /* guest EA -> host */
+
     pTick0->tick = pTick1->tick + iAdd * (s64)USEC_PER_SEC;
     return CELL_OK;
 }
@@ -255,6 +294,9 @@ s32 cellRtcTickAddMicroseconds(CellRtcTick* pTick0, const CellRtcTick* pTick1, s
     if (!pTick0 || !pTick1)
         return CELL_EINVAL;
 
+    pTick0 = GUEST_PTR(pTick0, CellRtcTick*);         /* guest EA -> host */
+    pTick1 = GUEST_PTR(pTick1, const CellRtcTick*);   /* guest EA -> host */
+
     pTick0->tick = pTick1->tick + iAdd;
     return CELL_OK;
 }
@@ -263,6 +305,9 @@ s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUt
 {
     if (!pLocalTime || !pUtc)
         return CELL_EINVAL;
+
+    pLocalTime = GUEST_PTR(pLocalTime, const CellRtcTick*);   /* guest EA -> host */
+    pUtc       = GUEST_PTR(pUtc, CellRtcTick*);               /* guest EA -> host */
 
     /* Get local-to-UTC offset using the C runtime */
     time_t now = time(NULL);
@@ -288,6 +333,9 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
     if (!pUtc || !pLocalTime)
         return CELL_EINVAL;
 
+    pUtc       = GUEST_PTR(pUtc, const CellRtcTick*);        /* guest EA -> host */
+    pLocalTime = GUEST_PTR(pLocalTime, CellRtcTick*);        /* guest EA -> host */
+
     time_t now = time(NULL);
     struct tm local_tm, utc_tm;
 #ifdef _WIN32
@@ -310,6 +358,9 @@ s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
 {
     if (!pszDateTime || !pTick)
         return CELL_EINVAL;
+
+    pszDateTime = GUEST_PTR(pszDateTime, char*);            /* guest EA -> host */
+    pTick       = GUEST_PTR(pTick, const CellRtcTick*);     /* guest EA -> host */
 
     /* Convert tick to time_t, apply timezone offset */
     s64 unix_time = tick_to_time_t(pTick->tick);
@@ -344,6 +395,9 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
 {
     if (!pszDateTime || !pTick)
         return CELL_EINVAL;
+
+    pszDateTime = GUEST_PTR(pszDateTime, char*);            /* guest EA -> host */
+    pTick       = GUEST_PTR(pTick, const CellRtcTick*);     /* guest EA -> host */
 
     s64 unix_time = tick_to_time_t(pTick->tick);
     unix_time += (s64)iTimeZoneMinutes * 60;
@@ -401,11 +455,12 @@ s32 cellRtcGetDaysInMonth(s32 year, s32 month)
     return s_days_in_month[month - 1];
 }
 
-s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
+/* Host-pointer workers: operate on ALREADY-translated host pointers. The HLE
+ * entries below translate then call these; internal callers (cellRtcTickAdd*)
+ * that already hold host pointers (e.g. a host stack CellRtcDateTime) call these
+ * directly, avoiding a double GUEST_PTR translation of a host address. */
+static void rtc_set_tick_h(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
 {
-    if (!pDateTime || !pTick)
-        return CELL_EINVAL;
-
     u64 tick = pTick->tick;
     u32 usec = (u32)(tick % USEC_PER_SEC);
     s64 unix_time = tick_to_time_t(tick);
@@ -419,14 +474,10 @@ s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
 #endif
 
     tm_to_datetime(&tm_val, usec, pDateTime);
-    return CELL_OK;
 }
 
-s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
+static void rtc_get_tick_h(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
 {
-    if (!pDateTime || !pTick)
-        return CELL_EINVAL;
-
     struct tm t = datetime_to_tm(pDateTime);
 #ifdef _WIN32
     time_t tt = _mkgmtime(&t);
@@ -435,5 +486,28 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
 #endif
 
     pTick->tick = time_t_to_tick((s64)tt) + pDateTime->microsecond;
+}
+
+s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
+{
+    if (!pDateTime || !pTick)
+        return CELL_EINVAL;
+
+    pDateTime = GUEST_PTR(pDateTime, CellRtcDateTime*);   /* guest EA -> host */
+    pTick     = GUEST_PTR(pTick, const CellRtcTick*);     /* guest EA -> host */
+
+    rtc_set_tick_h(pDateTime, pTick);
+    return CELL_OK;
+}
+
+s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
+{
+    if (!pDateTime || !pTick)
+        return CELL_EINVAL;
+
+    pDateTime = GUEST_PTR(pDateTime, const CellRtcDateTime*);   /* guest EA -> host */
+    pTick     = GUEST_PTR(pTick, CellRtcTick*);                 /* guest EA -> host */
+
+    rtc_get_tick_h(pDateTime, pTick);
     return CELL_OK;
 }

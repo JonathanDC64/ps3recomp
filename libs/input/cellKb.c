@@ -9,8 +9,14 @@
  */
 
 #include "cellKb.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
+
+/* Guest pointers reach these HLE entries as raw 32-bit guest effective addresses
+ * (the generic adapter passes GPRs verbatim); translate to host before deref.
+ * NULL guest EA -> NULL host. Matches the cellSpurs convention. */
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -152,6 +158,8 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
     if (port_no >= s_kb_max_connect || !data)
         return CELL_KB_ERROR_INVALID_PARAMETER;
 
+    data = GUEST_PTR(data, CellKbData*);   /* guest EA -> host */
+
     KbPortState* kb = &s_kb_ports[port_no];
 
     if (!kb->connected) {
@@ -197,6 +205,8 @@ s32 cellKbGetInfo(CellKbInfo* info)
 
     if (!info)
         return CELL_KB_ERROR_INVALID_PARAMETER;
+
+    info = GUEST_PTR(info, CellKbInfo*);   /* guest EA -> host */
 
     memset(info, 0, sizeof(CellKbInfo));
     info->max_connect = s_kb_max_connect;
