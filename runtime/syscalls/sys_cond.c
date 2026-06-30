@@ -5,6 +5,11 @@
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdlib.h>   /* getenv/strtol/strtoul/strtoull (probes must not truncate ptrs) */
+
+/* Set by spu_workload when an awaited SPURS leaf task completes; consumed by the
+ * SPURS_RELEASE_COND completion-bridge in sys_cond_wait. */
+volatile long g_spurs_release_pending = 0;
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -158,18 +163,28 @@ int64_t sys_cond_wait(ppu_context* ctx)
     { static int fc = -2; if (fc == -2) { const char* e = getenv("FORCE_COND_DONE"); fc = e ? (int)strtol(e,0,0) : -1; }
       if (fc >= 0 && cond_id == (uint32_t)fc) return CELL_OK; }
 
+    /* Completion-bridge release (SPURS_RELEASE_COND=N): release cond N's barrier
+     * once the awaited SPURS leaf work has actually completed (g_spurs_release_pending
+     * set by spu_workload on leaf exit). Sticky -> no lost wakeup (unlike raw signal),
+     * and only after the data is produced (unlike unconditional FORCE_COND_DONE). */
+    { extern volatile long g_spurs_release_pending;
+      static int rc = -2; if (rc == -2) { const char* e = getenv("SPURS_RELEASE_COND"); rc = e ? (int)strtol(e,0,0) : -1; }
+      if (rc >= 0 && cond_id == (uint32_t)rc && g_spurs_release_pending > 0) {
+          long p = --g_spurs_release_pending;   /* consume one completion */
+          fprintf(stderr, "[spurs-bridge] release cond %u (work done, remaining=%ld)\n", cond_id, p);
+          return CELL_OK;
+      } }
+
     /* One-shot guest backtrace for the hot cond=2 waiter (Frontier #11): walk the
      * PPC64 stack back-chain (*(r1)=prev SP, saved LR at prev+0x10) to identify which
      * guest function is blocked and what it's waiting for. */
-    if (cond_id == 9) { static int once9 = 0; if (!once9) { once9 = 1;
+    if (cond_id == 9) { static int n9 = 0; if (n9 < 12) { n9++;
         extern uint32_t vm_read32(uint64_t);
-        extern uint8_t* vm_base;
-        uint32_t obj = (uint32_t)ctx->gpr[31];
-        char nm[33]; for (int i = 0; i < 32; i++) { uint8_t b = vm_base[(obj + 0x18 + i) & 0x1FFFFFFF]; nm[i] = (b >= 32 && b < 127) ? (char)b : '.'; } nm[32] = 0;
-        fprintf(stderr, "[cond9-bt] MAIN waiter cia=0x%08X lr=0x%08X obj(gpr31)=0x%08X "
-                "hdr[+0=0x%08X +4=0x%08X +8=0x%08X +C=0x%08X] name@+0x18=\"%s\"\n",
-                (uint32_t)ctx->cia, (uint32_t)ctx->lr, obj,
-                vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8), vm_read32(obj+0xC), nm);
+        uint32_t obj = (uint32_t)ctx->gpr[31];          /* = barrier_obj + 0xC */
+        uint32_t base = obj - 0xC;                       /* barrier object */
+        /* +0x1F0 from the barrier base = the target count N the waiter loops on. */
+        fprintf(stderr, "[cond9-bt] #%d base=0x%08X count(+0x1F0)=0x%08X +0x1EC=0x%08X +0x1F4=0x%08X\n",
+                n9, base, vm_read32(base+0x1F0), vm_read32(base+0x1EC), vm_read32(base+0x1F4));
     } }
 
     if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
@@ -314,6 +329,21 @@ int64_t sys_cond_signal(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+/* C-callable: wake one waiter on cond `cond_id` (completion-bridging experiment --
+ * spu_workload signals a SPURS barrier's cond once per completed leaf task). */
+void spurs_signal_cond_by_id(uint32_t cond_id)
+{
+    if (cond_id == 0 || cond_id > SYS_COND_MAX) return;
+    sys_cond_info* c = &g_sys_conds[cond_id - 1];
+    if (!c->active) return;
+#ifdef _WIN32
+    WakeConditionVariable(&c->cv);
+#else
+    pthread_cond_signal(&c->cv);
+#endif
+    fprintf(stderr, "[spurs-bridge] signaled cond %u (one waiter)\n", cond_id);
 }
 
 /* ---------------------------------------------------------------------------

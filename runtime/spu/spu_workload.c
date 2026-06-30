@@ -289,6 +289,23 @@ static void spu_async_run(spu_async_job* j)
              * Helper on evq 12) wakes and signals the barrier the game waits on.
              * Tests whether wiring SPU-completion -> PPU-event unblocks pre-title
              * loading. Params overridable: SPURS_DONE_SPUP, SPURS_DONE_DATA. */
+            /* Completion bridging (SPURS_SIGNAL_COND=N[,TS]): on leaf completion,
+             * signal SPURS barrier cond N once (the barrier waits N times, one wake
+             * per completed task). Optional ,TS restricts to taskset_ea==TS. The leaf
+             * has actually run (data ready), so this releases the barrier correctly --
+             * unlike force-releasing the wait before the work runs. */
+            { const char* se = getenv("SPURS_SIGNAL_COND");
+              if (se) { extern void spurs_signal_cond_by_id(uint32_t);
+                  char* end = 0; unsigned long cid = strtoul(se, &end, 0);
+                  unsigned long ts = 0; if (end && *end == ',') ts = strtoul(end+1, 0, 0);
+                  if (!ts || (uint32_t)ts == j->taskset_ea) {
+                      extern volatile long g_spurs_release_pending;
+                      g_spurs_release_pending++;   /* sticky: SPURS_RELEASE_COND consumes it */
+                      fprintf(stderr, "[spu_workload] completion-bridge: signal cond %lu + mark "
+                              "release-pending (image=%d taskset=0x%08X)\n", cid, j->image_id, j->taskset_ea);
+                      spurs_signal_cond_by_id((uint32_t)cid);
+                  } } }
+
             { const char* qe = getenv("SPURS_DONE_EVQ");
               if (qe) { extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
                   uint32_t q = (uint32_t)strtoul(qe, 0, 0);
