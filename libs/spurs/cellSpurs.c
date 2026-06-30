@@ -578,10 +578,54 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     CellSpursTaskAttribute* attr_h = GUEST_PTR(attr, CellSpursTaskAttribute*);
     /* taskset/taskId forwarded raw (callee translates); elf/context are guest EAs. */
+    if (attr_h->eaExitCode)
+        printf("[cellSpurs] CreateTaskWithAttribute: task exit-code container @0x%08X\n",
+               (u32)attr_h->eaExitCode);
     return cellSpursCreateTask(taskset, taskId,
                                (void*)(uintptr_t)(u32)attr_h->eaElf,
                                (void*)(uintptr_t)(u32)attr_h->eaContext,
                                attr_h->sizeContext, attr);
+}
+
+/* ---- SPURS task exit-code mechanism -------------------------------------- *
+ * func_00A31158's wait is the task EXIT-CODE poll: the leaf task runs, does
+ * `stop 0` (CELL_SPURS_TASK_SYSCALL_EXIT), and the SPURS taskset PM writes the
+ * task's exit code into a container the PPU polls. The game sets that container
+ * up via these three calls (previously unresolved NIDs -> no-op). Implement them
+ * so the container EA reaches the task (the runtime then writes the code on EXIT).
+ * Reimplemented clean from the public SDK contracts (RPCS3 stubs these on the PPU
+ * side because it runs the real SPU kernel). */
+
+/* cellSpursTaskAttributeSetExitCodeContainer(pAttribute, pExitCode): record the
+ * guest EA of the task's CellSpursTaskExitCode container in the attribute. */
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr, void* pExitCode)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    CellSpursTaskAttribute* a = GUEST_PTR(attr, CellSpursTaskAttribute*);
+    a->eaExitCode = (u64)(uintptr_t)pExitCode;
+    printf("[cellSpurs] TaskAttributeSetExitCodeContainer(exitCode=0x%08X)\n",
+           (u32)(uintptr_t)pExitCode);
+    return CELL_OK;
+}
+
+/* cellSpursTaskExitCodeInitialize(pExitCode): zero the 128-byte exit-code
+ * container to its "task has not exited yet" state. (Single-arg form.) */
+s32 cellSpursTaskExitCodeInitialize(void* pExitCode)
+{
+    if (!pExitCode) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    uint8_t* c = GUEST_PTR(pExitCode, uint8_t*);
+    memset(c, 0, 128);
+    printf("[cellSpurs] TaskExitCodeInitialize(0x%08X)\n", (u32)(uintptr_t)pExitCode);
+    return CELL_OK;
+}
+
+/* cellSpursTasksetAttributeSetTasksetSize(pAttribute, size): record the taskset
+ * size hint. We don't size-limit tasksets, so just acknowledge it. */
+s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
+{
+    (void)attr;
+    printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    return CELL_OK;
 }
 
 /* The SDK's versioned taskset-attribute initializer. We forward taskset creation

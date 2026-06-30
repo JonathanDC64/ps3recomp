@@ -147,7 +147,8 @@ struct CellSpursTaskAttribute {
     u64  eaContext;
     u64  eaElf;        /* SPU task ELF guest EA (set by _cellSpursTaskAttributeInitialize) */
     u64  eaArgument;   /* guest EA of the 16-byte CellSpursTaskArgument (r10 of the init) */
-    u8   _padding[48];
+    u64  eaExitCode;   /* guest EA of the CellSpursTaskExitCode container (SetExitCodeContainer) */
+    u8   _padding[40];
 };
 
 /* Event flag -- SPURS-level event synchronization */
@@ -230,6 +231,11 @@ s32 cellSpursJoinTask(CellSpursTaskset* taskset, CellSpursTaskId taskId,
 s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId);
 
 s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr);
+
+/* Task exit-code container setup (func_00A31158 completion path). */
+s32 cellSpursTaskAttributeSetExitCodeContainer(CellSpursTaskAttribute* attr, void* pExitCode);
+s32 cellSpursTaskExitCodeInitialize(void* pExitCode);
+s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
 
 /* ---------------------------------------------------------------------------
  * Workload functions
