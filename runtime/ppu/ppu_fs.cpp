@@ -34,6 +34,7 @@
 extern "C" uint8_t* vm_base;
 extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+extern "C" void     ds_dump_shadow(void);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 
@@ -114,6 +115,16 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+
+    /* Diagnostic: the FileLoader builds a hash path "/%02x/%02x..." that comes out
+     * unformatted ("/02x/..."). Dump the guest call stack + fd_ptr on that path so
+     * we can find the caller that builds it. */
+    if (getenv("FS_TRACE") && (strstr(gpath, "02x") || strstr(gpath, "%02x"))) {
+        static int _n = 0; if (_n++ < 2) {
+        fprintf(stderr, "[fs-hash] malformed open path='%s' flags=0x%08X fd_ptr=0x%08X\n",
+                gpath, flags, fd_ptr);
+        ds_dump_shadow(); }
+    }
 
     /* fopen() mode strings can't express the PS3/POSIX open semantics (e.g.
      * O_WRONLY without create+truncate, or O_CREAT without O_TRUNC), so build
