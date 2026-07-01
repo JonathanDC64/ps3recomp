@@ -517,9 +517,25 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             wlen = 0x4000u;
         }
         FILE* out = stdout;   /* keep all TTY on stdout, clean of [ppu] logs */
+        static char pacc[8192]; static uint32_t paccn = 0;
         for (uint32_t i = 0; i < wlen; i++) {
             if (ppu_vm_size && buf + i >= ppu_vm_size) break;
-            fputc(vm_read8(buf + i), out);
+            uint8_t c = vm_read8(buf + i);
+            fputc(c, out);
+            /* Accumulate lines; on a Dantelion allocator panic dump the guest
+             * call stack so we can find the failing DLStdAllocator transaction. */
+            if (paccn < sizeof(pacc) - 1) pacc[paccn++] = (char)c;
+            if (c == '\n' || paccn >= sizeof(pacc) - 1) {
+                pacc[paccn] = 0;
+                if (strstr(pacc, "Transaction failed") || strstr(pacc, "DL_PANIC") ||
+                    strstr(pacc, "Dantelion2 Panic")) {
+                    extern void ds_dump_shadow(void);
+                    fflush(out);
+                    fprintf(stderr, "[panic-hook] Dantelion panic -- guest backtrace:\n");
+                    ds_dump_shadow();
+                }
+                paccn = 0;
+            }
         }
         fflush(out);
         if (pwl) vm_write32(pwl, len);

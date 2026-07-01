@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include <string.h>   /* strstr, memcpy */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
@@ -53,6 +54,20 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
+
+        /* Catch the Dantelion allocator panic and dump the guest call stack so
+         * we can find the failing allocation site (DLStdAllocator.inl:268). */
+        if (len < 4096u) {
+            char tmp[4096];
+            memcpy(tmp, vm_base + buf_ea, len);
+            tmp[len] = 0;
+            if (strstr(tmp, "Transaction failed") || strstr(tmp, "DL_PANIC") ||
+                strstr(tmp, "Dantelion2 Panic")) {
+                extern void ds_dump_shadow(void);
+                fprintf(stderr, "[panic-hook] Dantelion panic detected -- guest backtrace:\n");
+                ds_dump_shadow();
+            }
+        }
     }
 
     /* Write back the number of bytes written */

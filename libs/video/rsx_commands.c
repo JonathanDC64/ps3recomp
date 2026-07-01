@@ -607,6 +607,16 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 
     if (g_rsx_mlog < 0) { const char* e = getenv("RSX_MLOG"); g_rsx_mlog = (e && *e != '0') ? 300 : 0; }
 
+    if (getenv("RSX_FIRST")) { static int shown = 0; if (shown < 8 && count > 0) {
+        shown++;
+        fprintf(stderr, "[rsx-first] call size=%u words=%u  hdrs:", size, count);
+        for (u32 k = 0; k < count && k < 8; k++) {
+            u32 h = buf[k]; u32 t = (h >> 29) & 0x7;
+            fprintf(stderr, " [%u]=0x%08X(t%u,m0x%04X,n%u)", k, h, t, ((h>>2)&0x7FF)<<2, (h>>18)&0x7FF);
+        }
+        fprintf(stderr, "\n");
+    } }
+
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;

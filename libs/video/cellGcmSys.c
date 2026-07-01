@@ -465,12 +465,20 @@ void cellGcm_rsx_process_fifo(void)
     { u32 put = vm_read32(GCM_CONTROL_GUEST_EA + 0);
       vm_write32(GCM_CONTROL_GUEST_EA + 4, put); }
 
-    if (!s_gcm_context_ea) return;
+    if (!s_gcm_context_ea) {
+        if (getenv("GCM_FIFO_DBG")) { static int n=0; if((n++ & 0x7F)==0)
+            fprintf(stderr, "[gcm-fifo] ctx_ea=0 (not set up yet)\n"); }
+        return;
+    }
     if (!s_inited) { rsx_state_init(&s_state); s_get = s_config.ioAddress; s_inited = 1; }
 
     /* The title's cellGcm macros write methods to the context's `current` pointer
      * (context+0x8) and advance it. Read it (vm_read32 byte-swaps BE->host). */
     u32 current = vm_read32(s_gcm_context_ea + 0x8);
+    if (getenv("GCM_FIFO_DBG")) { static int n=0; if((n++ & 0x7F)==0)
+        fprintf(stderr, "[gcm-fifo] ctx_ea=0x%08X begin=0x%08X current=0x%08X get=0x%08X put=0x%08X\n",
+                s_gcm_context_ea, vm_read32(s_gcm_context_ea+0x0), current, s_get,
+                vm_read32(GCM_CONTROL_GUEST_EA + 0)); }
     if (current < s_get) s_get = s_config.ioAddress;   /* wrapped */
     if (current <= s_get) return;                       /* nothing new */
 

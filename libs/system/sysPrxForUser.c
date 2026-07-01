@@ -765,9 +765,33 @@ s32 sys_get_random_number(void* buf, u64 size)
  * Console I/O (debug)
  * -----------------------------------------------------------------------*/
 
+/* Accumulate console output and, on a Dantelion panic, dump the guest call
+ * stack so we can locate the failing DLStdAllocator transaction. */
+static void console_panic_scan(const char* s, u32 len)
+{
+    static char acc[8192];
+    static u32 accn = 0;
+    for (u32 i = 0; i < len; i++) {
+        char c = s[i];
+        if (accn < sizeof(acc) - 1) acc[accn++] = c;
+        if (c == '\n' || accn >= sizeof(acc) - 1) {
+            acc[accn] = 0;
+            if (strstr(acc, "Transaction failed") || strstr(acc, "DL_PANIC") ||
+                strstr(acc, "Dantelion2 Panic")) {
+                extern void ds_dump_shadow(void);
+                fprintf(stderr, "[panic-hook] Dantelion panic -- guest backtrace:\n");
+                ds_dump_shadow();
+            }
+            accn = 0;
+        }
+    }
+}
+
 s32 console_putc(s32 ch)
 {
     fputc(ch, stderr);
+    char c = (char)ch;
+    console_panic_scan(&c, 1);
     return CELL_OK;
 }
 
@@ -778,8 +802,10 @@ s32 console_getc(void)
 
 s32 console_write(const void* buf, u32 len)
 {
-    if (buf && len > 0)
+    if (buf && len > 0) {
         fwrite(buf, 1, len, stderr);
+        console_panic_scan((const char*)buf, len);
+    }
     return CELL_OK;
 }
 
