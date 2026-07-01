@@ -187,6 +187,7 @@ void spu_reservation_notify_write(uint32_t ea);
 
 /* Generic write watchpoint: log any guest store into [YDKJ_WWATCH, +0x40) with size +
  * caller RVA, across all widths (write32 has its own inline variant below). */
+extern "C" void ds_dump_shadow(void);
 static inline void vm_hexwatch(uint64_t a, uint64_t v, int sz, void* ra) {
     static int hw=-2; if (hw==-2) { hw = getenv("YDKJ_HEXWATCH")?1:0; }
     if (!hw) return;
@@ -198,7 +199,9 @@ static inline void vm_hexwatch(uint64_t a, uint64_t v, int sz, void* ra) {
     }
     if (!hit) return;
     static HMODULE _m=0; if(!_m) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)ra,&_m);
-    static int _n=0; if(_n++<8) fprintf(stderr,"[HEXWATCH] wrote '02x' @0x%08X (write%d) rva=0x%llX\n", ea, sz, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m));
+    static int _n=0; if(_n++<3) {
+        fprintf(stderr,"[HEXWATCH] wrote '02x' @0x%08X (write%d) rva=0x%llX -- guest stack:\n", ea, sz, (unsigned long long)((uintptr_t)ra-(uintptr_t)_m));
+        ds_dump_shadow(); }
 }
 static inline void vm_watch(uint64_t a, uint64_t v, int sz, void* ra) {
     vm_hexwatch(a, v, sz, ra);
