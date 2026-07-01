@@ -141,6 +141,11 @@ static void cellFsOpen(ppu_context* ctx)
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        /* EXPERIMENT (FS_OPENFAIL_NEGFD): write -1 to the out-fd on failure so a
+         * caller that checks the fd (not the return code) sees an invalid handle
+         * and takes its cache-miss/source fallback instead of reading the stale
+         * sentinel (512). */
+        if (getenv("FS_OPENFAIL_NEGFD") && fd_ptr) vm_write32(fd_ptr, 0xFFFFFFFFu);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
