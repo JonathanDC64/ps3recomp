@@ -857,7 +857,8 @@ class PPULifter:
         if mn in ("stfsx", "stfdx"):
             frs, ra_i, rb_i = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"(ctx->gpr[{ra_i}] + ctx->gpr[{rb_i}])" if ra_i != "0" else f"ctx->gpr[{rb_i}]"
-            if "s" in mn:
+            # match single-precision explicitly: "stfdx" contains an 's' too (see stfd note)
+            if mn == "stfsx":
                 return f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; memcpy(&tmp, &ftmp, 4); vm_write32({ea}, tmp); }}"
             else:
                 return f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); vm_write64({ea}, tmp); }}"
@@ -1112,7 +1113,13 @@ class PPULifter:
             frs = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                if "s" in mn:
+                # NB: match single-precision by explicit mnemonic, NOT `"s" in mn`
+                # -- every store mnemonic ("stf...") contains an 's', so the old
+                # substring test mis-classified stfd/stfdu as single-precision and
+                # emitted a lossy 4-byte (float) store, corrupting the double AND
+                # leaving the other 4 bytes stale. This broke fctidz+stfd+ld
+                # float->int-to-GPR idioms (garbage counts) and any stored double.
+                if mn in ("stfs", "stfsu"):
                     return (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
                             f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
                 else:
