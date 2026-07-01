@@ -306,9 +306,22 @@ static void spu_async_run(spu_async_job* j)
                       spurs_signal_cond_by_id((uint32_t)cid);
                   } } }
 
-            { const char* qe = getenv("SPURS_DONE_EVQ");
-              if (qe) { extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
-                  uint32_t q = (uint32_t)strtoul(qe, 0, 0);
+            /* Completion event propagation. On real HW the SPU SPURS kernel posts a
+             * completion event to a workload's event queue when its tasks finish; the
+             * PPU-side handler (e.g. the Havok PPU Thread on evq 5) receives it and
+             * releases the barrier the game's MAIN loop waits on. We run leaf tasks
+             * directly (bypassing the kernel), so we post that event here.
+             *
+             * Default mapping (proven to unblock the Core.Res asset pipeline): the
+             * Havok leaf image (image_id 7) -> evq 5. SPURS_DONE_EVQ=N overrides the
+             * target queue for experiments; SPURS_DONE_SPUP / SPURS_DONE_DATA tune the
+             * payload. */
+            { extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
+              uint32_t q = 0;
+              const char* qe = getenv("SPURS_DONE_EVQ");
+              if (qe) q = (uint32_t)strtoul(qe, 0, 0);
+              else if (j->image_id == 7) q = 5;   /* Havok leaf completion -> Havok PPU Thread */
+              if (q) {
                   uint32_t spup = 0; { const char* e = getenv("SPURS_DONE_SPUP"); if (e) spup = (uint32_t)strtoul(e,0,0); }
                   uint64_t d3 = (uint64_t)j->taskset_ea; { const char* e = getenv("SPURS_DONE_DATA"); if (e) d3 = strtoull(e,0,0); }
                   fprintf(stderr, "[spu_workload] POST completion USER event q=%u spup=%u data3=0x%llX (image=%d)\n",
