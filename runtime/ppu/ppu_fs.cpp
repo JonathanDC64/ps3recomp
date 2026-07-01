@@ -162,9 +162,10 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { fprintf(stderr,"[fs] read FAIL bad fd=%d\n", fd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (getenv("FS_TRACE")) fprintf(stderr, "[fs] read fd=%d nbytes=%llu -> %zu\n", fd, (unsigned long long)nbytes, n);
     if (nread_ptr) vm_write64(nread_ptr, n);
     ctx->gpr[3] = CELL_OK;
 }
@@ -187,10 +188,14 @@ static void cellFsLseek(ppu_context* ctx)
     int64_t off   = (int64_t)ctx->gpr[4];
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        fprintf(stderr, "[fs] lseek FAIL bad fd=%d off=%lld wh=%u\n", fd, (long long)off, wh);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
+    int sr = fseek(g_files[fd], (long)off, worigin);
     long p = ftell(g_files[fd]);
+    if (getenv("FS_TRACE")) fprintf(stderr, "[fs] lseek fd=%d off=%lld wh=%u -> pos=%ld (fseek rc=%d)\n", fd, (long long)off, wh, p, sr);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
