@@ -489,6 +489,22 @@ extern "C" void lv2_syscall(ppu_context* ctx)
 #endif
         return;
     }
+    case 803: {   /* sys_fs_write(fd, buf, len, u64* nwrite) -- DIAGNOSTIC: the DL
+                   * panic logger writes its "detail" message here (to a log file
+                   * we don't back). Echo it to stderr so we can see WHAT failed. */
+        uint32_t buf = (uint32_t)ctx->gpr[4];
+        uint32_t len = (uint32_t)ctx->gpr[5];
+        uint32_t nw  = (uint32_t)ctx->gpr[6];
+        if (getenv("FS_WRITE_DBG") && buf && len && len < 4096 &&
+            (!ppu_vm_size || buf + len <= ppu_vm_size)) {
+            fprintf(stderr, "[fs-write fd=%u] ", (uint32_t)ctx->gpr[3]);
+            for (uint32_t i = 0; i < len; i++) fputc(vm_read8(buf + i), stderr);
+            fputc('\n', stderr); fflush(stderr);
+        }
+        if (nw) vm_write64(nw, len);   /* report all bytes written */
+        ctx->gpr[3] = 0;
+        return;
+    }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
         static uint32_t s_next_va = 0x11000000u;   /* just past the loaded image */
@@ -518,12 +534,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         }
         FILE* out = stdout;   /* keep all TTY on stdout, clean of [ppu] logs */
         static char pacc[8192]; static uint32_t paccn = 0;
+        static char prevlines[4][512]; static int prevpos = 0;   /* ring of prior lines */
         for (uint32_t i = 0; i < wlen; i++) {
             if (ppu_vm_size && buf + i >= ppu_vm_size) break;
             uint8_t c = vm_read8(buf + i);
             fputc(c, out);
-            /* Accumulate lines; on a Dantelion allocator panic dump the guest
-             * call stack so we can find the failing DLStdAllocator transaction. */
+            /* Accumulate lines; on a Dantelion allocator panic dump the prior
+             * lines (the "see above message for detail") + the guest call stack
+             * so we can pin the failing DLStdAllocator transaction. */
             if (paccn < sizeof(pacc) - 1) pacc[paccn++] = (char)c;
             if (c == '\n' || paccn >= sizeof(pacc) - 1) {
                 pacc[paccn] = 0;
@@ -531,9 +549,17 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                     strstr(pacc, "Dantelion2 Panic")) {
                     extern void ds_dump_shadow(void);
                     fflush(out);
-                    fprintf(stderr, "[panic-hook] Dantelion panic -- guest backtrace:\n");
+                    fprintf(stderr, "[panic-hook] Dantelion panic. Prior tty lines:\n");
+                    for (int k = 0; k < 4; k++) {
+                        const char* pl = prevlines[(prevpos + k) & 3];
+                        if (pl[0]) fprintf(stderr, "[panic-hook]  prev: %s", pl);
+                    }
+                    fprintf(stderr, "[panic-hook] guest backtrace:\n");
                     ds_dump_shadow();
                 }
+                /* stash this line into the ring */
+                { char* slot = prevlines[prevpos & 3]; prevpos++;
+                  uint32_t n = paccn < 511 ? paccn : 511; memcpy(slot, pacc, n); slot[n] = 0; }
                 paccn = 0;
             }
         }
