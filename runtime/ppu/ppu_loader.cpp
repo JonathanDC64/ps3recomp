@@ -349,6 +349,24 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     { static int en = -1; if (en < 0) { const char* e = getenv("YDKJ_ICTRACE"); en = e ? 1 : 0; }
       if (en) { fprintf(stderr, "[ic] 0x%08X r3=0x%08X r4=0x%08X\n", addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4]); fflush(stderr); } }
 
+    /* Targeted: the Core.Res path-builder's format call (func_00C32360 @0x00C32550).
+     * Log target + args + any string arg to pin the "/02x/" (%02x) path-format bug. */
+    if (getenv("FS_TRACE") && ((uint32_t)ctx->cia == 0x00C32550u || (uint32_t)ctx->cia == 0x00C323D0u)) {
+        static int _n = 0; if (_n++ < 6) {
+            extern uint8_t* vm_base;
+            fprintf(stderr, "[icfmt] cia=0x%08X target=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X r7=0x%08X\n",
+                    (uint32_t)ctx->cia, addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                    (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7]);
+            for (int r = 3; r <= 7; r++) {
+                uint32_t p = (uint32_t)ctx->gpr[r];
+                if (p > 0x10000 && p < 0x1900000) {
+                    char s[40]; int k=0; for (; k<39; k++){ char c=(char)vm_base[p+k]; if(c<0x20||c>0x7e)break; s[k]=c;} s[k]=0;
+                    if (k>=2) fprintf(stderr, "[icfmt]   r%d=0x%08X -> \"%s\"\n", r, p, s);
+                }
+            }
+        }
+    }
+
     ppu_fn fn = ppu_lookup(addr);
     if (fn) {
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
