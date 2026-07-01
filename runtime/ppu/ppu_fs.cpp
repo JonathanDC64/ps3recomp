@@ -174,7 +174,14 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { fprintf(stderr,"[fs] read FAIL bad fd=%d\n", fd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        /* EXPERIMENT (FS_BADFD_EOF): report 0 bytes read + CELL_OK (EOF) instead of
+         * EIO, to see if the FileLoader's read-loop on the sentinel fd 512 treats it
+         * as EOF and advances past the gate. */
+        if (getenv("FS_BADFD_EOF")) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
+        static int _rn = 0; if (_rn++ < 3) fprintf(stderr,"[fs] read FAIL bad fd=%d\n", fd);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
+    }
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
     if (getenv("FS_TRACE")) fprintf(stderr, "[fs] read fd=%d nbytes=%llu -> %zu\n", fd, (unsigned long long)nbytes, n);
@@ -201,6 +208,7 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        if (getenv("FS_BADFD_EOF")) { if (pos_ptr) vm_write64(pos_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
         static int _n = 0;
         if (_n++ < 1) {
             fprintf(stderr, "[fs] lseek FAIL bad fd=%d off=%lld wh=%u -- caller stack:\n", fd, (long long)off, wh);
