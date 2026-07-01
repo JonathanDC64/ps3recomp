@@ -137,6 +137,10 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD8] spinning on 0x%08X cia=0x%08X\n", (uint32_t)a, g_active_ctx?(uint32_t)g_active_ctx->cia:0); n=0; } }
       else { last=(uint32_t)a; n=0; } }
+    { static int64_t rw=-2; if (rw==-2) { const char* e=getenv("YDKJ_RWATCH"); rw=e?(int64_t)strtoul(e,0,0):-1; }
+      if (rw>=0) { uint32_t ea=(uint32_t)a; if (ea>=(uint32_t)rw && ea<(uint32_t)rw+0x14) {
+        static HMODULE _rm=0; if(!_rm) GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)__builtin_return_address(0),&_rm);
+        static int _n=0; if (_n++<20) fprintf(stderr,"[RWATCH8] read8 0x%08X = 0x%02X  rva=0x%llX\n", ea, vm_base[ea], (unsigned long long)((uintptr_t)__builtin_return_address(0)-(uintptr_t)_rm)); } } }
     return vm_base[(uint32_t)a]; }
 uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
     { static __declspec(thread) uint32_t last=0xFFFFFFFFu; static __declspec(thread) uint32_t n=0;
