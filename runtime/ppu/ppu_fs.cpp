@@ -163,6 +163,7 @@ static void cellFsOpen(ppu_context* ctx)
 static void cellFsClose(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
+    if (getenv("FS_TRACE")) fprintf(stderr, "[fs] close fd=%d%s\n", fd, (fd>=0&&fd<FS_MAX&&g_files[fd])?"":" (bad/already-closed)");
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) { fclose(g_files[fd]); g_files[fd] = nullptr; }
     ctx->gpr[3] = CELL_OK;
 }
@@ -200,7 +201,11 @@ static void cellFsLseek(ppu_context* ctx)
     uint32_t wh   = (uint32_t)ctx->gpr[5];
     uint32_t pos_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
-        fprintf(stderr, "[fs] lseek FAIL bad fd=%d off=%lld wh=%u\n", fd, (long long)off, wh);
+        static int _n = 0;
+        if (_n++ < 1) {
+            fprintf(stderr, "[fs] lseek FAIL bad fd=%d off=%lld wh=%u -- caller stack:\n", fd, (long long)off, wh);
+            ds_dump_shadow();
+        }
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
@@ -244,11 +249,12 @@ static void cellFsFstat(ppu_context* ctx)
 {
     int fd      = (int)(uint32_t)ctx->gpr[3];
     uint32_t sb = (uint32_t)ctx->gpr[4];
-    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { if(getenv("FS_TRACE")) fprintf(stderr,"[fs] fstat FAIL bad fd=%d\n", fd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     long cur = ftell(g_files[fd]);
     fseek(g_files[fd], 0, SEEK_END);
     long sz = ftell(g_files[fd]);
     fseek(g_files[fd], cur, SEEK_SET);
+    if (getenv("FS_TRACE")) fprintf(stderr, "[fs] fstat fd=%d -> size=%ld\n", fd, sz);
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
     ctx->gpr[3] = CELL_OK;
 }
