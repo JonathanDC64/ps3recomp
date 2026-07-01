@@ -585,7 +585,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             if (c == '\n' || paccn >= sizeof(pacc) - 1) {
                 pacc[paccn] = 0;
                 if (strstr(pacc, "Transaction failed") || strstr(pacc, "DL_PANIC") ||
-                    strstr(pacc, "Dantelion2 Panic")) {
+                    strstr(pacc, "Dantelion2 Panic") ||
+                    (getenv("NORUN_BT") && strstr(pacc, "no runnable target"))) {
                     extern void ds_dump_shadow(void);
                     fflush(out);
                     fprintf(stderr, "[panic-hook] Dantelion panic. Prior tty lines:\n");
