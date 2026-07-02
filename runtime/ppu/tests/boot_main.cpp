@@ -195,6 +195,7 @@ extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" int  lv2_semaphore_post_by_id(uint32_t, int);  /* sys_semaphore.c: vblank-sema post */
+extern "C" void vm_write32(unsigned long long, unsigned int);  /* guest BE write */
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
@@ -206,9 +207,24 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * -> never signals MAIN's frame cond -> boot wedges pre-title. VBLANK_SEMA=<id>
      * selects the guest semaphore id to post each tick. */
     long vbl_sema = 0; { const char* e = getenv("VBLANK_SEMA"); if (e) vbl_sema = strtol(e, 0, 0); }
+    /* RSX vblank reference LABELS: on real HW the RSX advances flip/vblank-count
+     * labels each vblank; HighGraphics polls them (index 255=0x03000FF0,
+     * 129=0x03000810) and spins while they stay 0. RSX_TICK_LABELS="255,129"
+     * -> write an incrementing count to those label slots each tick. */
+    #define GCM_LABEL_BASE 0x03000000u
+    #define GCM_LABEL_STRIDE 0x10u
+    int lbl_idx[8]; int lbl_n = 0;
+    { const char* e = getenv("RSX_TICK_LABELS");
+      if (e) { char buf[64]; strncpy(buf, e, 63); buf[63]=0;
+               for (char* t = strtok(buf, ","); t && lbl_n < 8; t = strtok(NULL, ","))
+                   lbl_idx[lbl_n++] = (int)strtol(t, 0, 0); } }
+    unsigned vbl_count = 0;
     for (;;) {
         Sleep(16);            /* ~60 Hz */
         if (vbl_sema > 0) lv2_semaphore_post_by_id((uint32_t)vbl_sema, 1);
+        if (lbl_n) { ++vbl_count;
+            for (int i = 0; i < lbl_n; i++)
+                vm_write32(GCM_LABEL_BASE + (unsigned)lbl_idx[i] * GCM_LABEL_STRIDE, vbl_count); }
         cellGcmTickVBlank();
         cellGcmTickFlip();
         cellGcm_rsx_process_fifo();          /* drain FIFO (get->put) + run commands;
