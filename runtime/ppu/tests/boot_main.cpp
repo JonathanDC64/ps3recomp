@@ -194,13 +194,21 @@ extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" int  lv2_semaphore_post_by_id(uint32_t, int);  /* sys_semaphore.c: vblank-sema post */
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     int rsx_ok = (rsx_d3d12_backend_init(1280, 720, "Demon's Souls (ps3recomp)") == 0);
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
+    /* Emulate the RSX vblank interrupt that on real HW wakes _gcm_intr_thread to
+     * post the GCM vblank semaphore HighGraphics waits on each frame (RPCS3:
+     * sema 0x9604d100 posted by _gcm_intr_thread). Without it HighGraphics blocks
+     * -> never signals MAIN's frame cond -> boot wedges pre-title. VBLANK_SEMA=<id>
+     * selects the guest semaphore id to post each tick. */
+    long vbl_sema = 0; { const char* e = getenv("VBLANK_SEMA"); if (e) vbl_sema = strtol(e, 0, 0); }
     for (;;) {
         Sleep(16);            /* ~60 Hz */
+        if (vbl_sema > 0) lv2_semaphore_post_by_id((uint32_t)vbl_sema, 1);
         cellGcmTickVBlank();
         cellGcmTickFlip();
         cellGcm_rsx_process_fifo();          /* drain FIFO (get->put) + run commands;

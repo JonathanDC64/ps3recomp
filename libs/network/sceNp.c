@@ -217,7 +217,7 @@ static void np_fire_manager_cb_once(void)
     static int fired = 0, in_fire = 0;
     if (fired || in_fire) return;
     if (!s_npmgr_cb_opd) return;
-    if (!getenv("NP_FIRE_CB")) return;
+    if (getenv("NP_NO_FIRE_CB")) return;   /* fire by default; env disables */
     extern uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
     in_fire = 1; fired = 1;
     fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=OFFLINE arg=0x%08X\n",
@@ -261,7 +261,13 @@ s32 sceNpManagerUnregisterCallback(void)
 }
 
 /* Identity getters: reuse the fake-profile implementations (offline-with-account). */
-s32 sceNpManagerGetNpId(SceNpId* npId)               { return sceNpGetNpId(0, npId); }
+/* The engine's NexusRevolution Main thread polls GetNpId/GetOnlineName while the
+ * NP state machine settles. On real HW the sceNpManager status callback fires
+ * (via the sysutil callback pump) with the connection result; without it the
+ * poll never concludes and the boot never advances to the NP2 teardown / save-
+ * data (auto-save dialog) phase. Deliver the (offline) status the first time the
+ * engine polls, so its state machine concludes and proceeds. */
+s32 sceNpManagerGetNpId(SceNpId* npId)               { np_fire_manager_cb_once(); return sceNpGetNpId(0, npId); }
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0, onlineId); }
-s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
+s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { np_fire_manager_cb_once(); return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }

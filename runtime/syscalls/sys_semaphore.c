@@ -319,6 +319,32 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Host-callable post by id (no ppu_context). Used to emulate the RSX vblank
+ * interrupt: on real HW _gcm_intr_thread receives an RSX interrupt event and
+ * posts the GCM vblank semaphore that HighGraphics waits on each frame. We have
+ * no RSX interrupt, so the synthetic vblank ticker calls this at ~60Hz. Safe if
+ * the sema is full (won't exceed max_value). Returns 1 if it posted. */
+int lv2_semaphore_post_by_id(uint32_t sem_id, int count)
+{
+    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX || count <= 0) return 0;
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active) return 0;
+#ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    if (s->value + count > s->max_value) { LeaveCriticalSection(&s->value_lock); return 0; }
+    s->value += count;
+    LeaveCriticalSection(&s->value_lock);
+    ReleaseSemaphore(s->sem_handle, count, NULL);
+#else
+    pthread_mutex_lock(&s->mtx);
+    if (s->value + count > s->max_value) { pthread_mutex_unlock(&s->mtx); return 0; }
+    s->value += count;
+    for (int i = 0; i < count; i++) pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mtx);
+#endif
+    return 1;
+}
+
 /* ---------------------------------------------------------------------------
  * sys_semaphore_get_value
  *
