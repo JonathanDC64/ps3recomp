@@ -2474,6 +2474,13 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         if all_insns[i].mnemonic != 'bctr':
             continue
         win = all_insns[max(0, i - 120):i]
+        # Wider window for resolving a base-relative table's nonvolatile TOC
+        # ANCHOR (e.g. `lwz r30,disp(r2)` at function entry). In large functions
+        # the dispatching bctr can sit many hundreds of instructions past that
+        # entry load (observed ~362 in the PPUThreadHandle dispatcher), so the
+        # 120-insn window can't see it and the base -> the whole switch is missed.
+        # The dispatch mechanics (lwzx/add/cmp) stay within `win`.
+        win_wide = all_insns[max(0, i - 1200):i]
         # the ctr source register (last mtctr before the bctr)
         rC = None
         for w in reversed(win):
@@ -2504,13 +2511,34 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
         # secondary data anchor (lwz rM,disp(r2); lwz base,disp(rM)) — the prior
         # single-level-only resolver silently skipped every such dispatcher.
         def _reg_load(cand):
-            for w in reversed(win):
-                if w.mnemonic in ('bctr', 'bctrl', 'blr', 'bl', 'blrl'):
+            # Nonvolatile regs (r14-r31) are callee-saved: set once (typically at
+            # function entry, e.g. a secondary TOC anchor `lwz r30,disp(r2)`) and
+            # preserved across calls AND across intervening block terminators in
+            # the linear window. Don't stop the backward search at blr/b/bl for
+            # them, or a jump table whose base anchor sits before an unrelated
+            # in-window `blr` (a preceding block's return) is never resolved and
+            # the switch dispatcher is silently mis-lifted as ps3_indirect_call.
+            # Volatile regs can be clobbered, so keep stopping at terminators.
+            _nv = cand[1:].isdigit() and 14 <= int(cand[1:]) <= 31
+            # Nonvolatile anchors are set once at entry (far from a deep bctr in a
+            # big function) and survive calls/returns, so scan the wide window for
+            # them; volatile bases load right before the bctr, so the narrow window
+            # (stopping at terminators) is correct and avoids stale matches.
+            for w in reversed(win_wide if _nv else win):
+                if not _nv and w.mnemonic in ('bctr', 'bctrl', 'blr', 'bl', 'blrl'):
                     break
                 if w.mnemonic in ('lwz', 'ld'):
                     a = [x.strip() for x in w.operands.split(',')]
                     if len(a) == 2 and a[0] == cand and '(' in a[1]:
-                        return (mem_disp(a[1]), a[1].split('(')[1].rstrip(')'))
+                        base_reg = a[1].split('(')[1].rstrip(')')
+                        # A nonvolatile reg reloaded from the stack (`lwz rX,disp(r1)`)
+                        # is a callee-save RESTORE of its entry value -- not statically
+                        # resolvable and not its real definition. Skip it and keep
+                        # searching backward for the original TOC/anchor load
+                        # (`lwz rX,disp(r2)`), which is what carries the jump-table base.
+                        if _nv and base_reg == 'r1':
+                            continue
+                        return (mem_disp(a[1]), base_reg)
             return None
 
         def _base_addr(cand):
