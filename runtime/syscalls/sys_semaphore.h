@@ -33,6 +33,12 @@ typedef struct sys_semaphore_info {
     uint32_t protocol;
     int32_t  value;      /* current count */
     int32_t  max_value;
+    volatile long timed_waiters; /* # threads currently blocked in a FINITE-timeout wait.
+                                  * The libgcm vblank frame sema is waited with a 100ms
+                                  * timeout (HighGraphics), whereas one-shot barriers
+                                  * (e.g. SLSession) wait with timeout=0. The vblank tick
+                                  * posts only semas with a timed waiter, so it wakes the
+                                  * frame sema each vblank without disturbing infinite waits. */
 
 #ifdef _WIN32
     HANDLE   sem_handle;

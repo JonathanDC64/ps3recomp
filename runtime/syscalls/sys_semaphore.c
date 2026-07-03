@@ -186,7 +186,10 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
 
+    int is_timed = (timeout_us > 0);
+    if (is_timed) InterlockedIncrement(&s->timed_waiters);
     DWORD result = WaitForSingleObject(s->sem_handle, ms);
+    if (is_timed) InterlockedDecrement(&s->timed_waiters);
     { extern void thrdiag_wake(void); thrdiag_wake(); }
     if (result == WAIT_TIMEOUT) {
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
@@ -343,6 +346,38 @@ int lv2_semaphore_post_by_id(uint32_t sem_id, int count)
     pthread_mutex_unlock(&s->mtx);
 #endif
     return 1;
+}
+
+/* lv2_semaphore_post_frame -- emulate the libgcm RSX vblank interrupt handler
+ * (_gcm_intr_thread) posting the GCM frame semaphore each vblank so HighGraphics
+ * advances a frame (RPCS3: sema 0x9604d100, get_value-then-post). We don't run
+ * _gcm_intr_thread; the host vblank ticker calls this with the exact sema id that
+ * HighGraphics is currently blocked on (via thrdiag).
+ *
+ * Guards (this is a SPECIFIC id, but stay defensive): post only if the sema is
+ * binary (max_value==1), drained (value==0), and has a FINITE-timeout waiter
+ * (timed_waiters>0). HighGraphics's frame wait is timed (100ms); its init waits
+ * are infinite (timeout=0, timed_waiters==0) so they are never posted here.
+ * Returns 1 if posted. */
+int lv2_semaphore_post_frame(uint32_t sem_id)
+{
+    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) return 0;
+    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
+    if (!s->active || s->max_value != 1 || s->timed_waiters <= 0) return 0;
+#ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    int do_post = (s->value == 0);
+    if (do_post) s->value += 1;
+    LeaveCriticalSection(&s->value_lock);
+    if (do_post) { ReleaseSemaphore(s->sem_handle, 1, NULL); return 1; }
+#else
+    pthread_mutex_lock(&s->mtx);
+    int do_post = (s->value == 0);
+    if (do_post) { s->value += 1; pthread_cond_signal(&s->cv); }
+    pthread_mutex_unlock(&s->mtx);
+    if (do_post) return 1;
+#endif
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------

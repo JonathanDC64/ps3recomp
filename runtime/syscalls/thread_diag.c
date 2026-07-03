@@ -65,6 +65,22 @@ void thrdiag_wake(void)
     if (s_slot >= 0) g_t[s_slot].waiting = 0;
 }
 
+/* Return the wait-object (e.g. sema id) that a currently-blocked thread whose name
+ * starts with `prefix` is waiting on, restricted to wait-type `type`; 0 if none.
+ * Used by the vblank ticker to post exactly the sema HighGraphics is blocked on. */
+uint32_t thrdiag_wobj_of(const char* prefix, const char* type)
+{
+    long n = g_n; if (n > TDIAG_MAX) n = TDIAG_MAX;
+    size_t plen = 0; while (prefix && prefix[plen]) plen++;
+    for (long i = 0; i < n; i++) {
+        if (!g_t[i].waiting) continue;
+        if (strncmp(g_t[i].name, prefix, plen) != 0) continue;
+        if (type && strcmp(g_t[i].wtype, type) != 0) continue;
+        return g_t[i].wobj;
+    }
+    return 0;
+}
+
 void thrdiag_hle(const char* name)
 {
     int i = tdiag_slot();
