@@ -391,6 +391,8 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
     fprintf(stderr, "[spu] SPURS taskset syscall num=%u (raw=0x%X args=0x%08X) image=%d "
             "link/r0=0x%05X\n", num, raw, args, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     fflush(stderr);
+    if (num != 3) ctx->poll_spins = 0;   /* only POLL(3) accumulates the spin count */
+
     switch (num) {
     case 0: /* CELL_SPURS_TASK_SYSCALL_EXIT: the task is done. Mark a clean `stop 0` and
              * halt; spu_run_lifted_job_abi's post-run path writes the exit code + the
@@ -399,7 +401,43 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
         spu_halt(ctx);          /* longjmp out to spu_run_with_halt */
         return;
-    default: /* YIELD(1)/WAIT_SIGNAL(2)/POLL(3)/RECV_WKL_FLAG(4): for our single-task model
+    case 3: { /* CELL_SPURS_TASK_SYSCALL_POLL: returns a bitmask -- bit0 FOUND_TASK,
+               * bit1 FOUND_WORKLOAD. A taskset scheduler task idle-loops here waiting
+               * for the kernel to mark a task/workload ready. We dispatch leaves
+               * host-side, so that signal never arrives and the loop spins forever,
+               * pinning a worker thread. Faithful POLL needs the SPURS kernel's
+               * workload-poll state (cellSpursModulePollStatus, DMA'd management area)
+               * which we don't run. Pragmatic break: after N no-progress polls, signal
+               * FOUND_WORKLOAD so the lifted scheduler takes its workload-changed path
+               * (which, for a shut-down taskset, exits). Gated + tunable. */
+        static int s_break_after = -1;   /* -1 = uninit; 0 = disabled */
+        static int s_break_mode  = 2;    /* return value on break: 2=FOUND_WORKLOAD */
+        if (s_break_after < 0) {
+            const char* a = getenv("SPU_POLL_BREAK_AFTER");
+            s_break_after = a ? atoi(a) : 2000;    /* default on: 2000 spins */
+            const char* m = getenv("SPU_POLL_BREAK_MODE");
+            if (m) s_break_mode = atoi(m);         /* 0=FOUND_none(exit),1=TASK,2=WKL */
+        }
+        if (s_break_after > 0 && (int)(++ctx->poll_spins) >= s_break_after) {
+            ctx->poll_spins = 0;
+            if (s_break_mode == 0) {   /* blunt fallback: end the scheduler task */
+                fprintf(stderr, "[spu] POLL-spin break: EXIT scheduler task (image=%d)\n", ctx->image_id);
+                fflush(stderr);
+                ctx->stop_code = 0;
+                ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+                spu_halt(ctx);
+                return;
+            }
+            fprintf(stderr, "[spu] POLL-spin break: return %d (image=%d) after %d polls\n",
+                    s_break_mode, ctx->image_id, s_break_after);
+            fflush(stderr);
+            ctx->gpr[3]._u32[0] = (uint32_t)s_break_mode;
+            return;
+        }
+        ctx->gpr[3]._u32[0] = 0;
+        return;
+    }
+    default: /* YIELD(1)/WAIT_SIGNAL(2)/RECV_WKL_FLAG(4): for our single-task model
               * report success and resume (return -> lifted caller continues at its link).
               * Refine per-syscall (e.g. real WAIT_SIGNAL blocking) when a task needs it. */
         ctx->gpr[3]._u32[0] = 0;

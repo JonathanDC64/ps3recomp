@@ -192,6 +192,14 @@ typedef struct spu_context {
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 
+    /* Count of consecutive taskset-PM POLL (num=3) syscalls with no intervening
+     * dispatch/progress. A SPURS taskset scheduler task idle-loops on POLL waiting
+     * for the kernel to mark a task ready; since we dispatch leaves host-side, that
+     * signal never arrives and the scheduler task spins forever, pinning a worker
+     * thread. spu_spurs_taskset_syscall uses this to break the spin. Reset to 0 on
+     * any non-POLL syscall. */
+    uint32_t poll_spins;
+
 } spu_context;
 
 /* ---------------------------------------------------------------------------
