@@ -167,6 +167,31 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
     fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
+    /* One-shot: capture the guest caller (LR) of the sema-4 frame wait so we can
+     * decompile the exact condition-loop that HighGraphics parks in. */
+    { static int _n4 = 0;
+      if (sem_id == 4 && _n4 < 2) { _n4++;
+        fprintf(stderr, "[WAIT4] sema-4 r3..r6=%08X %08X %08X %08X host-bt:\n",
+                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
+                (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
+#ifdef _WIN32
+        void* frames[48];
+        unsigned short nfr = RtlCaptureStackBackTrace(0, 48, frames, 0);
+        HMODULE self = 0;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&sys_semaphore_wait, &self);
+        for (unsigned short i = 0; i < nfr; i++) {
+            HMODULE m = 0;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)frames[i], &m);
+            if (m == self)
+                fprintf(stderr, "[WAIT4]   rva=0x%llX\n",
+                        (unsigned long long)((char*)frames[i] - (char*)self));
+        }
+#endif
+      } }
 
     /* EXPERIMENT (FORCE_SEMA=N): make sys_semaphore_wait on sema N return immediately
      * (probe whether a never-posted semaphore, e.g. SLSession's sema 2, gates the

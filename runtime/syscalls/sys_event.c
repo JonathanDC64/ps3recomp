@@ -470,6 +470,15 @@ int64_t sys_event_port_create(ppu_context* ctx)
     }
 
     evt_table_unlock();
+
+    /* libgcm display/vblank event port: created with name==0xfee1dead. On real
+     * HW the RSX + vblank interrupt post vblank(data2=0x2)/flip(data2=0x10)
+     * events to it; the game's _gcm_intr_thread receives them and drives the
+     * render loop. We have no such interrupt source, so we must post these from
+     * the host vblank ticker (see gcm_display_event_post). Record the port id. */
+    if ((uint32_t)name == 0xfee1deadu) {
+        fprintf(stderr, "[gcm-evt] display/vblank event port created id=%u (name=0xfee1dead)\n", port_id);
+    }
     return CELL_OK;
 }
 
@@ -566,6 +575,35 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     evt.data2  = data2;
     evt.data3  = data3;
     return event_queue_push(q, &evt);
+}
+
+/* Host-side libgcm display-event source. On PS3 the RSX/vblank interrupt posts
+ * events to the game's display port (name==0xfee1dead); the game's
+ * _gcm_intr_thread receives them and calls the registered vblank/flip handlers,
+ * which drive the render loop. We have no hardware interrupt, so the host vblank
+ * ticker calls this each vblank. data2 selects the cause, matching RPCS3:
+ *   vblank -> data2=0x2   flip -> data2=0x10   (data1=data3=0).
+ * Posts to every active, connected fee1dead port. Returns the number posted. */
+int gcm_display_event_post(uint64_t data1, uint64_t data2, uint64_t data3)
+{
+    int posted = 0;
+    evt_table_lock();
+    for (int i = 0; i < SYS_EVENT_PORT_MAX; i++) {
+        sys_event_port_info* p = &g_sys_event_ports[i];
+        if (!p->active || (uint32_t)p->name != 0xfee1deadu) continue;
+        int32_t qidx = p->connected_queue;
+        if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX) continue;
+        sys_event_queue_info* q = &g_sys_event_queues[qidx - 1];
+        if (!q->active) continue;
+        sys_event_t evt;
+        evt.source = p->name;
+        evt.data1  = data1;
+        evt.data2  = data2;
+        evt.data3  = data3;
+        if (event_queue_push(q, &evt) >= 0) posted++;
+    }
+    evt_table_unlock();
+    return posted;
 }
 
 /* Post a SYS_SPU_THREAD_EVENT_USER event exactly as the lv2 kernel does for an SPU's

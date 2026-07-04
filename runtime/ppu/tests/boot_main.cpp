@@ -199,6 +199,7 @@ extern "C" int  lv2_semaphore_post_frame(uint32_t);       /* sys_semaphore.c: co
 extern "C" uint32_t thrdiag_wobj_of(const char*, const char*);  /* thread_diag.c: a thread's current wait obj */
 extern "C" uint32_t watch_thread_pc(void);                      /* ppu_loader.cpp: WATCH_HDD live guest PC */
 extern "C" void vm_write32(unsigned long long, unsigned int);  /* guest BE write */
+extern "C" int  gcm_display_event_post(unsigned long long, unsigned long long, unsigned long long); /* sys_event.c: libgcm vblank/flip event */
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
@@ -226,6 +227,8 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * binary sema with a finite-timeout waiter blocked (HighGraphics), never a t=0
      * one-shot barrier (SLSession). Set VBLANK_TICK=0 to disable. */
     int vbl_tick = 1; { const char* e = getenv("VBLANK_TICK"); if (e) vbl_tick = atoi(e); }
+    /* libgcm display event (vblank/flip) post -- the real inter-frame trigger. Default ON. */
+    int gcm_display_evt = 1; { const char* e = getenv("GCM_DISPLAY_EVT"); if (e) gcm_display_evt = atoi(e); }
     /* PROBE: one-shot post of a semaphore after the boot settles. POKE_SEMA=<id>
      * (internal id), POKE_AFTER=<ticks, default 240=~4s>. Used to test whether
      * releasing SLSession's gate sema (3) makes it call cellSaveDataAutoLoad2. */
@@ -261,6 +264,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                 vm_write32(GCM_LABEL_BASE + (unsigned)lbl_idx[i] * GCM_LABEL_STRIDE, vbl_count); }
         cellGcmTickVBlank();
         cellGcmTickFlip();
+        /* libgcm display-event source: post vblank(data2=0x2)+flip(data2=0x10) to
+         * the game's fee1dead display port each tick, waking _gcm_intr_thread which
+         * on real HW is driven by the RSX/vblank interrupt. This is the missing
+         * inter-frame trigger: without it the render loop submits frame 1 then
+         * blocks forever (RPCS3 fires ~1300 vblank + ~1200 flip events during boot).
+         * GCM_DISPLAY_EVT=0 disables for A/B testing. */
+        if (gcm_display_evt) {
+            gcm_display_event_post(0, 0x2, 0);   /* vblank */
+            gcm_display_event_post(0, 0x10, 0);  /* flip   */
+        }
         cellGcm_rsx_process_fifo();          /* drain FIFO (get->put) + run commands;
                                               * needed even with no window so the title's
                                               * get==put FIFO waits complete */
