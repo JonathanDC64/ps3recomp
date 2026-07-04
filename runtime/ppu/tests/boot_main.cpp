@@ -200,6 +200,7 @@ extern "C" uint32_t thrdiag_wobj_of(const char*, const char*);  /* thread_diag.c
 extern "C" uint32_t watch_thread_pc(void);                      /* ppu_loader.cpp: WATCH_HDD live guest PC */
 extern "C" void vm_write32(unsigned long long, unsigned int);  /* guest BE write */
 extern "C" int  gcm_display_event_post(unsigned long long, unsigned long long, unsigned long long); /* sys_event.c: libgcm vblank/flip event */
+extern "C" int  gcm_frame_enqueue(void);   /* sys_event.c: enqueue next-frame render work (per-frame trigger) */
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
@@ -274,6 +275,13 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             gcm_display_event_post(0, 0x2, 0);   /* vblank */
             gcm_display_event_post(0, 0x10, 0);  /* flip   */
         }
+        /* Per-frame trigger experiment (GCM_FRAME_ENQUEUE=1): call the game's own
+         * display work-queue enqueue (func_00A9DD58) with the captured dispatch
+         * ctx, mimicking func_00A662C8's flip path, so HighGraphics's worker gets
+         * fed frame work each vblank. Throttle to every 3rd tick (~20Hz). */
+        { static int fe = -1; static unsigned fe_n = 0;
+          if (fe < 0) fe = getenv("GCM_FRAME_ENQUEUE") ? atoi(getenv("GCM_FRAME_ENQUEUE")) : 0;
+          if (fe && (++fe_n % 3) == 0) gcm_frame_enqueue(); }
         cellGcm_rsx_process_fifo();          /* drain FIFO (get->put) + run commands;
                                               * needed even with no window so the title's
                                               * get==put FIFO waits complete */

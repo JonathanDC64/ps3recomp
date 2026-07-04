@@ -191,6 +191,22 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
                         (unsigned long long)((char*)frames[i] - (char*)self));
         }
 #endif
+        /* Runtime capture of the graphics-context globals the display work-queue
+         * machinery uses (TOC-relative), so the host _gcm_intr build can enqueue
+         * frame work with real pointers. r2 = EBOOT TOC (constant per module). */
+        { uint32_t toc  = (uint32_t)ctx->gpr[2];
+          uint32_t gb   = vm_read32(toc - 0x6D0C);   /* graphics base (func_009F81F0 r30) */
+          uint32_t db   = vm_read32(toc - 0x6C28);   /* dispatch base (func_00A662C8)      */
+          fprintf(stderr, "[WAIT4] TOC=0x%08X gbase=0x%08X dbase=0x%08X\n", toc, gb, db);
+          fprintf(stderr, "[WAIT4]   enq_obj[gb-7FE4]=0x%08X  worker_q[gb-7FD8]=0x%08X  sema_obj[gb-7FEC]=0x%08X\n",
+                  vm_read32(gb - 0x7FE4), vm_read32(gb - 0x7FD8), vm_read32(gb - 0x7FEC));
+          fprintf(stderr, "[WAIT4]   handlers[gb-7F94/98/9C/A8/AC]=%08X %08X %08X %08X %08X\n",
+                  vm_read32(gb - 0x7F94), vm_read32(gb - 0x7F98), vm_read32(gb - 0x7F9C),
+                  vm_read32(gb - 0x7FA8), vm_read32(gb - 0x7FAC));
+          fprintf(stderr, "[WAIT4]   dispatch_obj[db-7FF4]=0x%08X  dispatch_arg[db-7FF0]=0x%08X\n",
+                  vm_read32(db - 0x7FF4), vm_read32(db - 0x7FF0));
+          { extern void gcm_capture_disp_ctx(uint32_t, uint32_t, uint32_t);
+            gcm_capture_disp_ctx(toc, vm_read32(db - 0x7FF4), vm_read32(db - 0x7FF0)); } }
       } }
 
     /* EXPERIMENT (FORCE_SEMA=N): make sys_semaphore_wait on sema N return immediately

@@ -601,6 +601,34 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
  * ticker calls this each vblank. data2 selects the cause, matching RPCS3:
  *   vblank -> data2=0x2   flip -> data2=0x10   (data1=data3=0).
  * Posts to every active, connected fee1dead port. Returns the number posted. */
+/* Display work-queue enqueue bridge (the missing per-frame trigger). The game's
+ * event dispatch (func_00A662C8) enqueues frame work via
+ * func_00A9DD58(dispatch_obj, id, dispatch_arg) with id 0x100 (vblank)/0x103 (flip).
+ * We have no _gcm_intr to fire it, so the host ticker calls gcm_frame_enqueue()
+ * per vblank. Pointers captured at runtime (sema-4 wait, gcm_capture_disp_ctx). */
+uint32_t g_gcm_toc = 0, g_gcm_disp_obj = 0, g_gcm_disp_arg = 0;
+extern uint64_t ppu_guest_call_code(uint32_t code, uint32_t toc,
+                                    uint64_t, uint64_t, uint64_t, uint64_t);
+
+void gcm_capture_disp_ctx(uint32_t toc, uint32_t disp_obj, uint32_t disp_arg)
+{
+    if (!g_gcm_toc) {
+        g_gcm_toc = toc; g_gcm_disp_obj = disp_obj; g_gcm_disp_arg = disp_arg;
+        fprintf(stderr, "[gcm-frame] captured disp ctx: toc=0x%08X obj=0x%08X arg=0x%08X\n",
+                toc, disp_obj, disp_arg);
+    }
+}
+
+int gcm_frame_enqueue(void)
+{
+    if (!g_gcm_toc || !g_gcm_disp_obj) return 0;   /* not captured yet */
+    /* func_00A9DD58 = 0x00A9DD58: enqueue(obj, id, arg). Mirror func_00A662C8's
+     * flip-event path: vblank(0x100) then flip(0x103). */
+    ppu_guest_call_code(0x00A9DD58u, g_gcm_toc, g_gcm_disp_obj, 0x100, g_gcm_disp_arg, 0);
+    ppu_guest_call_code(0x00A9DD58u, g_gcm_toc, g_gcm_disp_obj, 0x103, g_gcm_disp_arg, 0);
+    return 1;
+}
+
 int gcm_display_event_post(uint64_t data1, uint64_t data2, uint64_t data3)
 {
     int posted = 0;

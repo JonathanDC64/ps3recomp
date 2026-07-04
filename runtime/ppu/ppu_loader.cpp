@@ -814,6 +814,32 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     return ctx.gpr[3];
 }
 
+/* Call a lifted guest function by raw code address + TOC (no OPD needed). Used to
+ * invoke internal (non-exported) game functions like the display work-queue enqueue
+ * func_00A9DD58 from host threads. Mirrors ppu_guest_call's ctx setup. */
+extern "C" uint64_t ppu_guest_call_code(uint32_t code, uint32_t toc,
+                                        uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    if (!code) return 0;
+    ppu_fn fn = ppu_lookup(code);
+    if (!fn) { fprintf(stderr, "[ppu] guest_call_code: code 0x%08X not registered\n", code); return 0; }
+    static __declspec(thread) uint32_t s_cb_sp2 = 0;
+    if (!s_cb_sp2) s_cb_sp2 = 0xCFFC0000u;   /* distinct scratch stack from ppu_guest_call */
+    ppu_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.gpr[1]  = s_cb_sp2;
+    ctx.gpr[2]  = toc;
+    ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+    ctx.gpr[13] = PPU_TLS_TP;
+    ctx.cia     = code;
+    ppu_context* saved_active = g_active_ctx;
+    g_active_ctx = &ctx;
+    fn(&ctx);
+    while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+    g_active_ctx = saved_active;
+    return ctx.gpr[3];
+}
+
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
