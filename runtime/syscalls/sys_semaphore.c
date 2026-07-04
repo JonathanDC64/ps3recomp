@@ -182,6 +182,12 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("sema", sem_id); }
+    /* SLSESSION_BT: one-shot guest backtrace at the SLSession gate wait (the only
+     * infinite wait on this id), so we can find its functor + the condition it loops on. */
+    { static int bt=-1; if(bt<0){const char* e=getenv("SLSESSION_BT"); bt=e?atoi(e):0;}
+      if (bt>0 && sem_id==(uint32_t)bt && timeout_us==0) { static int once=0; if(once++<3){
+          fprintf(stderr,"[slsess-bt] wait sem=%u cia=0x%08X lr=0x%08X\n",sem_id,(uint32_t)ctx->cia,(uint32_t)ctx->lr);
+          extern void ds_dump_shadow(void); ds_dump_shadow(); fflush(stderr);} } }
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;

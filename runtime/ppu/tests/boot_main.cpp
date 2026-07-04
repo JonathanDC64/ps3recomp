@@ -226,10 +226,23 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * binary sema with a finite-timeout waiter blocked (HighGraphics), never a t=0
      * one-shot barrier (SLSession). Set VBLANK_TICK=0 to disable. */
     int vbl_tick = 1; { const char* e = getenv("VBLANK_TICK"); if (e) vbl_tick = atoi(e); }
+    /* PROBE: one-shot post of a semaphore after the boot settles. POKE_SEMA=<id>
+     * (internal id), POKE_AFTER=<ticks, default 240=~4s>. Used to test whether
+     * releasing SLSession's gate sema (3) makes it call cellSaveDataAutoLoad2. */
+    long poke_sema = 0; { const char* e = getenv("POKE_SEMA"); if (e) poke_sema = strtol(e,0,0); }
+    long poke_after = 240; { const char* e = getenv("POKE_AFTER"); if (e) poke_after = strtol(e,0,0); }
+    int poke_done = 0;
     unsigned vbl_count = 0;
     unsigned watch_n = 0; uint32_t watch_last = 0xFFFFFFFF; int watch_stable = 0;
     for (;;) {
         Sleep(16);            /* ~60 Hz */
+        /* POKE_ONCE=1 -> single post; else post every poke_after ticks (pump probe). */
+        if (poke_sema > 0 && (long)(++vbl_count) >= poke_after) {
+            static int _pn = 0; static long _last = 0;
+            int once = (getenv("POKE_ONCE") != 0);
+            if ((!once || !poke_done) && (long)vbl_count - _last >= (once?0:30)) {
+                _last = vbl_count; if (++_pn <= 40) fprintf(stderr, "[poke] post sema %ld (#%d)\n", poke_sema, _pn);
+                lv2_semaphore_post_by_id((uint32_t)poke_sema, 1); poke_done = 1; } }
         /* WATCH_HDD sampler: log the watched (hung) thread's live guest PC ~2x/s; flag
          * when it stops advancing (a spin) so the stuck guest addr is obvious. */
         if ((++watch_n % 30) == 0) { uint32_t wp = watch_thread_pc();
