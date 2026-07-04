@@ -478,6 +478,23 @@ int64_t sys_event_port_create(ppu_context* ctx)
      * the host vblank ticker (see gcm_display_event_post). Record the port id. */
     if ((uint32_t)name == 0xfee1deadu) {
         fprintf(stderr, "[gcm-evt] display/vblank event port created id=%u (name=0xfee1dead)\n", port_id);
+#ifdef _WIN32
+        { void* frames[48];
+          unsigned short nfr = RtlCaptureStackBackTrace(0, 48, frames, 0);
+          HMODULE self = 0;
+          GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             (LPCSTR)&sys_event_port_create, &self);
+          for (unsigned short i = 0; i < nfr; i++) {
+              HMODULE m = 0;
+              GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 (LPCSTR)frames[i], &m);
+              if (m == self)
+                  fprintf(stderr, "[gcm-evt]   rva=0x%llX\n",
+                          (unsigned long long)((char*)frames[i] - (char*)self));
+          } }
+#endif
     }
     return CELL_OK;
 }
