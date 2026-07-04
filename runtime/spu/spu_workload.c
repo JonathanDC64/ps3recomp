@@ -324,9 +324,15 @@ static void spu_async_run(spu_async_job* j)
               if (q) {
                   uint32_t spup = 0; { const char* e = getenv("SPURS_DONE_SPUP"); if (e) spup = (uint32_t)strtoul(e,0,0); }
                   uint64_t d3 = (uint64_t)j->taskset_ea; { const char* e = getenv("SPURS_DONE_DATA"); if (e) d3 = strtoull(e,0,0); }
-                  fprintf(stderr, "[spu_workload] POST completion USER event q=%u spup=%u data3=0x%llX (image=%d)\n",
-                          q, spup, (unsigned long long)d3, j->image_id);
-                  int r = sys_spu_thread_post_user_event(q, 1, spup, 0, d3);
+                  /* data1 = the SENDING SPU thread's lv2 id (docs/15 §3). Use the id the
+                   * P2 substrate registered (g_cs_spu_lv2[0]) so handler B's list lookup
+                   * HITS; fall back to 1 only if the substrate isn't up (SPURS_LV2THREADS
+                   * off). Round-robin association could refine which spu id per task (P3/Q3). */
+                  extern uint32_t g_cs_spu_lv2[]; extern uint32_t g_cs_nspus;
+                  uint64_t spu_lv2 = (g_cs_nspus && g_cs_spu_lv2[0]) ? g_cs_spu_lv2[0] : 1u;
+                  fprintf(stderr, "[spu_workload] POST completion USER event q=%u spup=%u spu_lv2=0x%llX data3=0x%llX (image=%d)\n",
+                          q, spup, (unsigned long long)spu_lv2, (unsigned long long)d3, j->image_id);
+                  int r = sys_spu_thread_post_user_event(q, spu_lv2, spup, 0, d3);
                   fprintf(stderr, "[spu_workload] post_user_event -> %d\n", r); } }
         }
         free(ls);
