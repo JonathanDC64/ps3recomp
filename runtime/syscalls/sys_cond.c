@@ -212,6 +212,18 @@ int64_t sys_cond_wait(ppu_context* ctx)
                 n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8), vm_read32(obj+0xC));
     } }
 
+    /* cond=29 = MAIN's frame barrier (func_009E0370). r31 = the sync object;
+     * cond id lives at +0x8, the state/predicate MAIN loops on at +0xC. Dump the
+     * object addr + header over the first waits so we can WWATCH obj+0xC and find
+     * the completion producer that advances the state. */
+    if (cond_id == 29) { static int n = 0; if (n++ < 12) {
+        extern uint32_t vm_read32(uint64_t);
+        uint32_t obj = (uint32_t)ctx->gpr[31];
+        fprintf(stderr, "[cond29-pred] #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X +0x10=0x%08X\n",
+                n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8),
+                vm_read32(obj+0xC), vm_read32(obj+0x10));
+    } }
+
     /* PROBE (SPURS_EVTEST=1): one-shot chain test for Frontier #11. The parked
      * SPURuntimeService (q=1) waits for a SPURS USER event (source 0xFFFFFFFF53505501,
      * handler selected by (data2>>32)&0xFF). Post one to q=1 to see if it wakes the
