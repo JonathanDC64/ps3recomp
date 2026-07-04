@@ -411,12 +411,18 @@ static void spu_spurs_taskset_syscall(spu_context* ctx)
                * FOUND_WORKLOAD so the lifted scheduler takes its workload-changed path
                * (which, for a shut-down taskset, exits). Gated + tunable. */
         static int s_break_after = -1;   /* -1 = uninit; 0 = disabled */
-        static int s_break_mode  = 2;    /* return value on break: 2=FOUND_WORKLOAD */
+        static int s_break_mode  = 0;    /* DEFAULT 0 = EXIT the spinning scheduler task */
         if (s_break_after < 0) {
             const char* a = getenv("SPU_POLL_BREAK_AFTER");
-            s_break_after = a ? atoi(a) : 2000;    /* default on: 2000 spins */
+            s_break_after = a ? atoi(a) : 500;     /* default on: 500 spins */
             const char* m = getenv("SPU_POLL_BREAK_MODE");
-            if (m) s_break_mode = atoi(m);         /* 0=FOUND_none(exit),1=TASK,2=WKL */
+            if (m) s_break_mode = atoi(m);         /* 0=EXIT(default),1=TASK,2=WKL */
+            /* Default mode 0: the image=1 taskset-scheduler POLL(num=3) spins forever
+             * (we dispatch leaves host-side, so the kernel never marks a workload
+             * ready). mode 2 (return FOUND_WORKLOAD) does NOT stop the re-spin -> 500k
+             * polls = 100% CPU. mode 0 EXITS the spinner: same boot state reached
+             * (verified via milestones.sh, all 18 threads + main idle) with no 100% CPU
+             * and no regression. Set SPU_POLL_BREAK_MODE=2 to restore the old behavior. */
         }
         if (s_break_after > 0 && (int)(++ctx->poll_spins) >= s_break_after) {
             ctx->poll_spins = 0;
