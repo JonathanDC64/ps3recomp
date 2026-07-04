@@ -256,6 +256,15 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
 
     s32 result = (s32)vm_read32(cb + 0x000);
     printf("[cellGame] DataCheckCreate2: funcStat returned result=%d\n", result);
+    /* WATCH_HDD=1: register the calling thread's persistent ctx for PC sampling (to
+     * find where AsyncGetHddFreeSizeThread hangs after this returns). g_active_ctx is
+     * now valid post-callback (ppu_guest_call restores it). */
+    { extern char* getenv(const char*);
+      if (getenv("WATCH_HDD")) {
+          extern void* ppu_get_active_ctx(void); extern volatile void* g_watch_ctx;
+          g_watch_ctx = ppu_get_active_ctx();
+          fprintf(stderr, "[watch] registered ctx=%p (cellGameDataCheckCreate2 caller)\n", (void*)g_watch_ctx);
+      } }
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
     /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */

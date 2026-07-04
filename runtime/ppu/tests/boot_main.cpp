@@ -197,6 +197,7 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
 extern "C" int  lv2_semaphore_post_by_id(uint32_t, int);  /* sys_semaphore.c: vblank-sema post */
 extern "C" int  lv2_semaphore_post_frame(uint32_t);       /* sys_semaphore.c: conditional frame-sema post */
 extern "C" uint32_t thrdiag_wobj_of(const char*, const char*);  /* thread_diag.c: a thread's current wait obj */
+extern "C" uint32_t watch_thread_pc(void);                      /* ppu_loader.cpp: WATCH_HDD live guest PC */
 extern "C" void vm_write32(unsigned long long, unsigned int);  /* guest BE write */
 
 static DWORD WINAPI vblank_ticker(LPVOID)
@@ -226,8 +227,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * one-shot barrier (SLSession). Set VBLANK_TICK=0 to disable. */
     int vbl_tick = 1; { const char* e = getenv("VBLANK_TICK"); if (e) vbl_tick = atoi(e); }
     unsigned vbl_count = 0;
+    unsigned watch_n = 0; uint32_t watch_last = 0xFFFFFFFF; int watch_stable = 0;
     for (;;) {
         Sleep(16);            /* ~60 Hz */
+        /* WATCH_HDD sampler: log the watched (hung) thread's live guest PC ~2x/s; flag
+         * when it stops advancing (a spin) so the stuck guest addr is obvious. */
+        if ((++watch_n % 30) == 0) { uint32_t wp = watch_thread_pc();
+            if (wp) { if (wp == watch_last) { if (++watch_stable == 3)
+                        fprintf(stderr, "[watch] SPIN at guest PC 0x%08X (stable)\n", wp); }
+                      else { watch_stable = 0; watch_last = wp;
+                        fprintf(stderr, "[watch] guest PC 0x%08X\n", wp); } } }
         /* Post exactly the sema HighGraphics is currently blocked on (its frame
          * wait), if any -- the libgcm _gcm_intr vblank tick. Targeted by thread so
          * we never disturb other threads' init waits. */

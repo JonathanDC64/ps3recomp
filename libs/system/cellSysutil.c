@@ -131,6 +131,12 @@ s32 cellSysutilCheckCallback(void)
      * Stops when the queue empties OR when no guest caller is installed
      * (in which case we drop pending events to avoid stalling).
      */
+    /* Livelock guard: if a dispatched callback keeps re-queueing events the drain
+     * never ends and the calling thread wedges here (observed: AsyncGetHddFreeSizeThread
+     * spins at guest 0x00B5D8C0 = this call). Cap the drain per call; if exceeded, log
+     * the offending callback + break (also breaks the wedge). Zero normal-case overhead
+     * (a plain counter). A healthy drain processes only a handful of events. */
+    int iters = 0;
     while (s_event_head != s_event_tail) {
         SysutilEvent e = s_event_queue[s_event_head];
         s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
@@ -139,6 +145,11 @@ s32 cellSysutilCheckCallback(void)
         if (!s_callbacks[e.slot].registered) continue;
         if (!s_callbacks[e.slot].guest_opd) continue;
 
+        if (++iters > 256) {
+            fprintf(stderr, "[cellSysutil] CheckCallback DRAIN RUNAWAY (%d) slot=%d opd=0x%08X status=0x%X -- breaking\n",
+                    iters, e.slot, s_callbacks[e.slot].guest_opd, e.status); fflush(stderr);
+            break;
+        }
         if (g_ps3_guest_caller) {
             g_ps3_guest_caller(s_callbacks[e.slot].guest_opd,
                                (uint64_t)e.status,
