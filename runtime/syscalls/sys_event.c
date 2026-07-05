@@ -664,6 +664,50 @@ int gcm_frame_enqueue(void)
     return 1;
 }
 
+/* ---- SPURS runtime helpers (docs/17): create a queue + blocking-pop from C, so
+ * our host event-helper thread can be a persistent consumer like libsre's SpursHdlr1. */
+uint32_t spurs_rt_alloc_queue(int size)
+{
+    if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX) size = SYS_EVENT_QUEUE_BUF_MAX;
+    evt_table_lock();
+    int slot = -1;
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) if (!g_sys_event_queues[i].active) { slot = i; break; }
+    if (slot < 0) { evt_table_unlock(); return 0; }
+    sys_event_queue_info* q = &g_sys_event_queues[slot];
+    memset(q, 0, sizeof(*q));
+    q->active = 1; q->capacity = size; q->type = SYS_PPU_QUEUE;
+#ifdef _WIN32
+    InitializeCriticalSection(&q->lock); InitializeConditionVariable(&q->not_empty);
+#else
+    pthread_mutex_init(&q->lock, NULL); pthread_cond_init(&q->not_empty, NULL);
+#endif
+    evt_table_unlock();
+    return (uint32_t)(slot + 1);
+}
+
+/* Blocking dequeue of one event from queue_id. Returns 0 on success. */
+int spurs_rt_pop_blocking(uint32_t queue_id, uint64_t* src, uint64_t* d1, uint64_t* d2, uint64_t* d3)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return -1;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    while (q->count == 0 && q->active) SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
+    if (!q->active || q->count == 0) { LeaveCriticalSection(&q->lock); return -1; }
+    sys_event_t evt = q->buffer[q->head]; q->head = (q->head + 1) % q->capacity; q->count--;
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    while (q->count == 0 && q->active) pthread_cond_wait(&q->not_empty, &q->lock);
+    if (!q->active || q->count == 0) { pthread_mutex_unlock(&q->lock); return -1; }
+    sys_event_t evt = q->buffer[q->head]; q->head = (q->head + 1) % q->capacity; q->count--;
+    pthread_mutex_unlock(&q->lock);
+#endif
+    if (src) *src = evt.source; if (d1) *d1 = evt.data1; if (d2) *d2 = evt.data2; if (d3) *d3 = evt.data3;
+    return 0;
+}
+
 /* Per-queue receive counter + "busiest receive queue" = the SPURS service's queue
  * (it loops receiving far more than any other). Lets trigger B target the service's
  * dynamically-allocated queue instead of a hardcoded id. */

@@ -250,6 +250,11 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                   /*spuPort*/1, /*eventQueue*/0, /*eventPort*/0);
         printf("[cellSpurs] P2: lv2 substrate -> group=0x%X spus[0]=0x%X spus[1]=0x%X "
                "(written to CellSpurs @0x%08X)\n", grp, tids[0], tids[1], spurs_ea);
+        /* docs/17 P-A/P-B: create the SPURS event queue + spawn the HOST event-helper
+         * thread (our substitute for libsre's SpursHdlr1, which we don't lift). It
+         * persistently receives SPU->PPU completion events + dispatches them
+         * (data0==3 -> the game's eventPortMux completion callbacks). */
+        { extern uint32_t spurs_runtime_start(uint32_t); spurs_runtime_start(spurs_ea); }
       } }
     return CELL_OK;
 }

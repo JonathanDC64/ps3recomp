@@ -279,11 +279,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                * blocked receiving on -- looked up by thread name, since its queue id is
                * allocated dynamically per run. Env override wins; fall back to busiest
                * receiver, then 1. */
+              /* Post to our host event-helper's SPURS queue (docs/17) -- the persistent
+               * consumer we spawn in cellSpursInitialize. Fallbacks for pre-init timing. */
+              extern uint32_t spurs_runtime_eventq(void);
               extern uint32_t spurs_service_queue(void);
-              extern uint32_t thrdiag_wobj_of(const char*, const char*);
               extern uint32_t spurs_busiest_recv_queue(void);
-              uint32_t q = spurs_service_queue();                       /* captured by name */
-              if (!q) q = thrdiag_wobj_of("(Dantelion2)SPURuntime", "evq");
+              uint32_t q = spurs_runtime_eventq();
+              if (!q) q = spurs_service_queue();
               if (!q) q = spurs_busiest_recv_queue();
               if (!q) q = 1;
               { const char* e = getenv("SPURS_INTRMBOX_EVQ"); if (e) q = (uint32_t)strtoul(e,0,0); }
