@@ -216,13 +216,24 @@ int64_t sys_cond_wait(ppu_context* ctx)
      * cond id lives at +0x8, the state/predicate MAIN loops on at +0xC. Dump the
      * object addr + header over the first waits so we can WWATCH obj+0xC and find
      * the completion producer that advances the state. */
-    if (cond_id == 29) { static int n = 0; if (n++ < 12) {
-        extern uint32_t vm_read32(uint64_t);
+    /* Probe the CURRENT MAIN gate. With SPURS_LV2THREADS+taskset side-effects MAIN
+     * advances cond-29 -> cond-13 (Havok barrier); SPURS_PROBE_COND overrides. */
+    { static int pc = -2; if (pc == -2) { const char* e = getenv("SPURS_PROBE_COND"); pc = e ? (int)strtol(e,0,0) : 13; }
+    if (cond_id == (uint32_t)pc) { static int n = 0; if (n++ < 12) {
+        extern uint32_t vm_read32(uint64_t); extern const char* thrdiag_cur_name(void);
         uint32_t obj = (uint32_t)ctx->gpr[31];
-        fprintf(stderr, "[cond29-pred] #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X +0x10=0x%08X\n",
-                n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8),
+        fprintf(stderr, "[condprobe] cond=%u thr='%s' #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X +0x10=0x%08X\n",
+                cond_id, thrdiag_cur_name(), n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8),
                 vm_read32(obj+0xC), vm_read32(obj+0x10));
-    } }
+#ifdef _WIN32
+        /* Full host backtrace of MAIN's cond-29 wait -> the whole loop chain up to
+         * main() in one shot (symbolize with tools/des/sym.py --stack). Piece 2. */
+        { void* fr[64]; unsigned short nf = RtlCaptureStackBackTrace(0, 64, fr, 0);
+          HMODULE self = 0; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)&vm_read32,&self);
+          for (unsigned short i=0;i<nf;i++){ HMODULE m=0; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)fr[i],&m);
+            if(m==self) fprintf(stderr,"[condprobe-bt] rva=0x%llX\n",(unsigned long long)((char*)fr[i]-(char*)self)); } }
+#endif
+    } } }
 
     /* PROBE (SPURS_EVTEST=1): one-shot chain test for Frontier #11. The parked
      * SPURuntimeService (q=1) waits for a SPURS USER event (source 0xFFFFFFFF53505501,
