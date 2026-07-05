@@ -1089,6 +1089,14 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
 
     u16 pattern = *bits;
 
+    /* P1 diagnostic (docs/19): which thread waits on which event-flag + pattern,
+     * so we can map each dormant worker -> its CellSpursEventFlag (A-R8) for P2. */
+    { extern const char* thrdiag_cur_name(void);
+      static int _n = 0; if (getenv("SPU_MBOX_LOG") && _n < 24) { _n++;
+        const char* nm = thrdiag_cur_name();
+        fprintf(stderr, "[ef-wait] thread='%s' flag_ea=0x%08X pattern=0x%04X mode=%u bits_now=0x%04X\n",
+                nm ? nm : "?", (unsigned)(uintptr_t)eventFlag, pattern, mode, eventFlag->bits); } }
+
     ef_lock(sync);
 
     /* Block until the requested bit pattern is satisfied */
