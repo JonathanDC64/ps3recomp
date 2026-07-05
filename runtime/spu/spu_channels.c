@@ -254,8 +254,34 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     }
 
     switch (channel) {
-    case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);       break;
-    case SPU_WrOutIntrMbox:  spu_channel_write(&ctx->ch_out_intr_mbox, v);  break;
+    case SPU_WrOutMbox:      spu_channel_write(&ctx->ch_out_mbox, v);
+        { static int _n=0; if (getenv("SPU_MBOX_LOG") && _n<64) { _n++;
+            fprintf(stderr, "[spu-mbox] image=%d WrOutMbox=0x%08X\n", ctx->image_id, v); } }
+        break;
+    case SPU_WrOutIntrMbox:  spu_channel_write(&ctx->ch_out_intr_mbox, v);
+        /* = sys_spu_thread_send_event(spup, data0, data1): v = (spup<<24)|(data0&0xFFFFFF),
+         * and the paired data1 is the last WrOutMbox value. docs/15 §4 trigger B: this is the
+         * REAL event the SPU code produces -- post it (vs synthesizing data3). */
+        { static int _n=0; if (getenv("SPU_MBOX_LOG") && _n<64) { _n++;
+            fprintf(stderr, "[spu-mbox] image=%d WrOutIntrMbox=0x%08X (spup=%u data0=0x%06X) pending_data1=depth%d\n",
+                    ctx->image_id, v, (v>>24)&0xFF, v&0xFFFFFF, ctx->ch_out_mbox.count); } }
+        /* Trigger B: when the SPU substrate is up (SPURS_LV2THREADS), post the REAL USER
+         * event the SPU is sending. spup selects the PPU handler; data1 (from OutMbox) is
+         * the payload handler B needs (the next task/functor descriptor). Post to the SPURS
+         * service queue with the registered SPU lv2 id so the list-lookup hits. */
+        { extern uint32_t g_cs_spu_lv2[]; extern uint32_t g_cs_nspus;
+          extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
+          if (g_cs_nspus && g_cs_spu_lv2[0]) {
+              uint32_t spup  = (v >> 24) & 0xFF;
+              uint32_t data0 = v & 0xFFFFFF;
+              uint64_t data1 = spu_channel_read(&ctx->ch_out_mbox);   /* paired payload */
+              uint32_t q = 1; { const char* e = getenv("SPURS_INTRMBOX_EVQ"); if (e) q = (uint32_t)strtoul(e,0,0); }
+              int r = sys_spu_thread_post_user_event(q, g_cs_spu_lv2[0], spup, data0, data1);
+              if (getenv("SPU_MBOX_LOG")) { static int _p=0; if(_p++<64)
+                  fprintf(stderr, "[spu-mbox] -> POST real USER event q=%u lv2=0x%X spup=%u data0=0x%06X data1=0x%llX -> %d\n",
+                          q, g_cs_spu_lv2[0], spup, data0, (unsigned long long)data1, r); } }
+        }
+        break;
     case SPU_WrDec:          ctx->decrementer = v;                          break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break;
     case SPU_WrEventAck:     ctx->event_status &= ~v;                       break;
