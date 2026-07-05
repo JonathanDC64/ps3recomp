@@ -346,6 +346,16 @@ extern "C" {
     DS_TLS unsigned g_ds_ring_r3[1024];
 }
 
+/* One-shot diagnostic: confirm SPURS handler B (func_00C5D6D8) executes on our
+ * posted SPU USER event. Gated by SPU_MBOX_LOG. */
+void ds_note_handlerB(unsigned r3, unsigned r4)
+{
+    static int n = 0;
+    if (getenv("SPU_MBOX_LOG") && n < 40) { n++;
+        fprintf(stderr, "[handlerB] func_00C5D6D8 ENTER r3=0x%08X r4=0x%08X\n", r3, r4);
+    }
+}
+
 extern "C" void ds_dump_shadow(void)
 {
     unsigned n = g_ds_sp; if (n > 8192u) n = 8192u;
