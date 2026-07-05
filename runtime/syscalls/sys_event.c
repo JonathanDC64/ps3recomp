@@ -307,6 +307,21 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         out[2] = bswap64(evt.data2);
         out[3] = bswap64(evt.data3);
     }
+    /* Trace SPU USER events delivered to the SPURS service so we can see whether our
+     * posted event (source 0x..53505501) arrives with the right fields to reach handler B. */
+    if (getenv("SPU_MBOX_LOG") && (evt.source >> 32) == 0xFFFFFFFFu) {
+        static int _n=0; if (_n++ < 40)
+            fprintf(stderr, "[evq-recv] q=%u tid=%lu src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (sel=%u)\n",
+                    queue_id, (unsigned long)
+#ifdef _WIN32
+                    GetCurrentThreadId(),
+#else
+                    (unsigned long)pthread_self(),
+#endif
+                    (unsigned long long)evt.source, (unsigned long long)evt.data1,
+                    (unsigned long long)evt.data2, (unsigned long long)evt.data3,
+                    (unsigned)((evt.data2 >> 32) & 0xFF));
+    }
 
     return CELL_OK;
 }
