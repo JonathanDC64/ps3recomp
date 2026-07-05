@@ -275,7 +275,18 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               uint32_t spup  = (v >> 24) & 0xFF;
               uint32_t data0 = v & 0xFFFFFF;
               uint64_t data1 = spu_channel_read(&ctx->ch_out_mbox);   /* paired payload */
-              uint32_t q = 1; { const char* e = getenv("SPURS_INTRMBOX_EVQ"); if (e) q = (uint32_t)strtoul(e,0,0); }
+              /* Target the queue the SPURS service (SPURuntimeService) is actually
+               * blocked receiving on -- looked up by thread name, since its queue id is
+               * allocated dynamically per run. Env override wins; fall back to busiest
+               * receiver, then 1. */
+              extern uint32_t spurs_service_queue(void);
+              extern uint32_t thrdiag_wobj_of(const char*, const char*);
+              extern uint32_t spurs_busiest_recv_queue(void);
+              uint32_t q = spurs_service_queue();                       /* captured by name */
+              if (!q) q = thrdiag_wobj_of("(Dantelion2)SPURuntime", "evq");
+              if (!q) q = spurs_busiest_recv_queue();
+              if (!q) q = 1;
+              { const char* e = getenv("SPURS_INTRMBOX_EVQ"); if (e) q = (uint32_t)strtoul(e,0,0); }
               int r = sys_spu_thread_post_user_event(q, g_cs_spu_lv2[0], spup, data0, data1);
               if (getenv("SPU_MBOX_LOG")) { static int _p=0; if(_p++<64)
                   fprintf(stderr, "[spu-mbox] -> POST real USER event q=%u lv2=0x%X spup=%u data0=0x%06X data1=0x%llX -> %d\n",

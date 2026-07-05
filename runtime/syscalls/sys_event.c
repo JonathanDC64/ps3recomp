@@ -202,6 +202,13 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
     fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu)\n", queue_id, (unsigned long long)timeout_us);
+    /* Track per-queue receive counts + capture the SPURS service's queue by thread
+     * name, so trigger B posts to the exact queue the service receives on (its id is
+     * allocated dynamically per run; docs/15 P2 left it unwired). */
+    { extern void spurs_note_recv(uint32_t); spurs_note_recv(queue_id);
+      extern const char* thrdiag_cur_name(void); extern void spurs_note_service_q(uint32_t);
+      const char* nm = thrdiag_cur_name();
+      if (nm && nm[0] && strstr(nm, "SPURuntime")) spurs_note_service_q(queue_id); }
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -656,6 +663,28 @@ int gcm_frame_enqueue(void)
     ppu_guest_call_code(0x00A9DD58u, g_gcm_toc, g_gcm_disp_obj, 0x103, g_gcm_disp_arg, 0);
     return 1;
 }
+
+/* Per-queue receive counter + "busiest receive queue" = the SPURS service's queue
+ * (it loops receiving far more than any other). Lets trigger B target the service's
+ * dynamically-allocated queue instead of a hardcoded id. */
+static uint32_t g_recv_counts[SYS_EVENT_QUEUE_MAX + 1] = {0};
+void spurs_note_recv(uint32_t queue_id)
+{
+    if (queue_id > 0 && queue_id <= SYS_EVENT_QUEUE_MAX) g_recv_counts[queue_id]++;
+}
+uint32_t spurs_busiest_recv_queue(void)
+{
+    uint32_t best = 0, bestc = 0;
+    for (uint32_t i = 1; i <= SYS_EVENT_QUEUE_MAX; i++)
+        if (g_recv_counts[i] > bestc) { bestc = g_recv_counts[i]; best = i; }
+    return best;   /* 0 if none received yet */
+}
+
+/* The queue the SPURS service (SPURuntimeService) actually receives on -- captured
+ * by thread name whenever it calls receive, so trigger B targets it deterministically. */
+static volatile uint32_t g_spurs_service_q = 0;
+void     spurs_note_service_q(uint32_t q) { if (q) g_spurs_service_q = q; }
+uint32_t spurs_service_queue(void)        { return g_spurs_service_q; }
 
 int gcm_display_event_post(uint64_t data1, uint64_t data2, uint64_t data3)
 {

@@ -89,6 +89,14 @@ void thrdiag_hle(const char* name)
     g_t[i].hleseq++;
 }
 
+/* Current thread's registered name (or "" if not set yet). Lets event syscalls
+ * attribute a receive to a named guest thread (e.g. the SPURS service). */
+const char* thrdiag_cur_name(void)
+{
+    if (s_slot < 0) return "";
+    return g_t[s_slot].name;
+}
+
 void thrdiag_dump(void)
 {
     long n = g_n; if (n > TDIAG_MAX) n = TDIAG_MAX;
