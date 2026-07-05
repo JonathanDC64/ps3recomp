@@ -28,14 +28,32 @@ enum {
     CS_EVENT_QUEUE      = 0xD5C,  /* u32    -- lv2 event queue id */
     CS_EVENT_PORT       = 0xD60,  /* u32    -- lv2 event port id */
     CS_HANDLER_DIRTY    = 0xD64,  /* u8 (atomic) -- handler needs wakeup */
+    CS_WKL_CONTENTION   = 0x20,   /* u8[16] -- wklCurrentContention: #SPUs running each wkl */
     CS_MAX_SPUS         = 8,
+};
+
+/* Real CellSpursTaskset offsets (RPCS3 cellSpurs.h). Bitsets are atomic_be_t<u32>[4] =
+ * 128-bit, indexed by taskId with bit (0x80000000 >> (taskId%32)) in word taskId/32. */
+enum {
+    TS_RUNNING = 0x00,   /* u32[4] -- task currently executing */
+    TS_ENABLED = 0x30,   /* u32[4] -- task slot allocated (created, not destroyed) */
+    TS_SPURS   = 0x60,   /* u32    -- back-pointer to CellSpurs */
+    TS_WID     = 0x74,   /* u32    -- this taskset's SPURS workload id */
 };
 
 /* vm_* byte-swapping guest-memory accessors (defined in runtime/ppu/ppu_loader.cpp; the
  * unit test provides its own over a buffer). */
 extern uint32_t vm_read32(uint64_t ea);
+extern uint8_t  vm_read8 (uint64_t ea);
 extern void     vm_write8 (uint64_t ea, uint8_t  v);
 extern void     vm_write32(uint64_t ea, uint32_t v);
+
+/* Taskset side-effects (docs/19 P2 / docs/17 A-R6): reproduce the SPU Taskset PM's
+ * bitset + contention bookkeeping when we run a leaf directly, so the PPU-side SPURS
+ * API/scheduler sees a coherent world. On start: running|=bit, contention[wid]++.
+ * On finish: running&=~bit, enabled&=~bit (DONE marker), contention[wid]--. */
+void spurs_taskset_task_start(uint32_t taskset_ea, uint32_t taskId);
+void spurs_taskset_task_done (uint32_t taskset_ea, uint32_t taskId);
 
 /* Write the SPU/event substrate fields into the guest CellSpurs at `spurs_ea` (BE), so the
  * SPURS service finds the SPU thread group, the per-SPU lv2 ids, the SPU port, and the event

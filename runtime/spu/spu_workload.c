@@ -264,6 +264,13 @@ static void spu_async_run(spu_async_job* j)
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
              * overwriting the stack-allocated context. */
+            /* docs/19 P2 (A-R6): reproduce the SPU Taskset PM's bitset/contention
+             * side-effects so the PPU-side SPURS scheduler sees a coherent world.
+             * Gated with the substrate (SPURS_LV2THREADS). */
+            { static int lv2t = -1; if (lv2t < 0) { const char* e = getenv("SPURS_LV2THREADS"); lv2t = (e && e[0] != '0') ? 1 : 0; }
+              if (lv2t && j->taskset_ea) {
+                  extern void spurs_taskset_task_start(uint32_t, uint32_t);
+                  spurs_taskset_task_start(j->taskset_ea, j->taskId); } }
             fprintf(stderr, "[spu_workload] async image=%d ENTER run\n", j->image_id);
             fflush(stderr);
             int32_t rc = -999;
@@ -283,6 +290,12 @@ static void spu_async_run(spu_async_job* j)
 #endif
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d\n", j->image_id, rc);
             fflush(stderr);
+            /* docs/19 P2 (A-R6): on leaf completion, clear running+enabled + decrement
+             * contention (the DONE marker + scheduler coherence). Gated. */
+            { static int lv2t = -1; if (lv2t < 0) { const char* e = getenv("SPURS_LV2THREADS"); lv2t = (e && e[0] != '0') ? 1 : 0; }
+              if (lv2t && j->taskset_ea) {
+                  extern void spurs_taskset_task_done(uint32_t, uint32_t);
+                  spurs_taskset_task_done(j->taskset_ea, j->taskId); } }
 
             /* EXPERIMENT (SPURS_DONE_EVQ=N): on task completion, post a SPURS USER
              * event to event queue N so the PPU completion handler (e.g. hkSpuUtil
