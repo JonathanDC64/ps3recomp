@@ -790,6 +790,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 
     /* taskId/taskset are guest EAs; translate before deref. elf/context stay
      * guest EAs (handled below — elf is translated for load, context kept EA). */
+    uint32_t taskId_ea  = (uint32_t)(uintptr_t)taskId;   /* BE out-param, see below */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     CellSpursTaskId* taskId_h = GUEST_PTR(taskId, CellSpursTaskId*);
 
@@ -814,7 +815,22 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             s_tasks[i].exitCode = 0;
             s_tasks[i].entryPoint = elf;
 
-            if (taskId_h) *taskId_h = s_tasks[i].id;
+            /* The assigned task id goes back to the guest BIG-ENDIAN.
+             *
+             * A host-endian store here is the whole Demon's Souls SPURS deadlock:
+             * the game reads its taskId back as bswap32(1) = 0x01000000 and hands
+             * that straight to _cellSpursSendSignal, whose delivery path rejects
+             * anything >= 128 (spu_taskset_signal_task) and silently drops the
+             * signal. The taskset's SIGNALLED bitset then stays empty, SPU task 1
+             * parks in WAIT_SIGNAL forever, never sets event flag 0x01CE7800, and
+             * the PPU blocks in cellSpursEventFlagWait on it -- each side waiting
+             * for the other. Verified with PS3_HLE_ARGS=E0A6DBE4: the guest really
+             * does pass r4=0x01000000, i.e. it is echoing back what we wrote.
+             *
+             * Same bug class as the libs/ guest-pointer sweep (a scalar the guest
+             * reads back needs vm_write*, not a bare store through a host pointer). */
+            if (taskId_ea) vm_write32(taskId_ea, (uint32_t)s_tasks[i].id);
+            (void)taskId_h;
             taskset->taskCount++;
 
             /* Register the task in the REAL BE taskset: writes task_info[slot]
