@@ -22,6 +22,12 @@
 #include <stdlib.h>
 #include <setjmp.h>
 #include <time.h>
+
+/* SPU_QLOG diagnostic state (fork c5da2a2 / 9623eaf). The DMA tracer in
+ * spu_dma.h references these; defined here so that header stays header-only. */
+int g_spu_qlog     = -1;   /* -1 = uninit; set from env on first DMA */
+int g_qlog7_budget = 60;   /* cap image-7 DMA log lines (it transfers a lot) */
+int g_qlog7_prov   = 2;    /* cap image-7 bad-EA GPR provenance dumps */
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -1131,16 +1137,14 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
         if (s_break_after > 0 && (int)(++ctx->poll_spins) >= s_break_after) {
             ctx->poll_spins = 0;
             if (s_break_mode == 0) {
-                fprintf(stderr, "[spu] POLL-spin break: EXIT scheduler task (image=%d)
-", ctx->image_id);
+                fprintf(stderr, "[spu] POLL-spin break: EXIT scheduler task (image=%d)\n", ctx->image_id);
                 fflush(stderr);
                 ctx->stop_code = 0;
                 ctx->status = SPU_STATUS_STOPPED_BY_STOP;
                 spu_halt(ctx);
                 return;
             }
-            fprintf(stderr, "[spu] POLL-spin break: return %d (image=%d) after %d polls
-",
+            fprintf(stderr, "[spu] POLL-spin break: return %d (image=%d) after %d polls\n",
                     s_break_mode, ctx->image_id, s_break_after);
             fflush(stderr);
             ctx->gpr[3]._u32[0] = (uint32_t)s_break_mode;

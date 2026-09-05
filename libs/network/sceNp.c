@@ -227,8 +227,7 @@ static void np_fire_manager_cb_once(void)
     if (getenv("NP_NO_FIRE_CB")) return;
     extern uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
     in_fire = 1; fired = 1;
-    fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=OFFLINE arg=0x%08X
-",
+    fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=OFFLINE arg=0x%08X\n",
             s_npmgr_cb_opd, s_npmgr_cb_arg_ea);
     ppu_guest_call(s_npmgr_cb_opd, (uint64_t)(int64_t)SCE_NP_MANAGER_STATUS_OFFLINE,
                    0, (uint64_t)s_npmgr_cb_arg_ea, 0);

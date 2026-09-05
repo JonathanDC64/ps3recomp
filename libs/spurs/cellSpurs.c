@@ -26,7 +26,13 @@
  * create path is sequential here). Gated by YDKJ_REAL_TASKSET in the dispatch. */
 uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid     = 0;
-uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the taskset-policy handoff) */
+uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (taskset-policy handoff) */
+
+/* Guest EA of the CellSpursTaskExitCode container for the task being dispatched
+ * (fork 9404ead / 4b1348d). Same set-immediately-before-dispatch handoff as the
+ * g_ydkj_real_* globals above; consumed in runtime/spu/spu_lifted_job.h when the
+ * leaf ends via `stop 0`. */
+uint32_t g_spurs_exitcode_ea = 0;
 
 /* Generic HLE adapter passes GUEST addresses; translate pointer args. CellSpurs
  * is treated opaquely by the game (passed back as a handle), so translating the
@@ -999,10 +1005,6 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
  * three PPU-side NIDs that set the container up, so they resolved to nothing and
  * the container EA never reached the task. Reimplemented clean from the public
  * SDK contracts (RPCS3 stubs these PPU-side because it runs the real SPU kernel). */
-
-/* Bridge the attribute's exit-code container EA to the SPU dispatch, matching
- * upstream's own g_ydkj_real_* handoff pattern (set immediately before dispatch). */
-uint32_t g_spurs_exitcode_ea = 0;
 
 /* cellSpursTaskAttributeSetExitCodeContainer(pAttribute, pExitCode): record the
  * guest EA of the task's CellSpursTaskExitCode container in the attribute. */
