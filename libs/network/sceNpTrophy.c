@@ -15,6 +15,8 @@
 #include <time.h>
 #include <stdint.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
@@ -165,6 +167,7 @@ static u32 trophy_count_unlocked(TrophyContext* ctx)
 
 void sceNpTrophySetStoragePath(const char* path)
 {
+    path = GUEST_PTR(path, const char*);
     if (path) {
         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
@@ -288,8 +291,34 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
     return CELL_OK;
 }
 
+/* Fire a guest SceNpTrophyStatusCallback via the OPD in `statusCb`.
+ * Callback ABI: int cb(context, status, completed, total, arg). */
+extern unsigned long long ppu_guest_call_ct(u32 code, u32 toc,
+                                            u64 a0, u64 a1, u64 a2, u64 a3,
+                                            u64 a4, u64 a5, u64 a6, u64 a7);
+
+static void trophy_fire_status_cb(u32 statusCb, u32 arg,
+                                  SceNpTrophyContext context,
+                                  u32 status, u32 completed, u32 total)
+{
+    if (!statusCb) return;
+    /* Resolve the guest OPD (big-endian: [code][toc]). */
+    const u8* opd = (const u8*)(vm_base + statusCb);
+    u32 code = ((u32)opd[0] << 24) | ((u32)opd[1] << 16) |
+               ((u32)opd[2] <<  8) |  (u32)opd[3];
+    u32 toc  = ((u32)opd[4] << 24) | ((u32)opd[5] << 16) |
+               ((u32)opd[6] <<  8) |  (u32)opd[7];
+    printf("[sceNpTrophy] firing status cb: opd=0x%08X code=0x%08X toc=0x%08X "
+           "status=%u (%u/%u)\n", statusCb, code, toc, status, completed, total);
+    ppu_guest_call_ct(code, toc,
+                      (u64)(u32)context, (u64)status, (u64)completed, (u64)total,
+                      (u64)arg, 0, 0, 0);
+}
+
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
+                               u32 statusCb,
+                               u32 arg,
                                u64 options)
 {
     (void)options;
@@ -312,8 +341,19 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     trophy_load(&s_contexts[context]);
     s_contexts[context].registered = 1;
 
-    printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d) -> loaded saved data\n",
-           context, handle);
+    printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
+           "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
+
+    /* The game blocks (TrophyThread poll on 0x543580) until registration
+     * completes.  Real fw drives that completion by invoking the guest status
+     * callback synchronously on this thread.  Matching the RPCS3 oracle, we
+     * fire it once with INSTALLED (trp_status=3). */
+    {
+        u32 total = s_contexts[context].total_trophies;
+        trophy_fire_status_cb(statusCb, arg, context,
+                              SCE_NP_TROPHY_STATUS_INSTALLED, total, total);
+    }
+
     return CELL_OK;
 }
 
@@ -334,8 +374,14 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
-    /* Typical trophy pack size */
-    *reqSpace = 1024 * 1024; /* 1 MB */
+    /* Typical trophy pack size. The guest is big-endian and reads this u64
+     * back in BE order, so the value MUST be byte-swapped on write -- otherwise
+     * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
+     * "required disk space" straight into its save-data free-space accounting
+     * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
+     * errB underflow negative -> cellGame GameData check returns ERROR-B ->
+     * boot bails. (Same LE-write class as the cellUserInfo fix.) */
+    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
     printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
     return CELL_OK;
 }
@@ -470,7 +516,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     /* Check if all non-platinum trophies are unlocked -> platinum */
     if (platinumId) {
-        *platinumId = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
         /* Simplified: don't auto-award platinum without grade info */
     }
 
@@ -497,14 +543,19 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     if (!flags || !count)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    memset(flags, 0, sizeof(SceNpTrophyFlagArray));
+    u32 flags_ea = (u32)(uintptr_t)flags;
+    for (u32 o = 0; o < sizeof(SceNpTrophyFlagArray); o += 4)
+        vm_write32(flags_ea + o, 0);
 
     for (u32 i = 0; i < s_contexts[context].total_trophies; i++) {
         if (s_contexts[context].unlocked[i])
-            flags->flag[i / 32] |= (1u << (i % 32));
+            {
+            u32 word_ea = flags_ea + (i / 32) * 4;
+            vm_write32(word_ea, vm_read32(word_ea) | (1u << (i % 32)));
+        }
     }
 
-    *count = s_contexts[context].total_trophies;
+    vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
     return CELL_OK;
 }
 
@@ -530,9 +581,10 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
     u32 total = s_contexts[context].total_trophies;
     u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
 
-    *percentage = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    s32 pct = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+    vm_write32(GUEST_EA(percentage), (u32)pct);
 
     printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
-           context, *percentage);
+           context, pct);
     return CELL_OK;
 }

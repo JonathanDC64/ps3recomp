@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (BE store into guest) */
+#include <stddef.h>   /* offsetof */
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
@@ -141,6 +143,70 @@ static void jpgdec_free_source(JpgDecSubState* sub)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * Guest struct access
+ *
+ * Same as cellGifDec: none of these structs holds a pointer, so the guest lays
+ * them out as we do and offsetof() gives a usable guest offset. Only the
+ * address and the byte order differ. CellJpgDecOutParam leads with a u64, so it
+ * is written field by field rather than word by word.
+ * -----------------------------------------------------------------------*/
+#define JPG_EA(p) ((u32)(uintptr_t)(p))
+
+static void jpgdec_src_load(CellJpgDecSrc* h, const CellJpgDecSrc* guest_ea)
+{
+    u32 ea = JPG_EA(guest_ea);
+    memset(h, 0, sizeof(*h));
+    if (!ea)
+        return;
+    h->srcSelect       = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, srcSelect));
+    h->fileOffset      = vm_read64(ea + (u32)offsetof(CellJpgDecSrc, fileOffset));
+    h->fileSize        = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, fileSize));
+    h->streamPtr       = vm_read64(ea + (u32)offsetof(CellJpgDecSrc, streamPtr));
+    h->streamSize      = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, streamSize));
+    h->spuThreadEnable = vm_read32(ea + (u32)offsetof(CellJpgDecSrc, spuThreadEnable));
+    memcpy(h->fileName, vm_base + ea + offsetof(CellJpgDecSrc, fileName),
+           sizeof(h->fileName));
+    h->fileName[sizeof(h->fileName) - 1] = '\0';
+}
+
+static void jpgdec_in_param_load(CellJpgDecInParam* h,
+                                 const CellJpgDecInParam* guest_ea)
+{
+    u32 ea = JPG_EA(guest_ea);
+    memset(h, 0, sizeof(*h));
+    if (!ea)
+        return;
+    const u32 n = (u32)(sizeof(*h) / 4);   /* all u32 */
+    u32* w = (u32*)h;
+    for (u32 i = 0; i < n; i++)
+        w[i] = vm_read32(ea + i * 4);
+}
+
+/* CellJpgDecInfo is four consecutive u32. */
+static void jpgdec_info_store(u32 ea, const CellJpgDecInfo* h)
+{
+    if (!ea)
+        return;
+    const u32* w = (const u32*)h;
+    for (u32 i = 0; i < sizeof(*h) / 4; i++)
+        vm_write32(ea + i * 4, w[i]);
+}
+
+static void jpgdec_out_param_store(u32 ea, const CellJpgDecOutParam* h)
+{
+    if (!ea)
+        return;
+    vm_write64(ea + (u32)offsetof(CellJpgDecOutParam, outputWidthByte),  h->outputWidthByte);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputWidth),      h->outputWidth);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputHeight),     h->outputHeight);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputComponents), h->outputComponents);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputMode),       h->outputMode);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, outputColorSpace), h->outputColorSpace);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, downScale),        h->downScale);
+    vm_write32(ea + (u32)offsetof(CellJpgDecOutParam, useMemorySpace),   h->useMemorySpace);
+}
+
 s32 cellJpgDecCreate(CellJpgDecMainHandle* mainHandle,
                      const CellJpgDecThreadInParam* threadInParam,
                      CellJpgDecThreadOutParam* threadOutParam)
@@ -154,9 +220,11 @@ s32 cellJpgDecCreate(CellJpgDecMainHandle* mainHandle,
     for (u32 i = 0; i < JPGDEC_MAX_HANDLES; i++) {
         if (!s_jpg_main[i].in_use) {
             s_jpg_main[i].in_use = 1;
-            *mainHandle = i;
+            vm_write32((u32)(uintptr_t)mainHandle, (u32)i);
             if (threadOutParam)
-                threadOutParam->jpgCodecVersion = 0x00010000;
+                vm_write32(JPG_EA(threadOutParam)
+               + (u32)offsetof(CellJpgDecThreadOutParam, jpgCodecVersion),
+               0x00010000);
             return CELL_OK;
         }
     }
@@ -188,7 +256,7 @@ s32 cellJpgDecOpen(CellJpgDecMainHandle mainHandle,
                    CellJpgDecOpnInfo* openInfo)
 {
     printf("[cellJpgDec] Open(main=%u, srcSelect=%u)\n", mainHandle,
-           src ? src->srcSelect : 0xFFFFFFFF);
+           src ? vm_read32(JPG_EA(src)) : 0xFFFFFFFFu);
 
     if (mainHandle >= JPGDEC_MAX_HANDLES || !s_jpg_main[mainHandle].in_use)
         return CELL_JPGDEC_ERROR_SEQ;
@@ -201,15 +269,18 @@ s32 cellJpgDecOpen(CellJpgDecMainHandle mainHandle,
             memset(&s_jpg_sub[i], 0, sizeof(JpgDecSubState));
             s_jpg_sub[i].in_use = 1;
             s_jpg_sub[i].main_handle = mainHandle;
-            s_jpg_sub[i].src = *src;
-            *subHandle = i;
-            if (openInfo) openInfo->initSpaceAllocated = 0;
+            jpgdec_src_load(&s_jpg_sub[i].src, src);
+            vm_write32((u32)(uintptr_t)subHandle, (u32)i);
+            if (openInfo)
+                vm_write32(JPG_EA(openInfo), 0);   /* initSpaceAllocated */
 
-            if (src->srcSelect == CELL_JPGDEC_FILE)
-                printf("[cellJpgDec]   file: '%s'\n", src->fileName);
-            else if (src->srcSelect == CELL_JPGDEC_BUFFER)
+            /* read back from the host copy just loaded */
+            const CellJpgDecSrc* hsrc = &s_jpg_sub[i].src;
+            if (hsrc->srcSelect == CELL_JPGDEC_FILE)
+                printf("[cellJpgDec]   file: '%s'\n", hsrc->fileName);
+            else if (hsrc->srcSelect == CELL_JPGDEC_BUFFER)
                 printf("[cellJpgDec]   buffer: guest_addr=0x%08X size=%u\n",
-                       (u32)src->streamPtr, src->streamSize);
+                       (u32)hsrc->streamPtr, hsrc->streamSize);
 
             return CELL_OK;
         }
@@ -257,7 +328,7 @@ s32 cellJpgDecReadHeader(CellJpgDecMainHandle mainHandle,
         printf("[cellJpgDec]   %ux%u, %u components\n", (u32)w, (u32)h, (u32)comp);
 
         sub->header_read = 1;
-        *info = sub->info;
+        jpgdec_info_store(JPG_EA(info), &sub->info);
         return CELL_OK;
     }
 #else
@@ -282,7 +353,7 @@ s32 cellJpgDecReadHeader(CellJpgDecMainHandle mainHandle,
             printf("[cellJpgDec]   %ux%u (header-only parse, no stb_image)\n", w, h);
 
             sub->header_read = 1;
-            *info = sub->info;
+            jpgdec_info_store(JPG_EA(info), &sub->info);
             return CELL_OK;
         }
         if (marker == 0x00 || marker == 0xFF) { i++; continue; }
@@ -315,6 +386,15 @@ s32 cellJpgDecSetParameter(CellJpgDecMainHandle mainHandle,
     if (!sub->header_read)
         return CELL_JPGDEC_ERROR_SEQ;
 
+    CellJpgDecInParam host_in;
+    jpgdec_in_param_load(&host_in, inParam);
+    inParam = &host_in;
+
+    u32 out_ea = JPG_EA(outParam);
+    CellJpgDecOutParam host_out;
+    memset(&host_out, 0, sizeof(host_out));
+    outParam = &host_out;
+
     sub->in_param = *inParam;
     sub->param_set = 1;
 
@@ -342,6 +422,7 @@ s32 cellJpgDecSetParameter(CellJpgDecMainHandle mainHandle,
     outParam->outputMode       = 0;
     outParam->downScale        = ds;
     outParam->useMemorySpace   = (u32)(outParam->outputWidthByte * out_h);
+    jpgdec_out_param_store(out_ea, outParam);
 
     return CELL_OK;
 }
@@ -364,6 +445,17 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
     if (!sub->header_read || !sub->param_set)
         return CELL_JPGDEC_ERROR_SEQ;
 
+    /* `data` and `dataInfo` arrive as raw guest effective addresses (the generic
+     * HLE dispatcher passes GPRs straight through), so they must be translated
+     * to host memory before use -- exactly as sub->src_data is above and as
+     * cellPngDecDecodeData does. Writing decoded pixels straight into `data`
+     * dereferenced it as a host pointer, corrupting/crashing instead of landing
+     * in the guest's output buffer. status is one BE u32 in guest memory. */
+    u32 data_addr     = (u32)(uintptr_t)data;
+    u32 datainfo_addr = (u32)(uintptr_t)dataInfo;
+    if (!vm_base) return CELL_JPGDEC_ERROR_ARG;
+    u8* data_host = vm_base + data_addr;
+
 #if JPGDEC_HAS_STB
     {
         int w, h, comp;
@@ -381,7 +473,7 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
                                             &w, &h, &comp, desired_comp);
         if (!pixels) {
             printf("[cellJpgDec] stbi_load failed: %s\n", stbi_failure_reason());
-            dataInfo->status = CELL_JPGDEC_DEC_STATUS_STOP;
+            if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_STOP);
             return CELL_JPGDEC_ERROR_STREAM_FORMAT;
         }
 
@@ -395,17 +487,18 @@ s32 cellJpgDecDecodeData(CellJpgDecMainHandle mainHandle,
             }
         }
 
-        memcpy(data, pixels, total);
+        memcpy(data_host, pixels, total);
         stbi_image_free(pixels);
 
-        printf("[cellJpgDec]   decoded %ux%u (%u bytes)\n", (u32)w, (u32)h, total);
+        printf("[cellJpgDec]   decoded %ux%u (%u bytes) -> guest 0x%08X\n",
+               (u32)w, (u32)h, total, data_addr);
 
-        dataInfo->status = CELL_JPGDEC_DEC_STATUS_FINISH;
+        if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_FINISH);
         return CELL_OK;
     }
 #else
     printf("[cellJpgDec] DecodeData: stb_image not available — place stb_image.h in libs/codec/\n");
-    dataInfo->status = CELL_JPGDEC_DEC_STATUS_STOP;
+    if (datainfo_addr) vm_write32(datainfo_addr, CELL_JPGDEC_DEC_STATUS_STOP);
     return (s32)CELL_ENOSYS;
 #endif
 }

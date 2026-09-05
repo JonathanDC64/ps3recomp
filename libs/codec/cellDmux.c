@@ -9,6 +9,8 @@
 #include "cellDmux.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -49,7 +51,7 @@ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
     (void)res;
 
     printf("[cellDmux] Open(streamType=%u)\n",
-           type ? type->streamType : 0);
+           type ? vm_read32(GUEST_EA(type)) : 0);   /* streamType */
 
     if (!type || !handle)
         return (s32)CELL_DMUX_ERROR_ARG;
@@ -59,12 +61,12 @@ s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
             s_dmux[i].in_use = 1;
             s_dmux[i].cbFunc = cbFunc;
             s_dmux[i].cbArg = cbArg;
-            s_dmux[i].streamType = type->streamType;
+            s_dmux[i].streamType = vm_read32(GUEST_EA(type));
             s_dmux[i].streamAddr = 0;
             s_dmux[i].streamSize = 0;
             s_dmux[i].userData = 0;
             s_dmux[i].auSeqNo = 0;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellDmux] Open -> handle=%u\n", i);
             return CELL_OK;
         }
@@ -102,8 +104,10 @@ s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId
 
     printf("[cellDmux] EnableEs(dmux=%u, major=%u, minor=%u)\n",
            handle,
-           esFilterId ? esFilterId->filterIdMajor : 0,
-           esFilterId ? esFilterId->filterIdMinor : 0);
+           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMajor)) : 0,
+           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMinor)) : 0);
 
     if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
@@ -114,12 +118,13 @@ s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId
         if (!s_es[i].in_use) {
             s_es[i].in_use = 1;
             s_es[i].dmuxId = handle;
-            s_es[i].filterId = *esFilterId;
+            guest_struct_load(&s_es[i].filterId, GUEST_EA(esFilterId),
+                              (u32)sizeof(s_es[i].filterId));
             s_es[i].esCbFunc = esCbFunc;
             s_es[i].esCbArg = esCbArg;
             s_es[i].hasAu = 0;
             memset(&s_es[i].currentAu, 0, sizeof(CellDmuxAuInfo));
-            *esHandle = (u32)i;
+            vm_write32((u32)(uintptr_t)esHandle, (u32)i);
             return CELL_OK;
         }
     }
@@ -248,7 +253,7 @@ s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInf
     if (auInfo)
         *auInfo = &s_es[esHandle].currentAu;
     if (auInfoNum)
-        *auInfoNum = 1;
+        vm_write32((u32)(uintptr_t)auInfoNum, (u32)1);
 
     return CELL_OK;
 }

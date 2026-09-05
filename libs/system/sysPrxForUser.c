@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -156,6 +157,28 @@ static u32 s_next_heap_id = 1;
 void sys_process_exit(s32 exitcode)
 {
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
+#ifdef _WIN32
+    /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
+     * would tear down before the first frame is ever presented. Hold
+     * indefinitely with CELLMARK_HOLD so the last rendered frame is
+     * visible / capturable. */
+    if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
+#endif
+    /* YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a
+     * teardown assert triggered by incomplete SPU/SPURS state (a timing race).
+     * Ignoring the exit on the calling thread lets the render loop keep running
+     * so we can see whether sustained execution produces on-screen content. */
+    if (getenv("YDKJ_NOEXIT")) {
+        printf("[sysPrxForUser] sys_process_exit IGNORED (YDKJ_NOEXIT) -- parking thread\n");
+        fflush(stdout);
+        for (;;) {
+#ifdef _WIN32
+            Sleep(1000);
+#else
+            struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
+    }
     exit(exitcode);
 }
 
@@ -167,7 +190,7 @@ s32 sys_process_getpid(void)
 s32 sys_process_get_number_of_object(u32 object_type, u32* count)
 {
     (void)object_type;
-    if (count) *count = 0;
+    if (count) vm_write32((u32)(uintptr_t)count, 0);
     return CELL_OK;
 }
 
@@ -345,10 +368,25 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
 extern u8* vm_base;  /* for guest-address diagnostics in the boot log */
 #define YZ_GUEST_ADDR(p) ((u32)((u8*)(p) - vm_base))
 
+/* Pointer PARAMETERS arrive as raw 32-bit guest EAs -- translate before any
+ * deref. Everything below then works on host pointers, and YZ_GUEST_ADDR
+ * round-trips correctly again. NULL is preserved so "attr ? ... : \"???\""
+ * still means what it reads like.
+ *
+ * NOTE runtime/ppu/ppu_sysprx.cpp implements these SAME NIDs as ctx handlers
+ * using vm_read32/vm_write32, and lbp/gen/ppu_hle_nids.cpp registers the ones
+ * here -- whichever registers last wins. Both are now correct about
+ * translation, so the order no longer decides whether it crashes. */
+#define YZ_XLAT(p, T) ((p) = (p) ? (T)(void*)(vm_base + (u32)(uintptr_t)(p)) : (T)0)
+
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    YZ_XLAT(attr, const sys_lwmutex_attribute_t*);
     printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
            attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
+    { extern char* getenv(const char*); static int _lt=-1; if(_lt<0)_lt=getenv("FLOW_LWMTRACE")?1:0;
+      if(_lt){ extern unsigned int ppu_active_lr(void); printf("[LWMTRACE] create guest=0x%08X caller_lr=0x%08X\n", YZ_GUEST_ADDR(lwmutex), ppu_active_lr()); } }
 
     if (!lwmutex)
         return CELL_EFAULT;
@@ -389,6 +427,7 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
 s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     (void)timeout;
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
@@ -405,6 +444,8 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
                YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
 #endif
+        { extern char* getenv(const char*); static int _lk=-1; if(_lk<0)_lk=getenv("FLOW_LOCKOK")?1:0;
+          if(_lk) return CELL_OK; }   /* diag: treat uninit lwmutex as acquired, see if boot proceeds */
         return CELL_ESRCH;
     }
 
@@ -426,6 +467,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 
 s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
@@ -447,6 +489,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
     if (!lwmutex) return CELL_EFAULT;
 
     u32 slot = lwmutex->sleep_queue - 1;
@@ -467,6 +510,7 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
 #ifdef _WIN32
     printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
            lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
@@ -513,6 +557,9 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
                       const sys_lwcond_attribute_t* attr)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
+    YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+    YZ_XLAT(attr, const sys_lwcond_attribute_t*);
     printf("[sysPrxForUser] sys_lwcond_create(name='%.8s')\n",
            attr ? attr->name : "???");
 
@@ -546,6 +593,7 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
 
 s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     if (!lwcond) return CELL_EFAULT;
 
     u32 slot = lwcond->lwcond_queue - 1;
@@ -562,6 +610,7 @@ s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
 
 s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     if (!lwcond) return CELL_EFAULT;
 
     u32 slot = lwcond->lwcond_queue - 1;
@@ -578,6 +627,7 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
 
 s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     fprintf(stderr, "[WAIT] lwcond_wait(timeout=%llu)\n", (unsigned long long)timeout);
     if (!lwcond) return CELL_EFAULT;
 
@@ -622,6 +672,7 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 
 s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
 {
+    YZ_XLAT(lwcond, sys_lwcond_t_hle*);
     printf("[sysPrxForUser] sys_lwcond_destroy()\n");
 
     if (!lwcond) return CELL_EFAULT;
@@ -656,7 +707,7 @@ s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
         if (!s_heaps[i].in_use) {
             s_heaps[i].in_use = 1;
             s_heaps[i].id = s_next_heap_id++;
-            *heap = s_heaps[i].id;
+            vm_write32((u32)(uintptr_t)heap, s_heaps[i].id);
             return CELL_OK;
         }
     }
@@ -676,22 +727,42 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
     return CELL_ESRCH;
 }
 
+/* Guest-address bump allocator for the _sys_heap_* API. These return a GUEST
+ * effective address (the caller writes to it through the VM), so a host malloc
+ * pointer is wrong -- the guest would treat it as a 32-bit EA and fault. Hand
+ * out addresses from a dedicated guest window above the sys_memory window. */
+#define YZ_HEAP_BASE 0x50000000u
+#define YZ_HEAP_END  0x58000000u
+static u32 s_heap_bump = 0;
+
+static u32 yz_heap_alloc(u32 size, u32 align)
+{
+    if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
+    if (align < 16) align = 16;
+    s_heap_bump = (s_heap_bump + align - 1) & ~(align - 1);
+    u32 ea = s_heap_bump;
+    s_heap_bump += (size + 15) & ~15u;
+    if (s_heap_bump > YZ_HEAP_END) return 0;
+    return ea;   /* guest EA; flat VM commits pages on first access */
+}
+
 void* sys_heap_malloc(sys_heap_t heap, u32 size)
 {
     (void)heap;
-    return malloc(size);
+    return (void*)(uintptr_t)yz_heap_alloc(size, 16);
 }
 
 s32 sys_heap_free(sys_heap_t heap, void* ptr)
 {
-    (void)heap;
-    free(ptr);
+    (void)heap; (void)ptr;   /* bump allocator: no per-alloc free */
     return CELL_OK;
 }
 
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 {
     (void)heap;
+    return (void*)(uintptr_t)yz_heap_alloc(size, align);
+#if 0
 #ifdef _WIN32
     return _aligned_malloc(size, align);
 #else
@@ -700,6 +771,17 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
         return NULL;
     return ptr;
 #endif
+#endif
+}
+
+/* _sys_heap_create_heap (libdbgfont / dinkum ABI): RETURNS a non-zero heap id
+ * in r3 (args name/type/blocksize/flags in r3..r6). Distinct from the out-param
+ * sys_heap_create_heap above; _sys_heap_malloc bump-allocs regardless of id. */
+u32 sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags)
+{
+    (void)name; (void)type; (void)blocksize; (void)flags;
+    static u32 s_hid = 0x100;
+    return s_hid++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -715,11 +797,18 @@ s32 sys_prx_exitspawn_with_level(void)
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
     (void)flags;
+    /* name/id arrive as raw GUEST effective addresses (the generic HLE adapter
+     * forwards gpr3.. untranslated). Translate before touching memory -- else
+     * printf("%s", name) derefs a bare host address and AVs. This path first
+     * appears once real libsre is loaded (its name string lives in the libsre
+     * image at 0x3000xxxx). Same bug class as the _sys_memset fix above. */
+    const char* hname = (const char*)yz_g2h(name);
+    u32* hid = (u32*)yz_g2h(id);
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
-           name ? name : "(null)");
+           hname ? hname : "(null)");
 
-    if (!id) return CELL_EFAULT;
-    *id = 0; /* fake module ID */
+    if (!hid) return CELL_EFAULT;
+    *hid = 0; /* fake module ID */
     return CELL_OK;
 }
 
@@ -733,6 +822,7 @@ s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 s32 sys_get_random_number(void* buf, u64 size)
 {
     if (!buf || size == 0) return CELL_EFAULT;
+    buf = yz_g2h(buf);   /* guest EA -> host pointer before the OS fills it */
 
 #ifdef _WIN32
     /* Use BCryptGenRandom on Windows */
@@ -765,33 +855,9 @@ s32 sys_get_random_number(void* buf, u64 size)
  * Console I/O (debug)
  * -----------------------------------------------------------------------*/
 
-/* Accumulate console output and, on a Dantelion panic, dump the guest call
- * stack so we can locate the failing DLStdAllocator transaction. */
-static void console_panic_scan(const char* s, u32 len)
-{
-    static char acc[8192];
-    static u32 accn = 0;
-    for (u32 i = 0; i < len; i++) {
-        char c = s[i];
-        if (accn < sizeof(acc) - 1) acc[accn++] = c;
-        if (c == '\n' || accn >= sizeof(acc) - 1) {
-            acc[accn] = 0;
-            if (strstr(acc, "Transaction failed") || strstr(acc, "DL_PANIC") ||
-                strstr(acc, "Dantelion2 Panic")) {
-                extern void ds_dump_shadow(void);
-                fprintf(stderr, "[panic-hook] Dantelion panic -- guest backtrace:\n");
-                ds_dump_shadow();
-            }
-            accn = 0;
-        }
-    }
-}
-
 s32 console_putc(s32 ch)
 {
     fputc(ch, stderr);
-    char c = (char)ch;
-    console_panic_scan(&c, 1);
     return CELL_OK;
 }
 
@@ -802,10 +868,8 @@ s32 console_getc(void)
 
 s32 console_write(const void* buf, u32 len)
 {
-    if (buf && len > 0) {
+    if (buf && len > 0)
         fwrite(buf, 1, len, stderr);
-        console_panic_scan((const char*)buf, len);
-    }
     return CELL_OK;
 }
 
@@ -817,6 +881,6 @@ s32 sys_process_get_paramsfo(void* buf)
 {
     /* PARAM.SFO data — return a minimal valid SFO with title ID */
     if (!buf) return CELL_EFAULT;
-    memset(buf, 0, 256);
+    memset(yz_g2h(buf), 0, 256);
     return CELL_OK;
 }

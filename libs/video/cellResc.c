@@ -7,6 +7,7 @@
  */
 
 #include "cellResc.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include <stdio.h>
 #include <string.h>
 
@@ -41,7 +42,7 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     if (!initConfig)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_config = *initConfig;
+    s_config = *GUEST_PTR(initConfig, const CellRescInitConfig*);
     memset(s_src, 0, sizeof(s_src));
     memset(s_dsts, 0, sizeof(s_dsts));
     s_flip_handler = NULL;
@@ -83,10 +84,10 @@ s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBuf
     case CELL_RESC_PAL_60_INTERPOLATE:
     case CELL_RESC_PAL_60_INTERPOLATE_30_DROP:
     case CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE:
-        *numBufs = 6;
+        vm_write32((uint32_t)(uintptr_t)numBufs, 6);
         break;
     default:
-        *numBufs = 2;
+        vm_write32((uint32_t)(uintptr_t)numBufs, 2);
         break;
     }
     return CELL_OK;
@@ -99,11 +100,11 @@ s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBu
 
     /* Provide reasonable buffer sizes for state tracking */
     if (colorBufSize)
-        *colorBufSize = 1920 * 1080 * 4; /* RGBA 1080p */
+        vm_write32((uint32_t)(uintptr_t)colorBufSize, 1920 * 1080 * 4); /* RGBA 1080p */
     if (vertexBufSize)
-        *vertexBufSize = 64 * 1024; /* 64KB vertex buffer */
+        vm_write32((uint32_t)(uintptr_t)vertexBufSize, 64 * 1024); /* 64KB vertex buffer */
     if (fragmentBufSize)
-        *fragmentBufSize = 256 * 1024; /* 256KB fragment shader */
+        vm_write32((uint32_t)(uintptr_t)fragmentBufSize, 256 * 1024); /* 256KB fragment shader */
 
     return CELL_OK;
 }
@@ -133,7 +134,7 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
     if (!src || index < 0 || index >= 8)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_src[index] = *src;
+    s_src[index] = *GUEST_PTR(src, const CellRescSrc*);
     return CELL_OK;
 }
 
@@ -153,7 +154,7 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     else if (displayMode & CELL_RESC_1280x720) idx = 2;
     else if (displayMode & CELL_RESC_1920x1080) idx = 3;
 
-    s_dsts[idx] = *dsts;
+    s_dsts[idx] = *GUEST_PTR(dsts, const CellRescDsts*);
     return CELL_OK;
 }
 
@@ -193,7 +194,7 @@ s32 cellRescGetDisplayMode(u32* displayMode)
     if (!displayMode)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    *displayMode = s_display_mode;
+    vm_write32((uint32_t)(uintptr_t)displayMode, s_display_mode);
     return CELL_OK;
 }
 
@@ -202,7 +203,7 @@ s32 cellRescGetLastFlipTime(u64* time)
     if (!time)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    *time = s_last_flip_time;
+    vm_write64((uint32_t)(uintptr_t)time, s_last_flip_time);
     return CELL_OK;
 }
 

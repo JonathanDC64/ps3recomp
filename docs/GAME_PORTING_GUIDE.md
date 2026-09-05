@@ -82,7 +82,7 @@ Cross-reference the game's imports against [MODULE_STATUS.md](MODULE_STATUS.md):
 
 ```bash
 # After ELF analysis
-python tools/prx_analyzer.py game/EBOOT.ELF --coverage
+python tools/prx_analyzer.py game/EBOOT.ELF --stubs
 ```
 
 If coverage is 95%+, the game is a good candidate.
@@ -104,9 +104,15 @@ PS3 game binaries are encrypted in SELF (Signed ELF) format. You need a decrypte
 - Enable "Dump Executable" in RPCS3 debug settings
 - Look for the decrypted file in RPCS3's cache directory
 
-**Option C: ps3recomp decrypt tool**
+**Option C: ps3recomp's fSELF rebuilder**
+
+Only for **debug / prototype** fSELF binaries, which are unencrypted — this
+rebuilds the original ELF without keys. A retail `EBOOT.BIN` is encrypted and
+needs Option A or B.
+
 ```bash
-python tools/elf_parser.py EBOOT.BIN --decrypt --output game/
+python tools/unfself.py EBOOT.BIN --output game/EBOOT.ELF
+python tools/unfself.py EBOOT.BIN --info      # describe it, write nothing
 ```
 
 ### Required Files
@@ -125,15 +131,20 @@ python tools/elf_parser.py EBOOT.BIN --decrypt --output game/
 
 ### ELF Analysis
 
+`elf_parser.py` writes JSON to **stdout** — it has no `--output`; redirect it.
+
 ```bash
-python tools/elf_parser.py game/EBOOT.ELF --output analysis/
+mkdir -p analysis
+python tools/elf_parser.py game/EBOOT.ELF --all      > analysis/elf_info.json
+python tools/elf_parser.py game/EBOOT.ELF --imports  > analysis/imports.json
+python tools/elf_parser.py game/EBOOT.ELF --exports  > analysis/exports.json
 ```
 
-This produces:
-- `elf_info.json` — header, entry point, architecture
-- `imports.json` — all imported functions (module + NID)
-- `exports.json` — exported symbols (if any)
-- `segments.json` — memory layout
+The flags select what to report:
+- *(default)* — header, entry point, architecture
+- `--imports` — imported functions (module + NID)
+- `--exports` — exported symbols (if any)
+- `--sections` / `--segments` / `--relocs`, or `--all` for everything
 
 ### Key Questions to Answer
 
@@ -148,7 +159,9 @@ This produces:
 ### NID Resolution
 
 ```bash
-python tools/nid_database.py --resolve analysis/imports.json --output resolved.json
+# Resolve the NIDs your imports dump listed (one hex NID per line):
+python tools/nid_database.py --batch analysis/nids.txt --json > resolved.json
+python tools/nid_database.py --lookup 0xAB8B4DA4        # or one at a time
 ```
 
 Review the output for unresolved NIDs. For each one:
@@ -184,7 +197,7 @@ python tools/ppu_disasm.py game/EBOOT.ELF \
 
 If the game uses SPU programs:
 ```bash
-python tools/elf_parser.py game/EBOOT.ELF --extract-spu --output spu_programs/
+python tools/extract_spu_images.py game/EBOOT.ELF --output spu_programs/
 ```
 
 SPU ELF segments are embedded within the main PPU ELF. Each one needs separate analysis.
@@ -209,7 +222,8 @@ This generates:
 ### SPU Code Lifting (if applicable)
 
 ```bash
-python tools/spu_disasm.py spu_programs/spu_0.elf --output spu_disasm/
+# spu_disasm writes to stdout; redirect it
+python tools/spu_disasm.py spu_programs/spu_0.elf > spu_disasm/spu_0.txt
 # SPU lifter generates similar C output for each SPU program
 ```
 

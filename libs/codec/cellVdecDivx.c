@@ -8,6 +8,8 @@
 #include "cellVdecDivx.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -40,10 +42,12 @@ s32 cellVdecDivxOpen(const CellVdecDivxConfig* config, CellVdecDivxHandle* handl
     if (slot < 0) return (s32)CELL_VDEC_DIVX_ERROR_OUT_OF_MEMORY;
 
     s_slots[slot].in_use = 1;
-    s_slots[slot].maxWidth = config ? config->maxWidth : 1920;
-    s_slots[slot].maxHeight = config ? config->maxHeight : 1080;
+    CellVdecDivxConfig host_cfg;
+    guest_struct_load(&host_cfg, GUEST_EA(config), (u32)sizeof(host_cfg));
+    s_slots[slot].maxWidth  = config ? host_cfg.maxWidth  : 1920;
+    s_slots[slot].maxHeight = config ? host_cfg.maxHeight : 1080;
 
-    *handle = (CellVdecDivxHandle)slot;
+    vm_write32((u32)(uintptr_t)handle, (CellVdecDivxHandle)slot);
     return CELL_OK;
 }
 
@@ -67,12 +71,14 @@ s32 cellVdecDivxDecode(CellVdecDivxHandle handle, const void* au, u32 auSize,
 
     /* Output black frame if buffer provided */
     if (picOut && picBufSize > 0)
-        memset(picOut, 0, picBufSize);
+        memset(GUEST_PTR(picOut, void*), 0, picBufSize);
 
     if (info) {
-        memset(info, 0, sizeof(*info));
-        info->width = s_slots[handle].maxWidth;
-        info->height = s_slots[handle].maxHeight;
+        CellVdecDivxFrameInfo host_info;
+        memset(&host_info, 0, sizeof(host_info));
+        host_info.width  = s_slots[handle].maxWidth;
+        host_info.height = s_slots[handle].maxHeight;
+        guest_struct_store(GUEST_EA(info), &host_info, (u32)sizeof(host_info));
     }
     return CELL_OK;
 }

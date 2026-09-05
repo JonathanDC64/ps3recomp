@@ -9,6 +9,7 @@
 #include "cellVdec.h"
 #include <stdio.h>
 #include <string.h>
+#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -39,7 +40,8 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
 {
     (void)res;
 
-    printf("[cellVdec] Open(codecType=%u)\n", type ? type->codecType : 0);
+    u32 codec_type = type ? vm_read32(GUEST_EA(type)) : 0;   /* codecType */
+    printf("[cellVdec] Open(codecType=%u)\n", codec_type);
 
     if (!type || !handle)
         return (s32)CELL_VDEC_ERROR_ARG;
@@ -48,10 +50,10 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
         if (!s_vdec[i].in_use) {
             memset(&s_vdec[i], 0, sizeof(VdecSlot));
             s_vdec[i].in_use = 1;
-            s_vdec[i].codecType = type->codecType;
+            s_vdec[i].codecType = codec_type;
             s_vdec[i].cbFunc = cbFunc;
             s_vdec[i].cbArg = cbArg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellVdec] Open -> handle=%u\n", i);
             return CELL_OK;
         }
@@ -109,9 +111,20 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
 
     VdecSlot* v = &s_vdec[handle];
 
+    /* CellVdecAuInfo mixes u32 and u64, so it comes across field by field: a
+     * big-endian u64 is high word first, and a word-at-a-time copy would put
+     * the two halves the wrong way round on a little-endian host. */
+    u32 au_ea = GUEST_EA(auInfo);
+    CellVdecAuInfo au;
+    au.startAddr = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, startAddr));
+    au.size      = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, size));
+    au.pts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, pts));
+    au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
+    au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
+
     printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
-           handle, auInfo->startAddr, auInfo->size,
-           (unsigned long long)auInfo->pts);
+           handle, au.startAddr, au.size,
+           (unsigned long long)au.pts);
 
     /* Step 1: Report AU consumed */
     if (v->cbFunc)
@@ -125,12 +138,12 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     v->auCount++;
     memset(&v->lastPic, 0, sizeof(v->lastPic));
     v->lastPic.codecType = v->codecType;
-    v->lastPic.startAddr = auInfo->startAddr;
-    v->lastPic.size      = auInfo->size;
+    v->lastPic.startAddr = au.startAddr;
+    v->lastPic.size      = au.size;
     v->lastPic.auNum     = v->auCount;
-    v->lastPic.pts       = auInfo->pts;
-    v->lastPic.dts       = auInfo->dts;
-    v->lastPic.userData  = auInfo->userData;
+    v->lastPic.pts       = au.pts;
+    v->lastPic.dts       = au.dts;
+    v->lastPic.userData  = au.userData;
     v->lastPic.status    = 0; /* OK */
     v->lastPic.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
     v->lastPic.width     = v->width ? v->width : 1280;

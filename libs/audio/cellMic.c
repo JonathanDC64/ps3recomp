@@ -7,6 +7,7 @@
 #include "cellMic.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* Internal state */
 
@@ -58,7 +59,7 @@ s32 cellMicStop(s32 devNum)
 s32 cellMicRead(s32 devNum, void* data, u32 maxBytes, u32* readBytes)
 {
     (void)devNum; (void)data; (void)maxBytes;
-    if (readBytes) *readBytes = 0;
+    if (readBytes) vm_write32((u32)(uintptr_t)readBytes, 0);
     return (s32)CELL_MIC_ERROR_DEVICE_NOT_FOUND;
 }
 
@@ -85,7 +86,7 @@ s32 cellMicGetType(s32 devNum, s32* type)
 {
     (void)devNum;
     if (!type) return (s32)CELL_MIC_ERROR_INVALID_ARGUMENT;
-    *type = CELL_MIC_TYPE_UNKNOWN;
+    vm_write32((u32)(uintptr_t)type, (u32)CELL_MIC_TYPE_UNKNOWN);
     return CELL_OK;
 }
 
@@ -100,7 +101,7 @@ s32 cellMicGetSignalState(s32 devNum, s32* signalState)
 {
     (void)devNum;
     if (!signalState) return (s32)CELL_MIC_ERROR_INVALID_ARGUMENT;
-    *signalState = 0;
+    vm_write32((u32)(uintptr_t)signalState, 0);
     return CELL_OK;
 }
 
@@ -114,6 +115,6 @@ s32 cellMicGetDeviceGUID(s32 devNum, u64* guid)
 {
     (void)devNum;
     if (!guid) return (s32)CELL_MIC_ERROR_INVALID_ARGUMENT;
-    *guid = 0;
+    vm_write64((u32)(uintptr_t)guid, 0);
     return CELL_OK;
 }

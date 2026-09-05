@@ -5,7 +5,9 @@
 #include "sys_timer.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
+#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -23,7 +25,53 @@ static void ensure_qpc_init(void)
         s_qpc_init = 1;
     }
 }
+
+int64_t lv2_usec_deadline(uint64_t usec)
+{
+    LARGE_INTEGER now;
+    ensure_qpc_init();
+    QueryPerformanceCounter(&now);
+    return now.QuadPart +
+        (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+}
+
+int lv2_deadline_passed(int64_t deadline)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart >= deadline;
+}
 #endif
+
+/* ---------------------------------------------------------------------------
+ * PPU timebase (mftb/mftbu) -- THE guest clock.
+ *
+ * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
+ * anchored at first use. The old lifter emission was a per-call-site
+ * static that advanced 16667 ticks PER READ -- not a clock at all: every
+ * guest timing loop (media pacers, throttles, profilers) computed garbage
+ * from it, and each call site had a PRIVATE counter that only moved when
+ * polled. Overflow-safe split multiply (rem < qpf, so
+ * rem * 79.8e6 < ~8e14 << 2^63).
+ * -----------------------------------------------------------------------*/
+uint64_t ppu_timebase_now(void)
+{
+#ifdef _WIN32
+    static LONGLONG t0 = 0;
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
+    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
+           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+#endif
+}
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -58,11 +106,40 @@ static void write_be64(uint32_t addr, uint64_t val)
  * -----------------------------------------------------------------------*/
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
-    { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13): covers poll-loops (e.g. func_00A31158) */
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    { static int n=0; if (n++ < 30) fprintf(stderr, "[WAIT] timer_usleep(%llu us)\n", (unsigned long long)usec); }
-    { extern void thrdiag_wait(const char*, uint32_t); extern void thrdiag_wake(void);
-      thrdiag_wait("usleep", (uint32_t)usec); /* wake recorded by next wait; usleep is brief */ }
+    { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n",
+        (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+    /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
+     * address, dump the registers and the object they point at. A poll loop
+     * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
+     * which is the part you actually need to find who never releases it. */
+    { static long s_wo = -1;
+      if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
+                      s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
+      if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
+        static int _n = 0;
+        if (_n++ < 8) {
+          uint32_t o = (uint32_t)ctx->gpr[29];
+          fprintf(stderr, "[wait-obj] lr=0x%08X r3=%llu r9=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X",
+                  (uint32_t)ctx->lr, (unsigned long long)usec, (uint32_t)ctx->gpr[9],
+                  o, (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
+          /* guest memory is big-endian: assemble the words explicitly. */
+          if (o && vm_base) {
+            const uint8_t* p = vm_base + o;
+            uint32_t w0 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
+            p = vm_base + o + 0x24;
+            uint32_t w24 = (uint32_t)(((uint32_t)(p)[0]<<24)|((uint32_t)(p)[1]<<16)|((uint32_t)(p)[2]<<8)|(uint32_t)(p)[3]);
+            fprintf(stderr, "  [r29+0x00]=0x%08X [r29+0x24]=0x%08X", w0, w24);
+          }
+          fprintf(stderr, "\n"); fflush(stderr);
+        } } }
+
+    /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
+     * guest functions -- names the stage that is starving. */
+    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
+      if (_ps > 0 && usec == 1000) { _ps--;
+        extern void ppu_log_host_chain(const char*);
+        ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
@@ -78,8 +155,23 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             Sleep((DWORD)(usec / 1000));
         }
     } else if (usec > 0) {
-        /* Very short sleep -- yield */
-        SwitchToThread();
+        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
+         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
+         * on accurate microsecond pacing -- a short usleep() spin waiting on
+         * another thread to make progress otherwise collapses to a single yield
+         * and busy-spins at full speed (so the wait is effectively a no-op).
+         * Busy-wait to a precise QPC deadline, yielding inside the spin
+         * (SwitchToThread) so a sibling host thread the guest may be waiting on
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+        ensure_qpc_init();
+        LARGE_INTEGER qpc_start, qpc_now;
+        QueryPerformanceCounter(&qpc_start);
+        const int64_t qpc_deadline = qpc_start.QuadPart +
+            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        do {
+            SwitchToThread();
+            QueryPerformanceCounter(&qpc_now);
+        } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
     if (usec > 0) {

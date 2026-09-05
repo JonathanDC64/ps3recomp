@@ -10,6 +10,8 @@
 #include "cellOskDialog.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -47,10 +49,43 @@ static void osk_utf16_to_ascii(const CellOskDialogChar* src, char* dst,
  * Configuration
  * -----------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * Guest struct access
+ *
+ * CellOskDialogInputFieldInfo is { CellOskDialogChar* message;
+ * CellOskDialogChar* init_text; u32 limit_length; } and
+ * CellOskDialogCallbackReturnParam is { s32 result; u32 numCharsResultString;
+ * CellOskDialogChar* pResultString; }. Both lead with (or contain) pointers,
+ * which the guest stores in four bytes and we in eight, so a cast misplaces
+ * every field after the first. The strings are UTF-16 and big-endian, so the
+ * code units come across one at a time too.
+ * -----------------------------------------------------------------------*/
+enum {
+    OSKIF_O_MESSAGE = 0, OSKIF_O_INIT_TEXT = 4, OSKIF_O_LIMIT_LENGTH = 8,
+    OSKRET_O_RESULT = 0, OSKRET_O_NUMCHARS = 4, OSKRET_O_PRESULTSTRING = 8
+};
+
+/* Copy a NUL-terminated big-endian UTF-16 string out of guest memory. */
+static u32 osk_guest_utf16(u32 ea, CellOskDialogChar* dst, u32 max)
+{
+    u32 n = 0;
+    if (!ea)
+        return 0;
+    while (n < max) {
+        u16 c = vm_read16(ea + n * 2);
+        if (!c)
+            break;
+        dst[n++] = c;
+    }
+    dst[n] = 0;
+    return n;
+}
+
 void cellOskDialogSetDefaultResponse(const char* text)
 {
     if (text) {
-        strncpy(s_default_response, text, CELL_OSK_MAX_TEXT_LENGTH);
+        strncpy(s_default_response, GUEST_PTR(text, const char*),
+                CELL_OSK_MAX_TEXT_LENGTH);
         s_default_response[CELL_OSK_MAX_TEXT_LENGTH] = '\0';
     }
 }
@@ -98,18 +133,27 @@ s32 cellOskDialogLoadAsync(u32 container,
 
     s_osk_loaded = 1;
 
+    u32 info_ea    = GUEST_EA(inputFieldInfo);
+    u32 message_ea = info_ea ? vm_read32(info_ea + OSKIF_O_MESSAGE)   : 0;
+    u32 init_ea    = info_ea ? vm_read32(info_ea + OSKIF_O_INIT_TEXT) : 0;
+
+    static CellOskDialogChar host_init[CELL_OSK_MAX_TEXT_LENGTH + 1];
+    u32 init_len = osk_guest_utf16(init_ea, host_init, CELL_OSK_MAX_TEXT_LENGTH);
+
     /* Log the prompt if available */
-    if (inputFieldInfo && inputFieldInfo->message) {
+    if (message_ea) {
+        static CellOskDialogChar host_msg[CELL_OSK_MAX_TEXT_LENGTH + 1];
+        osk_guest_utf16(message_ea, host_msg, CELL_OSK_MAX_TEXT_LENGTH);
         char prompt[256];
-        osk_utf16_to_ascii(inputFieldInfo->message, prompt, sizeof(prompt) - 1);
+        osk_utf16_to_ascii(host_msg, prompt, sizeof(prompt) - 1);
         printf("[cellOskDialog] LoadAsync - Prompt: \"%s\"\n", prompt);
     } else {
         printf("[cellOskDialog] LoadAsync - (no prompt)\n");
     }
 
-    if (inputFieldInfo && inputFieldInfo->init_text) {
+    if (init_ea) {
         char init[256];
-        osk_utf16_to_ascii(inputFieldInfo->init_text, init, sizeof(init) - 1);
+        osk_utf16_to_ascii(host_init, init, sizeof(init) - 1);
         printf("[cellOskDialog] Initial text: \"%s\"\n", init);
     }
 
@@ -121,15 +165,11 @@ s32 cellOskDialogLoadAsync(u32 container,
         s_result_length = (u32)strlen(s_default_response);
         printf("[cellOskDialog] Returning default response: \"%s\"\n",
                s_default_response);
-    } else if (inputFieldInfo && inputFieldInfo->init_text) {
+    } else if (init_ea) {
         /* Copy initial text as the response */
-        u32 i;
-        for (i = 0; i < CELL_OSK_MAX_TEXT_LENGTH &&
-             inputFieldInfo->init_text[i] != 0; i++) {
-            s_result_text[i] = inputFieldInfo->init_text[i];
-        }
-        s_result_text[i] = 0;
-        s_result_length = i;
+        memcpy(s_result_text, host_init,
+               (init_len + 1) * sizeof(CellOskDialogChar));
+        s_result_length = init_len;
     } else {
         s_result_length = 0;
     }
@@ -148,11 +188,15 @@ s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
     printf("[cellOskDialog] UnloadAsync()\n");
 
     if (result) {
-        result->result = CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK;
-        result->numCharsResultString = s_result_length;
-        if (result->pResultString && s_result_length > 0) {
-            memcpy(result->pResultString, s_result_text,
-                   (s_result_length + 1) * sizeof(CellOskDialogChar));
+        u32 res_ea = GUEST_EA(result);
+        vm_write32(res_ea + OSKRET_O_RESULT,
+                   CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK);
+        vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
+        u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
+        if (str_ea && s_result_length > 0) {
+            /* UTF-16, big-endian in guest memory: one unit at a time. */
+            for (u32 i = 0; i <= s_result_length; i++)
+                vm_write16(str_ea + i * 2, s_result_text[i]);
         }
     }
 
@@ -166,8 +210,8 @@ s32 cellOskDialogGetSize(u32* width, u32* height)
         return CELL_OSK_ERROR_INVALID_PARAMETER;
 
     /* Standard PS3 OSK dimensions */
-    *width  = 640;
-    *height = 240;
+    vm_write32((u32)(uintptr_t)width, (u32)640);
+    vm_write32((u32)(uintptr_t)height, (u32)240);
     return CELL_OK;
 }
 
@@ -216,14 +260,17 @@ s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result)
     if (!result)
         return CELL_OSK_ERROR_INVALID_PARAMETER;
 
-    result->result = (s_result_length > 0)
-                     ? CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK
-                     : CELL_OSK_DIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT;
-    result->numCharsResultString = s_result_length;
+    u32 res_ea = GUEST_EA(result);
+    vm_write32(res_ea + OSKRET_O_RESULT, (s_result_length > 0)
+               ? CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK
+               : CELL_OSK_DIALOG_INPUT_FIELD_RESULT_NO_INPUT_TEXT);
+    vm_write32(res_ea + OSKRET_O_NUMCHARS, s_result_length);
 
-    if (result->pResultString && s_result_length > 0) {
-        memcpy(result->pResultString, s_result_text,
-               (s_result_length + 1) * sizeof(CellOskDialogChar));
+    u32 str_ea = vm_read32(res_ea + OSKRET_O_PRESULTSTRING);
+    if (str_ea && s_result_length > 0) {
+        /* UTF-16, big-endian in guest memory: one unit at a time. */
+        for (u32 i = 0; i <= s_result_length; i++)
+            vm_write16(str_ea + i * 2, s_result_text[i]);
     }
 
     return CELL_OK;

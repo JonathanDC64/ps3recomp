@@ -8,7 +8,7 @@ git-ignored; this file is the human summary.)
 
 ## 1. PSN library catalog (filename pass, no extraction)
 
-- **1,345 archives** under `Z:\Roms\PS3\PSN` (PSN_1: 672, PSN_2: 673), **~1.13 TB** total.
+- **1,345 archives** in the local PSN library (set `PS3RECOMP_PSN_ROOT`; two shards of 672 / 673), **~1.13 TB** total.
 - **1,339 / 1,345** carry a parseable title-id in the filename (`… [NPxx-NNNNN]`).
 - **Region:** EU (SCEE) 661 · US (SCEA) 635 · JP (SCEJ) 28 · Asia 6 · unknown 15.
 - **Content class** (PSN prefix 4th letter, coarse):

@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include <stddef.h>   /* offsetof */
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
@@ -46,8 +48,17 @@ s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
     if (!uri || !url)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
 
+    /* CellHttpUtilUri is seven char arrays and a trailing u32: the guest
+     * layout is identical to ours, so the strings can be written straight
+     * through the translated pointer and only `port` needs a byte swap.
+     * It is parsed into a local and stored once at the end. */
+    u32 uri_ea = (u32)(uintptr_t)uri;
+    u32 port = 0;
+    uri = GUEST_PTR(uri, CellHttpUtilUri*);
+    url = GUEST_PTR(url, const char*);
+
     memset(uri, 0, sizeof(CellHttpUtilUri));
-    uri->port = 0;
+    port = 0;
 
     const char* p = url;
 
@@ -99,9 +110,9 @@ s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
         if (hlen >= sizeof(uri->hostname)) hlen = sizeof(uri->hostname) - 1;
         memcpy(uri->hostname, p, hlen);
 
-        uri->port = 0;
+        port = 0;
         for (const char* c = port_colon + 1; c < host_end; c++)
-            uri->port = uri->port * 10 + (*c - '0');
+            port = port * 10 + (*c - '0');
     } else {
         u32 hlen = (u32)(host_end - p);
         if (hlen >= sizeof(uri->hostname)) hlen = sizeof(uri->hostname) - 1;
@@ -109,9 +120,9 @@ s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
 
         /* Default ports */
         if (strcmp(uri->scheme, "https") == 0)
-            uri->port = 443;
+            port = 443;
         else if (strcmp(uri->scheme, "http") == 0)
-            uri->port = 80;
+            port = 80;
     }
 
     p = host_end;
@@ -148,6 +159,7 @@ s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
         memcpy(uri->fragment, p, flen);
     }
 
+    vm_write32(uri_ea + (u32)offsetof(CellHttpUtilUri, port), port);
     return CELL_OK;
 }
 
@@ -157,6 +169,10 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
     if (!urlBuf || !uri)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
 
+    u32 port = vm_read32((u32)(uintptr_t)uri + (u32)offsetof(CellHttpUtilUri, port));
+    urlBuf = GUEST_PTR(urlBuf, char*);
+    uri    = GUEST_PTR(uri, const CellHttpUtilUri*);
+
     int n = snprintf(urlBuf, urlBufSize, "%s://%s",
                      uri->scheme[0] ? uri->scheme : "http",
                      uri->hostname);
@@ -164,8 +180,8 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
 
     /* Append port if non-default */
     int default_port = (strcmp(uri->scheme, "https") == 0) ? 443 : 80;
-    if (uri->port && uri->port != (u32)default_port) {
-        n += snprintf(urlBuf + n, urlBufSize - n, ":%u", uri->port);
+    if (port && port != (u32)default_port) {
+        n += snprintf(urlBuf + n, urlBufSize - n, ":%u", port);
     }
 
     /* Path */
@@ -181,7 +197,7 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
         n += snprintf(urlBuf + n, urlBufSize - n, "#%s", uri->fragment);
 
     if (written)
-        *written = (u32)n;
+        vm_write32((u32)(uintptr_t)written, (u32)n);
 
     return CELL_OK;
 }
@@ -190,8 +206,17 @@ s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
  * URL encoding / decoding
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
-                           const u8* src, u32 srcSize, u32* written)
+/* Host-pointer core, shared by the guest entry point and by
+ * cellHttpUtilFormUrlEncode.
+ *
+ * FormUrlEncode used to call cellHttpUtilEscapeUri directly, which is an HLE
+ * ENTRY POINT: it translates its arguments as guest EAs. Two of the three
+ * pointers it was handed were already host pointers (out, and the address of a
+ * local u32 for `written`), so translating them a second time sent the escaped
+ * output and its length somewhere else entirely. An entry point cannot be
+ * called from inside the library it lives in. */
+static s32 http_escape_uri_host(char* out, u32 outSize,
+                                const u8* src, u32 srcSize, u32* written)
 {
     if (!out || !src)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
@@ -220,31 +245,54 @@ s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
     return CELL_OK;
 }
 
-s32 cellHttpUtilUnescapeUri(u8* out, u32 outSize,
-                             const char* src, u32 srcSize, u32* written)
+s32 cellHttpUtilEscapeUri(char* out, u32 outSize,
+                           const u8* src, u32 srcSize, u32* written)
 {
-    if (!out || !src)
+    u32 n = 0;
+    s32 rc = http_escape_uri_host(GUEST_PTR(out, char*), outSize,
+                                  GUEST_PTR(src, const u8*), srcSize, &n);
+    if (rc == CELL_OK && written)
+        vm_write32((u32)(uintptr_t)written, n);
+    return rc;
+}
+
+s32 cellHttpUtilUnescapeUri(u8* out, u32 outSize,
+                             const char* src, u32* required)
+{
+    src = GUEST_PTR(src, const char*);
+    out = GUEST_PTR(out, u8*);
+    if (!src)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
+    if (!out && !required)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
 
+    u32 srcSize = (u32)strlen(src);
     u32 pos = 0;
     for (u32 i = 0; i < srcSize; i++) {
-        if (pos >= outSize)
+        if (out && pos >= outSize)
             return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
 
+        u8 decoded;
         if (src[i] == '%' && i + 2 < srcSize) {
             int hi = hex_digit(src[i + 1]);
             int lo = hex_digit(src[i + 2]);
             if (hi >= 0 && lo >= 0) {
-                out[pos++] = (u8)((hi << 4) | lo);
+                decoded = (u8)((hi << 4) | lo);
                 i += 2;
-                continue;
+            } else {
+                decoded = (u8)src[i];
             }
+        } else {
+            decoded = (u8)src[i];
         }
-        out[pos++] = (u8)src[i];
+
+        if (out)
+            out[pos] = decoded;
+        pos++;
     }
 
-    if (written)
-        *written = pos;
+    if (required)
+        vm_write32((u32)(uintptr_t)required, (u32)pos);
 
     return CELL_OK;
 }
@@ -259,11 +307,15 @@ s32 cellHttpUtilFormUrlEncode(char* out, u32 outSize,
     if (!out || !key || !value)
         return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
 
+    out   = GUEST_PTR(out, char*);
+    key   = GUEST_PTR(key, const char*);
+    value = GUEST_PTR(value, const char*);
+
     u32 key_esc_len = outSize;
     u32 pos = 0;
 
     /* Encode key */
-    s32 rc = cellHttpUtilEscapeUri(out, outSize, (const u8*)key,
+    s32 rc = http_escape_uri_host(out, outSize, (const u8*)key,
                                     (u32)strlen(key), &key_esc_len);
     if (rc != CELL_OK) return rc;
     pos = key_esc_len;
@@ -275,7 +327,7 @@ s32 cellHttpUtilFormUrlEncode(char* out, u32 outSize,
 
     /* Encode value */
     u32 val_esc_len = outSize - pos;
-    rc = cellHttpUtilEscapeUri(out + pos, outSize - pos, (const u8*)value,
+    rc = http_escape_uri_host(out + pos, outSize - pos, (const u8*)value,
                                 (u32)strlen(value), &val_esc_len);
     if (rc != CELL_OK) return rc;
     pos += val_esc_len;
@@ -284,7 +336,7 @@ s32 cellHttpUtilFormUrlEncode(char* out, u32 outSize,
         out[pos] = '\0';
 
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }
@@ -320,7 +372,7 @@ s32 cellHttpUtilBase64Encode(char* out, u32 outSize,
 
     out[pos] = '\0';
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }
@@ -366,7 +418,7 @@ s32 cellHttpUtilBase64Decode(u8* out, u32 outSize,
     }
 
     if (written)
-        *written = pos;
+        vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
 }

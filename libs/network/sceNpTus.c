@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -96,7 +98,7 @@ s32 sceNpTusCreateCtx(SceNpTusCtx* ctx)
     for (int i = 0; i < SCE_NP_TUS_MAX_CTX; i++) {
         if (!s_ctx[i].in_use) {
             s_ctx[i].in_use = 1;
-            *ctx = (u32)i;
+            vm_write32((u32)(uintptr_t)ctx, (u32)i);
             return CELL_OK;
         }
     }
@@ -137,6 +139,23 @@ s32 sceNpTusSetVariable(SceNpTusCtx ctx, u32 slotId, s64 variable,
     return CELL_OK;
 }
 
+/* SceNpTusVariable is { s64 variable; u64 lastChangedDate; char ownerNpId[20];
+ * u8 hasData; u8 reserved[3]; }. The two 64-bit fields rule out a
+ * word-at-a-time copy -- big-endian puts the high word first and a
+ * little-endian host the low one -- so it goes out field by field. */
+static void tus_variable_store(u32 ea, const SceNpTusVariable* h)
+{
+    if (!ea)
+        return;
+    vm_write64(ea + (u32)offsetof(SceNpTusVariable, variable),        (u64)h->variable);
+    vm_write64(ea + (u32)offsetof(SceNpTusVariable, lastChangedDate), h->lastChangedDate);
+    memcpy(vm_base + ea + offsetof(SceNpTusVariable, ownerNpId),
+           h->ownerNpId, sizeof(h->ownerNpId));
+    vm_write8(ea + (u32)offsetof(SceNpTusVariable, hasData), h->hasData);
+    for (u32 i = 0; i < sizeof(h->reserved); i++)
+        vm_write8(ea + (u32)offsetof(SceNpTusVariable, reserved) + i, 0);
+}
+
 s32 sceNpTusGetVariable(SceNpTusCtx ctx, const void* npId, u32 slotId,
                           SceNpTusVariable* outVariable, void* option)
 {
@@ -150,11 +169,13 @@ s32 sceNpTusGetVariable(SceNpTusCtx ctx, const void* npId, u32 slotId,
     if (!s_variables[slotId].valid)
         return (s32)SCE_NP_TUS_ERROR_DATA_NOT_FOUND;
 
-    memset(outVariable, 0, sizeof(*outVariable));
-    outVariable->variable = s_variables[slotId].value;
-    outVariable->lastChangedDate = s_variables[slotId].timestamp;
-    outVariable->hasData = 1;
-    strncpy(outVariable->ownerNpId, "ps3recomp_user", sizeof(outVariable->ownerNpId) - 1);
+    SceNpTusVariable hv;
+    memset(&hv, 0, sizeof(hv));
+    hv.variable        = s_variables[slotId].value;
+    hv.lastChangedDate = s_variables[slotId].timestamp;
+    hv.hasData         = 1;
+    strncpy(hv.ownerNpId, "ps3recomp_user", sizeof(hv.ownerNpId) - 1);
+    tus_variable_store(GUEST_EA(outVariable), &hv);
     return CELL_OK;
 }
 
@@ -224,13 +245,16 @@ s32 sceNpTusSetData(SceNpTusCtx ctx, u32 slotId,
     if (!s_data[slotId].data)
         return (s32)SCE_NP_TUS_ERROR_OUT_OF_MEMORY;
 
-    memcpy(s_data[slotId].data, data, dataSize);
+    memcpy(s_data[slotId].data, GUEST_PTR(data, const void*), dataSize);
     s_data[slotId].dataSize = dataSize;
     s_data[slotId].valid = 1;
 
-    if (info)
-        s_data[slotId].info = *info;
-    else
+    if (info) {
+        s_data[slotId].info.infoSize = vm_read32(GUEST_EA(info));
+        memcpy(s_data[slotId].info.data,
+               vm_base + GUEST_EA(info) + offsetof(SceNpTusDataInfo, data),
+               sizeof(s_data[slotId].info.data));
+    } else
         memset(&s_data[slotId].info, 0, sizeof(SceNpTusDataInfo));
 
     return CELL_OK;
@@ -255,13 +279,16 @@ s32 sceNpTusGetData(SceNpTusCtx ctx, const void* npId, u32 slotId,
         copySize = dataSize;
 
     if (data && copySize > 0)
-        memcpy(data, s_data[slotId].data, copySize);
+        memcpy(GUEST_PTR(data, void*), s_data[slotId].data, copySize);
 
     if (outDataSize)
-        *outDataSize = s_data[slotId].dataSize;
+        vm_write32((u32)(uintptr_t)outDataSize, (u32)s_data[slotId].dataSize);
 
-    if (outInfo)
-        *outInfo = s_data[slotId].info;
+    if (outInfo) {
+        vm_write32(GUEST_EA(outInfo), s_data[slotId].info.infoSize);
+        memcpy(vm_base + GUEST_EA(outInfo) + offsetof(SceNpTusDataInfo, data),
+               s_data[slotId].info.data, sizeof(s_data[slotId].info.data));
+    }
 
     return CELL_OK;
 }
@@ -291,14 +318,14 @@ s32 sceNpTusDeleteMultiSlotData(SceNpTusCtx ctx, const u32* slotIds,
 s32 sceNpTusPollAsync(SceNpTusRequestId reqId, s32* result)
 {
     (void)reqId;
-    if (result) *result = 0; /* always done */
+    if (result) vm_write32((u32)(uintptr_t)result, (u32)0); /* always done */
     return CELL_OK;
 }
 
 s32 sceNpTusWaitAsync(SceNpTusRequestId reqId, s32* result)
 {
     (void)reqId;
-    if (result) *result = 0;
+    if (result) vm_write32((u32)(uintptr_t)result, (u32)0);
     return CELL_OK;
 }
 

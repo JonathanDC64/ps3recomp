@@ -6,6 +6,7 @@
 
 #include "cellGameRecording.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -79,6 +80,6 @@ s32 cellGameRecordingGetDuration(float* duration)
     if (!s_initialized)
         return (s32)CELL_GAME_REC_ERROR_NOT_INITIALIZED;
     if (!duration) return (s32)CELL_GAME_REC_ERROR_INVALID_ARGUMENT;
-    *duration = 0.0f; /* No actual recording */
+    vm_write_f32((u32)(uintptr_t)duration, 0.0f); /* No actual recording */
     return CELL_OK;
 }

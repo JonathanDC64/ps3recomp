@@ -8,6 +8,8 @@
 #include "cellSubdisplay.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -57,7 +59,7 @@ s32 cellSubdisplayGetRequiredMemory(u32* size)
 {
     if (!size) return (s32)CELL_SUBDISPLAY_ERROR_INVALID_ARGUMENT;
     /* Minimal buffer requirement */
-    *size = 1024 * 1024; /* 1 MB */
+    vm_write32((u32)(uintptr_t)size, (u32)1024 * 1024); /* 1 MB */
     return CELL_OK;
 }
 
@@ -68,7 +70,7 @@ s32 cellSubdisplayGetTouchData(CellSubdisplayTouchData* data)
     if (!data) return (s32)CELL_SUBDISPLAY_ERROR_INVALID_ARGUMENT;
 
     /* No sub-display connected, return empty data */
-    memset(data, 0, sizeof(*data));
+    memset(GUEST_PTR(data, CellSubdisplayTouchData*), 0, sizeof(*data));
     return CELL_OK;
 }
 

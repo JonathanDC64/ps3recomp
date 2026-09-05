@@ -37,7 +37,7 @@ extern "C" const uint32_t    libsre_export_count;
 
 /* ---- runtime symbols the lifted libsre object links against ------------- */
 extern "C" uint8_t* vm_base = nullptr;
-extern "C" __declspec(thread) void (*g_trampoline_fn)(void*) = nullptr;
+extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
 
 static inline uint64_t guest(uint64_t a) { return (uint64_t)(uintptr_t)(vm_base + a); }
 extern "C" uint8_t  vm_read8 (uint64_t a){ return *(uint8_t*) (vm_base + a); }

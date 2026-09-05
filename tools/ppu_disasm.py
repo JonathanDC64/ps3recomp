@@ -27,6 +27,7 @@ SPR_NAMES = {
     19: "DAR",
     22: "DEC",
     25: "SDR1",
+    256: "VRSAVE",
     26: "SRR0",
     27: "SRR1",
     268: "TBL",
@@ -251,7 +252,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         bb = bits(insn, 16, 20)
         cr_ops = {
             257: "crand", 449: "cror", 193: "crxor",
-            33: "crnand", 225: "crnor", 289: "creqv",
+            33: "crnor", 225: "crnand", 289: "creqv",
             129: "crandc", 417: "crorc",
             0: "mcrf",
         }
@@ -790,6 +791,27 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
 
+        # Cell unaligned vector STORES (were previously undecoded, so any
+        # vector store using them fell through to the op31_x fallback and got
+        # lifted as a TODO no-op -- a silent memory non-write, not just a
+        # wrong value).
+        if xo_full == 647:  # stvlx (Store Vector Left Indexed)
+            result.mnemonic = "stvlx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 679:  # stvrx (Store Vector Right Indexed)
+            result.mnemonic = "stvrx"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 903:  # stvlxl
+            result.mnemonic = "stvlxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+        if xo_full == 935:  # stvrxl
+            result.mnemonic = "stvrxl"
+            result.operands = f"v{rd}, r{ra}, r{rb}"
+            return result
+
         # Fall through – unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
@@ -821,7 +843,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
             elif xo_5 == 23:  # fsel
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
-            elif xo_5 in (26, 24):  # frsqrte / fre: frd, frb
+            elif xo_5 in (26, 24, 22):  # frsqrte / fre / fsqrt(s): frd, frb (frA reserved=0)
                 result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
@@ -834,6 +856,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             40: "fneg", 72: "fmr", 264: "fabs", 136: "fnabs",
             64: "mcrfs",
             583: "mffs", 711: "mtfsf",
+            # FPSCR bit ops. These previously fell through to the unknown-xo
+            # catch-all and emitted a raw .word, silently dropping the
+            # instruction from the lift.
+            70: "mtfsb0", 38: "mtfsb1", 134: "mtfsfi",
         }
         if xo_full in fp_x:
             mne = fp_x[xo_full]
@@ -874,7 +900,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"f{frd}, f{fra}, f{frc}"
             elif xo_5 in (29, 28, 31, 30):
                 result.operands = f"f{frd}, f{fra}, f{frc}, f{frb}"
-            elif xo_5 in (24, 26):  # fres / frsqrtes: frd, frb
+            elif xo_5 in (24, 26, 22):  # fres / frsqrtes / fsqrts: frd, frb (frA reserved=0)
                 result.operands = f"f{frd}, f{frb}"
             else:
                 result.operands = f"f{frd}, f{fra}, f{frb}"
@@ -935,9 +961,13 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         vmx_vx = {
             # Float arithmetic
             10: "vaddfp", 74: "vsubfp",
-            266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
-            714: "vrfim",  # round to FP integer toward -inf (floor)
+            # Float estimate family (vD, vB; step-64 XOs). vexptefp/vlogefp were
+            # decoding as vmx_x394/x458 -- found by diffing against spu/ppu-lv2-objdump
+            # over 17M instructions of retail code (objdump_audit.py).
+            266: "vrefp", 330: "vrsqrtefp", 394: "vexptefp", 458: "vlogefp",
+            # Round to FP integer (vD, vB; step-64 XOs): nearest / zero / +inf / -inf.
+            522: "vrfin", 586: "vrfiz", 650: "vrfip", 714: "vrfim",
 
             # Integer add/sub
             0: "vaddubm", 64: "vadduhm", 128: "vadduwm",
@@ -964,10 +994,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
 
-            # Splat immediate (vspltis*) — the non-immediate vspltb/h/w are
-            # handled separately below with the UIMM operand form. Their correct
-            # XOs are 524/588/652 (were wrongly 1098/1162/1226 here).
-            780: "vspltisb", 844: "vspltish", 908: "vspltisw",
+            # (vspltisb/h/w moved to the SIMM handler below the UIMM block — their
+            # vA field (bits 11-15) is a 5-bit SIGNED immediate, not a register.)
 
             # Merge
             12: "vmrghb", 76: "vmrghh", 140: "vmrghw",
@@ -1017,6 +1045,15 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         if xo_full in vmx_uimm:
             result.mnemonic = vmx_uimm[xo_full]
             result.operands = f"v{vd}, v{vb}, {va}"
+            return result
+
+        # vspltis* : vD, SIMM — the vA field (bits 11-15) is a 5-bit SIGNED
+        # immediate (-16..15), NOT a register (unlike vspltb/h/w's UIMM index).
+        vmx_simm = {780: "vspltisb", 844: "vspltish", 908: "vspltisw"}
+        if xo_full in vmx_simm:
+            result.mnemonic = vmx_simm[xo_full]
+            simm = va - 32 if va >= 16 else va
+            result.operands = f"v{vd}, {simm}"
             return result
 
         # lvx / stvx (X-form under opcode 31 actually, but some are opcd 4)
@@ -1137,6 +1174,10 @@ def main() -> None:
                         help="Start offset within file (for raw mode)")
     parser.add_argument("--length", type=lambda x: int(x, 0), default=0,
                         help="Number of bytes to disassemble (0=all)")
+    parser.add_argument("--va", type=lambda x: int(x, 0), default=None,
+                        help="Virtual address to disassemble (ELF: maps va->file via PT_LOAD segments; "
+                             "use with --length). Correct alternative to --raw --offset, which treats "
+                             "--offset as a raw FILE offset (off by the segment base).")
     parser.add_argument("--little-endian", action="store_true",
                         help="Decode as little-endian")
     args = parser.parse_args()
@@ -1146,6 +1187,28 @@ def main() -> None:
 
     big_endian = not args.little_endian
     base_addr = args.base
+
+    # --va: disassemble a window at a VIRTUAL address, mapping va->file offset through the ELF's
+    # PT_LOAD segments (fixes the long-standing footgun where --raw --offset <vaddr> read the wrong
+    # bytes because --offset is a file offset, off by the .text segment base e.g. 0x10000).
+    if args.va is not None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from elf_parser import ELFFile, PT_LOAD
+        elf = ELFFile(args.input); elf.load()
+        big_endian = elf.elf_header.big_endian
+        va = args.va; seg = None
+        for ph in elf.program_headers:
+            if ph.p_type == PT_LOAD and ph.p_vaddr <= va < ph.p_vaddr + ph.p_filesz:
+                seg = ph; break
+        if seg is None:
+            print(f"Error: vaddr 0x{va:08X} not in any PT_LOAD file-backed range", file=sys.stderr)
+            sys.exit(1)
+        file_off = seg.p_offset + (va - seg.p_vaddr)
+        n = args.length or 0x40
+        data = file_data[file_off:file_off + n]
+        for i in disassemble_bytes(data, va, big_endian):
+            print(i)
+        return
 
     if args.raw:
         data = file_data[args.offset:]

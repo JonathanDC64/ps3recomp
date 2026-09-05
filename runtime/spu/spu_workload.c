@@ -7,6 +7,7 @@
  */
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+#include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,12 @@
 #else
 #include <pthread.h>
 #endif
+
+/* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
+ * real video-payload GET (>256B from a non-context EA) = it actually decoded,
+ * as opposed to the 64-byte context handshake DMAs. The dispatcher's
+ * YDKJ_CRI_RESUME poll-loop watches this to know real work arrived. */
+int g_cri_video_dma = 0;
 
 /* ---- fingerprint ------------------------------------------------------- */
 
@@ -83,6 +90,17 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint)
     return NULL;
 }
 
+spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            if (image_id_out) *image_id_out = s_registry[i].image_id;
+            return s_registry[i].fn;
+        }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
 unsigned spu_workload_count(void) { return s_registry_count; }
 
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
@@ -90,12 +108,10 @@ unsigned spu_workload_count(void) { return s_registry_count; }
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static uint32_t rd_be32(const uint8_t* p)
 {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
-                       uint32_t* entry_out)
+int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls, uint32_t* entry_out)
 {
     if (!image || !ls || image_size < 0x34) return 0;
 
@@ -202,8 +218,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     uint32_t entry = 0;
     if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
-        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n",
-                (unsigned long long)fp);
+        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n", (unsigned long long)fp);
         free(ls);
         return 0;
     }
@@ -233,240 +248,735 @@ typedef struct {
     int                 image_id;
     uint32_t            r3[4];        /* captured race-free at dispatch time */
     int                 have_r3;
-    int                 abi;          /* spu_run_lifted_job_abi mode: 1=kernel, 2=task-start */
-    uint32_t            exitcode_ea;  /* CellSpursTaskExitCode container EA (0 = none) */
-    uint32_t            taskset_ea;   /* CellSpursTaskset EA (Option B PM), 0 = none */
-    uint32_t            taskId;       /* taskset slot for the PM SpursTasksetContext */
+    uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
+    uint32_t            taskid;
 } spu_async_job;
 
-/* Option B PM: build the SpursTasksetContext @LS 0x2700 for the selected task before
- * running it (spurs_pm.c). Returns the task ELF EA (low bits = flags). */
-extern uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskId,
-                                       uint32_t spuNum, uint32_t dmaTagId);
+/* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
+ * Real SPURS time-multiplexes a taskset's tasks onto SPUs, saving/restoring a
+ * shared taskset context in LS. Our default model runs each task ONCE on a
+ * fresh calloc'd LS, so state one task establishes (e.g. FMOD's SPU DSP handler
+ * table at LS 0x39Dxx, built by the init task) is invisible to the next task of
+ * the same taskset, which reads the uninitialised image sentinel and
+ * branch-to-0's. Give each taskset a PERSISTENT LS reused across its task
+ * dispatches (image loaded once, state retained) and SERIALIZE its tasks (one
+ * at a time) so they observe each other's setup without racing the shared
+ * store -- a cooperative approximation of the kernel's context save/restore.
+ * With LBP_WS_DRAIN (a task parked in WAIT_SIGNAL resumes + releases the
+ * taskset, letting the next task run), the FMOD init + DSP tasks share one LS
+ * and the handler table is populated when the DSP dispatch reads it. Opt-in;
+ * default keeps per-dispatch fresh LS. */
+typedef struct {
+    uint32_t taskset_ea;   /* 0 = free slot */
+    uint32_t taskid;       /* slot key is (taskset, task): on real SPURS each
+                            * task has a PRIVATE LS context (the kernel saves/
+                            * restores per task); one shared slot per TASKSET
+                            * serialized siblings behind one lock, and FMOD's
+                            * persistent mixer (task 0, never returns) starved
+                            * its producer (task 1) forever -- the mixer then
+                            * DMA-polled a NULL control EA for the whole run. */
+    uint8_t* ls;           /* persistent LS (NULL until first task loads it) */
+    int      loaded;       /* image loaded into ls */
+#ifdef _WIN32
+    SRWLOCK  lock;         /* serializes re-dispatches of this ONE task */
+#else
+    pthread_mutex_t lock;
+#endif
+} spu_ts_ls_slot;
+
+#define SPU_TS_LS_MAX 24
+static spu_ts_ls_slot s_ts_ls[SPU_TS_LS_MAX];
+#ifdef _WIN32
+static SRWLOCK s_ts_ls_dir = SRWLOCK_INIT;
+#else
+static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static int spu_persist_ls_enabled(void)
+{ static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
+
+/* ---- Global SPU execution serialization (LBP_SPU_SERIAL) ------------------
+ * Default runs each SPU task on its own detached host thread, so N tasks race:
+ * timing jitter sends each boot down a different path to a different dead end
+ * (one run hangs on the FMOD DSP null, the next on an unrelated PPU init spin),
+ * which makes any single failure impossible to reproduce and debug. Serialize:
+ * only ONE SPU task executes at a time (global lock), so the SPU stage becomes
+ * a fixed, repeatable sequence. A task that parks in WAIT_SIGNAL RELEASES the
+ * lock so another task can run (and possibly signal it) -- cooperative, mirrors
+ * a single SPU's task scheduling; with LBP_WS_DRAIN a genuinely unsignalled
+ * task drains and releases. Opt-in; default keeps concurrent per-thread SPU. */
+static int spu_serial_enabled(void)
+{ static int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
+#ifdef _WIN32
+static SRWLOCK s_spu_serial = SRWLOCK_INIT;
+void spu_serial_acquire(void){ if (spu_serial_enabled()) AcquireSRWLockExclusive(&s_spu_serial); }
+void spu_serial_release(void){ if (spu_serial_enabled()) ReleaseSRWLockExclusive(&s_spu_serial); }
+#else
+static pthread_mutex_t s_spu_serial = PTHREAD_MUTEX_INITIALIZER;
+void spu_serial_acquire(void){ if (spu_serial_enabled()) pthread_mutex_lock(&s_spu_serial); }
+void spu_serial_release(void){ if (spu_serial_enabled()) pthread_mutex_unlock(&s_spu_serial); }
+#endif
+
+/* Find-or-create the slot for a (taskset, task) pair (directory lock held
+ * briefly). Per-task keying is load-bearing: see spu_ts_ls_slot.taskid. */
+static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
+{
+    spu_ts_ls_slot* slot = NULL;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_ts_ls_dir);
+#else
+    pthread_mutex_lock(&s_ts_ls_dir);
+#endif
+    for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
+        if (s_ts_ls[i].taskset_ea == taskset_ea && s_ts_ls[i].taskid == taskid)
+            slot = &s_ts_ls[i];
+    for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
+        if (s_ts_ls[i].taskset_ea == 0) {
+            s_ts_ls[i].taskset_ea = taskset_ea;
+            s_ts_ls[i].taskid = taskid;
+#ifdef _WIN32
+            InitializeSRWLock(&s_ts_ls[i].lock);
+#else
+            pthread_mutex_init(&s_ts_ls[i].lock, NULL);
+#endif
+            slot = &s_ts_ls[i];
+        }
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&s_ts_ls_dir);
+#else
+    pthread_mutex_unlock(&s_ts_ls_dir);
+#endif
+    return slot;
+}
 
 static void spu_async_run(spu_async_job* j)
 {
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+     * back to a fresh per-dispatch LS when disabled / no taskset. */
+    spu_ts_ls_slot* ts_slot = NULL;
+    int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
+    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != 22)
+        ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
+    uint8_t* ls;
+    if (ts_slot) {
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&ts_slot->lock);   /* serialize this taskset */
+#else
+        pthread_mutex_lock(&ts_slot->lock);
+#endif
+        if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+        ls = ts_slot->ls;
+        { static int _n = 0; if (_n++ < 24)
+            fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
+                    j->taskset_ea, j->taskid, j->image_id,
+                    ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
+    } else {
+        ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+    }
     if (ls) {
         uint32_t entry = 0;
-        if (spu_elf_load_to_ls(j->image, j->image_size, ls, &entry)) {
-            /* Option B: before running the leaf, build the SpursTasksetContext at LS
-             * 0x2700 (the reimplemented PM) so the leaf reads valid taskset/context
-             * state instead of zeros. Requires the taskset's real layout (built in
-             * cellSpursCreateTask) to be in place -- it is, by dispatch time. */
-            if (j->taskset_ea) {
-                spurs_pm_build_context(ls, j->taskset_ea, j->taskId, /*spuNum*/0, /*dmaTag*/0);
-                fprintf(stderr, "[spu_workload] PM context built @LS 0x2700 (taskset=0x%08X "
-                        "taskId=%u)\n", j->taskset_ea, j->taskId);
+        /* Load the image only on a taskset's FIRST task (or every dispatch when
+         * not persisting) -- reusing preserves the prior task's LS state. */
+        int loaded = (ts_slot && ts_slot->loaded)
+                   ? 1
+                   : (did_load = 1, spu_elf_load_to_ls(j->image, j->image_size, ls, &entry));
+        if (ts_slot && did_load && loaded) ts_slot->loaded = 1;
+        if (!loaded)
+            fprintf(stderr, "[spu_workload] async image=%d ELF LOAD FAILED\n",
+                    j->image_id), fflush(stderr);
+        if (loaded) {
+            /* YDKJ_CRI_POLICY (cri build experiment): the cri SPU task
+             * (image 22) calls the SPURS task-API via a jump table at LS 0x2700
+             * and reads its task descriptor at LS 0x2FB0 — both POLICY-provided,
+             * not in the task ELF (so it branch-to-0's at func_00026DE0). Preload
+             * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
+             * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
+             * run the cri task, to see how much further it gets. Diagnostic only. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
+                /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
+                 * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
+                 * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
+                 * policy builds the 0x2700 task-API table + dispatches the cri
+                 * task. Needs the SpursKernelContext at LS[0x1C0] (instance ptr)
+                 * + r80=0x100 context base, mirroring the kernel->policy handoff. */
+                extern uint8_t* vm_base;
+                extern void tsp_spu_func_00000A00(spu_context*);
+                if (vm_base) memcpy(ls + 0xA00, vm_base + 0x30023680, 0x2200);
+                /* Build the REAL SpursTasksetContext at LS 0x2700 (taskset ptr @0x27B8,
+                 * TaskInfo @0x2780, syscallAddr @0x27C4) from the actual game taskset,
+                 * so the policy's DMAs read valid data instead of garbage. The instance
+                 * ptr (LS[0x1C0]) was a hardcoded 0x40009D00 that mismatched the game's
+                 * real 0x40009F00 -> policy DMA'd garbage -> null branches. */
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                extern uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                if (g_ydkj_real_taskset_ea)
+                    spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                uint32_t inst = g_ydkj_real_spurs_ea ? g_ydkj_real_spurs_ea : 0x40009D00u;
+                uint8_t* p = ls + 0x1C0;
+                p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
+                p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
+                p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
+                fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
+                /* Run the taskset policy entry instead of the cri task entry.
+                 * (Declared by spu_lifted_job.h -- a local extern re-declaration
+                 * here conflicts with the header's static inline under clang.) */
+                int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
+                                                     j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0);
+                fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
+                fflush(stderr);
+                free(ls); free(j); return;
+            }
+            /* YDKJ HLE cri-task path (image 22, cri_mpvps3spurs.elf): the real
+             * SPURS kernel/policy would build the task's SpursTasksetContext (LS
+             * 0x2700) before dispatch. In the HLE-cellSpurs path we dispatch the
+             * task ELF directly, so LS 0x2700 is empty and the task branch-to-0's:
+             * cri func_00026DE0 reads syscallAddr@0x27C4 (=0) and branches there.
+             * Plant a minimal context so the task-API call lands on the HLE syscall
+             * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
+             * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
+             * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+            if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
+                    /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                     * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                     * so the cri leaf reads valid data instead of my planted guesses. */
+                    uint64_t elf = spurs_pm_build_context(ls, g_ydkj_real_taskset_ea, g_ydkj_real_taskid, 0, 0);
+                    /* still plant the cri-specific task descriptor @0x2FB0 that build_context
+                     * doesn't cover (cri func_00026DE0 reads it). */
+                    LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
+                    LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
+                    fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+                } else {
+                    LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
+                    LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
+                    LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
+                    LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
+                    fprintf(stderr, "[cri] HLE cri-task ctx (minimal plant): syscallAddr@0x27C4=0xA70\n");
+                }
+                #undef LSBE32
+                fflush(stderr);
+            }
+            /* Dump the 64-byte decode context the cri task will DMA from eaContext
+             * (r3.word1 = args_ea). This is the job the game's cri_mpv PPU layer is
+             * supposed to populate (video-data EA, output buffer). If it's zero/garbage
+             * the PPU layer never wrote a real job -> the task decodes nothing. */
+            if (j->image_id == 22 && j->args_ea) {
+                extern uint8_t* vm_base;
+                const uint8_t* c = vm_base + (j->args_ea & 0x0FFFFFFFu);
+                fprintf(stderr, "[cri] eaContext=0x%08X 64B decode-context:", j->args_ea);
+                for (int i = 0; i < 64; i++) { if ((i&15)==0) fprintf(stderr,"\n     +%02X:", i); fprintf(stderr, " %02X", c[i]); }
+                fprintf(stderr, "\n"); fflush(stderr);
             }
             /* Async dispatch is the SPURS-task path: the entry expects the SPURS
              * task kernel ABI in r3 ({0x40 marker, eaContext, queue EA, ...}),
              * captured at dispatch time (j->r3) so it doesn't race the PPU
              * overwriting the stack-allocated context. */
-            /* docs/19 P2 (A-R6): reproduce the SPU Taskset PM's bitset/contention
-             * side-effects so the PPU-side SPURS scheduler sees a coherent world.
-             * Gated with the substrate (SPURS_LV2THREADS). */
-            { static int lv2t = -1; if (lv2t < 0) { const char* e = getenv("SPURS_LV2THREADS"); lv2t = (e && e[0] != '0') ? 1 : 0; }
-              if (lv2t && j->taskset_ea) {
-                  extern void spurs_taskset_task_start(uint32_t, uint32_t);
-                  spurs_taskset_task_start(j->taskset_ea, j->taskId); } }
-            fprintf(stderr, "[spu_workload] async image=%d ENTER run\n", j->image_id);
-            fflush(stderr);
-            int32_t rc = -999;
-#if defined(_WIN32) && defined(_MSC_VER)
-            __try {
-                rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                            j->abi, j->have_r3 ? j->r3 : 0, j->exitcode_ea);
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                fprintf(stderr, "[spu_workload] async image=%d *** SEH FAULT 0x%08lX *** "
-                        "(SPU task crashed -- caught, not propagated)\n",
-                        j->image_id, (unsigned long)GetExceptionCode());
+            /* Generic SPURS taskset task (LBP's audio SPEEX/MultiStream tasks,
+             * image 6/7 — anything but the cri image 22 handled above): the real
+             * kernel runs the task UNDER the taskset policy, which plants a
+             * SpursTasksetContext at LS 0x2700 (taskset header, TaskInfo, and
+             * syscallAddr=0xA70) and enters it with r3 = task args, r4 = {spurs,
+             * taskset args}. We dispatch the task ELF directly, so without this it
+             * runs with r3=r4=0 and no context and SPINS FOREVER (observed: image
+             * 6/7 ENTER + RUN, never RETURN, 0 DMA, PPU blocks on EventFlag 0x0100).
+             * Build the context here from the real taskset CreateTask recorded;
+             * spu_run_lifted_job_abi then sets r3/r4 off the 0xA70 sentinel.
+             * Env-gated while bringing this up — default leaves every path as-is. */
+            /* Timing probe: a real SPURS task is dispatched when work is signaled.
+             * We dispatch immediately at CreateTask. If LBP fills the task's work
+             * buffer slightly LATER, delaying the run lets it see real data (=>
+             * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+             * a null base, the buffer is never filled (=> an audio HLE gap). */
+            if (j->image_id != 22) {
+                const char* d = getenv("LBP_TASK_DELAY");
+                if (d && *d) {
+#ifdef _WIN32
+                    Sleep((unsigned)(atoi(d) * 1000));
+#endif
+                }
+            }
+            /* A generic SPURS taskset task (image != cri 22) MUST get its
+             * SpursTasksetContext planted at LS 0x2700 -- the real kernel builds
+             * it from the taskset before entry, and the task reads its args and
+             * every DMA base pointer out of it. Without it the task runs with a
+             * null base and DMAs EVERYTHING from EA 0 (observed on LBP's FMOD
+             * mixer: 105k GETs from ea=0x0, degenerate handler targets ->
+             * branch-to-0, and the PPU pump blocks forever on EventFlag 0x0100).
+             * Planting it makes the mixer read the real FMOD control block
+             * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+             * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
+                extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                 * globals, which the next CreateTask clobbers -- the race that made
+                 * both audio tasks run task 1's descriptor). */
+                if (j->taskset_ea) {
+                    spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
+                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                            "taskset=0x%08X task=%u\n", j->image_id,
+                            j->taskset_ea, j->taskid); fflush(stderr);
+                }
+            }
+            /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
+             * (1) dump binkspu's Bink work-descriptor at its arg EA so we can see
+             *     the output-plane EAs and the plane+0x50 "needs-decode" gate that
+             *     gates the frame-output PUT (all prior PUTs went to the 0x927E80
+             *     control block, never a plane). This tells us whether the missing
+             *     output EA is a Bink/PPU-layer field (this descriptor) or a SPURS
+             *     taskset-context field (LS 0x2700, below).
+             * (2) LBP_REAL_POLICY: run the REAL lifted taskset policy to build its
+             *     SpursTasksetContext and diff it against the C reimpl build_context
+             *     planted in `ls` -- shows exactly which fields differ. */
+            if (j->image_id == 3) {
+                extern uint8_t* vm_base;
+                uint32_t arg = j->args_ea;
+                /* SPU DMA maps EAs as vm_base + (uint32_t)ea with NO masking
+                 * (spu_dma.h:186); vm_base spans the full 4GB so VRAM 0xC0000000+
+                 * is directly addressable. (The earlier &0x0FFFFFFF mask read main
+                 * code at 0x10B88 instead of the real VRAM descriptor.) */
+                #define RDBE32(base, off) (((uint32_t)(base)[(off)]<<24)|((uint32_t)(base)[(off)+1]<<16)| \
+                                           ((uint32_t)(base)[(off)+2]<<8)|(base)[(off)+3])
+                if (vm_base && arg >= 0x10000) {
+                    const uint8_t* d = vm_base + arg;         /* FULL EA, no mask */
+                    fprintf(stderr, "[bink-desc] arg=0x%08X 256B work-descriptor:", arg);
+                    uint32_t words[64];
+                    for (int i = 0; i < 256; i += 16) {
+                        fprintf(stderr, "\n   +%03X:", i);
+                        for (int k = 0; k < 16; k += 4) {
+                            uint32_t w = RDBE32(d, i+k); words[(i+k)/4] = w;
+                            fprintf(stderr, " %08X", w);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    /* Follow each plausible pointer one level: dump +0x00..+0x60 so
+                     * the output-plane EA + the plane+0x50 "needs-decode" gate show. */
+                    for (int wi = 0; wi < 64; wi++) {
+                        uint32_t p = words[wi];
+                        if (p < 0x10000 || (p >= 0x50000000u && p < 0xC0000000u)) continue;
+                        const uint8_t* q = vm_base + p;
+                        fprintf(stderr, "  [desc+%02X]=0x%08X -> +00:%08X +40:%08X +50:%08X(gate) +54:%08X\n",
+                                wi*4, p, RDBE32(q,0), RDBE32(q,0x40), RDBE32(q,0x50), RDBE32(q,0x54));
+                    }
+                    fflush(stderr);
+                }
+                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
+                    extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
+                                                              uint64_t,uint32_t,uint8_t*,uint32_t);
+                    /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
+                    uint32_t ts = j->taskset_ea;
+                    uint32_t spurs_ea = 0;
+                    if (vm_base) { const uint8_t* t = vm_base + ts;
+                        spurs_ea = RDBE32(t, 0x64);
+                        /* Why did the policy exit without dispatching? Dump the task
+                         * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
+                        fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
+                                RDBE32(t,0x00),RDBE32(t,0x04), RDBE32(t,0x10),RDBE32(t,0x14),
+                                RDBE32(t,0x30),RDBE32(t,0x34), RDBE32(t,0x40),RDBE32(t,0x44),
+                                RDBE32(t,0x50),RDBE32(t,0x54)); }
+                    uint8_t real2700[0x180];
+                    int st = spurs_run_taskset_policy_probe(ts, j->taskid, spurs_ea,
+                                                            (uint64_t)ts, 3, real2700, sizeof real2700);
+                    fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
+                    for (uint32_t o = 0; o < sizeof real2700; o += 4) {
+                        uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
+                                      ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
+                        uint32_t rp = ((uint32_t)real2700[o]<<24)|((uint32_t)real2700[o+1]<<16)|
+                                      ((uint32_t)real2700[o+2]<<8)|real2700[o+3];
+                        if (bc != rp)
+                            fprintf(stderr, "   0x%04X: build=%08X real=%08X\n", 0x2700+o, bc, rp);
+                    }
+                    /* EMPIRICAL TEST (LBP_POLICY_CTX): overlay the REAL policy's
+                     * SpursTasksetContext onto binkspu's LS 0x2700, replacing the C
+                     * reimpl, then let binkspu run with it. If the movie plane fills
+                     * (not green) the policy's fuller ctx is the fix (H1); if still
+                     * green, the frame-output gate is Bink-layer (H2). Keeps the
+                     * build_context 0x100 kernel ctx (moduleId "TK") intact. */
+                    if (getenv("LBP_POLICY_CTX")) {
+                        memcpy(ls + 0x2700, real2700, sizeof real2700);
+                        fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
+                    }
+                    fflush(stderr);
+                }
+                #undef RDBE32
+            }
+            spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
+            int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0);
+            /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
+             * the kernel re-enters it when work is signaled. Our HLE runs it once,
+             * so it polls the (concurrently PPU-updated) eaContext, finds no work,
+             * yields and exits before the PPU marks work-ready. Approximate the
+             * resume by re-running the task (fresh context re-read from eaContext)
+             * in a bounded loop until it actually DECODES (a >256B video GET sets
+             * g_cri_video_dma) or we time out. This does NOT fake data: the task
+             * only decodes if the PPU genuinely populated real work meanwhile. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+                for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
+#ifdef _WIN32
+                    Sleep(3);
+#endif
+                    memset(ls, 0, SPU_LS_SIZE);
+                    uint32_t e2 = 0;
+                    if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
+                    rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                1, j->have_r3 ? j->r3 : 0);
+                    if (g_cri_video_dma) {
+                        fprintf(stderr, "[cri] RESUME: cri task DECODED real video (attempt %d)\n", attempt);
+                        break;
+                    }
+                }
+                if (!g_cri_video_dma)
+                    fprintf(stderr, "[cri] RESUME: no work-ready after 400 polls (PPU never marked work)\n");
                 fflush(stderr);
             }
-#else
-            rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                        j->abi, j->have_r3 ? j->r3 : 0, j->exitcode_ea);
-#endif
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d\n", j->image_id, rc);
-            fflush(stderr);
-            /* docs/19 P2 (A-R6): on leaf completion, clear running+enabled + decrement
-             * contention (the DONE marker + scheduler coherence). Gated. */
-            { static int lv2t = -1; if (lv2t < 0) { const char* e = getenv("SPURS_LV2THREADS"); lv2t = (e && e[0] != '0') ? 1 : 0; }
-              if (lv2t && j->taskset_ea) {
-                  extern void spurs_taskset_task_done(uint32_t, uint32_t);
-                  spurs_taskset_task_done(j->taskset_ea, j->taskId); } }
-
-            /* EXPERIMENT (SPURS_DONE_EVQ=N): on task completion, post a SPURS USER
-             * event to event queue N so the PPU completion handler (e.g. hkSpuUtil
-             * Helper on evq 12) wakes and signals the barrier the game waits on.
-             * Tests whether wiring SPU-completion -> PPU-event unblocks pre-title
-             * loading. Params overridable: SPURS_DONE_SPUP, SPURS_DONE_DATA. */
-            /* Completion bridging (SPURS_SIGNAL_COND=N[,TS]): on leaf completion,
-             * signal SPURS barrier cond N once (the barrier waits N times, one wake
-             * per completed task). Optional ,TS restricts to taskset_ea==TS. The leaf
-             * has actually run (data ready), so this releases the barrier correctly --
-             * unlike force-releasing the wait before the work runs. */
-            { const char* se = getenv("SPURS_SIGNAL_COND");
-              if (se) { extern void spurs_signal_cond_by_id(uint32_t);
-                  char* end = 0; unsigned long cid = strtoul(se, &end, 0);
-                  unsigned long ts = 0; if (end && *end == ',') ts = strtoul(end+1, 0, 0);
-                  if (!ts || (uint32_t)ts == j->taskset_ea) {
-                      extern volatile long g_spurs_release_pending;
-                      g_spurs_release_pending++;   /* sticky: SPURS_RELEASE_COND consumes it */
-                      fprintf(stderr, "[spu_workload] completion-bridge: signal cond %lu + mark "
-                              "release-pending (image=%d taskset=0x%08X)\n", cid, j->image_id, j->taskset_ea);
-                      spurs_signal_cond_by_id((uint32_t)cid);
-                  } } }
-
-            /* Completion event propagation. On real HW the SPU SPURS kernel posts a
-             * completion event to a workload's event queue when its tasks finish; the
-             * PPU-side handler (e.g. the Havok PPU Thread on evq 5) receives it and
-             * releases the barrier the game's MAIN loop waits on. We run leaf tasks
-             * directly (bypassing the kernel), so we post that event here.
-             *
-             * Default mapping (proven to unblock the Core.Res asset pipeline): the
-             * Havok leaf image (image_id 7) -> evq 5. SPURS_DONE_EVQ=N overrides the
-             * target queue for experiments; SPURS_DONE_SPUP / SPURS_DONE_DATA tune the
-             * payload. */
-            { extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
-              uint32_t q = 0;
-              const char* qe = getenv("SPURS_DONE_EVQ");
-              if (qe) q = (uint32_t)strtoul(qe, 0, 0);
-              else if (j->image_id == 7) q = 5;   /* Havok leaf completion -> Havok PPU Thread */
-              if (q) {
-                  uint32_t spup = 0; { const char* e = getenv("SPURS_DONE_SPUP"); if (e) spup = (uint32_t)strtoul(e,0,0); }
-                  uint64_t d3 = (uint64_t)j->taskset_ea; { const char* e = getenv("SPURS_DONE_DATA"); if (e) d3 = strtoull(e,0,0); }
-                  /* data1 = the SENDING SPU thread's lv2 id (docs/15 §3). Use the id the
-                   * P2 substrate registered (g_cs_spu_lv2[0]) so handler B's list lookup
-                   * HITS; fall back to 1 only if the substrate isn't up (SPURS_LV2THREADS
-                   * off). Round-robin association could refine which spu id per task (P3/Q3). */
-                  extern uint32_t g_cs_spu_lv2[]; extern uint32_t g_cs_nspus;
-                  uint64_t spu_lv2 = (g_cs_nspus && g_cs_spu_lv2[0]) ? g_cs_spu_lv2[0] : 1u;
-                  fprintf(stderr, "[spu_workload] POST completion USER event q=%u spup=%u spu_lv2=0x%llX data3=0x%llX (image=%d)\n",
-                          q, spup, (unsigned long long)spu_lv2, (unsigned long long)d3, j->image_id);
-                  int r = sys_spu_thread_post_user_event(q, spu_lv2, spup, 0, d3);
-                  fprintf(stderr, "[spu_workload] post_user_event -> %d\n", r); } }
+            /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
+             * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
+             * propagated yet). Tests whether the game then advances to draw content. */
+            if (j->image_id == 22 && getenv("YDKJ_CRI_WAKE")) {
+                extern void ydkj_wake_all_event_flags(void);
+                ydkj_wake_all_event_flags();
+                fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+            }
+            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                    "(job ran to completion, did not loop)\n", j->image_id, rc);
+            spu_serial_release();
         }
-        free(ls);
+        /* Persistent LS is retained in its taskset slot for the next task; a
+         * per-dispatch LS is freed. */
+        if (!ts_slot) free(ls);
+    }
+    if (ts_slot) {
+#ifdef _WIN32
+        ReleaseSRWLockExclusive(&ts_slot->lock);
+#else
+        pthread_mutex_unlock(&ts_slot->lock);
+#endif
     }
     free(j);
 }
 
 #ifdef _WIN32
-static DWORD WINAPI spu_async_thread(LPVOID p) { spu_async_run((spu_async_job*)p); return 0; }
+static DWORD WINAPI spu_async_thread(LPVOID p) {
+    /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
+     * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
+     * instead of killing the process silently with 0x80000001. */
+    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    spu_async_run((spu_async_job*)p); return 0;
+}
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
 #endif
 
-/* SPU task thread stack size (bytes). A lifted SPU job's guest `brsl` calls become
- * real nested host C calls. Guest LOOPS that branch to another lifted function are
- * forced tail calls (SPU_TAILCALL/musttail in the lifter) so they iterate in O(1)
- * host stack -- without that they overflowed and silently killed the process (a
- * stack-overflow SE can't run the unhandled filter; exit code reads 0). Genuine
- * call nesting is bounded by the guest's own stack discipline; 64 MB RESERVE
- * (committed on demand) is ample headroom. env SPU_STACK_MB overrides (also a probe
- * for runaway recursion: if crash time scales with this, something still nests). */
-static size_t spu_task_stack_bytes(void)
+int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+                              uint32_t job_ea, uint32_t job_desc_size)
 {
-    const char* e = getenv("SPU_STACK_MB");
-    unsigned mb = e ? (unsigned)strtoul(e, NULL, 10) : 0;
-    if (mb == 0) mb = 64;
-    return (size_t)mb << 20;
-}
+    if (!image || image_size == 0) return 0;
 
-/* Spawn a detached host thread to run job `j` (takes ownership of `j`). */
-static int spu_spawn_job_thread(spu_async_job* j)
-{
-#ifdef _WIN32
-    HANDLE th = CreateThread(NULL, spu_task_stack_bytes(), spu_async_thread, j, 0, NULL);
-    if (!th) { free(j); return 0; }
-    CloseHandle(th);   /* detached */
-#else
-    pthread_t th;
-    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
-    pthread_detach(th);
-#endif
+    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    spu_lifted_entry_fn fn = NULL;
+    int image_id = 0;
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
+    if (!fn) {
+        fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
+                (unsigned long long)fp, image_size, job_ea);
+        /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
+         * lifted and registered. SPURS job binaries are raw code+data blobs
+         * the title loads from its own data files -- unlike sys_spu_image
+         * programs they are NOT embedded ELFs in the EBOOT, so
+         * tools/extract_spu_images.py cannot find them and this is the only
+         * place the bytes exist. One file per fingerprint. */
+        { const char* _dir = getenv("SPU_DUMP_MISS");
+          if (_dir && *_dir) {
+              static uint64_t _seen[64]; static unsigned _nseen = 0;
+              unsigned _k = 0;
+              for (; _k < _nseen; _k++) if (_seen[_k] == fp) break;
+              if (_k == _nseen && _nseen < 64) {
+                  char _path[512];
+                  _seen[_nseen++] = fp;
+                  snprintf(_path, sizeof(_path), "%s/spujob_%016llX_%u.bin",
+                           _dir, (unsigned long long)fp, image_size);
+                  FILE* _f = fopen(_path, "wb");
+                  if (_f) {
+                      fwrite(image, 1, image_size, _f);
+                      fclose(_f);
+                      fprintf(stderr, "[spurs-job] dumped -> %s\n", _path);
+                  }
+              }
+          } }
+        return 0;
+    }
+    /* Two lines plus two explicit flushes PER JOB. A title running its audio
+     * chain does ~1500 jobs/s, so this alone was ~6k writes/s through one FILE
+     * lock, and it starved the guest threads competing for that lock badly
+     * enough to change what the title does (see ps3_log.h). Milestones stay;
+     * the per-job pair is verbose-only. */
+    int verbose = ps3_log_verbose();
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
+                (unsigned long long)fp, image_id, job_ea);
+        fflush(stderr);
+    }
+    int rc = spu_run_spurs_job(fn, image_id, job_ea, job_desc_size);
+    if (verbose) {
+        fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
+        fflush(stderr);
+    }
     return 1;
 }
 
-/* ---- Deferred SPURS-task scheduling (docs/13 Part A) -----------------------
- * RPCS3 does NOT run a SPURS task at cellSpursCreateTask -- it marks it ready and
- * the SPU kernel schedules it LATER, after the game has populated per-task data.
- * We model that by REGISTERING created tasks as pending and FLUSHING them (spawning
- * their threads) the first time the creating PPU thread WAITS (event-queue receive,
- * cond/sema wait, or the timer-usleep poll loop) -- by which point setup is done.
- * Without this, a task races ahead of its data (image=7 read a NULL ptr from its
- * still-zero arg struct -> CELL_SPURS_TASK_ERROR_NULL_POINTER). */
-#define SPU_PENDING_MAX 64
-static spu_async_job* s_pending[SPU_PENDING_MAX];
-static int            s_pending_count = 0;
+/* ---- SPURS task signal channel (real WAIT_SIGNAL semantics) --------------
+ *
+ * Mirrors the kernel/RPCS3 contract (spursTasksetProcessSyscall):
+ *   - _cellSpursSendSignal / cellSpursEventFlagSet mark the task's bit in the
+ *     taskset's `signalled` bitset (BE, in the GUEST CellSpursTaskset) and
+ *     wake it if sleeping.
+ *   - The WAIT_SIGNAL taskset syscall consumes a pending signal, or sleeps
+ *     the task until one arrives (POLL_SIGNAL-then-wait, no lost wakeups:
+ *     the guest bit is set under the same lock the waiter checks it).
+ * The bitset is guest state (SPU-visible); the host lock/condvar exist only
+ * to block and wake the task's host thread. */
+#include "../../libs/spurs/spurs_taskset.h"
+
 #ifdef _WIN32
-static CRITICAL_SECTION s_pending_cs;
-static volatile long    s_pending_cs_init = 0;   /* 0=uninit, 1=initializing, 2=ready */
-static void pending_lock(void)   {
-    if (_InterlockedCompareExchange(&s_pending_cs_init, 1, 0) == 0) {
-        InitializeCriticalSection(&s_pending_cs);
-        _InterlockedExchange(&s_pending_cs_init, 2);
-    } else {
-        while (s_pending_cs_init != 2) { /* spin until the initializer finishes */ }
-    }
-    EnterCriticalSection(&s_pending_cs);
-}
-static void pending_unlock(void) { LeaveCriticalSection(&s_pending_cs); }
+static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
 #else
-static pthread_mutex_t s_pending_mx = PTHREAD_MUTEX_INITIALIZER;
-static void pending_lock(void)   { pthread_mutex_lock(&s_pending_mx); }
-static void pending_unlock(void) { pthread_mutex_unlock(&s_pending_mx); }
+static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 #endif
 
-/* Register a created-but-not-yet-run task. Takes ownership of `j`. */
-static int spu_pending_register(spu_async_job* j)
+/* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
+ *
+ * A PPU->SPU event-flag Set must be able to reach a task that parked WITHOUT
+ * registering a wait slot in the flag: our Set path only signalled tasks listed
+ * in the flag`s `used` bitmask, so such a task slept forever while the producer`s
+ * memory looked perfectly intact. Same failure class canersaka documented for
+ * SPURS queues in Yakuza Dead Souls ("the HLE previously woke only its host
+ * condvar, which lifted SPU consumer tasks never wait on").
+ *
+ * ponytail: deliberately lock-free and racy. A missed entry costs one 1s poll
+ * timeout in the waiter; a stale entry costs one spurious signal, which is safe
+ * because signals are LATCHED in guest state (CSTS_SIGNALLED) and every wait
+ * loop re-checks its own predicate. Add a lock only if this ever needs to be
+ * authoritative rather than a hint. */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
+
+#define SPU_PARKED_MAX 64
+static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+
+void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
-    pending_lock();
-    int ok = (s_pending_count < SPU_PENDING_MAX);
-    if (ok) s_pending[s_pending_count++] = j;
-    pending_unlock();
-    if (!ok) { fprintf(stderr, "[spu_workload] pending registry FULL -- running task eagerly\n");
-               return spu_spawn_job_thread(j); }
-    fprintf(stderr, "[spu_workload] task REGISTERED pending image=%d taskset=0x%08X taskId=%u "
-            "(run deferred to next PPU wait)\n", j->image_id, j->taskset_ea, j->taskId);
-    return 1;
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
 }
 
-/* Q2 diagnostic (SPU_QLOG): at flush time the PPU is blocked waiting for completion,
- * so the game's setup is done -- re-dump a pending task's arg-pointed structs to see
- * whether the data it will read is NOW populated (vs zero at create time). */
-static void spu_pending_dump_args(const spu_async_job* j)
+void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
-    if (!getenv("SPU_QLOG")) return;
-    extern uint8_t* vm_base;
-    for (int s = 0; s < 3; s++) {
-        uint32_t p = j->r3[s];
-        if (p < 0x00010000u || p >= 0x50000000u) continue;
-        const uint8_t* d = vm_base + p;
-        fprintf(stderr, "[flush-argdump] image=%d r3[%d]=0x%08X:", j->image_id, s, p);
-        for (int b = 0; b < 32; b++) fprintf(stderr, "%s%02X", (b%4)?"":" ", d[b]);
-        fprintf(stderr, "\n");
-    }
+    uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
+    for (int i = 0; i < SPU_PARKED_MAX; i++)
+        if (s_parked[i] == key) { s_parked[i] = 0; return; }
 }
 
-/* Run all pending tasks now. Called from the PPU blocking/poll syscalls. Idempotent
- * (no-op when empty), so it is cheap to call on every wait. */
-void spu_pending_flush(void)
+/* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
+ *
+ * Writing the bits at Set time loses a race: the guest reads them from
+ * object+0x30 immediately on resuming, and a task that took the latched-wake
+ * path was never parked for the Set to target. So the Set only RECORDS what is
+ * owed, and the WAIT_SIGNAL handler writes it into guest memory just before it
+ * hands control back -- at which point the guest cannot yet have read it. */
+#define SPU_EFBITS_MAX 16
+static volatile uint32_t s_efbits_obj[SPU_EFBITS_MAX];
+static volatile uint32_t s_efbits_val[SPU_EFBITS_MAX];
+
+void spu_ef_bits_post(uint32_t obj, uint16_t bits)
 {
-    spu_async_job* batch[SPU_PENDING_MAX];
+    if (!obj) return;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) { s_efbits_val[i] |= bits; return; }
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == 0) { s_efbits_val[i] = bits; s_efbits_obj[i] = obj; return; }
+}
+
+/* Take (and clear) whatever is owed to `obj`. 0 = nothing pending. */
+uint16_t spu_ef_bits_take(uint32_t obj)
+{
+    if (!obj) return 0;
+    for (int i = 0; i < SPU_EFBITS_MAX; i++)
+        if (s_efbits_obj[i] == obj) {
+            uint16_t v = (uint16_t)s_efbits_val[i];
+            s_efbits_obj[i] = 0; s_efbits_val[i] = 0;
+            return v;
+        }
+    return 0;
+}
+
+/* A direction-2 Set that finds NOBODY parked yet is a lost wakeup: the task
+ * parks a moment later and sleeps through the signal it was meant to get. Latch
+ * one pending wake per taskset; the next task to park consumes it instead of
+ * sleeping. One bit, not a counter -- SPURS signals are latched, not queued, so
+ * two Sets before a park must not buy two passes through the wait. */
+#define SPU_WAKE_LATCH_MAX 16
+static volatile uint32_t s_wake_latch[SPU_WAKE_LATCH_MAX];   /* taskset EA, 0 = free */
+
+void spu_taskset_latch_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) return;          /* already latched */
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == 0) { s_wake_latch[i] = taskset_ea; return; }
+}
+
+/* Consume a latched wake for this taskset. Returns 1 if one was pending. */
+int spu_taskset_consume_wake(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return 0;
+    for (int i = 0; i < SPU_WAKE_LATCH_MAX; i++)
+        if (s_wake_latch[i] == taskset_ea) { s_wake_latch[i] = 0; return 1; }
+    return 0;
+}
+
+/* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
+ * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
+ * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can
+ * address the one task that was waiting for it instead of every parked task. */
+int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
+{
+    if (!taskset_ea) return 0;
     int n = 0;
-    pending_lock();
-    n = s_pending_count; s_pending_count = 0;
-    for (int i = 0; i < n; i++) batch[i] = s_pending[i];
-    pending_unlock();
-    if (n == 0) return;
-    fprintf(stderr, "[spu_workload] pending FLUSH: running %d deferred task(s)\n", n);
-    for (int i = 0; i < n; i++) {
-        spu_pending_dump_args(batch[i]);     /* Q2: is the data populated now? */
-        spu_spawn_job_thread(batch[i]);
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
+        if (wait_obj && s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
     }
+    return n;
+}
+
+/* Deliver a signal to a task (callable from any PPU/host thread). */
+void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return;
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    WakeAllConditionVariable(&s_sig_cv);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
+    pthread_cond_broadcast(&s_sig_cv);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+    { static int _n = 0; if (_n++ < 24)
+        fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
+                taskId, taskset_ea); fflush(stderr); }
+}
+
+/* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
+ * the 0xA70 taskset-syscall intercept). Consumes a pending signal or blocks
+ * until one is delivered. Returns 0 (the syscall's success rc). */
+int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+{
+    if (!taskset_ea || taskId >= 128) return 0;
+    /* ran= is the wall time this task spent OUT of the wait (decode/mix work
+     * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
+     * task runs on its own host thread. */
+    static _Thread_local unsigned long long s_wait_exit_ms;
+    { extern unsigned long long ps3_ms_now(void);
+      unsigned long long _now = ps3_ms_now();
+      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
+                _n, taskId, taskset_ea,
+                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
+    /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
+     * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
+     * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
+     * runs the task on a dedicated thread and re-runs the PM ~never, so the
+     * lanes froze and the skip path's min-of-lanes barrier (sub_4D3730) hung
+     * forever. A task ENTERING WAIT_SIGNAL has by definition drained all work
+     * dispatched to it, so advancing the active lanes to the published ticket
+     * here is semantically the PM's bookkeeping, batched. Validation gate. */
+    if (getenv("LBP_SYNC_ACK")) {
+        extern uint32_t g_barrier_sync_watch;
+        uint32_t b = g_barrier_sync_watch;
+        if (b) {
+            for (int row = 0; row < 4; row++) {
+                uint32_t p = b + 0x40 + 16u * (uint32_t)row;
+                extern uint8_t* vm_base;
+                uint16_t ticket = (uint16_t)((vm_base[p] << 8) | vm_base[p+1]);
+                for (int lane = 0; lane < 7; lane++) {
+                    uint32_t la = p + 2 + 2u * (uint32_t)lane;
+                    uint16_t cur = (uint16_t)((vm_base[la] << 8) | vm_base[la+1]);
+                    if (cur != 0xFFFF && cur < ticket) {
+                        vm_base[la]   = (uint8_t)(ticket >> 8);
+                        vm_base[la+1] = (uint8_t)ticket;
+                    }
+                }
+            }
+            { static int _a = 0; if (_a++ < 8)
+                fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
+        }
+    }
+    unsigned secs = 0;
+    /* LBP_WS_DRAIN=<secs>: EXPERIMENT (general work-drained approximation).
+     * A task ENTERING WAIT_SIGNAL has drained the work dispatched to it. In our
+     * one-shot SPU model the producer task ran to completion already, so the
+     * signal never arrives and the consumer blocks forever (movie/audio/loading
+     * deadlock). If set, after <secs> of no real signal we RETURN rc=0 as if the
+     * kernel resumed the task with "no pending work" -- lets it run its post-wait
+     * path (complete its loop / set completion flags) instead of hanging. 0/unset
+     * keeps the block-forever behaviour. Reversible, opt-in. */
+    unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+    int drained = 0;
+    /* Release the global SPU-serial lock while parked so another SPU task can
+     * run (and possibly signal us); re-acquired before returning to resume. */
+    spu_serial_release();
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+            static int _n = 0;
+            if (++secs && _n < 16) { _n++;
+                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            if (drain && secs >= drain) { drained = 1; break; }
+        }
+    }
+    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+        if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+            static int _n = 0;
+            if (++secs && _n < 16) { _n++;
+                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+            if (drain && secs >= drain) { drained = 1; break; }
+        }
+    }
+    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+    if (drained) { static int _d = 0; if (_d++ < 24)
+        fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+                "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+    spu_serial_acquire();       /* resume: re-take the serial lock */
+    { extern unsigned long long ps3_ms_now(void);
+      s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
+    return 0;
 }
 
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
@@ -488,8 +998,13 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     spu_async_job* j = (spu_async_job*)malloc(sizeof(*j));
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
-    j->fn = fn; j->image_id = image_id; j->abi = 1;   /* kernel marker ABI */
-    j->exitcode_ea = 0; j->taskset_ea = 0; j->taskId = 0;
+    j->fn = fn; j->image_id = image_id;
+    /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
+     * set the globals for THIS task). Reading them later in the async thread races
+     * the next CreateTask overwriting the single-slot globals -- with two audio
+     * tasks that made both run task 1's descriptor. */
+    { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is
@@ -507,58 +1022,45 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
+    if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
+        static int _d=0; if (_d++ < 1) {
+            /* Dump a larger window of the task context buffer + scan for any word
+             * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
+             * to see if the kernel-restored LS data lives here (real game data). */
+            /* The policy module restores the task context from a save buffer into
+             * LS 0xB200; LS[0xBEC0] = ctxbuf + 0xCC0. Check the heap-EA candidates
+             * in the descriptor for a save buffer whose +0xCC0/+0xCC8 holds a
+             * small LS pointer (a valid P for LS[0xBEC8]). */
+            uint32_t cand[5];
+            cand[0]=((uint32_t)c[0x14]<<24)|((uint32_t)c[0x15]<<16)|((uint32_t)c[0x16]<<8)|c[0x17];
+            cand[1]=((uint32_t)c[0x1C]<<24)|((uint32_t)c[0x1D]<<16)|((uint32_t)c[0x1E]<<8)|c[0x1F];
+            cand[2]=((uint32_t)c[0x98]<<24)|((uint32_t)c[0x99]<<16)|((uint32_t)c[0x9A]<<8)|c[0x9B];
+            cand[3]=((uint32_t)c[0xB8]<<24)|((uint32_t)c[0xB9]<<16)|((uint32_t)c[0xBA]<<8)|c[0xBB];
+            cand[4]=((uint32_t)c[0x16C]<<24)|((uint32_t)c[0x16D]<<16)|((uint32_t)c[0x16E]<<8)|c[0x16F];
+            for (int ci=0; ci<5; ci++) {
+                uint32_t ea=cand[ci]; if (!ea || ea>=0x10000000) continue;
+                const uint8_t* b = vm_base + ea + 0xCC0;
+                fprintf(stderr, "[ctxbuf cand 0x%08X +0xCC0]:", ea);
+                for (int k=0;k<0x20;k+=4) {
+                    uint32_t w=((uint32_t)b[k]<<24)|((uint32_t)b[k+1]<<16)|((uint32_t)b[k+2]<<8)|b[k+3];
+                    fprintf(stderr, " %08X%s", w, (w>0&&w<0x40000)?"<LS":"");
+                }
+                fprintf(stderr, "\n");
+            } } }
 
-    return spu_spawn_job_thread(j);
-}
-
-/* Dispatch a SPURS leaf task with the task-START ABI (what the taskset policy
- * module hands a fresh task): r3 = the 16-byte task argument, r4 = tasksetEA.
- * Unlike dispatch_async (kernel-marker ABI), this passes the real task argument
- * the task body reads -- without it the body processes a null arg and loops. */
-int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
-                               const uint32_t arg[4], uint32_t taskset_ea,
-                               uint32_t exitcode_ea, uint32_t taskId)
-{
-    if (!image || image_size == 0) return 0;
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
-    spu_lifted_entry_fn fn = NULL; int image_id = 0;
-    for (unsigned i = 0; i < s_registry_count; i++)
-        if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
-    if (!fn) {
-        fprintf(stderr, "[spu_workload] task dispatch MISS fp=0x%016llX size=%u\n",
-                (unsigned long long)fp, image_size);
-        return 0;
-    }
-    spu_async_job* j = (spu_async_job*)malloc(sizeof(*j));
-    if (!j) return 0;
-    j->image = image; j->image_size = image_size; j->args_ea = taskset_ea;
-    j->fn = fn; j->image_id = image_id; j->abi = 2;   /* task-start ABI */
-    j->r3[0]=arg[0]; j->r3[1]=arg[1]; j->r3[2]=arg[2]; j->r3[3]=arg[3]; j->have_r3 = 1;
-    j->exitcode_ea = exitcode_ea;     /* CellSpursTaskExitCode container (0 = none) */
-    j->taskset_ea  = taskset_ea;      /* Option B: PM builds SpursTasksetContext from this */
-    j->taskId      = taskId;
-    fprintf(stderr, "[spu_workload] task dispatch (async) fp=0x%016llX "
-            "r3={0x%08X,0x%08X,0x%08X,0x%08X} tasksetEA=0x%08X image=%d\n",
-            (unsigned long long)fp, arg[0], arg[1], arg[2], arg[3], taskset_ea, image_id);
-    /* Controlled diagnostic: SPU_TASK_OFF suppresses the actual SPU thread spawn
-     * (the task is "created" but never runs) to isolate whether the concurrent SPU
-     * task is what terminates the process after CreateTask. */
-    { const char* off = getenv("SPU_TASK_OFF");
-      if (off && off[0] != '0') { fprintf(stderr, "[spu_workload] SPU_TASK_OFF: thread NOT spawned\n");
-                                  fflush(stderr); free(j); return 1; } }
-    /* Diagnostic: SPU_INLINE runs the task on THIS (PPU) thread instead of a
-     * worker, so the boot's hang_watchdog -- which samples every OTHER thread's
-     * RIP -- pins exactly which lifted SPU function the task loops in. Deadlocks
-     * the boot (the task can't get PPU-side signals), but that's fine for a probe. */
-    { const char* inl = getenv("SPU_INLINE");
-      if (inl && inl[0] != '0') {
-          fprintf(stderr, "[spu_workload] SPU_INLINE: running task on PPU thread\n");
-          fflush(stderr); spu_async_run(j); return 1; } }
-    /* DEFERRED scheduling (docs/13 Part A): register the task as pending and run it
-     * when the creating PPU thread next WAITS (spu_pending_flush in the wait syscalls),
-     * by which point the game has populated per-task data. SPU_TASK_EAGER=1 forces the
-     * old run-on-create behaviour for A/B comparison. */
-    { const char* eager = getenv("SPU_TASK_EAGER");
-      if (eager && eager[0] != '0') return spu_spawn_job_thread(j); }
-    return spu_pending_register(j);
+#ifdef _WIN32
+    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
+     * chains are deep host call chains with fat lifted frames -- a 1MB stack
+     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
+     * process death) the moment the real decode path first executed. */
+    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
+                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!th) { free(j); return 0; }
+    CloseHandle(th);   /* detached */
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, spu_async_thread, j) != 0) { free(j); return 0; }
+    pthread_detach(th);
+#endif
+    return 1;
 }

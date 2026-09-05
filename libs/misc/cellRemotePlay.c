@@ -6,6 +6,7 @@
 
 #include "cellRemotePlay.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -41,6 +42,6 @@ s32 cellRemotePlayGetStatus(u32* status)
     if (!s_initialized)
         return (s32)CELL_REMOTE_PLAY_ERROR_NOT_INITIALIZED;
     if (!status) return (s32)CELL_REMOTE_PLAY_ERROR_INVALID_ARGUMENT;
-    *status = 0; /* Disconnected */
+    vm_write32((u32)(uintptr_t)status, (u32)0); /* Disconnected */
     return CELL_OK;
 }

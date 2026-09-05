@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include <stddef.h>   /* offsetof */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* vm_base: base pointer for the PS3 guest address space */
 extern uint8_t* vm_base;
@@ -141,6 +144,44 @@ static void gifdec_free_source(GifDecSubState* sub)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* ---------------------------------------------------------------------------
+ * Guest struct access
+ *
+ * Neither CellGifDecSrc nor CellGifDecInfo holds a pointer, so the guest lays
+ * them out exactly as we do -- same scalar sizes, same alignment -- and
+ * offsetof() on the host struct is a valid guest offset. What does not carry
+ * over is byte order: every field in guest memory is big-endian.
+ * -----------------------------------------------------------------------*/
+#define GIF_EA(p) ((u32)(uintptr_t)(p))
+
+static void gifdec_src_load(CellGifDecSrc* h, const CellGifDecSrc* guest_ea)
+{
+    u32 ea = GIF_EA(guest_ea);
+    memset(h, 0, sizeof(*h));
+    if (!ea)
+        return;
+    h->srcSelect       = vm_read32(ea + (u32)offsetof(CellGifDecSrc, srcSelect));
+    h->fileOffset      = vm_read64(ea + (u32)offsetof(CellGifDecSrc, fileOffset));
+    h->fileSize        = vm_read32(ea + (u32)offsetof(CellGifDecSrc, fileSize));
+    h->streamPtr       = vm_read64(ea + (u32)offsetof(CellGifDecSrc, streamPtr));
+    h->streamSize      = vm_read32(ea + (u32)offsetof(CellGifDecSrc, streamSize));
+    h->spuThreadEnable = vm_read32(ea + (u32)offsetof(CellGifDecSrc, spuThreadEnable));
+    /* fileName is bytes, so it comes across as-is. */
+    memcpy(h->fileName, vm_base + ea + offsetof(CellGifDecSrc, fileName),
+           sizeof(h->fileName));
+    h->fileName[sizeof(h->fileName) - 1] = '\0';
+}
+
+/* CellGifDecInfo is eight consecutive u32. */
+static void gifdec_info_store(u32 ea, const CellGifDecInfo* h)
+{
+    if (!ea)
+        return;
+    const u32* w = (const u32*)h;
+    for (u32 i = 0; i < sizeof(*h) / 4; i++)
+        vm_write32(ea + i * 4, w[i]);
+}
+
 s32 cellGifDecCreate(CellGifDecMainHandle* mainHandle,
                      const CellGifDecThreadInParam* threadInParam,
                      CellGifDecThreadOutParam* threadOutParam)
@@ -153,8 +194,11 @@ s32 cellGifDecCreate(CellGifDecMainHandle* mainHandle,
     for (u32 i = 0; i < GIFDEC_MAX_HANDLES; i++) {
         if (!s_gif_main[i].in_use) {
             s_gif_main[i].in_use = 1;
-            *mainHandle = i;
-            if (threadOutParam) threadOutParam->gifCodecVersion = 0x00010000;
+            vm_write32((u32)(uintptr_t)mainHandle, (u32)i);
+            if (threadOutParam)
+        vm_write32(GIF_EA(threadOutParam)
+                   + (u32)offsetof(CellGifDecThreadOutParam, gifCodecVersion),
+                   0x00010000);
             return CELL_OK;
         }
     }
@@ -184,7 +228,7 @@ s32 cellGifDecOpen(CellGifDecMainHandle mainHandle,
                    CellGifDecOpnInfo* openInfo)
 {
     printf("[cellGifDec] Open(main=%u, srcSelect=%u)\n", mainHandle,
-           src ? src->srcSelect : 0xFFFFFFFF);
+           src ? vm_read32(GIF_EA(src)) : 0xFFFFFFFFu);
 
     if (mainHandle >= GIFDEC_MAX_HANDLES || !s_gif_main[mainHandle].in_use)
         return CELL_GIFDEC_ERROR_SEQ;
@@ -195,15 +239,18 @@ s32 cellGifDecOpen(CellGifDecMainHandle mainHandle,
             memset(&s_gif_sub[i], 0, sizeof(GifDecSubState));
             s_gif_sub[i].in_use = 1;
             s_gif_sub[i].main_handle = mainHandle;
-            s_gif_sub[i].src = *src;
-            *subHandle = i;
-            if (openInfo) openInfo->initSpaceAllocated = 0;
+            gifdec_src_load(&s_gif_sub[i].src, src);
+            vm_write32((u32)(uintptr_t)subHandle, (u32)i);
+            if (openInfo)
+                vm_write32(GIF_EA(openInfo), 0);   /* initSpaceAllocated */
 
-            if (src->srcSelect == CELL_GIFDEC_FILE)
-                printf("[cellGifDec]   file: '%s'\n", src->fileName);
-            else if (src->srcSelect == CELL_GIFDEC_BUFFER)
+            /* read back from the host copy just loaded */
+            const CellGifDecSrc* hsrc = &s_gif_sub[i].src;
+            if (hsrc->srcSelect == CELL_GIFDEC_FILE)
+                printf("[cellGifDec]   file: '%s'\n", hsrc->fileName);
+            else if (hsrc->srcSelect == CELL_GIFDEC_BUFFER)
                 printf("[cellGifDec]   buffer: guest_addr=0x%08X size=%u\n",
-                       (u32)src->streamPtr, src->streamSize);
+                       (u32)hsrc->streamPtr, hsrc->streamSize);
 
             return CELL_OK;
         }
@@ -221,6 +268,11 @@ s32 cellGifDecReadHeader(CellGifDecMainHandle mainHandle,
     if (subHandle >= GIFDEC_MAX_SUBHANDLES || !s_gif_sub[subHandle].in_use)
         return CELL_GIFDEC_ERROR_SEQ;
     if (!info) return CELL_GIFDEC_ERROR_ARG;
+
+    /* Fill a host copy and publish it big-endian on the way out. */
+    u32 info_ea = GIF_EA(info);
+    CellGifDecInfo host_info;
+    info = &host_info;
 
     GifDecSubState* sub = &s_gif_sub[subHandle];
     if (gifdec_load_source(sub) < 0)
@@ -259,6 +311,7 @@ s32 cellGifDecReadHeader(CellGifDecMainHandle mainHandle,
 
         sub->info = *info;
         sub->header_read = 1;
+        gifdec_info_store(info_ea, info);
         return CELL_OK;
     }
 manual_parse:
@@ -292,6 +345,7 @@ manual_parse:
 
     sub->info = *info;
     sub->header_read = 1;
+    gifdec_info_store(info_ea, info);
     return CELL_OK;
 }
 
@@ -308,16 +362,27 @@ s32 cellGifDecSetParameter(CellGifDecMainHandle mainHandle,
     GifDecSubState* sub = &s_gif_sub[subHandle];
     if (!sub->header_read) return CELL_GIFDEC_ERROR_SEQ;
 
+    /* CellGifDecInParam is three u32; CellGifDecOutParam leads with a u64,
+     * so it is published field by field -- a word-at-a-time copy would put
+     * the two halves of outputWidthByte the wrong way round. */
+    CellGifDecInParam host_in;
+    guest_struct_load(&host_in, GUEST_EA(inParam), (u32)sizeof(host_in));
+    inParam = &host_in;
+
     sub->in_param = *inParam;
     sub->param_set = 1;
 
     u32 out_comp = 4; /* GIF always decoded to 4-component (RGBA or ARGB) */
-    outParam->outputWidth      = sub->image_width;
-    outParam->outputHeight     = sub->image_height;
-    outParam->outputComponents = out_comp;
-    outParam->outputColorSpace = inParam->outputColorSpace ? inParam->outputColorSpace : CELL_GIFDEC_RGBA;
-    outParam->outputWidthByte  = (u64)(sub->image_width * out_comp);
-    outParam->useMemorySpace   = (u32)(outParam->outputWidthByte * sub->image_height);
+    u64 width_byte = (u64)(sub->image_width * out_comp);
+    u32 out_ea = GUEST_EA(outParam);
+    vm_write64(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidthByte),  width_byte);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputWidth),      sub->image_width);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputHeight),     sub->image_height);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputComponents), out_comp);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, outputColorSpace),
+               inParam->outputColorSpace ? inParam->outputColorSpace : CELL_GIFDEC_RGBA);
+    vm_write32(out_ea + (u32)offsetof(CellGifDecOutParam, useMemorySpace),
+               (u32)(width_byte * sub->image_height));
 
     return CELL_OK;
 }
@@ -346,7 +411,9 @@ s32 cellGifDecDecodeData(CellGifDecMainHandle mainHandle,
                                             &w, &h, &comp, 4);
         if (!pixels) {
             printf("[cellGifDec] stbi_load failed: %s\n", stbi_failure_reason());
-            dataInfo->status = CELL_GIFDEC_DEC_STATUS_STOP;
+            vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, status),
+               CELL_GIFDEC_DEC_STATUS_STOP);
             return CELL_GIFDEC_ERROR_STREAM_FORMAT;
         }
 
@@ -360,18 +427,23 @@ s32 cellGifDecDecodeData(CellGifDecMainHandle mainHandle,
             }
         }
 
-        memcpy(data, pixels, total);
+        memcpy(GUEST_PTR(data, u8*), pixels, total);
         stbi_image_free(pixels);
 
         printf("[cellGifDec]   decoded %ux%u (%u bytes)\n", (u32)w, (u32)h, total);
 
-        dataInfo->recordType = 0;
-        dataInfo->status = CELL_GIFDEC_DEC_STATUS_FINISH;
+        vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, recordType), 0);
+        vm_write32(GUEST_EA(dataInfo)
+                   + (u32)offsetof(CellGifDecDataInfo, status),
+                   CELL_GIFDEC_DEC_STATUS_FINISH);
         return CELL_OK;
     }
 #else
     printf("[cellGifDec] DecodeData: stb_image not available — place stb_image.h in libs/codec/\n");
-    dataInfo->status = CELL_GIFDEC_DEC_STATUS_STOP;
+    vm_write32(GUEST_EA(dataInfo)
+               + (u32)offsetof(CellGifDecDataInfo, status),
+               CELL_GIFDEC_DEC_STATUS_STOP);
     return (s32)CELL_ENOSYS;
 #endif
 }

@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* stb_image_write for PNG encoding */
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -53,15 +55,17 @@ s32 cellPngEncQueryAttr(const CellPngEncParam* param, u32* workMemSize)
 {
     (void)param;
     if (!workMemSize) return (s32)CELL_PNGENC_ERROR_INVALID_ARGUMENT;
-    *workMemSize = 1024 * 1024; /* 1 MB */
+    vm_write32((u32)(uintptr_t)workMemSize, (u32)1024 * 1024); /* 1 MB */
     return CELL_OK;
 }
 
 s32 cellPngEncCreate(const CellPngEncParam* param, CellPngEncHandle* handle)
 {
     printf("[cellPngEnc] Create(%ux%u, colorSpace=%u)\n",
-           param ? param->width : 0, param ? param->height : 0,
-           param ? param->colorSpace : 0);
+           param ? vm_read32(GUEST_EA(param) + (u32)offsetof(CellPngEncParam, width)) : 0,
+           param ? vm_read32(GUEST_EA(param) + (u32)offsetof(CellPngEncParam, height)) : 0,
+           param ? vm_read32(GUEST_EA(param)
+                             + (u32)offsetof(CellPngEncParam, colorSpace)) : 0);
     if (!param || !handle)
         return (s32)CELL_PNGENC_ERROR_INVALID_ARGUMENT;
 
@@ -69,8 +73,9 @@ s32 cellPngEncCreate(const CellPngEncParam* param, CellPngEncHandle* handle)
         if (!s_handles[i].in_use) {
             memset(&s_handles[i], 0, sizeof(PngEncHandle));
             s_handles[i].in_use = 1;
-            s_handles[i].param = *param;
-            *handle = (u32)i;
+            guest_struct_load(&s_handles[i].param, GUEST_EA(param),
+                              (u32)sizeof(s_handles[i].param));
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }
@@ -152,8 +157,19 @@ s32 cellPngEncEncode(CellPngEncHandle handle, const void* inputData,
         return (s32)CELL_PNGENC_ERROR_FATAL;
     }
 
-    outputInfo->outputData = ctx.data;
-    outputInfo->outputSize = ctx.size;
+    /* The encoded bytes have nowhere to go. CellPngEncOutputInfo.outputData is a
+     * pointer the TITLE reads, and what we have is a host malloc -- writing it
+     * would hand the guest an address it cannot touch (and the old code leaked
+     * the buffer besides). Report the size and a null pointer, which the caller
+     * can at least test.
+     *
+     * ponytail: the real API hands the encoder a destination buffer at open
+     * time; wire that through cellPngEncOpen and the data has somewhere to land.
+     */
+    u32 out_ea = GUEST_EA(outputInfo);
+    vm_write32(out_ea + (u32)offsetof(CellPngEncOutputInfo, outputData), 0);
+    vm_write32(out_ea + (u32)offsetof(CellPngEncOutputInfo, outputSize), ctx.size);
+    free(ctx.data);
     printf("[cellPngEnc] Encode complete: %u bytes\n", ctx.size);
 
     return CELL_OK;

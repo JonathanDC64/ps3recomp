@@ -16,14 +16,21 @@
 
 #include "rsx_commands.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
-#include <stdlib.h>   /* getenv (RSX_MLOG diagnostic) */
+#include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 
 /* ---------------------------------------------------------------------------
  * Global backend
  * -----------------------------------------------------------------------*/
 
 static rsx_backend* s_backend = NULL;
+
+/* Last NV406E_SET_REFERENCE value seen in the FIFO. The title writes a
+ * reference then spins on the GCM control register's `ref` field until the RSX
+ * reports it as reached; cellGcmSys mirrors this into the guest control
+ * register after each drain so those waits (cellGcmFinish / wait-label) unblock. */
+u32 g_rsx_last_reference = 0;
 
 void rsx_set_backend(rsx_backend* backend)
 {
@@ -42,6 +49,10 @@ rsx_backend* rsx_get_backend(void)
 void rsx_state_init(rsx_state* state)
 {
     memset(state, 0, sizeof(rsx_state));
+    /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
+     * struct would leave w at 0. */
+    for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
+        state->vertex_data4f[_i][3] = 1.0f;
 
     /* Default viewport */
     state->viewport_w = 1280;
@@ -75,6 +86,10 @@ void rsx_state_init(rsx_state* state)
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
     state->alpha_ref = 0;
+
+    /* Default shader control: 32-bit colour exports (r0..) -- matches every
+     * title that never programs the register. */
+    state->shader_control = CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS;
 
     /* Mark everything dirty */
     state->surface_dirty = 1;
@@ -112,6 +127,11 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
+        { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
+          static unsigned _seen[32]; static int _n = 0;
+          if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
+              if (!f && _n < 32) { _seen[_n++] = data;
+                  fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:
@@ -131,6 +151,10 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
+        { static int _ct=0; if (_ct++ < 24 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
+                    data, state->surface_color_offset[0], state->surface_color_offset[1],
+                    state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
         state->color_target = data;
         state->surface_dirty = 1;
         return 0;
@@ -231,11 +255,18 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
          *   [15:8]  stride (bytes between consecutive elements)
          *   [16]    enable
          */
-        attr->type    = data & 0xF;
-        attr->size    = (data >> 4) & 0xF;
-        attr->stride  = (data >> 8) & 0xFF;
-        attr->enabled = (attr->type != 0); /* type 0 = disabled */
-        attr->format  = data;
+        attr->type      = data & 0xF;
+        attr->size      = (data >> 4) & 0xF;
+        attr->stride    = (data >> 8) & 0xFF;
+        attr->frequency = (data >> 16) & 0xFFFF;   /* instancing divisor */
+        /* SIZE (the component count) is what enables the attribute: NV4097 uses
+         * size == 0 to mean "this array is off". Keying off `type` instead marked
+         * every unused slot enabled-with-zero-components, because PSGL writes a
+         * bare type (e.g. 0x00000002 = float32, size 0, stride 0) into the slots
+         * it is NOT using -- so the input layout was built from 16 attributes of
+         * which most were degenerate, and the draws rasterized nothing. */
+        attr->enabled   = (attr->size != 0);
+        attr->format    = data;
         state->vertex_dirty = 1;
         return 0;
     }
@@ -257,28 +288,42 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
 
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
-    /* NV4097 semaphore / GCM label write. The game sets the offset (0x1D6C) into the
-     * GCM label area (base 0x03000000), then a RELEASE (0x1D70 back-end / 0x1D88 texture)
-     * writes the value -- which the RSX would do after executing the command buffer.
-     * Emulate it so PPU label-polls complete (e.g. func_009F94A8 waits on label 255 =
-     * offset 0xFF0). vm_write32 stores big-endian; the game reads via vm_read32 (BE->host),
-     * so writing `data` round-trips to `data` for the poll comparison. */
-    if (method == 0x1D6C) {            /* NV4097_SET_SEMAPHORE_OFFSET */
-        state->sema_offset = data;
-        return 1;
-    }
-    if (method == 0x1D70 || method == 0x1D88) {   /* (BACK_END|TEXTURE_READ)_WRITE_SEMAPHORE_RELEASE */
-        extern void vm_write32(unsigned long long, unsigned int);
-        u32 addr = 0x03000000u + (state->sema_offset & 0x0000FFFFu);
-        vm_write32(addr, data);
-        { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
-            fprintf(stderr, "[rsx-sema] write label @0x%08X (off=0x%X) = 0x%08X\n",
-                    addr, state->sema_offset, data); } }
-        return 1;
-    }
+    /* YDKJ_RSXTRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
+     * The fixed 250 was spent entirely on boot-time setup, so the methods around
+     * the first real draw -- exactly the ones worth seeing -- were never traced. */
+    { static int _rt=-1; if(_rt<0){ const char* e=getenv("YDKJ_RSXTRACE");
+        _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
+      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
+     * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
+     * buffering). Real hardware DOES this; without it the game's frame-fence
+     * loop (func_0006E6E0 polling label 0x41 @ 0x03000410) spins forever and
+     * never reaches render. NV4097_SET_SEMAPHORE_OFFSET(0x1D6C)=offset (index*0x10
+     * into the GCM label window @0x03000000); NV4097_BACK_END_WRITE_SEMAPHORE_
+     * RELEASE(0x1D70)=value. Also NV406E semaphore release (0x0010 offset/0x0014
+     * value) for the sub-channel path. */
+    /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION: per-attribute modulo/divide mask
+     * for the frequency divisor (instancing). Captured for read_vp_vertex. */
+    if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
-    /* Surface configuration */
-    if (method >= 0x200 && method <= 0x23C)
+    { static u32 s_sem_off = 0;
+      if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      if (method == 0x1D70) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
+         * quirk); libgcm's cellGcmSetWriteBackEndLabel PRE-swaps to compensate
+         * (SDK gcm_implementation_sub.h: "// swap byte 0 and 2"). Writing the
+         * FIFO value verbatim left the label byte-swapped, so gcmutil's
+         * cellGcmUtilFinish poll (label 255 == sLabelVal, starts at 1) compared
+         * 0x00010000 != 1 and spun forever (gcm/cube sample hang after init).
+         * Apply the same swap the hardware does so the pre-swap cancels out. */
+        u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+        return 0;
+      } }
+    if ((method >= 0x200 && method <= 0x23C) ||
+        (method >= 0x280 && method <= 0x28C))
         return process_surface_method(state, method, data);
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */
@@ -294,6 +339,21 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return process_vertex_attrib_method(state, method, data);
 
     /* Viewport */
+    /* Viewport transform: window = ndc*scale + offset. The z lane is the
+     * GL->[0,1] depth remap (offset.z=0.5/scale.z=0.5); without honoring it,
+     * GL-convention projections (SDK gcm samples) get their near-camera
+     * geometry clipped by D3D's 0<=z<=w rule (gcm/cube: missing polygons). */
+    if (method >= 0x0A20 && method < 0x0A30) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_offset[(method - 0x0A20) >> 2] = v;
+        return 0;
+    }
+    if (method >= 0x0A30 && method < 0x0A40) {
+        u32 f = data; float v; memcpy(&v, &f, 4);
+        state->viewport_scale[(method - 0x0A30) >> 2] = v;
+        return 0;
+    }
+
     if (method == NV4097_SET_VIEWPORT_HORIZONTAL) {
         state->viewport_x = data & 0xFFFF;
         state->viewport_w = (data >> 16) & 0xFFFF;
@@ -341,6 +401,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
+        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
@@ -453,16 +514,68 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
-        /* Vertex program load slot — index into vertex program instruction memory */
+        /* Vertex program load slot — instruction index (each = 16 bytes).
+         * Following NV4097_SET_TRANSFORM_PROGRAM words fill from here. */
         state->transform_program_load = data;
+        state->vp_ucode_write = data * 16;
         state->shader_dirty = 1;
+        return 0;
+    }
+
+    if (method == NV4097_SET_TRANSFORM_PROGRAM_START) {
+        if (state->transform_program_start != data) state->vp_dirty = 1;
+        state->transform_program_start = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
+
+    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
+     * microcode words appended at the current write cursor. Capture them so the
+     * backend can decompile the real VP (4 words = one NV40 instruction). */
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        u32 w = state->vp_ucode_write;
+        if (w + 4 <= sizeof(state->vp_ucode)) {
+            /* data is host-endian already; store as little-endian bytes. */
+            state->vp_ucode[w+0] = (u8)(data);
+            state->vp_ucode[w+1] = (u8)(data >> 8);
+            state->vp_ucode[w+2] = (u8)(data >> 16);
+            state->vp_ucode[w+3] = (u8)(data >> 24);
+            state->vp_ucode_write = w + 4;
+            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
+            state->vp_dirty = 1;
+        }
         return 0;
     }
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
         state->vertex_attrib_output_mask = data;
         return 0;
     }
+    /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
+     * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
+     * every vertex when the attribute's ARRAY is disabled -- it is not zero.
+     *
+     * Rubber Ducky leaves attribute 3 (diffuse colour) disabled and sets it here
+     * instead; its duck shader computes (lighting * col0) * texture + spec, so a
+     * zero col0 multiplies the texture away and the ducks rendered as a dim grey
+     * specular term only -- present in the framebuffer, invisible on screen.
+     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
+     * file; add them if a title needs them. */
+    if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
+        u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
+        u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
+        float f; memcpy(&f, &data, 4);
+        state->vertex_data4f[idx][lane] = f;
+        { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
+          static int _n = 0;
+          if (_d && _n < 400) { _n++;
+            fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+        return 0;
+    }
+
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+        { static int _n=0; if (getenv("LOAD_DBG") && _n++ < 200)
+            fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
         return 0;
     }
@@ -482,7 +595,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (slot < RSX_MAX_VERTEX_CONSTANTS) {
             float f;
             memcpy(&f, &data, 4);
+            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+              static int _n=0;
+              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
+              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
+            { static int _sq=0; if (getenv("SEQ_DBG") && slot==256 && lane==0 && _sq++ < 500)
+                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
                 state->vertex_constants_hi = slot;
@@ -500,6 +620,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         if (data != 0) {
             state->primitive_type = data;
             state->in_begin_end = 1;
+            state->begin_epoch++;
 
             /* Flush dirty state to backend before drawing */
             if (s_backend) {
@@ -550,22 +671,53 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+        { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+        { static int _sq=0; if (getenv("SEQ_DBG") && _sq++ < 500)
+            fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
+                    state->surface_color_offset[0], state->vertex_constants[256][0],
+                    state->vertex_constants[257][1]); }
+        /* MVPDBG: dump every non-zero vertex-constant slot the FIRST time a
+         * G-buffer draw (surf0=0xCC0000) is dispatched -- the true MVP the GPU
+         * will use, read live (no snapshot/parity indirection). */
+        if (getenv("MVPDBG") && state->surface_color_offset[0] == 0xCC0000) {
+            static int _once = 0;
+            if (!_once) { _once = 1;
+                for (int s = 0; s < RSX_MAX_VERTEX_CONSTANTS; s++) {
+                    float* v = state->vertex_constants[s];
+                    if (v[0]||v[1]||v[2]||v[3])
+                        fprintf(stderr, "[MVP] c[%3d] = %10.4f %10.4f %10.4f %10.4f\n",
+                                s, v[0], v[1], v[2], v[3]);
+                }
+            }
+        }
         if (s_backend && s_backend->draw_arrays)
             s_backend->draw_arrays(s_backend->userdata, state->primitive_type, first, count);
         return 0;
     }
 
+    if (method == NV4097_SET_SHADER_CONTROL) {
+        { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
+            fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+        state->shader_control = data;
+        state->shader_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
+        state->index_array_offset = data;
+        return 0;
+    }
+    if (method == NV4097_SET_INDEX_ARRAY_DMA) {
+        state->index_array_dma = data;
+        return 0;
+    }
     if (method == NV4097_DRAW_INDEX_ARRAY) {
-        /*
-         * Draw indexed command:
-         *   [23:0]  index buffer offset (in indices, not bytes)
-         *   [31:24] count - 1
-         */
-        u32 index_offset = data & 0xFFFFFF;
+        /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
+        u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
+        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
-                                    index_offset, count);
+                                    first, count);
         return 0;
     }
 
@@ -578,6 +730,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_SET_SCISSOR_VERTICAL) {
         state->scissor_y = data & 0xFFFF;
         state->scissor_h = (data >> 16) & 0xFFFF;
+        return 0;
+    }
+
+    /* NV406E_SET_REFERENCE (0x0050): the title writes a reference value it then
+     * spins on (cellGcmFinish / cellGcmSetWaitLabel). Record the latest so the
+     * GCM control register can report completion back to the guest and unblock
+     * the spin. Class 0 (software) method, no subchannel state needed here. */
+    if (method == 0x0050) {
+        g_rsx_last_reference = data;
         return 0;
     }
 
@@ -597,26 +758,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
-int g_rsx_mlog = -1;   /* RSX_MLOG diagnostic budget (-1 = read env on first use) */
-
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
-    if (g_rsx_mlog < 0) { const char* e = getenv("RSX_MLOG"); g_rsx_mlog = (e && *e != '0') ? 300 : 0; }
-
-    if (getenv("RSX_FIRST")) { static int shown = 0; if (shown < 8 && count > 0) {
-        shown++;
-        fprintf(stderr, "[rsx-first] call size=%u words=%u  hdrs:", size, count);
-        for (u32 k = 0; k < count && k < 8; k++) {
-            u32 h = buf[k]; u32 t = (h >> 29) & 0x7;
-            fprintf(stderr, " [%u]=0x%08X(t%u,m0x%04X,n%u)", k, h, t, ((h>>2)&0x7FF)<<2, (h>>18)&0x7FF);
-        }
-        fprintf(stderr, "\n");
-    } }
-
+    { static int _c=0; if (count && _c++ < 16) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;
@@ -631,28 +779,15 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             for (u32 i = 0; i < num_data && pos < count; i++) {
                 u32 data = buf[pos++];
                 u32 m = increasing ? (method + i * 4) : method;
-                /* RSX_MLOG: trace methods to find the label-255 write (semaphore/report
-                 * methods: SET_SEMAPHORE_OFFSET 0x1d6c, BACK_END_WRITE_SEMAPHORE_RELEASE
-                 * 0x1d70, TEXTURE_READ_SEMAPHORE_RELEASE 0x1d88, SET_REFERENCE 0x50, or
-                 * NV406E semaphore). Capped. */
-                { extern int g_rsx_mlog; if (g_rsx_mlog > 0 &&
-                    (m == 0x1d6c || m == 0x1d70 || m == 0x1d88 || m == 0x1d94 || m == 0x50 ||
-                     m == 0x64 || m == 0x68 || m == 0x6c || m == 0x10 || m == 0x14)) {
-                    g_rsx_mlog--;
-                    fprintf(stderr, "[rsx-mlog] method=0x%04X data=0x%08X\n", m, data); } }
                 rsx_process_method(state, m, data);
                 methods_processed++;
             }
         } else if (type == 1) {
             /* Jump — change command buffer read position */
             /* In recomp context, this is handled by the caller */
-            { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
-                fprintf(stderr, "[rsx-mlog] JUMP -> 0x%08X (not followed)\n", header & 0x1FFFFFFCu); } }
             break;
         } else {
             /* Unknown type, skip */
-            { extern int g_rsx_mlog; if (g_rsx_mlog > 0) { g_rsx_mlog--;
-                fprintf(stderr, "[rsx-mlog] type=%u header=0x%08X (CALL/RET?) -- stop\n", type, header); } }
             break;
         }
     }

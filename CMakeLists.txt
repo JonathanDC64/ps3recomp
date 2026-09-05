@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
+# Keep in step with the changelog in README.md. This sat at 0.3.0 until August
+# 2026 while the project shipped 0.6.x through 0.8.0, so every build printed
+# "ps3recomp runtime v0.3.0" and was believed. v0.9.0 is the first TAGGED one.
 project(ps3recomp_runtime
-    VERSION 0.3.0
+    VERSION 0.9.1
     LANGUAGES C CXX
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
@@ -36,6 +39,7 @@ file(GLOB_RECURSE HLE_SOURCES
     "libs/font/*.c"
     "libs/misc/*.c"
     "libs/hardware/*.c"
+    "runtime/diag/*.c"      # yz_frontier_trace, used by the live draw engine
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
@@ -43,6 +47,13 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # same sceNpCommerce2* symbols, no v1 API of its own). MSVC lib only warned
 # (LNK4006) but lld-link errors on the duplicate symbols when linking an exe.
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/sceNpCommerce\\.c$")
+
+# The Metal backend is Objective-C and Apple-only, so it is added explicitly
+# rather than globbed. It needs no platform #ifdef of its own as a result.
+if(APPLE)
+    enable_language(OBJC)
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
+endif()
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -95,6 +106,44 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+else()
+    # cellPad and cellAudio select their SDL2 backends unconditionally off
+    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
+    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+    find_package(SDL2 QUIET)
+    if(SDL2_FOUND)
+        if(TARGET SDL2::SDL2)
+            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+        else()
+            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
+            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
+        endif()
+        message(STATUS "  SDL2:         found (input + audio backends enabled)")
+    else()
+        message(FATAL_ERROR
+            "SDL2 not found. It provides the cellPad and cellAudio backends on "
+            "non-Windows hosts.\n"
+            "  macOS:  brew install sdl2\n"
+            "  Debian: apt install libsdl2-dev\n"
+            "If SDL2 is installed in a non-standard prefix, pass "
+            "-DCMAKE_PREFIX_PATH=<prefix>.")
+    endif()
+
+    find_package(Threads REQUIRED)
+    target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
+endif()
+
+if(APPLE)
+    target_link_libraries(ps3recomp_runtime PUBLIC
+        "-framework Metal"
+        "-framework QuartzCore"
+        "-framework Foundation"
+        "-framework AppKit"
+    )
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -113,6 +162,43 @@ elseif(MSVC)
     )
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(PS3RECOMP_BUILD_TESTS)
+    include(CTest)
+    # sync_stress is written directly against the Win32 threading API
+    # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
+    # runtime/platform/win32_compat.h covers the subset the runtime itself needs,
+    # but not joinable handles or multi-object waits -- porting this test needs a
+    # real handle table and is left as follow-up work.
+    if(WIN32)
+        add_subdirectory(tests/sync_stress)
+    else()
+        message(STATUS "  sync_stress:  skipped (Win32-only threading API)")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# POSIX host harness
+# ---------------------------------------------------------------------------
+# Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
+# can be brought up and regression-tested without a game binary or a recompiler
+# run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
+# headless software path everywhere else, so Linux -- which has no real backend
+# yet -- can still run the whole guest command stream end to end in CI.
+if(UNIX)
+    add_executable(ps3recomp_host
+        runtime/host/host_posix.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(ps3recomp_host PRIVATE ps3recomp_runtime)
+    target_include_directories(ps3recomp_host PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
 endif()
 

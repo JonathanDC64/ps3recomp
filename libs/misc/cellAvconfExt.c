@@ -6,6 +6,17 @@
  */
 
 #include "cellAvconfExt.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
+
+/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
+ * bare deref here writes to whatever host address shares that number. These
+ * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
+ * memset()s through one -- an access violation the moment a title reaches audio
+ * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
+ * are all-u8, so translation alone is correct for them; the float needs a
+ * byte-swapped store. */
+extern u8* vm_base;
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 #include <stdio.h>
 #include <string.h>
 
@@ -24,13 +35,22 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
     (void)audioOut;
     (void)option;
 
-    /* Report 2-channel LPCM at 48kHz as always available */
-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM && (fs & CELL_AUDIO_OUT_FS_48KHZ))
+    /* Report the SAME capability set a real PS3/RPCS3 reports, not just stereo.
+     * Golden trace (RPCS3.log, real YDKJ boot) shows:
+     *   cellAudioOut: found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch.
+     *   cellAudioOut: found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch.
+     * This call returns the MAX channel count available for (type, fs). Under-reporting
+     * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
+     * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
+     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
+    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
+        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
         return CELL_AUDIO_OUT_CHNUM_2;
+    }
 
-    /* 6-channel (5.1) LPCM also available */
-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM)
-        return CELL_AUDIO_OUT_CHNUM_2;
+    /* Dolby Digital / DTS: real hardware reports 5.1 for these. */
+    if (type == CELL_AUDIO_OUT_CODING_TYPE_AC3 || type == CELL_AUDIO_OUT_CODING_TYPE_DTS)
+        return CELL_AUDIO_OUT_CHNUM_6;
 
     return 0; /* not available */
 }
@@ -59,16 +79,27 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
 
     if (!info)
         return CELL_EINVAL;
+    info = GUEST_PTR(info, CellAudioOutDeviceInfo*);
 
     memset(info, 0, sizeof(CellAudioOutDeviceInfo));
 
-    /* Report one available mode: LPCM stereo 48kHz */
+    /* Report the mode set a real PS3 reports. Golden trace (RPCS3.log, real YDKJ boot):
+     *   "found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch."
+     *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
+     * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
+     * self-inconsistent, and middleware (FMOD) validates these against each other. */
     info->portType = 0; /* HDMI */
-    info->availableModeCount = 1;
-    info->state = 2; /* connected */
-    info->availableModes[0].type = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    info->state = 2;    /* connected */
+    info->availableModeCount = 3;
+    info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
-    info->availableModes[0].fs = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
+    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
+    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
 
     return CELL_OK;
 }
@@ -85,6 +116,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 
     if (!config)
         return CELL_EINVAL;
+    config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
     config->channel = CELL_AUDIO_OUT_CHNUM_2;
@@ -110,7 +142,8 @@ s32 cellVideoOutGetGamma(u32 videoOut, float* gamma)
 {
     (void)videoOut;
     if (!gamma) return CELL_EINVAL;
-    *gamma = s_gamma;
+    { float g = s_gamma; uint32_t bits; memcpy(&bits, &g, 4);
+      vm_write32((uint32_t)(uintptr_t)gamma, bits); }
     return CELL_OK;
 }
 

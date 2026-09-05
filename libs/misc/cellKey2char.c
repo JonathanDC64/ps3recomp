@@ -9,6 +9,7 @@
 #include "cellKey2char.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * HID usage codes (subset used for key-to-char mapping)
@@ -87,7 +88,7 @@ s32 cellKey2CharOpen(u32 arrangement, CellKey2CharHandle* handle)
             s_contexts[i].in_use = 1;
             s_contexts[i].arrangement = arrangement;
             s_contexts[i].mode = 0;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }
@@ -119,7 +120,7 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
     int shift = (mkey & MKEY_SHIFT) != 0;
     int caps  = (led & LED_CAPS_LOCK) != 0;
 
-    *charNum = 0;
+    vm_write32((u32)(uintptr_t)charNum, (u32)0);
 
     /* Letters A-Z (HID 0x04 - 0x1D) */
     if (rawcode >= HID_KEY_A && rawcode <= HID_KEY_Z) {
@@ -127,7 +128,7 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
         if (shift ^ caps) /* XOR: shift or caps but not both */
             base = (char)(base - 32); /* to uppercase */
         charCode[0] = (u16)base;
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     }
 
@@ -139,7 +140,7 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
         } else {
             charCode[0] = (idx < 9) ? (u16)('1' + idx) : (u16)'0';
         }
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     }
 
@@ -147,23 +148,23 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
     switch (rawcode) {
     case HID_KEY_ENTER:
         charCode[0] = '\n';
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     case HID_KEY_TAB:
         charCode[0] = '\t';
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     case HID_KEY_SPACE:
         charCode[0] = ' ';
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     case HID_KEY_BACKSPACE:
         charCode[0] = 0x08;
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     case HID_KEY_ESCAPE:
         charCode[0] = 0x1B;
-        *charNum = 1;
+        vm_write32((u32)(uintptr_t)charNum, (u32)1);
         return CELL_OK;
     }
 
@@ -173,13 +174,13 @@ s32 cellKey2CharKeyCodeToChar(CellKey2CharHandle handle,
         if (idx < (int)sizeof(s_unshifted_symbols)) {
             charCode[0] = shift ? (u16)s_shifted_symbols[idx]
                                 : (u16)s_unshifted_symbols[idx];
-            *charNum = 1;
+            vm_write32((u32)(uintptr_t)charNum, (u32)1);
             return CELL_OK;
         }
     }
 
     /* Unknown key - no character output */
-    *charNum = 0;
+    vm_write32((u32)(uintptr_t)charNum, (u32)0);
     return CELL_OK;
 }
 
@@ -200,6 +201,6 @@ s32 cellKey2CharGetMode(CellKey2CharHandle handle, s32* mode)
     if (!mode)
         return (s32)CELL_K2C_ERROR_INVALID_PARAMETER;
 
-    *mode = s_contexts[handle].mode;
+    vm_write32((u32)(uintptr_t)mode, (u32)s_contexts[handle].mode);
     return CELL_OK;
 }

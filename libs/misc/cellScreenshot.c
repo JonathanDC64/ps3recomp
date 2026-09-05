@@ -8,6 +8,7 @@
 #include "cellScreenshot.h"
 #include <stdio.h>
 #include <string.h>
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -51,13 +52,15 @@ s32 cellScreenShotSetParameter(const CellScreenShotSetParam* param)
     if (!param)
         return CELL_EINVAL;
 
-    s_param = *param;
+    s_param = *GUEST_PTR(param, const CellScreenShotSetParam*);
     return CELL_OK;
 }
 
 s32 cellScreenShotSetOverlayImage(const char* srcDir, const char* srcFile,
                                    s32 offsetX, s32 offsetY)
 {
+    srcDir  = GUEST_PTR(srcDir, const char*);
+    srcFile = GUEST_PTR(srcFile, const char*);
     printf("[cellScreenshot] SetOverlayImage(dir=%s, file=%s, x=%d, y=%d)\n",
            srcDir ? srcDir : "(null)",
            srcFile ? srcFile : "(null)",

@@ -8,6 +8,7 @@
 #include "cellVoice.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* Internal state */
 
@@ -51,8 +52,8 @@ s32 cellVoiceCreatePort(const CellVoicePortParam* param, CellVoicePortId* portId
     for (int i = 0; i < CELL_VOICE_PORT_MAX; i++) {
         if (!s_ports[i].in_use) {
             s_ports[i].in_use = 1;
-            s_ports[i].param = *param;
-            *portId = (u32)i;
+            s_ports[i].param = *GUEST_PTR(param, const CellVoicePortParam*);
+            vm_write32((u32)(uintptr_t)portId, (u32)i);
             return CELL_OK;
         }
     }
@@ -129,7 +130,7 @@ s32 cellVoiceGetPortInfo(CellVoicePortId portId, CellVoicePortParam* param)
     if (portId >= CELL_VOICE_PORT_MAX || !s_ports[portId].in_use)
         return (s32)CELL_VOICE_ERROR_PORT_NOT_FOUND;
     if (!param) return (s32)CELL_VOICE_ERROR_INVALID_ARGUMENT;
-    *param = s_ports[portId].param;
+    *GUEST_PTR(param, CellVoicePortParam*) = s_ports[portId].param;
     return CELL_OK;
 }
 
@@ -140,7 +141,7 @@ s32 cellVoiceWriteToIPort(CellVoicePortId portId, const void* data, u32* size)
     if (portId >= CELL_VOICE_PORT_MAX || !s_ports[portId].in_use)
         return (s32)CELL_VOICE_ERROR_PORT_NOT_FOUND;
     /* Accept and discard voice data */
-    if (size) *size = 0;
+    if (size) vm_write32((u32)(uintptr_t)size, 0);
     return CELL_OK;
 }
 
@@ -151,7 +152,7 @@ s32 cellVoiceReadFromOPort(CellVoicePortId portId, void* data, u32* size)
     if (portId >= CELL_VOICE_PORT_MAX || !s_ports[portId].in_use)
         return (s32)CELL_VOICE_ERROR_PORT_NOT_FOUND;
     /* No voice data to return */
-    if (size) *size = 0;
+    if (size) vm_write32((u32)(uintptr_t)size, 0);
     return CELL_OK;
 }
 

@@ -6,6 +6,7 @@
 
 #include "cellPrint.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -34,6 +35,6 @@ s32 cellPrintGetPrinterCount(u32* count)
     if (!s_initialized)
         return (s32)CELL_PRINT_ERROR_NOT_INITIALIZED;
     if (!count) return (s32)CELL_PRINT_ERROR_INVALID_ARGUMENT;
-    *count = 0; /* No printers */
+    vm_write32((u32)(uintptr_t)count, (u32)0); /* No printers */
     return CELL_OK;
 }

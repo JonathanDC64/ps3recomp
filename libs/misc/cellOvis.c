@@ -6,6 +6,7 @@
 
 #include "cellOvis.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -36,7 +37,7 @@ s32 cellOvisGetOverlayTableSize(const char* filePath, u32* tableSize)
     (void)filePath;
     if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
     if (!tableSize) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
-    *tableSize = 0;
+    vm_write32((u32)(uintptr_t)tableSize, (u32)0);
     return CELL_OK;
 }
 
@@ -45,7 +46,7 @@ s32 cellOvisCreateOverlay(const void* table, u32 tableSize, CellOvisHandle* hand
     (void)table; (void)tableSize;
     if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
     if (!handle) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
-    *handle = s_next_handle++;
+    vm_write32((u32)(uintptr_t)handle, (u32)s_next_handle++);
     return CELL_OK;
 }
 

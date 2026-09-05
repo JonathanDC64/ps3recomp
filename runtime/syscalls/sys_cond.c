@@ -5,11 +5,9 @@
 #include "sys_cond.h"
 #include "../memory/vm.h"
 #include <string.h>
-#include <stdlib.h>   /* getenv/strtol/strtoul/strtoull (probes must not truncate ptrs) */
-
-/* Set by spu_workload when an awaited SPURS leaf task completes; consumed by the
- * SPURS_RELEASE_COND completion-bridge in sys_cond_wait. */
-volatile long g_spurs_release_pending = 0;
+#include <stdlib.h>
+/* RtlCaptureStackBackTrace + GetModuleHandleA come from <windows.h> (pulled in
+ * by sys_cond.h for CRITICAL_SECTION) -- do not redeclare them. */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -62,6 +60,12 @@ static void write_be32(uint32_t addr, uint32_t val)
  * r4 = mutex_id to associate with
  * r5 = pointer to attribute struct
  * -----------------------------------------------------------------------*/
+/* Guest address the cond id was written to, per id. A guest sync object
+ * usually embeds {flag, mutex, cond, count}, so the cond id lives at a known
+ * offset inside it and this recovers the object address -- enough to watch the
+ * counter a waiter is blocked on. */
+uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
+
 int64_t sys_cond_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -69,10 +73,12 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t attr_addr   = LV2_ARG_PTR(ctx, 2);
 
     /* Validate the associated mutex */
-    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
-    if (!g_sys_mutexes[mutex_id - 1].active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u out of range -> ESRCH (cond var not created -> worker will spin on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
+    if (!g_sys_mutexes[mutex_id - 1].active) {
+        if(getenv("YDKJ_SYNCLOG")) fprintf(stderr,"[SYNC] sys_cond_create FAIL: mutex_id=%u INACTIVE -> ESRCH (cond var not created -> worker spins on null)\n",mutex_id);
+        return (int64_t)(int32_t)CELL_ESRCH; }
 
     cond_table_lock();
 
@@ -106,6 +112,7 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t cond_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, cond_id);
+        if ((uint32_t)(slot + 1) <= SYS_COND_MAX) g_cond_id_addr[slot + 1] = id_out_addr;
     }
 
     cond_table_unlock();
@@ -150,112 +157,36 @@ int64_t sys_cond_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_wait(ppu_context* ctx)
 {
-    { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13) */
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu)\n", cond_id, (unsigned long long)timeout_us);
-
-    /* EXPERIMENT (FORCE_COND_DONE=N): make cond_wait on cond N return immediately
-     * (CELL_OK, no block) -- simulates the awaited signals. Probes whether a never-
-     * signaled barrier (e.g. the Havok cond-9 barrier MAIN parks on) is the boot gate:
-     * if the game advances, that barrier's missing completions are the cause. */
-    { static int fc = -2; if (fc == -2) { const char* e = getenv("FORCE_COND_DONE"); fc = e ? (int)strtol(e,0,0) : -1; }
-      if (fc >= 0 && cond_id == (uint32_t)fc) return CELL_OK; }
-
-    /* Completion-bridge release (SPURS_RELEASE_COND=N): release cond N's barrier
-     * once the awaited SPURS leaf work has actually completed (g_spurs_release_pending
-     * set by spu_workload on leaf exit). Sticky -> no lost wakeup (unlike raw signal),
-     * and only after the data is produced (unlike unconditional FORCE_COND_DONE). */
-    { extern volatile long g_spurs_release_pending;
-      static int rc = -2; if (rc == -2) { const char* e = getenv("SPURS_RELEASE_COND"); rc = e ? (int)strtol(e,0,0) : -1; }
-      if (rc >= 0 && cond_id == (uint32_t)rc && g_spurs_release_pending > 0) {
-          long p = --g_spurs_release_pending;   /* consume one completion */
-          fprintf(stderr, "[spurs-bridge] release cond %u (work done, remaining=%ld)\n", cond_id, p);
-          return CELL_OK;
-      } }
-
-    /* One-shot guest backtrace for the hot cond=2 waiter (Frontier #11): walk the
-     * PPC64 stack back-chain (*(r1)=prev SP, saved LR at prev+0x10) to identify which
-     * guest function is blocked and what it's waiting for. */
-    if (cond_id == 9) { static int n9 = 0; if (n9 < 12) { n9++;
-        extern uint32_t vm_read32(uint64_t);
-        uint32_t obj = (uint32_t)ctx->gpr[31];          /* = barrier_obj + 0xC */
-        uint32_t base = obj - 0xC;                       /* barrier object */
-        /* +0x1F0 from the barrier base = the target count N the waiter loops on. */
-        fprintf(stderr, "[cond9-bt] #%d base=0x%08X count(+0x1F0)=0x%08X +0x1EC=0x%08X +0x1F4=0x%08X\n",
-                n9, base, vm_read32(base+0x1F0), vm_read32(base+0x1EC), vm_read32(base+0x1F4));
-    } }
-
-    if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
-        extern uint64_t vm_read64(uint64_t);
-        fprintf(stderr, "[cond2-bt] cia=0x%08X lr=0x%08X r1=0x%08X\n",
-                (uint32_t)ctx->cia, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1]);
-        uint32_t sp = (uint32_t)ctx->gpr[1];
-        for (int i = 0; i < 10 && sp >= 0x10000 && sp < 0xE0000000u; i++) {
-            uint32_t bc = (uint32_t)vm_read64(sp);
-            if (bc <= sp || bc < 0x10000 || bc >= 0xE0000000u) break;
-            uint32_t lr = (uint32_t)vm_read64(bc + 0x10);
-            fprintf(stderr, "[cond2-bt]   #%d lr=0x%08X\n", i, lr);
-            sp = bc;
-        }
-    } }
-
-    /* cond=2 predicate probe: the waiter is func_009E0370, which sets gpr[31]=r3
-     * (the shared sync/queue object) at entry and re-waits while *(obj+0xC) stays
-     * in the wait-state. Dump the object header [0..0x10] on the first ~12 waits to
-     * see whether the producer ever moves the predicate field +0xC. */
-    if (cond_id == 2) { static int n = 0; if (n++ < 12) {
-        extern uint32_t vm_read32(uint64_t);
-        uint32_t obj = (uint32_t)ctx->gpr[31];
-        fprintf(stderr, "[cond2-pred] #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X\n",
-                n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8), vm_read32(obj+0xC));
-    } }
-
-    /* cond=29 = MAIN's frame barrier (func_009E0370). r31 = the sync object;
-     * cond id lives at +0x8, the state/predicate MAIN loops on at +0xC. Dump the
-     * object addr + header over the first waits so we can WWATCH obj+0xC and find
-     * the completion producer that advances the state. */
-    /* Probe the CURRENT MAIN gate. With SPURS_LV2THREADS+taskset side-effects MAIN
-     * advances cond-29 -> cond-13 (Havok barrier); SPURS_PROBE_COND overrides. */
-    { static int pc = -2; if (pc == -2) { const char* e = getenv("SPURS_PROBE_COND"); pc = e ? (int)strtol(e,0,0) : 13; }
-    if (cond_id == (uint32_t)pc) { static int n = 0; if (n++ < 12) {
-        extern uint32_t vm_read32(uint64_t); extern const char* thrdiag_cur_name(void);
-        uint32_t obj = (uint32_t)ctx->gpr[31];
-        fprintf(stderr, "[condprobe] cond=%u thr='%s' #%d obj=0x%08X  +0x0=0x%08X +0x4=0x%08X +0x8=0x%08X +0xC=0x%08X +0x10=0x%08X\n",
-                cond_id, thrdiag_cur_name(), n, obj, vm_read32(obj+0x0), vm_read32(obj+0x4), vm_read32(obj+0x8),
-                vm_read32(obj+0xC), vm_read32(obj+0x10));
+    { static int s_ow = -1; if (s_ow < 0) s_ow = getenv("PS3_COND_OBJ") ? 1 : 0;
+      if (s_ow && cond_id <= SYS_COND_MAX && g_cond_id_addr[cond_id]) {
+          uint32_t obj = g_cond_id_addr[cond_id] - 8;   /* {flag,mutex,cond,count} */
+          extern uint8_t* vm_base;
+          static int _n = 0;
+          if (_n++ < 12 && vm_base) {
+              const uint8_t* o = vm_base + obj;
+              fprintf(stderr, "[cond-obj] cond=%u obj=0x%08X:", cond_id, obj);
+              for (int k = 0; k < 16; k++) fprintf(stderr, " %02X", o[k]);
+              fputc(10, stderr);
+          } } }
+    fprintf(stderr, "[WAIT] cond_wait(cond=%u timeout=%llu) tid=%llu lr=0x%08X\n", cond_id, (unsigned long long)timeout_us,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+    /* YDKJ_THREADGATE: creating thread is blocking -> let gated workers run. */
+    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
 #ifdef _WIN32
-        /* Full host backtrace of MAIN's cond-29 wait -> the whole loop chain up to
-         * main() in one shot (symbolize with tools/des/sym.py --stack). Piece 2. */
-        { void* fr[64]; unsigned short nf = RtlCaptureStackBackTrace(0, 64, fr, 0);
-          HMODULE self = 0; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)&vm_read32,&self);
-          for (unsigned short i=0;i<nf;i++){ HMODULE m=0; GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)fr[i],&m);
-            if(m==self) fprintf(stderr,"[condprobe-bt] rva=0x%llX\n",(unsigned long long)((char*)fr[i]-(char*)self)); } }
-#endif
-    } } }
-
-    /* PROBE (SPURS_EVTEST=1): one-shot chain test for Frontier #11. The parked
-     * SPURuntimeService (q=1) waits for a SPURS USER event (source 0xFFFFFFFF53505501,
-     * handler selected by (data2>>32)&0xFF). Post one to q=1 to see if it wakes the
-     * service -> dispatches handler A -> enqueues a job -> cond_signal(2) -> coordinator
-     * advances. Confirms (or refutes) the SPU->PPU event-delivery chain before building it
-     * properly. data1=0 (handler stores, doesn't immediately deref). */
-    if (cond_id == 2) { static int probed = 0;
-        if (!probed && getenv("SPURS_EVTEST")) { probed = 1;
-            extern int sys_spu_thread_post_user_event(uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
-            /* Correct contract layout (docs/14): data1=spu lv2 id, data2=(spup<<32)|data0,
-             * data3=payload. spup selects the handler (1 -> handler B work path).
-             * SPURS_EVLV2 = spu lv2 id, SPURS_EVSEL = spup, SPURS_EVDATA = data3 payload. */
-            uint64_t lv2 = 1; { const char* e = getenv("SPURS_EVLV2"); if (e) lv2 = strtoull(e,0,0); }
-            uint32_t spup = 1; { const char* e = getenv("SPURS_EVSEL"); if (e) spup = (uint32_t)strtoul(e,0,0); }
-            uint64_t d3 = 0x45A4B280ull; { const char* e = getenv("SPURS_EVDATA"); if (e) d3 = strtoull(e,0,0); }
-            fprintf(stderr, "[evtest] USER event q=1 lv2id=0x%llX spup=%u data3=0x%llX\n",
-                    (unsigned long long)lv2, spup, (unsigned long long)d3);
-            int r = sys_spu_thread_post_user_event(1u, lv2, spup, 0, d3);
-            fprintf(stderr, "[evtest] post_user_event(q=1) -> %d\n", r);
+    if (cond_id == 7) {
+        static int _n = 0;
+        if (_n++ < 1) {
+            void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
+            char* mb = (char*)GetModuleHandleA(0);
+            char line[640]; int p = snprintf(line, sizeof line, "[cond7-bt] fr=%u rva:", (unsigned)fr);
+            for (int i = 0; i < fr; i++)
+                p += snprintf(line+p, sizeof(line)-p, " %llX", (unsigned long long)((char*)bt[i]-mb));
+            fprintf(stderr, "%s\n", line); fflush(stderr);
         }
     }
+#endif
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -281,19 +212,23 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->owner_tid = 0;
     m->lock_count = 0;
 
-    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("cond", cond_id); }
 #ifdef _WIN32
     DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
     if (ms == 0 && timeout_us > 0) ms = 1;
+    /* FLOW_CONDKICK (SPU-bring-up diagnostic): cond=7 is waited on but never
+     * signaled (its signaler is blocked on the dead SPU pipeline). Cap infinite
+     * waits and return CELL_OK so the engine can advance past spurious waits. */
+    static int s_kick = -1; if (s_kick < 0) s_kick = getenv("FLOW_CONDKICK") ? 1 : 0;
+    if (s_kick && ms == INFINITE) ms = 1500;
 
     BOOL ok = SleepConditionVariableCS(&c->cv, &m->cs, ms);
-    { extern void thrdiag_wake(void); thrdiag_wake(); }
 
     /* Restore ownership */
     m->owner_tid = saved_owner;
     m->lock_count = saved_count;
 
     if (!ok && GetLastError() == ERROR_TIMEOUT) {
+        if (s_kick) return CELL_OK;   /* pretend signaled so the guest re-checks/proceeds */
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
@@ -335,8 +270,9 @@ int64_t sys_cond_wait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_signal(ppu_context* ctx)
 {
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_SIG id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
+    { static int n=0; if(n++<80) fprintf(stderr,"[SIGNAL] cond_signal(cond=%u) tid=%llu lr=0x%08X\n", cond_id,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -354,21 +290,6 @@ int64_t sys_cond_signal(ppu_context* ctx)
     return CELL_OK;
 }
 
-/* C-callable: wake one waiter on cond `cond_id` (completion-bridging experiment --
- * spu_workload signals a SPURS barrier's cond once per completed leaf task). */
-void spurs_signal_cond_by_id(uint32_t cond_id)
-{
-    if (cond_id == 0 || cond_id > SYS_COND_MAX) return;
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active) return;
-#ifdef _WIN32
-    WakeConditionVariable(&c->cv);
-#else
-    pthread_cond_signal(&c->cv);
-#endif
-    fprintf(stderr, "[spurs-bridge] signaled cond %u (one waiter)\n", cond_id);
-}
-
 /* ---------------------------------------------------------------------------
  * sys_cond_signal_all
  *
@@ -376,25 +297,8 @@ void spurs_signal_cond_by_id(uint32_t cond_id)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_signal_all(ppu_context* ctx)
 {
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu COND_SIGALL id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t cond_id = LV2_ARG_U32(ctx, 0);
-
-    /* One-shot guest backtrace for the cond=2 signaler (the lwmutex hog livelocking the
-     * coordinator). Mirrors the cond2-bt probe in sys_cond_wait. */
-    if (cond_id == 2) { static int once = 0; if (!once) { once = 1;
-        extern uint64_t vm_read64(uint64_t);
-        fprintf(stderr, "[cond2-sig] tid=%lu cia=0x%08X lr=0x%08X r1=0x%08X\n",
-                (unsigned long)GetCurrentThreadId(),
-                (uint32_t)ctx->cia, (uint32_t)ctx->lr, (uint32_t)ctx->gpr[1]);
-        uint32_t sp = (uint32_t)ctx->gpr[1];
-        for (int i = 0; i < 12 && sp >= 0x10000 && sp < 0xE0000000u; i++) {
-            uint32_t bc = (uint32_t)vm_read64(sp);
-            if (bc <= sp || bc < 0x10000 || bc >= 0xE0000000u) break;
-            uint32_t lr = (uint32_t)vm_read64(bc + 0x10);
-            fprintf(stderr, "[cond2-sig]   #%d lr=0x%08X\n", i, lr);
-            sp = bc;
-        }
-    } }
+    { static int n=0; if(n++<40) fprintf(stderr,"[SIGNAL] cond_signal_all(cond=%u)\n", cond_id); }
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;

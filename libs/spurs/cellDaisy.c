@@ -7,6 +7,7 @@
  */
 
 #include "cellDaisy.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ static int daisy_alloc(void)
 s32 cellDaisyPipeAttributeInitialize(CellDaisyPipeAttribute* attr,
                                      u32 direction, u32 entrySize, u32 depth)
 {
+    attr = GUEST_PTR(attr, CellDaisyPipeAttribute*);
     if (!attr) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
     if (entrySize == 0 || depth == 0 || depth > CELL_DAISY_MAX_DEPTH)
         return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
@@ -54,6 +56,8 @@ s32 cellDaisyCreatePipe(void* spurs, CellDaisyPipe* pipe,
                         const CellDaisyPipeAttribute* attr,
                         void* buffer, u32 bufferSize)
 {
+    attr = GUEST_PTR(attr, const CellDaisyPipeAttribute*);
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     (void)spurs; (void)buffer; (void)bufferSize;
     printf("[cellDaisy] CreatePipe(entrySize=%u, depth=%u)\n",
            attr ? attr->entrySize : 0, attr ? attr->depth : 0);
@@ -80,12 +84,13 @@ s32 cellDaisyCreatePipe(void* spurs, CellDaisyPipe* pipe,
     }
     memset(p->ring, 0, attr->entrySize * attr->depth);
 
-    *pipe = (CellDaisyPipe)slot;
+    vm_write32((u32)(uintptr_t)pipe, (u32)slot);
     return CELL_OK;
 }
 
 s32 cellDaisyDestroyPipe(CellDaisyPipe* pipe)
 {
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     if (!pipe) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *pipe;
@@ -100,6 +105,8 @@ s32 cellDaisyDestroyPipe(CellDaisyPipe* pipe)
 
 s32 cellDaisyPipePush(CellDaisyPipe* pipe, const void* data)
 {
+    data = GUEST_PTR(data, const void*);
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     if (!pipe || !data) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *pipe;
@@ -123,6 +130,8 @@ s32 cellDaisyPipeTryPush(CellDaisyPipe* pipe, const void* data)
 
 s32 cellDaisyPipePop(CellDaisyPipe* pipe, void* data)
 {
+    data = GUEST_PTR(data, void*);
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     if (!pipe || !data) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *pipe;
@@ -146,24 +155,26 @@ s32 cellDaisyPipeTryPop(CellDaisyPipe* pipe, void* data)
 
 s32 cellDaisyPipeGetCount(CellDaisyPipe* pipe, u32* count)
 {
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     if (!pipe || !count) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *pipe;
     if (slot >= CELL_DAISY_MAX_PIPES || !s_pipes[slot].in_use)
         return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
-    *count = s_pipes[slot].count;
+    vm_write32((u32)(uintptr_t)count, s_pipes[slot].count);
     return CELL_OK;
 }
 
 s32 cellDaisyPipeGetFreeCount(CellDaisyPipe* pipe, u32* count)
 {
+    pipe = GUEST_PTR(pipe, CellDaisyPipe*);
     if (!pipe || !count) return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
     u32 slot = *pipe;
     if (slot >= CELL_DAISY_MAX_PIPES || !s_pipes[slot].in_use)
         return (s32)CELL_DAISY_ERROR_INVALID_ARGUMENT;
 
-    *count = s_pipes[slot].depth - s_pipes[slot].count;
+    vm_write32((u32)(uintptr_t)count, s_pipes[slot].depth - s_pipes[slot].count);
     return CELL_OK;
 }

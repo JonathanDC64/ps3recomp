@@ -3,9 +3,11 @@
  */
 
 #include "sys_semaphore.h"
+#include "../ps3_log.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
-#include <stdlib.h>   /* getenv/strtol (FORCE_SEMA probe; avoid ptr-truncating implicit decls) */
+#include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -49,6 +51,135 @@ static void write_be32(uint32_t addr, uint32_t val)
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
     *p = val;
+}
+
+static uint32_t read_be32(uint32_t addr)
+{
+    uint32_t v; uint32_t* p = (uint32_t*)vm_to_host(addr);
+    v = *p;
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+    v = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+        ((v <<  8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
+#endif
+    return v;
+}
+
+/* ---------------------------------------------------------------------------
+ * lbp_hang_census (diagnostic; called from the hang watchdog)
+ *
+ * Reads the LBP resource-manager's three work-queue depths straight out of
+ * guest memory and cross-references each queue's semaphore runtime value. The
+ * manager pointer lives at guest [TOC(0x93BCC0)-25864] = 0x009357B8; each queue
+ * struct has +0=base, +4=count, +8=capacity, +0x30=sem_id, +0x34=done flag.
+ *
+ * Reading:  count>0 with sem.value==0  => item enqueued but no post reached the
+ *           consumer (lost wakeup / producer bug), OR the consumer left (done!=0)
+ *           without draining. count>0 with sem.value>0 => a post is pending and
+ *           unconsumed (the consumer has exited). all counts 0 => queues drained,
+ *           the stall is in completion signalling, not the pump.
+ * -----------------------------------------------------------------------*/
+void lbp_hang_census(void)
+{
+    uint32_t mgr = read_be32(0x009357B8);
+    fprintf(stderr, "\n[HANGCENSUS] resource-manager mgr=0x%08X\n", mgr);
+    const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
+    int poke = getenv("POKESEM") ? 1 : 0;
+    for (int i = 0; i < 3; i++) {
+        uint32_t q    = read_be32(mgr + qoff[i]);
+        uint32_t base = read_be32(q + 0x00);
+        uint32_t cnt  = read_be32(q + 0x04);
+        uint32_t cap  = read_be32(q + 0x08);
+        uint32_t sem  = read_be32(q + 0x30);
+        /* the guest done flag is the BYTE at address q+0x34 = big-endian high byte */
+        uint32_t done = (read_be32(q + 0x34) >> 24) & 0xFF;
+        fprintf(stderr, "[HANGCENSUS] q[%d]@mgr+0x%02X ptr=0x%08X count=%u cap=%u sem=%u done=%u base=0x%08X\n",
+                i, qoff[i], q, cnt, cap, sem, done, base);
+        fprintf(stderr, "[HANGCENSUS]   raw:");
+        for (uint32_t o = 0; o <= 0x34; o += 4) fprintf(stderr, " +%02X=%08X", o, read_be32(q + o));
+        fprintf(stderr, "\n");
+        if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX) {
+            sys_semaphore_info* qs = &g_sys_semaphores[sem - 1];
+            fprintf(stderr, "[HANGCENSUS]   sem=%u runtime: active=%d value=%d max=%d\n",
+                    sem, qs->active, qs->value, qs->max_value);
+#ifdef _WIN32
+            /* POKESEM experiment: if the guest queue holds more items than the
+             * semaphore has been posted for, the wakeup was lost -- post the
+             * deficit and see whether the consumer drains it and the load proceeds. */
+            if (poke && qs->active && (int)cnt > qs->value) {
+                int deficit = (int)cnt - qs->value;
+                EnterCriticalSection(&qs->value_lock);
+                qs->value += deficit;
+                LeaveCriticalSection(&qs->value_lock);
+                ReleaseSemaphore(qs->sem_handle, deficit, NULL);
+                fprintf(stderr, "[HANGCENSUS]   *** POKED sem=%u by %d (count=%u > value) ***\n",
+                        sem, deficit, cnt);
+            }
+#endif
+        }
+    }
+#ifdef _WIN32
+    /* POKE7=<id>: one-shot force-post of an arbitrary semaphore, to test whether a
+     * starved gate (e.g. the completion sem tid0 polls) is merely a lost wakeup --
+     * if the load then proceeds, the state was ready and only the signal was lost. */
+    { const char* pk = getenv("POKE7");
+      if (pk && *pk) {
+        static int done_pk = 0;
+        if (!done_pk) { done_pk = 1;
+          int id = atoi(pk);
+          if (id >= 1 && id <= SYS_SEMAPHORE_MAX && g_sys_semaphores[id-1].active) {
+            sys_semaphore_info* ps = &g_sys_semaphores[id-1];
+            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
+            ReleaseSemaphore(ps->sem_handle, 1, NULL);
+            fprintf(stderr, "[HANGCENSUS] *** FORCE-POSTED sem=%d by 1 (POKE7 test) ***\n", id);
+          }
+        }
+      }
+    }
+#endif
+    fflush(stderr);
+}
+
+/* ---------------------------------------------------------------------------
+ * lbp_unstick_once (diagnostic; called on a timer when UNSTICK is set)
+ *
+ * Tests the lost-wakeup hypothesis: the loader is a producer/consumer pipeline
+ * whose "an item is ready / work is done" nudge posts are intermittently lost
+ * (the hang is nondeterministic). Each tick:
+ *   - for each of the 3 resource-manager queues, if the guest item count exceeds
+ *     the semaphore value, post the deficit (a lost enqueue-post) so the consumer
+ *     drains it and advances the resource one load-step;
+ *   - nudge the top-level completion sem (id 7) so tid0 re-checks its predicate.
+ * If the title then reaches the loading screen, the deadlock IS lost wakeups and
+ * the real fix is to make the guest producer/consumer handshake race-free.
+ * -----------------------------------------------------------------------*/
+void lbp_unstick_once(void)
+{
+#ifdef _WIN32
+    uint32_t mgr = read_be32(0x009357B8);
+    if (!mgr) return;
+    const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
+    for (int i = 0; i < 3; i++) {
+        uint32_t q   = read_be32(mgr + qoff[i]);
+        uint32_t cnt = read_be32(q + 0x04);
+        uint32_t sem = read_be32(q + 0x30);
+        if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX && g_sys_semaphores[sem-1].active) {
+            sys_semaphore_info* ps = &g_sys_semaphores[sem-1];
+            if ((int)cnt > ps->value) {
+                int d = (int)cnt - ps->value;
+                EnterCriticalSection(&ps->value_lock); ps->value += d; LeaveCriticalSection(&ps->value_lock);
+                ReleaseSemaphore(ps->sem_handle, d, NULL);
+            }
+        }
+    }
+    /* nudge the completion sem (id 7) so tid0 re-evaluates the load predicate */
+    if (g_sys_semaphores[7-1].active) {
+        sys_semaphore_info* ps = &g_sys_semaphores[7-1];
+        if (ps->value < 2) {
+            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
+            ReleaseSemaphore(ps->sem_handle, 1, NULL);
+        }
+    }
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -100,7 +231,8 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     }
 
 #ifdef _WIN32
-    s->sem_handle = CreateSemaphoreA(NULL, initial, max_val, NULL);
+    /* The kernel semaphore is a wake channel, not a second count. */
+    s->sem_handle = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
     InitializeCriticalSection(&s->value_lock);
     if (s->sem_handle == NULL) {
         s->active = 0;
@@ -116,6 +248,14 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, sem_id);
     }
+
+    /* Identify every semaphore at birth: name + creator's guest LR. The
+     * LBP movie stall was a 2369-waits/0-posts semaphore whose OWNER took
+     * grep archaeology to guess -- the name would have said it instantly. */
+    { static int _n = 0;
+      if (_n++ < 48)
+          fprintf(stderr, "[sem] create id=%u name='%.8s' init=%d max=%d lr=0x%08X\n",
+                  sem_id, s->name, initial, max_val, (uint32_t)ctx->lr); }
 
     sem_table_unlock();
     return CELL_OK;
@@ -160,61 +300,47 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
  * r3 = sem_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
+ * these once per frame, and naming the failing call beats inferring it. */
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
-    { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13) */
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu SEMA_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
+    int64_t r = sys_semaphore_wait_impl(ctx);
+    static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
+    if (d && r) { static int n = 0; if (n++ < 12)
+        fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
+                (unsigned)ctx->gpr[3], (long long)r, 10); }
+    return r;
+}
+static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
+{
+    { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
+      if (_d) { static int _n = 0; if (_n++ < 20)
+          fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
+                  (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-    fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us);
-    /* One-shot: capture the guest caller (LR) of the sema-4 frame wait so we can
-     * decompile the exact condition-loop that HighGraphics parks in. */
-    { static int _n4 = 0;
-      if (sem_id == 4 && _n4 < 2) { _n4++;
-        fprintf(stderr, "[WAIT4] sema-4 r3..r6=%08X %08X %08X %08X host-bt:\n",
-                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
-#ifdef _WIN32
-        void* frames[48];
-        unsigned short nfr = RtlCaptureStackBackTrace(0, 48, frames, 0);
-        HMODULE self = 0;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)&sys_semaphore_wait, &self);
-        for (unsigned short i = 0; i < nfr; i++) {
-            HMODULE m = 0;
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)frames[i], &m);
-            if (m == self)
-                fprintf(stderr, "[WAIT4]   rva=0x%llX\n",
-                        (unsigned long long)((char*)frames[i] - (char*)self));
-        }
-#endif
-        /* Runtime capture of the graphics-context globals the display work-queue
-         * machinery uses (TOC-relative), so the host _gcm_intr build can enqueue
-         * frame work with real pointers. r2 = EBOOT TOC (constant per module). */
-        { uint32_t toc  = (uint32_t)ctx->gpr[2];
-          uint32_t gb   = vm_read32(toc - 0x6D0C);   /* graphics base (func_009F81F0 r30) */
-          uint32_t db   = vm_read32(toc - 0x6C28);   /* dispatch base (func_00A662C8)      */
-          fprintf(stderr, "[WAIT4] TOC=0x%08X gbase=0x%08X dbase=0x%08X\n", toc, gb, db);
-          fprintf(stderr, "[WAIT4]   enq_obj[gb-7FE4]=0x%08X  worker_q[gb-7FD8]=0x%08X  sema_obj[gb-7FEC]=0x%08X\n",
-                  vm_read32(gb - 0x7FE4), vm_read32(gb - 0x7FD8), vm_read32(gb - 0x7FEC));
-          fprintf(stderr, "[WAIT4]   handlers[gb-7F94/98/9C/A8/AC]=%08X %08X %08X %08X %08X\n",
-                  vm_read32(gb - 0x7F94), vm_read32(gb - 0x7F98), vm_read32(gb - 0x7F9C),
-                  vm_read32(gb - 0x7FA8), vm_read32(gb - 0x7FAC));
-          fprintf(stderr, "[WAIT4]   dispatch_obj[db-7FF4]=0x%08X  dispatch_arg[db-7FF0]=0x%08X\n",
-                  vm_read32(db - 0x7FF4), vm_read32(db - 0x7FF0));
-          { extern void gcm_capture_disp_ctx(uint32_t, uint32_t, uint32_t);
-            gcm_capture_disp_ctx(toc, vm_read32(db - 0x7FF4), vm_read32(db - 0x7FF0)); } }
-      } }
-
-    /* EXPERIMENT (FORCE_SEMA=N): make sys_semaphore_wait on sema N return immediately
-     * (probe whether a never-posted semaphore, e.g. SLSession's sema 2, gates the
-     * cellSaveDataAutoLoad2 dialog). */
-    { static int fs = -2; if (fs == -2) { const char* e = getenv("FORCE_SEMA"); fs = e ? (int)strtol(e,0,0) : -1; }
-      if (fs >= 0 && sem_id == (uint32_t)fs) return CELL_OK; }
-
+    /* LBP_HLE_JOBDONE: the JobManagerWorker spins on sys_semaphore_wait/trywait
+     * while waiting for SPU-job completions our lifted PM never writes; satisfy
+     * them here (no-op unless the env is set + jobs are pending). */
+    { extern void lbp_hle_complete_pending(void); lbp_hle_complete_pending(); }
+    { static int _n = 0; if (getenv("SEMTID") && _n++ < 60000)
+        fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu)\n",
+                (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us);
+      else if (!getenv("SEMTID") && ps3_log_verbose())
+        fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
+    /* LBP_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
+     * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
+     * so two consecutive [BC] lines reveal which worker's count is FROZEN = the
+     * job it's stuck in, and its last indirect-call target = that callback. */
+    { static int bc=-2; if(bc==-2) bc=getenv("LBP_BREADCRUMB")?1:0;
+      if(bc){ static long w=0; if((++w % 500)==0){ extern void lbp_breadcrumb_dump(const char*); lbp_breadcrumb_dump("semwait"); } } }
+    /* SEMCHAIN: dump the guest call-chain at the main thread's sem=7 poll (the
+     * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */
+    if (getenv("SEMCHAIN") && sem_id == 7 && ctx->thread_id == 0) {
+        static int _c = 0;
+        if (_c++ < 2) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
+    }
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -222,38 +348,42 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("sema", sem_id); }
-    /* SLSESSION_BT: one-shot guest backtrace at the SLSession gate wait (the only
-     * infinite wait on this id), so we can find its functor + the condition it loops on. */
-    { static int bt=-1; if(bt<0){const char* e=getenv("SLSESSION_BT"); bt=e?atoi(e):0;}
-      if (bt>0 && sem_id==(uint32_t)bt && timeout_us==0) { static int once=0; if(once++<3){
-          fprintf(stderr,"[slsess-bt] wait sem=%u cia=0x%08X lr=0x%08X\n",sem_id,(uint32_t)ctx->cia,(uint32_t)ctx->lr);
-          extern void ds_dump_shadow(void); ds_dump_shadow(); fflush(stderr);} } }
 #ifdef _WIN32
-    DWORD ms = (timeout_us == 0) ? INFINITE : (DWORD)(timeout_us / 1000);
-    if (ms == 0 && timeout_us > 0) ms = 1;
+    /* value is the only count. The kernel semaphore is only a wake channel;
+     * every wake re-checks value under the lock. */
+    int64_t deadline = (timeout_us > 0) ? lv2_usec_deadline(timeout_us) : 0;
+    for (;;) {
+        /* Take a token if available (the ONLY count, under the lock). */
+        EnterCriticalSection(&s->value_lock);
+        if (s->value > 0) {
+            s->value--;
+            LeaveCriticalSection(&s->value_lock);
+            return CELL_OK;
+        }
+        if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
+            LeaveCriticalSection(&s->value_lock);
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        }
+        s->waiters++;
+        LeaveCriticalSection(&s->value_lock);
 
-    int is_timed = (timeout_us > 0);
-    if (is_timed) InterlockedIncrement(&s->timed_waiters);
-    DWORD result = WaitForSingleObject(s->sem_handle, ms);
-    if (is_timed) InterlockedDecrement(&s->timed_waiters);
-    { extern void thrdiag_wake(void); thrdiag_wake(); }
-    if (result == WAIT_TIMEOUT) {
-        return (int64_t)(int32_t)CELL_ETIMEDOUT;
-    }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
+        /* Bounded slices keep timed waits on the QPC deadline. */
+        DWORD ms = (timeout_us == 0) ? INFINITE : 1;
+        WaitForSingleObject(s->sem_handle, ms);
 
-    EnterCriticalSection(&s->value_lock);
-    s->value--;
-    LeaveCriticalSection(&s->value_lock);
+        EnterCriticalSection(&s->value_lock);
+        if (s->waiters > 0) s->waiters--;
+        LeaveCriticalSection(&s->value_lock);
+        /* loop: re-check value */
+    }
 #else
     pthread_mutex_lock(&s->mtx);
 
     if (timeout_us == 0) {
         while (s->value <= 0) {
+            s->waiters++;
             pthread_cond_wait(&s->cv, &s->mtx);
+            s->waiters--;
         }
     } else {
         struct timespec ts;
@@ -265,7 +395,9 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
             ts.tv_nsec -= 1000000000L;
         }
         while (s->value <= 0) {
+            s->waiters++;
             int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
+            s->waiters--;
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&s->mtx);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
@@ -288,23 +420,26 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 int64_t sys_semaphore_trywait(ppu_context* ctx)
 {
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
+    { extern void lbp_hle_complete_pending(void); lbp_hle_complete_pending(); }
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active)
+    if (!s->active) {
+        static int _n = 0; if (_n++ < 6)
+            fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
+                            " (value=%d max=%d)%c",
+                    sem_id, s->value, s->max_value, 10);
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
 #ifdef _WIN32
-    DWORD result = WaitForSingleObject(s->sem_handle, 0);
-    if (result == WAIT_TIMEOUT) {
+    EnterCriticalSection(&s->value_lock);
+    if (s->value <= 0) {
+        LeaveCriticalSection(&s->value_lock);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
-    if (result != WAIT_OBJECT_0) {
-        return (int64_t)(int32_t)CELL_EINVAL;
-    }
-    EnterCriticalSection(&s->value_lock);
     s->value--;
     LeaveCriticalSection(&s->value_lock);
 #else
@@ -328,9 +463,23 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu SEMA_POST id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
+
+    { static int _n=0; if (getenv("SEMTID") && _n < 60000)
+        fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
+                (unsigned long long)ctx->thread_id, sem_id, count);
+      else if (!getenv("SEMTID") && _n < 40)
+        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
+      _n++; }
+    /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
+     * loading thread starves on) -- reveals which thread/loop produces it. */
+    if (getenv("SEMCHAIN") && sem_id == 3) {
+        static int _c = 0;
+        if (_c++ < 3) { extern void ppu_log_host_chain(const char*);
+            fprintf(stderr, "[SEMCHAIN] sem=3 post by tid=%llu\n", (unsigned long long)ctx->thread_id);
+            ppu_log_host_chain("sem3-post"); }
+    }
 
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -345,86 +494,37 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
+        if (getenv("RD_SEMTRACE")) { static int _n=0; if(_n++<6)
+            fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
+                    sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
+    /* Wake channel: release exactly enough tokens to cover the parked waiters
+     * this post can satisfy (min(count, waiters)). Woken waiters re-check
+     * value under the lock; an orphaned token (waiter already left) is benign.
+     * This is the lost-wake fix — a post can NEVER skip the release now. */
+    int wake = (count < s->waiters) ? count : s->waiters;
     LeaveCriticalSection(&s->value_lock);
 
-    ReleaseSemaphore(s->sem_handle, count, NULL);
+    if (wake > 0)
+        ReleaseSemaphore(s->sem_handle, wake, NULL);
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
-        return (int64_t)(int32_t)CELL_EINVAL;
+        return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value += count;
-    /* Wake waiters */
-    for (int i = 0; i < count; i++) {
-        pthread_cond_signal(&s->cv);
-    }
+    /* Wake the waiters this post can satisfy (broadcast is also correct — they
+     * re-check value — but min(count,waiters) signals is precise). */
+    { int wake = (count < s->waiters) ? count : s->waiters;
+      for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
 #endif
 
     return CELL_OK;
-}
-
-/* Host-callable post by id (no ppu_context). Used to emulate the RSX vblank
- * interrupt: on real HW _gcm_intr_thread receives an RSX interrupt event and
- * posts the GCM vblank semaphore that HighGraphics waits on each frame. We have
- * no RSX interrupt, so the synthetic vblank ticker calls this at ~60Hz. Safe if
- * the sema is full (won't exceed max_value). Returns 1 if it posted. */
-int lv2_semaphore_post_by_id(uint32_t sem_id, int count)
-{
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX || count <= 0) return 0;
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active) return 0;
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    if (s->value + count > s->max_value) { LeaveCriticalSection(&s->value_lock); return 0; }
-    s->value += count;
-    LeaveCriticalSection(&s->value_lock);
-    ReleaseSemaphore(s->sem_handle, count, NULL);
-#else
-    pthread_mutex_lock(&s->mtx);
-    if (s->value + count > s->max_value) { pthread_mutex_unlock(&s->mtx); return 0; }
-    s->value += count;
-    for (int i = 0; i < count; i++) pthread_cond_signal(&s->cv);
-    pthread_mutex_unlock(&s->mtx);
-#endif
-    return 1;
-}
-
-/* lv2_semaphore_post_frame -- emulate the libgcm RSX vblank interrupt handler
- * (_gcm_intr_thread) posting the GCM frame semaphore each vblank so HighGraphics
- * advances a frame (RPCS3: sema 0x9604d100, get_value-then-post). We don't run
- * _gcm_intr_thread; the host vblank ticker calls this with the exact sema id that
- * HighGraphics is currently blocked on (via thrdiag).
- *
- * Guards (this is a SPECIFIC id, but stay defensive): post only if the sema is
- * binary (max_value==1), drained (value==0), and has a FINITE-timeout waiter
- * (timed_waiters>0). HighGraphics's frame wait is timed (100ms); its init waits
- * are infinite (timeout=0, timed_waiters==0) so they are never posted here.
- * Returns 1 if posted. */
-int lv2_semaphore_post_frame(uint32_t sem_id)
-{
-    if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) return 0;
-    sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
-    if (!s->active || s->max_value != 1 || s->timed_waiters <= 0) return 0;
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    int do_post = (s->value == 0);
-    if (do_post) s->value += 1;
-    LeaveCriticalSection(&s->value_lock);
-    if (do_post) { ReleaseSemaphore(s->sem_handle, 1, NULL); return 1; }
-#else
-    pthread_mutex_lock(&s->mtx);
-    int do_post = (s->value == 0);
-    if (do_post) { s->value += 1; pthread_cond_signal(&s->cv); }
-    pthread_mutex_unlock(&s->mtx);
-    if (do_post) return 1;
-#endif
-    return 0;
 }
 
 /* ---------------------------------------------------------------------------

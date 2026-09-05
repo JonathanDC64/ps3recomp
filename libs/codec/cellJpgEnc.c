@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* stb_image_write (declarations only — implementation in cellPngEnc.c) */
 #include "stb_image_write.h"
@@ -46,24 +48,26 @@ s32 cellJpgEncQueryAttr(const CellJpgEncParam* param, u32* workMemSize)
 {
     (void)param;
     if (!workMemSize) return (s32)CELL_JPGENC_ERROR_INVALID_ARGUMENT;
-    *workMemSize = 1024 * 1024;
+    vm_write32((u32)(uintptr_t)workMemSize, (u32)1024 * 1024);
     return CELL_OK;
 }
 
 s32 cellJpgEncCreate(const CellJpgEncParam* param, CellJpgEncHandle* handle)
 {
     printf("[cellJpgEnc] Create(%ux%u, quality=%u)\n",
-           param ? param->width : 0, param ? param->height : 0,
-           param ? param->quality : 0);
+           param ? vm_read32(GUEST_EA(param) + (u32)offsetof(CellJpgEncParam, width)) : 0,
+           param ? vm_read32(GUEST_EA(param) + (u32)offsetof(CellJpgEncParam, height)) : 0,
+           param ? vm_read32(GUEST_EA(param) + (u32)offsetof(CellJpgEncParam, quality)) : 0);
     if (!param || !handle) return (s32)CELL_JPGENC_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < CELL_JPGENC_HANDLE_MAX; i++) {
         if (!s_handles[i].in_use) {
             memset(&s_handles[i], 0, sizeof(JpgEncHandle));
             s_handles[i].in_use = 1;
-            s_handles[i].param = *param;
+            guest_struct_load(&s_handles[i].param, GUEST_EA(param),
+                              (u32)sizeof(s_handles[i].param));
             if (s_handles[i].param.quality == 0) s_handles[i].param.quality = 85;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }
@@ -119,8 +123,19 @@ s32 cellJpgEncEncode(CellJpgEncHandle handle, const void* inputData,
     free(rgb);
     if (!ok) { free(ctx.data); return (s32)CELL_JPGENC_ERROR_FATAL; }
 
-    outputInfo->outputData = ctx.data;
-    outputInfo->outputSize = ctx.size;
+    /* The encoded bytes have nowhere to go. CellJpgEncOutputInfo.outputData is a
+     * pointer the TITLE reads, and what we have is a host malloc -- writing it
+     * would hand the guest an address it cannot touch (and the old code leaked
+     * the buffer besides). Report the size and a null pointer, which the caller
+     * can at least test.
+     *
+     * ponytail: the real API hands the encoder a destination buffer at open
+     * time; wire that through cellJpgEncOpen and the data has somewhere to land.
+     */
+    u32 out_ea = GUEST_EA(outputInfo);
+    vm_write32(out_ea + (u32)offsetof(CellJpgEncOutputInfo, outputData), 0);
+    vm_write32(out_ea + (u32)offsetof(CellJpgEncOutputInfo, outputSize), ctx.size);
+    free(ctx.data);
     return CELL_OK;
 }
 

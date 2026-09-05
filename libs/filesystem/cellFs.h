@@ -18,8 +18,8 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * FS-specific error codes
  * -----------------------------------------------------------------------*/
-#define CELL_FS_ERROR_EBADF         (s32)0x80010009
-#define CELL_FS_ERROR_EMFILE        (s32)0x80010018
+#define CELL_FS_ERROR_EBADF         (s32)CELL_EBADF
+#define CELL_FS_ERROR_EMFILE        (s32)CELL_EMFILE
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -65,6 +65,12 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
+/* The PS3 ABI packs CellFsStat to 4-byte alignment: the 64-bit fields sit at
+ * 4-byte (not 8-byte) offsets, so st_size is at +0x24 and the struct is 52
+ * bytes (RPCS3 sys_fs.h: be_t<s64,4>, CHECK_SIZE_ALIGN(CellFsStat,52,4)).
+ * Without #pragma pack the host would 8-align the s64s, putting st_size at +0x28
+ * (56-byte struct) and the guest would read its size from the wrong offset. */
+#pragma pack(push, 4)
 typedef struct CellFsStat {
     s32  st_mode;
     s32  st_uid;
@@ -80,6 +86,28 @@ typedef struct CellFsDirectoryEntry {
     CellFsStat attribute;
     char       entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
 } CellFsDirectoryEntry;
+#pragma pack(pop)
+
+/* cellFsReaddir writes this compact dirent. CellFsDirectoryEntry is the
+ * separate stat-carrying shape used by cellFsGetDirectoryEntries. */
+#pragma pack(push, 1)
+typedef struct CellFsDirent {
+    u8   d_type;
+    u8   d_namlen;
+    char d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
+} CellFsDirent;
+#pragma pack(pop)
+
+#define CELL_FS_TYPE_UNKNOWN       0
+#define CELL_FS_TYPE_DIRECTORY     1
+#define CELL_FS_TYPE_REGULAR       2
+#define CELL_FS_TYPE_SYMLINK       3
+
+#ifdef __cplusplus
+static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+#else
+_Static_assert(sizeof(CellFsDirent) == 258, "CellFsDirent ABI size");
+#endif
 
 /* Opaque file/directory descriptors */
 typedef s32 CellFsFd;
@@ -147,7 +175,7 @@ s32 cellFsChmod(const char* path, s32 mode);
 s32 cellFsOpendir(const char* path, CellFsDir* fd);
 
 /* NID: 0x9F951810 */
-s32 cellFsReaddir(CellFsDir fd, CellFsDirectoryEntry* entry, u64* nread);
+s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread);
 
 /* NID: 0xFF42DCC3 */
 s32 cellFsClosedir(CellFsDir fd);

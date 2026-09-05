@@ -9,6 +9,7 @@
 #include "cellUsbd.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
 /* Internal state */
 
@@ -40,7 +41,10 @@ s32 cellUsbdEnd(void)
 
 s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops)
 {
-    printf("[cellUsbd] RegisterLdd(%s)\n", ops ? (ops->name ? ops->name : "?") : "null");
+    /* CellUsbdLddOps leads with a char* -- a 4-byte EA to the guest. */
+    u32 name_ea = ops ? vm_read32((u32)(uintptr_t)ops) : 0;
+    printf("[cellUsbd] RegisterLdd(%s)\n",
+           name_ea ? (const char*)(vm_base + name_ea) : (ops ? "?" : "null"));
     if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
     if (!ops) return (s32)CELL_USBD_ERROR_INVALID_ARGUMENT;
     if (s_ldd_count >= MAX_LDD_OPS) return (s32)CELL_USBD_ERROR_INVALID_ARGUMENT;
@@ -68,7 +72,7 @@ s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
     (void)list; (void)maxDevices;
     if (!s_initialized) return (s32)CELL_USBD_ERROR_NOT_INITIALIZED;
     if (!numDevices) return (s32)CELL_USBD_ERROR_INVALID_ARGUMENT;
-    *numDevices = 0; /* no devices */
+    vm_write32((u32)(uintptr_t)numDevices, 0); /* no devices */
     return CELL_OK;
 }
 

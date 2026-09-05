@@ -42,6 +42,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import struct
@@ -59,13 +60,18 @@ PPU_LOADER = TOOLS_DIR / "ppu_loader.py"
 GHIDRA_ANALYZE = TOOLS_DIR / "ghidra_analyze.py"
 IDA_ANALYZE = TOOLS_DIR / "ida_analyze.py"
 
+# Machine-specific locations. Override any of these with the matching
+# PS3RECOMP_* environment variable (or the corresponding command-line flag)
+# rather than editing this file -- the defaults are deliberately generic so
+# the harness carries no one developer's directory layout.
 DEFAULTS = {
-    "psn_root": r"Z:\Roms\PS3\PSN",
-    "out": str(TOOLS_DIR.parent / "_harness"),
-    "sevenzip": r"C:\Program Files\7-Zip\7z.exe",
-    "ps3sce": r"D:\recomp\ps3games\ps3sce\ps3sce",
-    # IDA's idalib is installed in a specific Python (IDA Pro 9.1 -> 3.11).
-    "ida_python": r"C:\Users\nedch\AppData\Local\Programs\Python\Python311\python.exe",
+    "psn_root":   os.environ.get("PS3RECOMP_PSN_ROOT", ""),
+    "out":        os.environ.get("PS3RECOMP_OUT", str(TOOLS_DIR.parent / "_harness")),
+    "sevenzip":   os.environ.get("PS3RECOMP_7ZIP", "7z"),
+    "ps3sce":     os.environ.get("PS3RECOMP_PS3SCE", "ps3sce"),
+    # IDA's idalib lives in whichever Python IDA was built against (IDA Pro
+    # 9.1 -> 3.11); point PS3RECOMP_IDA_PYTHON at that interpreter.
+    "ida_python": os.environ.get("PS3RECOMP_IDA_PYTHON", sys.executable),
 }
 
 # A PSN archive name carries the title-id and region:  "Name PSN [NPUZ-00401].rar"

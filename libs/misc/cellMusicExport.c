@@ -6,6 +6,7 @@
 
 #include "cellMusicExport.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -48,6 +49,6 @@ s32 cellMusicExportGetProgress(float* progress)
     if (!s_initialized)
         return (s32)CELL_MUSIC_EXPORT_ERROR_NOT_INITIALIZED;
     if (!progress) return (s32)CELL_MUSIC_EXPORT_ERROR_INVALID_ARGUMENT;
-    *progress = 0.0f;
+    vm_write_f32((u32)(uintptr_t)progress, 0.0f);
     return CELL_OK;
 }

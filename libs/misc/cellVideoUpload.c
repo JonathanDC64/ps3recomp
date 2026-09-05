@@ -6,6 +6,7 @@
 
 #include "cellVideoUpload.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -48,6 +49,6 @@ s32 cellVideoUploadGetStatus(s32* status)
 {
     if (!s_initialized) return (s32)CELL_VIDEO_UPLOAD_ERROR_NOT_INITIALIZED;
     if (!status) return (s32)CELL_VIDEO_UPLOAD_ERROR_INVALID_ARGUMENT;
-    *status = 0; /* idle */
+    vm_write32((u32)(uintptr_t)status, (u32)0); /* idle */
     return CELL_OK;
 }

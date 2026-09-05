@@ -1,0 +1,96 @@
+# Builds the runtime library on Apple Silicon.
+#
+# ps3recomp had no CI of any kind, and docs/BUILDING.md advertised macOS as
+# "Full support" while the tree did not compile there at all. This job exists so
+# that stays fixed: it is the only thing preventing the next Windows-only commit
+# from silently re-breaking the POSIX paths.
+name: macOS
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: macOS arm64 (${{ matrix.build_type }})
+    runs-on: macos-14          # Apple Silicon runner
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install ninja sdl2
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Verify architecture
+        run: |
+          lipo -info build/libps3recomp_runtime.a
+          lipo -info build/libps3recomp_runtime.a | grep -q arm64
+
+      # The Python suites are the project's real correctness net -- the
+      # conformance one COMPILES AND RUNS 1300+ lifted instruction cases and has
+      # caught silent miscompiles that a build check never would (15 VMX
+      # endianness bugs most recently). Running them here means they guard both
+      # platforms, not just whoever last ran them on Windows.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run the lifter test suites
+        env:
+          CI: "1"          # makes a skipped conformance run fail instead of passing
+        run: |
+          set -e
+          for t in tools/test_*.py; do
+            echo "--- $t"
+            python "$t"
+          done
+
+      - name: Run self-contained SPU helper tests
+        run: |
+          clang -std=gnu17 -I include -I runtime/spu \
+                -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
+          /tmp/test_spu_helpers
+
+      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
+      # backend and asserts the presented pixel matches the guest clear colour.
+      # Headless, so it needs no display: exit 0 means the whole graphics bridge
+      # is intact, not merely that it compiled.
+      - name: Run the POSIX host (headless Metal end-to-end)
+        run: |
+          # Clear + flip: asserts the guest clear colour reaches the drawable.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host
+          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+          # pixel, which exercises guest vertex fetch, the pipeline-state cache
+          # and the draw path, not just the clear.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+
+      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+      # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
+      # baseline yet, so this reports its numbers and passes; the first run's
+      # output is what to record with --update.
+      - name: Check the PPU boot scaffold (ratchet)
+        run: python tools/check_ppu_scaffold.py
+
+      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+      # arithmetic with no host API in it, so it runs everywhere, and it is the
+      # regression net for having lifted that maths out of the D3D12 uploader.
+      - name: Run self-contained RSX tests
+        run: |
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
+          /tmp/test_texture_layout
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
+          /tmp/test_rsx_primitives

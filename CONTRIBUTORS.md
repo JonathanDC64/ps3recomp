@@ -62,6 +62,208 @@ wrong. Landed in **v0.6.1 "Many Hands"**:
 - **`tools/show_func.py`** — dump a single lifted function's C and/or its
   original PowerPC disassembly from the chunked output.
 
+*Also incorporated (**v0.6.4** "Carry the One")* — the PPU **XER[CA] carry/borrow
+bug class** (shift-algebraic `sraw`/`srad` forms + `mtcrf` mask, #21;
+`subfe`/`subfme`/`addme`, #26), `cntlzw(0) = 32` (#35), the **PPU lifter
+conformance suite** (#37), and the `vcmpgt*` handlers (#39); the SPU
+**computed-`bi $r0` tail-jump classifier** (#36), self-referential branch
+mislift fix (#30), full SPU ISA coverage (#31), byte-correct quadword helpers
+(#32), `il` double sign-extension (#33), and preferred-slot link register +
+`rchcnt` (#34); plus `mftb`/`mftbu` reading a real timebase (#38).
+
+*Also incorporated (**v0.6.5**)* — cellFs big-endian out-params + `CellFsStat`
+PS3 packing (#22), cellGame title id read from `PARAM.SFO` (#24), `sys_rwlock`
+`EDEADLK`/`EPERM` lv2 semantics (#25), the `crnor`/`crnand` opcode-33/225
+disassembler fix (#40), and **static firmware LLE** (`tools/lift_prx.py`) —
+relocating a decrypted PRX to lift a real firmware module (e.g. the libsre
+SPURS kernel) instead of HLE-ing it, under a bring-your-own-firmware model
+that ships nothing derived from firmware (#53).
+
+*Also incorporated (**v0.6.6** "Two Ports, One Toolkit")* — `fsqrt`/`fsqrts`
+source-register decode + `vspltis` signed-immediate printing (#46), the
+`addeo`/`subfeo`/`mulhwo`/`mulhwuo` overflow forms + `vupklsb`/`vupkhsb`/`vupklsh`
+unpacks (#52), sub-millisecond `sys_timer` usleep (#44), `cellNetCtl` big-endian
+out-params (#45), and `cellAudio` period-event delivery to notify queues (#54).
+
+*Also incorporated (**v0.6.7** "Fine Print")* — NV40 VP/FP shader-decompiler
+hardening (#47), `spu_disasm` channel-width/hbr/`bisl`-link/`ri7` fixes (#49),
+sub-millisecond timeouts for event-flags/semaphores/mutexes (#50), corrected HLE
+ABI signatures across cellPamf/Sail/Http/Ssl/Net/sysNet/sceNpTrophy/cellGameData
+(#55), and a lifter/HLE audit toolkit + lv2 sync stress test (#56).
+
+*Also incorporated (unreleased)* — a PPU/SPU correctness batch, several of which
+were silent-miscompile classes rather than crashes:
+- **VMX element-wise ops read big-endian lanes** — values were byte-reversed on
+  x86, so every float lane op quietly computed on the wrong data (#74).
+- **D-form loads/stores treat `rA=0` as a literal zero base**, not `GPR[0]` (#72).
+- **Update forms write back `rA`** — indexed stores (#71) and FP loads/stores
+  (#73); dropping the write-back leaves `rA` stale and corrupts every subsequent
+  `(rA)`-relative access.
+- **`lmw`/`stmw`** load/store multiple word (#68), **`mulldo`** overflow form
+  (#70), and **`stvlx`/`stvrx`/`stvlxl`/`stvrxl`** Cell unaligned vector stores
+  (#61).
+- **Value-verified CAS** for `lwarx`/`stwcx` and `ldarx`/`stdcx` (#62).
+- **FP correctness batch** — `fcmpu` NaN ordering, `fcti` saturation, single
+  rounding, `vctsxs`/`vctuxs` (#60); plus the objdump decoder audit that found 5
+  missing VMX float ops.
+- **SPU**: `brsl` target parse broken by the disasm link-register fix — every call
+  lifted as a silent no-op (#58); `bisl`/`bisled` target register is the last
+  operand; single-round `fma`/`fms`/`fnms`, `fesd`/`frds` from the left word slot,
+  and `fi`/`frest`/`frsqest` base+step interpolation (#51).
+- **lv2**: `sys_mutex_trylock` recursive fast path pairs the host critical section
+  (#67); `sys_spu_thread_group_create` reads r5 as priority and the name from the
+  attr struct (#66).
+
+*Also incorporated (unreleased, folded via `integrate/fold-2026-08-14`)* — a
+guest-ABI and lv2 batch:
+- **Guest callbacks receive r3 through r10** — the dispatch hook only plumbed
+  four arguments, so any guest callback taking more than four read stale
+  registers (#86).
+- **One authoritative lv2 semaphore count** — the count lived twice (in
+  `sys_semaphore_info::value` and in the Win32 handle), so timeout/wake races
+  could lose tokens or park a waiter while `value` was already positive. `value`
+  under `value_lock` is now the only count, the handle is a wake channel, and
+  overflow returns the lv2 `CELL_EBUSY` instead of `CELL_EINVAL` (#88).
+- **`cellFsReaddir` writes the real 258-byte dirent ABI** + a corrected CellOS
+  generic error-code table (#85).
+- **`cellGame` firmware parameter IDs, error values and buffer bounds** matched
+  to the SDK (#84).
+- **SPU `sync`/`dsync`/`syncc` emit real host memory fences**, with the `sync` C
+  bit decoded instead of folded into plain `sync` (#87).
+- **`cellAudio` clears each consumed ring-buffer block**, so an underrun replays
+  silence rather than the previous block (#83).
+- Plus the **`sync_stress` lv2 target wired into the build**, so the semaphore
+  behaviour above stays executable outside a generated title (#88).
+
+*The live RSX draw engine (**v0.10.0** "Three Platforms")* — a second, independent
+draw engine beside the one [@sagemono](https://github.com/sagemono) built, brought
+upstream from the [Yakuza: Dead Souls EX](https://github.com/canersaka/Yakuza-Dead-Souls-EX)
+port (#113). It executes the guest's NV4097 command stream **as it arrives**
+rather than replaying a recorded frame. `rsx_live_draw.c`, `rsx_dispatch.*`,
+`rsx_vertex_compact.*`, `rsx_restart_cuts.h` and the vertex/fragment-program
+decompiler updates are his work; it is opt-in behind `RSX_LIVE_DRAW`, so the
+existing backend path is untouched when it is off. A second title driving the
+same engine then needed the FIFO subchannel treated as a binding slot rather
+than an engine selector, HDR (`F_W16Z16Y16X16`) colour surfaces, and
+fragment-output NaN guards — all on top of his engine, not in place of it.
+
+### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
+Correctness and robustness fixes distilled from a **Demon's Souls** port that
+stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
+incorporated (**v0.6.6**):
+- **SPU cross-function tail calls forced with `musttail`** — a guest loop whose
+  back-edge crosses a lifted-function boundary was nesting one host C frame per
+  iteration and silently overflowing the stack (a stack-overflow SE runs no
+  unhandled filter, so the process died with no crash log and exit code 0); now an
+  O(1)-stack jump under clang, with a call+return fallback elsewhere.
+- **Mid-function / gap lifting sliced O(n²)→O(span)** — turned a ~40-minute
+  no-output hang on 96k+ function titles into bounded work.
+- **`sys_event_queue_receive` returns the event in r4–r7** (lv2 ABI) — callers
+  that read the registers instead of the `sys_event_t*` buffer saw stale values.
+- **`sys_memory_get_page_attribute`** renumbered 358→351 (0x15F) and implemented.
+- **`CellFsStat` runtime-side layout** corrected to the 52-byte / 4-byte-aligned
+  ABI, fixing the `ppu_fs.cpp` / `sys_fs.c` stat writers the v0.6.5 libs-side fix
+  didn't cover.
+
+Further title-agnostic fixes incorporated (**v0.6.7**):
+- **`g_active_ctx` restored after guest callbacks** — it was left pointing at a
+  stack-local scratch ctx, so after any callback the current-thread ctx pointer
+  dangled and corrupted the crash handler / diagnostics; applied to both
+  `ppu_guest_call` and `ppu_guest_call_ct`.
+- **SPU `stop` signal code preserved** to a new `ctx->stop_code` — SPURS leaf
+  tasks invoke kernel syscalls via `stop <code>` (EXIT/YIELD/WAIT/POLL/…), which
+  the lifter was discarding.
+- **`cellGameDataCheckCreate2`** (NID `0xC9645C41`) implemented — marshals
+  StatGet/StatSet and fires the guest `funcStat` callback.
+
+*(The port's remaining fork-specific work — SPU/PPU jump-table discovery tuned to
+a different lifter architecture, and cellKb/Mouse/Rtc guest-pointer translation
+that needs a big-endian rewrite — is tracked for a follow-up with a re-lift/test
+loop rather than a blind port.)*
+
+### sagemono — [@sagemono](https://github.com/sagemono)
+Real-controller correctness surfaced by a DualShock-as-XInput bring-up
+(**v0.6.5**):
+- **cellPad DIGITAL2 packing** — `hs->buttons` carries DIGITAL1 in its low byte
+  and DIGITAL2 (the face buttons cross/circle/triangle/square + L1/L2/R1/R2) in
+  the high byte; the whole value was being written into DIGITAL1 with DIGITAL2
+  forced to 0, so every face button was dead. Split correctly (#42).
+- **analog-Y centering** — reflect the inverted Y about 128 (`256 - x`) instead
+  of `255 - x`, which turned a centered stick into 127 (`0x7F`, aliasing
+  SELECT+START self-exit + TRIANGLE).
+
+The **RSX draw engine** and the toolchain work behind it, developed across a
+homebrew TUI (cellmark), vkcube, wave, and a PSL1GHT/Tiny3D bring-up
+(*unreleased*):
+
+*Rendering*
+- **2D/dbgfont pipeline + vertex-program capture**, then **executing the title's
+  real NV4097 vertex program** on D3D12 for pixel-perfect text (#43) — grown from
+  there into guest fragment-program pipelines, per-draw textures and VP constants,
+  indexed draws, render-to-texture, MRT, multi-unit textures, FP predication and
+  branches, float RTs, and a VS cache keyed by ucode hash.
+- **Present correctness** — present only on guest flip (partial-frame flicker),
+  present at the clear boundary (ring-wrap blink), flips ordered against the
+  drain, honest flip status, synced non-blocking flips.
+- **FIFO ring recycle on wrap** — the command ring never recycled (the callback
+  OPD was null), wedging ~200 frames in; a real command-buffer-full callback now
+  drains and resets it.
+- **`cellGcmSetFlipCommand` context argument**, `MapMainMemory` never handing out
+  IO offset 0 (FIFO collision), back-end label byte-swap, and discrete-GPU
+  selection by default.
+
+*Lifter & toolchain*
+- **`blrl` dispatched as an indirect call** — it was lumped with `blr` and emitted
+  a bare `return;`, dropping the call *and* skipping the frame epilogue, so `r1`
+  leaked the frame size on every function-descriptor call (#42).
+- **EBOOT (`ET_EXEC`) import parsing** — the lib-stub table was only reachable via
+  the PRX module_info path, so every retail main executable reported 0 imports;
+  now located via `PT_PROC_PRX_PARAM`. Minecraft: 0 → 345 NIDs across 30 modules
+  (#41).
+- **`lift_function` indexed by address** — an O(refs·N) mid-function pass hung the
+  lifter indefinitely after "100% lifted" on large titles (~11.6k refs × 3M
+  instructions); now bisect over a cached sorted index (#41).
+- **Rotate-by-0 undefined behaviour** in the rotate helpers — `v >> (64 - n)` at
+  n=0 is UB, and clang miscompiled the `clrldi` truncation idiom that every 32-bit
+  address/index cast lowers to (#41).
+- **Function-registry sizing** for >64k-function titles, jump-table switches as
+  in-function computed gotos, multi-TOC jump-table discovery, and callee-save
+  detection that rejects a reused save slot / scratch spill.
+- **Lifter torture suite** — 3793 KATs against an independent PPC model (#64),
+  plus the fused-fmadd / PPC NaN / `mfspr`/`mtspr` semantics it surfaced.
+- **`sys_spu_image_import`** implemented (SPU ELF → entry point + segment table)
+  and the SPU image syscall numbers corrected (#57).
+
+A **guest-ABI HLE correctness batch**, mostly surfaced by LBP and DeferredShading
+bring-ups (folded via `integrate/fold-2026-07-24`):
+- **Guest-EA / big-endian out-param marshalling** across the HLE surface — a run
+  of handlers were writing host pointers or native-endian values into what are
+  actually guest VM addresses: `cellUserInfo` (overflow), trophy u64s,
+  `cellGameGetParamInt` DISC type, open PSID, `cellRtc`, save-data user paths,
+  `cellJpgDecDecodeData`, `cellPngDec` (first live use, DeferredShading), and the
+  `cellAudio` read index as a BE u64.
+- **`cellFsSdataOpen` with real SDATA/EDAT (NPD) decryption**, `cellFsMkdir` + the
+  game-data dir created where the VFS actually looks, and a `/dev_hdd0` overlay
+  onto the installed-update tree (`PS3_HDD0_ROOT`).
+- **Honest state, not silently-faked CELL_OK** — a module name that matches no
+  file now fails; net reports a real offline state with real SDK NP error codes;
+  `sys_time_get_system_time` returns real microseconds instead of a call counter.
+- **Raw-`sys_fs` path parity** — strip mount prefixes so raw `sys_fs` opens hit
+  the same host tree as the cellFs layer; `cellHttpCreateClient` guest-EA
+  translation (fixed a boot crash); HLSL-safe NaN/Inf fragment-program constants;
+  `sys_spu_image_import` segment source EA at the correct offset.
+
+The **SPU-lifter "faithful adoption"** (branch `spu/faithful-adopt-caner`, folded
+via `integrate/faithful-adopt-caner`) — a from-scratch re-implementation of the
+SPU decode/lift + runtime, consolidating the interpreter and function registry
+into `spu_channels.c`, plus LBP SPU/SPURS bring-up and RSX texture support
+(G8B8/DXT, deswizzle). **This work re-adopts the original SPU decoder/lifter and
+runtime that [@sp00nznet](https://github.com/sp00nznet) and
+[@canersaka](https://github.com/canersaka) authored** — their commit history for
+that work stands on its own (the `caner/ppu-*`, `c6*/c7*`, and the core SPU
+subsystem commits); the faithful-adoption branch is a parallel re-derivation, and
+credit for the underlying design belongs to them.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
@@ -94,6 +296,35 @@ upstream:
   were shadowing identically named `CellFsStat` / `CellSaveData` members; five
   translation units now compile clean so downstream game projects get a Linux
   runtime to link against. (v0.6.1)
+
+### slushiimusic — [@slushiimusic](https://github.com/slushiimusic)
+Gave the project its first CI and its second platform, in **v0.9.0**.
+- **macOS is not actually supported, and said so with receipts** (#94) — the
+  docs advertised Apple Clang 14+ under "full support" while the runtime failed
+  to compile on arm64 with 77 errors. Filed with the errors *and* a fix.
+- **arm64 macOS build + the first CI this repository has ever had** (#95).
+  Its value was immediate and slightly embarrassing: it failed 17 seconds after
+  landing on a `getenv` without `<stdlib.h>` that MSVC had been quietly
+  accepting, and again on Win32 timing APIs used unguarded.
+- **RSX → Metal backend, POSIX host, and the draw path** (#96) — a second
+  graphics backend beside D3D12: clear, flip, guest vertex fetch, a
+  pipeline-state cache and blend translation, windowed or headless.
+  `runtime/host/host_posix.c` drives cellGcm → RSX → backend with **no lifted
+  game**, hand-building a big-endian NV4097 command buffer — which is what
+  makes non-Windows graphics work startable at all.
+- The CI those PRs brought asserts the **presented pixel** rather than an exit
+  code, and running the existing lifter suites under it immediately exposed
+  fifteen silent VMX miscompiles that had been in the tree unnoticed.
+
+### lilbeefaroni — [@lilbeefaroni](https://github.com/lilbeefaroni)
+- **Caught the porting guide documenting flags that do not exist** (#93) —
+  `elf_parser.py --output` / `--decrypt`. Both were wrong, and auditing every
+  documented command against its tool's real argument parser turned up four more
+  in the guide and two in the README. Fixed.
+
+### Filedownloader-tech — [@Filedownloader-tech](https://github.com/Filedownloader-tech)
+- **Build failure report with a full log** (#89) — the kind of report that can
+  actually be acted on.
 
 ---
 

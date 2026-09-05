@@ -33,7 +33,7 @@ into `REPORT.md`.
 
 ```bash
 # Catalog the whole PSN library by filename (no extraction), + probe 10 headers:
-python ps3_recomp_harness.py catalog --psn-root "Z:\Roms\PS3\PSN" --probe 10
+python ps3_recomp_harness.py catalog --psn-root "$PS3RECOMP_PSN_ROOT" --probe 10
 
 # Triage every decrypted binary under a tree (profile + function detection):
 python ps3_recomp_harness.py analyze --elf-root D:\recomp\ps3games --max-tier 4

@@ -12,6 +12,7 @@
  * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
  */
 
+#include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
@@ -19,6 +20,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+
+/* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
+ * rather than including sys_event.h to avoid pulling PPU context/syscall
+ * table types into the HLE audio module. */
+extern int      sys_event_queue_push_by_id(uint32_t queue_id,
+                                            uint64_t source, uint64_t data1,
+                                            uint64_t data2,  uint64_t data3);
+extern uint32_t sys_event_find_queue_by_key(uint64_t key);
+extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -346,6 +356,20 @@ static u32 audio_backend_queued_samples(void)
  * Mixing
  * -----------------------------------------------------------------------*/
 
+/* Guest PCM is BIG-ENDIAN float32; the port buffer is a raw vm_base view, so
+ * every sample must be byte-swapped before use. Reading it as a host float
+ * turned the whole mix into denormal noise -- silence after clipping (LBP
+ * had a verified end-to-end pipeline with no audible output). */
+static inline float ld_be_f32(const float* p)
+{
+    u32 v;
+    memcpy(&v, p, 4);
+    v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+}
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
@@ -355,6 +379,23 @@ static void audio_mix_one_block(void)
 
     for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
         AudioPortSlot* port = &s_ports[p];
+        /* Diagnostic: a port that HOLDS PCM but was never started is inaudible
+         * by design -- flag it once so "no PortStart" vs "no data" is decidable
+         * from the log (LBP's Bink movie audio port sat exactly there). */
+        if (port->in_use && !port->running && port->buffer) {
+            static u8 warned[CELL_AUDIO_PORT_MAX];
+            if (!warned[p]) {
+                u32 probe = (u32)(port->param.nBlock * CELL_AUDIO_BLOCK_SAMPLES *
+                                  port->param.nChannel);
+                int nz = 0;
+                for (u32 s = 0; s < probe; s += 64) if (port->buffer[s] != 0.0f) { nz = 1; break; }
+                if (nz) {
+                    warned[p] = 1;
+                    fprintf(stderr, "[cellAudio] port %d HAS DATA but never started"
+                            " -- game withheld PortStart\n", p);
+                }
+            }
+        }
         if (!port->in_use || !port->running || !port->buffer)
             continue;
 
@@ -369,24 +410,43 @@ static void audio_mix_one_block(void)
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
 
+        /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
+         * vs which block the read cursor is on -- distinguishes "writer never
+         * writes" from "writer and reader cycle out of phase". */
+        { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
+          if (s_pk) { static _Thread_local unsigned _c;
+            if ((++_c % 400) == 0) {
+                char map[36]; u32 b;
+                for (b = 0; b < nblock && b < 32; b++) {
+                    const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                    int nz = 0;
+                    for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16)
+                        if (bp[s2] != 0.0f) { nz = 1; break; }
+                    map[b] = nz ? '#' : '.';
+                }
+                map[b] = 0;
+                fprintf(stderr, "[audio-ring] port %d ridx=%llu blk=%u ring=[%s]\n",
+                        p, (unsigned long long)port->read_index, block_idx, map);
+            } } }
+
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
             float left, right;
             if (nch >= 2) {
-                left  = src[s * nch + 0] * level;
-                right = src[s * nch + 1] * level;
+                left  = ld_be_f32(&src[s * nch + 0]) * level;
+                right = ld_be_f32(&src[s * nch + 1]) * level;
             } else {
                 /* Mono: duplicate to both channels */
-                left = right = src[s] * level;
+                left = right = ld_be_f32(&src[s]) * level;
             }
 
             /* If 7.1, mix center and other channels into stereo */
             if (nch == 8) {
-                float center = src[s * 8 + 2] * level * 0.707f;
-                float lfe    = src[s * 8 + 3] * level * 0.5f;
-                float rl     = src[s * 8 + 4] * level * 0.5f;
-                float rr     = src[s * 8 + 5] * level * 0.5f;
-                float sl     = src[s * 8 + 6] * level * 0.3f;
-                float sr     = src[s * 8 + 7] * level * 0.3f;
+                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
+                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
+                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
+                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
                 left  += center + lfe + rl + sl;
                 right += center + lfe + rr + sr;
             }
@@ -395,11 +455,21 @@ static void audio_mix_one_block(void)
             s_mix_buffer[s * 2 + 1] += right;
         }
 
+        /* Firmware clears a ring-buffer block after consuming it. Besides
+         * preventing stale PCM from replaying when a producer stalls, the
+         * cleared block is an observable consumption signal for producers. */
+        memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
+
         /* Advance read index and publish it to the guest-visible counter so the
-         * game (FMOD) can tell how far playback has consumed. */
+         * game can tell how far playback has consumed. The counter is a 64-bit
+         * big-endian value: LBP's audio watchdog reads it with `ld` and compares
+         * the LOW word (`ld r0,0(r11)` / `cmpw r9,r0` at 0x484144), so the live
+         * bits are bytes [4..7]. A 32-bit store here only ever wrote bytes
+         * [0..3] -- the half the game never looks at -- so it saw a frozen index
+         * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
         port->read_index++;
         if (port->read_idx_addr)
-            vm_write32((u32)port->read_idx_addr, (u32)port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -417,13 +487,17 @@ static void audio_mix_one_block(void)
 
 static void audio_notify_event_queues(void)
 {
-    /*
-     * In a full emulator, this would send a sys_event to each registered
-     * event queue so the game knows it can write the next audio block.
-     * Here we just update state; the game-side event queue integration
-     * would be in the sys_event module.
-     */
-    (void)s_notify_queues; /* suppress unused warning */
+    /* Push the audio-period event (data1 = CELL_AUDIO_EVENT_MIX = 0) to each
+     * registered notify queue, so the game's audio loop (blocked on
+     * sys_event_queue_receive) wakes once per block and writes the next one.
+     * Resolve the queue by its ipc_key (set via cellAudioSetNotifyEventQueue). */
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (!s_notify_queues[i].in_use) continue;
+        uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
+        if (qid)
+            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
+                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+    }
 }
 
 #ifdef _WIN32
@@ -435,6 +509,14 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     while (s_mix_thread_running) {
         /* Mix and submit one block */
         audio_mix_one_block();
+        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
+         * "is any port producing sound" is answerable (LBP Bink movie audio). */
+        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
+          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
+            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 
         /* Notify event queues */
@@ -517,6 +599,14 @@ static void audio_stop_mix_thread(void)
 
 s32 cellAudioInit(void)
 {
+    /* PS3_NO_AUDIO=1: report that the audio library is unavailable. Middleware
+     * that drives its mixer through SPU jobs will otherwise block the whole boot
+     * waiting on work we cannot yet complete; failing here lets a title take its
+     * silent path and keep going. Diagnostic first, workaround second. */
+    if (getenv("PS3_NO_AUDIO")) {
+        printf("[cellAudio] PS3_NO_AUDIO -- reporting audio unavailable\n");
+        return (s32)CELL_AUDIO_ERROR_NOT_INIT;
+    }
     printf("[cellAudio] Init()\n");
 
     if (s_audio_initialized)
@@ -618,15 +708,27 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    static u32 s_audio_guest = 0x01000000u;          /* 1 MB-aligned, free window */
+    /* Audio buffers live in GUEST memory, but the base must be a window NOTHING
+     * else claims. It used to be 0x01000000, commented "free window" -- it is not:
+     * that is where ports put their HLE OPD arena (Tokyo Jungle's HLE_OPD_BASE is
+     * exactly 0x01000000), and the memset below wiped 128 KB of it. Every import
+     * whose OPD lived there began dispatching to a NULL address the moment the
+     * game opened an audio port -- and a null bctr returns with r3 untouched, so
+     * the guest reads its own first argument back as a status code. That is why
+     * Tokyo Jungle reported "failed to set notify queue (23A0)": 0x23A0 was the
+     * key it had just passed in, echoed back by a call that never happened. */
+#define CELL_AUDIO_GUEST_BASE 0x60000000u   /* clear of HLE, heaps, RSX and libsre */
+    static u32 s_audio_guest = CELL_AUDIO_GUEST_BASE;
     u32 guest_buf  = s_audio_guest;
     s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
     u32 guest_ridx = s_audio_guest;
     s_audio_guest += 0x100000u;
+    /* Not part of the pre-committed main-memory map: commit before touching. */
+    vm_commit(guest_buf, (guest_ridx + 0x100000u) - guest_buf);
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
-    vm_write32(guest_ridx, 0);                        /* read index counter */
+    vm_write64(guest_ridx, 0);                        /* read index counter (u64, see below) */
 
     port->port_addr     = guest_buf;
     port->read_idx_addr = guest_ridx;
@@ -706,6 +808,59 @@ s32 cellAudioPortStop(u32 portNum)
     return CELL_OK;
 }
 
+/* cellAudioCreateNotifyEventQueue(sys_event_queue_t* id, u64* key)
+ *
+ * Creates the queue the game will block on for audio-period events, and
+ * registers it for notification in one step -- the game never calls
+ * SetNotifyEventQueue for this one.
+ *
+ * This was missing entirely. YDKJ imports it, got the unimplemented-NID path,
+ * and then blocked on an id nothing had created: sys_event_queue_receive
+ * answered CELL_ESRCH every time and the title logged 1.7 MILLION
+ * "ERROR - LIBAUDIO DROPOUT" lines in a 60 s run.
+ *
+ * Both params are GUEST addresses and both are big-endian out-values; the id
+ * is 32-bit and the key 64-bit, so they cannot be written with a plain store. */
+s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key)
+{
+    uint32_t id_ea  = (uint32_t)(uintptr_t)id;
+    uint32_t key_ea = (uint32_t)(uintptr_t)key;
+
+    printf("[cellAudio] CreateNotifyEventQueue(id_ea=0x%08X key_ea=0x%08X)\n",
+           id_ea, key_ea);
+
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (!id_ea || !key_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    /* A distinct key per queue: the notify path resolves queues BY KEY, and the
+     * game creates its other queues with key 0, so reusing 0 here would make
+     * find_queue_by_key ambiguous and post audio events to whichever matched. */
+    static uint64_t s_next_key = 0x8000000000000001ull;
+    uint64_t k = s_next_key++;
+
+    uint32_t qid = sys_event_queue_create_direct(k, 8);
+    if (!qid)
+        return CELL_AUDIO_ERROR_EVENT_QUEUE;
+
+    mutex_lock(&s_audio_mutex);
+    int slot = -1;
+    for (int i = 0; i < CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES; i++) {
+        if (!s_notify_queues[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) { mutex_unlock(&s_audio_mutex); return CELL_AUDIO_ERROR_PARAM; }
+    s_notify_queues[slot].in_use = 1;
+    s_notify_queues[slot].key    = k;
+    mutex_unlock(&s_audio_mutex);
+
+    vm_write32(id_ea, qid);
+    vm_write64(key_ea, k);
+    printf("[cellAudio] CreateNotifyEventQueue -> id=%u key=0x%llX\n",
+           qid, (unsigned long long)k);
+    return CELL_OK;
+}
+
 s32 cellAudioSetNotifyEventQueue(u64 key)
 {
     printf("[cellAudio] SetNotifyEventQueue(key=0x%llX)\n",
@@ -771,13 +926,28 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
 
-    vm_write64(cfg +  0, port->read_idx_addr);                               /* readIndexAddr */
-    vm_write32(cfg +  8, port->running ? CELL_AUDIO_STATUS_RUN
+    /* CellAudioPortConfig (cell/audio.h). sys_addr_t is uintptr_t, which on the
+     * 32-bit PPU ABI is FOUR bytes -- not eight. Writing the two sys_addr_t
+     * fields as u64 shifted every field past it and left the game reading the
+     * high (zero) half of readIndexAddr as its pointer:
+     *   sys_addr_t readIndexAddr;  u32 @  0
+     *   uint32_t   status;         u32 @  4
+     *   uint64_t   nChannel;       u64 @  8
+     *   uint64_t   nBlock;         u64 @ 16
+     *   uint32_t   portSize;       u32 @ 24
+     *   sys_addr_t portAddr;       u32 @ 28      -> 32 bytes */
+    vm_write32(cfg +  0, (u32)port->read_idx_addr);                          /* readIndexAddr */
+    vm_write32(cfg +  4, port->running ? CELL_AUDIO_STATUS_RUN
                                        : CELL_AUDIO_STATUS_READY);           /* status */
-    vm_write64(cfg + 16, port->param.nChannel);                             /* nChannel */
-    vm_write64(cfg + 24, port->param.nBlock);                               /* nBlock */
-    vm_write32(cfg + 32, port->buf_size);                                   /* portSize */
-    vm_write64(cfg + 40, port->port_addr);                                  /* portAddr */
+    vm_write64(cfg +  8, port->param.nChannel);                             /* nChannel */
+    vm_write64(cfg + 16, port->param.nBlock);                               /* nBlock */
+    vm_write32(cfg + 24, port->buf_size);                                   /* portSize */
+    vm_write32(cfg + 28, (u32)port->port_addr);                             /* portAddr */
+
+    { static int _n = 0; if (_n++ < 24)
+        fprintf(stderr, "[cellAudio] GetPortConfig(port=%u) status=%s bufEA=0x%08X ridxEA=0x%08X\n",
+                portNum, port->running ? "RUN" : "READY",
+                (u32)port->port_addr, (u32)port->read_idx_addr); }
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
@@ -792,11 +962,11 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
         return CELL_AUDIO_ERROR_PARAM;
 
     if (!s_ports[portNum].in_use) {
-        *status = CELL_AUDIO_STATUS_CLOSE;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_CLOSE);
     } else if (s_ports[portNum].running) {
-        *status = CELL_AUDIO_STATUS_RUN;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_RUN);
     } else {
-        *status = CELL_AUDIO_STATUS_READY;
+        vm_write32((u32)(uintptr_t)status, CELL_AUDIO_STATUS_READY);
     }
 
     return CELL_OK;

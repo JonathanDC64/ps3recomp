@@ -8,7 +8,15 @@
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+/* Guest-memory stores — out-params from the recompiled title are guest VM
+ * addresses, not host pointers. */
+extern void vm_write8(uint64_t addr, uint8_t v);
+extern void vm_write32(uint64_t addr, uint32_t v);
+extern uint8_t* vm_base;
 
 /* ---------------------------------------------------------------------------
  * Guest callback dispatch hook (set by the game's host code at startup).
@@ -131,12 +139,6 @@ s32 cellSysutilCheckCallback(void)
      * Stops when the queue empties OR when no guest caller is installed
      * (in which case we drop pending events to avoid stalling).
      */
-    /* Livelock guard: if a dispatched callback keeps re-queueing events the drain
-     * never ends and the calling thread wedges here (observed: AsyncGetHddFreeSizeThread
-     * spins at guest 0x00B5D8C0 = this call). Cap the drain per call; if exceeded, log
-     * the offending callback + break (also breaks the wedge). Zero normal-case overhead
-     * (a plain counter). A healthy drain processes only a handful of events. */
-    int iters = 0;
     while (s_event_head != s_event_tail) {
         SysutilEvent e = s_event_queue[s_event_head];
         s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
@@ -145,17 +147,12 @@ s32 cellSysutilCheckCallback(void)
         if (!s_callbacks[e.slot].registered) continue;
         if (!s_callbacks[e.slot].guest_opd) continue;
 
-        if (++iters > 256) {
-            fprintf(stderr, "[cellSysutil] CheckCallback DRAIN RUNAWAY (%d) slot=%d opd=0x%08X status=0x%X -- breaking\n",
-                    iters, e.slot, s_callbacks[e.slot].guest_opd, e.status); fflush(stderr);
-            break;
-        }
         if (g_ps3_guest_caller) {
             g_ps3_guest_caller(s_callbacks[e.slot].guest_opd,
                                (uint64_t)e.status,
                                (uint64_t)e.param,
                                (uint64_t)s_callbacks[e.slot].userdata,
-                               0);
+                               0, 0, 0, 0, 0);
         }
     }
     return CELL_OK;
@@ -163,62 +160,69 @@ s32 cellSysutilCheckCallback(void)
 
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value)
 {
-    /* `value` arrives as a raw GUEST address (the HLE dispatch passes r4 verbatim), NOT a
-     * host pointer. Translate it into the VM and write the result big-endian (PS3 is BE).
-     * Dereferencing it directly faulted (guest addr used as host addr). */
-    extern uint8_t* vm_base;
-    uint32_t gaddr = (uint32_t)(uintptr_t)value;
-    if (!gaddr)
+    /* `value` is a GUEST address (the recompiled title passes its own VM
+     * pointer); dereferencing it as a host pointer faults. Compute locally
+     * and store big-endian via vm_write32 (this crashed minecraft's boot at
+     * its very first GetSystemParamInt(LANG) call). */
+    uint32_t out_ea = (uint32_t)(uintptr_t)value;
+    if (!out_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
-    s32 v;
+    s32 v = 0;
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:                        v = CELL_SYSUTIL_LANG_ENGLISH_US; break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS; break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:                v = 0; break; /* YYYYMMDD */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:                v = 0; break; /* 24-hour */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:                   v = 0; break; /* UTC */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:                 v = 0; break; /* No DST */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:        v = 0; break; /* No restriction */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
+        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
+        v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
+        break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT: v = 1; break; /* Has NP account */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:              v = 0; break; /* 60Hz */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:                 v = 1; break; /* Rumble on */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:              v = 0; break; /* US/101 */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:                v = 0; break; /* Disabled */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CAMERA_PLFREQ:  v = 0; break; /* 60Hz */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_RUMBLE:     v = 1; break; /* Rumble on */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_KEYBOARD_TYPE:  v = 0; break; /* US/101 */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_PAD_AUTOOFF:    v = 0; break; /* Disabled */
     default:
         printf("[cellSysutil] GetSystemParamInt: unknown id 0x%04X\n", id);
         v = 0;
         break;
     }
 
-    /* big-endian store into guest memory */
-    uint8_t* p = vm_base + gaddr;
-    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+    vm_write32(out_ea, (uint32_t)v);
     return CELL_OK;
 }
 
-s32 cellSysutilGetSystemParamString(s32 id, char* buf_guest, u32 bufsize)
+s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
 {
-    /* buf_guest is a raw GUEST address; translate into the VM. (byte string -> no bswap) */
-    extern uint8_t* vm_base;
-    if (!(uint32_t)(uintptr_t)buf_guest || bufsize == 0)
+    if (!buf || bufsize == 0)
         return CELL_SYSUTIL_ERROR_VALUE;
-    char* buf = (char*)(vm_base + (uint32_t)(uintptr_t)buf_guest);
 
     switch (id) {
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME:
-        strncpy(buf, "ps3recomp_user", bufsize - 1);
-        buf[bufsize - 1] = '\0';
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_NICKNAME: {
+        /* `buf` is a GUEST address — serialize byte-wise via vm_write8. */
+        const char* s = "ps3recomp_user";
+        uint32_t ea = (uint32_t)(uintptr_t)buf;
+        u32 i;
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
+        vm_write8(ea + i, 0);
         break;
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME:
-        strncpy(buf, "User", bufsize - 1);
-        buf[bufsize - 1] = '\0';
+    }
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USERNAME: {
+        const char* s = "User";
+        uint32_t ea = (uint32_t)(uintptr_t)buf;
+        u32 i;
+        for (i = 0; s[i] && i < bufsize - 1; i++) vm_write8(ea + i, (uint8_t)s[i]);
+        vm_write8(ea + i, 0);
         break;
+    }
     default:
         printf("[cellSysutil] GetSystemParamString: unknown id 0x%04X\n", id);
-        buf[0] = '\0';
+        vm_write8((uint32_t)(uintptr_t)buf, 0);
         break;
     }
 
@@ -246,10 +250,23 @@ s32 cellSysutilDisableBgmPlayback(void)
 
 s32 cellSysutilGetBgmPlaybackStatus(s32* status)
 {
-    if (!status)
+    /* `status` is a GUEST address (YDKJ's "FMOD BGM status query thread" passes its
+     * own stack, e.g. 0xD011FF00) -- the old `*status = ...` dereferenced it as a
+     * HOST pointer and segfaulted (same bug the GetSystemParamInt comment above
+     * describes). It is also NOT an s32 out-param: the real API fills a
+     * CellSysutilBgmPlaybackStatus (guest, big-endian):
+     *   +0x00 u8  playerState        +0x01 u8 reserved[7]
+     *   +0x08 char contentId[16]     +0x18 u8 reserved2[8]
+     *   +0x20 s32 currentFadeRatio   +0x24 u8 reserved3[4]     (0x28 bytes)
+     */
+    uint32_t out_ea = (uint32_t)(uintptr_t)status;
+    if (!out_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 
-    *status = s_bgm_status;
+    for (uint32_t o = 0; o < 0x28; o += 4)
+        vm_write32(out_ea + o, 0);
+    vm_write8(out_ea + 0x00, (uint8_t)s_bgm_status);   /* playerState */
+    vm_write32(out_ea + 0x20, 0);                      /* currentFadeRatio */
     return CELL_OK;
 }
 
@@ -280,23 +297,31 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
-s32 cellSysCacheMount(char* cachePath_g)
+s32 cellSysCacheMount(char* param)
 {
-    extern uint8_t* vm_base;
-    printf("[cellSysutil] SysCacheMount()\n");
-
-    if (!(uint32_t)(uintptr_t)cachePath_g)
+    /* The argument is a GUEST EA of CellSysCacheParam:
+     *   +0x00 char cacheId[32]       (IN)
+     *   +0x20 char getCachePath[136] (OUT)
+     *   +0xA8 void* reserved
+     * The old code strncpy'd through the raw EA as a host char* -> host AV
+     * (LBP: write fault at 0xD00109F0, a guest thread-stack address). */
+    uint32_t ea = (uint32_t)(uintptr_t)param;
+    if (!ea)
         return CELL_EINVAL;
-    char* cachePath = (char*)(vm_base + (uint32_t)(uintptr_t)cachePath_g); /* guest addr -> host */
 
-    /* Provide a temp directory path */
-    strncpy(s_cache_path, "/dev_hdd1/caches", CELL_SYSCACHE_PATH_MAX - 1);
-    s_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
-    strncpy(cachePath, s_cache_path, CELL_SYSCACHE_PATH_MAX - 1);
-    cachePath[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
+    char cache_id[33];
+    memcpy(cache_id, vm_base + ea, 32);
+    cache_id[32] = '\0';
+    printf("[cellSysutil] SysCacheMount(id='%s')\n", cache_id);
+
+    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1/cache/%s", cache_id);
+    size_t n = strlen(s_cache_path);
+    if (n > 135) n = 135;
+    memcpy(vm_base + ea + 0x20, s_cache_path, n);
+    vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
 
-    return CELL_OK;
+    return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }
 
 s32 cellSysCacheClear(void)
@@ -311,23 +336,48 @@ s32 cellSysCacheClear(void)
  * Disc game check
  * -----------------------------------------------------------------------*/
 
-s32 cellDiscGameGetBootDiscInfo(u32* type_g, char* titleId_g, u32 titleIdSize)
+/* cellDiscGameGetBootDiscInfo(CellDiscGameSystemFileParam* getParam)
+ *
+ * ONE argument, not three. This was declared (u32* type, char* titleId, u32
+ * size), so the adapter handed it whatever r4 and r5 happened to hold at the
+ * call -- and it wrote a title-id string through r4. In GT5P r4 still holds an
+ * unrelated global the guest loaded for the cellDiscGameRegisterDiscChangeCallback
+ * call two instructions earlier, so every boot stamped a string into 0x01025510.
+ *
+ * The real shape is a single out-struct the caller pre-zeroes (this title zeroes
+ * 0x20 bytes of it) whose first field is titleId[CELL_DISCGAME_SYSP_TITLEID_SIZE].
+ * The return code is what carries disc-vs-HDD: CELL_OK means booted from disc,
+ * CELL_DISCGAME_ERROR_NOT_DISCBOOT (0x8002BD02) means not -- GT5P branches on
+ * exactly those two values and ignores everything else.
+ */
+s32 cellDiscGameGetBootDiscInfo(void* getParam)
 {
-    extern uint8_t* vm_base;
-    printf("[cellSysutil] DiscGameGetBootDiscInfo()\n");
+    uint32_t ea = (uint32_t)(uintptr_t)getParam;
+    printf("[cellSysutil] DiscGameGetBootDiscInfo(param=0x%08X)\n", ea);
 
-    if ((uint32_t)(uintptr_t)type_g) {
-        uint8_t* p = vm_base + (uint32_t)(uintptr_t)type_g;     /* BE u32 store */
-        uint32_t t = CELL_DISCGAME_TYPE_HDD;
-        p[0]=(uint8_t)(t>>24); p[1]=(uint8_t)(t>>16); p[2]=(uint8_t)(t>>8); p[3]=(uint8_t)t;
+    if (ea) {
+        extern const char* cellGame_get_title_id(void);
+        const char* tid = cellGame_get_title_id();
+        if (!tid || !tid[0]) tid = "GAME00000";
+        size_t n = strlen(tid);
+        if (n > CELL_DISCGAME_SYSP_TITLEID_SIZE - 1)
+            n = CELL_DISCGAME_SYSP_TITLEID_SIZE - 1;
+        memcpy(vm_base + ea, tid, n);
+        vm_base[ea + n] = '\0';
     }
 
-    if ((uint32_t)(uintptr_t)titleId_g && titleIdSize > 0) {
-        char* titleId = (char*)(vm_base + (uint32_t)(uintptr_t)titleId_g);
-        strncpy(titleId, "GAME00000", titleIdSize - 1);
-        titleId[titleIdSize - 1] = '\0';
-    }
-
+    /* PS3_DISCGAME_BOOT=0 reports NOT_DISCBOOT instead, for a title that is
+     * genuinely installed to HDD. Disc is the default because that is the tree
+     * cellFs actually serves. */
+    { static int s_disc = -1;
+      if (s_disc < 0) { const char* e = getenv("PS3_DISCGAME_BOOT");
+                        s_disc = e ? atoi(e) : 1; }
+      if (!s_disc) {
+          printf("[cellSysutil]   -> NOT_DISCBOOT\n");
+          return (s32)CELL_DISCGAME_ERROR_NOT_DISCBOOT;
+      } }
+    printf("[cellSysutil]   -> disc boot, titleId='%s'\n",
+           (const char*)(vm_base + ea));
     return CELL_OK;
 }
 

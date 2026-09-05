@@ -3,6 +3,8 @@
  */
 
 #include "sys_mutex.h"
+#include "../platform/darwin_compat.h"
+#include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -179,6 +181,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] mutex_lock(mutex=%u timeout=%llu)\n", mutex_id,(unsigned long long)timeout_us); }
 
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -201,16 +204,20 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         EnterCriticalSection(&m->cs);
         { extern void thrdiag_wake(void); thrdiag_wake(); }
     } else {
-        /* Timed lock via TryEnterCriticalSection + spin/sleep */
-        DWORD timeout_ms = (DWORD)(timeout_us / 1000);
-        if (timeout_ms == 0) timeout_ms = 1;
-        DWORD start = GetTickCount();
+        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
+         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
+         * and slept a full tick per retry, overshooting sub-ms timeouts by
+         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
+         * holder can run; Sleep(1) only for waits long enough to absorb it.
+         * Safe to poll: TryEnterCriticalSection's success IS the atomic
+         * acquire, so there's no separate signal to miss between polls. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
-            DWORD elapsed = GetTickCount() - start;
-            if (elapsed >= timeout_ms) {
+            if (lv2_deadline_passed(deadline)) {
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
-            Sleep(1);
+            if (timeout_us < 1000) SwitchToThread();
+            else                   Sleep(1);
         }
     }
 #else
@@ -255,8 +262,24 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    /* Recursive re-entry */
+    /* Recursive re-entry. MUST still acquire the host primitive: unlock
+     * calls LeaveCriticalSection unconditionally per guest unlock, so every
+     * guest lock (including a recursive re-entry) must Enter exactly once
+     * or the Enter/Leave pairing breaks: the paired unlock releases the CS
+     * while the guest logically still holds the mutex, and the final
+     * unlock calls Leave on a non-held CS (undefined behavior, corrupts
+     * the CS and causes random forever-blocks on later Enters).
+     * EnterCriticalSection by the current owner is itself recursive and
+     * never blocks, so this is safe and cheap. */
     if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+#ifdef _WIN32
+        EnterCriticalSection(&m->cs);
+#else
+        /* pthreads: the default mutex is non-recursive; an owner re-lock
+         * would deadlock. The pthread path needs a PTHREAD_MUTEX_RECURSIVE
+         * mutex for guest-recursive locks; pre-existing gap, not introduced
+         * by this fix. */
+#endif
         m->lock_count++;
         return CELL_OK;
     }
@@ -296,7 +319,12 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
     uint64_t caller_tid = ctx->thread_id;
 
     if (m->owner_tid != caller_tid) {
-        return (int64_t)(int32_t)CELL_EMUTEX_NOT_OWNED;
+        /* Real lv2 returns EPERM for a non-owner unlock (RPCS3
+         * sys_mutex.h's lv2_mutex::try_unlock, oracle, no code copied:
+         * "if (it.owner != cpu.id) return CELL_EPERM;"), not a made up
+         * CELL_EMUTEX_NOT_OWNED code that guest branches on this
+         * contract would never match. */
+        return (int64_t)(int32_t)CELL_EPERM;
     }
 
     m->lock_count--;

@@ -9,6 +9,8 @@
 #include "cellAdec.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -37,7 +39,8 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
 {
     (void)res;
 
-    printf("[cellAdec] Open(codecType=%u)\n", type ? type->audioCodecType : 0);
+    u32 codec_type = type ? vm_read32(GUEST_EA(type)) : 0;   /* audioCodecType */
+    printf("[cellAdec] Open(codecType=%u)\n", codec_type);
 
     if (!type || !handle)
         return (s32)CELL_ADEC_ERROR_ARG;
@@ -46,10 +49,10 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
         if (!s_adec[i].in_use) {
             memset(&s_adec[i], 0, sizeof(AdecSlot));
             s_adec[i].in_use = 1;
-            s_adec[i].codecType = type->audioCodecType;
+            s_adec[i].codecType = codec_type;
             s_adec[i].cbFunc = cbFunc;
             s_adec[i].cbArg = cbArg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             printf("[cellAdec] Open -> handle=%u\n", i);
             return CELL_OK;
         }
@@ -106,7 +109,8 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
     AdecSlot* a = &s_adec[handle];
 
     printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
-           handle, auInfo->startAddr, auInfo->size);
+           handle, vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, startAddr)),
+           vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size)));
 
     /* Step 1: Report AU consumed */
     if (a->cbFunc)

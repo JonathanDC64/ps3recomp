@@ -8,6 +8,8 @@
 #include "cellSheap.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -39,10 +41,18 @@ s32 cellSheapInitialize(const CellSheapAttr* attr, CellSheapHandle* handle)
 {
     printf("[cellSheap] Initialize()\n");
 
-    if (!attr || !handle || !attr->heapBase || attr->heapSize == 0)
+    /* CellSheapAttr is { void* heapBase; u32 heapSize; u32 align; ... } --
+     * the base is a 4-byte EA to the guest and 8 bytes to us, so every
+     * field after it is at a different offset. Read by guest offset. */
+    u32 attr_ea   = GUEST_EA(attr);
+    u32 heap_base = attr_ea ? vm_read32(attr_ea + 0) : 0;
+    u32 heap_size = attr_ea ? vm_read32(attr_ea + 4) : 0;
+    u32 attr_algn = attr_ea ? vm_read32(attr_ea + 8) : 0;
+
+    if (!attr || !handle || !heap_base || heap_size == 0)
         return (s32)CELL_SHEAP_ERROR_INVAL;
 
-    u32 alignment = attr->align;
+    u32 alignment = attr_algn;
     if (alignment == 0) alignment = 16;
     if (alignment & (alignment - 1))
         return (s32)CELL_SHEAP_ERROR_ALIGN;
@@ -51,11 +61,11 @@ s32 cellSheapInitialize(const CellSheapAttr* attr, CellSheapHandle* handle)
         if (!s_heaps[i].in_use) {
             memset(&s_heaps[i], 0, sizeof(SheapState));
             s_heaps[i].in_use = 1;
-            s_heaps[i].base = (u8*)attr->heapBase;
-            s_heaps[i].totalSize = attr->heapSize;
+            s_heaps[i].base = vm_base + heap_base;
+            s_heaps[i].totalSize = heap_size;
             s_heaps[i].align = alignment;
             s_heaps[i].offset = 0;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }
@@ -122,7 +132,7 @@ s32 cellSheapQueryMax(CellSheapHandle handle, u32* maxFree)
 
     SheapState* h = &s_heaps[handle];
     u32 aligned_offset = align_up(h->offset, h->align);
-    *maxFree = (aligned_offset < h->totalSize) ? h->totalSize - aligned_offset : 0;
+    vm_write32((u32)(uintptr_t)maxFree, (aligned_offset < h->totalSize) ? h->totalSize - aligned_offset : 0);
     return CELL_OK;
 }
 

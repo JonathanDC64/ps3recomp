@@ -33,6 +33,24 @@ extern uint8_t* vm_base;
 /* ---------------------------------------------------------------------------
  * Address translation
  * -----------------------------------------------------------------------*/
+/* Translate a guest pointer PARAMETER to a host pointer, preserving NULL.
+ *
+ * HLE entry points receive pointer arguments as raw 32-bit GUEST addresses
+ * (ppu_hle.cpp passes the PPC register through untouched), so dereferencing
+ * one directly hits whatever host address happens to share that number. That
+ * is the most common bug in libs/ -- cellFsRead read an entire sound bank to
+ * an untranslated address this way. Fifteen files had each pasted their own
+ * copy of this macro; this is the one definition.
+ *
+ * NOTE this gives you a host pointer to BIG-ENDIAN memory. It is right for
+ * byte buffers and for structs of u8, but a u32/u64/float field still needs
+ * the vm_read and vm_write accessors below (or an explicit swap) -- the cast
+ * alone does not fix endianness.
+ */
+#ifndef GUEST_PTR
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+#endif
+
 static inline void* vm_translate(uint32_t addr)
 {
     return (void*)(vm_base + addr);
@@ -95,27 +113,68 @@ static inline double vm_read_f64(uint32_t addr)
 /* ---------------------------------------------------------------------------
  * Stores -- write host-endian value into big-endian guest memory.
  * -----------------------------------------------------------------------*/
+/* PPU reservation: a plain store to a reserved word must break other threads'
+ * reservations (real-PPC granule semantics). g_resv_store_active gates it so the
+ * default path is one predictable branch. Defined in ppu_loader.cpp. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int  g_resv_store_active;
+void        ppu_resv_break_store(uint64_t ea);
+#ifdef __cplusplus
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Write-watch hook for the INLINE writers.
+ *
+ * LBP_WW (ppu_loader.cpp) logs stores to a watched address along with the guest
+ * function responsible. Recompiled guest code calls the extern vm_write* family
+ * there, so it is covered -- but everything in libs/ uses the inline family
+ * below, and those stores were invisible to it. That makes "nothing writes this
+ * address" a claim the watch cannot actually support, which is exactly the sort
+ * of thing worth not being wrong about: an HLE writing a zero looks identical
+ * to nobody writing at all.
+ *
+ * Cost is two compares against a pair that stay 0 unless LBP_WW is set, on the
+ * HLE path only -- guest stores never reach here.
+ * -----------------------------------------------------------------------*/
+extern uint32_t g_ww_lo, g_ww_hi;
+void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width);
+
+#define PS3_WW_CHECK(a, v, w)                                                 \
+    do {                                                                      \
+        if ((a) >= g_ww_lo && (a) < g_ww_hi)                                  \
+            ps3_ww_report_inline((uint32_t)(a), (uint64_t)(v), (w));          \
+    } while (0)
+
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
+    PS3_WW_CHECK(addr, val, 1);
     *vm_ptr8(addr) = val;
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
+    PS3_WW_CHECK(addr, val, 2);
     uint16_t raw = ps3_bswap16(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
 }
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
+    PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
+    PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
     memcpy(vm_ptr8(addr), &raw, sizeof(raw));
+    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
 static inline void vm_write_f32(uint32_t addr, float val)

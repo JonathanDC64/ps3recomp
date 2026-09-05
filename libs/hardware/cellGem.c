@@ -7,6 +7,7 @@
 #include "cellGem.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
 /* Internal state */
 
@@ -21,7 +22,7 @@ s32 cellGemInit(const CellGemAttribute* attr)
     if (s_initialized)
         return (s32)CELL_GEM_ERROR_ALREADY_INITIALIZED;
     if (!attr) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
-    s_max_connect = attr->maxConnect;
+    s_max_connect = vm_read32((u32)(uintptr_t)attr + 4);   /* maxConnect */
     if (s_max_connect > CELL_GEM_MAX_NUM) s_max_connect = CELL_GEM_MAX_NUM;
     s_initialized = 1;
     return CELL_OK;
@@ -39,11 +40,13 @@ s32 cellGemGetInfo(CellGemInfo* info)
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     if (!info) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
 
-    memset(info, 0, sizeof(CellGemInfo));
-    info->maxConnect = s_max_connect;
-    info->nowConnect = 0; /* no controllers */
+    u32 info_ea = (u32)(uintptr_t)info;
+    for (u32 o = 0; o < sizeof(CellGemInfo); o += 4)
+        vm_write32(info_ea + o, 0);
+    vm_write32(info_ea + 0, s_max_connect);   /* maxConnect */
+    vm_write32(info_ea + 4, 0);               /* nowConnect: none      */
     for (u32 i = 0; i < CELL_GEM_MAX_NUM; i++)
-        info->status[i] = CELL_GEM_STATUS_DISCONNECTED;
+        vm_write32(info_ea + 8 + i * 4, CELL_GEM_STATUS_DISCONNECTED);
     return CELL_OK;
 }
 
@@ -89,7 +92,7 @@ s32 cellGemGetStatusFlags(u32 gemNum, u64* flags)
     (void)gemNum;
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     if (!flags) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
-    *flags = 0;
+    vm_write64((u32)(uintptr_t)flags, 0);
     return CELL_OK;
 }
 

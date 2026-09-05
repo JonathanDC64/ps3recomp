@@ -9,6 +9,7 @@
 #include "sceNpBasic.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -54,16 +55,20 @@ s32 sceNpBasicTerm(void)
     return CELL_OK;
 }
 
-/* The title's main loop drains PSN events with `while (sceNpBasicGetEvent(...)
- * == CELL_OK) { ... }`. Unregistered, this returned 0 (CELL_OK) forever -> the
- * loop never terminated and the game idled instead of advancing to its frame
- * work. Return "no pending event" (any non-zero error ends the drain). We don't
- * dereference the out-params (we report no event), so no translation needed. */
+/* The title's main loop drains PSN events with a loop that exits ONLY when
+ * sceNpBasicGetEvent returns the specific code 0x8002A66A (SCE_NP_BASIC_ERROR_NO_EVENT)
+ * -- verified in the recompiled drain loop func_00063E34 (cmpwi r3, 0x8002A66A ->
+ * exit). Returning any OTHER error (e.g. 0x8002AA09) is NOT recognized: the game
+ * then reads a STALE/garbage event out-param and loops forever, hanging the boot
+ * before NP-init/trophy/GThread. So the exact value matters. We report no event
+ * and don't touch the out-params. */
 #ifndef SCE_NP_BASIC_ERROR_NO_EVENT
-#define SCE_NP_BASIC_ERROR_NO_EVENT 0x8002AA09
+#define SCE_NP_BASIC_ERROR_NO_EVENT 0x8002A66A
 #endif
 s32 sceNpBasicGetEvent(u32* event, void* from, void* data, u32* size)
 {
+    /* out-params are GUEST EAs; the game checks the return (0x8002A66A) and
+     * exits the drain BEFORE reading them, so we leave them untouched. */
     (void)event; (void)from; (void)data; (void)size;
     return (s32)SCE_NP_BASIC_ERROR_NO_EVENT;
 }
@@ -104,7 +109,7 @@ s32 sceNpBasicGetFriendListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0; /* offline -- no friends */
+    vm_write32((u32)(uintptr_t)count, (u32)0); /* offline -- no friends */
     return CELL_OK;
 }
 
@@ -133,6 +138,7 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
 
 s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 {
+    presence = GUEST_PTR(presence, const SceNpBasicPresence*);
     printf("[sceNpBasic] SetPresence()\n");
 
     if (!s_initialized)
@@ -148,6 +154,7 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
                            const void* body, u32 bodySize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)body;
     (void)bodySize;
 
@@ -164,6 +171,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
                                       const char* subject,
                                       const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -180,6 +188,7 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
 s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
                                      const void* data, u32 dataSize)
 {
+    to = GUEST_PTR(to, const SceNpOnlineId*);
     (void)data;
     (void)dataSize;
 
@@ -202,7 +211,7 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
     if (dataSize)
-        *dataSize = 0;
+        vm_write32((u32)(uintptr_t)dataSize, (u32)0);
 
     return (s32)SCE_NP_BASIC_ERROR_DATA_NOT_FOUND;
 }
@@ -215,12 +224,13 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
     if (!count)
         return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
 
-    *count = 0;
+    vm_write32((u32)(uintptr_t)count, (u32)0);
     return CELL_OK;
 }
 
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
 {
+    onlineId = GUEST_PTR(onlineId, const SceNpOnlineId*);
     printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
            onlineId ? onlineId->data : "(null)");
 

@@ -127,9 +127,60 @@ cmake --install build --prefix /usr/local
 
 | CMake Option | Default | Description |
 |---|---|---|
-| `PS3RECOMP_BUILD_TESTS` | `OFF` | Build unit tests |
+| `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
+
+### Running the Tests
+
+```bash
+cmake -S . -B build-tests -G Ninja -DPS3RECOMP_BUILD_TESTS=ON
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+The test build currently registers the deterministic synchronization stress
+suite. It can still be configured directly from `tests/sync_stress` when
+testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
+
+### Checking the PPU boot scaffold
+
+`runtime/ppu/` is the one part of the runtime no CMake target builds. Those
+files `#include "ppu_recomp.h"`, which the lifter generates per game, so
+`CMakeLists.txt` excludes them from the library and they are only ever
+compiled inside somebody's game port — historically, on Windows.
+
+```bash
+python tools/check_ppu_scaffold.py            # check against the baseline
+python tools/check_ppu_scaffold.py --verbose  # show the diagnostics
+python tools/check_ppu_scaffold.py --update   # re-record after improving it
+```
+
+It synthesises a stub `ppu_recomp.h` from the lifter's own `HEADER_PREAMBLE`
+— imported from `ppu_lifter.py`, not copied, so it cannot drift from what
+games really get — and compiles the scaffold against it. It does not link and
+runs nothing; it proves only that every declaration the scaffold reaches for
+exists on this platform.
+
+It is a **ratchet** rather than a pass/fail gate:
+`tools/ppu_scaffold_baseline.json` records the current error count per
+toolchain, and the check fails only if a number goes **up**. A toolchain with
+no baseline entry reports its numbers and passes, so a new platform's first CI
+run tells you what to record.
+
+Every recorded toolchain is now at **zero** — the whole scaffold compiles under
+GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
+fails the build.
+
+Compiling is not the same as running. The scaffold is not linked or executed by
+anything in this repository (that needs a lifted game), and `boot_main.cpp`
+still starts its vblank ticker, hang watchdog and profiler inside
+`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
+the remaining gaps between "builds" and "runs a title".
+
+It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
+it also pulls in the per-game SPU recomp header and the generated function
+table, which a stub cannot stand in for.
 
 ### Compile Definitions
 
@@ -167,7 +218,25 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 **Definitions:**
 - `_CRT_SECURE_NO_WARNINGS` — Suppress MSVC CRT security warnings
 
+> **`dirent.h` is supplied in-tree.** The PPU boot scaffold's filesystem layer
+> walks host directories with `opendir`/`readdir`/`closedir`, none of which
+> MSVC ships, so game ports used to vendor their own Win32 shim on the include
+> path. `runtime/platform/win32_dirent.h` provides one (`FindFirstFileA`
+> behind the POSIX names, passing straight through to the system header off
+> Windows) — a port carrying its own copy can drop it.
+
 ### Linux
+
+Builds and is covered by CI (`.github/workflows/linux.yml`, x86-64, GCC and
+Clang, Debug and Release on every push). That workflow builds the runtime
+library, runs all eight lifter suites plus the SPU helper tests, and drives
+`ps3recomp_host` end to end against the headless software backend.
+
+> **No hardware render backend.** Metal is Apple-only and D3D12 is
+> Windows-only. Linux falls back to the null backend's headless software path
+> (`libs/video/rsx_null_backend.c`), which rasterises into host memory — a
+> correctness probe, not a renderer. Running a recompiled title additionally
+> needs the PPU boot scaffold ported off Win32 — the same gap macOS has.
 
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings
@@ -180,7 +249,32 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ### macOS
 
-Similar to Linux. Use Xcode command-line tools or a standalone Clang installation.
+Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
+Release on every push). That workflow builds the runtime library, runs all
+eight lifter test suites — including the 1300+ instruction conformance checks,
+which compile and *execute* lifted code — and then runs `ps3recomp_host`
+headlessly, asserting the presented pixel matches the guest clear colour and
+that an NV4097 triangle covers the centre pixel. A green tick means the
+graphics bridge works, not merely that it compiled.
+
+```bash
+brew install ninja sdl2
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+```
+
+**It cannot run a recompiled game yet.** The PPU boot scaffold —
+`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
+dispatch — is still Win32-only (thread creation, `VirtualAlloc`, SEH, stack
+walking) and is compiled per-game rather than into the library, so it is not
+covered by the macOS build. Porting that scaffold is the remaining work.
+
+Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
+original docs-vs-reality gap in
+[#94](https://github.com/sp00nznet/ps3recomp/issues/94) and contributed both
+the build fix with CI ([#95](https://github.com/sp00nznet/ps3recomp/pull/95))
+and the Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
 
 ---
 
@@ -192,8 +286,8 @@ Similar to Linux. Use Xcode command-line tools or a standalone Clang installatio
 |----------|---------|----------|--------|
 | MSVC | 19.35+ (VS 2022) | Windows | Full support |
 | GCC | 12+ | Linux | Full support |
-| Clang | 14+ | Linux/macOS | Full support |
-| Apple Clang | 14+ (Xcode 14) | macOS | Full support |
+| Clang | 14+ | Linux | Full support |
+| Clang / Apple Clang | 14+ (Xcode 14) | macOS | **Not building** — see #94, fix in review (#95) |
 | MinGW-w64 | GCC 12+ | Windows | Supported |
 
 ### Required C17 Features

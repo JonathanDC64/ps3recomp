@@ -8,6 +8,7 @@
 #include "sceNpMatching2.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -67,7 +68,7 @@ s32 sceNpMatching2CreateContext(const void* npId, const void* commId,
         if (!s_ctx[i].in_use) {
             memset(&s_ctx[i], 0, sizeof(M2Context));
             s_ctx[i].in_use = 1;
-            *ctxId = (u16)i;
+            vm_write16((u32)(uintptr_t)ctxId, (u16)i);
             return CELL_OK;
         }
     }

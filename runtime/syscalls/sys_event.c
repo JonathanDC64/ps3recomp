@@ -3,6 +3,8 @@
  */
 
 #include "sys_event.h"
+#include "../ps3_log.h"
+#include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
@@ -89,6 +91,52 @@ static uint64_t bswap64(uint64_t v)
  * r5 = key (u64)
  * r6 = size (s32)
  * -----------------------------------------------------------------------*/
+/* Create a queue directly, without a guest ppu_context.
+ *
+ * HLE libraries sometimes have to CREATE a queue rather than merely find one:
+ * cellAudioCreateNotifyEventQueue hands the game back a queue id + key that the
+ * game then blocks on. Without this the game receives on an id nothing ever
+ * created and gets ESRCH forever -- YDKJ printed 1.7 MILLION "LIBAUDIO DROPOUT"
+ * lines a run that way. Returns the queue id, or 0 if the table is full. */
+uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
+{
+    if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
+        size = SYS_EVENT_QUEUE_BUF_MAX;
+
+    evt_table_lock();
+    int slot = -1;
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+        if (!g_sys_event_queues[i].active) { slot = i; break; }
+    }
+    if (slot < 0) { evt_table_unlock(); return 0; }
+
+    sys_event_queue_info* q = &g_sys_event_queues[slot];
+    memset(q, 0, sizeof(*q));
+    q->active   = 1;
+    q->key      = key;
+    q->capacity = size;
+    q->type     = SYS_PPU_QUEUE;
+
+    /* The waiter primitives MUST be initialised here too. memset+fields is
+     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
+     * first EnterCriticalSection on it faults writing near offset 0x24 of a
+     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
+     * died the moment it was finally given a real queue to block on. */
+#ifdef _WIN32
+    InitializeCriticalSection(&q->lock);
+    InitializeConditionVariable(&q->not_empty);
+#else
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+#endif
+
+    evt_table_unlock();
+
+    fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
+            slot + 1, (unsigned long long)key, size);
+    return (uint32_t)(slot + 1);
+}
+
 int64_t sys_event_queue_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -165,14 +213,14 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
     if (!q->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
 #ifdef _WIN32
@@ -194,28 +242,99 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
  * r4 = pointer to sys_event_t in guest memory
  * r5 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+/* A queue has a producer again (SPURS re-attach after a finalize). Without this
+ * the cancel is permanent: the flag survives, every later receive fails, and a
+ * title that tears its audio down and brings it back never runs again. */
+void sys_event_queue_uncancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active || !q->cancelled) return;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 0;
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 0;
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
+}
+
+void sys_event_queue_cancel_by_id(uint32_t queue_id)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return;
+
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    q->cancelled = 1;
+    WakeAllConditionVariable(&q->not_empty);   /* every waiter, not one */
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+    q->cancelled = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->lock);
+#endif
+    fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
+            queue_id);
+}
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
-    { extern void spu_pending_flush(void); spu_pending_flush(); }  /* run deferred SPURS tasks (docs/13) */
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVQ_RECV id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
-    fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu)\n", queue_id, (unsigned long long)timeout_us);
-    /* Track per-queue receive counts + capture the SPURS service's queue by thread
-     * name, so trigger B posts to the exact queue the service receives on (its id is
-     * allocated dynamically per run; docs/15 P2 left it unwired). */
-    { extern void spurs_note_recv(uint32_t); spurs_note_recv(queue_id);
-      extern const char* thrdiag_cur_name(void); extern void spurs_note_service_q(uint32_t);
-      const char* nm = thrdiag_cur_name();
-      if (nm && nm[0] && strstr(nm, "SPURuntime")) spurs_note_service_q(queue_id); }
+    /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
+     * (PS3 priority semantics). Their job objects are fully initialized by now. */
+    { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+    if (ps3_log_verbose())
+        fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+                queue_id, (unsigned long long)timeout_us,
+                (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
+    /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+     * exact game function the main thread is stuck polling in the flip loop. */
+    if (getenv("YDKJ_WAITBT")) {
+        static unsigned char seen[8][8] = {{0}};
+        unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+        if (!seen[t][qk]) {
+            seen[t][qk] = 1;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            char tag[48]; snprintf(tag, sizeof tag, "waitbt tid=%u q=%u", t, queue_id);
+            ppu_dump_guest_stack(ctx, tag);
+        }
+    }
+
+    /* A guest that receives on a queue id it never initialised gets ESRCH
+     * straight back and, if it does not check, spins on it. That is the
+     * guest's bug, but returning instantly makes it ours: GT5P's Job Manager
+     * handler hit this and issued 2,323,673 receives in a 45-second boot,
+     * pinning a core and starving the very threads that would have made
+     * progress. Yield before answering -- it costs a mis-behaving caller
+     * nothing it was entitled to, and stops one bad loop deciding how much
+     * CPU every other thread gets. */
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active)
+    if (!q->active) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
     /* SPURS bring-up: when a PPU thread is about to block forever for SPU
      * completion (libsre created the taskset correctly but never started its SPU
@@ -237,19 +356,129 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
-    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("evq", queue_id); }
+    /* YDKJ_SPURS_READY (diagnostic): break the SPURS bring-up deadlock from the
+     * PPU side. cellSpursInitialize blocks forever (timeout=0) on the SPURS event
+     * queues (q=1/q=4) awaiting the kernel/policy "ready" event, while the policy
+     * (now running real code) waits for a workload the PPU only adds AFTER init
+     * returns. Synthesize a ready event so init returns -> see whether the PPU
+     * then reaches CreateTaskset and the running policy dispatches the cri task.
+     * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
+    if (getenv("YDKJ_SPURS_READY") && (queue_id == 1 || queue_id == 4)
+            && timeout_us == 0 && q->count == 0) {
+        static int s_fire[8] = {0};
+        if (s_fire[queue_id] < 64) {
+            s_fire[queue_id]++;
+            if (event_addr != 0) {
+                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                /* Match the observed real port_send(port=4) shape: data1=0, data2=1,
+                 * data3=0. source is the port name; use a SPURS-ish tag. Env
+                 * YDKJ_RDY_D2 overrides data2 for quick format experiments. */
+                const char* d2s = getenv("YDKJ_RDY_D2");
+                uint64_t d2 = d2s ? (uint64_t)strtoull(d2s, 0, 0) : 1ULL;
+                out[0] = bswap64(0x0000000000000000ULL); /* source/name */
+                out[1] = 0; out[2] = bswap64(d2); out[3] = 0;
+            }
+            fprintf(stderr, "[ydkj] SPURS_READY: synthesized ready event on q=%u (#%d)\n",
+                    queue_id, s_fire[queue_id]);
+            return CELL_OK;
+        }
+    }
+
+    /* YDKJ_FAKECOMPLETE (diagnostic): the SPURS task-completion events the SPU
+     * would post to q=2/q=3 never arrive (SPU video task not running), so the
+     * main thread times out after 30s and the title tears down. Synthesize a
+     * completion so the wait returns -> see whether the game then advances to
+     * asset load + menu draw (content). Returns immediately with a zero event. */
+    if (getenv("YDKJ_FAKECOMPLETE") && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+        if (event_addr != 0) {
+            uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+            out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+        }
+        return CELL_OK;
+    }
+    /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
+     * blocks forever) so the loader thread proceeds. Tests whether the game's
+     * render/draw code is reachable once the completion waits are satisfied. */
+    if (getenv("YDKJ_HLE_DRAW") && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+        static int s_n1 = 0;
+        if (s_n1 < 256) { s_n1++;
+            if (event_addr != 0) {
+                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+            }
+            return CELL_OK;
+        }
+    }
+
+    /* Diagnostic: dump the guest call chain of a thread about to block on q=1
+     * (the loader/worker) -- identifies WHICH function's receive-loop it's in,
+     * so we can see why it only receives once. Fires a few times. */
+    if (queue_id == 1 && timeout_us == 0) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        static int _gs = 0; if (_gs++ < 5) ppu_dump_guest_stack(ctx, "q1-worker");
+    }
+    /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
+     * advances to content. Dump its guest call chain to identify the frame-loop
+     * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
+    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+#ifdef _WIN32
+        static int _gs23 = 0; if (_gs23++ < 4) {
+            void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
+            char* base=(char*)GetModuleHandleA(0);
+            char ln[1000]; int p=snprintf(ln,sizeof ln,"[Q23STACK q=%u] host RVAs:",queue_id);
+            for(unsigned short i=0;i<n && p<920;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)fr[i]-base));
+            fprintf(stderr,"%s\n",ln);
+        }
+#endif
+    }
+
+    /* Demand-driven sim-SPU dispatch. The game's persistent worker SPUs are
+     * fed by event_port_send during ASSET LOAD, but its main loop never sends --
+     * it just receives each worker's per-frame completion, expecting the SPU to
+     * be free-running. A send-triggered dispatcher therefore starves the main
+     * loop: the first frame consumes the completions left over from load and
+     * every frame after blocks forever.
+     *
+     * Run the worker when the guest actually blocks on its completion queue
+     * instead. That is exactly 1:1 by construction -- one run per event the
+     * guest waits for -- so it can neither oversupply (which desynchronises the
+     * queue and wedges the loop, the failure mode of forwarding every plain
+     * WrOutMbox write) nor undersupply (the failure mode of one event per run,
+     * when a worker signals more than once per frame).
+     * ponytail: one attempt per receive, then fall through to the normal wait --
+     * no retry loop, so a worker that genuinely produces nothing still blocks
+     * rather than spinning. */
+    if (q->count == 0 && timeout_us == 0) {
+        extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+        spu_dispatch_frame_by_queue(queue_id, 0);
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
-        { extern void thrdiag_wake(void); thrdiag_wake(); }
+        if (q->count == 0 && q->cancelled) {
+            LeaveCriticalSection(&q->lock);
+            return (int64_t)(int32_t)CELL_ECANCELED;
+        }
+    } else if (timeout_us < 1000) {
+        /* Sub-millisecond timeout = the title's non-blocking event poll (it polls
+         * queues 2 & 3 every frame with a 30us timeout). Windows' ~15.6ms timer
+         * granularity inflates even a 1ms SleepConditionVariableCS to ~15ms, so a
+         * naive floor-to-1ms throttled the game's per-frame poll loop ~500x
+         * (each frame ate ~30ms in two polls). Honor the intent: check once and
+         * return ETIMEDOUT immediately if empty -- same result the game already
+         * handles, just without the bogus 15ms stall. */
+        if (q->count == 0 || !q->active) {
+            LeaveCriticalSection(&q->lock);
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
                     LeaveCriticalSection(&q->lock);
@@ -259,6 +488,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -273,7 +506,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_lock(&q->lock);
 
     if (timeout_us == 0) {
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             pthread_cond_wait(&q->not_empty, &q->lock);
         }
     } else {
@@ -285,7 +518,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (q->count == 0 && q->active) {
+        while (q->count == 0 && q->active && !q->cancelled) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
             if (rc == ETIMEDOUT) {
                 pthread_mutex_unlock(&q->lock);
@@ -294,6 +527,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+    if (q->count == 0 && q->cancelled) {
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
     if (!q->active || q->count == 0) {
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -317,6 +554,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
+    { static int _r=0; if (getenv("RD_RECV") && _r++<60) fprintf(stderr,
+        "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
+        (unsigned long long)evt.source, (unsigned long long)evt.data1,
+        (unsigned long long)evt.data2); }
 
     /* Also write the (legacy) guest memory buffer in big-endian, for callers that
      * pass a real sys_event_t* and read from it. */
@@ -327,21 +568,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         out[2] = bswap64(evt.data2);
         out[3] = bswap64(evt.data3);
     }
-    /* Trace SPU USER events delivered to the SPURS service so we can see whether our
-     * posted event (source 0x..53505501) arrives with the right fields to reach handler B. */
-    if (getenv("SPU_MBOX_LOG") && (evt.source >> 32) == 0xFFFFFFFFu) {
-        static int _n=0; if (_n++ < 40)
-            fprintf(stderr, "[evq-recv] q=%u tid=%lu src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (sel=%u)\n",
-                    queue_id, (unsigned long)
-#ifdef _WIN32
-                    GetCurrentThreadId(),
-#else
-                    (unsigned long)pthread_self(),
-#endif
-                    (unsigned long long)evt.source, (unsigned long long)evt.data1,
-                    (unsigned long long)evt.data2, (unsigned long long)evt.data3,
-                    (unsigned)((evt.data2 >> 32) & 0xFF));
-    }
+    /* Diagnostic: prove the blocked receiver was WOKEN and is returning an event
+     * (vs. staying blocked forever). Distinguishes a wake bug from game logic. */
+    /* Was hardcoded to queue 1, which makes every other queue look silent: the
+     * [WAIT] line prints on entry, so a queue with thousands of receives and no
+     * deliveries is indistinguishable from one that is delivering fine.
+     * PS3_EVT_RECV=<queue id> follows a different one; PS3_EVT_RECV=all follows
+     * every queue. Default stays queue 1 so existing logs read the same. */
+    {
+        static int _sel = -2;
+        if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
+                          _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
+    if (_sel == -1 || (int)queue_id == _sel) {
+        static int _r = 0;
+        if (_r++ < 64)
+            fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+                    queue_id,
+                    (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
+                    (unsigned long long)evt.data1, (unsigned long long)evt.data2,
+                    (unsigned long long)evt.data3, q->count);
+    } }
 
     return CELL_OK;
 }
@@ -500,37 +746,13 @@ int64_t sys_event_port_create(ppu_context* ctx)
     p->connected_queue = 0;
 
     uint32_t port_id = (uint32_t)(slot + 1);
+    fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
+            port_id, (int)port_type, (unsigned long long)name);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, port_id);
     }
 
     evt_table_unlock();
-
-    /* libgcm display/vblank event port: created with name==0xfee1dead. On real
-     * HW the RSX + vblank interrupt post vblank(data2=0x2)/flip(data2=0x10)
-     * events to it; the game's _gcm_intr_thread receives them and drives the
-     * render loop. We have no such interrupt source, so we must post these from
-     * the host vblank ticker (see gcm_display_event_post). Record the port id. */
-    if ((uint32_t)name == 0xfee1deadu) {
-        fprintf(stderr, "[gcm-evt] display/vblank event port created id=%u (name=0xfee1dead)\n", port_id);
-#ifdef _WIN32
-        { void* frames[48];
-          unsigned short nfr = RtlCaptureStackBackTrace(0, 48, frames, 0);
-          HMODULE self = 0;
-          GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                             (LPCSTR)&sys_event_port_create, &self);
-          for (unsigned short i = 0; i < nfr; i++) {
-              HMODULE m = 0;
-              GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                 (LPCSTR)frames[i], &m);
-              if (m == self)
-                  fprintf(stderr, "[gcm-evt]   rva=0x%llX\n",
-                          (unsigned long long)((char*)frames[i] - (char*)self));
-          } }
-#endif
-    }
     return CELL_OK;
 }
 
@@ -539,14 +761,14 @@ int64_t sys_event_port_destroy(ppu_context* ctx)
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
     if (!p->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
     p->active = 0;
@@ -584,6 +806,12 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
 
     p->connected_queue = (int32_t)queue_id;
     evt_table_unlock();
+    /* Port->queue wiring was invisible: create and connect logged nothing, so a
+     * queue nobody is wired to reads exactly like one that is. GT5P's PDI queue
+     * takes 1,901 receives and delivers zero events; knowing whether any port
+     * points at it is the difference between "no sender ran" and "no sender
+     * exists". */
+    fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
     return CELL_OK;
 }
 
@@ -592,19 +820,24 @@ int64_t sys_event_port_disconnect(ppu_context* ctx)
     uint32_t port_id = LV2_ARG_U32(ctx, 0);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
-        return (int64_t)(int32_t)CELL_ESRCH;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
 
     evt_table_lock();
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
     if (!p->active) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ESRCH;
+        /* YDKJ: libsre (cellSpursInitialize) disconnects a port it already
+         * destroyed (our small reused port-ids make its second teardown hit an
+         * inactive slot) -> lv2 ESRCH -> "SPURS is aborted" assertion in
+         * event_helper.c. Idempotent teardown (return OK when already gone)
+         * removes the spurious abort without fabricating anything game-visible. */
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;
     }
 
     if (p->connected_queue == 0) {
         evt_table_unlock();
-        return (int64_t)(int32_t)CELL_ENOTCONN;
+        return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ENOTCONN;
     }
 
     p->connected_queue = 0;
@@ -629,142 +862,17 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     return event_queue_push(q, &evt);
 }
 
-/* Host-side libgcm display-event source. On PS3 the RSX/vblank interrupt posts
- * events to the game's display port (name==0xfee1dead); the game's
- * _gcm_intr_thread receives them and calls the registered vblank/flip handlers,
- * which drive the render loop. We have no hardware interrupt, so the host vblank
- * ticker calls this each vblank. data2 selects the cause, matching RPCS3:
- *   vblank -> data2=0x2   flip -> data2=0x10   (data1=data3=0).
- * Posts to every active, connected fee1dead port. Returns the number posted. */
-/* Display work-queue enqueue bridge (the missing per-frame trigger). The game's
- * event dispatch (func_00A662C8) enqueues frame work via
- * func_00A9DD58(dispatch_obj, id, dispatch_arg) with id 0x100 (vblank)/0x103 (flip).
- * We have no _gcm_intr to fire it, so the host ticker calls gcm_frame_enqueue()
- * per vblank. Pointers captured at runtime (sema-4 wait, gcm_capture_disp_ctx). */
-uint32_t g_gcm_toc = 0, g_gcm_disp_obj = 0, g_gcm_disp_arg = 0;
-extern uint64_t ppu_guest_call_code(uint32_t code, uint32_t toc,
-                                    uint64_t, uint64_t, uint64_t, uint64_t);
-
-void gcm_capture_disp_ctx(uint32_t toc, uint32_t disp_obj, uint32_t disp_arg)
+/* Public helper: resolve an event queue by its ipc_key (as registered at
+ * sys_event_queue_create). Returns the queue_id (1-based) or 0 if none. Used by
+ * cellAudio to route the audio-period notify event to the game's queue. */
+uint32_t sys_event_find_queue_by_key(uint64_t key)
 {
-    if (!g_gcm_toc) {
-        g_gcm_toc = toc; g_gcm_disp_obj = disp_obj; g_gcm_disp_arg = disp_arg;
-        fprintf(stderr, "[gcm-frame] captured disp ctx: toc=0x%08X obj=0x%08X arg=0x%08X\n",
-                toc, disp_obj, disp_arg);
+    if (key == 0) return 0;
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
+        if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key)
+            return (uint32_t)(i + 1);
     }
-}
-
-int gcm_frame_enqueue(void)
-{
-    if (!g_gcm_toc || !g_gcm_disp_obj) return 0;   /* not captured yet */
-    /* func_00A9DD58 = 0x00A9DD58: enqueue(obj, id, arg). Mirror func_00A662C8's
-     * flip-event path: vblank(0x100) then flip(0x103). */
-    ppu_guest_call_code(0x00A9DD58u, g_gcm_toc, g_gcm_disp_obj, 0x100, g_gcm_disp_arg, 0);
-    ppu_guest_call_code(0x00A9DD58u, g_gcm_toc, g_gcm_disp_obj, 0x103, g_gcm_disp_arg, 0);
-    return 1;
-}
-
-/* ---- SPURS runtime helpers (docs/17): create a queue + blocking-pop from C, so
- * our host event-helper thread can be a persistent consumer like libsre's SpursHdlr1. */
-uint32_t spurs_rt_alloc_queue(int size)
-{
-    if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX) size = SYS_EVENT_QUEUE_BUF_MAX;
-    evt_table_lock();
-    int slot = -1;
-    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) if (!g_sys_event_queues[i].active) { slot = i; break; }
-    if (slot < 0) { evt_table_unlock(); return 0; }
-    sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
-    q->active = 1; q->capacity = size; q->type = SYS_PPU_QUEUE;
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock); InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL); pthread_cond_init(&q->not_empty, NULL);
-#endif
-    evt_table_unlock();
-    return (uint32_t)(slot + 1);
-}
-
-/* Blocking dequeue of one event from queue_id. Returns 0 on success. */
-int spurs_rt_pop_blocking(uint32_t queue_id, uint64_t* src, uint64_t* d1, uint64_t* d2, uint64_t* d3)
-{
-    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
-    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-    while (q->count == 0 && q->active) SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
-    if (!q->active || q->count == 0) { LeaveCriticalSection(&q->lock); return -1; }
-    sys_event_t evt = q->buffer[q->head]; q->head = (q->head + 1) % q->capacity; q->count--;
-    LeaveCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-    while (q->count == 0 && q->active) pthread_cond_wait(&q->not_empty, &q->lock);
-    if (!q->active || q->count == 0) { pthread_mutex_unlock(&q->lock); return -1; }
-    sys_event_t evt = q->buffer[q->head]; q->head = (q->head + 1) % q->capacity; q->count--;
-    pthread_mutex_unlock(&q->lock);
-#endif
-    if (src) *src = evt.source; if (d1) *d1 = evt.data1; if (d2) *d2 = evt.data2; if (d3) *d3 = evt.data3;
     return 0;
-}
-
-/* Per-queue receive counter + "busiest receive queue" = the SPURS service's queue
- * (it loops receiving far more than any other). Lets trigger B target the service's
- * dynamically-allocated queue instead of a hardcoded id. */
-static uint32_t g_recv_counts[SYS_EVENT_QUEUE_MAX + 1] = {0};
-void spurs_note_recv(uint32_t queue_id)
-{
-    if (queue_id > 0 && queue_id <= SYS_EVENT_QUEUE_MAX) g_recv_counts[queue_id]++;
-}
-uint32_t spurs_busiest_recv_queue(void)
-{
-    uint32_t best = 0, bestc = 0;
-    for (uint32_t i = 1; i <= SYS_EVENT_QUEUE_MAX; i++)
-        if (g_recv_counts[i] > bestc) { bestc = g_recv_counts[i]; best = i; }
-    return best;   /* 0 if none received yet */
-}
-
-/* The queue the SPURS service (SPURuntimeService) actually receives on -- captured
- * by thread name whenever it calls receive, so trigger B targets it deterministically. */
-static volatile uint32_t g_spurs_service_q = 0;
-void     spurs_note_service_q(uint32_t q) { if (q) g_spurs_service_q = q; }
-uint32_t spurs_service_queue(void)        { return g_spurs_service_q; }
-
-int gcm_display_event_post(uint64_t data1, uint64_t data2, uint64_t data3)
-{
-    int posted = 0;
-    evt_table_lock();
-    for (int i = 0; i < SYS_EVENT_PORT_MAX; i++) {
-        sys_event_port_info* p = &g_sys_event_ports[i];
-        if (!p->active || (uint32_t)p->name != 0xfee1deadu) continue;
-        int32_t qidx = p->connected_queue;
-        if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX) continue;
-        sys_event_queue_info* q = &g_sys_event_queues[qidx - 1];
-        if (!q->active) continue;
-        sys_event_t evt;
-        evt.source = p->name;
-        evt.data1  = data1;
-        evt.data2  = data2;
-        evt.data3  = data3;
-        if (event_queue_push(q, &evt) >= 0) posted++;
-    }
-    evt_table_unlock();
-    return posted;
-}
-
-/* Post a SYS_SPU_THREAD_EVENT_USER event exactly as the lv2 kernel does for an SPU's
- * sys_spu_thread_send_event(spup, data0, data) -- the SPURS kernel uses this to notify the
- * PPU event-helper (SPURuntimeService). Decoded from RPCS3 (SPUThread.cpp / lv2/sys_event.h,
- * docs/14): event = { source=0xFFFFFFFF53505501, data1=spu_lv2_id, data2=(spup<<32)|data0,
- * data3=data }. The PPU helper dispatches by spup (the SPU port) and reads data1 (the SPU
- * thread lv2 id, which it looks up) + data3 (the payload). */
-int sys_spu_thread_post_user_event(uint32_t queue_id, uint64_t spu_lv2_id,
-                                   uint32_t spup, uint32_t data0, uint64_t data)
-{
-    return sys_event_queue_push_by_id(queue_id, 0xFFFFFFFF53505501ull,
-                                      spu_lv2_id,
-                                      ((uint64_t)spup << 32) | (data0 & 0x00FFFFFFu),
-                                      data);
 }
 
 int64_t sys_event_port_send(ppu_context* ctx)
@@ -773,6 +881,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
+    if (getenv("YDKJ_PRODSTACK")) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
+        if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
+            char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
+    if (getenv("YDKJ_NOTIFIER")) { static int _d=0; if(_d++==0){ extern uint32_t vm_read32(uint64_t);
+        fprintf(stderr,"[NOTIFIER-ARRAY] @0x587300..0x5873C0 (each obj: +0x0,+0x4,+0x8=portid,+0xC):\n");
+        for(uint32_t a=0x587300;a<=0x5873C0;a+=0x10) fprintf(stderr,"  0x%08X: %08X %08X %08X %08X\n",a,vm_read32(a),vm_read32(a+4),vm_read32(a+8),vm_read32(a+0xC)); fflush(stderr); } }
     fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
@@ -780,11 +894,34 @@ int64_t sys_event_port_send(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_event_port_info* p = &g_sys_event_ports[port_id - 1];
-    if (!p->active)
+    if (!p->active) {
+        /* YDKJ: cellSpurs (libsre) sends its REAL completion via port_send(port=N)
+         * but creates the port through a path whose id doesn't map to our port slot,
+         * so the port is never "active" here and the real SPURS ready/completion event
+         * (e.g. port=4 data=0/1/0) is dropped -> cellSpursInitialize deadlocks on q=N.
+         * Bridge: if an event QUEUE with the same id is active, deliver the REAL event
+         * to it (not a synthesized payload). This is the genuine completion the title
+         * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
+         * (default ON) can be disabled for A/B. */
+        if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
+                && (!getenv("YDKJ_NO_PORTROUTE"))) {
+            sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
+            sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
+            int rc = event_queue_push(rq, &revt);
+            fprintf(stderr, "[evt] port_send(port=%u): port inactive -> ROUTED real event to queue id=%u (data=0x%llX/0x%llX/0x%llX) rc=%d\n",
+                    port_id, port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3, rc);
+            return (rc < 0) ? (int64_t)(int32_t)CELL_EBUSY : CELL_OK;
+        }
+        fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
-    if (p->connected_queue == 0)
+    if (p->connected_queue == 0) {
+        fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
+    }
+    fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+            port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;
     if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX)
@@ -800,7 +937,32 @@ int64_t sys_event_port_send(ppu_context* ctx)
     evt.data2  = data2;
     evt.data3  = data3;
 
+    /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
+     * a "start" queue and waits on the SPU's completion queue (start+1). Re-run
+     * that SPU with the work EA so it produces this frame's result + completion.
+     *
+     * Dispatch BEFORE the push, and skip the push entirely when a sim SPU took
+     * the work: on hardware the SPU thread is what drains its start queue, and we
+     * have no such thread -- so pushing anyway leaves the event queued forever.
+     * The queue then fills after ~190 frames and event_queue_push returns EBUSY,
+     * which the guest asserts on (SpuThreadGroup.cpp:315 ret == CELL_OK). */
+    { extern int spu_dispatch_frame_by_queue(uint32_t, uint32_t);
+      /* Stage the full event for the SPU's sys_spu_thread_receive_event
+       * (stop 0x110): the worker reads back {CELL_OK, data1, data2, data3} and
+       * takes its work-descriptor EA from those, so data2 alone is not enough. */
+      extern uint32_t g_spu_pending_evt[3];
+      extern int      g_spu_pending_evt_valid;
+      g_spu_pending_evt[0] = (uint32_t)data1;
+      g_spu_pending_evt[1] = (uint32_t)data2;
+      g_spu_pending_evt[2] = (uint32_t)data3;
+      g_spu_pending_evt_valid = 1;
+      if (spu_dispatch_frame_by_queue((uint32_t)qidx + 1, (uint32_t)data2))
+          return CELL_OK;
+      g_spu_pending_evt_valid = 0; }
+
     if (event_queue_push(q, &evt) < 0) {
+        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
+                port_id, qidx, 10);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
@@ -861,6 +1023,10 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     if (id_out_addr != 0) {
         write_be32(id_out_addr, flag_id);
     }
+    { char nm[9]; memcpy(nm, f->name, 8); nm[8]=0;
+      for(int i=0;i<8;i++) if(nm[i] && (nm[i]<32||nm[i]>126)) nm[i]='.';
+      fprintf(stderr, "[evt] flag_create id=%u name=\"%s\" init=0x%llX type=%u\n",
+              flag_id, nm, (unsigned long long)init_pattern, f->type); }
 
     evt_table_unlock();
     return CELL_OK;
@@ -915,11 +1081,11 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVF_WAIT id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
+    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
     { static int _w=0; if (_w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
@@ -941,17 +1107,67 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         return CELL_OK;
     }
 
-    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
+    if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
+        { static int _e=0; if(_e++<8) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
 
+    /* YDKJ_F100_OK (diagnostic, env-gated): the game busy-spins ~145k times on
+     * event_flag_wait(flag=100 bits=0x2) with a GARBAGE mode (0x38CAE4) on a
+     * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
+     * (as if the flag were set) breaks the spin and lets the game progress into
+     * real render code. Diagnostic only; identifies whether the spin is the gate. */
+    { static int s_f = -1; if (s_f < 0) s_f = getenv("YDKJ_F100_OK") ? 1 : 0;
+      if (s_f && !g_sys_event_flags[flag_id-1].active) {
+        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] YDKJ_F100_OK: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
+        return CELL_OK;
+      } }
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
-    if (!f->active)
+    if (!f->active) {
+        { static int _e=0; if(_e++<8) {
+            uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
+            fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
+            /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
+            if (r29 && r29 < 0x10000000u) { uint8_t* p=(uint8_t*)vm_to_host(r29);
+              fprintf(stderr,"     [r29+0x00..0x30]:"); for(int i=0;i<0x34;i+=4) fprintf(stderr," %02X%02X%02X%02X",p[i],p[i+1],p[i+2],p[i+3]); fprintf(stderr,"\n"); }
+        } }
+        /* Titles busy-wait on a not-yet-created (or, via the 141/142 syscall
+         * collision, a usleep-that-lands-here) flag, hot-spinning at 100% and
+         * starving the RSX FIFO-drain / producer thread that would satisfy the
+         * condition -- making progress timing-dependent (e.g. rubberducky's
+         * cellGcmFinish ref-sync). Yield so the busy-wait is cooperative and the
+         * other thread gets to run; still returns ESRCH. ponytail: a scheduling
+         * yield, not a semantic change; the real fix is the syscall-number table. */
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
         return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    { extern void thrdiag_wait(const char*, uint32_t); thrdiag_wait("evflag", flag_id); }
+    /* YDKJ_FORCE_EVF (diagnostic): the game's init blocks polling event_flag
+     * (flag=100 bits=0x2) for a subsystem/SPU completion that our HLE never fires,
+     * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
+     * bits) to see if the game advances into its real render/content code. Blunt;
+     * identifies the gate. */
+    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("YDKJ_FORCE_EVF") ? 1 : 0;
+      if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
+        static int _n = 0; if (_n++ < 20)
+            fprintf(stderr, "[evt] YDKJ_FORCE_EVF: force-satisfy flag=%u bits=0x%llX mode=%u\n",
+                    flag_id, (unsigned long long)bitpat, mode);
+#ifdef _WIN32
+        EnterCriticalSection(&f->lock); f->pattern |= bitpat; LeaveCriticalSection(&f->lock);
+#else
+        pthread_mutex_lock(&f->lock); f->pattern |= bitpat; pthread_mutex_unlock(&f->lock);
+#endif
+      } }
+
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 
@@ -959,10 +1175,29 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
         }
-        { extern void thrdiag_wake(void); thrdiag_wake(); }
+    } else if (timeout_us < 1000) {
+        /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
+         * floored-to-1ms condvar wait. Safe to poll: f->pattern only changes
+         * under f->lock (sys_event_flag_set/clear), so yielding with the lock
+         * dropped never misses a committed pattern change -- it just re-reads
+         * the latest value on the next lock acquisition. */
+        int64_t deadline = lv2_usec_deadline(timeout_us);
+        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            if (lv2_deadline_passed(deadline)) {
+                /* Write current pattern even on timeout */
+                if (result_addr != 0) {
+                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                    *out = bswap64(f->pattern);
+                }
+                LeaveCriticalSection(&f->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            }
+            LeaveCriticalSection(&f->lock);
+            SwitchToThread();
+            EnterCriticalSection(&f->lock);
+        }
     } else {
         DWORD ms = (DWORD)(timeout_us / 1000);
-        if (ms == 0) ms = 1;
         while (!flag_check(f->pattern, bitpat, mode) && f->active) {
             if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
                 if (GetLastError() == ERROR_TIMEOUT) {
@@ -1098,9 +1333,11 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
 
 int64_t sys_event_flag_set(ppu_context* ctx)
 {
-    { static int _st=-1; if(_st<0)_st=getenv("YDKJ_SYNCTRACE")?1:0; if(_st) fprintf(stderr,"[SYNC] tid=%lu EVF_SET id=0x%X\n",(unsigned long)GetCurrentThreadId(),(unsigned)(uint32_t)ctx->gpr[3]); }
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
+
+    { static int _n=0; if(_n++<200) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+        flag_id,(unsigned long long)bitpat); }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -1122,6 +1359,30 @@ int64_t sys_event_flag_set(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+/* YDKJ diag (YDKJ_CRI_WAKE): the cri_mpv SPU task completes but the SPU->PPU
+ * completion (cellSpursEventFlagSet) isn't propagated, so the game blocks in
+ * event_flag_wait forever (black screen). As a probe, set all bits on every
+ * active event flag with a waiter -> wake any completion-waiter, to see if the
+ * game then advances to draw content. Blunt; identifies the gate, not a real fix. */
+void ydkj_wake_all_event_flags(void)
+{
+    for (int i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
+        sys_event_flag_info* f = &g_sys_event_flags[i];
+        if (!f->active) continue;
+#ifdef _WIN32
+        EnterCriticalSection(&f->lock);
+        f->pattern |= 0xFFFFFFFFFFFFFFFFull;
+        WakeAllConditionVariable(&f->cv);
+        LeaveCriticalSection(&f->lock);
+#else
+        pthread_mutex_lock(&f->lock);
+        f->pattern |= 0xFFFFFFFFFFFFFFFFull;
+        pthread_cond_broadcast(&f->cv);
+        pthread_mutex_unlock(&f->lock);
+#endif
+    }
 }
 
 int64_t sys_event_flag_clear(ppu_context* ctx)

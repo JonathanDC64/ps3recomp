@@ -7,6 +7,7 @@
 #include "cellBGDL.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -42,7 +43,7 @@ s32 cellBgdlGetList(CellBgdlInfo* list, u32 maxEntries, u32* numEntries)
     (void)list; (void)maxEntries;
     if (!s_initialized) return (s32)CELL_BGDL_ERROR_NOT_INITIALIZED;
     if (!numEntries) return (s32)CELL_BGDL_ERROR_INVALID_ARGUMENT;
-    *numEntries = 0; /* no downloads */
+    vm_write32((u32)(uintptr_t)numEntries, (u32)0); /* no downloads */
     return CELL_OK;
 }
 

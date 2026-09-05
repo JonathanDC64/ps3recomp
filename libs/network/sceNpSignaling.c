@@ -8,6 +8,7 @@
 #include "sceNpSignaling.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -57,7 +58,7 @@ s32 sceNpSignalingCreateCtx(const void* npId, SceNpSignalingHandler handler,
             s_ctx[i].in_use = 1;
             s_ctx[i].handler = handler;
             s_ctx[i].handlerArg = arg;
-            *ctxId = (u32)i;
+            vm_write32((u32)(uintptr_t)ctxId, (u32)i);
             return CELL_OK;
         }
     }
@@ -97,9 +98,9 @@ s32 sceNpSignalingGetConnectionStatus(SceNpSignalingCtxId ctxId,
                                         u32* peerAddr, u16* peerPort)
 {
     (void)ctxId; (void)connId;
-    if (connStatus) *connStatus = SCE_NP_SIGNALING_CONN_STATUS_INACTIVE;
-    if (peerAddr) *peerAddr = 0;
-    if (peerPort) *peerPort = 0;
+    if (connStatus) vm_write32((u32)(uintptr_t)connStatus, (u32)SCE_NP_SIGNALING_CONN_STATUS_INACTIVE);
+    if (peerAddr) vm_write32((u32)(uintptr_t)peerAddr, (u32)0);
+    if (peerPort) vm_write16((u32)(uintptr_t)peerPort, (u16)0);
     return CELL_OK;
 }
 
@@ -109,15 +110,17 @@ s32 sceNpSignalingGetConnectionInfo(SceNpSignalingCtxId ctxId,
 {
     (void)ctxId; (void)connId;
     if (!info) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
-    memset(info, 0, sizeof(SceNpSignalingConnectionInfo));
-    info->status = SCE_NP_SIGNALING_CONN_STATUS_INACTIVE;
+    u32 info_ea = (u32)(uintptr_t)info;
+    for (u32 o = 0; o < sizeof(SceNpSignalingConnectionInfo); o += 4)
+        vm_write32(info_ea + o, 0);
+    vm_write32(info_ea, SCE_NP_SIGNALING_CONN_STATUS_INACTIVE);
     return CELL_OK;
 }
 
 s32 sceNpSignalingGetLocalNetInfo(u32* localAddr, u16* localPort)
 {
-    if (localAddr) *localAddr = 0x7F000001; /* 127.0.0.1 */
-    if (localPort) *localPort = 0;
+    if (localAddr) vm_write32((u32)(uintptr_t)localAddr, (u32)0x7F000001); /* 127.0.0.1 */
+    if (localPort) vm_write16((u32)(uintptr_t)localPort, (u16)0);
     return CELL_OK;
 }
 
@@ -126,7 +129,7 @@ s32 sceNpSignalingGetPeerNetInfo(SceNpSignalingCtxId ctxId,
                                    u32* peerAddr, u16* peerPort)
 {
     (void)ctxId; (void)connId;
-    if (peerAddr) *peerAddr = 0;
-    if (peerPort) *peerPort = 0;
+    if (peerAddr) vm_write32((u32)(uintptr_t)peerAddr, (u32)0);
+    if (peerPort) vm_write16((u32)(uintptr_t)peerPort, (u16)0);
     return CELL_OK;
 }

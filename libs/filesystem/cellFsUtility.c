@@ -6,6 +6,7 @@
  */
 
 #include "cellFsUtility.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -21,6 +22,7 @@
 /* Create directory and all parents */
 s32 cellFsUtilMkdirAll(const char* path, u32 mode)
 {
+    path = GUEST_PTR(path, const char*);
     if (!path) return (s32)CELL_FS_UTIL_ERROR_INVALID_ARGUMENT;
 
     char tmp[1024];
@@ -42,18 +44,21 @@ s32 cellFsUtilMkdirAll(const char* path, u32 mode)
 
 s32 cellFsUtilGetFileSize(const char* path, u64* size)
 {
+    path = GUEST_PTR(path, const char*);
     if (!path || !size) return (s32)CELL_FS_UTIL_ERROR_INVALID_ARGUMENT;
 
     struct stat st;
     if (stat(path, &st) != 0)
         return (s32)CELL_FS_UTIL_ERROR_NOT_FOUND;
 
-    *size = (u64)st.st_size;
+    vm_write64((u32)(uintptr_t)size, (u64)st.st_size);
     return CELL_OK;
 }
 
 s32 cellFsUtilReadFile(const char* path, void* buf, u64 bufSize, u64* bytesRead)
 {
+    buf = GUEST_PTR(buf, void*);
+    path = GUEST_PTR(path, const char*);
     if (!path || !buf) return (s32)CELL_FS_UTIL_ERROR_INVALID_ARGUMENT;
 
     FILE* f = fopen(path, "rb");
@@ -62,12 +67,14 @@ s32 cellFsUtilReadFile(const char* path, void* buf, u64 bufSize, u64* bytesRead)
     size_t n = fread(buf, 1, (size_t)bufSize, f);
     fclose(f);
 
-    if (bytesRead) *bytesRead = (u64)n;
+    if (bytesRead) vm_write64((u32)(uintptr_t)bytesRead, (u64)n);
     return CELL_OK;
 }
 
 s32 cellFsUtilWriteFile(const char* path, const void* buf, u64 size, u64* bytesWritten)
 {
+    buf = GUEST_PTR(buf, const void*);
+    path = GUEST_PTR(path, const char*);
     if (!path || !buf) return (s32)CELL_FS_UTIL_ERROR_INVALID_ARGUMENT;
 
     FILE* f = fopen(path, "wb");
@@ -76,12 +83,14 @@ s32 cellFsUtilWriteFile(const char* path, const void* buf, u64 size, u64* bytesW
     size_t n = fwrite(buf, 1, (size_t)size, f);
     fclose(f);
 
-    if (bytesWritten) *bytesWritten = (u64)n;
+    if (bytesWritten) vm_write64((u32)(uintptr_t)bytesWritten, (u64)n);
     return CELL_OK;
 }
 
 s32 cellFsUtilCopyFile(const char* srcPath, const char* dstPath)
 {
+    dstPath = GUEST_PTR(dstPath, const char*);
+    srcPath = GUEST_PTR(srcPath, const char*);
     if (!srcPath || !dstPath) return (s32)CELL_FS_UTIL_ERROR_INVALID_ARGUMENT;
 
     FILE* src = fopen(srcPath, "rb");
@@ -106,6 +115,7 @@ s32 cellFsUtilCopyFile(const char* srcPath, const char* dstPath)
 
 s32 cellFsUtilExists(const char* path)
 {
+    path = GUEST_PTR(path, const char*);
     if (!path) return 0;
     struct stat st;
     return (stat(path, &st) == 0) ? 1 : 0;

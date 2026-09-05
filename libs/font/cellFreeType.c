@@ -8,6 +8,7 @@
 #include "cellFreeType.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* Internal state */
 
@@ -26,7 +27,7 @@ s32 cellFreeTypeInit(const CellFreeTypeConfig* config, CellFreeTypeLibrary* lib)
 
     s_initialized = 1;
     s_lib = 1;
-    if (lib) *lib = s_lib;
+    if (lib) vm_write32((u32)(uintptr_t)lib, s_lib);
     return CELL_OK;
 }
 
@@ -44,9 +45,9 @@ s32 cellFreeTypeGetVersion(CellFreeTypeVersion* version)
     if (!version) return (s32)CELL_FREETYPE_ERROR_INVALID_ARGUMENT;
 
     /* PS3 firmware 4.x ships FreeType 2.4.12 */
-    version->major = 2;
-    version->minor = 4;
-    version->patch = 12;
+    vm_write32((u32)(uintptr_t)version + 0, 2);    /* major */
+    vm_write32((u32)(uintptr_t)version + 4, 4);    /* minor */
+    vm_write32((u32)(uintptr_t)version + 8, 12);   /* patch */
     return CELL_OK;
 }
 
@@ -54,6 +55,6 @@ s32 cellFreeTypeGetLibrary(CellFreeTypeLibrary* lib)
 {
     if (!lib) return (s32)CELL_FREETYPE_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FREETYPE_ERROR_NOT_INITIALIZED;
-    *lib = s_lib;
+    vm_write32((u32)(uintptr_t)lib, s_lib);
     return CELL_OK;
 }

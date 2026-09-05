@@ -8,8 +8,11 @@
  */
 
 #include "cellSail.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
+#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 
 /* Internal state */
 
@@ -64,7 +67,7 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
             s_players[i].state = CELL_SAIL_PLAYER_STATE_INITIALIZED;
             s_players[i].callback = callback;
             s_players[i].callbackArg = callbackArg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);   /* guest out-param */
             return CELL_OK;
         }
     }
@@ -141,7 +144,7 @@ s32 cellSailPlayerGetState(CellSailPlayerHandle handle, s32* state)
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!state) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    *state = s_players[handle].state;
+    vm_write32((u32)(uintptr_t)state, (u32)s_players[handle].state);
     return CELL_OK;
 }
 
@@ -150,7 +153,7 @@ s32 cellSailPlayerGetStreamNum(CellSailPlayerHandle handle, u32* streamNum)
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (!streamNum) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    *streamNum = 0; /* no streams in stub */
+    vm_write32((u32)(uintptr_t)streamNum, 0);   /* no streams in stub */
     return CELL_OK;
 }
 
@@ -164,17 +167,17 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
     return (s32)CELL_SAIL_ERROR_NOT_FOUND;
 }
 
-s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index)
+s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index;
+    (void)index; (void)adapter;
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
 }
 
-s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index)
+s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index;
+    (void)index; (void)adapter;
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
@@ -195,13 +198,14 @@ s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle)
     return (s_players[handle].state == CELL_SAIL_PLAYER_STATE_PAUSE) ? 1 : 0;
 }
 
-s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode)
+s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command)
 {
-    (void)repeatMode;
+    (void)command;
     printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return CELL_OK;
+    /* Real ABI returns the (now-set) repeat mode in r3, not an error code. */
+    return repeatMode;
 }
 
 /* ---------------------------------------------------------------------------
@@ -220,11 +224,13 @@ typedef struct {
 static SailDescriptor s_descs[MAX_DESCRIPTORS];
 
 s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
-                                     s32 streamType, void* arg,
+                                     s32 streamType, void* mediaInfo,
+                                     char* uri,
                                      CellSailDescriptorHandle* desc)
 {
-    (void)arg;
-    printf("[cellSail] CreateDescriptor(player=%u, type=%d)\n", handle, streamType);
+    (void)mediaInfo;
+    printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
+           streamType, uri ? uri : "null");
     if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
@@ -233,7 +239,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
             s_descs[i].in_use = 1;
             s_descs[i].streamType = streamType;
             s_descs[i].player = handle;
-            *desc = (u32)i;
+            vm_write32((u32)(uintptr_t)desc, (u32)i);   /* guest out-param */
             return CELL_OK;
         }
     }
@@ -290,7 +296,7 @@ s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type)
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !type)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    *type = s_descs[desc].streamType;
+    vm_write32((u32)(uintptr_t)type, (u32)s_descs[desc].streamType);
     return CELL_OK;
 }
 
@@ -306,22 +312,99 @@ s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLe
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !uri)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    strncpy(uri, s_descs[desc].uri, maxLen - 1);
+    strncpy(GUEST_PTR(uri, char*), s_descs[desc].uri, maxLen - 1);
     uri[maxLen - 1] = '\0';
     return CELL_OK;
 }
 
 /* Memory allocator */
 
-s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
-                                     void* (*allocFunc)(void*, u32, u32),
-                                     void  (*freeFunc)(void*, u32, void*),
-                                     void* arg)
+/* cellSailPlayerInitialize2(pSelf, pAllocator, pCallback, pUserParam,
+ *                          pAttribute, pResource)  -- NID 0x23654375
+ *
+ * This was unimplemented, so it took the generic "return success and touch
+ * nothing" path. That is the worst answer for an initialiser: the guest
+ * believes its player struct is set up and reads whatever happened to be in
+ * that memory. Tokyo Jungle then dereferenced one of those stale words and
+ * faulted reading guest 0x10F000B4, well past the end of main memory.
+ *
+ * The struct fields are not documented here, and guessing offsets to write
+ * would just trade one wrong value for another. What IS safe and sufficient is
+ * to ZERO it: every pointer the guest reads out is then NULL, which callers
+ * check, instead of a garbage address that faults. The handles we were given
+ * are kept on our side, keyed by the struct EA, so no guest layout is assumed.
+ */
+#define SAIL_PLAYER_CLEAR   0x200u   /* well clear of the caller's next object */
+#define SAIL_ADAPTER_CLEAR  0x100u
+
+static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; }
+    s_sail_players[CELL_SAIL_PLAYER_MAX];
+
+static void sail_zero_guest(u32 ea, u32 n)
 {
-    printf("[cellSail] MemAllocatorInitialize()\n");
-    if (!allocator) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    allocator->alloc = allocFunc;
-    allocator->free = freeFunc;
-    allocator->arg = arg;
+    for (u32 i = 0; i < n; i += 4) vm_write32(ea + i, 0);
+}
+
+s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
+                              u32 pUserParam, u32 pAttribute, u32 pResource)
+{
+    (void)pAttribute; (void)pResource;
+    printf("[cellSail] PlayerInitialize2(self=0x%08X alloc=0x%08X cb=0x%08X)\n",
+           pSelf, pAllocator, pCallback);
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+
+    /* PS3_NO_SAIL=1: report that the player cannot be created. On hardware
+     * this call spawns the SAIL player's own worker threads, and a title that
+     * then waits for one of them to signal readiness will wait forever against
+     * a stub that spawns nothing. Failing cleanly lets a title take its
+     * "no video" path instead of deadlocking during setup. */
+    if (getenv("PS3_NO_SAIL")) {
+        printf("[cellSail] PS3_NO_SAIL -- reporting player creation failure\n");
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    }
+
+    sail_zero_guest(pSelf, SAIL_PLAYER_CLEAR);
+
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
+        if (!s_sail_players[i].in_use) {
+            s_sail_players[i].in_use       = 1;
+            s_sail_players[i].self_ea      = pSelf;
+            s_sail_players[i].allocator_ea = pAllocator;
+            s_sail_players[i].callback_ea  = pCallback;
+            s_sail_players[i].arg_ea       = pUserParam;
+            break;
+        }
+    }
+    return CELL_OK;
+}
+
+/* cellSailSoundAdapterInitialize(pSelf, pCallbacks, pArg) -- NID 0x3D0D3B72.
+ * Same reasoning: zero it rather than leave the guest reading stale memory. */
+s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
+{
+    printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
+           pSelf, pCallbacks);
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    return CELL_OK;
+}
+
+s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
+                                     CellSailMemAllocatorFuncs* pFuncs)
+{
+    /* Both parameters are GUEST addresses, and both structs live in GUEST
+     * memory with 32-bit big-endian pointers. Dereferencing them as host
+     * structs was wrong twice over: the address was never translated, and the
+     * host struct has 64-bit fields, so even the offsets did not line up. The
+     * values stored here are guest OPD addresses that SAIL calls back into. */
+    u32 alloc_ea = (u32)(uintptr_t)allocator;
+    u32 funcs_ea = (u32)(uintptr_t)pFuncs;
+    printf("[cellSail] MemAllocatorInitialize(allocator=0x%08X funcs=0x%08X)\n",
+           alloc_ea, funcs_ea);
+    if (!alloc_ea) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (funcs_ea) {
+        vm_write32(alloc_ea + 0, vm_read32(funcs_ea + 0));   /* pAlloc */
+        vm_write32(alloc_ea + 4, vm_read32(funcs_ea + 4));   /* pFree  */
+    }
     return CELL_OK;
 }

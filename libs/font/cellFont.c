@@ -7,6 +7,7 @@
  */
 
 #include "cellFont.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,11 +77,98 @@ static FontSlot* font_alloc_slot(void)
     return NULL;
 }
 
+
+/* ---------------------------------------------------------------------------
+ * Guest struct marshalling
+ *
+ * The structs in cellFont.h are HOST layout and are not what the title has in
+ * memory: CellFontRenderSurface and CellFontGlyphImage lead with an 8-byte host
+ * pointer where the guest has 4, and every u32/float field is big-endian on the
+ * guest side. So a pointer translation alone is not enough -- casting a guest EA
+ * to CellFontGlyphMetrics* and storing floats through it writes little-endian
+ * values at the wrong offsets, which is how a title reads a glyph advance of
+ * 4.6e-41 and lays every string out on top of itself.
+ *
+ * The render/metrics bodies keep working on host structs; these move them in and
+ * out. Offsets are the guest ABI, listed explicitly so they cannot drift with a
+ * host compiler's padding.
+ * -----------------------------------------------------------------------*/
+enum {
+    FONT_O_HANDLE = 0,  FONT_O_TYPE = 4,  FONT_O_SCALEX = 8, FONT_O_SCALEY = 12,
+    SURF_O_BUFFER = 0,  SURF_O_WIDTHBYTE = 4, SURF_O_PIXELSIZE = 8,
+    SURF_O_WIDTH  = 12, SURF_O_HEIGHT = 16,
+    IMG_O_BUFFER  = 0,  IMG_O_WIDTHBYTE = 4,  IMG_O_PIXELSIZE = 8,
+    IMG_O_WIDTH   = 12, IMG_O_HEIGHT = 16,
+    LAY_O_BASELINEY = 0, LAY_O_LINEHEIGHT = 4, LAY_O_EFFECTHEIGHT = 8
+};
+
+#define FONT_EA(p) ((u32)(uintptr_t)(p))
+
+/* CellFontGlyphMetrics is eight consecutive floats in guest order. */
+static void font_metrics_store(CellFontGlyphMetrics* guest_ea,
+                               const CellFontGlyphMetrics* h)
+{
+    u32 ea = FONT_EA(guest_ea);
+    if (!ea) return;
+    vm_write_f32(ea +  0, h->width);
+    vm_write_f32(ea +  4, h->height);
+    vm_write_f32(ea +  8, h->h_bearing_x);
+    vm_write_f32(ea + 12, h->h_bearing_y);
+    vm_write_f32(ea + 16, h->h_advance);
+    vm_write_f32(ea + 20, h->v_bearing_x);
+    vm_write_f32(ea + 24, h->v_bearing_y);
+    vm_write_f32(ea + 28, h->v_advance);
+}
+
+static void font_surface_load(CellFontRenderSurface* h,
+                              const CellFontRenderSurface* guest_ea)
+{
+    u32 ea = FONT_EA(guest_ea);
+    memset(h, 0, sizeof(*h));
+    if (!ea) return;
+    u32 buf = vm_read32(ea + SURF_O_BUFFER);
+    h->buffer        = buf ? (u8*)(vm_base + buf) : NULL;
+    h->widthByte     = (s32)vm_read32(ea + SURF_O_WIDTHBYTE);
+    h->pixelSizeByte = (s32)vm_read32(ea + SURF_O_PIXELSIZE);
+    h->width         = (s32)vm_read32(ea + SURF_O_WIDTH);
+    h->height        = (s32)vm_read32(ea + SURF_O_HEIGHT);
+}
+
+/* buffer is left as the title set it -- we render into the surface, never
+ * hand back a buffer of our own. */
+static void font_image_store(CellFontGlyphImage* guest_ea,
+                             s32 widthByte, s32 pixelSizeByte, s32 w, s32 hgt)
+{
+    u32 ea = FONT_EA(guest_ea);
+    if (!ea) return;
+    vm_write32(ea + IMG_O_BUFFER,    0);
+    vm_write32(ea + IMG_O_WIDTHBYTE, (u32)widthByte);
+    vm_write32(ea + IMG_O_PIXELSIZE, (u32)pixelSizeByte);
+    vm_write32(ea + IMG_O_WIDTH,     (u32)w);
+    vm_write32(ea + IMG_O_HEIGHT,    (u32)hgt);
+}
+
+static void font_store(CellFont* guest_ea, u32 handle, u32 type,
+                       float sx, float sy)
+{
+    u32 ea = FONT_EA(guest_ea);
+    if (!ea) return;
+    vm_write32(ea + FONT_O_HANDLE, handle);
+    vm_write32(ea + FONT_O_TYPE,   type);
+    vm_write_f32(ea + FONT_O_SCALEX, sx);
+    vm_write_f32(ea + FONT_O_SCALEY, sy);
+}
+
 static FontSlot* font_get_slot(CellFont* font)
 {
-    if (!font || font->handle >= CELL_FONT_MAX_OPENED)
+    /* font is a guest EA; the handle is the big-endian word at +0. */
+    u32 ea = FONT_EA(font);
+    if (!ea)
         return NULL;
-    FontSlot* slot = &s_fonts[font->handle];
+    u32 handle = vm_read32(ea + FONT_O_HANDLE);
+    if (handle >= CELL_FONT_MAX_OPENED)
+        return NULL;
+    FontSlot* slot = &s_fonts[handle];
     if (!slot->in_use)
         return NULL;
     return slot;
@@ -133,6 +221,7 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
 {
     (void)subNum;
     (void)uniqueId;
+    fontPath = GUEST_PTR(fontPath, const char*);
     printf("[cellFont] OpenFontFile(%s)\n", fontPath ? fontPath : "(null)");
 
     if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
@@ -174,10 +263,7 @@ s32 cellFontOpenFontFile(CellFont* font, const char* fontPath, u32 subNum, s32 u
     }
 #endif
 
-    font->handle = (u32)(slot - s_fonts);
-    font->type = 0;
-    font->scale_x = 1.0f;
-    font->scale_y = 1.0f;
+    font_store(font, (u32)(slot - s_fonts), 0, 1.0f, 1.0f);
 
     return CELL_OK;
 }
@@ -194,7 +280,7 @@ s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 s
     FontSlot* slot = font_alloc_slot();
     if (!slot) return CELL_FONT_ERROR_ALLOCATION_FAILED;
 
-    slot->font_data = (u8*)data; /* borrowed pointer */
+    slot->font_data = GUEST_PTR(data, u8*); /* borrowed guest buffer */
     slot->font_data_size = dataSize;
     slot->font_data_owned = 0;
 
@@ -207,10 +293,7 @@ s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 s
     }
 #endif
 
-    font->handle = (u32)(slot - s_fonts);
-    font->type = 0;
-    font->scale_x = 1.0f;
-    font->scale_y = 1.0f;
+    font_store(font, (u32)(slot - s_fonts), 0, 1.0f, 1.0f);
 
     return CELL_OK;
 }
@@ -218,7 +301,8 @@ s32 cellFontOpenFontMemory(CellFont* font, const void* data, u32 dataSize, u32 s
 s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* font)
 {
     (void)lib;
-    printf("[cellFont] OpenFontset(type=0x%X)\n", fontType ? fontType->type : 0);
+    u32 want_type = fontType ? vm_read32(FONT_EA(fontType)) : 0;
+    printf("[cellFont] OpenFontset(type=0x%X)\n", want_type);
 
     if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
     if (!font) return CELL_FONT_ERROR_INVALID_PARAMETER;
@@ -228,12 +312,9 @@ s32 cellFontOpenFontset(CellFontLibrary lib, CellFontType* fontType, CellFont* f
     FontSlot* slot = font_alloc_slot();
     if (!slot) return CELL_FONT_ERROR_ALLOCATION_FAILED;
 
-    slot->type = fontType ? fontType->type : 0;
+    slot->type = want_type;
 
-    font->handle = (u32)(slot - s_fonts);
-    font->type = slot->type;
-    font->scale_x = 1.0f;
-    font->scale_y = 1.0f;
+    font_store(font, (u32)(slot - s_fonts), slot->type, 1.0f, 1.0f);
 
     return CELL_OK;
 }
@@ -267,7 +348,7 @@ s32 cellFontCreateRenderer(CellFontLibrary lib, CellFontRenderer* renderer)
     for (u32 i = 0; i < CELL_FONT_MAX_RENDERERS; i++) {
         if (!s_renderers[i].in_use) {
             s_renderers[i].in_use = 1;
-            *renderer = i;
+            vm_write32(FONT_EA(renderer), i);
             return CELL_OK;
         }
     }
@@ -320,8 +401,8 @@ s32 cellFontSetScalePixel(CellFont* font, float w, float h)
 
     slot->scale_x = w;
     slot->scale_y = h;
-    font->scale_x = w;
-    font->scale_y = h;
+    vm_write_f32(FONT_EA(font) + FONT_O_SCALEX, w);
+    vm_write_f32(FONT_EA(font) + FONT_O_SCALEY, h);
 
     return CELL_OK;
 }
@@ -355,25 +436,29 @@ s32 cellFontGetHorizontalLayout(CellFont* font, CellFontHorizontalLayout* layout
         float scale = font_get_stb_scale(slot);
         int ascent, descent, lineGap;
         stbtt_GetFontVMetrics(&slot->stb_info, &ascent, &descent, &lineGap);
-        layout->baseLineY    = (float)ascent * scale;
-        layout->lineHeight   = (float)(ascent - descent + lineGap) * scale;
-        layout->effectHeight = (float)(ascent - descent) * scale;
+        vm_write_f32(FONT_EA(layout) + LAY_O_BASELINEY, (float)ascent * scale);
+        vm_write_f32(FONT_EA(layout) + LAY_O_LINEHEIGHT,
+                     (float)(ascent - descent + lineGap) * scale);
+        vm_write_f32(FONT_EA(layout) + LAY_O_EFFECTHEIGHT,
+                     (float)(ascent - descent) * scale);
         return CELL_OK;
     }
 #endif
 
     /* Fallback: reasonable defaults based on scale */
-    layout->baseLineY    = slot->scale_y * 0.8f;
-    layout->lineHeight   = slot->scale_y * 1.2f;
-    layout->effectHeight = slot->scale_y;
+    vm_write_f32(FONT_EA(layout) + LAY_O_BASELINEY,    slot->scale_y * 0.8f);
+    vm_write_f32(FONT_EA(layout) + LAY_O_LINEHEIGHT,   slot->scale_y * 1.2f);
+    vm_write_f32(FONT_EA(layout) + LAY_O_EFFECTHEIGHT, slot->scale_y);
     return CELL_OK;
 }
 
-s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
-                                       CellFontGlyphMetrics* metrics)
+/* Fills a HOST metrics struct. cellFontGetRenderCharGlyphMetrics is the
+ * marshalling wrapper; cellFontRenderCharGlyphImage wants the host copy
+ * anyway and would otherwise write the guest struct then read it back. */
+static s32 font_metrics_host(CellFont* font, u32 code,
+                             CellFontGlyphMetrics* metrics)
 {
     if (!s_font_initialized) return CELL_FONT_ERROR_UNINITIALIZED;
-    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
 
     FontSlot* slot = font_get_slot(font);
     if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
@@ -418,19 +503,32 @@ s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
     return CELL_OK;
 }
 
+s32 cellFontGetRenderCharGlyphMetrics(CellFont* font, u32 code,
+                                       CellFontGlyphMetrics* metrics)
+{
+    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
+    CellFontGlyphMetrics h;
+    s32 rc = font_metrics_host(font, code, &h);
+    if (rc == (s32)CELL_OK) font_metrics_store(metrics, &h);
+    return rc;
+}
+
 s32 cellFontGetRenderCharGlyphMetricsVertical(CellFont* font, u32 code,
                                                CellFontGlyphMetrics* metrics)
 {
     /* Vertical metrics: use horizontal metrics as base, swap axes */
-    s32 rc = cellFontGetRenderCharGlyphMetrics(font, code, metrics);
+    if (!metrics) return CELL_FONT_ERROR_INVALID_PARAMETER;
+    CellFontGlyphMetrics h;
+    s32 rc = font_metrics_host(font, code, &h);
     if (rc != (s32)CELL_OK) return rc;
 
     /* Swap horizontal/vertical bearings for vertical layout */
     float tmp;
-    tmp = metrics->h_bearing_x; metrics->h_bearing_x = metrics->v_bearing_x; metrics->v_bearing_x = tmp;
-    tmp = metrics->h_bearing_y; metrics->h_bearing_y = metrics->v_bearing_y; metrics->v_bearing_y = tmp;
-    tmp = metrics->h_advance;   metrics->h_advance = metrics->v_advance;     metrics->v_advance = tmp;
+    tmp = h.h_bearing_x; h.h_bearing_x = h.v_bearing_x; h.v_bearing_x = tmp;
+    tmp = h.h_bearing_y; h.h_bearing_y = h.v_bearing_y; h.v_bearing_y = tmp;
+    tmp = h.h_advance;   h.h_advance   = h.v_advance;   h.v_advance   = tmp;
 
+    font_metrics_store(metrics, &h);
     return CELL_OK;
 }
 
@@ -445,13 +543,16 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
     FontSlot* slot = font_get_slot(font);
     if (!slot) return CELL_FONT_ERROR_INVALID_PARAMETER;
 
-    /* Get metrics if requested */
-    CellFontGlyphMetrics local_metrics;
-    if (!metrics) metrics = &local_metrics;
-    cellFontGetRenderCharGlyphMetrics(font, code, metrics);
+    /* Work from a host copy; hand the title its own if it asked. */
+    CellFontGlyphMetrics hm;
+    font_metrics_host(font, code, &hm);
+    if (metrics) font_metrics_store(metrics, &hm);
+
+    CellFontRenderSurface hs;
+    font_surface_load(&hs, surface);
 
 #if FONT_HAS_STB
-    if (slot->stb_valid && surface && surface->buffer) {
+    if (slot->stb_valid && hs.buffer) {
         float scale = font_get_stb_scale(slot);
         int glyph = stbtt_FindGlyphIndex(&slot->stb_info, (int)code);
         if (glyph == 0) goto done;
@@ -462,20 +563,20 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
         if (!bitmap) goto done;
 
         /* Blit glyph bitmap to surface */
-        int dx = (int)(x + metrics->h_bearing_x);
-        int dy = (int)(y - metrics->h_bearing_y);
+        int dx = (int)(x + hm.h_bearing_x);
+        int dy = (int)(y - hm.h_bearing_y);
 
         for (int row = 0; row < bh; row++) {
             int sy = dy + row;
-            if (sy < 0 || sy >= surface->height) continue;
+            if (sy < 0 || sy >= hs.height) continue;
             for (int col = 0; col < bw; col++) {
                 int sx = dx + col;
-                if (sx < 0 || sx >= surface->width) continue;
+                if (sx < 0 || sx >= hs.width) continue;
                 u8 alpha = bitmap[row * bw + col];
                 if (alpha > 0) {
-                    int offset = sy * surface->widthByte + sx * surface->pixelSizeByte;
+                    int offset = sy * hs.widthByte + sx * hs.pixelSizeByte;
                     /* Alpha-blend (simple overwrite for alpha-only surface) */
-                    surface->buffer[offset] = alpha;
+                    hs.buffer[offset] = alpha;
                 }
             }
         }
@@ -483,13 +584,8 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
         stbtt_FreeBitmap(bitmap, NULL);
 
         /* Fill image output if requested */
-        if (image) {
-            image->buffer = NULL; /* rendering was done directly to surface */
-            image->width = bw;
-            image->height = bh;
-            image->widthByte = bw;
-            image->pixelSizeByte = 1;
-        }
+        if (image)
+            font_image_store(image, bw, 1, bw, bh);
 
         return CELL_OK;
     }
@@ -498,11 +594,8 @@ s32 cellFontRenderCharGlyphImage(CellFont* font, u32 code,
 done:
     /* Fallback: empty glyph */
     if (image) {
-        image->buffer = NULL;
-        image->width = (s32)metrics->width;
-        image->height = (s32)metrics->height;
-        image->widthByte = (s32)metrics->width;
-        image->pixelSizeByte = 1;
+        font_image_store(image, (s32)hm.width, 1,
+                         (s32)hm.width, (s32)hm.height);
     }
 
     return CELL_OK;

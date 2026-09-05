@@ -48,6 +48,41 @@ extern "C" {
 #define VM_STACK_REGION     0x10000000u      /* 256 MB stack region */
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
+
+/* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
+ * the control register (put/get/ref) and the IO<->EA offset tables. These must
+ * NOT sit inside main memory, because that is where the title's own allocator
+ * hands out blocks: flOw's heap runs 0x00C00000..0x0D000000, which swallowed the
+ * old 0x03000000 home. The game memset straight over the control register, our
+ * FIFO drain then read ASCII text as `put` (0x3D3D3D0F -- "===" from a log
+ * banner), walked `get` into unmapped IO and resynchronised away whole frames of
+ * commands. Nothing was drawn and nothing said why.
+ *
+ * 0x20000000 is unclaimed by the map above: past RSX (ends 0x20000000) and well
+ * below the raw-SPU windows (0x30000000). The title only ever learns these
+ * addresses through cellGcmGetLabelAddress / cellGcmGetControlRegister, so the
+ * value is free to move as long as every user goes through this base. */
+/* No fixed value works for every title. 0x03000000 was the original home until
+ * flOw's heap grew over it; 0x20000000 replaced it and Gran Turismo 5 Prologue
+ * maps its own 174 MB heap there (cellGcmMapMainMemory(0x20000000, 0xAE00000)),
+ * so the GCM window and its 16 KB of offset tables landed on the game's own
+ * allocations and quietly destroyed them. The same failure, one address along.
+ *
+ * So it is a variable, not a constant: a port that knows its title's memory map
+ * assigns ppu_hle_inject_base before it runs any guest code, and everything
+ * derived from VM_HLE_INJECT_BASE follows. The default is the historical value.
+ * The window needs 0x8000 bytes and the title only ever learns these addresses
+ * through cellGcmGetLabelAddress / cellGcmGetControlRegister /
+ * cellGcmGetOffsetTable, so it is free to move. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern uint32_t ppu_hle_inject_base;
+#ifdef __cplusplus
+}
+#endif
+#define VM_HLE_INJECT_BASE  ppu_hle_inject_base
+
 #define VM_PAGE_SIZE        0x00001000u      /* 4 KB page size */
 
 /* Align a value up to `align` (must be power of 2) */

@@ -6,6 +6,7 @@
  */
 
 #include "cellFiber.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -14,6 +15,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
+/* Darwin marks the ucontext routines deprecated and hides them unless
+ * _XOPEN_SOURCE is defined before the header is pulled in. */
+#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
+#  define _XOPEN_SOURCE 600
+#endif
 #include <ucontext.h>
 #endif
 
@@ -162,12 +168,20 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
     f->state = CELL_FIBER_STATE_INITIALIZED;
     f->stack_size = CELL_FIBER_DEFAULT_STACK_SIZE;
 
+    /* CellFiberAttribute is { const char* name; u32 priority; u32 stackSize; }.
+     * The guest lays that out as three 4-byte fields; the host struct leads with
+     * an 8-byte pointer, so a cast would read priority and stackSize from the
+     * wrong offsets even after the address is translated. */
     if (attr) {
-        if (attr->stackSize > 0)
-            f->stack_size = attr->stackSize;
-        if (attr->name)
-            strncpy(f->name, attr->name, sizeof(f->name) - 1);
-        f->priority = attr->priority;
+        u32 attr_ea    = (u32)(uintptr_t)attr;
+        u32 name_ea    = vm_read32(attr_ea + 0);
+        u32 priority   = vm_read32(attr_ea + 4);
+        u32 stack_size = vm_read32(attr_ea + 8);
+        if (stack_size > 0)
+            f->stack_size = stack_size;
+        if (name_ea)
+            strncpy(f->name, (const char*)(vm_base + name_ea), sizeof(f->name) - 1);
+        f->priority = priority;
     }
 
     printf("[cellFiber] CreateFiber(id=%d, name=%s, stack=%u)\n",
@@ -194,7 +208,7 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
                 (int)(idx & 0xFFFF), (int)(idx >> 16));
 #endif
 
-    *fiber = (CellFiber)idx;
+    vm_write32((u32)(uintptr_t)fiber, (u32)idx);
     return CELL_OK;
 }
 
@@ -302,7 +316,7 @@ s32 cellFiberPpuGetCurrentFiber(CellFiber* fiber)
     if (s_current_fiber < 0)
         return (s32)CELL_FIBER_ERROR_PERM;
 
-    *fiber = (CellFiber)s_current_fiber;
+    vm_write32((u32)(uintptr_t)fiber, (u32)s_current_fiber);
     return CELL_OK;
 }
 
@@ -315,7 +329,7 @@ s32 cellFiberPpuGetFiberState(CellFiber fiber, u32* state)
     if (!state)
         return (s32)CELL_FIBER_ERROR_NULL_POINTER;
 
-    *state = s_fibers[idx].state;
+    vm_write32((u32)(uintptr_t)state, s_fibers[idx].state);
     return CELL_OK;
 }
 
@@ -324,9 +338,10 @@ s32 cellFiberPpuAttributeInitialize(CellFiberAttribute* attr)
     if (!attr)
         return (s32)CELL_FIBER_ERROR_NULL_POINTER;
 
-    attr->name = NULL;
-    attr->priority = 0;
-    attr->stackSize = CELL_FIBER_DEFAULT_STACK_SIZE;
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    vm_write32(attr_ea + 0, 0);                                  /* name      */
+    vm_write32(attr_ea + 4, 0);                                  /* priority  */
+    vm_write32(attr_ea + 8, CELL_FIBER_DEFAULT_STACK_SIZE);      /* stackSize */
     return CELL_OK;
 }
 

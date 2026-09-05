@@ -1,0 +1,138 @@
+# Builds the runtime library on Linux.
+#
+# Linux was the last platform with no CI and no evidence: the POSIX paths were
+# there, README listed the whole column as "untested", and nobody had ever run
+# a compiler over it. Two real defects were sitting in that gap -- an
+# Apple-only QueryPerformanceCounter shim reached from a shared translation
+# unit, and a Darwin-only pthread_threadid_np called from the POSIX branch of
+# win32_compat.h. This job is what stops the next two from accumulating.
+#
+# Both compilers, deliberately. GCC accepted the pthread_threadid_np call as an
+# implicit declaration and produced an archive that would only have failed when
+# something finally linked it; Clang rejected it outright. A single-compiler
+# matrix would have shipped that bug.
+#
+# The graphics step runs against the null backend's headless software path,
+# which is what gives Linux an end-to-end check without a GPU, a display, or a
+# render backend of its own.
+name: Linux
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Linux x64 (${{ matrix.compiler }}, ${{ matrix.build_type }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL2 is not optional off Windows: cellPad and cellAudio select their
+      # SDL2 backends unconditionally there, and CMakeLists.txt hard-fails
+      # without it.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev clang
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          else
+            CC=gcc CXX=g++ cmake -S . -B build -G Ninja \
+              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          fi
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Verify the archive exists and is x86-64
+        run: |
+          test -f build/libps3recomp_runtime.a
+          file build/libps3recomp_runtime.a
+          # An archive links nothing, so a bad extern survives the build. Catch
+          # the undefined symbols the compiler let through -- this is exactly
+          # how pthread_threadid_np hid from GCC.
+          nm --undefined-only build/libps3recomp_runtime.a \
+            | awk '{print $2}' | sort -u > /tmp/undef.txt
+          if grep -qE '^(pthread_threadid_np|QueryPerformance|GetTickCount64)' /tmp/undef.txt; then
+            echo "Win32/Darwin-only symbol left undefined in a POSIX build:"
+            grep -E '^(pthread_threadid_np|QueryPerformance|GetTickCount64)' /tmp/undef.txt
+            exit 1
+          fi
+
+      # The Python suites are the project's real correctness net -- the
+      # conformance one compiles and runs 1300+ lifted instruction cases with
+      # the host compiler, so it is genuinely testing this platform's codegen
+      # and not just re-checking the lifter's Python.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run the lifter test suites
+        env:
+          CI: "1"          # makes a skipped conformance run fail instead of passing
+        run: |
+          set -e
+          for t in tools/test_*.py; do
+            echo "--- $t"
+            python "$t"
+          done
+
+      - name: Run self-contained SPU helper tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -I include -I runtime/spu \
+            -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c
+          /tmp/test_spu_helpers
+
+      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+      # it needs the lifter's per-game ppu_recomp.h -- so nothing here ever
+      # compiled it and the POSIX port is unfinished. This ratchets the error
+      # count: it fails if the scaffold gets WORSE, which is what keeps the
+      # port from sliding backwards while it is being done.
+      - name: Check the PPU boot scaffold (ratchet)
+        env:
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: python tools/check_ppu_scaffold.py
+
+      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the null
+      # backend's headless software path and asserts the presented pixel. No
+      # display and no GPU are involved, so exit 0 means the whole graphics
+      # bridge is intact on Linux, not merely that it compiled.
+      - name: Run the POSIX host (headless end-to-end)
+        run: |
+          # Clear + flip: asserts the guest clear colour reaches the framebuffer.
+          ./build/ps3recomp_host
+          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+          # pixel, which exercises guest vertex fetch, primitive expansion and
+          # the draw path, not just the clear.
+          ./build/ps3recomp_host --draw
+          ./build/ps3recomp_host --draw --frames=60
+          # Bind a texture and sample it: the quad is green, the texture is
+          # not, so a path that dropped the texture still draws something
+          # plausible and still fails here. Exercises rsx_texture_layout and
+          # rsx_texture_decode end to end with no GPU involved.
+          ./build/ps3recomp_host --tex
+
+      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+      # arithmetic with no host API in it, so it runs everywhere, and it is the
+      # regression net for having lifted that maths out of the D3D12 uploader.
+      - name: Run self-contained RSX tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
+          /tmp/test_texture_layout
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
+          /tmp/test_rsx_primitives

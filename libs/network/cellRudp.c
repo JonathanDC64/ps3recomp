@@ -7,6 +7,7 @@
 #include "cellRudp.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -58,7 +59,7 @@ s32 cellRudpCreateContext(const CellRudpOption* option,
             s_ctx[i].state = CELL_RUDP_STATE_IDLE;
             s_ctx[i].handler = handler;
             s_ctx[i].handlerArg = arg;
-            *ctxId = (u32)i;
+            vm_write32((u32)(uintptr_t)ctxId, (u32)i);
             return CELL_OK;
         }
     }
@@ -112,7 +113,7 @@ s32 cellRudpRecv(CellRudpCtxId ctxId, void* data, u32 size, u32* received)
     (void)data; (void)size;
     if (ctxId >= CELL_RUDP_CTX_MAX || !s_ctx[ctxId].in_use)
         return (s32)CELL_RUDP_ERROR_CTX_NOT_FOUND;
-    if (received) *received = 0;
+    if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
     return (s32)CELL_RUDP_ERROR_NOT_CONNECTED;
 }
 
@@ -121,7 +122,7 @@ s32 cellRudpGetState(CellRudpCtxId ctxId, s32* state)
     if (ctxId >= CELL_RUDP_CTX_MAX || !s_ctx[ctxId].in_use)
         return (s32)CELL_RUDP_ERROR_CTX_NOT_FOUND;
     if (!state) return (s32)CELL_RUDP_ERROR_INVALID_ARGUMENT;
-    *state = s_ctx[ctxId].state;
+    vm_write32((u32)(uintptr_t)state, (u32)s_ctx[ctxId].state);
     return CELL_OK;
 }
 
@@ -137,6 +138,6 @@ s32 cellRudpPoll(CellRudpCtxId ctxId, s32 events, s32* revents, u32 timeoutMs)
     (void)events; (void)timeoutMs;
     if (ctxId >= CELL_RUDP_CTX_MAX || !s_ctx[ctxId].in_use)
         return (s32)CELL_RUDP_ERROR_CTX_NOT_FOUND;
-    if (revents) *revents = 0;
+    if (revents) vm_write32((u32)(uintptr_t)revents, (u32)0);
     return CELL_OK;
 }

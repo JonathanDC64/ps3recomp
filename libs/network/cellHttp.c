@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* ---------------------------------------------------------------------------
  * Platform socket abstraction
@@ -32,6 +33,12 @@ typedef int http_socket_t;
 #define HTTP_INVALID_SOCKET (-1)
 #define http_closesocket close
 #endif
+
+/* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
+ * pointer arguments are guest effective addresses, not host pointers. Translate
+ * through vm_base before dereferencing. */
+extern uint8_t* vm_base;
+#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -260,9 +267,9 @@ static int http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
  * API implementations
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpInit(u32 poolSize)
+s32 cellHttpInit(void* pool, u32 poolSize)
 {
-    printf("[cellHttp] Init(poolSize=%u)\n", poolSize);
+    printf("[cellHttp] Init(pool=%p, poolSize=%u)\n", pool, poolSize);
 
     if (s_http_initialized)
         return CELL_HTTP_ERROR_ALREADY_INITIALIZED;
@@ -331,6 +338,10 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
     if (!clientId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
+    /* clientId is a raw GUEST effective address (the generic HLE adapter passes
+     * r3 verbatim); translate it before writing or we fault on a host pointer. */
+    CellHttpClientId* clientId_h = GUEST_PTR(clientId, CellHttpClientId*);
+
     for (u32 i = 0; i < CELL_HTTP_MAX_CLIENTS; i++) {
         if (!s_clients[i].in_use) {
             s_clients[i].in_use = 1;
@@ -338,7 +349,7 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
             s_clients[i].connect_timeout = 30000000;
             s_clients[i].send_timeout    = 120000000;
             s_clients[i].recv_timeout    = 120000000;
-            *clientId = i;
+            *clientId_h = i;
             printf("[cellHttp] CreateClient(id=%u)\n", i);
             return CELL_OK;
         }
@@ -368,14 +379,28 @@ s32 cellHttpDestroyClient(CellHttpClientId clientId)
     return CELL_OK;
 }
 
-s32 cellHttpCreateTransaction(CellHttpClientId clientId, const char* method,
-                              const CellHttpUri* uri, CellHttpTransId* transId)
+s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientId,
+                              const char* method, const CellHttpUri* uri)
 {
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
     if (!method || !uri || !transId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
+
+    /* CellHttpUri is { const char* scheme, hostname, path, username,
+     * password; u32 port; } -- five 4-byte EAs then the port, twenty bytes
+     * to the guest against forty to us, so nothing but scheme lines up if
+     * you cast. Pull each field out by guest offset. */
+    u32 uri_ea = (u32)(uintptr_t)uri;
+    u32 ea_scheme   = vm_read32(uri_ea +  0);
+    u32 ea_hostname = vm_read32(uri_ea +  4);
+    u32 ea_path     = vm_read32(uri_ea +  8);
+    u32 uri_port    = vm_read32(uri_ea + 20);
+    const char* uri_scheme   = ea_scheme   ? (const char*)(vm_base + ea_scheme)   : NULL;
+    const char* uri_hostname = ea_hostname ? (const char*)(vm_base + ea_hostname) : NULL;
+    const char* uri_path     = ea_path     ? (const char*)(vm_base + ea_path)     : NULL;
+    method = GUEST_PTR(method, const char*);
 
     if (clientId >= CELL_HTTP_MAX_CLIENTS || !s_clients[clientId].in_use)
         return CELL_HTTP_ERROR_NOT_FOUND;
@@ -397,23 +422,23 @@ s32 cellHttpCreateTransaction(CellHttpClientId clientId, const char* method,
 
             /* Store hostname, path, port separately for socket connect */
             strncpy(t->hostname,
-                    uri->hostname ? uri->hostname : "unknown",
+                    uri_hostname ? uri_hostname : "unknown",
                     sizeof(t->hostname) - 1);
             t->hostname[sizeof(t->hostname) - 1] = '\0';
 
             strncpy(t->path,
-                    uri->path ? uri->path : "/",
+                    uri_path ? uri_path : "/",
                     sizeof(t->path) - 1);
             t->path[sizeof(t->path) - 1] = '\0';
 
-            t->port = uri->port ? uri->port : 80;
+            t->port = uri_port ? uri_port : 80;
 
             /* Build URL string for logging */
             snprintf(t->url, sizeof(t->url), "%s://%s:%u%s",
-                     uri->scheme   ? uri->scheme   : "http",
+                     uri_scheme   ? uri_scheme   : "http",
                      t->hostname, t->port, t->path);
 
-            *transId = i;
+            vm_write32((u32)(uintptr_t)transId, (u32)i);
             printf("[cellHttp] CreateTransaction(client=%u, %s %s) -> trans=%u\n",
                    clientId, method, t->url, i);
             return CELL_OK;
@@ -474,7 +499,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (gai != 0 || !result) {
         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -484,7 +509,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (sock == HTTP_INVALID_SOCKET) {
         printf("[cellHttp]   socket() failed\n");
         freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -497,7 +522,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         printf("[cellHttp]   connect() failed to %s:%u\n", t->hostname, t->port);
         http_closesocket(sock);
         freeaddrinfo(result);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -537,7 +562,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
         printf("[cellHttp]   Failed to send request headers\n");
         http_closesocket(sock);
-        if (sent) *sent = 0;
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_SEND_FAILED;
     }
 
@@ -546,7 +571,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         if (http_send_all(sock, (const char*)buf, size) != 0) {
             printf("[cellHttp]   Failed to send request body\n");
             http_closesocket(sock);
-            if (sent) *sent = 0;
+            if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
             return CELL_HTTP_ERROR_SEND_FAILED;
         }
     }
@@ -564,7 +589,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     t->body_overflow_len = 0;
 
     if (sent)
-        *sent = size;
+        vm_write32((u32)(uintptr_t)sent, (u32)size);
 
     return CELL_OK;
 }
@@ -582,14 +607,14 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
 
     if (t->aborted) {
         printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_HTTP_ERROR_ABORTED;
     }
 
     if (t->sock == HTTP_INVALID_SOCKET) {
         printf("[cellHttp] RecvResponse(trans=%u) - no socket (send first)\n",
                transId);
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
@@ -605,7 +630,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (n <= 0) {
                 printf("[cellHttp]   recv() failed during header read (n=%d)\n", n);
                 http_close_slot_socket(t);
-                if (received) *received = 0;
+                if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
                 return (n == 0) ? CELL_HTTP_ERROR_RECV_FAILED
                                 : CELL_HTTP_ERROR_RECV_FAILED;
             }
@@ -616,7 +641,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (hdr_end) {
                 if (http_parse_response_headers(t, hdr_end) != 0) {
                     http_close_slot_socket(t);
-                    if (received) *received = 0;
+                    if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
                     return CELL_HTTP_ERROR_RECV_FAILED;
                 }
                 break;
@@ -626,25 +651,25 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         if (!t->headers_parsed) {
             printf("[cellHttp]   Header buffer overflow, no \\r\\n\\r\\n found\n");
             http_close_slot_socket(t);
-            if (received) *received = 0;
+            if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
             return CELL_HTTP_ERROR_RECV_FAILED;
         }
     }
 
     /* ---- Return body data ---- */
     if (!buf || size == 0) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
     /* Check if we've already received all expected body bytes */
     if (t->content_length_known && t->body_received >= t->content_length) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
     if (t->eof_reached) {
-        if (received) *received = 0;
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
     }
 
@@ -655,7 +680,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         u32 copy = t->body_overflow_len;
         if (copy > size)
             copy = size;
-        memcpy(buf, t->body_overflow, copy);
+        memcpy(GUEST_PTR(buf, void*), t->body_overflow, copy);
         filled += copy;
         t->body_received += copy;
 
@@ -692,7 +717,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
             if (filled > 0)
                 break;
             printf("[cellHttp]   recv() error during body read\n");
-            if (received) *received = 0;
+            if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
             return CELL_HTTP_ERROR_RECV_FAILED;
         }
         if (n == 0) {
@@ -711,7 +736,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
     }
 
     if (received)
-        *received = filled;
+        vm_write32((u32)(uintptr_t)received, (u32)filled);
 
     return CELL_OK;
 }
@@ -727,7 +752,7 @@ s32 cellHttpGetResponseContentLength(CellHttpTransId transId, u64* length)
     if (!length)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    *length = s_transactions[transId].content_length;
+    vm_write64((u32)(uintptr_t)length, (u64)s_transactions[transId].content_length);
     return CELL_OK;
 }
 
@@ -742,7 +767,7 @@ s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code)
     if (!code)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    *code = s_transactions[transId].status_code;
+    vm_write32((u32)(uintptr_t)code, (u32)s_transactions[transId].status_code);
     return CELL_OK;
 }
 
@@ -850,9 +875,9 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
     }
 
     HttpCustomHeader* h = &t->custom_headers[t->custom_header_count];
-    strncpy(h->name, name, sizeof(h->name) - 1);
+    strncpy(h->name, GUEST_PTR(name, const char*), sizeof(h->name) - 1);
     h->name[sizeof(h->name) - 1] = '\0';
-    strncpy(h->value, value, sizeof(h->value) - 1);
+    strncpy(h->value, GUEST_PTR(value, const char*), sizeof(h->value) - 1);
     h->value[sizeof(h->value) - 1] = '\0';
     t->custom_header_count++;
 

@@ -303,7 +303,7 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 
 /* Label / report / timestamp */
 
-/* NID: 0x21397818 */
+/* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index);
 
 /* NID: 0x8572ADE4 */
@@ -339,7 +339,7 @@ s32 cellGcmUnbindZcull(u8 index);
 /* Misc */
 
 /* NID: 0x107BF789 */
-s32 cellGcmGetTiledPitchSize(u32 size, u32* pitch);
+u32 cellGcmGetTiledPitchSize(u32 size);
 
 /* NID: 0xBC982946 */
 void cellGcmSetDebugOutputLevel(u32 level);
@@ -360,8 +360,8 @@ u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
 s32 cellGcmSetDefaultFifoSize(u32 size);
 
 /* Internal flip commands (called by game code directly) */
-s32 _cellGcmSetFlipCommand(u32 bufferId);
-s32 _cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
+s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId);
+s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId, u32 labelIndex, u32 labelValue);
 
 /* --- Additional functions (RPCS3 parity) --- */
 

@@ -9,6 +9,7 @@
 #include "sys_interrupt.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 
 /* Internal state */
 
@@ -40,7 +41,7 @@ s32 sys_interrupt_tag_create(sys_interrupt_tag_t* tag, u32 intrtag, u32 classId)
         if (!s_tags[i].in_use) {
             s_tags[i].in_use = 1;
             s_tags[i].classId = classId;
-            *tag = (u32)i;
+            vm_write32((u32)(uintptr_t)tag, (u32)i);
             return CELL_OK;
         }
     }
@@ -74,7 +75,7 @@ s32 sys_interrupt_thread_establish(sys_interrupt_thread_handle_t* handle,
             s_threads[i].tag = tag;
             s_threads[i].intrthread = intrthread;
             s_threads[i].arg = arg;
-            *handle = (u32)i;
+            vm_write32((u32)(uintptr_t)handle, (u32)i);
             return CELL_OK;
         }
     }

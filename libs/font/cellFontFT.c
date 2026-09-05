@@ -7,8 +7,51 @@
  */
 
 #include "cellFontFT.h"
+#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
 #include <stdio.h>
 #include <string.h>
+
+/* ---------------------------------------------------------------------------
+ * Guest struct access
+ *
+ * Same story as cellFont.c: these pointers are guest EAs, the fields are
+ * big-endian, and CellFontFTGlyphImage leads with an 8-byte host pointer where
+ * the guest has 4. Offsets are the guest ABI, spelled out so no host padding
+ * can move them.
+ * -----------------------------------------------------------------------*/
+enum {
+    FT_O_HANDLE = 0, FT_O_TYPE = 4, FT_O_SCALE = 8,
+    FT_FONT_GUEST_SIZE = 28,          /* handle, type, scale, reserved[4] */
+    FTIMG_O_BUFFER = 0, FTIMG_O_WIDTH = 4, FTIMG_O_HEIGHT = 8,
+    FTIMG_O_PITCH  = 12, FTIMG_O_FORMAT = 16
+};
+
+#define FT_EA(p) ((u32)(uintptr_t)(p))
+
+static u32 ft_handle(const CellFontFT* font)
+{
+    u32 ea = FT_EA(font);
+    return ea ? vm_read32(ea + FT_O_HANDLE) : 0xFFFFFFFFu;
+}
+
+static void ft_font_store(CellFontFT* font, u32 handle, u32 type, float scale)
+{
+    u32 ea = FT_EA(font);
+    if (!ea) return;
+    for (u32 o = 0; o < FT_FONT_GUEST_SIZE; o += 4)
+        vm_write32(ea + o, 0);
+    vm_write32(ea + FT_O_HANDLE, handle);
+    vm_write32(ea + FT_O_TYPE, type);
+    vm_write_f32(ea + FT_O_SCALE, scale);
+}
+
+static void ft_font_clear(CellFontFT* font)
+{
+    u32 ea = FT_EA(font);
+    if (!ea) return;
+    for (u32 o = 0; o < FT_FONT_GUEST_SIZE; o += 4)
+        vm_write32(ea + o, 0);
+}
 
 /* Internal state */
 
@@ -38,7 +81,7 @@ s32 cellFontFTInit(const CellFontFTConfig* config, CellFontFTLibrary* lib)
     memset(s_fonts, 0, sizeof(s_fonts));
     s_initialized = 1;
 
-    if (lib) *lib = 1;
+    if (lib) vm_write32(FT_EA(lib), 1);
     return CELL_OK;
 }
 
@@ -60,10 +103,13 @@ static int ft_alloc_slot(void)
     return -1;
 }
 
+
+
 s32 cellFontFTOpenFontFile(CellFontFTLibrary lib, const char* path,
                            u32 index, CellFontFT* font)
 {
     (void)lib; (void)index;
+    path = GUEST_PTR(path, const char*);
     printf("[cellFontFT] OpenFontFile(%s)\n", path ? path : "(null)");
 
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
@@ -78,10 +124,7 @@ s32 cellFontFTOpenFontFile(CellFontFTLibrary lib, const char* path,
     strncpy(s_fonts[slot].path, path, sizeof(s_fonts[slot].path) - 1);
     s_fonts[slot].path[sizeof(s_fonts[slot].path) - 1] = '\0';
 
-    memset(font, 0, sizeof(*font));
-    font->handle = (u32)slot;
-    font->type = 1; /* file-based */
-    font->scale = 1.0f;
+    ft_font_store(font, (u32)slot, 1, 1.0f);
 
     return CELL_OK;
 }
@@ -102,10 +145,7 @@ s32 cellFontFTOpenFontMemory(CellFontFTLibrary lib, const void* data,
     s_fonts[slot].size = 16.0f;
     s_fonts[slot].from_file = 0;
 
-    memset(font, 0, sizeof(*font));
-    font->handle = (u32)slot;
-    font->type = 2; /* memory-based */
-    font->scale = 1.0f;
+    ft_font_store(font, (u32)slot, 2, 1.0f);
 
     return CELL_OK;
 }
@@ -115,12 +155,12 @@ s32 cellFontFTCloseFont(CellFontFT* font)
     if (!font) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
 
-    u32 h = font->handle;
+    u32 h = ft_handle(font);
     if (h >= MAX_FT_FONTS || !s_fonts[h].in_use)
         return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
 
     s_fonts[h].in_use = 0;
-    memset(font, 0, sizeof(*font));
+    ft_font_clear(font);
     return CELL_OK;
 }
 
@@ -129,12 +169,12 @@ s32 cellFontFTSetFontSize(CellFontFT* font, float size)
     if (!font) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
 
-    u32 h = font->handle;
+    u32 h = ft_handle(font);
     if (h >= MAX_FT_FONTS || !s_fonts[h].in_use)
         return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
 
     s_fonts[h].size = size;
-    font->scale = size / 16.0f;
+    vm_write_f32(FT_EA(font) + FT_O_SCALE, size / 16.0f);
     return CELL_OK;
 }
 
@@ -143,17 +183,17 @@ s32 cellFontFTGetFontMetrics(const CellFontFT* font, CellFontFTFontMetrics* metr
     if (!font || !metrics) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
 
-    u32 h = font->handle;
+    u32 h = ft_handle(font);
     if (h >= MAX_FT_FONTS || !s_fonts[h].in_use)
         return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
 
     float size = s_fonts[h].size;
 
     /* Fallback metrics based on typical proportions */
-    metrics->ascender   = size * 0.8f;
-    metrics->descender  = size * -0.2f;
-    metrics->lineHeight = size * 1.2f;
-    metrics->maxAdvance = size * 0.6f;
+    vm_write_f32(FT_EA(metrics) +  0, size * 0.8f);   /* ascender   */
+    vm_write_f32(FT_EA(metrics) +  4, size * -0.2f);  /* descender  */
+    vm_write_f32(FT_EA(metrics) +  8, size * 1.2f);   /* lineHeight */
+    vm_write_f32(FT_EA(metrics) + 12, size * 0.6f);   /* maxAdvance */
 
     return CELL_OK;
 }
@@ -164,7 +204,7 @@ s32 cellFontFTGetGlyphMetrics(const CellFontFT* font, u32 charCode,
     if (!font || !metrics) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
 
-    u32 h = font->handle;
+    u32 h = ft_handle(font);
     if (h >= MAX_FT_FONTS || !s_fonts[h].in_use)
         return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
 
@@ -172,14 +212,14 @@ s32 cellFontFTGetGlyphMetrics(const CellFontFT* font, u32 charCode,
     float size = s_fonts[h].size;
 
     /* Fallback glyph metrics */
-    metrics->width     = size * 0.5f;
-    metrics->height    = size * 0.8f;
-    metrics->hBearingX = 0.0f;
-    metrics->hBearingY = size * 0.8f;
-    metrics->hAdvance  = size * 0.6f;
-    metrics->vBearingX = size * -0.25f;
-    metrics->vBearingY = size * 0.1f;
-    metrics->vAdvance  = size * 1.2f;
+    vm_write_f32(FT_EA(metrics) +  0, size * 0.5f);    /* width     */
+    vm_write_f32(FT_EA(metrics) +  4, size * 0.8f);    /* height    */
+    vm_write_f32(FT_EA(metrics) +  8, 0.0f);           /* hBearingX */
+    vm_write_f32(FT_EA(metrics) + 12, size * 0.8f);    /* hBearingY */
+    vm_write_f32(FT_EA(metrics) + 16, size * 0.6f);    /* hAdvance  */
+    vm_write_f32(FT_EA(metrics) + 20, size * -0.25f);  /* vBearingX */
+    vm_write_f32(FT_EA(metrics) + 24, size * 0.1f);    /* vBearingY */
+    vm_write_f32(FT_EA(metrics) + 28, size * 1.2f);    /* vAdvance  */
 
     return CELL_OK;
 }
@@ -190,7 +230,7 @@ s32 cellFontFTRenderGlyph(const CellFontFT* font, u32 charCode,
     if (!font || !image) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     if (!s_initialized) return (s32)CELL_FONTFT_ERROR_NOT_INITIALIZED;
 
-    u32 h = font->handle;
+    u32 h = ft_handle(font);
     if (h >= MAX_FT_FONTS || !s_fonts[h].in_use)
         return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
 
@@ -203,14 +243,16 @@ s32 cellFontFTRenderGlyph(const CellFontFT* font, u32 charCode,
     if (w < 1) w = 1;
     if (hh < 1) hh = 1;
 
-    image->width  = w;
-    image->height = hh;
-    image->pitch  = w;
-    image->format = 0; /* 8-bit alpha */
+    u32 img_ea = FT_EA(image);
+    vm_write32(img_ea + FTIMG_O_WIDTH,  w);
+    vm_write32(img_ea + FTIMG_O_HEIGHT, hh);
+    vm_write32(img_ea + FTIMG_O_PITCH,  w);
+    vm_write32(img_ea + FTIMG_O_FORMAT, 0); /* 8-bit alpha */
 
     /* If caller provided a buffer, zero it */
-    if (image->buffer) {
-        memset(image->buffer, 0, (size_t)(w * hh));
+    u32 buf_ea = vm_read32(img_ea + FTIMG_O_BUFFER);
+    if (buf_ea) {
+        memset(vm_base + buf_ea, 0, (size_t)(w * hh));
     }
 
     return CELL_OK;
@@ -221,7 +263,7 @@ s32 cellFontFTGetCharGlyphCode(const CellFontFT* font, u32 charCode, u32* glyphC
     (void)font;
     if (!glyphCode) return (s32)CELL_FONTFT_ERROR_INVALID_ARGUMENT;
     /* Direct mapping: char code = glyph code (no cmap lookup without FreeType) */
-    *glyphCode = charCode;
+    vm_write32(FT_EA(glyphCode), charCode);
     return CELL_OK;
 }
 
@@ -230,7 +272,7 @@ s32 cellFontFTGetKerning(const CellFontFT* font, u32 leftChar, u32 rightChar,
 {
     (void)font; (void)leftChar; (void)rightChar;
     /* No kerning data without FreeType */
-    if (kernX) *kernX = 0.0f;
-    if (kernY) *kernY = 0.0f;
+    if (kernX) vm_write_f32(FT_EA(kernX), 0.0f);
+    if (kernY) vm_write_f32(FT_EA(kernY), 0.0f);
     return CELL_OK;
 }

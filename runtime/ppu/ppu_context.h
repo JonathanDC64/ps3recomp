@@ -17,6 +17,19 @@
 extern "C" {
 #endif
 
+/* Thread-local storage qualifier. Defined identically in the lifter's
+ * HEADER_PREAMBLE (tools/ppu_lifter.py), which this header is already kept
+ * in sync with -- code reaches one or the other depending on whether it
+ * built against a generated ppu_recomp.h. The #ifndef makes including both
+ * harmless. */
+#ifndef PPU_THREAD_LOCAL
+#  ifdef _MSC_VER
+#    define PPU_THREAD_LOCAL __declspec(thread)
+#  else
+#    define PPU_THREAD_LOCAL __thread
+#  endif
+#endif
+
 /* ---------------------------------------------------------------------------
  * Condition Register field -- 4 bits: LT, GT, EQ, SO
  * -----------------------------------------------------------------------*/

@@ -6,6 +6,7 @@
 
 #include "cellMusicDecode2.h"
 #include <stdio.h>
+#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
 /* Internal state */
 
@@ -41,7 +42,7 @@ s32 cellMusicDecode2GetDecodeStatus(s32* status)
 {
     if (!s_initialized2) return (s32)CELL_MUSIC_DECODE2_ERROR_NOT_INITIALIZED;
     if (!status) return (s32)CELL_MUSIC_DECODE2_ERROR_INVALID_ARGUMENT;
-    *status = 0; /* dormant */
+    vm_write32((u32)(uintptr_t)status, (u32)0); /* dormant */
     return CELL_OK;
 }
 
@@ -49,7 +50,7 @@ s32 cellMusicDecode2Read(void* buf, u32* size)
 {
     (void)buf;
     if (!s_initialized2) return (s32)CELL_MUSIC_DECODE2_ERROR_NOT_INITIALIZED;
-    if (size) *size = 0;
+    if (size) vm_write32((u32)(uintptr_t)size, (u32)0);
     return (s32)CELL_MUSIC_DECODE2_ERROR_NOT_SUPPORTED;
 }
 
