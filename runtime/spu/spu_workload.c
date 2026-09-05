@@ -532,7 +532,17 @@ static void spu_async_run(spu_async_job* j)
              * (2) LBP_REAL_POLICY: run the REAL lifted taskset policy to build its
              *     SpursTasksetContext and diff it against the C reimpl build_context
              *     planted in `ls` -- shows exactly which fields differ. */
-            if (j->image_id == 3) {
+            /* Image gate: 3 is LBP's binkspu. Other titles reach the same
+             * taskset-policy A/B through their own image -- Demon's Souls's
+             * event-flag producer is image 12 -- so make it selectable instead of
+             * hardcoded. REAL_POLICY_IMG=<n> overrides; default 3 keeps LBP's
+             * behaviour exactly. (fork: DeS needs 12) */
+            int _rp_img = 3;
+            { static int _rpi = -2;
+              if (_rpi == -2) { const char* e = getenv("REAL_POLICY_IMG");
+                                _rpi = e ? atoi(e) : -1; }
+              if (_rpi >= 0) _rp_img = _rpi; }
+            if (j->image_id == _rp_img) {
                 extern uint8_t* vm_base;
                 uint32_t arg = j->args_ea;
                 /* SPU DMA maps EAs as vm_base + (uint32_t)ea with NO masking

@@ -115,10 +115,34 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
      * wait-capable task (LBP's binkspu movie IO) spun forever and the intro
      * movie never decoded a frame. The game's own pattern reaches us mangled
      * anyway (its lsPattern EA arrives unaligned through the attribute ABI). */
-    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x0, 0xFFFFFFFFu);
-    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x4, 0xFFFFFFFFu);
-    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x8, 0xFFFFFFFFu);
-    LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0xC, 0xFFFFFFFFu);
+    /* ...BUT only when the task's own pattern did not survive the attribute ABI.
+     * Diffing this context against the AUTHENTIC Sony taskset policy (run via
+     * spurs_run_taskset_policy_probe / LBP_REAL_POLICY) showed exactly one
+     * meaningful disagreement in Demon's Souls:
+     *
+     *     LS 0x27A0:  build=FFFFFFFF   real=03FFFFFF
+     *
+     * i.e. the real policy uses the GAME's pattern, and DeS's arrives intact --
+     * cellSpursCreateTask logs lsp=03FFFFFF FFFFFFFF FFFFFFFF FFFFFFFF, and the
+     * TaskInfo DMA above already placed it here. Clobbering it with all-ones
+     * overrides authentic data with a guess. Keep a non-zero pattern; force full
+     * coverage only when it is absent (the LBP case this was written for).
+     * SPURS_LSPATTERN_FORCE=1 restores the unconditional all-ones behaviour. */
+    {
+        const uint8_t* _lp = ls + STC_TEMP_TASKINFO + TI_LS_PATTERN;
+        uint32_t p0 = ((uint32_t)_lp[0] << 24) | ((uint32_t)_lp[1] << 16) |
+                      ((uint32_t)_lp[2] <<  8) |  (uint32_t)_lp[3];
+        uint32_t p1 = ((uint32_t)_lp[4] << 24) | ((uint32_t)_lp[5] << 16) |
+                      ((uint32_t)_lp[6] <<  8) |  (uint32_t)_lp[7];
+        static int s_force = -1;
+        if (s_force < 0) s_force = getenv("SPURS_LSPATTERN_FORCE") ? 1 : 0;
+        if (s_force || (p0 == 0 && p1 == 0)) {
+            LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x0, 0xFFFFFFFFu);
+            LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x4, 0xFFFFFFFFu);
+            LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x8, 0xFFFFFFFFu);
+            LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0xC, 0xFFFFFFFFu);
+        }
+    }
 
     return vm_read64(ti + TI_ELF);       /* caller masks elf & ~7 to load */
     #undef LS_BE32
