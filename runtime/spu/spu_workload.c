@@ -652,6 +652,43 @@ static void spu_async_run(spu_async_job* j)
                 ydkj_wake_all_event_flags();
                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
             }
+            /* SPU_DONE_WORD=<descEA hex>[:<img>] -- DIAGNOSTIC BISECT, NOT A FIX.
+             *
+             * Demon's Souls's HighGraphics thread submits a command block, then
+             * spins usleep(30) at func_00ACAFA8+0xF4 (over a MILLION times)
+             * waiting for a completion word to go non-zero:
+             *
+             *   desc = 0x01B50FC4:  +0x00 = end pointer (0x45A4B320)
+             *                       +0x0C = completion word (stays 0)
+             *
+             * The SPU graphics dispatcher (image 2) demonstrably READS the work --
+             * it GETs the 256-byte descriptor at 0x01B51000 and the command buffer
+             * at 0x45A4B280/0x45A4B290 -- and writes the descriptor back, but never
+             * writes that completion word. Publishing "consumed up to the end
+             * pointer" on task completion tests whether that word is the whole
+             * remaining gate for the graphics path, exactly as the taskset
+             * round-notify was for the audio path. Off unless set.
+             * Example: SPU_DONE_WORD=01B50FC4:2 */
+            { static int s_dw = -2; static uint32_t s_dw_ea; static int s_dw_img = -1;
+              if (s_dw == -2) { const char* e = getenv("SPU_DONE_WORD");
+                  s_dw = 0;
+                  if (e && *e) { char* end = 0;
+                      s_dw_ea = (uint32_t)strtoul(e, &end, 16);
+                      if (end && *end == ':') s_dw_img = (int)strtoul(end + 1, 0, 0);
+                      s_dw = s_dw_ea ? 1 : 0; } }
+              extern uint8_t* vm_base;
+              if (s_dw && (s_dw_img < 0 || s_dw_img == j->image_id) && vm_base) {
+                  const uint8_t* d = vm_base + s_dw_ea;
+                  uint32_t endp = ((uint32_t)d[0]<<24)|((uint32_t)d[1]<<16)|
+                                  ((uint32_t)d[2]<<8)|(uint32_t)d[3];
+                  uint8_t* w = vm_base + s_dw_ea + 0x0C;
+                  w[0]=(uint8_t)(endp>>24); w[1]=(uint8_t)(endp>>16);
+                  w[2]=(uint8_t)(endp>>8);  w[3]=(uint8_t)endp;
+                  static int _n = 0; if (_n++ < 12)
+                      fprintf(stderr, "[done-word] image=%d done -> [0x%08X+0x0C]=0x%08X (bisect)\n",
+                              j->image_id, s_dw_ea, endp);
+              } }
+
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
