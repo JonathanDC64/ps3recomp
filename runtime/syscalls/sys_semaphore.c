@@ -348,6 +348,30 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    /* SEMA_RELEASE=<id>[:<secs>] -- DIAGNOSTIC BISECT, NOT A FIX.
+     *
+     * A semaphore nobody ever posts is a real gate, and forcing it hides the
+     * bug. But it also answers a question nothing else can: is THIS the gate to
+     * the next milestone, or merely one of several? Demon's Souls waits on sem 2
+     * and sem 3 with ZERO sys_semaphore_post in the whole run; sem 3 is created
+     * (init=0 max=1) immediately before the SLSession thread, and SLSession is
+     * what calls cellSaveDataAutoLoad2 (the auto-save dialog). Releasing it says
+     * whether the dialog is one link away or many.
+     *
+     * After <secs> (default 3) of blocking on the named id, return CELL_OK as if
+     * a post had arrived. Off unless set. */
+    { static int s_rid = -2; static unsigned s_rsecs = 3;
+      if (s_rid == -2) { const char* e = getenv("SEMA_RELEASE");
+          s_rid = -1;
+          if (e && *e) { char* end = 0; s_rid = (int)strtoul(e, &end, 0);
+              if (end && *end == ':') s_rsecs = (unsigned)strtoul(end + 1, 0, 0); } }
+      if (s_rid >= 0 && (uint32_t)s_rid == sem_id) {
+          static _Thread_local unsigned long long s_first_ms;
+          extern unsigned long long ps3_ms_now(void);
+          unsigned long long now = ps3_ms_now();
+          if (!s_first_ms) s_first_ms = now;
+      } }
+
 #ifdef _WIN32
     /* value is the only count. The kernel semaphore is only a wake channel;
      * every wake re-checks value under the lock. */
@@ -368,12 +392,34 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
         LeaveCriticalSection(&s->value_lock);
 
         /* Bounded slices keep timed waits on the QPC deadline. */
-        DWORD ms = (timeout_us == 0) ? INFINITE : 1;
+        DWORD ms = (timeout_us == 0) ? (getenv("SEMA_RELEASE") ? 50 : INFINITE) : 1;
         WaitForSingleObject(s->sem_handle, ms);
 
         EnterCriticalSection(&s->value_lock);
         if (s->waiters > 0) s->waiters--;
         LeaveCriticalSection(&s->value_lock);
+
+        /* SEMA_RELEASE bisect: the elapsed test has to live HERE. The function is
+         * entered once per wait and then blocks in this loop, so a check at entry
+         * can never fire for the very case it exists to break. */
+        { static int s_rid2 = -2; static unsigned s_rsecs2 = 3;
+          if (s_rid2 == -2) { const char* e = getenv("SEMA_RELEASE");
+              s_rid2 = -1;
+              if (e && *e) { char* end = 0; s_rid2 = (int)strtoul(e, &end, 0);
+                  if (end && *end == ':') s_rsecs2 = (unsigned)strtoul(end + 1, 0, 0); } }
+          if (s_rid2 >= 0 && (uint32_t)s_rid2 == sem_id) {
+              extern unsigned long long ps3_ms_now(void);
+              static _Thread_local unsigned long long s_t0;
+              unsigned long long now2 = ps3_ms_now();
+              if (!s_t0) s_t0 = now2;
+              else if (now2 - s_t0 >= (unsigned long long)s_rsecs2 * 1000ull) {
+                  static int _n = 0; if (_n++ < 8)
+                      fprintf(stderr, "[sem] SEMA_RELEASE: releasing sem=%u after %us (bisect)\n",
+                              sem_id, s_rsecs2);
+                  s_t0 = 0;
+                  return CELL_OK;
+              }
+          } }
         /* loop: re-check value */
     }
 #else
