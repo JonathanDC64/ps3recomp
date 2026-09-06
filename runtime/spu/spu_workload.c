@@ -748,6 +748,13 @@ static void spu_async_run(spu_async_job* j)
                               j->image_id, s_dw_ea, endp);
               } }
 
+            /* The PM's other completion duty: signal the lv2 event queues SPURS
+             * attached, so a PPU thread blocked in sys_event_queue_receive waiting
+             * for this SPU work actually wakes. Only fires for queues with a
+             * blocked receiver (see spurs_notify_task_completion). */
+            { extern void spurs_notify_task_completion(void);
+              spurs_notify_task_completion(); }
+
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();

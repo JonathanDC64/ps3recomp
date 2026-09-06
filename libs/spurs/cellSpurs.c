@@ -655,6 +655,45 @@ extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 
+/* SPU task completion -> lv2 event queue, the other half of the PM's job.
+ *
+ * SPURS signals the application through the queues attached with
+ * cellSpursAttachLv2EventQueue. Demon's Souls attaches eleven and its Havok PPU
+ * thread then blocks in sys_event_queue_receive(q=5) waiting for SPU work to
+ * finish. Our HLE runs the Havok SPU tasks (image 7 completes four times) but
+ * posts NOTHING -- zero events on any queue for the whole run -- so that thread
+ * never wakes, never signals cond 13, and MAIN sits on cond 13 forever. With
+ * MAIN parked the engine never requests content, which is why every consumer
+ * (Core.Res, SLSession, the renderer) is idle: one missing edge explains all of it.
+ *
+ * Post a completion event on task completion, but only to queues that actually
+ * have a blocked receiver -- the same rule the event-flag notify uses. A queue
+ * nobody is waiting on gets nothing, so this cannot manufacture wakeups for
+ * paths the game is not currently blocked on.
+ *
+ * SPURS_NO_TASK_EVENT=1 disables it (A/B). */
+void spurs_notify_task_completion(void)
+{
+    static int s_off = -1;
+    if (s_off < 0) s_off = getenv("SPURS_NO_TASK_EVENT") ? 1 : 0;
+    if (s_off) return;
+
+    extern int sys_event_queue_inject(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+    extern int sys_event_queue_waiters(uint32_t);
+
+    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        uint32_t q = s_spurs_event_queue[i];
+        if (!q || sys_event_queue_waiters(q) <= 0) continue;
+        /* SPURS completion source key; data words carry no task identity yet --
+         * if a handler turns out to demand a specific payload this is where it
+         * goes, and the receiver-side trace will say so. */
+        sys_event_queue_inject(q, 0x0000000053505500ull /* "SPU" */, 0, 0, 0);
+        { static int _n = 0; if (_n++ < 16)
+            fprintf(stderr, "[spurs] task completion -> event queue %u (had a waiter)%c", q, 10); }
+    }
+}
+
+
 /* Release anyone blocked on the completion queues SPURS attached; see
  * cellSpursFinalize. */
 static void spurs_cancel_attached_queues(void)

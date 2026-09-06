@@ -65,6 +65,11 @@ typedef struct sys_event_queue_info {
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
 
+    /* Receivers currently blocked on this queue. Lets a producer ask "is anyone
+     * actually waiting here?" -- SPURS task-completion notification targets only
+     * queues with a blocked receiver, rather than spraying every attached queue. */
+    int          waiters;
+
 #ifdef _WIN32
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE not_empty;

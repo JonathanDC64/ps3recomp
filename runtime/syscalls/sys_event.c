@@ -457,9 +457,11 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     EnterCriticalSection(&q->lock);
 
     if (timeout_us == 0) {
+        q->waiters++;
         while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
+        if (q->waiters > 0) q->waiters--;
         if (q->count == 0 && q->cancelled) {
             LeaveCriticalSection(&q->lock);
             return (int64_t)(int32_t)CELL_ECANCELED;
@@ -711,6 +713,15 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 
 /* EXPERIMENT: inject an event into a queue by id, to probe whether unblocking
  * the SPURS completion queue (q=1) lets the PPU reach its render loop. */
+/* How many receivers are currently blocked on this queue (0 if none/invalid).
+ * Lets a producer notify only where someone is actually waiting. */
+int sys_event_queue_waiters(uint32_t qid)
+{
+    if (qid == 0 || qid > SYS_EVENT_QUEUE_MAX) return 0;
+    sys_event_queue_info* q = &g_sys_event_queues[qid - 1];
+    return q->active ? q->waiters : 0;
+}
+
 int sys_event_queue_inject(uint32_t qid, uint64_t source,
                            uint64_t d1, uint64_t d2, uint64_t d3)
 {
