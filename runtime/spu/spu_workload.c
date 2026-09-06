@@ -644,6 +644,51 @@ static void spu_async_run(spu_async_job* j)
                     fprintf(stderr, "[cri] RESUME: no work-ready after 400 polls (PPU never marked work)\n");
                 fflush(stderr);
             }
+            /* SPU_TASK_RESUME=<img>[:<attempts>[:<ms>]] -- generalised persistent
+             * re-entry, the same idea as YDKJ_CRI_RESUME above but not hardwired
+             * to image 22.
+             *
+             * A real SPURS task is PERSISTENT: the kernel re-enters it whenever
+             * work is signalled. Our HLE dispatches it ONCE at cellSpursCreateTask,
+             * so a task created before the PPU has anything to give it finds an
+             * empty queue and exits, and nothing ever runs it again.
+             *
+             * Demon's Souls's graphics dispatcher (image 2) is exactly that: it
+             * reads its 256-byte descriptor at 0x01B51000 and the command buffer,
+             * finds the work list empty (its entries are self-pointers), exits --
+             * and HighGraphics then submits a command block and spins ~930k times
+             * at func_00ACAFA8+0xF4 waiting for a completion word no one will
+             * write, because the only task that could write it has already exited.
+             *
+             * Re-running reloads the ELF into a fresh local store and re-reads the
+             * task context from guest memory, so a re-entry sees whatever the PPU
+             * has submitted in the meantime. It fabricates nothing: the task only
+             * does work if the PPU genuinely queued some. Bounded, and off unless
+             * set, so the default build is unchanged. */
+            { static int s_tr = -2; static int s_tr_img, s_tr_att = 400, s_tr_ms = 3;
+              if (s_tr == -2) { const char* e = getenv("SPU_TASK_RESUME");
+                  s_tr = 0;
+                  if (e && *e) { char* end = 0;
+                      s_tr_img = (int)strtoul(e, &end, 0); s_tr = 1;
+                      if (end && *end == ':') { s_tr_att = (int)strtoul(end + 1, &end, 0);
+                          if (end && *end == ':') s_tr_ms = (int)strtoul(end + 1, 0, 0); } } }
+              if (s_tr && s_tr_img == j->image_id) {
+                  fprintf(stderr, "[task-resume] image=%d: re-entering up to %dx every %dms\n",
+                          j->image_id, s_tr_att, s_tr_ms);
+                  for (int attempt = 0; attempt < s_tr_att; attempt++) {
+#ifdef _WIN32
+                      Sleep((DWORD)s_tr_ms);
+#endif
+                      memset(ls, 0, SPU_LS_SIZE);
+                      uint32_t e2 = 0;
+                      if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
+                      rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
+                                                  1, j->have_r3 ? j->r3 : 0);
+                  }
+                  fprintf(stderr, "[task-resume] image=%d: done re-entering\n", j->image_id);
+                  fflush(stderr);
+              } }
+
             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
              * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
              * propagated yet). Tests whether the game then advances to draw content. */
