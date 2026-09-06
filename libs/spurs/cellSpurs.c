@@ -99,6 +99,12 @@ typedef struct {
     pthread_cond_t      cond;
 #endif
     int                 initialized;
+    /* Pattern the blocked PPU waiter is waiting for, 0 when nobody is waiting.
+     * The GUEST field EF_PPU_WAIT_MASK is deliberately never written (see the
+     * Set protocol note below: leaving it clear keeps the SPU-side lifted Set
+     * on its "no PPU waiter" path), so the taskset round-completion notify
+     * cannot read it from guest memory and reads it from here instead. */
+    volatile unsigned short ppu_wait_mask;
 } EventFlagSync;
 
 static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
@@ -347,6 +353,47 @@ void spurs_ef_set_from_spu(uint32_t flag_ea, uint16_t bits)
     spurs_ef_set_locked(flag_ea, (u16)bits);
     ef_broadcast(sync);
     ef_unlock(sync);
+}
+
+/* Taskset round-completion notify -- what the real taskset POLICY MODULE does.
+ *
+ * On real SPURS the taskset PM performs the completion bookkeeping when a task
+ * finishes the round it was signalled for, including setting the SPU->PPU event
+ * flag a PPU thread is blocked on. We HLE the taskset PM in C
+ * (spurs_pm_build_context) and never ran that notify, so the edge was never
+ * produced by anyone: Demon's Souls's SPU audio mixer completed a full mixing
+ * round and wrote PCM to the cellAudio ring, while MOMixerThread stayed blocked
+ * in cellSpursEventFlagWait forever with bits=0x0000.
+ *
+ * Everything here is read from REAL guest state rather than assumed:
+ *   - which flags belong to this taskset  -> EF_ADDR (0x70)
+ *   - which of those are SPU->PPU         -> EF_DIRECTION (0x0E)
+ *   - which bits the waiter actually wants-> EF_PPU_WAIT_MASK (0x04)
+ * so it only ever fires when a PPU thread is genuinely blocked on a flag owned
+ * by the taskset whose task just completed a round -- precisely the PM's
+ * condition. A flag with no blocked waiter has mask 0 and is left alone.
+ *
+ * SPURS_NO_ROUND_NOTIFY=1 disables it (A/B); SPURS_ROUND_NOTIFY=<ea>[:<bits>]
+ * in runtime/spu overrides with an explicit flag for bisecting. */
+void spurs_ef_notify_taskset_round(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    static int s_off = -1;
+    if (s_off < 0) s_off = getenv("SPURS_NO_ROUND_NOTIFY") ? 1 : 0;
+    if (s_off) return;
+
+    for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+        uint32_t ea = s_ef_sync[i].ea;
+        if (!s_ef_sync[i].initialized || !ea) continue;
+        if ((uint32_t)vm_read64(ea + EF_ADDR) != taskset_ea) continue;
+        if (vm_read8(ea + EF_DIRECTION) != CELL_SPURS_EVENT_FLAG_SPU2PPU) continue;
+        uint16_t mask = (uint16_t)s_ef_sync[i].ppu_wait_mask;
+        if (!mask) continue;             /* nobody blocked on this flag */
+        { static int _n = 0; if (_n++ < 12)
+            fprintf(stderr, "[round-notify] taskset 0x%08X round done -> flag 0x%08X "
+                    "bits=0x%04X (waiter mask)\n", taskset_ea, ea, (unsigned)mask); }
+        spurs_ef_set_from_spu(ea, mask);
+    }
 }
 
 /* =========================================================================
@@ -1787,6 +1834,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     u16 pattern = vm_read16(bits_ea);
 
     ef_lock(sync);
+    sync->ppu_wait_mask = (unsigned short)pattern;   /* for the round notify */
 
     /* Block until the requested bit pattern is satisfied in the GUEST struct
      * (BE events word at +0x00) — set by an SPU task (lifted code / taskset
@@ -1846,6 +1894,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
         vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
 
+    sync->ppu_wait_mask = 0;   /* no longer blocked: stop the round notify */
     ef_unlock(sync);
 
     return CELL_OK;

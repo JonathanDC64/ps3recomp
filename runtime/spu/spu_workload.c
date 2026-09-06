@@ -977,6 +977,14 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
               fprintf(stderr, "[round-notify] task %u finished a round -> set flag "
                       "0x%08X bits=0x%04X\n", taskId, s_rn_ea, (unsigned)s_rn_bits);
           spurs_ef_set_from_spu(s_rn_ea, (uint16_t)s_rn_bits);
+      } else {
+          /* Default path: let the event-flag layer work out WHICH flag and WHICH
+           * bits from real guest state (flag->taskset binding, direction, and the
+           * blocked waiter's own mask) instead of taking them from the env. This
+           * is the taskset policy module's completion bookkeeping, which our C
+           * HLE of the PM otherwise never performs. */
+          extern void spurs_ef_notify_taskset_round(uint32_t);
+          spurs_ef_notify_taskset_round(taskset_ea);
       } }
 
     /* Release the global SPU-serial lock while parked so another SPU task can
