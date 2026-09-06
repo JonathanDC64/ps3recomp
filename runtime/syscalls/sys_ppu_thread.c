@@ -374,9 +374,24 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d cia=0x%08llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_size, priority,
+            (unsigned long long)ctx->cia);
+
+    /* A thread created with a NULL entry can never run, and the caller is the
+     * thing worth naming. Under libsre LLE the lifted firmware does not stamp
+     * ctx->cia, so that field is stale game-space -- symbolise the HOST stack
+     * instead, which resolves through the same function table libsre's 756
+     * functions are registered in. */
+    if (entry == 0) {
+        static int _n = 0;
+        if (_n++ < 4) {
+            fprintf(stderr, "[thread] NULL entry for \"%s\" -- caller chain:%c", t->name, 10);
+            extern void ppu_log_host_chain(const char* tag);
+            ppu_log_host_chain("null-thread-entry");
+        }
+    }
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
