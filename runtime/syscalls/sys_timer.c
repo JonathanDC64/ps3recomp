@@ -107,7 +107,13 @@ static void write_be64(uint32_t addr, uint64_t val)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-    { static int n=0; if (n++ < 60) fprintf(stderr, "[WAIT] timer_usleep(%llu us) tid=%llu lr=0x%08llX cia=0x%08llX\n",
+    /* Cap is settable (PS3_WAIT_LOG=<n>, 0 = unlimited; default 60). A fixed 60
+     * covers only the first moments of boot, so "which threads sleep where"
+     * silently becomes "which threads slept during early init" -- and a thread
+     * that stops appearing looks idle when it may be spinning hardest. */
+    { static int n=0; static int s_cap = -1;
+      if (s_cap < 0) { const char* e = getenv("PS3_WAIT_LOG"); s_cap = e ? atoi(e) : 60; }
+      if (s_cap == 0 || n++ < s_cap) fprintf(stderr, "[WAIT] timer_usleep(%llu us) tid=%llu lr=0x%08llX cia=0x%08llX\n",
         (unsigned long long)usec, (unsigned long long)ctx->thread_id,
         (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
@@ -117,13 +123,19 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     { static long s_wo = -1;
       if (s_wo < 0) { const char* e = getenv("PS3_WAIT_OBJ");
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
-      if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
+      /* Match the CIA as well as the LR: our lifted syscall path leaves ctx->lr
+       * at 0 for these call sites, so an lr-keyed probe can never fire there --
+       * and the usleep log prints cia, which is what one actually has to hand. */
+      if (s_wo && ((uint32_t)ctx->lr == (uint32_t)s_wo ||
+                   (uint32_t)ctx->cia == (uint32_t)s_wo)) {
         static int _n = 0;
         if (_n++ < 8) {
           uint32_t o = (uint32_t)ctx->gpr[29];
-          fprintf(stderr, "[wait-obj] lr=0x%08X r3=%llu r9=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X",
-                  (uint32_t)ctx->lr, (unsigned long long)usec, (uint32_t)ctx->gpr[9],
-                  o, (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
+          fprintf(stderr, "[wait-obj] cia=0x%08X lr=0x%08X r3=%llu r9=0x%08X r26=0x%08X "
+                          "r27=0x%08X r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X",
+                  (uint32_t)ctx->cia, (uint32_t)ctx->lr, (unsigned long long)usec,
+                  (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[26], (uint32_t)ctx->gpr[27],
+                  (uint32_t)ctx->gpr[28], o, (uint32_t)ctx->gpr[30], (uint32_t)ctx->gpr[31]);
           /* guest memory is big-endian: assemble the words explicitly. */
           if (o && vm_base) {
             const uint8_t* p = vm_base + o;
