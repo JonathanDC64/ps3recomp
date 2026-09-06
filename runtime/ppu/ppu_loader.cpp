@@ -2400,6 +2400,25 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
  * dispatch table and print it. Callable from C runtime modules (sys_timer's
  * poll-site probe etc). Guest LR slots are stale under the direct-call model,
  * so this is the only reliable caller-chain view. */
+/* Secondary symbol table for host-stack resolution.
+ *
+ * ppu_log_host_chain / ydkj_host_bt resolve a host return address by finding the
+ * largest function_table[] entry below it -- but function_table[] holds only the
+ * GAME's lifted functions. A frame inside a dynamically loaded module (a lifted
+ * firmware PRX registered through ppu_register_function) therefore resolves to
+ * whichever GAME function happens to sit below it in host memory, i.e. a
+ * plausible-looking but entirely wrong guest address. That cost a wrong
+ * conclusion once already: a chain that appeared to be "all game frames, no
+ * libsre" was really "libsre frames mis-attributed to game functions".
+ *
+ * A loader that brings in extra lifted code registers its table here so the
+ * resolver can consider it too. Entries are the same {addr, func, name} layout
+ * the lifter emits. Null by default -- no behaviour change without a PRX. */
+extern "C" {
+    const void* g_extra_symtab = 0;      /* const func_entry* */
+    uint64_t    g_extra_symtab_count = 0;
+}
+
 extern "C" void ppu_log_host_chain(const char* tag)
 {
 #ifdef _WIN32
@@ -2410,6 +2429,15 @@ extern "C" void ppu_log_host_chain(const char* tag)
         for (uint64_t k = 0; k < function_table_count; k++) {
             uintptr_t h = (uintptr_t)function_table[k].func;
             if (h <= tgt && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
+        }
+        /* ...and any extra module table (lifted firmware PRX), so its frames are
+         * not silently attributed to whichever game function sits below them. */
+        if (g_extra_symtab) {
+            const func_entry* xt = (const func_entry*)g_extra_symtab;
+            for (uint64_t k = 0; k < g_extra_symtab_count; k++) {
+                uintptr_t h = (uintptr_t)xt[k].func;
+                if (h <= tgt && h > bh) { bh = h; bg = (uint32_t)xt[k].addr; }
+            }
         }
         if (bg && tgt - bh < 0x200000)
             p += snprintf(b + p, sizeof(b) - p, " %08X", bg);
