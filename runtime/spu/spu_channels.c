@@ -485,10 +485,15 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
      * mix distinguishes those. */
-    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+    /* SPU_CHHIST=<n>: print every n-th op (default 2000). A task that issues only
+     * a few dozen channel ops -- e.g. Demon's Souls's SPU audio mixer, which does
+     * one mixing round per signal -- never reached a fixed 2000 and so reported
+     * nothing at all, which reads as "touches no channels". Make it settable. */
+    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST");
+          s_c = e ? atoi(e) : 0; if (e && s_c <= 0) s_c = 2000; }
       if (s_c) { static unsigned long long w[128]; static unsigned long long n;
           w[channel & 127]++;
-          if ((++n % 2000) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
+          if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
@@ -621,10 +626,11 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
-    { static int s_c = -1; if (s_c < 0) s_c = getenv("SPU_CHHIST") ? 1 : 0;
+    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST");
+          s_c = e ? atoi(e) : 0; if (e && s_c <= 0) s_c = 2000; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
-          if ((++n % 2000) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
+          if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
               for (int i = 0; i < 128; i++) if (r[i])
                   fprintf(stderr, "   rdch ch%-3d %llu%c", i, r[i], 10); } } }
     /* Block (never fabricate) on an empty producer-fed read channel (opt-in

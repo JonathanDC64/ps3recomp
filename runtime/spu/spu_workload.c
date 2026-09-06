@@ -949,6 +949,36 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * keeps the block-forever behaviour. Reversible, opt-in. */
     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
     int drained = 0;
+    /* SPURS_ROUND_NOTIFY=<flagEA hex>[:<bits>] -- DIAGNOSTIC BISECT, NOT A FIX.
+     *
+     * A task entering WAIT_SIGNAL has by definition finished the round it was
+     * signalled for. On real SPURS the taskset POLICY MODULE does the completion
+     * bookkeeping at that point, including setting the event flag a PPU waiter is
+     * blocked on. We HLE the taskset PM in C (spurs_pm_build_context) and never
+     * run its notify logic, so nothing ever sets the flag -- established for
+     * Demon's Souls: its SPU audio mixer (image 12) completes a full mixing round
+     * and writes PCM to the cellAudio ring, yet issues NO atomic, NO mailbox and
+     * NO taskset syscall other than WAIT_SIGNAL itself, while MOMixerThread stays
+     * blocked in cellSpursEventFlagWait on 0x01CE7800 with bits=0x0000 forever.
+     *
+     * Setting the flag here tests exactly that diagnosis. It is a bisect because
+     * the real PM decides WHICH flag and WHICH bits from taskset state we do not
+     * model; this just applies the ones named in the env. Off unless set. */
+    { static int s_rn = -1; static uint32_t s_rn_ea; static unsigned s_rn_bits;
+      if (s_rn < 0) { const char* e = getenv("SPURS_ROUND_NOTIFY");
+          s_rn = 0; s_rn_ea = 0; s_rn_bits = 1;
+          if (e && *e) { char* end = 0;
+              s_rn_ea = (uint32_t)strtoul(e, &end, 16);
+              if (end && *end == ':') s_rn_bits = (unsigned)strtoul(end + 1, 0, 0);
+              s_rn = s_rn_ea ? 1 : 0; } }
+      if (s_rn) {
+          extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
+          static int _n = 0; if (_n++ < 12)
+              fprintf(stderr, "[round-notify] task %u finished a round -> set flag "
+                      "0x%08X bits=0x%04X\n", taskId, s_rn_ea, (unsigned)s_rn_bits);
+          spurs_ef_set_from_spu(s_rn_ea, (uint16_t)s_rn_bits);
+      } }
+
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
