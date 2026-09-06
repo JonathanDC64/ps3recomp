@@ -511,6 +511,16 @@ class PPULifter:
         # lift) is sorted+indexed once, not rescanned per call.
         self._range_cache: tuple | None = None
 
+        # Per-game function overrides: {guest_addr -> host symbol}. A listed
+        # function's body is replaced with a tail call to the host symbol, so a
+        # title can swap out e.g. its allocator/malloc for a clean host
+        # implementation (Demon's Souls redirects the DL heap's malloc/free).
+        # NOTE: must be initialised in __init__ -- the parallel workers build
+        # their own PPULifter and only override_funcs is restored from worker
+        # state, so override_syms has to exist from construction.
+        self.override_funcs: dict[int, str] = {}
+        self.override_syms: set[str] = set()
+
     def _range_insns(self, instructions: list["Instruction"],
                      start: int, end: int) -> list["Instruction"]:
         """Instructions whose addr is in [start, end), via a cached sorted index.
@@ -536,13 +546,6 @@ class PPULifter:
         lo = bisect.bisect_left(addrs, start)
         hi = bisect.bisect_left(addrs, end)
         return ordered[lo:hi]
-        # Per-game function overrides: {guest_addr -> host symbol}. A listed
-        # function's body is replaced with a tail call to the host symbol, so a
-        # title can swap out e.g. its allocator/malloc for a clean host
-        # implementation (used by Demon's Souls: the DL heap can't be backed in
-        # our env, so malloc/free are redirected to a host guest-memory pool).
-        self.override_funcs: dict[int, str] = {}
-        self.override_syms: set[str] = set()
 
     def lift_function(self, instructions: list[Instruction],
                       start: int, end: int) -> LiftedFunction:
