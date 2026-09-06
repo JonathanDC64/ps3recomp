@@ -684,6 +684,20 @@ static void spu_async_run(spu_async_job* j)
                       if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
                       rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                   1, j->have_r3 ? j->r3 : 0);
+                      /* Publish the completion word after EACH re-entry, not just
+                       * once at the end: the PPU waiter clears it and re-submits
+                       * every iteration, so a single publish only ever buys one
+                       * iteration. (SPU_DONE_WORD below documents the word.) */
+                      { extern uint8_t* vm_base;
+                        const char* de = getenv("SPU_DONE_WORD");
+                        if (de && *de && vm_base) {
+                            uint32_t dea = (uint32_t)strtoul(de, 0, 16);
+                            if (dea) { const uint8_t* d = vm_base + dea;
+                                uint32_t endp = ((uint32_t)d[0]<<24)|((uint32_t)d[1]<<16)|
+                                                ((uint32_t)d[2]<<8)|(uint32_t)d[3];
+                                uint8_t* w = vm_base + dea + 0x0C;
+                                w[0]=(uint8_t)(endp>>24); w[1]=(uint8_t)(endp>>16);
+                                w[2]=(uint8_t)(endp>>8);  w[3]=(uint8_t)endp; } } }
                   }
                   fprintf(stderr, "[task-resume] image=%d: done re-entering\n", j->image_id);
                   fflush(stderr);
