@@ -4650,6 +4650,16 @@ def main() -> None:
     if lifter.code_hi is None and func_bounds:
         lifter.code_lo = min(s for s, _ in func_bounds)
         lifter.code_hi = max(e for _, e in func_bounds)
+        # The first listed function is not where code starts: the linker puts
+        # TOC-switching long-branch stubs ahead of it. Demon's Souls' _init
+        # reaches __do_global_ctors_aux through one at 0x10200, and clamping the
+        # window at the first function dropped that `bl` -- no C++ static
+        # constructor ran. Start the window at the executable segment instead;
+        # the data misread as code lives past .text, which code_hi still guards.
+        for _v0, _blob in seg_blobs:
+            if _v0 <= lifter.code_lo < _v0 + len(_blob):
+                lifter.code_lo = _v0
+                break
     lifter.shadow_stack = args.shadow_stack
     lifter.hle_stub_nids = hle_stubs
     lifter.override_funcs = override_funcs
