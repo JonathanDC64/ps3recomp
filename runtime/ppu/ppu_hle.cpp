@@ -234,9 +234,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
       if (s_ha && nid == (uint32_t)s_ha) {
         static int _n = 0;
         if (_n++ < 6)
-          fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
+          fprintf(stderr, "[hle-args] nid=0x%08X r2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
                           "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
-                  nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+                  nid, (uint32_t)ctx->gpr[2], (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
                   (uint32_t)ctx->gpr[6], (uint32_t)ctx->gpr[7], (uint32_t)ctx->gpr[8],
                   (uint32_t)ctx->gpr[9], (uint32_t)ctx->gpr[10], (uint32_t)ctx->lr);
       } }
