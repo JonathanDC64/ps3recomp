@@ -30,6 +30,10 @@ extern "C" {
 #define CELL_HTTP_ERROR_INVALID_URL             0x8071010B
 #define CELL_HTTP_ERROR_ABORTED                 0x8071010C
 #define CELL_HTTP_ERROR_UNKNOWN                 0x807101FF
+/* "No Content-Length" from cellHttpResponseGetContentLength. The value is the
+ * one titles compare the result with before reading the body to the end; the
+ * SDK's own name for it is not confirmed here. */
+#define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017
 
 /* ---------------------------------------------------------------------------
  * HTTP methods
@@ -100,6 +104,11 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
                          u32* received);
 
 s32 cellHttpGetResponseContentLength(CellHttpTransId transId, u64* length);
+/* SDK names (CellHttpHeader** headers; size_t items/poolSize/required are 32-bit guest values) */
+s32 cellHttpResponseGetStatusCode(CellHttpTransId transId, s32* code);
+s32 cellHttpResponseGetContentLength(CellHttpTransId transId, u64* length);
+s32 cellHttpResponseGetAllHeaders(CellHttpTransId transId, void* headers, u32* items, void* pool, u32 poolSize,
+                                  u32* required);
 s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code);
 
 s32 cellHttpSetResolveTimeOut(CellHttpTransId transId, u32 usec);
