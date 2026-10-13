@@ -323,6 +323,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
 
     printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
            "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
+    fflush(stdout);
 
     /* Use the runner's OPD bridge, not the optional code/TOC scaffold entry
      * point. Registration status is synchronous; its terminal notification is

@@ -2132,9 +2132,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * (get stuck short of put), so require exactly that -- same overrun,
          * get not advancing, get != put -- to persist for 100 ms. A walker
          * that is caught up or still moving has lost nothing and the title's
-         * own callback will rewind. */
+         * own callback will rewind.
+         *
+         * A walker parked at a flip is not wedged either: it stops there on
+         * purpose and resumes on the next pass. When a frame takes longer than
+         * 100 ms that pause alone satisfied the test, so Demon's Souls was
+         * recycled mid-frame -- the SPU pushbuffer behind the flip, label 255
+         * releases included, was dropped and HighGraphics waited on the label
+         * forever (after the auto-save notice, at a random flip count). */
         static u32 s_over_cur = 0, s_over_get = 0; static unsigned long long s_over_ms = 0;
-        if (begin && end > begin && cur >= end && s_fifo_getoff != put) {
+        if (begin && end > begin && cur >= end && s_fifo_getoff != put && strcmp(why, "flip")) {
             unsigned long long now_ms = ps3_ms_now();
             if (cur != s_over_cur || s_fifo_getoff != s_over_get || !s_over_ms) {
                 s_over_cur = cur; s_over_get = s_fifo_getoff; s_over_ms = now_ms;

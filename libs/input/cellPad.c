@@ -502,8 +502,29 @@ void cellPad_poll(void)
  * were fixed.) These used to be redeclared here with a 64-bit address
  * parameter, which conflicts with the header now that it is included. */
 
+/* PAD_TRACE=1: once a second, how many GetData / GetInfo2 calls each port got.
+ * Tells "the title stopped reading the pad" apart from "it reads it and ignores
+ * the press" (DeS's auto-save notice). */
+static void pad_trace(int which, u32 port)
+{
+    static int on = -1; static unsigned long long t0 = 0;
+    static unsigned n[2][8];
+    if (on < 0) on = getenv("PAD_TRACE") ? 1 : 0;
+    if (!on) return;
+    if (port < 8) n[which][port]++;
+    unsigned long long now = GetTickCount64();
+    if (!t0) t0 = now;
+    if (now - t0 >= 1000) {
+        t0 = now;
+        printf("[cellPad] trace GetData p0=%u p1=%u p2=%u p3=%u  GetInfo2=%u%c",
+               n[0][0], n[0][1], n[0][2], n[0][3], n[1][0], 10);
+        memset(n, 0, sizeof n);
+    }
+}
+
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
+    pad_trace(0, port_no);
     { static int _once = 0;
       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
     if (!s_pad_initialized)
@@ -888,6 +909,7 @@ s32 cellPadGetInfo(CellPadInfo2* info)
 
 s32 cellPadGetInfo2(CellPadInfo2* info_guest)
 {
+    pad_trace(1, 0);
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
 

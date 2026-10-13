@@ -118,6 +118,8 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     return result;
 }
 
+static int cond_traced(uint32_t id);
+
 int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
@@ -139,6 +141,9 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
 #endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+    if (cond_traced(LV2_ARG_U32(ctx, 0)))
+        fprintf(stderr, "[COND_TRACE] wait cond=%u by tid=%llu lr=0x%08llX%c", LV2_ARG_U32(ctx, 0),
+                (unsigned long long)ctx->thread_id, (unsigned long long)ctx->lr, 10);
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
     if (!c) return (int32_t)CELL_ESRCH;
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
@@ -159,6 +164,13 @@ int64_t sys_cond_wait(ppu_context* ctx)
 #ifdef _WIN32
     ULONGLONG start = GetTickCount64();
     uint64_t duration = (timeout + 999) / 1000;
+    /* COND_SHADOW=1: a wait still blocked after 3 s prints the cond, the
+     * waiter's cia/lr and its guest call stack (shadow stack, --shadow-stack
+     * lift), once per wait. Names what a parked thread is waiting for when the
+     * host stack only shows ntdll. */
+    static int s_cs = -1;
+    if (s_cs < 0) s_cs = getenv("COND_SHADOW") ? 1 : 0;
+    int cs_said = !s_cs;
     while (!waiter.signalled) {
         DWORD ms = INFINITE;
         if (timeout) {
@@ -166,6 +178,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
             if (elapsed >= duration) { result = (int32_t)CELL_ETIMEDOUT; break; }
             uint64_t remaining = duration - elapsed;
             ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
+        }
+        if (!cs_said) {
+            if (GetTickCount64() - start >= 3000) {
+                extern void (*g_shadow_stack_dump_hook)(void);
+                cs_said = 1;
+                fprintf(stderr, "[COND_SHADOW] tid=%llu blocked >3s on cond=%u (mutex=%u) cia=0x%08llX lr=0x%08llX%c",
+                        (unsigned long long)ctx->thread_id, LV2_ARG_U32(ctx, 0), c->mutex_id,
+                        (unsigned long long)ctx->cia, (unsigned long long)ctx->lr, 10);
+                if (g_shadow_stack_dump_hook) g_shadow_stack_dump_hook();
+            } else if (ms > 3000) ms = 3000;
         }
         BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
         if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
@@ -201,6 +223,23 @@ int64_t sys_cond_wait(ppu_context* ctx)
     return result;
 }
 
+/* COND_TRACE=<id>[,<id>...]: log every wait and signal on those cond ids, with
+ * the caller's guest tid and lr and whether a waiter was there to take it. */
+static int cond_traced(uint32_t id)
+{
+    static int n = -1; static uint32_t ids[16];
+    if (n < 0) {
+        n = 0;
+        const char* e = getenv("COND_TRACE");
+        while (e && *e && n < 16) {
+            ids[n++] = (uint32_t)strtoul(e, (char**)&e, 0);
+            while (*e == ',' || *e == ' ') e++;
+        }
+    }
+    for (int i = 0; i < n; i++) if (ids[i] == id) return 1;
+    return 0;
+}
+
 static int64_t signal_cond(uint32_t id, int all)
 {
     sys_cond_info* c = acquire_cond(id);
@@ -219,8 +258,23 @@ static int64_t signal_cond(uint32_t id, int all)
     return CELL_OK;
 }
 
-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
-int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+static int64_t signal_cond_traced(ppu_context* ctx, int all)
+{
+    uint32_t id = LV2_ARG_U32(ctx, 0);
+    if (cond_traced(id)) {
+        int waiting = 0;
+        sys_cond_info* c = acquire_cond(id);
+        if (c) { for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) waiting += !w->signalled;
+                 cond_unlock(c); }
+        fprintf(stderr, "[COND_TRACE] signal%s cond=%u by tid=%llu lr=0x%08llX waiting=%d%c",
+                all ? "_all" : "", id, (unsigned long long)ctx->thread_id,
+                (unsigned long long)ctx->lr, waiting, 10);
+    }
+    return signal_cond(id, all);
+}
+
+int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond_traced(ctx, 0); }
+int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond_traced(ctx, 1); }
 
 /* Preserve upstream's current broadcast fallback for signal_to. */
 int64_t sys_cond_signal_to(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }

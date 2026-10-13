@@ -556,6 +556,53 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             fprintf(stderr, "[atomcnt] %llu atomic ops; last cmd=0x%X ea=0x%08X\n",
                     (unsigned long long)s_n, cmd, ea);
           s_lastea = ea; } } }
+    /* SPU_ATOMHIST=<sec>: every <sec> seconds, the busiest (image, cmd, line,
+     * pc, lr) atomic sites since the last report. A task spinning on a lock
+     * line shows up as one tuple with millions of hits, which names the line it
+     * waits on and the code polling it. Unsynchronised counters: approximate. */
+    { static int s_ah = -1;
+      if (s_ah < 0) { const char* e = getenv("SPU_ATOMHIST"); s_ah = e ? (atoi(e) > 0 ? atoi(e) : 5) : 0; }
+      if (s_ah) {
+        enum { AH_N = 64 };
+        static struct { uint32_t img, cmd, ea, pc, lr; uint64_t n; } s_t[AH_N];
+        static int s_lock = 0;
+        static time_t s_last = 0;
+        const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK, lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        while (__atomic_exchange_n(&s_lock, 1, __ATOMIC_ACQUIRE)) {}
+        int k, free_k = -1;
+        for (k = 0; k < AH_N; k++) {
+            if (!s_t[k].n) { if (free_k < 0) free_k = k; continue; }
+            if (s_t[k].img == (uint32_t)ctx->image_id && s_t[k].cmd == cmd && s_t[k].ea == ea &&
+                s_t[k].pc == pc && s_t[k].lr == lr) { s_t[k].n++; break; }
+        }
+        if (k == AH_N && free_k >= 0) {
+            s_t[free_k].img = (uint32_t)ctx->image_id; s_t[free_k].cmd = cmd; s_t[free_k].ea = ea;
+            s_t[free_k].pc = pc; s_t[free_k].lr = lr; s_t[free_k].n = 1;
+        }
+        const time_t now = time(NULL);
+        if (!s_last) s_last = now;
+        if (now - s_last >= (time_t)s_ah) {
+            s_last = now;
+            char buf[4096]; int p = snprintf(buf, sizeof buf, "[atomhist] last %ds:\n", s_ah);
+            for (int r = 0; r < 8; r++) {
+                int best = -1;
+                for (k = 0; k < AH_N; k++) if (s_t[k].n && (best < 0 || s_t[k].n > s_t[best].n)) best = k;
+                if (best < 0) break;
+                static const uint8_t zl[16];
+                const uint8_t* m = mfc_ea_range_committed(s_t[best].ea, 16) ? vm_base + s_t[best].ea : zl;
+                p += snprintf(buf + p, sizeof buf - p,
+                    "[atomhist]  %10llu img=%u cmd=0x%02X ea=0x%08X pc=0x%05X lr=0x%05X line=%08X %08X %08X %08X\n",
+                    (unsigned long long)s_t[best].n, s_t[best].img, s_t[best].cmd, s_t[best].ea,
+                    s_t[best].pc, s_t[best].lr,
+                    __builtin_bswap32(*(const uint32_t*)m), __builtin_bswap32(*(const uint32_t*)(m + 4)),
+                    __builtin_bswap32(*(const uint32_t*)(m + 8)), __builtin_bswap32(*(const uint32_t*)(m + 12)));
+                s_t[best].n = 0;
+            }
+            memset(s_t, 0, sizeof s_t);
+            fputs(buf, stderr); fflush(stderr);
+        }
+        __atomic_store_n(&s_lock, 0, __ATOMIC_RELEASE);
+      } }
     /* SPU_ATOMTRACE=1 keeps the old 40-line cap; =<N> raises it. A busy image
      * (FMOD) exhausts 40 before a quieter one issues its first atomic, which
      * reads as "that image never does atomics" when it simply never got a line. */
