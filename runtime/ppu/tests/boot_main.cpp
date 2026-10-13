@@ -1172,6 +1172,23 @@ int main(int argc, char** argv)
     timeBeginPeriod(1);   /* 1ms timer resolution: the default ~15.6ms granularity
                            * inflates every sub-15ms wait (the game's event polls,
                            * usleeps) and throttled the whole title. */
+    /* PS3_PRIORITY=below|idle|normal and PS3_AFFINITY=<hex cpu mask>: keep a
+     * spinning or hung title from starving the rest of the machine during
+     * test runs. Unset leaves the process as the OS started it. */
+    { const char* pr = getenv("PS3_PRIORITY");
+      if (pr && *pr) {
+          DWORD cls = !_stricmp(pr, "idle")  ? IDLE_PRIORITY_CLASS :
+                      !_stricmp(pr, "below") ? BELOW_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS;
+          SetPriorityClass(GetCurrentProcess(), cls);
+      }
+      const char* af = getenv("PS3_AFFINITY");
+      if (af && *af) {
+          DWORD_PTR want = (DWORD_PTR)strtoull(af, 0, 16), proc = 0, sys = 0;
+          if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && (want & sys))
+              SetProcessAffinityMask(GetCurrentProcess(), want & sys);
+      }
+      if ((pr && *pr) || (af && *af))
+          fprintf(stderr, "[boot] priority=%s affinity=%s\n", pr ? pr : "-", af ? af : "-"); }
     SetUnhandledExceptionFilter(ydkj_crash_filter);
     AddVectoredExceptionHandler(0 /*last*/, [](EXCEPTION_POINTERS* ep)->LONG{
         if (ep->ExceptionRecord->ExceptionCode == 0xC00000FDu /*STACK_OVERFLOW*/) {

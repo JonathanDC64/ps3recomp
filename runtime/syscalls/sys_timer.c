@@ -108,6 +108,13 @@ static void write_be64(uint32_t addr, uint64_t val)
  * dumps the CALLING thread's guest stack. NULL otherwise. */
 void (*g_shadow_stack_dump_hook)(void) = 0;
 
+#ifdef _WIN32
+/* Short-usleep idle detection (see the sub-millisecond branch below). */
+static __declspec(thread) int64_t t_last_end;
+static __declspec(thread) unsigned t_streak;
+static __declspec(thread) HANDLE t_timer;
+#endif
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
@@ -273,16 +280,48 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * and busy-spins at full speed (so the wait is effectively a no-op).
          * Busy-wait to a precise QPC deadline, yielding inside the spin
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
+         *
+         * ...but a thread that does nothing BUT short sleeps is idle-polling a
+         * flag, and spinning pinned a core per poller (Demon's Souls'
+         * HighGraphics waits out each frame in usleep(30) loops). After 64
+         * back-to-back short sleeps -- each starting within 200 us of the
+         * previous one's end -- sleep for real on a high-resolution waitable
+         * timer (~0.5 ms granularity) until the thread does something else.
+         * Short one-off waits keep the precise spin. USLEEP_SPIN=1 restores
+         * the old always-spin behaviour. */
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
+        { static int s_spin = -1;
+          if (s_spin < 0) s_spin = getenv("USLEEP_SPIN") ? 1 : 0;
+          const int64_t gap_ticks = (int64_t)(200 * (uint64_t)s_qpc_freq.QuadPart / 1000000ULL);
+          if (t_last_end && qpc_start.QuadPart - t_last_end <= gap_ticks) t_streak++;
+          else t_streak = 0;
+          if (!s_spin && t_streak >= 64) {
+              if (!t_timer) {
+                  /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+). */
+                  t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
+                  if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+              }
+              if (t_timer) {
+                  LARGE_INTEGER due;
+                  due.QuadPart = -((LONGLONG)usec * 10);
+                  SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE);
+                  WaitForSingleObject(t_timer, INFINITE);
+                  QueryPerformanceCounter(&qpc_now);
+                  t_last_end = qpc_now.QuadPart;
+                  return CELL_OK;
+              }
+          }
+        }
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
         do {
             SwitchToThread();
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
+        t_last_end = qpc_now.QuadPart;
     }
 #else
     if (usec > 0) {

@@ -74,9 +74,6 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self);
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;
 
-/* Sleep the calling host thread about 1 ms (an SPU idle-poll back-off). */
-void spu_host_nap(void);
-
 #ifdef __cplusplus
 }
 #endif

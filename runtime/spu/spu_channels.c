@@ -32,6 +32,7 @@ int g_spu_qlog     = -1;   /* -1 = uninit; set from env on first DMA */
 int g_qlog7_budget = 60;   /* cap image-7 DMA log lines (it transfers a lot) */
 int g_qlog7_prov   = 2;    /* cap image-7 bad-EA GPR provenance dumps */
 #include "../platform/win32_compat.h"
+static void spu_llar_idle_wait(spu_context* ctx);  /* GETLLAR idle-poll wait, below */
 
 #ifdef __cplusplus
 extern "C" {
@@ -776,8 +777,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * flat out -- Demon's Souls' HighGraphics ring consumer (img 2, pc
          * 0x5120) re-read the ring's write pointer ~8M times a second and
          * pinned a core whenever it had caught up. After 20k unchanged reads in
-         * a row, nap ~1 ms per read until the line changes: a waiter wakes at
-         * most a millisecond late, and a busy consumer (whose line keeps
+         * a row, block until a write to the line drops the reservation
+         * (spu_coh_notify_write -> spu_ch_wake; 2 ms timeout as the safety
+         * net for a missed wake): a waiter wakes on the write, at worst 2 ms
+         * late, and a busy consumer (whose line keeps
          * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it. */
         { static int s_nap = -1;
           if (s_nap < 0) { const char* e = getenv("SPU_LLAR_NAP"); s_nap = e ? atoi(e) : 1; }
@@ -785,7 +788,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
           if (s_nap) {
               if (ea == n_ea && !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE)) {
-                  if (++n_same > 20000u) spu_host_nap();
+                  if (++n_same > 20000u) spu_llar_idle_wait(ctx);
               } else {
                   n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
               }
@@ -1158,6 +1161,24 @@ void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
+}
+
+/* An SPU re-reading an unchanged lock line is waiting for someone to write
+ * it. Sleep until a write drops its reservation -- every PPU store into a
+ * reserved line and every SPU PUTLLC/DMA put calls spu_coh_notify_write,
+ * which clears resv_valid and wakes this cv -- instead of spinning GETLLAR.
+ * The notifier does not take ch_wait_lock, so a write landing between the
+ * check and the sleep can miss the wake; the 2 ms timeout bounds that. */
+static void spu_llar_idle_wait(spu_context* ctx)
+{
+    yz_lockstep_block_begin(ctx);
+    AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    if (ctx->resv_valid && vm_base &&
+        !memcmp(vm_base + ctx->resv_ea, ctx->resv_line, MFC_ATOMIC_LINE))
+        SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                  (SRWLOCK*)&ctx->ch_wait_lock, 2, 0);
+    ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+    yz_lockstep_block_end(ctx);
 }
 
 /* Block the calling SPU host thread until `channel` is readable. */
