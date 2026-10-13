@@ -495,6 +495,10 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
  * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
  * getting it wrong makes the game read `current` as the callback OPD and stall
  * in cellGcmFlush. The command buffer is the start of the game's IO region. */
+static u32 s_fifo_getoff;   /* tentative: defined below (RSX get) */
+/* The SDK default command buffer as a ring of 32KB fragments (real layout
+ * only; 0 frags = legacy single buffer). See cellGcm_fifo_recycle. */
+static u32 s_cmdbuf_base = 0, s_cmdbuf_frags = 0;
 u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress,
                         CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32)
 {
@@ -511,11 +515,30 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
 
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
-    u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
+    /* The SDK's default command buffer is NOT at the IO region start: libgcm
+     * reserves the first 4KB, so `begin` is IO offset 0x1000, and it is a 32KB
+     * fragment (end = base+32KB-4, room for the wrap JUMP) that the default
+     * callback recycles. Titles bake that in. Demon's Souls builds its own
+     * pushbuffer on an SPU directly after the default fragment and computes the
+     * `put` it writes as (ea - begin + 0x1000): with begin at IO 0 every SPU kick
+     * pointed 4KB past the commands, the walker read zeros, and the label fence
+     * HighGraphics init waits on was never released. Matches RPCS3's
+     * _cellGcmInitBody. GCM_LEGACY_CMDBUF=1 restores the old whole-region
+     * buffer at IO 0. */
+    const int legacy = getenv("GCM_LEGACY_CMDBUF") != 0;
+    u32 cmdbuf = legacy ? ioAddress : ioAddress + 0x1000u;
+    u32 cmdend = legacy ? ioAddress + cmdSize : ioAddress + 0x8000u - 4u;
+    s_cmdbuf_base  = legacy ? 0 : ioAddress;
+    s_cmdbuf_frags = legacy ? 0 : cmdSize / 0x8000u;
+    if (!legacy) {
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0x1000u);   /* put */
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0x1000u);   /* get */
+        s_fifo_getoff = 0x1000u;
+    }
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
+        gwrite32(cdata + 0x4, cmdend);              /* end     */
         gwrite32(cdata + 0x8, cmdbuf);              /* current */
         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
@@ -1577,6 +1600,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     u32 start_off = s_fifo_getoff;
+    const u32 start_tr = s_tr_i;      /* words decoded this pass (stuck test) */
     if (getenv("GCM_DRAINDBG")) {
         static int n = 0;
         if (n++ % 60 == 0)
@@ -1613,7 +1637,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * bad branch, which is exactly the case where the drift is silent. */
     { static int snap = -1;
       if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
-      if (snap > 0 && put) {
+      if (snap > 0 && put && put != s_fifo_getoff) {   /* idle passes say nothing */
           snap--;
           fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
           for (int k = 0; k < 16; k++) {
@@ -1672,6 +1696,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * on would mix the next frame's head into the batch (wave: every
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
+            /* GCM_FLIPCTX=<n>: the words around the first n flip words -- what a
+             * frame's tail looks like (park, JUMP to the next frame, ...). */
+            { static int fc = -1, fn = 0;
+              if (fc < 0) { const char* e = getenv("GCM_FLIPCTX"); fc = e ? atoi(e) : 0; }
+              if (fn < fc) { fn++;
+                  fprintf(stderr, "[flipctx] #%d io=%08X put=%08X:", fn, s_fifo_getoff, put);
+                  for (int k = -6; k <= 10; k++) {
+                      u32 a = gcm_io2ea(s_fifo_getoff + (u32)(k * 4));
+                      fprintf(stderr, " %s%08X", k ? "" : "*", a ? vm_read32(a) : 0xDEADDEADu);
+                  }
+                  fprintf(stderr, "\n"); } }
             s_fifo_getoff += 4;
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
@@ -1997,7 +2032,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
       } else burned = 0; }
 
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      /* A pass that decoded words is not stuck, even if it ends where the last
+       * one did. Demon's Souls ends a static screen (the auto-save notice) with
+       * `flip; JUMP <frame start>`: the RSX re-runs that frame and re-presents
+       * it until the title patches the JUMP. Every pass stops at the flip, so
+       * `get` is the same each time -- resyncing to `put` there broke the loop
+       * and ran stale ring data instead. */
+      if (s_fifo_getoff == last && s_fifo_getoff != put && s_tr_i - start_tr <= 1) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
@@ -2008,7 +2049,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * the drained EA. */
     if (getenv("GCM_DRAINDBG")) {
         static int n2 = 0;
-        if (n2++ % 60 == 0)
+        /* GCM_DRAINDBG=2: every pass that did work or stopped early. */
+        const int all = atoi(getenv("GCM_DRAINDBG")) >= 2 &&
+                        (s_fifo_getoff != start_off || strcmp(why, "caught-up") != 0);
+        if (all || n2++ % 60 == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
     }
@@ -2077,11 +2121,34 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * overruns first, so the first overrun is recycled by the path above
          * and near-end recycling is enabled from then on. */
         static int s_title_overran = 0;
-        if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
+        /* ...and only an overrun that STAYS. Demon's Souls steps `current`
+         * past `end` on purpose every frame: an SPU appends a pushbuffer
+         * beyond the context's window, the PPU sets current to where it ended,
+         * and the title's own callback rewinds the ring on its next reserve.
+         * Treating that transient as AMGL's wedge teleported put/get to begin
+         * with the SPU's commands still unread -- the label releases among them
+         * -- and HighGraphics waited forever after 19 draws. A title whose
+         * callback declines stays past `end` for good AND wedges the walker
+         * (get stuck short of put), so require exactly that -- same overrun,
+         * get not advancing, get != put -- to persist for 100 ms. A walker
+         * that is caught up or still moving has lost nothing and the title's
+         * own callback will rewind. */
+        static u32 s_over_cur = 0, s_over_get = 0; static unsigned long long s_over_ms = 0;
+        if (begin && end > begin && cur >= end && s_fifo_getoff != put) {
+            unsigned long long now_ms = ps3_ms_now();
+            if (cur != s_over_cur || s_fifo_getoff != s_over_get || !s_over_ms) {
+                s_over_cur = cur; s_over_get = s_fifo_getoff; s_over_ms = now_ms;
+            } else if (now_ms - s_over_ms >= 100) { head_consumed = 1; s_title_overran = 1; }
+        } else {
+            s_over_ms = 0;
+        }
         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
                 && head_consumed && s_title_overran) {
             u32 io_begin = gcm_ea2io(begin);
             if (io_begin != 0xFFFFFFFFu) {
+                { static int nr = 0; if (nr++ < 8)
+                    fprintf(stderr, "[cellGcmSys] title-ring recycle: cur=0x%08X get=0x%08X put=0x%08X why=%s%c",
+                            cur, s_fifo_getoff, put, why, 10); }
                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
@@ -2131,9 +2198,62 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* The SDK's cellGcmCallback for the real default-buffer layout: the buffer is
+ * a ring of 32KB fragments and begin/end only ever bracket the CURRENT one.
+ * On overflow: flush (put = current), JUMP from current to the start of the
+ * next fragment (wrapping to base+4KB after the last), move begin/current/end
+ * there, and wait until the RSX `get` is not inside it. Mirrors RPCS3's
+ * cellGcmCallback/getNextCommandBufferBeginEnd.
+ *
+ * The old rewind-to-begin recycle is wrong for a title that steps `current`
+ * past `end` itself: Demon's Souls has an SPU append a pushbuffer in the
+ * following fragments and then sets context->current to where the SPU stopped.
+ * Rewinding set put back to begin, so the walker never executed the SPU's
+ * commands -- including the label release HighGraphics waits on every frame
+ * (stalled at 19 draws). */
+static void gcm_fifo_next_fragment(u32 ctx_ea)
+{
+    const u32 base = s_cmdbuf_base, frags = s_cmdbuf_frags;
+    u32 current = vm_read32(ctx_ea + 0x8);
+    u32 cur_io  = gcm_ea2io(current);
+    if (cur_io != 0xFFFFFFFFu)
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, cur_io);         /* flush */
+    u32 range = (current >= base) ? (current - base) / 0x8000u : frags;
+    u32 nb, ne;
+    if (range + 1 >= frags) { nb = base + 0x1000u;               ne = base + 0x8000u - 4u; }
+    else                    { nb = base + (range + 1) * 0x8000u; ne = base + (range + 2) * 0x8000u - 4u; }
+    u32 nb_io = gcm_ea2io(nb), ne_io = gcm_ea2io(ne);
+    if (nb_io == 0xFFFFFFFFu) return;
+    vm_write32(current, 0x20000000u | nb_io);                    /* OLD_JUMP */
+    atomic_thread_fence(memory_order_release);
+    vm_write32(ctx_ea + 0x0, nb);
+    vm_write32(ctx_ea + 0x8, nb);
+    vm_write32(ctx_ea + 0x4, ne);
+    /* The RSX must not be reading the fragment we are about to overwrite. */
+    int spins = 0;
+    for (;;) {
+        u32 g = s_fifo_getoff;
+        if (g < nb_io || g > ne_io) break;
+        if (++spins > 2000) {
+            static int warned = 0;
+            if (warned++ < 4)
+                fprintf(stderr, "[cellGcmSys] fifo fragment wait timed out (get=0x%08X frag=0x%08X..0x%08X)\n",
+                        g, nb_io, ne_io);
+            break;
+        }
+        Sleep(1);
+    }
+    static int s_recdbg = -1;
+    if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+    if (s_recdbg)
+        fprintf(stderr, "[REC-FRAG] cur=%08X -> frag %08X..%08X put=%08X get=%08X spins=%d\n",
+                current, nb, ne, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), s_fifo_getoff, spins);
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
+    if (s_cmdbuf_frags && ctx_ea == s_gcm_context_ea) { gcm_fifo_next_fragment(ctx_ea); return; }
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */

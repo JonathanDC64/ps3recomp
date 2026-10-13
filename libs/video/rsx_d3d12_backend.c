@@ -95,6 +95,7 @@ typedef struct {
         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
         u32 w, h, fmt;  /* dims + RSX base format */
         u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
+        u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -151,6 +152,10 @@ typedef struct {
  * so multi-unit fragment programs see all their textures (demosaic's
  * interpolation passes sample 3 units). */
 #define DRAW_SRV_BASE 32
+#define VP_SAMP_TABLES 512   /* distinct 4-sampler tables, kept for the whole run:
+                              * written once, never rewritten, so no frame in flight
+                              * can see a table change (D3D12 caps a shader-visible
+                              * sampler heap at 2048) */
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * 4)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
@@ -311,7 +316,10 @@ typedef struct {
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips; int cube; int set; } cur_texs[4];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[4];
+    ID3D12DescriptorHeap* samp_heap;            /* shader-visible guest samplers */
+    u32                   samp_inc;
+    u32                   samp_n;               /* 4-sampler tables created so far */
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -1122,7 +1130,7 @@ static int init_d3d12(u32 width, u32 height)
         srv_range.BaseShaderRegister = 0;
         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_ROOT_PARAMETER rp[3] = {0};
+        D3D12_ROOT_PARAMETER rp[4] = {0};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
         rp[0].Descriptor.ShaderRegister = 0;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -1134,22 +1142,34 @@ static int init_d3d12(u32 width, u32 height)
         rp[2].Descriptor.ShaderRegister = 1;
         rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        D3D12_STATIC_SAMPLER_DESC samp[4] = {0};
-        for (int _s = 0; _s < 4; _s++) {
-            samp[_s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            samp[_s].AddressU = samp[_s].AddressV = samp[_s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            samp[_s].ShaderRegister = (UINT)_s;
-            samp[_s].MaxLOD = D3D12_FLOAT32_MAX;
-            samp[_s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        /* s0-s3 come from a per-draw sampler table built from the guest's
+         * TEXTURE_ADDRESS/TEXTURE_FILTER (vp_sampler_table). Fixed static
+         * samplers sampled a 256x1 gamma LUT with WRAP, so u=0 blended texel 0
+         * with texel 255 and black came out mid-grey. */
+        D3D12_DESCRIPTOR_RANGE samp_range = {0};
+        samp_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        samp_range.NumDescriptors = 4;
+        samp_range.BaseShaderRegister = 0;
+        samp_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[3].DescriptorTable.NumDescriptorRanges = 1;
+        rp[3].DescriptorTable.pDescriptorRanges = &samp_range;
+        rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC sh = {0};
+            sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            sh.NumDescriptors = VP_SAMP_TABLES * 4;
+            sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &sh,
+                    &IID_ID3D12DescriptorHeap, (void**)&s_d3d.samp_heap)))
+                printf("[D3D12] sampler heap creation failed\n");
+            s_d3d.samp_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+                s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         }
-        /* s0 keeps point/clamp: the dbgfont atlas PS samples glyph cells and
-         * linear filtering bleeds neighbouring glyphs. */
-        samp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samp[0].AddressU = samp[0].AddressV = samp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 
         D3D12_ROOT_SIGNATURE_DESC rd = {0};
-        rd.NumParameters = 3; rd.pParameters = rp;
-        rd.NumStaticSamplers = 4; rd.pStaticSamplers = samp;
+        rd.NumParameters = 4; rd.pParameters = rp;
+        rd.NumStaticSamplers = 0; rd.pStaticSamplers = NULL;
         rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
@@ -2259,6 +2279,20 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         char* rp = strstr(hlsl, "return r[0];");
         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
     }
+    /* FP_SUB=<hex fp_addr>:<file>: compile that file instead of the translated
+     * program. The decompiler's output shape changes between versions, so the
+     * string-anchored rewrites above (FP_ONE/FP_TEX) silently miss; a whole
+     * replacement always applies. The file must keep the PSInput/rsx_tex[]
+     * declarations of the translated program (start from FP_PICK's dump). */
+    { const char* fs = getenv("FP_SUB");
+      if (fs && (u32)strtoul(fs, NULL, 16) == fp_addr && strchr(fs, ':')) {
+          FILE* f = fopen(strchr(fs, ':') + 1, "rb");
+          if (f) {
+              size_t n2 = fread(hlsl, 1, sizeof(hlsl) - 1, f); hlsl[n2] = 0; fclose(f);
+              fprintf(stderr, "[FP_SUB] fp=0x%X <- %s (%u bytes)%c", fp_addr,
+                      strchr(fs, ':') + 1, (unsigned)n2, 10);
+          }
+      } }
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
                             "main", "ps_5_0", 0, 0, &pb, &e);
@@ -3279,6 +3313,75 @@ static DXGI_FORMAT rsx_surface_dxgi(u32 fmt)
     }
 }
 
+/* NV4097 TEXTURE_ADDRESS wrap field (S: bits 0-3, T: 8-11, R: 16-19). */
+static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap_to_d3d(u32 m)
+{
+    switch (m) {
+    case 2: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case 3: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* CLAMP_TO_EDGE */
+    case 4: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    case 5: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* GL CLAMP */
+    case 6: case 7: case 8: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;        /* 1 = WRAP; 0 = never set */
+    }
+}
+
+/* The 4-sampler table (s0-s3) for one draw, from each unit's guest sampler
+ * state. Tables are deduplicated for the whole run; returns the table index. Unset
+ * units keep the old static defaults (s0 point/clamp, s1-s3 linear/wrap). */
+static u32 vp_sampler_table(const D3D12DrawRecord* dr)
+{
+    static u32 keys[VP_SAMP_TABLES][8];
+    u32 k[8];
+    for (int u = 0; u < 4; u++) {
+        k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
+        k[u * 2 + 1] = dr && dr->tex[u].set ? (dr->tex[u].filt & 0x07070000u)
+                                            : (u ? 0x02060000u : 0x01010000u);
+    }
+    for (u32 i = 0; i < s_d3d.samp_n; i++)
+        if (!memcmp(keys[i], k, sizeof k)) return i;
+    if (s_d3d.samp_n >= VP_SAMP_TABLES) return 0;
+    const u32 t = s_d3d.samp_n++;
+    memcpy(keys[t], k, sizeof k);
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
+    for (int u = 0; u < 4; u++) {
+        const u32 a = k[u * 2], f = k[u * 2 + 1];
+        const u32 minf = (f >> 16) & 7, magf = (f >> 24) & 7;
+        /* min: 1 NEAREST, 2 LINEAR, 3 N_MIP_N, 4 L_MIP_N, 5 N_MIP_L, 6 L_MIP_L,
+         * 7 convolution; mag: 1 NEAREST, 2 LINEAR, 4 convolution. */
+        const int min_lin = (minf == 2 || minf == 4 || minf == 6 || minf == 7);
+        const int mip_lin = (minf == 5 || minf == 6);
+        const int mag_lin = (magf == 2 || magf == 4);
+        D3D12_SAMPLER_DESC sd = {0};
+        sd.Filter = D3D12_ENCODE_BASIC_FILTER(
+            min_lin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+            mag_lin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+            mip_lin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+            D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+        sd.AddressU = rsx_wrap_to_d3d(a & 0xF);
+        sd.AddressV = rsx_wrap_to_d3d((a >> 8) & 0xF);
+        sd.AddressW = rsx_wrap_to_d3d((a >> 16) & 0xF);
+        sd.MaxAnisotropy = 1;
+        sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sd.MinLOD = 0.0f;
+        sd.MaxLOD = (minf == 1 || minf == 2) ? 0.0f : D3D12_FLOAT32_MAX;  /* no mipmapping */
+        D3D12_CPU_DESCRIPTOR_HANDLE hs = h;
+        hs.ptr += (SIZE_T)(t * 4 + (u32)u) * s_d3d.samp_inc;
+        s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, hs);
+    }
+    return t;
+}
+
+static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
+{
+    if (!s_d3d.samp_heap) return;
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    s_d3d.samp_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &g);
+    g.ptr += (u64)vp_sampler_table(dr) * 4 * s_d3d.samp_inc;
+    s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 3, g);
+}
+
 static int off_rt_find(u32 off)
 {
     if (!off) return -1;
@@ -3905,6 +4008,9 @@ static void render_frame(void)
     /* Frames with no ops (init/boot presents) don't count against the cap --
      * PNG-decode-heavy titles burn hundreds of empty presents before the first
      * real draw. */
+    /* RTT_DUMP_SKIP=<n>: skip the first n frames that have ops (dump late frames). */
+    { static int _sk = -1; if (_sk < 0) { const char* e = getenv("RTT_DUMP_SKIP"); _sk = e ? atoi(e) : 0; }
+      if (_sk > 0 && s_d3d.draw_count > 0 && getenv("RTT_DUMP")) { _sk--; goto rtt_dump_done; } }
     if (getenv("RTT_DUMP") && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(getenv("RTT_DUMP")); if (_cap < 2) _cap = 14; if (_f++ < _cap) {
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
@@ -3916,6 +4022,7 @@ static void render_frame(void)
                 r->cmask, r->vp_x, r->vp_y, r->vp_w, r->vp_h, r->blend);
         }
     } }
+rtt_dump_done:;
 
     /* Debug: RTT_PASS=N shows pass N's output directly on screen (drops later
      * ops, retargets pass N to the backbuffer). */
@@ -4142,9 +4249,14 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
-            /* Display-sized sampler source -> the rendered frame. */
+            /* Display-sized sampler source -> the rendered frame. Only when no
+             * offscreen RT lives at that offset: Demon's Souls renders its
+             * loading screen into a 1280x720 RT and composites it through a
+             * gamma LUT, and the frame copy (last frame's backbuffer) here
+             * replaced the RT it had just drawn -- a feedback loop to flat grey. */
             if (dr->tex[_u].set && s_screen_copy &&
-                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
+                off_rt_find(dr->tex[_u].raw) < 0) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
                 if (en) {
@@ -4413,8 +4525,9 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
-            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
-            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, heaps);
+            vp_bind_sampler_table(NULL);
             D3D12_GPU_DESCRIPTOR_HANDLE gh;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
@@ -4599,6 +4712,7 @@ static void render_frame(void)
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + d * 4) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                vp_bind_sampler_table(dr);
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
@@ -5467,6 +5581,27 @@ static void vp_attrs_dbg(const rsx_state* state)
       if (e == (const char*)1) { e = getenv("VP_ATTRS_FP");
           want = e ? (u32)strtoul(e, NULL, 0) : 0; }
       if (want && (!state || state->shader_program != want)) return; }
+    /* VP_CONSTS=<i,j,...>: print those vertex constants whenever their values
+     * change (capped). A VS that derives colour purely from constants renders
+     * black if the guest's uploads never landed, which the attrib dump can't show. */
+    { const char* e = getenv("VP_CONSTS");
+      if (e) {
+          static float last[16][4]; static int nl = -1, nprint = 0;
+          int idx[16]; int n = 0; const char* p = e;
+          while (*p && n < 16) { idx[n++] = (int)strtol(p, (char**)&p, 0); if (*p == ',') p++; else break; }
+          int changed = (nl != n);
+          for (int k = 0; k < n && !changed; k++)
+              if (memcmp(last[k], state->vertex_constants[idx[k] & 511], 16)) changed = 1;
+          if (changed && nprint < 60) {
+              nprint++; nl = n;
+              for (int k = 0; k < n; k++) {
+                  const float* c = state->vertex_constants[idx[k] & 511];
+                  memcpy(last[k], c, 16);
+                  fprintf(stderr, "[VPCONST] fp=0x%X c[%d] = (%g, %g, %g, %g)%c",
+                          state->shader_program, idx[k], c[0], c[1], c[2], c[3], 10);
+              }
+          }
+      } }
     /* Dedupe by the set of enabled attributes rather than printing the first
      * few draws: one fragment program can be used by meshes with different
      * vertex layouts, and a mesh missing an attribute takes the constant
@@ -6056,6 +6191,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
+                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -6178,6 +6315,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
+                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -6321,6 +6460,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
+                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -6410,6 +6551,29 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 
     if (!vm_base || width == 0 || height == 0) return;
 
+    /* TEX_STAT=1: one line per distinct texture offset -- format, location, both
+     * resolutions and how much of each is non-zero. Answers "is this draw black
+     * because its texture is empty, unsupported, or resolved to the wrong pool"
+     * for every texture a frame uses, not just the first few binds. */
+    { static int ts = -1; if (ts < 0) ts = getenv("TEX_STAT") ? 1 : 0;
+      if (ts) {
+        static u32 seen[128]; static int ns = 0; int known = 0;
+        for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
+        if (!known && ns < 128) { seen[ns++] = offset;
+            extern u32 cellGcmResolveLocated(int local, u32 offset);
+            u32 ea_l = cellGcmResolveLocated(1, offset), ea_m = cellGcmResolveLocated(0, offset);
+            u32 span = width * height; if (span > 65536) span = 65536;
+            u32 nz_l = 0, nz_m = 0;
+            for (u32 i = 0; i < span; i += 13) {
+                if (ea_l && ea_l < 0xF0000000u && vm_base[ea_l + i]) nz_l++;
+                if (ea_m && ea_m < 0xF0000000u && vm_base[ea_m + i]) nz_m++;
+            }
+            fprintf(stderr, "[TEX_STAT] unit=%u off=0x%08X fmt=0x%02X loc=%u %ux%u raw_fmt=0x%08X"
+                            " | LOCAL ea=0x%08X nz=%u | MAIN ea=0x%08X nz=%u (of %u)%c",
+                    unit, offset, format, tex->format & 3, width, height, tex->format,
+                    ea_l, nz_l, ea_m, nz_m, span / 13, 10);
+        } } }
+
     /* Record the currently-bound atlas so subsequent quad draws sample it. The
      * actual GPU upload happens in render_frame (we have no open command list
      * here). Only the 8-bit single-channel font atlas (B8, RSX fmt base 0x81 /
@@ -6469,6 +6633,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
+        s_d3d.cur_texs[unit].addr  = tex->address;
+        s_d3d.cur_texs[unit].filt  = tex->filter;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;

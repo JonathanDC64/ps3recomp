@@ -365,6 +365,15 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        { static u32 seen[64]; static int ns = 0; int k;   /* first write per label */
+          for (k = 0; k < ns && seen[k] != s_sem_off; k++) {}
+          if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
+              fprintf(stderr, "[RSX] first back-end label write: off=0x%X value=0x%08X\n", s_sem_off, val); } }
+        /* GCM_LABEL_LOG=<hex off>: every back-end write to that label, raw and stored. */
+        { static long lo = -2; static int ln = 0;
+          if (lo == -2) { const char* e = getenv("GCM_LABEL_LOG"); lo = e ? (long)strtoul(e, 0, 16) : -1; }
+          if (lo >= 0 && (u32)lo == s_sem_off && ln++ < 400)
+              fprintf(stderr, "[labellog] off=0x%X raw=0x%08X stored=0x%08X\n", s_sem_off, data, val); }
         { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }
