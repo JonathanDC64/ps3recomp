@@ -49,11 +49,14 @@ void spu_lockline_lock(void)
     }
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+void spu_host_nap(void) { Sleep(1); }
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+#include <time.h>
+void spu_host_nap(void) { struct timespec d = { 0, 1000000 }; nanosleep(&d, NULL); }
 #endif
 
 /* ===========================================================================

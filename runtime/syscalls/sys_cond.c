@@ -118,6 +118,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     return result;
 }
 
+extern unsigned long long ps3_ms_now(void);
 static int cond_traced(uint32_t id);
 
 int64_t sys_cond_wait(ppu_context* ctx)
@@ -142,7 +143,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
 #endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     if (cond_traced(LV2_ARG_U32(ctx, 0)))
-        fprintf(stderr, "[COND_TRACE] wait cond=%u by tid=%llu lr=0x%08llX%c", LV2_ARG_U32(ctx, 0),
+        fprintf(stderr, "[COND_TRACE] t=%llu wait cond=%u by tid=%llu lr=0x%08llX%c", ps3_ms_now(), LV2_ARG_U32(ctx, 0),
                 (unsigned long long)ctx->thread_id, (unsigned long long)ctx->lr, 10);
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
     if (!c) return (int32_t)CELL_ESRCH;
@@ -266,8 +267,8 @@ static int64_t signal_cond_traced(ppu_context* ctx, int all)
         sys_cond_info* c = acquire_cond(id);
         if (c) { for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) waiting += !w->signalled;
                  cond_unlock(c); }
-        fprintf(stderr, "[COND_TRACE] signal%s cond=%u by tid=%llu lr=0x%08llX waiting=%d%c",
-                all ? "_all" : "", id, (unsigned long long)ctx->thread_id,
+        fprintf(stderr, "[COND_TRACE] t=%llu signal%s cond=%u by tid=%llu lr=0x%08llX waiting=%d%c",
+                ps3_ms_now(), all ? "_all" : "", id, (unsigned long long)ctx->thread_id,
                 (unsigned long long)ctx->lr, waiting, 10);
     }
     return signal_cond(id, all);

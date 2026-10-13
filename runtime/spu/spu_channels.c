@@ -770,6 +770,26 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
+        /* Idle-poll back-off. A GETLLAR loop that keeps reading the same,
+         * unchanged line is an SPU waiting for another processor to write it;
+         * on hardware it would sleep on the lock-line-lost event. Here it ran
+         * flat out -- Demon's Souls' HighGraphics ring consumer (img 2, pc
+         * 0x5120) re-read the ring's write pointer ~8M times a second and
+         * pinned a core whenever it had caught up. After 20k unchanged reads in
+         * a row, nap ~1 ms per read until the line changes: a waiter wakes at
+         * most a millisecond late, and a busy consumer (whose line keeps
+         * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it. */
+        { static int s_nap = -1;
+          if (s_nap < 0) { const char* e = getenv("SPU_LLAR_NAP"); s_nap = e ? atoi(e) : 1; }
+          static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
+          static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
+          if (s_nap) {
+              if (ea == n_ea && !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE)) {
+                  if (++n_same > 20000u) spu_host_nap();
+              } else {
+                  n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
+              }
+          } }
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
