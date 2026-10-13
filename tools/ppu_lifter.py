@@ -2689,22 +2689,6 @@ class PPULifter:
                 return (f"{{ uint32_t v[4]; for(int i=0;i<4;i++) v[i]=(uint32_t)(int32_t){simm}; "
                         f"ppu_vstu4(&ctx->vr[{vd}],v); }}")
 
-        # Merge (vmrghb/h/w, vmrglb/h/w) — interleave elements
-        if mn.startswith("vmrg"):
-            vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            high = "h" in mn[4:5]
-            if "b" in mn[4:]:
-                ty, cnt = "uint8_t", 16
-            elif "h" in mn[4:]:
-                ty, cnt = "uint16_t", 8
-            else:
-                ty, cnt = "uint32_t", 4
-            half = cnt // 2
-            off = 0 if high else half
-            return (f"{{ {ty} tmp[{cnt}]; {ty}* a=({ty}*)&ctx->vr[{va}]; {ty}* b=({ty}*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<{half};i++) {{ tmp[i*2]=a[{off}+i]; tmp[i*2+1]=b[{off}+i]; }} "
-                    f"memcpy(&ctx->vr[{vd}], tmp, 16); }}")
-
         # Float reciprocal estimate / reciprocal sqrt estimate
         if mn == "vrefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
@@ -3079,7 +3063,7 @@ class PPULifter:
                     f"for(int i=0;i<4;i++) d[i]=(int32_t)a[4*i]*(int32_t)ub[4*i]+(int32_t)a[4*i+1]*(int32_t)ub[4*i+1]"
                     f"+(int32_t)a[4*i+2]*(int32_t)ub[4*i+2]+(int32_t)a[4*i+3]*(int32_t)ub[4*i+3]+cc[i]; }}")
 
-        # Merge high halfword / low halfword (vmrghh, vmrglh — already in vmrg* handler above)
+        # Merge high halfword / low halfword (vmrghh, vmrglh — in the VMX merge handler above)
 
         # ------- Default: emit as comment -------
         return f"/* TODO: {mn} {insn.operands} */;"
