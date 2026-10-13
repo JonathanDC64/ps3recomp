@@ -846,6 +846,14 @@ uint32_t spurs_hle_connect_port_mask(uint32_t queue, uint64_t mask, uint8_t* por
     return CELL_EISCONN;
 }
 
+/* The disconnect half (syscall 252 on spuTG 0). */
+uint32_t spurs_hle_disconnect_port(uint32_t port)
+{
+    if (port >= 64 || !s_spurs_port_queue[port]) return CELL_ENOTCONN;
+    s_spurs_port_queue[port] = 0;
+    return CELL_OK;
+}
+
 s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -884,6 +892,9 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
+    /* A taskset re-created at an EA retires whatever still ran for the old one. */
+    { extern void spu_taskset_shutdown(uint32_t); spu_taskset_shutdown(taskset_ea); }
+
     memset(taskset, 0, sizeof(CellSpursTaskset));
     taskset->initialized = 1;
     taskset->spurs = spurs;
@@ -918,24 +929,37 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
     return CELL_OK;
 }
 
+/* Shutdown: the kernel never resumes a waiting task of this taskset again.
+ * Join: returns once no task of it is running. Both act on the host task
+ * threads (spu_workload.c, s_ts_life): a task parked in WAIT_SIGNAL stops
+ * instead of serving a taskset that is later re-created at the same EA. */
+extern void spu_taskset_shutdown(uint32_t taskset_ea);
+extern int  spu_taskset_join(uint32_t taskset_ea, unsigned timeout_ms);
+
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
 {
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     if (!taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    printf("[cellSpurs] ShutdownTaskset()\n");
+    spu_taskset_shutdown(taskset_ea);
+    printf("[cellSpurs] ShutdownTaskset() ea=0x%08X\n", taskset_ea);
     return CELL_OK;
 }
 
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
 {
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     if (!taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    printf("[cellSpurs] JoinTaskset()\n");
-    /* In a full implementation, wait for all tasks to complete */
+    /* Bounded: a task that never reaches a syscall again would otherwise hang
+     * the joining PPU thread for good. */
+    int live = spu_taskset_join(taskset_ea, 20000);
+    printf("[cellSpurs] JoinTaskset() ea=0x%08X%s\n", taskset_ea,
+           live ? " -- tasks still running after 20s" : "");
     return CELL_OK;
 }
 
@@ -1050,6 +1074,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             /* Bridge to the image-22 dispatch so build_context uses this taskset+task. */
             g_ydkj_real_taskset_ea = taskset_ea;
             g_ydkj_real_taskid     = i;
+            { extern void spu_workload_set_dispatch_task(uint32_t, uint32_t);
+              spu_workload_set_dispatch_task(taskset_ea, i); }
 
             printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
@@ -2783,8 +2809,39 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
             if (!jg_wait(g_ea)) return;                  /* still closed */
             pc += 8; continue;
         }
+        if (op == 6) {                                    /* JOBLIST */
+            /* The EA names a CellSpursJobList (job_chain.h):
+             *     u32 numJobs; u32 sizeOfJob; u64 eaJobList;
+             * i.e. numJobs descriptors laid out back to back, sizeOfJob bytes
+             * apart. jm2 runs every one of them before the next command.
+             *
+             * Skipping this was silent and expensive: Demon's Souls queues its
+             * texture uploads as a JOBLIST (each followed by SYNC, FLUSH and a
+             * one-job "set event flag" notifier). The notifier ran, so the
+             * loader saw every texture as resident, while the copy jobs never
+             * did -- every texture in VRAM stayed zero and the frames were
+             * black.
+             *
+             * No per-job completion event: jm2 sends none for list members,
+             * and a chain that wants one says so with its own notifier job. */
+            const u32 jl = (u32)(cmd & ~7ull);
+            const u32 n  = vm_read32(jl);
+            const u32 sz = vm_read32(jl + 4);
+            const u32 a0 = (u32)vm_read64(jl + 8);
+            static int _n = 0;
+            if (_n++ < 8)
+                printf("[cellSpurs] chain 0x%08X: JOBLIST @0x%08X n=%u size=%u jobs@0x%08X\n",
+                       jc_ea, jl, n, sz, a0);
+            if (n && n <= 4096 && a0 && sz >= JH_SIZE && sz <= 1024) {
+                { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+                for (u32 i = 0; i < n; i++)
+                    jc_run_one_job(a0 + i * sz, jobs + (int)i, sz);
+                idle = 0;
+            }
+            pc += 8; continue;
+        }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+         * FLUSH(5) / SET_LABEL */
         pc += 8;
     }
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "

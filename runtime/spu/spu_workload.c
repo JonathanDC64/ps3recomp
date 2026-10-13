@@ -252,6 +252,7 @@ typedef struct {
     int                 have_r3;
     uint32_t            taskset_ea;   /* captured race-free at dispatch (globals get clobbered) */
     uint32_t            taskid;
+    LONG                gen;          /* taskset generation when the job was queued */
 } spu_async_job;
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -391,10 +392,101 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
     ts_unlock();
 }
 
+#if defined(_MSC_VER)
+#define SPU_WL_TLS __declspec(thread)
+#else
+#define SPU_WL_TLS __thread
+#endif
+/* Per-thread taskset/task handoff for spu_workload_dispatch_async (see there). */
+static SPU_WL_TLS uint32_t t_dispatch_ts, t_dispatch_id;
+static SPU_WL_TLS int t_dispatch_valid;
+void spu_workload_set_dispatch_task(uint32_t taskset_ea, uint32_t taskid)
+{
+    t_dispatch_ts = taskset_ea; t_dispatch_id = taskid; t_dispatch_valid = 1;
+}
+
+/* Taskset lifetime: a generation per taskset EA, and a count of task threads
+ * still alive for it.
+ *
+ * cellSpursShutdownTaskset means the kernel never resumes a waiting task of the
+ * taskset again, and cellSpursJoinTaskset returns once none is running. Our
+ * task threads parked in WAIT_SIGNAL outlived both. Demon's Souls creates a
+ * Core.Res taskset, shuts it down, joins it and creates the next one AT THE
+ * SAME EA; the stale image-1 tasks kept serving the re-initialised LFQueue and
+ * libsync asserted in _cellSyncLFQueueCompletePushPointer.
+ *
+ * Every task thread records the generation it was started under. Shutdown (and
+ * a re-create at the same EA) bumps the generation; a task that waits under an
+ * older generation is stopped instead of resumed. */
+#define TS_LIFE_MAX 32
+static struct { uint32_t ea; volatile LONG gen; volatile LONG live; uint64_t ids; uint32_t htid[64]; } s_ts_life[TS_LIFE_MAX];
+static SPU_WL_TLS uint32_t t_job_ts;
+static SPU_WL_TLS LONG t_job_gen;
+
+static int ts_life_idx(uint32_t taskset_ea)   /* ts_lock held */
+{
+    for (int i = 0; i < TS_LIFE_MAX; i++) if (s_ts_life[i].ea == taskset_ea) return i;
+    for (int i = 0; i < TS_LIFE_MAX; i++)
+        if (!s_ts_life[i].ea) { s_ts_life[i].ea = taskset_ea; return i; }
+    return -1;
+}
+
+static LONG spu_taskset_gen(uint32_t taskset_ea)
+{
+    ts_lock();
+    int i = ts_life_idx(taskset_ea);
+    LONG g = i >= 0 ? s_ts_life[i].gen : 0;
+    ts_unlock();
+    return g;
+}
+
+/* Generation of a taskset without taking ts_lock (callers may hold it). An EA
+ * with no entry yet is generation 0, which is what ts_life_idx creates. */
+static LONG spu_taskset_gen_peek(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return 0;
+    for (int i = 0; i < TS_LIFE_MAX; i++)
+        if (s_ts_life[i].ea == taskset_ea) return s_ts_life[i].gen;
+    return 0;
+}
+
+/* Task thread start/end bookkeeping (called on the task's own thread). */
+static void spu_taskset_job_begin(uint32_t taskset_ea, uint32_t taskid)
+{
+    t_job_ts = taskset_ea;
+    if (!taskset_ea) return;
+    ts_lock();
+    int i = ts_life_idx(taskset_ea);
+    if (i >= 0) {
+        t_job_gen = s_ts_life[i].gen; s_ts_life[i].live++;
+        if (taskid < 64) { s_ts_life[i].ids |= 1ull << taskid;
+                           s_ts_life[i].htid[taskid] = (uint32_t)GetCurrentThreadId(); }
+    }
+    ts_unlock();
+}
+
+static void spu_taskset_job_end(uint32_t taskset_ea, uint32_t taskid)
+{
+    if (!taskset_ea) return;
+    ts_lock();
+    int i = ts_life_idx(taskset_ea);
+    if (i >= 0 && s_ts_life[i].live > 0) s_ts_life[i].live--;
+    if (i >= 0 && taskid < 64) s_ts_life[i].ids &= ~(1ull << taskid);
+    ts_unlock();
+}
+
+/* 1 if the calling task thread belongs to a taskset that was shut down (or
+ * re-created) after the task started. */
+int spu_taskset_job_stale(void)
+{
+    return t_job_ts && spu_taskset_gen(t_job_ts) != t_job_gen;
+}
+
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    if (spu_taskset_job_stale()) return;   /* its taskset is gone: start nothing */
     ts_lock();
     uint8_t* ts = vm_base + taskset_ea;
     uint8_t* run = ts_running(taskset_ea);
@@ -422,6 +514,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
+        spu_workload_set_dispatch_task(taskset_ea, t);
         spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
     }
     ts_unlock();
@@ -429,6 +522,19 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 
 static void spu_async_run(spu_async_job* j)
 {
+    spu_taskset_job_begin(j->taskset_ea, j->taskid);
+    /* The job belongs to the generation it was QUEUED under. A shutdown that
+     * lands between the queueing and this thread starting would otherwise be
+     * missed: the task would adopt the new generation, park in WAIT_SIGNAL and
+     * hold up cellSpursJoinTaskset forever. Such a job never runs. */
+    t_job_gen = j->gen;
+    if (spu_taskset_job_stale()) {
+        fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) not started: "
+                "taskset was shut down after it was queued\n", j->taskid, j->taskset_ea);
+        spu_taskset_job_end(j->taskset_ea, j->taskid);
+        free(j);
+        return;
+    }
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -504,7 +610,7 @@ static void spu_async_run(spu_async_job* j)
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, 0);
                 fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
                 fflush(stderr);
-                free(ls); free(j); return;
+                free(ls); spu_taskset_job_end(j->taskset_ea, j->taskid); free(j); return;
             }
             /* YDKJ HLE cri-task path (image 22, cri_mpvps3spurs.elf): the real
              * SPURS kernel/policy would build the task's SpursTasksetContext (LS
@@ -867,7 +973,7 @@ static void spu_async_run(spu_async_job* j)
              * for this SPU work actually wakes. Only fires for queues with a
              * blocked receiver (see spurs_notify_task_completion). */
             { extern void spurs_notify_task_completion(void);
-              spurs_notify_task_completion(); }
+              if (!spu_taskset_job_stale()) spurs_notify_task_completion(); }
 
             /* SPU_LS_DUMP=<prefix>: write this job's whole local store when it
              * ends. A reference dump from real hardware is a full local store,
@@ -895,6 +1001,7 @@ static void spu_async_run(spu_async_job* j)
         pthread_mutex_unlock(&ts_slot->lock);
 #endif
     }
+    spu_taskset_job_end(j->taskset_ea, j->taskid);
     free(j);
 }
 
@@ -1237,7 +1344,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
      * path (complete its loop / set completion flags) instead of hanging. 0/unset
      * keeps the block-forever behaviour. Reversible, opt-in. */
     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
-    int drained = 0;
+    int drained = 0, killed = 0;
     /* SPURS_ROUND_NOTIFY=<flagEA hex>[:<bits>] -- DIAGNOSTIC BISECT, NOT A FIX.
      *
      * A task entering WAIT_SIGNAL has by definition finished the round it was
@@ -1282,6 +1389,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        if (spu_taskset_job_stale()) { killed = 1; break; }
         if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
             static int _n = 0;
             if (++secs && _n < 16) { _n++;
@@ -1290,11 +1398,12 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained && !killed) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
+        if (spu_taskset_job_stale()) { killed = 1; break; }
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
             static int _n = 0;
@@ -1304,16 +1413,79 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (drain && secs >= drain) { drained = 1; break; }
         }
     }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+    if (!drained && !killed) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
     if (drained) { static int _d = 0; if (_d++ < 24)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
+    if (killed) {
+        fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) stopped in WAIT_SIGNAL: "
+                "taskset was shut down\n", taskId, taskset_ea); fflush(stderr);
+        spu_serial_acquire();   /* the task's runner releases it on the way out */
+        return -1;              /* caller halts the task */
+    }
     spu_serial_acquire();       /* resume: re-take the serial lock */
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     return 0;
+}
+
+/* cellSpursShutdownTaskset / a re-create at the same EA: no waiting task of
+ * the current generation is ever resumed again (see s_ts_life). */
+void spu_taskset_shutdown(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    ts_lock();
+    int i = ts_life_idx(taskset_ea);
+    if (i >= 0) s_ts_life[i].gen++;
+    uint8_t* r = ts_running(taskset_ea);
+    if (r) memset(r, 0, 16);
+    ts_unlock();
+    spu_taskset_consume_wake(taskset_ea);
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&s_sig_lock);
+    WakeAllConditionVariable(&s_sig_cv);
+    ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+    pthread_mutex_lock(&s_sig_lock);
+    pthread_cond_broadcast(&s_sig_cv);
+    pthread_mutex_unlock(&s_sig_lock);
+#endif
+}
+
+/* cellSpursJoinTaskset: wait (bounded) until no task thread of the taskset is
+ * still running. Returns how many are still alive at the deadline. */
+int spu_taskset_join(uint32_t taskset_ea, unsigned timeout_ms)
+{
+    extern unsigned long long ps3_ms_now(void);
+    unsigned long long t0 = ps3_ms_now();
+    for (;;) {
+        ts_lock();
+        int i = ts_life_idx(taskset_ea);
+        LONG live = i >= 0 ? s_ts_life[i].live : 0;
+        uint64_t ids = i >= 0 ? s_ts_life[i].ids : 0;
+        uint32_t htid = 0;
+        for (int k = 0; k < 64 && i >= 0; k++) if (ids >> k & 1) { htid = s_ts_life[i].htid[k]; break; }
+        ts_unlock();
+        unsigned long long el = ps3_ms_now() - t0;
+        if (!live || el >= timeout_ms) {
+            if (live || el >= 100) {
+                int parked = 0;
+                for (int k = 0; k < SPU_PARKED_MAX; k++)
+                    if (s_parked[k] && (uint32_t)(s_parked[k] >> 32) == taskset_ea) parked++;
+                fprintf(stderr, "[spu_workload] join taskset 0x%08X: %ld live (ids=0x%llX, "
+                        "%d parked, host tid %u) after %llums\n", taskset_ea, (long)live,
+                        (unsigned long long)ids, parked, htid, el);
+            }
+            return (int)live;
+        }
+#ifdef _WIN32
+        Sleep(1);
+#else
+        { struct timespec d = { 0, 1000000 }; nanosleep(&d, NULL); }
+#endif
+    }
 }
 
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
@@ -1362,7 +1534,16 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
      * the next CreateTask overwriting the single-slot globals -- with two audio
      * tasks that made both run task 1's descriptor. */
     { extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid; }
+      j->taskset_ea = g_ydkj_real_taskset_ea; j->taskid = g_ydkj_real_taskid;
+      /* ...but the globals are process-wide, and with several tasksets live
+       * (Demon's Souls: Havok image 7 on one, image 1 on another) a PPU
+       * CreateTask and an SPU thread starting the next task both write them
+       * between another dispatcher's set and this read. That ran image 7 with
+       * image 1's taskset context (misaligned GETs from 0x48BAxxxx). The two
+       * dispatch sites hand THIS thread's pair over explicitly; prefer it. */
+      if (t_dispatch_valid) { j->taskset_ea = t_dispatch_ts; j->taskid = t_dispatch_id;
+                              t_dispatch_valid = 0; } }
+    j->gen = spu_taskset_gen_peek(j->taskset_ea);
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is

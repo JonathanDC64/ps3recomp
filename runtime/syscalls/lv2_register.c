@@ -336,6 +336,12 @@ typedef struct {
      * waiting on the command queue never woke. */
     struct { uint32_t spup; uint32_t queue; } evt_bind[8];
     int                 evt_bind_n;
+    /* sys_spu_thread_bind_queue(thread, queue, spuq_num): the PPU->SPU
+     * direction. The SPU names spuq_num in its out-mailbox and stops with
+     * 0x110 (receive_event) / 0x111 (tryreceive_event); lv2 receives from the
+     * bound queue on its behalf. */
+    struct { uint32_t num; uint32_t queue; } spuq[32];
+    int                 spuq_n;
 } spu_thread_t;
 
 typedef struct {
@@ -1607,6 +1613,33 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     return (int64_t)(int32_t)result;
 }
 
+/* sys_spu_thread_group_disconnect_event_all_threads(group, spup): the undo of
+ * the call above. Unregistered before, so real libsre's
+ * cellSpursLFQueueDetachLv2EventQueue could never release its port: every
+ * Core.Res decompression took a fresh one (16, 17, ... 36 in one boot) and the
+ * 64-port table would eventually run dry. Group 0 is the HLE SPURS instance. */
+static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
+{
+    uint32_t gid  = (uint32_t)ctx->gpr[3];
+    uint32_t spup = (uint32_t)ctx->gpr[4] & 0xFF;
+    uint32_t result = CELL_OK;
+    spu_group_t* g = spu_find_group(gid);
+    if (spup > 63) result = CELL_EINVAL;
+    else if (!g && gid == 0) {
+        extern uint32_t spurs_hle_disconnect_port(uint32_t);
+        result = spurs_hle_disconnect_port(spup);
+    }
+    else if (!g) result = CELL_ESRCH;
+    else {
+        AcquireSRWLockExclusive(&s_spu_port_lock);
+        if (g->user_event_ports[spup]) g->user_event_ports[spup] = 0;
+        else result = CELL_ENOTCONN;
+        ReleaseSRWLockExclusive(&s_spu_port_lock);
+    }
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
+    return (int64_t)(int32_t)result;
+}
+
 /* The interrupt mailbox encodes send_event (0..63) or throw_event (64..127).
  * The preceding ordinary mailbox word is data, not a separate PPU event. */
 static int spu_deliver_user_event(spu_context* spu, uint32_t value)
@@ -1658,6 +1691,10 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
         }
+        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_EVT_TRACE") ? 1 : 0;
+          if (s_t) fprintf(stderr, "[spu-evt] img=%d grp=0x%X port=%u -> queue=%u data0=0x%06X data1=0x%08X result=0x%08X\n",
+                           spu->image_id, spu->spu_group_id, port, queue,
+                           value & 0xFFFFFFu, data, result); }
     }
     if (code < 64) spu_channel_write(&spu->ch_in_mbox, result);
     return 1;
@@ -1699,6 +1736,58 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
             tid, eq, et, (uint32_t)ctx->gpr[6], t ? "" : " (thread not found)");
     fflush(stderr);
     ctx->gpr[3] = 0;
+    return 0;
+}
+
+/* sys_spu_thread_bind_queue(thread_id, spuq, spuq_num) / unbind_queue
+ * (thread_id, spuq_num). Unregistered before, so the call failed and an SPU
+ * thread's receive_event had no queue to read: Demon's Souls' MO synth SPU
+ * (_synth2) re-issued it in a tight loop for the whole run. */
+static int64_t sys_spu_thread_bind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t eq  = (uint32_t)ctx->gpr[4];
+    uint32_t num = (uint32_t)ctx->gpr[5];
+    spu_thread_t* t = spu_find_thread(tid);
+    int64_t rc = 0;
+    if (!t) rc = (int64_t)(int32_t)0x80010005;                      /* CELL_ESRCH */
+    else {
+        int slot = -1;
+        for (int i = 0; i < t->spuq_n; i++)
+            if (t->spuq[i].num == num) { slot = i; break; }
+        if (slot >= 0) rc = (int64_t)(int32_t)0x80010014;           /* CELL_EEXIST */
+        else if (t->spuq_n >= 32) rc = (int64_t)(int32_t)0x80010001; /* CELL_EAGAIN */
+        else { t->spuq[t->spuq_n].num = num; t->spuq[t->spuq_n].queue = eq; t->spuq_n++; }
+    }
+    fprintf(stderr, "[SPU] thread_bind_queue tid=0x%X queue=0x%X spuq_num=0x%X -> 0x%X\n",
+            tid, eq, num, (uint32_t)rc);
+    ctx->gpr[3] = (uint64_t)rc;
+    return rc;
+}
+
+static int64_t sys_spu_thread_unbind_queue_handler(ppu_context* ctx)
+{
+    uint32_t tid = (uint32_t)ctx->gpr[3];
+    uint32_t num = (uint32_t)ctx->gpr[4];
+    spu_thread_t* t = spu_find_thread(tid);
+    int64_t rc = (int64_t)(int32_t)0x80010005;                      /* CELL_ESRCH */
+    for (int i = 0; t && i < t->spuq_n; i++)
+        if (t->spuq[i].num == num) {
+            t->spuq[i] = t->spuq[--t->spuq_n];
+            rc = 0;
+            break;
+        }
+    ctx->gpr[3] = (uint64_t)rc;
+    return rc;
+}
+
+/* The queue an SPU thread bound under spuq_num, 0 if none. Called from the
+ * SPU side (spu_stop) when the thread stops with 0x110/0x111. */
+uint32_t spu_thread_bound_queue(uint32_t spu_tid, uint32_t spuq_num)
+{
+    spu_thread_t* t = spu_find_thread(spu_tid);
+    for (int i = 0; t && i < t->spuq_n; i++)
+        if (t->spuq[i].num == spuq_num) return t->spuq[i].queue;
     return 0;
 }
 
@@ -2521,6 +2610,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_ARGUMENT,    sys_spu_thread_set_argument_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_EXIT_STATUS, sys_spu_thread_get_exit_status_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_CONNECT_EVENT,   sys_spu_thread_connect_event_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_bind_queue_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_unbind_queue_handler);
     { extern void (*g_spu_out_mbox_hook)(uint32_t,uint32_t,int,uint32_t);
       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
     { extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
@@ -2534,9 +2625,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_SPU_THREAD_SET_SPU_CFG,    sys_spu_thread_set_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GET_SPU_CFG,    sys_spu_thread_get_spu_cfg_handler);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_SPU_MB,  sys_spu_thread_write_spu_mb_handler);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
-    lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
+    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_disconnect_event_all_threads_handler);
 }
 
 /* ---------------------------------------------------------------------------

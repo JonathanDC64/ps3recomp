@@ -165,6 +165,8 @@ static inline int mfc_is_fence(uint32_t cmd)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+static volatile uint32_t s_arm_pending;   /* SPU_PUT_MAGIC_ARM: guard EA to arm */
+static volatile int s_arm_abs;           /* ...as an absolute, write-only guard */
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
@@ -267,6 +269,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               for (uint32_t i7 = 0; i7 < size && i7 < 0x4000u; i7 += 7) if (q[i7]) nzs++;
               fprintf(stderr, "[getea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
                       spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
+    /* SPU_PUT_MAGIC=<hex u32>: log every PUT whose first source word is this
+     * big-endian magic (e.g. 54504600 = "TPF\0") -- where a decompressed file
+     * actually lands in guest memory. */
+    { static uint32_t s_pm = 1; if (s_pm == 1) { const char* e = getenv("SPU_PUT_MAGIC");
+        s_pm = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (s_pm && mfc_is_put(cmd) && size >= 4) {
+          const uint8_t* sp = &spu->ls[lsa & SPU_LS_MASK];
+          if ((((uint32_t)sp[0] << 24) | ((uint32_t)sp[1] << 16) | ((uint32_t)sp[2] << 8) | sp[3]) == s_pm)
+              fprintf(stderr, "[put-magic] img=%d pc=0x%05X ea=0x%08X size=%u next=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size,
+                      sp[4], sp[5], sp[6], sp[7], sp[8], sp[9], sp[10], sp[11]);
+          /* SPU_PUT_MAGIC_ARM=<hex u32 at +4>,<hex offset>: on the first such PUT
+           * whose next word matches, arm the PPU read/write page guard at
+           * ea+offset -- catches whoever consumes a freshly decompressed file. */
+          { static int s_armed = 0; static uint32_t s_nw = 1, s_off;
+            /* ",@<hex ea>" arms an absolute write-only guard instead (the object
+             * the file is about to be parsed into). */
+            if (s_nw == 1) { const char* e = getenv("SPU_PUT_MAGIC_ARM"); s_nw = 0;
+                if (e) { char* d; s_nw = (uint32_t)strtoul(e, &d, 16);
+                    if (*d == ',' && d[1] == '@') { s_arm_abs = 1; s_off = (uint32_t)strtoul(d + 2, 0, 16); }
+                    else if (*d == ',') s_off = (uint32_t)strtoul(d + 1, 0, 16); } }
+            const uint32_t nw = ((uint32_t)sp[4] << 24) | ((uint32_t)sp[5] << 16) | ((uint32_t)sp[6] << 8) | sp[7];
+            /* Armed by the NEXT transfer, so this PUT's own copy is not trapped. */
+            if (s_nw && !s_armed && nw == s_nw) { s_armed = 1; s_arm_pending = s_arm_abs ? s_off : (uint32_t)ea + s_off; } } } }
+    if (s_arm_pending) {
+        static int s_seen = 0;
+        if (s_seen++) { extern void ppu_guard_page_rearm(uint32_t, int);
+            ppu_guard_page_rearm(s_arm_pending, !s_arm_abs); s_arm_pending = 0; } }
     { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
       if (s_ph) { static unsigned long long ngets, nputs, nother;
           if (mfc_is_get(cmd)) ngets++; else if (mfc_is_put(cmd)) nputs++; else nother++;
@@ -477,9 +507,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         if (s_dg == 0xFFFFFFFFu) { const char* e = getenv("SPU_DUMP_GET");
                                    s_dg = e ? (uint32_t)strtoul(e, 0, 0) : 0; }
         if (s_dg && (uint32_t)ea == s_dg) {
-            static int done = 0;
-            if (!done) { done = 1;
-                uint32_t n = size > 128 ? 128 : size;
+            static int done = 0; /* every fetch, up to 16: a ring is re-read */
+            if (done < 16) { done++;
+                uint32_t n = size > 256 ? 256 : size;
                 fprintf(stderr, "[get-dump] img%d GET 0x%08X size=%u pc=0x%05X\n",
                         spu->image_id, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK);
                 for (uint32_t o = 0; o < n; o += 16) {

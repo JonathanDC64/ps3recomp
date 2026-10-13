@@ -157,6 +157,66 @@ void spu_halt(spu_context* ctx)
             fprintf(stderr, " r%d=%08X", r, ctx->gpr[r]._u32[0]);
         fprintf(stderr, " r80=%08X r85=%08X\n",
                 ctx->gpr[80]._u32[0], ctx->gpr[85]._u32[0]);
+        /* Who made the failing call. ctx->pc is only the last lifted block the
+         * trampoline entered, not the call site, so walk the SPU ABI stack: the
+         * back chain sits at 0(sp) and each caller's return address at 16(its
+         * sp), stored by the callee's prologue before it moves sp. */
+        {
+            uint32_t sp = ctx->gpr[1]._u32[0] & SPU_LS_MASK;
+            fprintf(stderr, "[spu-halt]   lr=0x%05X sp=0x%05X chain:",
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, sp);
+            for (int d = 0; d < 12 && sp && sp < SPU_LS_SIZE - 32; d++) {
+                const uint8_t* p = ctx->ls + sp;
+                uint32_t back = ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 |
+                                 (uint32_t)p[2] << 8 | p[3]) & SPU_LS_MASK;
+                if (back <= sp || back >= SPU_LS_SIZE - 32) break;
+                const uint8_t* q = ctx->ls + back + 16;
+                fprintf(stderr, " 0x%05X", ((uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 |
+                                            (uint32_t)q[2] << 8 | q[3]) & SPU_LS_MASK);
+                sp = back;
+            }
+            fprintf(stderr, "\n");
+        }
+        /* Everything else: the operands of a failing check are often in high
+         * registers (a lifted leaf allocates r17..r127 freely). */
+        fprintf(stderr, "[spu-halt]   nonzero:");
+        for (int r = 17; r < 128; r++)
+            if (ctx->gpr[r]._u32[0])
+                fprintf(stderr, " r%d=%08X", r, ctx->gpr[r]._u32[0]);
+        fprintf(stderr, "\n");
+        /* SPU_HALT_LS=<ls hex>,<len hex>: the bytes a failing check read. */
+        { const char* e = getenv("SPU_HALT_LS");
+          if (e) {
+              char* end = 0;
+              uint32_t a = (uint32_t)strtoul(e, &end, 16) & SPU_LS_MASK & ~15u;
+              uint32_t n = (end && *end == ',') ? (uint32_t)strtoul(end + 1, 0, 16) : 0x100;
+              if (n > 0x400) n = 0x400;
+              for (uint32_t o = 0; o < n && a + o + 16 <= SPU_LS_SIZE; o += 16) {
+                  const uint8_t* p = ctx->ls + a + o;
+                  fprintf(stderr, "[spu-halt]   ls %05X:", a + o);
+                  for (int w = 0; w < 4; w++)
+                      fprintf(stderr, " %02X%02X%02X%02X", p[w*4], p[w*4+1], p[w*4+2], p[w*4+3]);
+                  fprintf(stderr, "\n");
+              }
+          } }
+        /* SPU_HALT_EA=<ea hex>,<len hex>: the guest memory a DMA was meant to
+         * fetch, as it stands NOW. Differs from the LS copy -> the GET raced
+         * the PPU (e.g. a vector memcpy that no write-watch sees). */
+        { extern uint8_t* vm_base;
+          const char* e = getenv("SPU_HALT_EA");
+          if (e && vm_base) {
+              char* end = 0;
+              uint32_t a = (uint32_t)strtoul(e, &end, 16) & ~15u;
+              uint32_t n = (end && *end == ',') ? (uint32_t)strtoul(end + 1, 0, 16) : 0x100;
+              if (n > 0x400) n = 0x400;
+              for (uint32_t o = 0; o < n; o += 16) {
+                  const uint8_t* p = vm_base + a + o;
+                  fprintf(stderr, "[spu-halt]   ea %08X:", a + o);
+                  for (int w = 0; w < 4; w++)
+                      fprintf(stderr, " %02X%02X%02X%02X", p[w*4], p[w*4+1], p[w*4+2], p[w*4+3]);
+                  fprintf(stderr, "\n");
+              }
+          } }
         fflush(stderr);
       } }
     if (s_spu_halt_armed) { s_spu_halt_armed = 0; longjmp(s_spu_halt_env, 1); }
@@ -186,8 +246,64 @@ void spu_dbg_e60(spu_context* ctx)
  * host SPU thread (longjmp to spu_run_with_halt) so the job stops AT the stop,
  * with ctx->status + the outbound mailbox value available for the dispatcher to
  * service. Env YDKJ_STOP_NOHALT restores the old (looping) behavior for A/B. */
+/* lv2 SPU-thread syscalls made with `stop` (RPCS3 spu_thread::stop_and_signal).
+ * The lifter continues past these (spu_lifter.py RESUMABLE_STOP_CODES) when
+ * the stop returns with the SPU running again.
+ *   0x100 group_yield: nothing to do here.
+ *   0x110 receive_event / 0x111 tryreceive_event: the SPU queue number is in
+ *   the out-mailbox; receive from the queue sys_spu_thread_bind_queue bound
+ *   under it and reply in the in-mailbox -- {CELL_OK, data1, data2, data3}, or
+ *   a single error word. Returns 1 when the stop was serviced. */
+#include "../syscalls/sys_event.h"
+static int spu_service_thread_syscall(spu_context* ctx)
+{
+    extern uint32_t spu_thread_bound_queue(uint32_t, uint32_t);
+    extern int sys_event_queue_receive_host(uint32_t, sys_event_t*, unsigned);
+    const uint32_t code = ctx->stop_code;
+    if (code == 0x100) return 1;
+    if (code != 0x110 && code != 0x111) return 0;
+    if (!ctx->ch_out_mbox.count) return 0;          /* not the lv2 protocol */
+    uint32_t spuq = spu_channel_read(&ctx->ch_out_mbox);
+    uint32_t q = spu_thread_bound_queue(ctx->spu_id, spuq);
+    ctx->rcv_evt_i = 0;
+    if (ctx->rcv_evt_n || ctx->ch_in_mbox.count) {
+        ctx->rcv_evt[0] = 0x8001000A;               /* CELL_EBUSY: in-mailbox not empty */
+        ctx->rcv_evt_n = 1;
+        return 1;
+    }
+    if (!q) {
+        ctx->rcv_evt[0] = 0x80010002;               /* CELL_EINVAL: nothing bound */
+        ctx->rcv_evt_n = 1;
+        return 1;
+    }
+    sys_event_t ev;
+    int r;
+    if (code == 0x111) r = sys_event_queue_receive_host(q, &ev, 0);
+    else while ((r = sys_event_queue_receive_host(q, &ev, 100)) == 0) {}
+    if (r == 1) {
+        ctx->rcv_evt[0] = 0;
+        ctx->rcv_evt[1] = (uint32_t)ev.data1;
+        ctx->rcv_evt[2] = (uint32_t)ev.data2;
+        ctx->rcv_evt[3] = (uint32_t)ev.data3;
+        ctx->rcv_evt_n = 4;
+    } else {
+        ctx->rcv_evt[0] = r == 0 ? 0x8001000A        /* CELL_EBUSY: try, empty */
+                                 : 0x80010013;       /* CELL_ECANCELED: queue gone */
+        ctx->rcv_evt_n = 1;
+    }
+    { static int _n = 0; if (_n++ < 8)
+        fprintf(stderr, "[SPU] tid=0x%X %sreceive_event spuq=0x%X q=%u -> 0x%08X "
+                "(%08X %08X %08X)\n", ctx->spu_id, code == 0x111 ? "try" : "",
+                spuq, q, ctx->rcv_evt[0], ctx->rcv_evt[1], ctx->rcv_evt[2], ctx->rcv_evt[3]); }
+    return 1;
+}
+
 void spu_stop(spu_context* ctx)
 {
+    if (spu_service_thread_syscall(ctx)) {
+        ctx->status = SPU_STATUS_RUNNING;
+        return;
+    }
     /* A lifted `stop` sets status and RETURNS to its caller -- for a SPURS
      * policy this is stop-and-signal: it returns up into the kernel/policy
      * service loop, which continues (i.e. the SPU "resumes" past the stop). That
@@ -204,6 +320,8 @@ void spu_stop(spu_context* ctx)
 
 /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
  * (via spu_halt), 0 if it returned normally. */
+static int spu_interp_img(uint32_t* entry_lsa);
+
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
@@ -265,7 +383,14 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
          * returns; the drain loop re-enters each queued target until the SPU
          * halts (stop -> longjmp) or the trampoline empties. Nested brsl/bisl
          * calls drain inside their own call brackets (see the lifter). */
-        entry(ctx);
+        { uint32_t ie = 0;
+          if (ctx->image_id > 0 && ctx->image_id == spu_interp_img(&ie) && ie) {
+              static int _n = 0;
+              if (_n++ < 4) { fprintf(stderr, "[spu] img=%d running under the interpreter from 0x%05X\n",
+                                      ctx->image_id, ie); fflush(stderr); }
+              spu_interp_run(ctx, ie);
+          } else
+              entry(ctx); }
         { static int _e = 0;
           if (getenv("SPU_ARGWATCH") && _e < 8) { _e++;
               fprintf(stderr, "[argwatch] after entry(): img=%d pc=0x%05X "
@@ -1422,8 +1547,29 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
             "issue #59.\n", addr, want, got);
 }
 
+/* SPU_INTERP_IMG=<image>:<entry lsa hex>: run that image under the SPU
+ * interpreter instead of its lift -- a differential for a lift that is
+ * suspected of mis-decoding something. The image's lifted functions are hidden
+ * from the registry so the interpreter never rejoins them. */
+static int spu_interp_img(uint32_t* entry_lsa)
+{
+    static int s_img = -2; static uint32_t s_entry = 0;
+    if (s_img == -2) {
+        const char* e = getenv("SPU_INTERP_IMG");
+        s_img = -1;
+        if (e && *e) {
+            char* end = 0;
+            s_img = (int)strtol(e, &end, 10);
+            if (end && *end == ':') s_entry = (uint32_t)strtoul(end + 1, 0, 16);
+        }
+    }
+    if (entry_lsa) *entry_lsa = s_entry;
+    return s_img;
+}
+
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
+    if (image_id > 0 && image_id == spu_interp_img(0)) return 0;
     /* Match the context's active image; image_id 0 (context or entry) matches
      * any, for back-compat with single-image contexts. */
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
@@ -1871,9 +2017,14 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
             }
             yz_lockstep_block_begin(ctx);
             spu_taskset_parked_add(ts, tid, wobj);
-            spu_taskset_wait_signal(ts, tid);
+            int wrc = spu_taskset_wait_signal(ts, tid);
             spu_taskset_parked_del(ts, tid);
             yz_lockstep_block_end(ctx);
+            if (wrc < 0) {      /* taskset shut down: never resumed, stop the task */
+                ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+                spu_halt(ctx);
+                return;
+            }
             spu_ef_deliver_owed(ctx, wobj);
         }
         ctx->gpr[3]._u32[0] = 0;

@@ -260,6 +260,26 @@ def _is_identity_move(insn) -> bool:
     return len(ops) == 3 and ops[0] == ops[1] and ops[2].strip() in ("0", "0x0")
 
 
+# lv2 SPU-thread syscalls made with `stop` (0x100 group_yield, 0x110
+# receive_event, 0x111 tryreceive_event) are serviced by lv2 and the SPU
+# continues at the next instruction -- it reads the receive_event reply from the
+# in-mailbox right after the stop. Lifting them as a function end dropped that
+# continuation entirely: the stop came back, the dispatcher re-entered the same
+# lifted function, and the thread re-issued the syscall forever.
+RESUMABLE_STOP_CODES = (0x100, 0x110, 0x111)
+
+
+def _is_resumable_stop(w) -> bool:
+    return w.mnemonic == "stop" and (w.raw & 0x3FFF) in RESUMABLE_STOP_CODES
+
+
+def _flow_break(w) -> bool:
+    """An unconditional end of the basic block (no fall-through)."""
+    if w.mnemonic in ("bi", "br", "bra", "iret", "stopd"):
+        return True
+    return w.mnemonic == "stop" and not _is_resumable_stop(w)
+
+
 def compute_bi_r0_jumps(insns, bounds) -> set:
     """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
     (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
@@ -305,7 +325,7 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
             only_identity = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
-                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                if _flow_break(w):
                     break                  # block boundary: r0 is a live-in here
                 if not _writes_r0(w):
                     continue
@@ -419,7 +439,7 @@ def compute_link_returns(insns, bounds) -> set:
             gi = idx_of_all[insn.addr]
             for j in range(gi - 1, -1, -1):
                 w = ordered[j]
-                if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                if _flow_break(w):
                     block_start = ordered[j + 1].addr
                     break
                 if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
@@ -441,7 +461,7 @@ def compute_link_returns(insns, bounds) -> set:
                         continue
                     for j in range(k - 1, max(-1, k - 24), -1):
                         w = ordered[j]
-                        if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
+                        if _flow_break(w):
                             break
                         if (w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == rn
                                 and not _is_identity_move(w)):
@@ -523,8 +543,7 @@ class SPULifter:
         # conditional branch whose not-taken path continues), execution proceeds
         # into the next sequential function. Emit a tail-call so the chain isn't
         # truncated (this was silently dropping execution mid-job).
-        _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
-        if (last_insn is not None and last_insn.mnemonic not in _TERMINATORS
+        if (last_insn is not None and not _flow_break(last_insn)
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
                 f"    {{ ctx->pc = 0x{end:X}; "
@@ -608,6 +627,12 @@ class SPULifter:
         if mn == "fscrwr":
             return "/* fscrwr: FP status/control write (no-op in recomp) */;"
         if mn == "stop":
+            if _is_resumable_stop(insn):
+                # Serviced by spu_stop(), which sets the SPU running again on
+                # success; anything else still ends the thread.
+                return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); "
+                        f"if (ctx->status != SPU_STATUS_RUNNING) return;")
             # Preserve the 14-bit stop-and-signal code: SPURS leaf tasks use
             # `stop <code>` to invoke kernel syscalls (EXIT/YIELD/WAIT_SIGNAL/...).
             return (f"ctx->stop_code = 0x{insn.raw & 0x3FFF:X}u; "

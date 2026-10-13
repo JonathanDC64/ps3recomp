@@ -546,6 +546,18 @@ _TERMINATORS_NO_FALLTHROUGH = {
 }
 
 
+# lv2 SPU-thread syscalls made with `stop`: 0x100 sys_spu_thread_group_yield,
+# 0x110 sys_spu_thread_receive_event, 0x111 sys_spu_thread_tryreceive_event.
+# lv2 services them and the SPU carries on at the next instruction (the reply
+# of 0x110/0x111 is read back from the in-mailbox right after the stop), so
+# they do not end the function's fall-through region.
+RESUMABLE_STOP_CODES = (0x100, 0x110, 0x111)
+
+
+def is_resumable_stop(ins):
+    return ins.mnemonic == "stop" and (ins.raw & 0x3FFF) in RESUMABLE_STOP_CODES
+
+
 def is_return(ins):
     """SPU ABI: `bi $r0` is the standard return."""
     if ins.mnemonic != "bi":
@@ -569,7 +581,7 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
             break
         if is_return(ins):
             return pc + 4
-        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH:
+        if ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH and not is_resumable_stop(ins):
             # Unconditional control flow -- if the target is not within this
             # range, the function ends here.
             return pc + 4

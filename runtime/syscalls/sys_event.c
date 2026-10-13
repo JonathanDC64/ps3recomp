@@ -661,6 +661,52 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
     return CELL_OK;
 }
 
+/* Receive on behalf of an SPU thread (sys_spu_thread_receive_event, stop
+ * 0x110; tryreceive 0x111 passes timeout_ms 0), on the SPU's own host thread.
+ * Returns 1 with *out filled, 0 if nothing arrived within timeout_ms (the
+ * caller re-checks its SPU's state and calls again), -1 if the queue is gone
+ * or cancelled. */
+int sys_event_queue_receive_host(uint32_t queue_id, sys_event_t* out, unsigned timeout_ms)
+{
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
+    sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+    if (!q->active) return -1;
+    int rc;
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+    if (timeout_ms && q->count == 0 && !q->cancelled) {
+        q->waiters++;
+        SleepConditionVariableCS(&q->not_empty, &q->lock, timeout_ms);
+        if (q->waiters > 0) q->waiters--;
+    }
+#else
+    pthread_mutex_lock(&q->lock);
+    if (timeout_ms && q->count == 0 && !q->cancelled) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        q->waiters++;
+        pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
+        if (q->waiters > 0) q->waiters--;
+    }
+#endif
+    if (q->active && q->count > 0) {
+        *out = q->buffer[q->head];
+        q->head = (q->head + 1) % q->capacity;
+        q->count--;
+        rc = 1;
+    } else {
+        rc = (!q->active || q->cancelled) ? -1 : 0;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_unlock(&q->lock);
+#endif
+    return rc;
+}
+
 int64_t sys_event_queue_drain(ppu_context* ctx)
 {
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
