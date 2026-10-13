@@ -947,6 +947,69 @@ static DWORD WINAPI debug_console(LPVOID param)
                 p = end;
             }
             dbg_printf("  %d hit(s)%c", hits, 10);
+        } else if (!strcmp(verb, "nzmap") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
+            /* nzmap <hex start> <hex len>: the runs of 64KB pages in the range
+             * that hold any nonzero byte -- where data actually landed. */
+            uint32_t run0 = 0; int in = 0, runs = 0;
+            for (uint64_t p = a; p <= (uint64_t)a + b && vm_base && runs < 200; p += 0x10000) {
+                int nz = 0;
+                if (p < (uint64_t)a + b) {
+                    MEMORY_BASIC_INFORMATION mi;
+                    if (VirtualQuery(vm_base + p, &mi, sizeof mi) && mi.State == MEM_COMMIT &&
+                        !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+                        const uint64_t* w = (const uint64_t*)(vm_base + p);
+                        for (int i = 0; i < 0x10000 / 8; i++) if (w[i]) { nz = 1 + i; break; }
+                    }
+                }
+                if (nz && !in) {
+                    run0 = (uint32_t)p; in = 1;
+                    const uint8_t* f = vm_base + p + (nz - 1) * 8;
+                    dbg_printf("  first nz 0x%08X:", (unsigned)(p + (nz - 1) * 8));
+                    for (int i = 0; i < 32; i++) dbg_printf(" %02X", f[i]);
+                    dbg_printf("%c", 10);
+                }
+                if (!nz && in) { dbg_printf("  0x%08X-0x%08X%c", run0, (unsigned)p, 10); in = 0; runs++; }
+            }
+            dbg_printf("  %d run(s)%c", runs, 10);
+        } else if (!strcmp(verb, "dumpbin") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
+            /* dumpbin <hex ea> <hex len> <file>: raw guest bytes to a host file
+             * (uncommitted pages are written as zeros). */
+            char path[260] = {0};
+            sscanf(cmd, "%*s %*x %*x %259s", path);
+            FILE* f = path[0] ? fopen(path, "wb") : NULL;
+            uint32_t done = 0;
+            for (uint32_t p = a; f && vm_base && p < a + b; ) {
+                MEMORY_BASIC_INFORMATION mi;
+                const uint32_t chunk_end = (p | 0xFFFu) + 1u;
+                const uint32_t n2 = (chunk_end < a + b ? chunk_end : a + b) - p;
+                static const uint8_t zeros[0x1000] = {0};
+                const int ok = VirtualQuery(vm_base + p, &mi, sizeof mi) && mi.State == MEM_COMMIT &&
+                               !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+                fwrite(ok ? vm_base + p : zeros, 1, n2, f);
+                done += n2; p += n2;
+            }
+            if (f) fclose(f);
+            dbg_printf("  dumpbin 0x%08X +0x%X -> %s (%u bytes)%c", a, b, path[0] ? path : "(no file)", done, 10);
+        } else if (!strcmp(verb, "findhex")) {
+            /* findhex <hexbytes>: every 4-aligned occurrence of a byte string in
+             * committed guest memory, RSX local memory (0xC0000000+) included
+             * (first 256 hits). */
+            uint8_t pat[64]; size_t n = 0;
+            const char* h = cmd + 7;
+            while (*h == ' ') h++;
+            for (; h[0] && h[1] && n < sizeof pat; h += 2) {
+                unsigned v; if (sscanf(h, "%2x", &v) != 1) break; pat[n++] = (uint8_t)v; }
+            int hits = 0;
+            for (uint64_t p = 0; n && p < 0x100000000ull && hits < 256 && vm_base; ) {
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
+                const uint64_t end = (uint64_t)((uint8_t*)mi.BaseAddress + mi.RegionSize - vm_base);
+                if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                    for (uint64_t q = (p + 3) & ~3ull; q + n <= end && hits < 256; q += 4)
+                        if (!memcmp(vm_base + q, pat, n)) { dbg_printf("  0x%08X%c", (unsigned)q, 10); hits++; }
+                p = end;
+            }
+            dbg_printf("  %d hit(s) for %u byte(s)%c", hits, (unsigned)n, 10);
         } else if (!strcmp(verb, "qbset") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
             /* qbset <name-crc> <value>: set every integer QB struct member with
              * that name. A member is 16 bytes: xx 01|81 00 00 | name | value | next,

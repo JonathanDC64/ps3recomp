@@ -104,9 +104,43 @@ static void write_be64(uint32_t addr, uint64_t val)
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
+/* Set by a title whose lift keeps a guest shadow call stack (--shadow-stack):
+ * dumps the CALLING thread's guest stack. NULL otherwise. */
+void (*g_shadow_stack_dump_hook)(void) = 0;
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
+    /* USLEEP_SHADOW=<guest tid>[:<n>]: after that thread's n-th usleep (default
+     * 200), dump its guest shadow call stack once. A usleep poll's lr is the
+     * sleep helper; the loop that actually polls is further up, and only the
+     * thread itself can read its shadow stack. */
+    { static long s_tid = -2, s_at = 200; static long s_cnt = 0;
+      if (s_tid == -2) { const char* e = getenv("USLEEP_SHADOW"); s_tid = -1;
+          if (e) { char* end = 0; s_tid = strtol(e, &end, 0);
+                   if (end && *end == ':') s_at = strtol(end + 1, 0, 0); } }
+      if (s_tid >= 0 && (long)ctx->thread_id == s_tid && ++s_cnt == s_at &&
+          g_shadow_stack_dump_hook) {
+          fprintf(stderr, "[usleep-shadow] tid=%ld after %ld usleeps:\n", s_tid, s_at);
+          g_shadow_stack_dump_hook();
+          /* The poll loop's registers survive the leaf sleep helper: print the
+           * callee-saved ones and the object at each, which is what it polls. */
+          for (int r = 24; r < 32; r++) {
+              const uint32_t o = (uint32_t)ctx->gpr[r];
+              fprintf(stderr, "   r%d=0x%08X", r, o);
+              if (vm_base && o >= 0x10000u && o < 0xF0000000u) {
+                  fprintf(stderr, " [");
+                  for (int w = 0; w < 36; w++) {
+                      const uint8_t* q = vm_base + o + (unsigned)w * 4u;
+                      fprintf(stderr, "%s%08X", w ? " " : "",
+                              ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) |
+                              ((uint32_t)q[2] << 8) | (uint32_t)q[3]);
+                  }
+                  fprintf(stderr, "]");
+              }
+              fprintf(stderr, "\n");
+          }
+          fflush(stderr); } }
     { extern unsigned long long ps3_qpc_us(void);
       static int n=0; if (n++ < 60)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
@@ -134,7 +168,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         static uint64_t pt_us[PT_MAX]; static int pt_used = 0;
         static uint32_t pt_tid[PT_MAX];
         static unsigned long long pt_win = 0;
-        uint32_t lr = (uint32_t)ctx->lr;
+        /* Lifts that do not maintain ctx->lr at call sites leave it 0; their
+         * ctx->cia is the call site of the sleep helper, which is as good. */
+        uint32_t lr = ctx->lr ? (uint32_t)ctx->lr : (uint32_t)ctx->cia;
         int i = 0;
         for (; i < pt_used; i++) if (pt_lr[i] == lr) break;
         if (i == pt_used && pt_used < PT_MAX) {

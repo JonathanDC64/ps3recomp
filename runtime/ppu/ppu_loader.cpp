@@ -850,9 +850,10 @@ extern "C" void ppu_report_guest_lrs(void)
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
         if (!c) continue;
-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
+        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X cia=0x%08X r11=0x%X r4=0x%08X r5=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1], (uint32_t)c->cia,
+                (uint32_t)c->gpr[11], (uint32_t)c->gpr[4], (uint32_t)c->gpr[5]);
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -1046,6 +1047,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 #ifdef _WIN32
 static volatile uintptr_t s_guard_page = 0;   /* host base of the guarded 4KB page */
 static volatile uint32_t  s_guard_ea   = 0;   /* guest ea being watched */
+static volatile DWORD     s_guard_prot = PAGE_READONLY;   /* PAGE_NOACCESS = watch reads too */
 /* Defined later in this file with C linkage; the guard handler needs it, and a
  * block-scope plain declaration would mangle as C++ and fail to link. */
 extern "C" void ppu_guest_callstack(const char* tag);
@@ -1072,8 +1074,12 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
             char* mbase = (char*)GetModuleHandleA(NULL);
             { extern uint32_t ppu_prof_resolve_host(void*);
               uint32_t gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
-              fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
+              const ULONG_PTR acc = ep->ExceptionRecord->ExceptionInformation[0];
+              static volatile LONG s_hits = 0;
+              if (InterlockedIncrement(&s_hits) <= 400) fprintf(stderr, "[GUARD] %s guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X cia=0x%08X%s\n",
+                      acc == 1 ? "WRITE" : acc == 0 ? "READ" : "EXEC",
                       guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), gfn,
+                      g_active_ctx ? (uint32_t)g_active_ctx->cia : 0u,
                       (guest == s_guard_ea) ? "  <<< watched addr!" : ""); }
             /* On the watched word specifically, dump the guest call stack: with a
              * memset-style clear the writer is always the same memcpy body, and
@@ -1130,6 +1136,17 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
     }
     if (code == EXCEPTION_SINGLE_STEP && s_guard_page) {
         { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
+          /* PPU_GUARD_CHANGE=1: name every writer that changes the watched word,
+           * not just one that zeroes it -- for a value that is wrong, not lost. */
+          { static int en = -1; if (en < 0) en = getenv("PPU_GUARD_CHANGE") ? 1 : 0;
+            static int _c = 0;
+            if (en && nowv != s_guard_pre && _c++ < 24) {
+                fprintf(stderr, "[GUARD] CHANGED 0x%08X: 0x%08X -> 0x%08X cia=0x%08X lr=0x%08X\n",
+                        s_guard_ea, s_guard_pre, nowv,
+                        g_active_ctx ? g_active_ctx->cia : 0, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
+                fflush(stderr);
+                ppu_guest_callstack("guard-changed");
+            } }
           if (s_guard_pre && !nowv) {
               static int _z = 0;
               if (_z++ < 3) {
@@ -1150,7 +1167,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
                   ppu_guest_callstack("guard-zeroed");
               }
           } }
-        DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
+        DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, s_guard_prot, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -1178,8 +1195,24 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     fprintf(stderr, "[GUARD] armed on guest 0x%08X (host page %p)\n", guest_ea, (void*)s_guard_page);
     fflush(stderr);
 }
+/* Re-arm the guard on a new page at runtime (debug console / SPU DMA hook).
+ * noaccess=1 traps reads as well as writes. The previous page is released. */
+extern "C" void ppu_guard_page_rearm(uint32_t guest_ea, int noaccess)
+{
+    if (!vm_base) return;
+    static volatile LONG s_veh = 0;
+    DWORD old;
+    if (s_guard_page) VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READWRITE, &old);
+    else if (InterlockedExchange(&s_veh, 1) == 0) AddVectoredExceptionHandler(1, ppu_guard_veh);
+    s_guard_prot = noaccess ? PAGE_NOACCESS : PAGE_READONLY;
+    s_guard_ea   = guest_ea;
+    s_guard_page = ((uintptr_t)vm_base + guest_ea) & ~(uintptr_t)0xFFF;
+    VirtualProtect((void*)s_guard_page, 0x1000, s_guard_prot, &old);
+    fprintf(stderr, "[GUARD] re-armed (%s) on guest 0x%08X\n", noaccess ? "rw" : "w", guest_ea);
+}
 #else
 extern "C" void ppu_guard_page(uint32_t guest_ea) { (void)guest_ea; }
+extern "C" void ppu_guard_page_rearm(uint32_t guest_ea, int noaccess) { (void)guest_ea; (void)noaccess; }
 #endif
 
 /* Guest address-space size (host sets this); 0 = unchecked. Bounds-checking
@@ -2622,9 +2655,9 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
              * import was never resolved or was resolved and later clobbered. */
             uint32_t opd = (uint32_t)ctx->gpr[12];
             uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
-            fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
+            fprintf(stderr, "[ppu] bctr to NULL from %s cia=0x%08X r12(opd)=0x%08X opd[0]=0x%08X "
                     "(r3=0x%08X r4=0x%08X "
-                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
+                    "tid=%llu) -- returning with r3 untouched\n", who, (uint32_t)ctx->cia, opd, o0,
                     (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
                     (unsigned long long)ctx->thread_id); } }
         return;

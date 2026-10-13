@@ -59,9 +59,12 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_O_RDONLY     0
 #define CELL_FS_O_WRONLY     1
 #define CELL_FS_O_RDWR       2
-#define CELL_FS_O_CREAT      0x0200
-#define CELL_FS_O_TRUNC      0x0400
-#define CELL_FS_O_APPEND     0x0100
+/* Octal in the SDK (and RPCS3's sys_fs.h): O_CREAT is 0100 = 0x40, not 0x200.
+ * The hex misreading made every create-open a plain open of a missing file --
+ * Demon's Souls' resource cache write-back (flags 0x41) failed with ENOENT. */
+#define CELL_FS_O_CREAT      000100
+#define CELL_FS_O_TRUNC      001000
+#define CELL_FS_O_APPEND     002000
 #define CELL_FS_SEEK_SET     0
 #define CELL_FS_SEEK_CUR     1
 #define CELL_FS_SEEK_END     2
@@ -208,7 +211,8 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X errno=%d)\n",
+                gpath, hpath, flags, errno);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
