@@ -54,10 +54,17 @@ def discover_all():
     globs into ps3recomp_runtime, and take the cell*/sce*/sys* file names."""
     dirs = ["system", "filesystem", "input", "audio", "video", "network",
             "spurs", "sync", "codec", "font", "misc", "hardware"]
+    # Files CMakeLists.txt filters OUT of HLE_SOURCES. Registering their symbols
+    # emits references nothing defines: sceNpCommerce.c duplicates
+    # sceNpCommerce2.c, and the --all table failed to link on its
+    # sceNpCommerce2* functions.
+    cmake_excluded = {"sceNpCommerce"}
     names = set()
     for d in dirs:
         for p in glob.glob(os.path.join(ROOT, "libs", d, "*.c")):
             n = os.path.splitext(os.path.basename(p))[0]
+            if n in cmake_excluded:
+                continue
             if re.match(r"^(cell|sce|sys)", n) and not re.match(r"^(test_|validate_)", n):
                 names.add(n)
     return sorted(names)

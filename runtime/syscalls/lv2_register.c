@@ -1579,7 +1579,15 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
     uint64_t requested = ctx->gpr[5];
     uint32_t output = (uint32_t)ctx->gpr[6];
     uint32_t result = CELL_OK;
-    if (!g) result = CELL_ESRCH;
+    /* Group 0 is never a real lv2 group: it is CellSpurs.spuTG of an HLE SPURS
+     * instance, which has no thread group behind it. Real libsre code reaches
+     * this syscall with it (see spurs_hle_connect_port_mask). */
+    if (!g && (uint32_t)ctx->gpr[3] == 0 && requested && output) {
+        extern uint32_t spurs_hle_connect_port_mask(uint32_t, uint64_t, uint8_t*);
+        result = spurs_hle_connect_port_mask((uint32_t)ctx->gpr[4], requested,
+                                             &vm_base[output]);
+    }
+    else if (!g) result = CELL_ESRCH;
     else if (!requested) result = CELL_EINVAL;
     else if (!output) result = CELL_EFAULT;
     else {

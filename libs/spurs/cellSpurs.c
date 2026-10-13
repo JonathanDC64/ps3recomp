@@ -823,6 +823,29 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
     return CELL_OK;
 }
 
+/* sys_spu_thread_group_connect_event_all_threads on the HLE SPURS instance.
+ *
+ * Real libsre code (run through firmware LLE next to this HLE) attaches a queue
+ * one level BELOW cellSpursAttachLv2EventQueue: it reads CellSpurs.spuTG and
+ * calls syscall 251 on it directly. The HLE never creates an lv2 SPU thread
+ * group, so spuTG reads 0 and the syscall answered ESRCH -- Demon's Souls's
+ * cellSpursLFQueueAttachLv2EventQueue failed that way, left the queue unusable,
+ * and every _cellSpursLFQueuePushBody after it returned TASK_ERROR_STAT.
+ * Bind the lowest free port in `mask` in the same table the HLE attach uses,
+ * so SPU user events on it reach `queue`. Returns a CELL_* code. */
+uint32_t spurs_hle_connect_port_mask(uint32_t queue, uint64_t mask, uint8_t* port_out)
+{
+    for (u32 p = 0; p < 64; p++) {
+        if (!(mask & (1ull << p)) || s_spurs_port_queue[p]) continue;
+        s_spurs_port_queue[p] = queue;
+        *port_out = (uint8_t)p;
+        printf("[cellSpurs] lv2 connect_event_all_threads on HLE SPURS: queue=%u port=%u\n",
+               queue, p);
+        return CELL_OK;
+    }
+    return CELL_EISCONN;
+}
+
 s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -1258,14 +1281,6 @@ s32 cellSpursTaskExitCodeInitialize(void* pExitCode)
     if (!pExitCode) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     uint8_t* c = GUEST_PTR(pExitCode, uint8_t*);
     memset(c, 0, 128);
-    return CELL_OK;
-}
-
-/* cellSpursTasksetAttributeSetTasksetSize(pAttribute, size): record the taskset
- * size hint. We don't size-limit tasksets, so just acknowledge it. */
-s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
-{
-    (void)attr; (void)size;
     return CELL_OK;
 }
 

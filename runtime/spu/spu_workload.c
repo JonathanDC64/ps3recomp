@@ -797,7 +797,7 @@ static void spu_async_run(spu_async_job* j)
                       uint32_t e2 = 0;
                       if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
                       rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
-                                                  1, j->have_r3 ? j->r3 : 0);
+                                                  1, j->have_r3 ? j->r3 : 0, 0);
                       /* Publish the completion word after EACH re-entry, not just
                        * once at the end: the PPU waiter clears it and re-submits
                        * every iteration, so a single publish only ever buys one

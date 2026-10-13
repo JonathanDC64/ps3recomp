@@ -330,6 +330,30 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * (which succeeds) lets the caller proceed. */
     {
         uint32_t opd = prx_resolve_export(nid);
+        /* LIBSRE_LLE_ONLY=<nid,...> inverts YDKJ_FORCE_HLE: ONLY the listed NIDs go
+         * to the loaded PRX, everything else stays on HLE. For a title whose HLE
+         * SPURS path works except for a family it never implemented -- Demon's
+         * Souls's Core.Res.Decompressor feeds its SPU tasks through
+         * _cellSpursLFQueuePushBody, which has no HLE at all -- this moves just
+         * that family onto Sony's own code instead of guessing its protocol. */
+        if (opd) {
+            static const char* s_only = (const char*)1;
+            if (s_only == (const char*)1) s_only = getenv("LIBSRE_LLE_ONLY");
+            if (s_only && *s_only) {
+                char want[16]; snprintf(want, sizeof want, "%08X", nid);
+                int hit = 0;
+                for (const char* p2 = s_only; *p2 && !hit; p2++) {
+                    int k = 0;
+                    while (k < 8 && p2[k] &&
+                           (p2[k] == want[k] ||
+                            (p2[k] >= 'a' && p2[k] - 32 == want[k]))) k++;
+                    hit = (k == 8);
+                }
+                if (!hit) opd = 0;
+                else { static int _n = 0; if (_n++ < 8)
+                    fprintf(stderr, "[LLE-ONLY] nid=0x%08X -> libsre\n", nid); }
+            }
+        }
         if (opd) {
             static const char* s_force = (const char*)1;
             if (s_force == (const char*)1) s_force = getenv("YDKJ_FORCE_HLE");
