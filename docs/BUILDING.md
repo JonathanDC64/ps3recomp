@@ -9,12 +9,13 @@ Complete guide to building the ps3recomp runtime library and game projects.
 1. [Prerequisites](#prerequisites)
 2. [Building the Runtime Library](#building-the-runtime-library)
 3. [Build Options](#build-options)
-4. [Platform-Specific Notes](#platform-specific-notes)
-5. [Compiler Support](#compiler-support)
-6. [CMake Build System Details](#cmake-build-system-details)
-7. [Linking Against the Runtime](#linking-against-the-runtime)
-8. [Building a Game Project](#building-a-game-project)
-9. [Troubleshooting](#troubleshooting)
+4. [Graphics Backends](#graphics-backends)
+5. [Platform-Specific Notes](#platform-specific-notes)
+6. [Compiler Support](#compiler-support)
+7. [CMake Build System Details](#cmake-build-system-details)
+8. [Linking Against the Runtime](#linking-against-the-runtime)
+9. [Building a Game Project](#building-a-game-project)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -128,8 +129,33 @@ cmake --install build --prefix /usr/local
 | CMake Option | Default | Description |
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
+| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
+
+### FFmpeg (run-time loaded, opt-in)
+
+```bash
+# Headers only -- Debian/Ubuntu: libavcodec-dev, Fedora: ffmpeg-free-devel
+cmake -S . -B build -G Ninja -DPS3RECOMP_FFMPEG_RUNTIME=ON
+```
+
+FFmpeg is never linked. The first `cellVdecOpen` loads libavcodec and
+libavutil with `dlopen` / `LoadLibrary` and resolves the few functions the
+decoder calls. The library has to be the major version the headers describe
+(`libavcodec.so.63` / `avcodec-63.dll` for FFmpeg 9.0), because the decoder
+reads `AVFrame` fields and FFmpeg keeps their layout only within a major
+version; another major is reported and not used. Ship the matching FFmpeg DLLs
+next to a Windows build, or rely on the system's on Linux. When the library is
+missing, or `PS3RECOMP_FFMPEG=0` is set, the decoders keep the callback-only
+behaviour every build had before. `PS3RECOMP_FFMPEG_AVCODEC` and
+`PS3RECOMP_FFMPEG_AVUTIL` name the library files to load instead.
+
+FFmpeg stays a separate library supplied by the user; nothing from it is
+compiled into the runtime. If you redistribute FFmpeg DLLs with a port, use an
+LGPL-only build: distro and MSYS2 packages are usually built with GPL parts
+enabled (`--enable-gpl`), which changes what you may ship.
 
 ### Running the Tests
 
@@ -139,8 +165,11 @@ cmake --build build-tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
-The test build currently registers the deterministic synchronization stress
-suite. It can still be configured directly from `tests/sync_stress` when
+The test build registers the deterministic synchronization stress suite, the
+fiber switch test and cellVdec's guest-API test. With
+`-DPS3RECOMP_FFMPEG_RUNTIME=ON` and an `ffmpeg` program on `PATH`, it also
+generates small H.264 and MPEG-2 streams into the build tree and checks every
+decoded picture against FFmpeg's own decode. It can still be configured directly from `tests/sync_stress` when
 testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
 
 ### Checking the PPU boot scaffold
@@ -173,10 +202,10 @@ GCC, Clang and clang-cl — so in practice this is a hard gate: any new error
 fails the build.
 
 Compiling is not the same as running. The scaffold is not linked or executed by
-anything in this repository (that needs a lifted game), and `boot_main.cpp`
-still starts its vblank ticker, hang watchdog and profiler inside
-`#ifdef _WIN32` with no `#else`, so a POSIX host has no frame clock. Those are
-the remaining gaps between "builds" and "runs a title".
+anything in this repository (that needs a lifted game). `boot_main.cpp` now
+starts its vblank ticker on POSIX too, through the pthread `CreateThread` shim
+in `win32_compat.h`; the hang watchdog is still Windows-only. What remains
+between "builds" and "runs a title" is booting one.
 
 It compiles the four scaffold translation units. `boot_main.cpp` is excluded:
 it also pulls in the per-game SPU recomp header and the generated function
@@ -197,9 +226,151 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 ---
 
+## Graphics Backends
+
+Everything under `libs/video/` is compiled into `ps3recomp_runtime` and the
+backend is selected by host platform. The one exception is the Vulkan backend,
+which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
+
+| Host | Backend | Source | Status |
+|------|---------|--------|--------|
+| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
+| macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
+| Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
+| Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
+
+So on Windows a plain `cmake --build` already gives you the working renderer --
+there is nothing to switch on. If you are bringing up a port and want frames on
+screen, build on Windows.
+
+### Exercising the backend without a game
+
+On POSIX hosts the build also produces `ps3recomp_host`, which drives the
+`cellGcm` -> RSX -> backend bridge with no lifted game at all. It is how a
+backend gets brought up and regression-tested before any title exists:
+
+```bash
+cmake --build build --target ps3recomp_host
+./build/ps3recomp_host
+```
+
+### The Vulkan backend (Linux, opt-in)
+
+```bash
+# Headers only -- Debian/Ubuntu: libvulkan-dev, Fedora: vulkan-headers
+cmake -S . -B build -G Ninja -DPS3RECOMP_RSX_VULKAN=ON
+cmake --build build --target ps3recomp_host
+./build/ps3recomp_host --draw
+```
+
+`libvulkan` is loaded at run time, so building needs only the headers, which
+also keeps cross-compiling for aarch64 simple (point
+`-DPS3RECOMP_VULKAN_INCLUDE_DIR=` at them if the cross sysroot has none). Only
+Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe and on
+NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+
+| Environment variable | Effect |
+|---|---|
+| `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
+| `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
+| `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
+| `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
+
+| `PS3RECOMP_VK_GUEST_PROGRAMS=1` | Run the guest's own vertex/fragment programs (needs the translator, below); also makes the draw engine the default path |
+| `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | Pick the draw path explicitly -- the engine's own switch, shared with Metal |
+| `RSX_ENGINE_COHERENCE_LOG=<n>` | Log the first *n* syncs between guest memory and the engine's surfaces around NV3089 transfers, with how many non-zero pixels moved |
+| `RSX_ENGINE_PASS_DUMP=<dir>` | Capture draws pass by pass into an existing *dir*: each pass's colour targets as PPM, its zeta as PGM, and one line per pass in `passes.txt` (targets, depth range, clears, the first draw's state and textures). Starts after `RSX_ENGINE_PASS_DUMP_AFTER=<sec>` or on the frame after one of `RSX_ENGINE_PASS_DUMP_MINDRAWS=<n>` guest draws, and stops after `RSX_ENGINE_PASS_DUMP_MAX=<n>` passes (default 64). `RSX_ENGINE_PASS_DUMP_DRAWS=1` adds one line per draw to `draws.txt`. Every pass stalls the GPU for its readbacks |
+| `RSX_ENGINE_SHADER_DUMP=<dir>` | Write each new pipeline's translated programs to an existing *dir* as `pipe<handle>.vs.hlsl` and `.ps.hlsl`, the handles `passes.txt` names |
+
+Without a GPU, Mesa's lavapipe runs every check, e.g.
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ./build/ps3recomp_host --tex`
+(the ICD file name varies by distribution). Without guest programs, the modes
+that need them (`--shader`, `--mip`, `--rtt`, `--depthtex`, `--mrt`,
+`--mrt-a`, `--cube`) report that and are skipped, as on the null backend.
+
+#### Guest programs and the draw engine
+
+The guest's programs go through the shared decompilers to HLSL, then through
+glslang to SPIR-V (`libs/video/rsx_shader_spirv.cpp`), so they need glslang's
+CMake package at build time; CMake reports whether it found it
+(`Vulkan: guest programs available`). On Debian/Ubuntu that is `glslang-dev`
+plus `spirv-tools`. glslang must be built **with** SPIRV-Tools: the HLSL path
+runs its legalization passes, and a glslang without them emits different --
+possibly invalid -- SPIR-V, silently. That matters when cross-compiling glslang
+yourself: its `update_glslang_sources.py` fetches the SPIRV-Tools revision it
+expects.
+
+```bash
+PS3RECOMP_VK_GUEST_PROGRAMS=1 ./build/ps3recomp_host --rtt
+```
+
+With guest programs on, the backend runs on the register-file draw engine
+(`rsx_draw_engine.h`), as the Metal backend does: the engine owns surfaces,
+render-to-texture, MRT, depth textures, cube maps, vertex compaction and pipeline keys,
+and every `ps3recomp_host` scene passes. Not handled yet, and logged once when
+a title reaches them: vertex-texture units, colour targets other
+than RGBA8 and RGBA16F (the FP16 HDR target), depth-only passes, stencil on the vtable path, and depth snapshots on devices
+whose depth format is neither `D32_SFLOAT` nor `D32_SFLOAT_S8_UINT`. Everything is submitted synchronously for now:
+correct first, fast later.
+
+### `RSX_LIVE_DRAW` is not required
+
+`RSX_LIVE_DRAW=1` selects an **alternative** draw engine
+contributed from a downstream fork, not the normal renderer. It is **off by
+default** and the D3D12 backend is used instead. You do not need to set it to
+get a picture, and setting it changes which draw path executes -- so leave it
+unset unless you are specifically working on that engine.
+
+### The RSX code that is *not* in the library
+
+`runtime/ppu/` and `runtime/host/` are deliberately excluded from
+`ps3recomp_runtime` (see the `list(FILTER ...)` in the root `CMakeLists.txt`).
+They `#include` the lifter-generated `ppu_recomp.h`, which only exists once you
+have lifted a specific title, so they are compiled **into your game target**
+rather than into the shared library. `templates/project/CMakeLists.txt` shows the arrangement.
+
+---
+
 ## Platform-Specific Notes
 
 ### Windows
+
+**Configure from a developer environment.** CMake finds the compiler through
+the environment, so a plain shell will fail at `project()` with either
+"no CMAKE_C_COMPILER could be found" or, if you point it at `clang-cl`,
+"the C compiler is not able to compile a simple test program" -- `clang-cl`
+needs the MSVC headers and libraries that `vcvars` exports. Either
+
+```bat
+:: from a "x64 Native Tools Command Prompt for VS 2022", or after
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+or use the Visual Studio generator, which locates the toolchain itself:
+
+```bat
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+**Both toolchains work.** As of this writing the runtime library builds clean
+with either, verified by building `master` both ways (128/128 targets, warnings
+only):
+
+| Toolchain | Configure |
+|-----------|-----------|
+| MSVC (`cl`) | `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release` |
+| Clang (`clang-cl`) | add `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`, with LLVM's `bin` on `PATH` |
+
+`clang-cl` is what the in-tree ports are built with, so it is the better-trodden
+path for a game target. Older guidance said plain MSVC could not compile the
+runtime because of `__builtin_bswap*` and `__attribute__((weak))`; those are
+guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
@@ -232,11 +403,12 @@ Clang, Debug and Release on every push). That workflow builds the runtime
 library, runs all eight lifter suites plus the SPU helper tests, and drives
 `ps3recomp_host` end to end against the headless software backend.
 
-> **No hardware render backend.** Metal is Apple-only and D3D12 is
-> Windows-only. Linux falls back to the null backend's headless software path
-> (`libs/video/rsx_null_backend.c`), which rasterises into host memory — a
-> correctness probe, not a renderer. Running a recompiled title additionally
-> needs the PPU boot scaffold ported off Win32 — the same gap macOS has.
+> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-linux-opt-in)).
+> The default is the null backend's headless software path
+> (`libs/video/rsx_null_backend.c`), which rasterises into host memory: a
+> correctness probe for CI, not a renderer. Running a recompiled title from
+> this tree additionally needs the PPU boot scaffold to boot one on POSIX, the
+> same gap macOS has.
 
 **Compiler Flags (GCC/Clang):**
 - `-Wall -Wextra` — Enable warnings
@@ -264,11 +436,12 @@ cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
-**It cannot run a recompiled game yet.** The PPU boot scaffold —
-`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
-dispatch — is still Win32-only (thread creation, `VirtualAlloc`, SEH, stack
-walking) and is compiled per-game rather than into the library, so it is not
-covered by the macOS build. Porting that scaffold is the remaining work.
+**No title has run from this tree on macOS yet.** The PPU boot scaffold
+(`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
+dispatch) compiles on POSIX with zero errors under a CI ratchet, but it is
+compiled per game rather than into the library, and booting a title with it on
+macOS is the remaining work. Downstream, inFamous runs on macOS/arm64 with
+patches that are on their way upstream (#213).
 
 Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
 original docs-vs-reality gap in

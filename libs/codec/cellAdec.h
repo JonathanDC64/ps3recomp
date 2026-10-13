@@ -18,13 +18,28 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_ADEC_ERROR_ARG            0x80610201
-#define CELL_ADEC_ERROR_SEQ            0x80610202
-#define CELL_ADEC_ERROR_BUSY           0x80610203
-#define CELL_ADEC_ERROR_EMPTY          0x80610204
-#define CELL_ADEC_ERROR_AU             0x80610205
-#define CELL_ADEC_ERROR_PCM            0x80610206
-#define CELL_ADEC_ERROR_FATAL          0x80610207
+/* These were all wrong -- every one of them. The real values are
+ * FATAL/SEQ/ARG/BUSY/EMPTY = 0x80610001..5 (RPCS3 Modules/cellAdec.h:9), and
+ * the guest proves it: ps1_netemu's audio thread drains the decoder with
+ *
+ *     000EE220  bl 0x15f14c        ; cellAdecEndSeq
+ *     000EE230  bl 0x15f0ec        ; cellAdecGetPcm(handle, 0)
+ *     000EE238  cmpw cr7, r3, r31  ; r31 = 0x80610005
+ *
+ * and 0x80610005 is the ONLY cellAdec code it ever compares against (8 sites).
+ * Returning 0x80610204 for EMPTY meant that loop never saw its terminator, so
+ * the title re-ran the whole format-change path: 4760 EndSeq calls against a
+ * single StartSeq.
+ *
+ * There is no AU or PCM code in the real list; both are mapped to the nearest
+ * real one rather than left as invented values that no title can recognise. */
+#define CELL_ADEC_ERROR_FATAL          0x80610001
+#define CELL_ADEC_ERROR_SEQ            0x80610002
+#define CELL_ADEC_ERROR_ARG            0x80610003
+#define CELL_ADEC_ERROR_BUSY           0x80610004
+#define CELL_ADEC_ERROR_EMPTY          0x80610005
+#define CELL_ADEC_ERROR_AU             CELL_ADEC_ERROR_ARG
+#define CELL_ADEC_ERROR_PCM            CELL_ADEC_ERROR_EMPTY
 
 /* ---------------------------------------------------------------------------
  * Codec types
@@ -39,8 +54,14 @@ extern "C" {
 /* Callback message types */
 #define CELL_ADEC_MSG_TYPE_AUDONE      0
 #define CELL_ADEC_MSG_TYPE_PCMOUT      1
-#define CELL_ADEC_MSG_TYPE_SEQDONE     2
-#define CELL_ADEC_MSG_TYPE_ERROR       3
+/* ERROR is 2 and SEQDONE is 3, not the other way round. These were swapped,
+ * so cellAdecEndSeq's SEQDONE reached the guest as ERROR -- ps1_netemu's
+ * callback (func_000ED918, OPD 0x1B5F00) then restarted the stream, giving
+ * 4977 EndSeq calls against a single StartSeq. Order confirmed twice: RPCS3
+ * Modules/cellAdec.h:304, and the guest callback itself, which acts only on
+ * msgType == 1 (PCMOUT) and ignores everything else. */
+#define CELL_ADEC_MSG_TYPE_ERROR       2
+#define CELL_ADEC_MSG_TYPE_SEQDONE     3
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -78,15 +99,30 @@ typedef struct CellAdecPcmItem {
     u64 userData;
 } CellAdecPcmItem;
 
-typedef u32 (*CellAdecCbMsg)(CellAdecHandle handle, u32 msgType,
-                               s32 msgData, void* cbArg);
+/* NOT a host function pointer. The guest's cbFunc is a guest EA naming an OPD,
+ * so it must be dispatched through g_ps3_guest_caller -- calling it as a host
+ * pointer jumps to the guest address as if it were host code, which is exactly
+ * how this crashed (rip = 0x1B5F00, the guest OPD). Kept as a comment rather
+ * than a typedef so nobody can accidentally call one again.
+ *
+ *   cbFunc(handle, msgType, msgData, cbArg)  -- RPCS3 Modules/cellAdec.h:312
+ */
 
 /* ---------------------------------------------------------------------------
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* CellAdecCb is a GUEST STRUCT passed by pointer: { cbFunc, cbArg }, not two
+ * separate register arguments. Splitting it into two shifted `handle` from r6 to
+ * r7, so the handle out-pointer read as garbage and every Open failed ARG. */
+typedef struct CellAdecCb {
+    u32 cbFunc;   /* guest EA of a CellAdecCbMsg */
+    u32 cbArg;    /* guest EA passed back to it  */
+} CellAdecCb;
+
+s32 cellAdecQueryAttr(const CellAdecType* type, void* attr);
 s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
-                  CellAdecCbMsg cbFunc, void* cbArg, CellAdecHandle* handle);
+                 const CellAdecCb* cb, CellAdecHandle* handle);
 s32 cellAdecClose(CellAdecHandle handle);
 
 s32 cellAdecStartSeq(CellAdecHandle handle, void* param);

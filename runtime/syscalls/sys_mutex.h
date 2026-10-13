@@ -27,7 +27,11 @@
 extern "C" {
 #endif
 
-#define SYS_MUTEX_MAX  8192   /* PS3 lv2 default; Dantelion2 creates many mutexes during init */
+/* lv2's pool is far larger than 256. Resistance: Fall of Man has 256
+ * mutexes alive by its first intro movie (456 created, 200 destroyed),
+ * so the next sys_mutex_create returned EAGAIN and the movie player
+ * failed every start. 8192 keeps a wide margin at ~100 bytes a slot. */
+#define SYS_MUTEX_MAX  8192
 
 /* Protocol types */
 #define SYS_SYNC_FIFO            0x1

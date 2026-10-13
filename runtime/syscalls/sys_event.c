@@ -283,12 +283,15 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
             queue_id);
 }
 
+/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
+static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+
 int64_t sys_event_queue_receive(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
-    /* YDKJ_THREADGATE: the creating thread is now blocking -> workers may run
+    /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
     if (ps3_log_verbose())
@@ -296,9 +299,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                 queue_id, (unsigned long long)timeout_us,
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
-    /* YDKJ_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+    /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
      * exact game function the main thread is stuck polling in the flip loop. */
-    if (getenv("YDKJ_WAITBT")) {
+    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
         static unsigned char seen[8][8] = {{0}};
         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
         if (!seen[t][qk]) {
@@ -323,6 +326,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #else
         sched_yield();
 #endif
+    /* WAITBT_EVERY=<n>: the same dump, but every nth wait per (tid,queue)
+     * instead of once. The one-shot above names where a thread FIRST parks,
+     * which is a boot-time answer; when a title runs for a while and then stops
+     * doing something, the question is where it is parked at the END, and the
+     * last dump in the log answers that. */
+    { static int every = -1;
+      if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
+      if (every > 0) {
+          static unsigned n[8][8] = {{0}};
+          unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+          if ((n[t][qk]++ % (unsigned)every) == 0) {
+              extern void ppu_dump_guest_stack(ppu_context*, const char*);
+              char tag[64];
+              snprintf(tag, sizeof tag, "wait#%u tid=%u q=%u",
+                       n[t][qk] - 1u, t, queue_id);
+              ppu_dump_guest_stack(ctx, tag);
+          }
+      } }
+
+    if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -342,7 +365,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * 0x004F5F80) against the recorded SPURS context. It claims the ready task
      * from libsre's taskset and runs the task body -- real recompiled SPU code,
      * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
-    if (getenv("YDKJ_SPUTASK") && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
         static int s_fired = 0;
         if (!s_fired) {
             s_fired = 1;
@@ -363,7 +386,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * returns. Synthesize a ready event so init returns -> see whether the PPU
      * then reaches CreateTaskset and the running policy dispatches the cri task.
      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
-    if (getenv("YDKJ_SPURS_READY") && (queue_id == 1 || queue_id == 4)
+    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
             && timeout_us == 0 && q->count == 0) {
         static int s_fire[8] = {0};
         if (s_fire[queue_id] < 64) {
@@ -389,7 +412,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * main thread times out after 30s and the title tears down. Synthesize a
      * completion so the wait returns -> see whether the game then advances to
      * asset load + menu draw (content). Returns immediately with a zero event. */
-    if (getenv("YDKJ_FAKECOMPLETE") && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
         if (event_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
@@ -399,7 +422,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
      * blocks forever) so the loader thread proceeds. Tests whether the game's
      * render/draw code is reachable once the completion waits are satisfied. */
-    if (getenv("YDKJ_HLE_DRAW") && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
         static int s_n1 = 0;
         if (s_n1 < 256) { s_n1++;
             if (event_addr != 0) {
@@ -408,14 +431,6 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             }
             return CELL_OK;
         }
-    }
-
-    /* Diagnostic: dump the guest call chain of a thread about to block on q=1
-     * (the loader/worker) -- identifies WHICH function's receive-loop it's in,
-     * so we can see why it only receives once. Fires a few times. */
-    if (queue_id == 1 && timeout_us == 0) {
-        extern void ppu_dump_guest_stack(ppu_context*, const char*);
-        static int _gs = 0; if (_gs++ < 5) ppu_dump_guest_stack(ctx, "q1-worker");
     }
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
@@ -556,7 +571,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("RD_RECV") && _r++<60) fprintf(stderr,
+    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<60) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
@@ -681,6 +696,30 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
+     * how many events are sitting in it unread.
+     *
+     * For a deadlock the pending count is the whole answer. The R3000 spins
+     * waiting for spu4; spu4 waits for SigNotify2 from the guest thread that
+     * services an event queue; that thread sits in sys_event_queue_receive.
+     * pending > 0 means the receiver is not waking (our bug); pending == 0
+     * means nothing produced the event (the guest's, or a missing HLE
+     * producer). Those need opposite fixes, and nothing else distinguishes
+     * them. */
+    { static int s_es = -1;
+      if (s_es < 0) { const char* e = getenv("PS3_EVQSTAT");
+                      s_es = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+      if (s_es) { static unsigned long long np[SYS_EVENT_QUEUE_MAX + 1], n;
+          const unsigned qi = (unsigned)(q - g_sys_event_queues) + 1u;
+          if (qi <= SYS_EVENT_QUEUE_MAX) np[qi]++;
+          if ((++n % (unsigned long long)s_es) == 0) {
+              fprintf(stderr, "[evqstat] %llu pushes;", n);
+              for (unsigned k = 1; k <= SYS_EVENT_QUEUE_MAX; k++)
+                  if (np[k] || g_sys_event_queues[k - 1].count)
+                      fprintf(stderr, " q%u[pushed=%llu pending=%u]", k, np[k],
+                              (unsigned)g_sys_event_queues[k - 1].count);
+              fprintf(stderr, "\n"); fflush(stderr);
+          } } }
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 #else
@@ -796,6 +835,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
+    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
 
     evt_table_lock();
 
@@ -892,13 +932,11 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
-    if (getenv("YDKJ_PRODSTACK")) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
+    static int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
+    if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
-    if (getenv("YDKJ_NOTIFIER")) { static int _d=0; if(_d++==0){ extern uint32_t vm_read32(uint64_t);
-        fprintf(stderr,"[NOTIFIER-ARRAY] @0x587300..0x5873C0 (each obj: +0x0,+0x4,+0x8=portid,+0xC):\n");
-        for(uint32_t a=0x587300;a<=0x5873C0;a+=0x10) fprintf(stderr,"  0x%08X: %08X %08X %08X %08X\n",a,vm_read32(a),vm_read32(a+4),vm_read32(a+8),vm_read32(a+0xC)); fflush(stderr); } }
-    fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
@@ -931,7 +969,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
         fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
     }
-    fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
             port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;
@@ -1123,14 +1161,14 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* YDKJ_F100_OK (diagnostic, env-gated): the game busy-spins ~145k times on
+    /* PS3_EVF_OK_IF_MISSING (diagnostic, env-gated): the game busy-spins ~145k times on
      * event_flag_wait(flag=100 bits=0x2) with a GARBAGE mode (0x38CAE4) on a
      * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
      * (as if the flag were set) breaks the spin and lets the game progress into
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
-    { static int s_f = -1; if (s_f < 0) s_f = getenv("YDKJ_F100_OK") ? 1 : 0;
+    { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
-        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] YDKJ_F100_OK: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
@@ -1162,15 +1200,15 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    /* YDKJ_FORCE_EVF (diagnostic): the game's init blocks polling event_flag
+    /* PS3_EVF_FORCE (diagnostic): the game's init blocks polling event_flag
      * (flag=100 bits=0x2) for a subsystem/SPU completion that our HLE never fires,
      * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
      * bits) to see if the game advances into its real render/content code. Blunt;
      * identifies the gate. */
-    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("YDKJ_FORCE_EVF") ? 1 : 0;
+    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
         static int _n = 0; if (_n++ < 20)
-            fprintf(stderr, "[evt] YDKJ_FORCE_EVF: force-satisfy flag=%u bits=0x%llX mode=%u\n",
+            fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
 #ifdef _WIN32
         EnterCriticalSection(&f->lock); f->pattern |= bitpat; LeaveCriticalSection(&f->lock);

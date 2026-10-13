@@ -21,6 +21,11 @@ extern "C" {
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
 
+/* Source capacity for native backends decoding up to 4096 bytecode bytes.
+ * Predicated instructions can expand beyond 32 KiB of HLSL. This is a caller
+ * allocation size, not a limit imposed by the decompiler API. */
+#define RSX_FP_HLSL_BUFFER_SIZE (256u * 1024u)
+
 /* Runtime payload for a structurally decompiled fragment program. Values are
  * retained as host-order IEEE-754 bit patterns so signed zero, infinities,
  * NaNs, and NaN payloads survive the guest-word conversion exactly. One slot
@@ -74,6 +79,18 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
  * inserted, 0 for ALWAYS, and -1 if the generated shader could not be
  * patched safely. */
 int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
+
+/* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
+ * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
+ * half float and X32/W32Z32Y32X32 use a 32-bit float. */
+float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+
+/* Scale texel-space (RSX_TEX_FMT_UNNORM) coordinates into HLSL's 0..1 range.
+ * unnorm_mask selects the units; dim[u] gives that unit's {width, height};
+ * cube units are skipped. Returns the number of Sample sites patched, or -1 if
+ * the buffer would overflow. A no-op when unnorm_mask is 0. */
+int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                              const u32 dim[][2], u32 cube_mask);
 
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a

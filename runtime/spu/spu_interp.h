@@ -32,6 +32,9 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
  * host-fatal decode. Handles all control flow internally. Returns the stop
  * code (0 if none). ctx->pc holds the address that stopped execution. */
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
+/* As spu_interp_run, but also hands back at stop_lsa (0 = no such point): the
+ * return point of the drain the caller goes back to (spu_smc_microstep). */
+uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 
 /* The single dispatch point every computed branch routes through. If `target`
  * is a registered lifted entry, runs it; otherwise interprets from `target`.

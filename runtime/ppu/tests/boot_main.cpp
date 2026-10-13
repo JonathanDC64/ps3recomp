@@ -1,25 +1,29 @@
 /*
- * ps3recomp - integrated PPU boot harness (first-boot attempt).
+ * ps3recomp - integrated PPU boot harness.
  *
- * Links the whole PPU runtime half into one executable and starts executing
- * the recompiled game's entry point:
+ * Links the whole PPU runtime half into one executable and starts executing a
+ * recompiled program's entry point:
  *
  *   lifted code (ppu_recomp.c) + loader (ppu_loader.cpp) + HLE bridge
  *   (ppu_hle.cpp + generated NID table) + HLE libs (cellGcmSys, rsx_commands)
  *
- * It loads the real EBOOT image, registers the lifted functions and the HLE
- * NID handlers, then dispatches the entry. Execution runs real Uncharted boot
- * code until it reaches a function outside the lifted subset (logged by the
- * unlifted stub), an unimplemented firmware import (logged by ps3_hle_call),
- * or an lv2 syscall (logged by lv2_syscall) -- telling us exactly what to
- * implement next.
+ * It loads the PPU ELF named on the command line, registers the lifted
+ * functions and the HLE NID handlers, starts the frame clock, then dispatches
+ * the entry OPD. Execution runs real guest code until it reaches a function
+ * outside the lifted subset (logged by the unlifted stub), an unimplemented
+ * firmware import (logged by ps3_hle_call), or an lv2 syscall (logged by
+ * lv2_syscall) -- telling us exactly what to implement next.
  *
- * This proves the integration builds + runs; a full-image build additionally
- * needs the lifter to split output into multiple TUs (88 MB single-file
- * otherwise).
+ * Nothing here is title-specific: the ELF path, the VFS root derived from it
+ * and the window title all come from the command line or the environment. Two
+ * things drive it today -- a game port, which supplies its own lifted
+ * ppu_recomp.c and its own HLE overrides, and the smoke title in
+ * tests/smoke/, which is the same harness with a synthetic program in it and
+ * is what proves this path runs at all on POSIX.
  */
 #include <stdarg.h>
 #include "ppu_recomp.h"
+#include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
 /* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
  * a generated ppu_recomp.h already declares. Ports generated before the
  * qualifier existed do not define it, so the scaffold must carry its own
@@ -43,10 +47,18 @@ extern "C" {
 uint32_t ppu_load_elf(const char* path);
 void     ppu_recomp_register(void);
 void     ppu_hle_init(void);
+uint32_t ps3_hle_count(void);   /* handlers actually registered, for the milestone log */
 void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
+/* The status a guest handed to sys_process_exit, published by
+ * libs/system/sysPrxForUser.c before it calls the host exit(). A title that
+ * exits that way never returns through ppu_run, so this is only read on the
+ * path where the guest fell out of its entry function instead. */
+extern int     g_sys_process_exit_called;
+extern int32_t g_sys_process_exit_code;
+void     cellGame_init_from_paramsfo(const char* sfo_path);  /* libs/system/cellGame.c */
 /* Optional hook: load real system PRX modules (libsre = cellSpurs/cellSync) into
  * guest RAM and register their exports. Weak default is a no-op; a title that
  * links a lifted PRX defines a strong version. Called after the lifted function
@@ -61,10 +73,95 @@ void     ps3_load_prx_modules(void) {}
 
 #ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>   /* _ReturnAddress */
 /* timeBeginPeriod: windows.h is included with WIN32_LEAN_AND_MEAN, which
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
 #include <timeapi.h>
+
+/* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
+ * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
+ * environment lock and scans every variable each time: profiled at ~30% of
+ * GH3's main PPU thread and ~35% of the RSX thread in gameplay. Defining the
+ * import slot here (an object in the link beats the import library's lazy
+ * definition) routes every dllimport'ed getenv call through this cache.
+ * Nothing in the runtime mutates the environment after startup, so a value is
+ * looked up once and the pointer stays valid forever. Reads are lock-free:
+ * a slot's key is published last, after its value.
+ * ponytail: 1024 open-addressed slots, fixed; names past that fall back to the OS lookup. */
+namespace {
+struct EnvSlot { const char* volatile key; const char* val; };
+EnvSlot  s_env[1024];
+SRWLOCK  s_env_lock = SRWLOCK_INIT;
+
+unsigned env_hash(const char* s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) h = (h ^ (unsigned char)(*s >= 'a' && *s <= 'z' ? *s - 32 : *s)) * 16777619u;
+    return h;
+}
+
+const char* env_lookup_os(const char* name)
+{
+    DWORD n = GetEnvironmentVariableA(name, NULL, 0);
+    if (!n) return NULL;
+    char* v = (char*)malloc(n);
+    if (!v || GetEnvironmentVariableA(name, v, n) >= n) { free(v); return NULL; }
+    return v;
+}
+
+char* __cdecl cached_getenv(const char* name)
+{
+    if (!name || !*name) return NULL;
+    const unsigned mask = 1023, h = env_hash(name);
+    for (unsigned i = h & mask, n = 0; n <= mask; n++, i = (i + 1) & mask) {
+        const char* k = s_env[i].key;
+        MemoryBarrier();
+        if (!k) break;
+        if (!_stricmp(k, name)) {
+            /* GETENV_STATS=1: which gate is being polled on a hot path. */
+            static int st = -1;
+            if (st < 0) st = env_lookup_os("GETENV_STATS") ? 1 : 0;
+            if (st) {
+                static unsigned cnt[1024]; static void* ra[1024]; static unsigned long long tot;
+                cnt[i]++; ra[i] = _ReturnAddress();
+                if ((++tot & ((1u << 22) - 1)) == 0) {
+                    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+                    for (int r = 0; r < 5; r++) {
+                        unsigned b = 0;
+                        for (unsigned j = 1; j <= mask; j++) if (cnt[j] > cnt[b]) b = j;
+                        if (!cnt[b]) break;
+                        fprintf(stderr, "[getenv-stats] %-28s %u calls  caller rva=0x%llX%c",
+                                s_env[b].key, cnt[b], (unsigned long long)((uintptr_t)ra[b] - exe), 10);
+                        cnt[b] = 0;
+                    }
+                    memset(cnt, 0, sizeof cnt);
+                }
+            }
+            return (char*)s_env[i].val;
+        }
+    }
+    AcquireSRWLockExclusive(&s_env_lock);
+    const char* val = NULL; int found = 0;
+    unsigned i = h & mask, n = 0;
+    for (; n <= mask; n++, i = (i + 1) & mask) {
+        if (!s_env[i].key) break;
+        if (!_stricmp(s_env[i].key, name)) { val = s_env[i].val; found = 1; break; }
+    }
+    if (!found) {
+        val = env_lookup_os(name);
+        if (n <= mask) {
+            s_env[i].val = val;
+            MemoryBarrier();
+            s_env[i].key = _strdup(name);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_env_lock);
+    return (char*)val;
+}
+}
+extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
+
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
@@ -155,6 +252,7 @@ static void derive_vfs_root(const char* eboot)
 extern "C" uint8_t* vm_base = nullptr;
 extern "C" uint32_t ppu_vm_size;   /* defined in ppu_loader.cpp (OOB guard) */
 extern "C" void lv2_init_syscalls(void);   /* runtime/syscalls/lv2_register.c */
+extern "C" void np_psnr_setup(const char* username, const char* server);  /* libs/network/np_psnr.c */
 
 /* Guest-callback dispatch + RSX vblank/flip driver.
  *
@@ -207,8 +305,94 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #  define rsx_backend_pump    rsx_null_backend_pump_messages
 #endif
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
 extern "C" unsigned cellGcm_flip_request_count(void);
+extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
 extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
+
+/* Live NV4097->D3D12 engine (libs/video/rsx_live_draw.c, from caner /
+ * canersaka's Yakuza: Dead Souls port). Opt-in with RSX_LIVE_DRAW=1: the null
+ * backend opens the window, the engine binds its swap chain to that HWND and
+ * owns presentation, so rsx_d3d12_backend is left out entirely rather than run
+ * alongside it. Unset, every path below is exactly what it was. */
+extern "C" int   rsx_live_draw_enabled(void);
+extern "C" int   rsx_live_draw_init(void* hwnd, uint32_t w, uint32_t h,
+                                    const uint8_t* (*guest_ptr)(void*, uint32_t,
+                                                                uint32_t, uint32_t),
+                                    void* user);
+extern "C" void  rsx_live_draw_present(uint32_t buffer_id);
+extern "C" uint32_t rsx_live_draw_get_frames(void);
+extern "C" uint32_t rsx_live_draw_get_last_draws(void);
+extern "C" int   rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" int   rsx_null_backend_pump_messages(void);
+extern "C" void* rsx_null_backend_get_hwnd(void);
+extern "C" void  rsx_null_backend_suppress_present(int on);
+extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
+extern "C" uint32_t cellGcmResolveIO(uint32_t offset);
+
+static int s_rsx_live = 0;   /* live engine selected AND up */
+
+/* Resolve (location, offset) to host memory for the engine. location 0 is RSX
+ * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
+ * min_bytes span is readable, so validate the interval, not just its start.
+ * The location comes straight from the RSX DMA context selector and is
+ * authoritative -- cellGcmResolveOffset()'s heuristic prefers VRAM for any page
+ * the guest ever derived from a local EA, which maps a title's MAIN-memory
+ * textures into local memory where they read as garbage (caner hit exactly
+ * that in the Yakuza port; the geometry came out flat white). */
+static const uint8_t* rsx_live_guest_ptr(void* user, uint32_t location,
+                                         uint32_t offset, uint32_t min_bytes)
+{
+    (void)user;
+    if (!vm_base) return nullptr;
+    uint32_t ea;
+    if (location == 0) {
+        ea = cellGcmResolveLocated(1, offset);          /* RSX local VRAM */
+    } else {
+        ea = cellGcmResolveIO(offset);                  /* main, via the IO table */
+        if (!ea) ea = cellGcmResolveLocated(0, offset); /* unmapped: old behaviour */
+    }
+    if (!ea || ea == 0xFFFFFFFFu ||
+        (uint64_t)ea + min_bytes > 0x100000000ull) return nullptr;
+    return (const uint8_t*)vm_base + ea;
+}
+
+/* Present / pump through whichever backend is live. */
+static void rsx_present_frame(void)
+{
+    /* Present the buffer the guest actually flipped to, not buffer 0.
+     *
+     * rsx_live_draw_present() looks up the surface registered for the display
+     * buffer it is given, so hardcoding 0 presented buffer 0's surface for
+     * EVERY flip. A double-buffered title flips 0,1,0,1..., so half its frames
+     * showed the previous image instead of the one just drawn -- content
+     * appearing and vanishing at ~30 Hz, and black wherever buffer 0 had not
+     * been drawn yet. The Simpsons Arcade Game flips 0,1 alternately and that
+     * is exactly what it looked like.
+     *
+     * cellGcmGetCurrentDisplayBufferId() is set by cellGcmSetFlipCommand,
+     * which the FIFO walker calls on this same thread before setting the
+     * pending flag we are responding to, so it is current here. */
+    if (s_rsx_live) rsx_live_draw_present(cellGcmGetCurrentDisplayBufferId());
+    else            rsx_backend_present();   /* platform backend: D3D12 / Metal / null */
+}
+static int rsx_pump_messages(void)
+{ return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump(); }
+
+/* Frames handed to the backend at a guest FLIP boundary -- one per frame the
+ * guest actually finished, which is the number a port means by "is anything
+ * reaching the screen". The presents the ticker makes before the guest's first
+ * flip (so a fresh window is not left white through a long boot) are
+ * deliberately not counted: they carry no guest frame. */
+static volatile LONG g_frames_presented = 0;
+extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
+static void present_guest_frame(void)
+{
+    rsx_present_frame();
+    /* The ticker increments, a guest thread reads: interlocked rather than a
+     * volatile ++, which is neither atomic nor a fence on arm64. */
+    InterlockedIncrement(&g_frames_presented);
+}
 
 /* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
  * Samples every guest thread's ctx.cia every ~5ms and dumps the top sites
@@ -260,11 +444,40 @@ static DWORD WINAPI guest_prof_thread(LPVOID)
     }
 }
 
+extern "C" const char* cellGame_get_title(void);   /* PARAM.SFO TITLE, for the caption */
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
+    /* Window caption: $PS3_TITLE wins, else the TITLE field PARAM.SFO already
+     * gave cellGame, else a neutral name. It used to fall back to a specific
+     * other title, so every port announced itself as that game. */
     const char* _title = getenv("PS3_TITLE");
-    if (!_title || !*_title) _title = "You Don't Know Jack (ps3recomp)";
-    int rsx_ok = (rsx_backend_init(1280, 720, _title) == 0);
+    if (!_title || !*_title) {
+        const char* sfo = cellGame_get_title();
+        if (sfo && *sfo && strcmp(sfo, "Unknown Title") != 0) _title = sfo;
+    }
+    if (!_title || !*_title) _title = "ps3recomp";
+    /* The live engine's RT-as-backbuffer rescue only treats a surface as the
+     * backbuffer when its clip EQUALS the backend size, so a title that renders
+     * into something other than 1280x720 must say so: RSX_W / RSX_H. */
+    uint32_t rsx_w = 1280, rsx_h = 720;
+    if (const char* e = getenv("RSX_W")) rsx_w = (uint32_t)strtoul(e, 0, 0);
+    if (const char* e = getenv("RSX_H")) rsx_h = (uint32_t)strtoul(e, 0, 0);
+    int rsx_ok;
+    if (rsx_live_draw_enabled()) {
+        rsx_ok = (rsx_null_backend_init(rsx_w, rsx_h, _title) == 0);
+        if (rsx_ok && rsx_live_draw_init(rsx_null_backend_get_hwnd(), rsx_w, rsx_h,
+                                         rsx_live_guest_ptr, nullptr) == 0) {
+            s_rsx_live = 1;
+            rsx_null_backend_suppress_present(1);
+            fprintf(stderr, "[rsx] live-draw engine up (D3D12); GDI present suppressed\n");
+        } else {
+            fprintf(stderr, "[rsx] live-draw init FAILED -- falling back to the D3D12 backend\n");
+            rsx_ok = (rsx_backend_init(rsx_w, rsx_h, _title) == 0);
+        }
+    } else {
+        rsx_ok = (rsx_backend_init(rsx_w, rsx_h, _title) == 0);
+    }
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
     unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
@@ -274,7 +487,12 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * and catch up in a bounded burst so present latency never slows the game. */
     ULONGLONG next_tick = GetTickCount64();
     for (;;) {
-        Sleep(4);
+        /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
+         * fence queue, and had no waiter -- so a guest starved for `get` or a
+         * fence still paid the whole tick. Waiting on it keeps the same 4 ms
+         * ceiling when nothing kicks, and drains on demand when something
+         * does. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
@@ -287,7 +505,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * writes and showed empty or mixed batches. */
             {
                 if (rsx_ok && cellGcm_take_flip_pending()) {
-                    rsx_backend_present();
+                    present_guest_frame();
                     last_flip = cellGcm_flip_request_count();
                 }
             }
@@ -306,7 +524,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * The real RSX writes those fences in microseconds. */
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
-                rsx_backend_present();
+                present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
             cellGcm_rsx_process_fifo();
@@ -320,11 +538,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_backend_pump() != 0) { rsx_ok = 0; }
+            if (rsx_pump_messages() != 0) { rsx_ok = 0; }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
-                ULONGLONG t0=GetTickCount64(); rsx_backend_present(); ULONGLONG t1=GetTickCount64();
+                ULONGLONG t0=GetTickCount64(); rsx_present_frame(); ULONGLONG t1=GetTickCount64();
                 s_presms += (t1-t0);
                 if (s_win==0) s_win=now;
                 if (now - s_win >= 1000) {
@@ -341,8 +559,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                  * during boot. */
                 unsigned fc = cellGcm_flip_request_count();
                 if (fc != last_flip || fc == 0) {
-                    rsx_backend_present();
+                    if (fc) present_guest_frame(); else rsx_present_frame();
                     last_flip = fc;
+                } else if (fc == 0) {
+                    rsx_backend_present();
                 }
             }
         }
@@ -371,11 +591,41 @@ extern "C" const char* g_last_hle_name;
 /* Defined with the debug console below; writes to stderr and, when the
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
+/* While dump_threads holds a thread suspended, dbg_printf formats into this
+ * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
+ * and writing then deadlocks the watchdog -- and with it every thread that
+ * logs. GH3 froze solid (0% CPU, log silent mid-boot) exactly that way. */
+static __declspec(thread) char   s_dbg_capbuf[16384];
+static __declspec(thread) char*  s_dbg_cap = NULL;
+static __declspec(thread) size_t s_dbg_capn = 0;
+
+extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+
+    /* Which HLE each guest thread is INSIDE right now.
+     *
+     * ppu_hle.cpp has maintained this array for a while and nothing ever read
+     * it. It is the only way to see a thread parked in an HLE wait:
+     * sys_lwmutex_lock and sys_lwcond_wait are sysPrxForUser handlers, not lv2
+     * syscalls, so PS3_SCBLOCK_PROF cannot see them block, the usleep
+     * histogram cannot see them (they do not usleep), and the sampler just
+     * reports ntdll. A thread stuck and invisible to all three is exactly the
+     * case this answers. */
+    { int any = 0;
+      for (unsigned t = 0; t < 64u; t++) {
+          const char* n = g_hle_inflight[t];
+          if (!n) continue;
+          if (!any) { dbg_printf("[WATCHDOG] guest threads inside an HLE:\n"); any = 1; }
+          dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
+      }
+      if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
+    dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
+    ppu_report_guest_lrs();
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -385,6 +635,7 @@ static void dump_threads(const char* label, HMODULE self)
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
+            s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
             SuspendThread(th);
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
             if (GetThreadContext(th, &ctx)) {
@@ -425,9 +676,9 @@ static void dump_threads(const char* label, HMODULE self)
                                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
-                    if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;
+                    if (maxk > 0x200000 / 8) maxk = 0x200000 / 8;   /* lifted SPU frames are big */
                     int found = 0;
-                    for (int k = 0; k < maxk && found < 20; k++) {
+                    for (int k = 0; k < maxk && found < 40; k++) {
                         uint64_t v = sp[k];
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;
@@ -472,6 +723,8 @@ static void dump_threads(const char* label, HMODULE self)
                 }
             }
             ResumeThread(th);
+            s_dbg_cap = NULL;
+            if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
             CloseHandle(th);
         } while (Thread32Next(snap, &te));
     }
@@ -506,6 +759,13 @@ static void dbg_printf(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+    if (s_dbg_cap) {             /* a thread is suspended: format only, no stream lock */
+        int n = vsnprintf(s_dbg_cap + s_dbg_capn, sizeof s_dbg_capbuf - s_dbg_capn, fmt, ap);
+        if (n > 0) s_dbg_capn += (size_t)n;
+        if (s_dbg_capn >= sizeof s_dbg_capbuf) s_dbg_capn = sizeof s_dbg_capbuf - 1;
+        va_end(ap);
+        return;
+    }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -556,6 +816,80 @@ static void dbg_knobs(const char* prefix)
     dbg_printf("  (%d set; docs/DIAGNOSTICS.md lists all of them)%c", n, 10);
 }
 
+/* "prof <host-tid> [sec]": sample ONE thread at ~1 kHz and unwind it through
+ * .pdata (exact, unlike dump_threads' stack scan), then print the hottest
+ * functions exclusive (leaf) and inclusive (anywhere on the stack), keyed by
+ * function start. exe entries print as rva=; resolve against the link map.
+ * Only lock-free work happens while the thread is suspended.
+ * ponytail: fixed 4096-slot tables; a thread touching more functions drops the rest. */
+#define PROF_SLOTS 4096
+static uint64_t s_prof_key[3][PROF_SLOTS];
+static uint32_t s_prof_ct[3][PROF_SLOTS];
+static void prof_hit(int tab, uint64_t key)
+{
+    for (uint32_t i = (uint32_t)((key >> 4) * 2654435761u) % PROF_SLOTS, n = 0; n < PROF_SLOTS;
+         n++, i = (i + 1) % PROF_SLOTS) {
+        if (s_prof_key[tab][i] == key) { s_prof_ct[tab][i]++; return; }
+        if (!s_prof_key[tab][i]) { s_prof_key[tab][i] = key; s_prof_ct[tab][i] = 1; return; }
+    }
+}
+static void dbg_prof(DWORD tid, unsigned sec)
+{
+    /* Suspending ourselves never resumes: the console would hang for good. */
+    if (tid == GetCurrentThreadId()) { dbg_printf("  tid %lu is the console%c", (unsigned long)tid, 10); return; }
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) { dbg_printf("  cannot open tid %lu%c", (unsigned long)tid, 10); return; }
+    memset(s_prof_key, 0, sizeof s_prof_key); memset(s_prof_ct, 0, sizeof s_prof_ct);
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+    unsigned samples = 0;
+    const ULONGLONG end = GetTickCount64() + sec * 1000ull;
+    while (GetTickCount64() < end) {
+        if (SuspendThread(h) == (DWORD)-1) break;
+        CONTEXT c; c.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(h, &c)) {
+            samples++;
+            uint64_t seen[24]; int ns = 0, got = 0;
+            for (int d = 0; d < 24 && c.Rip; d++) {
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+                uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
+                if (d == 0) prof_hit(0, key);
+                /* first exe frame of a sample whose leaf is in a DLL: who called out */
+                if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
+                int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
+                if (!dup) { seen[ns++] = key; prof_hit(1, key); }
+                if (!rf) break;                       /* leaf without unwind data: stop */
+                void* hd; DWORD64 ef;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
+            }
+        }
+        ResumeThread(h);
+        Sleep(1);
+    }
+    CloseHandle(h);
+    dbg_printf("  prof tid %lu: %u samples over %us%c", (unsigned long)tid, samples, sec, 10);
+    for (int tab = 0; tab < 3; tab++) {
+        static const char* tn[3] = { "exclusive", "inclusive", "exe caller of DLL leaf" };
+        dbg_printf("  --- %s ---%c", tn[tab], 10);
+        for (int rank = 0; rank < 40; rank++) {
+            uint32_t best = 0; int bi = -1;
+            for (int k = 0; k < PROF_SLOTS; k++) if (s_prof_ct[tab][k] > best) { best = s_prof_ct[tab][k]; bi = k; }
+            if (bi < 0) break;
+            uint64_t key = s_prof_key[tab][bi];
+            HMODULE m = NULL; char path[MAX_PATH] = "?";
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)key, &m);
+            if (m) GetModuleFileNameA(m, path, sizeof path);
+            const char* b = strrchr(path, 92); b = b ? b + 1 : path;
+            if ((uintptr_t)m == exe) dbg_printf("  %5.1f%%  rva=0x%llX%c", 100.0 * best / (samples ? samples : 1),
+                                                (unsigned long long)(key - exe), 10);
+            else dbg_printf("  %5.1f%%  %s+0x%llX%c", 100.0 * best / (samples ? samples : 1), b,
+                            (unsigned long long)(key - (uintptr_t)m), 10);
+            s_prof_ct[tab][bi] = 0;
+        }
+    }
+}
+
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -590,6 +924,7 @@ static DWORD WINAPI debug_console(LPVOID param)
 
         if (!strcmp(verb, "help")) {
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
+            dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
@@ -597,6 +932,49 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
         } else if (!strcmp(verb, "threads")) {
             dump_threads("console", self);
+        } else if (!strcmp(verb, "find32") && sscanf(cmd, "%*s %x", &a) == 1) {
+            /* find32 <hex>: every aligned big-endian u32 equal to <hex> in committed
+             * guest memory below 0xC0000000 (first 4096 hits). */
+            const uint32_t be = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
+            int hits = 0;
+            for (uintptr_t p = 0; p < 0xC0000000u && hits < 4096 && vm_base; ) {
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
+                const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
+                if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                    for (uintptr_t q = p & ~3u; q + 4 <= end && q < 0xC0000000u && hits < 4096; q += 4)
+                        if (*(const uint32_t*)(vm_base + q) == be) { dbg_printf("  0x%08X%c", (unsigned)q, 10); hits++; }
+                p = end;
+            }
+            dbg_printf("  %d hit(s)%c", hits, 10);
+        } else if (!strcmp(verb, "qbset") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
+            /* qbset <name-crc> <value>: set every integer QB struct member with
+             * that name. A member is 16 bytes: xx 01|81 00 00 | name | value | next,
+             * big-endian (GH3: bot_play, unlocked). Prints how many it set. */
+            const uint32_t be_name = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
+            const uint32_t be_val  = ((b & 0xFF) << 24) | ((b & 0xFF00) << 8) | ((b >> 8) & 0xFF00) | (b >> 24);
+            unsigned n = 0;
+            for (uintptr_t p = 0; p < 0xC0000000u && vm_base; ) {
+                MEMORY_BASIC_INFORMATION mi;
+                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
+                const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
+                if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+                    for (uintptr_t q = (p + 4) & ~3u; q + 8 <= end; q += 4)
+                        if (*(const uint32_t*)(vm_base + q) == be_name) {
+                            /* type word: any flags byte, then 0x01 or 0x81 (integer), 00 00;
+                             * only 0/1 values change -- an unlocked tag is a flag. */
+                            const uint8_t* t = vm_base + q - 4;
+                            const uint32_t v = *(const uint32_t*)(vm_base + q + 4);
+                            if ((t[1] == 0x01 || t[1] == 0x81) && !t[2] && !t[3] &&
+                                (v == 0 || v == 0x01000000u)) {
+                                *(uint32_t*)(vm_base + q + 4) = be_val; n++;
+                            }
+                        }
+                p = end;
+            }
+            dbg_printf("  qbset 0x%08X = %u: %u member(s)%c", a, b, n, 10);
+        } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
+            dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "hle")) {
             dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
                        g_last_hle_name ? g_last_hle_name : "", 10);
@@ -634,10 +1012,17 @@ static DWORD WINAPI hang_watchdog(LPVOID)
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)&hang_watchdog, &self);
-    Sleep(8000);
-    dump_threads("8s sample", self);
-    Sleep(7000);
-    dump_threads("15s sample", self);
+    /* ponytail: two fixed samples cover a boot wedge, but a hang that happens
+     * minutes in (e.g. after a level load) needs them moved. WATCHDOG_AT="a,b"
+     * gives the two sample times in seconds. */
+    int t1 = 8, t2 = 15;
+    { const char* e = getenv("WATCHDOG_AT"); int a = 0, b = 0;
+      if (e && sscanf(e, "%d,%d", &a, &b) == 2 && a > 0 && b > a) { t1 = a; t2 = b; } }
+    char lbl[64];
+    Sleep((DWORD)t1 * 1000);
+    snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
+    Sleep((DWORD)(t2 - t1) * 1000);
+    snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
     return 0;
 }
 #endif
@@ -700,7 +1085,24 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) { printf("usage: %s <EBOOT.elf>\n", argv[0]); return 2; }
+    /* <PPU ELF> [--username NAME] [--psnr host[:port]], flags in any order. */
+    const char* elf = NULL;
+    const char* username = NULL;
+    const char* psnr = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        const char** flag = !strncmp(a, "--username", 10) ? &username
+                          : !strncmp(a, "--psnr", 6)      ? &psnr : NULL;
+        if (!flag) { if (!elf) elf = a; continue; }
+        const char* eq = strchr(a, '=');
+        if (eq) *flag = eq + 1;
+        else if (i + 1 < argc) *flag = argv[++i];
+    }
+    if (!elf) {
+        printf("usage: %s <PPU ELF> [--username NAME] [--psnr host[:port]]\n", argv[0]);
+        return 2;
+    }
+    np_psnr_setup(username, psnr);
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -742,11 +1144,43 @@ int main(int argc, char** argv)
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 
-    uint32_t entry = ppu_load_elf(argv[1]);
+    uint32_t entry = ppu_load_elf(elf);
     if (!entry) { printf("load failed\n"); return 1; }
 
-    derive_vfs_root(argv[1]);
+    derive_vfs_root(elf);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
+
+    /* Real title id, from the game's own PARAM.SFO. cellGame has been able to
+     * read this since 2026-06-21, but only a title's own main() ever called it,
+     * so every port that moved to this harness silently kept the BLES00000
+     * placeholder -- and that id is what cellGame / cellSaveData / trophy build
+     * their /dev_hdd0/game/<id> paths from, so saves landed in a directory
+     * belonging to no title. Same shape as the live-draw engine before 1a050be:
+     * a working facility with no caller in the shared harness. */
+    {
+        /* PARAM.SFO sits in a different place depending on how the VFS is rooted.
+         * A disc-style root has it under PS3_GAME/; a title whose content is
+         * opened by RELATIVE path needs the root AT USRDIR, and then PARAM.SFO is
+         * one level up instead. Only the first layout was tried, so rooting at
+         * USRDIR silently lost the title id and name -- which is how the window
+         * caption ended up on its hardcoded fallback. Try each and take the
+         * first that exists. */
+        static const char* const kSfoLayouts[] = {
+            "%s/PS3_GAME/PARAM.SFO",   /* vfs root = disc root      */
+            "%s/../PARAM.SFO",         /* vfs root = .../USRDIR     */
+            "%s/PARAM.SFO",            /* vfs root = the game dir   */
+        };
+        char sfo[1100];
+        int found = 0;
+        for (size_t i = 0; i < sizeof kSfoLayouts / sizeof kSfoLayouts[0]; i++) {
+            snprintf(sfo, sizeof sfo, kSfoLayouts[i], ppu_vfs_root);
+            FILE* f = fopen(sfo, "rb");
+            if (f) { fclose(f); found = 1; break; }
+        }
+        if (!found)
+            snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+        cellGame_init_from_paramsfo(sfo);
+    }
 
     fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
     ppu_recomp_register();   /* lifted function table -> address map */
@@ -758,6 +1192,13 @@ int main(int argc, char** argv)
     ppu_fs_register();       /* cellFs VFS over the real game directory */
     fprintf(stderr,"[boot-dbg] before lv2_init_syscalls\n"); fflush(stderr);
     lv2_init_syscalls();     /* real lv2 syscall table (semaphore/memory/fs/...) */
+
+    /* Two scalars that make a milestone diff interpretable: a lift that found
+     * fewer functions, or a build that registered fewer HLE handlers, explains
+     * a whole run going missing without anyone having to bisect the stream. */
+    ps3_ms_kv("load:functions", (long long)function_table_count);
+    ps3_ms_kv("load:hle_registered", (long long)ps3_hle_count());
+    ps3_ms("boot:init_done");
     fprintf(stderr,"[boot-dbg] after lv2_init_syscalls\n"); fflush(stderr);
 
     /* Install the guest-callback hook and start the synthetic RSX vblank driver
@@ -779,11 +1220,35 @@ int main(int argc, char** argv)
                        CreateThread(NULL, 0, debug_console, dbgpath, 0, NULL); } }   /* tlhelp32-based */
 #endif
 
-    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
+    ps3_ms("boot:entry");
+#ifdef _WIN32
+    { extern void ps3_sampler_start(void); ps3_sampler_start(); } /* PS3_SAMPLE=<ms> */
+#endif
+    /* PS3_MAIN_STACK_LV2=1: give the main thread its stack where lv2 does, in
+     * the 0xD0000000 stack region (the first allocation there, which is also
+     * what sys_ppu_thread_get_stack_information already reports for it).
+     * Guest code can tell: Tornado Outbreak's SPU memcpy (func_000D60E0) copies
+     * on the PPU when the destination shares the stack's top nibble, then waits
+     * for an SPU reply only the SPU path sends -- with the stack at 0x0FF00000,
+     * every low address "is on the stack" and the boot hangs. Opt-in until the
+     * regression gate has run with it on. */
+    uint32_t stack_top = STACK_TOP;
+    { const char* ms = getenv("PS3_MAIN_STACK_LV2");
+      if (ms && *ms && *ms != '0') {
+          uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE);
+          if (base) stack_top = base + VM_PPU_STACK_SIZE;
+      } }
+    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, stack_top);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
-    int rc = ppu_run(entry, STACK_TOP);
+    int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
-    return 0;
+    /* A guest that called sys_process_exit never reaches this line: that path
+     * ends in the host exit(). Getting here means the entry function returned
+     * instead, so hand back the status the guest published if it published one
+     * -- returning a hardcoded 0 reported success for a run that never got
+     * anywhere, which is exactly the kind of green a boot harness must not
+     * produce. */
+    return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
 }

@@ -98,6 +98,8 @@ s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);
  * -----------------------------------------------------------------------*/
 
 s32 _sys_printf(const char* fmt, ...);
+/* NID 0x9FB6228E -- the abort half of the SDK internal assertion macro. */
+s32 _sys_trap_process(const char* msg);
 s32 _sys_sprintf(char* buf, const char* fmt, ...);
 s32 _sys_snprintf(char* buf, u32 size, const char* fmt, ...);
 s32 _sys_strlen(const char* str);
@@ -146,6 +148,20 @@ s32 sys_heap_destroy_heap(sys_heap_t heap);
 void* sys_heap_malloc(sys_heap_t heap, u32 size);
 s32 sys_heap_free(sys_heap_t heap, void* ptr);
 void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
+
+/* The underscore-prefixed names titles import; forwarders to the above. */
+u32   sys_heap_create_heap_ret(u32 name, u32 type, u32 blocksize, u32 flags);
+u32   _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags);
+s32   _sys_heap_delete_heap(sys_heap_t heap);
+/* The plain libc allocator (not the sys_heap_* family below). */
+void* _sys_malloc(u32 size);
+void* _sys_memalign(u32 align, u32 size);
+s32   _sys_free(void* ptr);
+void* _sys_realloc(void* ptr, u32 size);
+
+void* _sys_heap_malloc(sys_heap_t heap, u32 size);
+void* _sys_heap_memalign(sys_heap_t heap, u32 align, u32 size);
+s32   _sys_heap_free(sys_heap_t heap, void* ptr);
 
 /* ---------------------------------------------------------------------------
  * PRX utilities

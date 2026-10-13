@@ -52,6 +52,11 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
  * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
 
+/* The VP slot the next program decompiled starts at (NV4097 transform
+ * program start). Branch targets are absolute slots; this makes them relative
+ * to the ucode pointer handed in. Defaults to 0. */
+void rsx_vp_set_branch_base(u32 start_slot);
+
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
  * Unmasked units retain the defined-zero fallback. */

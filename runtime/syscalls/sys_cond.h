@@ -25,17 +25,24 @@
 extern "C" {
 #endif
 
-#define SYS_COND_MAX  8192   /* pairs 1:1 with mutexes; raise alongside SYS_MUTEX_MAX */
+/* Sized with SYS_MUTEX_MAX: every cond is created against a mutex, and a
+ * title that outgrew 256 mutexes (Resistance: Fall of Man) had cond IDs past
+ * 130 by then. ~100 bytes a slot. */
+#define SYS_COND_MAX  8192
 
 typedef struct sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
     char     name[8];
+    int      initialized;
+    struct sys_cond_waiter* waiters;
 
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
+    CRITICAL_SECTION signal_lock;
 #else
     pthread_cond_t     cv;
+    pthread_mutex_t    signal_lock;
 #endif
 
 } sys_cond_info;
@@ -48,6 +55,7 @@ int64_t sys_cond_destroy(ppu_context* ctx);
 int64_t sys_cond_wait(ppu_context* ctx);
 int64_t sys_cond_signal(ppu_context* ctx);
 int64_t sys_cond_signal_all(ppu_context* ctx);
+int64_t sys_cond_signal_to(ppu_context* ctx);
 
 /* Registration */
 void sys_cond_init(lv2_syscall_table* tbl);

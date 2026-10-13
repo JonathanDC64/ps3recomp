@@ -131,6 +131,50 @@ static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
     emit(b, line);
 }
 
+/* ---- flow control -------------------------------------------------------- */
+#define RSX_VP_MAX_INSTR 512
+
+static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
+void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
+
+/* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
+static int vp_is_flow(u32 sca_op)
+{
+    return sca_op == 0x08 || sca_op == 0x09 || sca_op == 0x0A || sca_op == 0x0B ||
+           sca_op == 0x0C || sca_op == 0x11 || sca_op == 0x12;
+}
+
+/* Branch target (NV40 layout, RPCS3 as oracle): D0[23] << 9 | D2[0:5] << 3 |
+ * D3[29:31], an absolute VP slot; made relative to the program start. */
+static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
+{
+    const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
+    return t >= s_vp_branch_base ? t - s_vp_branch_base : t;
+}
+
+/* Condition-code state for one instruction (D0). The NV40 VP has two CC
+ * registers; a write under cond-test lands only in the components whose
+ * CC component (through the D0 CC swizzle) compares true against zero.
+ * cond: 0 = never, 1 LT, 2 EQ, 3 LE, 4 GT, 5 NE, 6 GE, 7 = always. */
+typedef struct { int test; u32 cond, sel; char swz[4]; } CondCtx;
+
+/* Emit the store, predicated per component when a cond test is active. */
+static void emit_store_cc(Out* b, const char* dst_fmt, u32 idx, const char* m, const CondCtx* cc)
+{
+    if (!cc->test) { emit_store(b, dst_fmt, idx, m); return; }
+    if (cc->cond == 0) return;                      /* FL: never writes */
+    static const char* cmp[8] = { 0, "<", "==", "<=", ">", "!=", ">=", 0 };
+    char dst[32];
+    snprintf(dst, sizeof(dst), dst_fmt, idx);
+    for (const char* c = m; *c; c++) {
+        const int ci = (*c == 'x') ? 0 : (*c == 'y') ? 1 : (*c == 'z') ? 2 : 3;
+        char line[160];
+        snprintf(line, sizeof(line), "        if (cc[%u].%c %s 0.0) %s.%c = _v.%c;\n",
+                 cc->sel, cc->swz[ci], cmp[cc->cond], dst, *c, *c);
+        emit(b, line);
+    }
+}
+
 static u32 vec_source_use(u32 op, int* exact)
 {
     switch (op) {
@@ -263,10 +307,54 @@ static int rsx_vp_decompile_impl(
 
     int n_cond_skipped = 0, n_flow_skipped = 0;
 
+    /* Flow control (BRI/CAL/CLI/RET...). It carries no write mask, so it was
+     * dropped and every block ran straight through: a lit shader that
+     * branches around its lighting when lighting is off (@20 -> 134 on
+     * cc.y == 0 in Tornado Outbreak's UI/particle shader) zeroed its colour
+     * and summed no lights -- black text, black smoke, black leaves.
+     *
+     * A branching program is emitted as a block state machine: leaders are
+     * the entry, every branch target and the instruction after every branch;
+     * each block is "if (_pc == N) { ... _pc = next-or-target; }" inside a
+     * bounded loop, with a small call stack for CAL/RET. Branch-free programs
+     * are emitted exactly as before. Targets are VP slot addresses; the slot
+     * the program starts at comes from rsx_vp_set_branch_base(). */
+    static u8 leader[RSX_VP_MAX_INSTR + 1];
+    memset(leader, 0, sizeof leader);
+    int has_flow = 0;
+    {
+        u32 o2 = 0; int k = 0;
+        while (o2 + 16 <= max_bytes && k < RSX_VP_MAX_INSTR) {
+            const u32 e0 = rd_le(ucode + o2), e1 = rd_le(ucode + o2 + 4);
+            const u32 e2 = rd_le(ucode + o2 + 8), e3 = rd_le(ucode + o2 + 12);
+            const u32 so = (e1 >> 27) & 0x1F;
+            if (vp_is_flow(so)) {
+                has_flow = 1;
+                const u32 t = vp_branch_target(e0, e2, e3);
+                if (t < RSX_VP_MAX_INSTR) leader[t] = 1;
+                leader[k + 1] = 1;
+            }
+            k++; o2 += 16;
+            if (e3 & 1u) break;
+        }
+        leader[0] = 1;
+    }
+    int block_open = 0;
+
     u32 off = 0; int instrs = 0;
     while (off + 16 <= max_bytes) {
         u32 d0 = rd_le(ucode+off+0), d1 = rd_le(ucode+off+4);
         u32 d2 = rd_le(ucode+off+8), d3 = rd_le(ucode+off+12);
+        if (has_flow && instrs < RSX_VP_MAX_INSTR && leader[instrs]) {
+            char line[64];
+            if (block_open) {
+                snprintf(line, sizeof line, "        _pc = %d;\n    }\n", instrs);
+                emit(&b, line);
+            }
+            snprintf(line, sizeof line, "    if (_pc == %d) {\n", instrs);
+            emit(&b, line);
+            block_open = 1;
+        }
         off += 16; instrs++;
 
         u32 vec_op = (d1 >> 22) & 0x1F;
@@ -299,13 +387,18 @@ static int rsx_vp_decompile_impl(
         int vmx=(d3>>16)&1, vmy=(d3>>15)&1, vmz=(d3>>14)&1, vmw=(d3>>13)&1;
         int smx=(d3>>20)&1, smy=(d3>>19)&1, smz=(d3>>18)&1, smw=(d3>>17)&1;
 
-        /* Condition-code tests are not modeled (no CC register file yet):
-         * cond==7 (always) and cond_test disabled execute normally, anything
-         * else is emitted unconditionally with a marker. */
-        if (cond_test && cond != 7) {
-            n_cond_skipped++;
-            emit(&b, "    /* WARNING: cond-test on next op not modeled */\n");
-        }
+        /* Condition codes (D0: CC swizzle [2:9], cond [10:12], test [13],
+         * update-enable [14] and [29], CC register select [25]). They were
+         * not modeled: every predicated write ran unconditionally and every
+         * CC-only write was dropped. Tornado Outbreak's UI shader replaces
+         * the vertex colour with a material constant under a CC test, so its
+         * text took that constant's alpha of 0 and the alpha test discarded
+         * every glyph. */
+        CondCtx cc = { cond_test && cond != 7, cond, (d0 >> 25) & 1, {0} };
+        cc.swz[0] = SWZ[(d0 >> 8) & 3]; cc.swz[1] = SWZ[(d0 >> 6) & 3];
+        cc.swz[2] = SWZ[(d0 >> 4) & 3]; cc.swz[3] = SWZ[(d0 >> 2) & 3];
+        const int cc_update = ((d0 >> 14) & 1) && ((d0 >> 29) & 1);
+        if (cc.test) n_cond_skipped++;
 
         /* ---- vector ALU ---- */
         if ((vmx|vmy|vmz|vmw) && vec_op != 0x00) {
@@ -313,12 +406,12 @@ static int rsx_vp_decompile_impl(
             int handled = 1;
             switch (vec_op) {
             case 0x01: snprintf(rhs,sizeof rhs,"%s",A); break;                 /* MOV */
-            case 0x02: snprintf(rhs,sizeof rhs,"(%s)*(%s)",A,B); break;        /* MUL */
+            case 0x02: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))",A,B); break;  /* MUL */
             case 0x03: snprintf(rhs,sizeof rhs,"(%s)+(%s)",A,C); break;        /* ADD: src0 + src2 */
-            case 0x04: snprintf(rhs,sizeof rhs,"(%s)*(%s)+(%s)",A,B,C); break; /* MAD */
-            case 0x05: snprintf(rhs,sizeof rhs,"dot((%s).xyz,(%s).xyz)",A,B); break; /* DP3 */
-            case 0x06: snprintf(rhs,sizeof rhs,"(dot((%s).xyz,(%s).xyz)+(%s).w)",A,B,B); break; /* DPH */
-            case 0x07: snprintf(rhs,sizeof rhs,"dot((%s),(%s))",A,B); break; /* DP4 */
+            case 0x04: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))+(%s)",A,B,C); break; /* MAD */
+            case 0x05: snprintf(rhs,sizeof rhs,"vp_dot3((%s),(%s))",A,B); break; /* DP3 */
+            case 0x06: snprintf(rhs,sizeof rhs,"(vp_dot3((%s),(%s))+(%s).w)",A,B,B); break; /* DPH */
+            case 0x07: snprintf(rhs,sizeof rhs,"vp_dot4((%s),(%s))",A,B); break; /* DP4 */
             case 0x08: snprintf(rhs,sizeof rhs,"float4(1,(%s).y*(%s).y,(%s).z,(%s).w)",A,B,A,B); break; /* DST */
             case 0x09: snprintf(rhs,sizeof rhs,"min((%s),(%s))",A,B); break;   /* MIN */
             case 0x0A: snprintf(rhs,sizeof rhs,"max((%s),(%s))",A,B); break;   /* MAX */
@@ -368,15 +461,51 @@ static int rsx_vp_decompile_impl(
                          rhs, saturate ? " _v = saturate(_v);" : "");
                 emit(&b, line);
                 if (vec_result && dst_out != 0x1F)
-                    emit_store(&b, "o[%u]", dst_out & 15, m);
+                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
                 if (dst_tmp != 0x3F)
-                    emit_store(&b, "r[%u]", dst_tmp & 31, m);
-                if (!vec_result && dst_tmp == 0x3F)
-                    emit(&b, "        /* TODO: CC-only write not modeled */\n");
+                    emit_store_cc(&b, "r[%u]", dst_tmp & 31, m, &cc);
+                if (cc_update)
+                    emit_store_cc(&b, "cc[%u]", cc.sel, m, &cc);
                 emit(&b, "    }\n");
             }
         }
 
+        /* Flow control has no write mask, so the ALU path below skips it
+         * silently. Mark it, with the decoded target, so a dump shows where a
+         * program branches. */
+        char flow_term[256] = "";
+        if (vp_is_flow(sca_op)) {
+            const u32 tgt = vp_branch_target(d0, d2, d3);
+            char line[160];
+            snprintf(line, sizeof line, "    /* FLOW %s @%d -> %u cond=%u test=%d swz=%c%c%c%c */\n",
+                     rsx_vp_sca_name(sca_op), instrs - 1, tgt, cond, cond_test,
+                     SWZ[(d0 >> 8) & 3], SWZ[(d0 >> 6) & 3], SWZ[(d0 >> 4) & 3], SWZ[(d0 >> 2) & 3]);
+            emit(&b, line);
+            /* The condition applies whether or not cond_test is set: every
+             * branch in these programs has test=0 with a real cond. */
+            static const char* cmp[8] = { 0, "<", "==", "<=", ">", "!=", ">=", 0 };
+            char c[48];
+            if (cond == 7)      snprintf(c, sizeof c, "true");
+            else if (cond == 0) snprintf(c, sizeof c, "false");
+            else snprintf(c, sizeof c, "(cc[%u].%c %s 0.0)", (d0 >> 25) & 1,
+                          SWZ[(d0 >> 8) & 3], cmp[cond]);
+            const int next = instrs;
+            if (sca_op == 0x09 || sca_op == 0x08)          /* BRI, BRA */
+                snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %d;\n", c, tgt, next);
+            else if (sca_op == 0x0A || sca_op == 0x0B)     /* CAL, CLI */
+                snprintf(flow_term, sizeof flow_term,
+                         "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d;\n",
+                         c, next, tgt, next);
+            else if (sca_op == 0x0C)                       /* RET */
+                snprintf(flow_term, sizeof flow_term,
+                         "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
+                         c, next);
+            else {                                         /* BRB/CLB: boolean-register branches */
+                n_flow_skipped++;
+                snprintf(flow_term, sizeof flow_term,
+                         "        _pc = %d; /* TODO: %s not modelled */\n", next, rsx_vp_sca_name(sca_op));
+            }
+        }
         /* ---- scalar ALU (reads SRC2) ---- */
         if ((smx|smy|smz|smw) && sca_op != 0x00) {
             char rhs[256];
@@ -412,15 +541,21 @@ static int rsx_vp_decompile_impl(
                 /* SCA writes the output register when the VEC unit does not
                  * own it; otherwise it targets its own temp. */
                 if (!vec_result && dst_out != 0x1F)
-                    emit_store(&b, "o[%u]", dst_out & 15, m);
+                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
                 if (sca_dst_tmp != 0x3F)
-                    emit_store(&b, "r[%u]", sca_dst_tmp & 31, m);
+                    emit_store_cc(&b, "r[%u]", sca_dst_tmp & 31, m, &cc);
                 emit(&b, "    }\n");
             }
         }
 
+        if (has_flow && flow_term[0]) {
+            emit(&b, flow_term);
+            emit(&b, "    }\n");
+            block_open = 0;
+        }
         if (d3 & 1u) break; /* end */
     }
+    if (block_open) emit(&b, "        _pc = -1;\n    }\n");
 
     if (b.overflow) return -1;
 
@@ -463,7 +598,18 @@ static int rsx_vp_decompile_impl(
         "    float4 vp_c[512];\n"
         "    float4 vp_posscale;\n"
         "    float4 vp_posoffset;\n"
-        "};\n");
+        "};\n"
+        /* NV vertex programs multiply by the legacy rule: 0 times anything,
+         * INF and NaN included, is 0. IEEE gives NaN, and one RCP of a zero
+         * distance then poisons a whole lighting sum -- Tornado Outbreak's UI
+         * text came out NaN, which the FP's NaN guard turned into black. */
+        /* Scalar logic per component: glslang's HLSL front end (the Metal
+         * path) does not take || on vectors. */
+        "float vp_mul1(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }\n"
+        "float4 vp_mul(float4 a, float4 b) { return float4(vp_mul1(a.x, b.x), vp_mul1(a.y, b.y),"
+        " vp_mul1(a.z, b.z), vp_mul1(a.w, b.w)); }\n"
+        "float vp_dot3(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
+        "float vp_dot4(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n");
 
     for (u32 vtu = 0; vtu < 4; vtu++) {
         if (!((vtex_mask >> vtu) & 1u)) continue;
@@ -499,9 +645,14 @@ static int rsx_vp_decompile_impl(
         "    float4 r[32]; float4 o[16];\n"
         "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
-        "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n");
+        "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
+        "    float4 cc[2]; cc[0] = (float4)0; cc[1] = (float4)0;\n");
 
+    if (has_flow)
+        emit(&o, "    int _pc = 0; int _cs[8]; int _csp = 0;\n"
+                 "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n");
     emit(&o, body);
+    if (has_flow) emit(&o, "    }\n");
 
     /* Output register map (see header comment): o0 = HPOS through the RSX
      * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7. */

@@ -35,6 +35,7 @@
  * exact.
  */
 
+#include "spu_coherency.h"
 #include "spu_workload.h"
 #include "spu_context.h"
 
@@ -128,8 +129,22 @@ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
 }
 
 /* Last outbound mailbox posted by a finished job (see below). */
-uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
-int g_spurs_job_mbox_valid;
+/* THREAD-LOCAL. A job's answer is read back by the completion event that
+ * follows it, and jc_execute signals immediately after each job -- but the walk
+ * runs on whichever guest thread drives the chain, and more than one can be in
+ * flight. As plain globals these were clobbered between a job finishing and its
+ * own completion being pushed, so a query could be answered with an unrelated
+ * job's mailbox. Per-thread keeps each job paired with its own answer. */
+#ifdef _WIN32
+#  define SPURS_JOB_TLS __declspec(thread)
+#else
+#  define SPURS_JOB_TLS __thread
+#endif
+SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+/* The command this job ran, read from its own command block. Only a query
+ * expects an answer back through the completion event. */
+SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
+SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
@@ -276,14 +291,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           }
       } }
 
-    /* LBP job protocol probe (LBP_JOB_DUMP): the game's one shared job binary
+    /* LBP job protocol probe (SPURS_JOB_DUMP): the game's one shared job binary
      * ("JOBCRT Ver13" crt + main @0x1570) reads a be u64 EA out of the
      * descriptor's USER DATA at +0x30, GETs a 128-byte command block from it,
      * then jump-tables on the command TYPE (word1 of the block, cases 0..5).
      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
-    if (getenv("LBP_JOB_DUMP")) {
+    if (getenv("SPURS_JOB_DUMP")) {
         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
@@ -357,13 +372,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
                           ? ctx.ch_out_intr_mbox.value : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
+    { uint32_t _cb = g32(job_ea + 0x4C);
+      g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
       static int n = 0;
       if (s_t && n++ < 16 && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
-    if (getenv("LBP_JOB_DUMP")) {
+    if (getenv("SPURS_JOB_DUMP")) {
         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
         /* Post-run view of the same command block: the game polls result/status
@@ -380,6 +397,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         fflush(stderr);
     }
 
+    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     free(ls);
     return 0;
 }

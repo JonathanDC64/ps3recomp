@@ -85,6 +85,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         if (!ctx) return -1;
         s_pm_ctx[wid][spu_num] = ctx;
         first = 1;
+        /* SPU_CTX_LOG=1: policy-module contexts are PERSISTENT and there is one
+         * per (workload, spu_num) -- a workload with readyCount 8 legitimately
+         * runs on several simulated SPUs, which then contend its lock lines
+         * exactly as real SPUs would. Counting only the job contexts in
+         * spu_lifted_job.h reports "two contexts" for a run that has five, and
+         * makes correct multi-SPU execution look like duplicated state. */
+        { static int s_cl = -1;
+          if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+          if (s_cl) fprintf(stderr, "[spu-ctx] new POLICY context %p wid=%u spu_num=%u\n",
+                            (void*)ctx, wid, spu_num); }
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
@@ -255,7 +265,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 
-    spu_run_with_halt(entry, ctx);
+    const int pm_halted = spu_run_with_halt(entry, ctx);
+    /* A lane's run should only end through exitToKernel. Anything else strands
+     * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+    if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+        extern unsigned spu_recent_pcs(uint32_t*, unsigned);
+        uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
+        static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+            fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
+                    spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
+                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
+            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
+            fprintf(stderr, "\n"); fflush(stderr); } }
 
     if (s_claimlog) {
         unsigned claims = g_spu_putllc_sync_hit - claim_before;
@@ -525,6 +546,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
         memcpy(out_2700, ctx->ls + 0x2700, n);
     }
     int st = (int)ctx->status;
+    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
     free(ctx);
     return st;
 }

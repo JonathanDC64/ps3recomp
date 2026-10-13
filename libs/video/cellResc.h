@@ -70,11 +70,11 @@ typedef struct CellRescInitConfig {
     u32 flipMode;
 } CellRescInitConfig;
 
-typedef struct CellRescSrc {
+typedef struct CellRescSrc {   /* SDK resc.h: 16 bytes, width/height are u16 */
     u32 format;
     u32 pitch;
-    u32 width;
-    u32 height;
+    u16 width;
+    u16 height;
     u32 offset;
 } CellRescSrc;
 

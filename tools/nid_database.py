@@ -90,6 +90,8 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellGcmSys", "cellGcmGetFlipStatus"),
     ("cellGcmSys", "cellGcmResetFlipStatus"),
     ("cellGcmSys", "cellGcmSetWaitFlip"),
+    ("cellGcmSys", "cellGcmSetWaitFlipUnsafe"),
+    ("cellGcmSys", "cellGcmGetReport"),
     ("cellGcmSys", "cellGcmSetFlip"),
     ("cellGcmSys", "cellGcmGetCurrentField"),
     ("cellGcmSys", "cellGcmGetLabelAddress"),
@@ -237,6 +239,8 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("cellSpurs", "cellSpursTaskAttribute2Initialize"),
     ("cellSpurs", "cellSpursTaskAttributeSetExitCode"),
     ("cellSpurs", "cellSpursTaskGetContextSaveAreaSize"),
+    ("cellSpurs", "cellSpursGetTasksetInfo"),
+    ("cellSpurs", "cellSpursBarrierInitialize"),
     ("cellSpurs", "cellSpursTaskExitCodeGet"),
     ("cellSpurs", "cellSpursTaskExitCodeRelease"),
     # SPURS workload
@@ -340,6 +344,13 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sysPrxForUser", "sys_lwcond_create"),
     ("sysPrxForUser", "sys_lwcond_destroy"),
     ("sysPrxForUser", "sys_lwcond_wait"),
+    # Recovered by brute-forcing compute_nid() over the sysPrxForUser export
+    # list against Virtua Fighter 5's imports (0x8C2BB498 / 0x722A0254 /
+    # 0x5267CB35 were unresolved in every title until then).
+    ("sysPrxForUser", "sys_spinlock_initialize"),
+    ("sysPrxForUser", "sys_spinlock_lock"),
+    ("sysPrxForUser", "sys_spinlock_trylock"),
+    ("sysPrxForUser", "sys_spinlock_unlock"),
     ("sysPrxForUser", "sys_lwcond_signal"),
     ("sysPrxForUser", "sys_lwcond_signal_all"),
     ("sysPrxForUser", "sys_mutex_create"),
@@ -443,6 +454,8 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sysPrxForUser", "_sys_heap_memalign"),                 # 0x44265c08 x2
     ("sysPrxForUser", "sys_spu_image_close"),                # 0xe0da8efd x2
     ("sysPrxForUser", "sys_mmapper_allocate_memory"),        # 0xb257540b x1
+    ("sceNp", "sceNpScoreInit"),
+    ("sceNp", "sceNpScoreTerm"),
     ("sceNp", "sceNpManagerGetStatus"),                      # 0xa7bff757 x5
     ("sceNp", "sceNpManagerGetNpId"),                        # 0xfe37a7f4 x5
     ("sceNp", "sceNpManagerRegisterCallback"),               # 0xe7dcd3b4 x5

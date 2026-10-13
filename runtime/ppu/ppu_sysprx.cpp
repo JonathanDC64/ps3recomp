@@ -89,7 +89,7 @@ static void sys_process_is_stack(ppu_context* ctx)
  * a no-op that never initializes the structure, the guarded init is skipped
  * and the protected registry is left with null function pointers (the early
  * boot then spins calling a null vtable entry). We model the structure for
- * real; locking is a no-op owner stamp (the boot is single-threaded).
+ * real, and lock it for real (see "REAL mutual exclusion" below).
  *
  * sys_lwmutex_t (big-endian, 24 bytes):
  *   +0x00 owner (u32)   +0x04 waiter (u32)   +0x08 attribute (u32)
@@ -107,9 +107,7 @@ static void sys_process_is_stack(ppu_context* ctx)
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
-#ifdef _WIN32
 static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
-#endif
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -124,18 +122,21 @@ static void sys_lwmutex_create(ppu_context* ctx)
     vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
     vm_write32(lwm + 0x10, 0);          /* sleep_queue */
     vm_write32(lwm + 0x14, 0);
-#ifdef _WIN32
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
     { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
-#endif
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
  * every lwmutex-protected structure once LBP spun up its worker/loader threads --
  * notably the dlmalloc mspace behind the game's big-allocator, whose tree then
  * fell apart and reported OOM on a tiny request with 100+ MB free.
+ *
+ * The same on every host: on POSIX the semaphore is win32_compat's. This was
+ * Windows-only for a while, which left every lwmutex on Linux a bare owner
+ * stamp -- Twisted Metal's FIOS layer then freed one block from two threads
+ * and its dlmalloc free() aborted on a chunk already merged into top.
  *
  * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
  * released by its owning thread, but guest code passes lwmutex ownership
@@ -145,7 +146,6 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * thread. Recursion is handled explicitly via the guest owner/recur fields
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
  * race-free). Keyed by guest address in an open-addressed table. */
-#ifdef _WIN32
 #define LWM_HASH 65536u
 static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
@@ -154,20 +154,18 @@ extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c *
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }
 static volatile long g_lwm_tab_lock = 0;
-/* LBP_LWM_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
+/* PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
  * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
  * contended block it logs who holds it and for how long; on unlock it flags a
  * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
  * convoy root. Default OFF. */
-static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("LBP_LWM_TRACE"); v=e?1:0;} return v; }
+static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
 static long long lwm_now_us(void){
-#ifdef _WIN32
     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (long long)(c.QuadPart*1000000ll/freq.QuadPart);
-#else
-    return 0;
-#endif
+    /* Seconds and remainder apart: on POSIX the frequency is 1e9, and the
+     * counter times 1e6 overflows after a few hours of uptime. */
+    return (long long)((c.QuadPart/freq.QuadPart)*1000000ll + (c.QuadPart%freq.QuadPart)*1000000ll/freq.QuadPart);
 }
 /* Find an EXISTING slot (no create) for hold-tracking. */
 static struct LwmSlot* lwm_find(uint32_t addr){
@@ -204,9 +202,6 @@ static HANDLE lwm_sem(uint32_t addr)
     }
     return nullptr;   /* table full (raise LWM_HASH) */
 }
-#else
-static void* lwm_sem(uint32_t) { return nullptr; }
-#endif
 /* Contention-probe window flag: 0 by default (prints stay bounded). A title's
  * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
  * logging during that window only (park hunts: gate on state, not counts). */
@@ -221,7 +216,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * contended lock yields to other threads instead of hard-blocking). We had
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
-#ifdef _WIN32
     HANDLE s = lwm_sem(lwm);
     if (s) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
@@ -259,7 +253,6 @@ static void sys_lwmutex_lock(ppu_context* ctx)
         }
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
-#endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;   // CELL_OK
@@ -268,7 +261,6 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
-#ifdef _WIN32
     HANDLE s = lwm_sem(lwm);
     if (s) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
@@ -279,7 +271,6 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
         if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
-#endif
     vm_write32(lwm + LWM_OWNER, self);
     vm_write32(lwm + LWM_RECUR, 1);
     ctx->gpr[3] = 0;
@@ -295,7 +286,6 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     }
     vm_write32(lwm + LWM_RECUR, 0);
     vm_write32(lwm + LWM_OWNER, 0);
-#ifdef _WIN32
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
         if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
             if (held > 100000) {
@@ -328,7 +318,6 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
      * hands lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) fails harmlessly at the max count of 1. */
     if (s) ReleaseSemaphore(s, 1, NULL);
-#endif
     ctx->gpr[3] = 0;
 }
 
@@ -361,7 +350,6 @@ static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
-#ifdef _WIN32
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
@@ -374,7 +362,6 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
-#endif
     ctx->gpr[3] = 0;
 }
 
@@ -417,7 +404,7 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
     uint32_t size       = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
     uint32_t id         = mmapper_new_id(size);
-    if (getenv("FLOW_MEMTRACE"))
+    if (getenv("PS3_MEMTRACE"))
         fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
                 size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
@@ -431,7 +418,7 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
     uint32_t size = (uint32_t)ctx->gpr[3];
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
     uint32_t id = mmapper_new_id(size);
-    if (getenv("FLOW_MEMTRACE"))
+    if (getenv("PS3_MEMTRACE"))
         fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
                 size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, id);
     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
@@ -534,6 +521,8 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
  * every receive/poll would-block. errno lives in a guest scratch cell since
  * _sys_net_errno_loc returns a POINTER the game dereferences. */
 #define SYS_NET_EWOULDBLOCK_V 35
+extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -598,6 +587,37 @@ static void hle_net_sendto(ppu_context* ctx) { ctx->gpr[3] = (uint32_t)ctx->gpr[
  * Self-verifying: no-op unless r4 points to an ELF (so a wrong NID guess is safe).
  * sys_spu_image { u32 type; u32 entry; sys_spu_segment* segs; int nsegs; }
  * sys_spu_segment{ int type; u32 ls_start; int size; u64 src_pa }  (0x18, src@0x10) */
+/* Last SPU image parsed below: where its loadable bytes live, which local
+ * store address they start at, and how far they span. Read by the SPU DMA
+ * path (SPU_DSP_IMAGE_EA in spu_dma.h) to recover a section load whose
+ * source address the title lost between import and use. */
+extern "C" uint32_t g_spu_image_src_ea = 0, g_spu_image_ls_start = 0,
+                    g_spu_image_span = 0;
+
+/* img_ea -> the EA of the SPU ELF it was parsed from. Small and fixed: a title
+ * has a handful of images, and a repeat import of the same descriptor replaces
+ * its entry. */
+#define SPU_IMG_SRC_MAX 32
+static struct { uint32_t img, src; } s_spu_img_src[SPU_IMG_SRC_MAX];
+
+extern "C" void ps3_spu_image_record(uint32_t img_ea, uint32_t src_ea)
+{
+    if (!img_ea || !src_ea) return;
+    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
+        if (s_spu_img_src[i].img == img_ea || s_spu_img_src[i].img == 0) {
+            s_spu_img_src[i].img = img_ea; s_spu_img_src[i].src = src_ea; return;
+        }
+}
+
+extern "C" uint32_t ps3_spu_image_source_ea(uint32_t img_ea)
+{
+    for (int i = 0; i < SPU_IMG_SRC_MAX; i++)
+        if (s_spu_img_src[i].img == img_ea) return s_spu_img_src[i].src;
+    return 0;
+}
+
+extern "C" void spu_raw_note_image(uint32_t src_ea, uint32_t entry);  /* runtime/spu/spu_raw.c */
+
 static void hle_sys_spu_image_import(ppu_context* ctx)
 {
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
@@ -626,7 +646,12 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
         uint32_t p_msz = vm_read32(src_ea + ph + 0x14);
         uint32_t seg = segs_ea + (uint32_t)nsegs * 0x18;       /* COPY */
         vm_write32(seg + 0x00, 1); vm_write32(seg + 0x04, p_va);
-        vm_write32(seg + 0x08, p_fsz); vm_write32(seg + 0x10, 0);
+        vm_write32(seg + 0x08, p_fsz);
+        /* src is the u64 at +0x10; its low word, which every 32-bit reader
+         * takes, is +0x14 -- but LBP's FMOD mixer reads the u32 at +0x10 as
+         * the DMA source (it DMA'd its DSP overlay from EA 0 and jumped into
+         * zeroed LS), so write both, as the lv2 syscall path already does. */
+        vm_write32(seg + 0x10, src_ea + p_off);
         vm_write32(seg + 0x14, src_ea + p_off); nsegs++;
         if (p_msz > p_fsz && nsegs < 32) {                     /* BSS tail -> FILL 0 */
             seg = segs_ea + (uint32_t)nsegs * 0x18;
@@ -637,14 +662,182 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
     }
     s_seg_bump += (uint32_t)nsegs * 0x18;
     if (s_seg_bump >= 0x0E000000u) s_seg_bump = 0x0D000000u;
+    /* Remember where this image's loadable bytes live, for the SPU-side
+     * recovery in spu_dma.h (SPU_DSP_IMAGE_EA). The segments are contiguous in
+     * the source image, so segment 0's address plus the span from its ls_start
+     * to the end of the last segment describes the whole thing. */
+    if (nsegs > 0) {
+        uint32_t last = segs_ea + (uint32_t)(nsegs - 1) * 0x18;
+        g_spu_image_src_ea   = vm_read32(segs_ea + 0x14);
+        g_spu_image_ls_start = vm_read32(segs_ea + 0x04);
+        g_spu_image_span     = vm_read32(last + 0x04) - g_spu_image_ls_start;
+    }
+    /* Remember which ELF this descriptor was parsed from. sys_spu_thread_group_
+     * start only gets the DESCRIPTOR, but the workload registry is keyed by a
+     * fingerprint of the ELF's own bytes -- without this the raw SPU path has no
+     * way to ask whether the image it is about to run was lifted. */
+    ps3_spu_image_record(img_ea, src_ea);
+    /* ...and ask that question now, while the ELF is still identified. A raw SPU
+     * is started by an MMIO store to its run-control register, with no syscall in
+     * between, so this import is the last point at which the image can be matched
+     * to a lifted entry (runtime/spu/spu_raw.c). No-op for a SPU-thread image. */
+    spu_raw_note_image(src_ea, entry);
     vm_write32(img_ea + 0x00, 0);                              /* type = USER */
     vm_write32(img_ea + 0x04, entry);
     vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);
     vm_write32(img_ea + 0x0C, (uint32_t)nsegs);
     fprintf(stderr, "[HLE] _sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
             entry, nsegs, machine);
+    /* SPU_IMAGE_DIAG=1: r6 is a caller-supplied guest buffer that differs on
+     * every call, which this handler ignores -- it points the segments at the
+     * source image instead. Show the segments written and what the caller's
+     * buffer holds, to establish whether the caller expects it to be filled. */
+    if (getenv("SPU_IMAGE_DIAG")) {
+        for (int i = 0; i < nsegs; i++) {
+            uint32_t s = segs_ea + (uint32_t)i * 0x18;
+            fprintf(stderr, "        seg[%d] type=%u ls=0x%05X size=%u src=0x%08X%08X\n",
+                    i, vm_read32(s + 0x00), vm_read32(s + 0x04), vm_read32(s + 0x08),
+                    vm_read32(s + 0x10), vm_read32(s + 0x14));
+        }
+        uint32_t r6 = (uint32_t)ctx->gpr[6];
+        if (r6 && r6 < 0xD0000000u) {
+            /* Scan a window around the caller's buffer for the DSP descriptor
+             * the SPU later reads: its first word is 0x0052E1E8 and it carries
+             * the image's {entry, size, ls_start, size} at +0x150. Finding it
+             * at a fixed offset says r6 IS that descriptor. */
+            for (int32_t o = -0x400; o <= 0x400; o += 4) {
+                uint32_t a = (uint32_t)((int32_t)r6 + o);
+                if (vm_read32(a) == 0x0052E1E8u)
+                    fprintf(stderr, "        descriptor marker 0x0052E1E8 at r6%+d (0x%08X)\n", o, a);
+                if (vm_read32(a) == 0x00000248u && vm_read32(a + 4) == 0x00002CB0u)
+                    fprintf(stderr, "        image quad {248,2CB0,80,2CB0} at r6%+d (0x%08X) "
+                            "=> descriptor+0x150, descriptor=0x%08X, its +0x140=%08X %08X %08X %08X\n",
+                            o, a, a - 0x150,
+                            vm_read32(a - 0x10), vm_read32(a - 0xC),
+                            vm_read32(a - 8), vm_read32(a - 4));
+            }
+        }
+    }
     fflush(stderr);
     ctx->gpr[3] = 0;
+}
+
+/* ---- sys_spinlock_* (sysPrxForUser) -------------------------------------
+ *
+ * A sys_spinlock_t is one 32-bit word in guest memory and nothing else -- the
+ * real firmware spins on it with lwarx/stwcx. The guest only ever touches that
+ * word through these four calls, so a host test-and-set on the same address is
+ * exactly equivalent and stays correct across the title's own threads.
+ *
+ * Stored big-endian, so a guest that peeks at the word still reads 1.
+ *
+ * ABI: initialize / lock / unlock return void; trylock returns CELL_OK or
+ * EBUSY. Found via Virtua Fighter 5, which locks with trylock in a retry loop
+ * and was the first title to import the family -- the three NIDs were unnamed
+ * in the database until compute_nid() was brute-forced over the sysPrxForUser
+ * export list.
+ */
+#define SPINLOCK_BE1  0x01000000u          /* be32(1) */
+
+static inline volatile long* spin_word(uint32_t ea)
+{
+    return (volatile long*)(vm_base + ea);
+}
+
+/* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
+ * word is idempotent, so a plain atomic exchange is enough -- and _Interlocked-
+ * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
+static inline int spin_try(uint32_t ea)
+{
+    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
+}
+
+static void sys_spinlock_initialize(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (ea) _InterlockedExchange(spin_word(ea), 0);
+}
+
+/* Who currently holds each locked word, so a spin that never ends can name the
+ * holder instead of just burning a core in silence.
+ *
+ * A spinlock has no timeout and no failure return, so a lock that is never
+ * released is invisible: the thread sits in Sleep(0) at 100% of a core, a
+ * sampling profiler attributes every sample to ntdll, and NOTHING says which
+ * address or which holder. Guitar Hero III deadlocks exactly this way during
+ * its heap bring-up and presented as "all threads idle in ntdll" while pinning
+ * a core -- two facts that only make sense together once the lock is named.
+ *
+ * Small fixed table, linear scan: contention here is rare by construction (a
+ * guest spinlock section is a few instructions), and a miss just means the
+ * report says "unknown" rather than being wrong. */
+#define SPIN_OWNER_MAX 64
+static struct { uint32_t ea; unsigned long tid; } s_spin_owner[SPIN_OWNER_MAX];
+
+static void spin_note_acquire(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == 0 || s_spin_owner[i].ea == ea) {
+            s_spin_owner[i].ea = ea; s_spin_owner[i].tid = GetCurrentThreadId(); return;
+        }
+}
+static void spin_note_release(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == ea) { s_spin_owner[i].ea = 0; s_spin_owner[i].tid = 0; return; }
+}
+static unsigned long spin_owner_of(uint32_t ea)
+{
+    for (int i = 0; i < SPIN_OWNER_MAX; i++)
+        if (s_spin_owner[i].ea == ea) return s_spin_owner[i].tid;
+    return 0;
+}
+
+static void sys_spinlock_lock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (!ea) return;
+    /* ponytail: spin briefly, then hand the core back. On real hardware the
+     * holder runs to completion in a few instructions; here it is a host thread
+     * the OS can deschedule mid-section, so busy-waiting a whole quantum is the
+     * wrong trade. Swap in a futex if a title ever shows real contention here. */
+    for (unsigned n = 0; !spin_try(ea); n++) {
+        if (n < 64) YieldProcessor();
+        else        Sleep(0);
+        /* Report once per stuck lock, well past any legitimate section. */
+        if (n == 200000) {
+            unsigned long owner = spin_owner_of(ea);
+            unsigned long me    = GetCurrentThreadId();
+            static int reported = 0;
+            if (reported++ < 8)
+                fprintf(stderr,
+                        "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
+                        "held by tid %lu, this is tid %lu%s\n",
+                        ea, (uint32_t)ctx->lr, owner, me,
+                        (owner && owner == me)
+                          ? "  <== SELF-DEADLOCK: this thread already holds it"
+                          : (owner ? "" : "  (holder unknown -- released without us seeing it?)"));
+        }
+    }
+    spin_note_acquire(ea);
+}
+
+static void sys_spinlock_trylock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    int got = (ea && spin_try(ea));
+    if (got) spin_note_acquire(ea);
+    ctx->gpr[3] = got
+                ? 0                                            /* CELL_OK */
+                : (uint64_t)(int64_t)(int32_t)0x8001000Au;     /* EBUSY   */
+}
+
+static void sys_spinlock_unlock(ppu_context* ctx)
+{
+    uint32_t ea = (uint32_t)ctx->gpr[3];
+    if (!ea) return;
+    spin_note_release(ea);
+    _InterlockedExchange(spin_word(ea), 0);
 }
 
 extern "C" void ppu_sysprx_register(void)
@@ -652,6 +845,13 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
 
+    /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
+     * first because the first registration of a NID wins, so these shadow the
+     * offline model below; without the variable nothing changes. */
+    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
+    /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
+     * come off the stack, so they need the full context. */
+    np_score_register_ctx();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);
@@ -685,6 +885,12 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+
+    /* Spinlocks. One guest word each, no kernel object; see the block above. */
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_lock"),       "sys_spinlock_lock",       sys_spinlock_lock);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_trylock"),    "sys_spinlock_trylock",    sys_spinlock_trylock);
+    ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_unlock"),     "sys_spinlock_unlock",     sys_spinlock_unlock);
 
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_create"),     "sys_lwcond_create",     sys_lwcond_create);
     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_destroy"),    "sys_lwcond_destroy",    sys_lwcond_destroy);

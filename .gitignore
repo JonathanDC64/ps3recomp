@@ -1,5 +1,6 @@
 # Build directories
 build/
+build-*/
 cmake-build-*/
 out/
 
@@ -98,3 +99,17 @@ _drill/
 /work_spu/
 # macOS packaging output
 *.dmg
+
+# Gate builds: a port (or the toolkit) built against the toolkit under test,
+# kept separate from the developer's own build/ so a gate run cannot be fooled
+# by a stale binary. See tools/regress.py.
+build-gate/
+
+# Scratch space for generated test drivers and their output (test_ppu_lift.py,
+# test_milestone.py).
+scratch/
+
+# Firmware and anything lifted from it stay local (docs/FIRMWARE_LLE.md)
+fw_spu/
+*.prx
+*.PRX

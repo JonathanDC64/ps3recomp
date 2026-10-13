@@ -116,7 +116,8 @@ static int spu_step(spu_context* ctx) {
 
     switch (d.op) {
     /* immediates / loads */
-    case SPU_il: case SPU_ilh: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_il: DST = spu_splat_u32((uint32_t)(int32_t)I); break;
+    case SPU_ilh: DST = spu_ilh((uint16_t)I); break;
     case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
     case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
     case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
@@ -158,6 +159,9 @@ static int spu_step(spu_context* ctx) {
     case SPU_andbi:DST = spu_andbi(A,I); break;
     case SPU_andhi:DST = spu_andhi(A,I); break;
     case SPU_orhi: DST = spu_orhi(A,I); break;
+    case SPU_orbi: DST = spu_orbi(A,I); break;
+    case SPU_xorhi:DST = spu_xorhi(A,I); break;
+    case SPU_xorbi:DST = spu_xorbi(A,I); break;
     case SPU_orx:  DST = spu_orx(A); break;
     /* compares */
     case SPU_ceq: DST = spu_ceq(A,B); break;
@@ -336,28 +340,33 @@ void spu_trace_dump(uint32_t at) {
 }
 
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
+    return spu_interp_run_until(ctx, start_lsa, 0);
+}
+
+uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
     static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
-    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("YDKJ_SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
+     * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
+     * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
+     * ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit
+     * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
+    static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
+    static int _g1in=0;
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
-        /* Taskset PM task-syscall entry (LS 0xA70): the pure interpreter has no PM
-         * code resident there, so a task's task-API call (EXIT/YIELD/WAIT/POLL via
-         * func_00026DE0 -> syscallAddr@0x27C4) would execute empty LS and stop 0.
-         * HLE it exactly like the lifted path (spu_channels.c spu_indirect_branch),
-         * then resume at the task's link (r0). Gated by the syscallAddr sentinel at
-         * LS 0x27C4 (only spurs_pm_build_context writes 0xA70 there). The handler
-         * halts on EXIT(num=0) unless image_id==22; present that momentarily so an
-         * interp'd cri task (image_id set to -1 for pure interp) resumes instead of
-         * longjmp-ing out of a context that isn't wrapped for it. */
+        /* Match the lifted path: only synthetic HLE tasks may bypass the
+         * resident policy. Real tasksets also store 0xA70 in their API table.
+         * Preserve the legacy CRI return convention while invoking the HLE. */
         if (ctx->pc == 0xA70u) {
             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
-            if (sc == 0xA70u) {
+            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
                 extern void spu_spurs_taskset_syscall(spu_context*);
                 int _save = ctx->image_id; ctx->image_id = 22;
                 spu_spurs_taskset_syscall(ctx);
@@ -370,11 +379,26 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
-        if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
+        if (_g1>0) {
+            int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
+            if (inr) { _g1in = 1; }
+            else if (_g1in) {
+                _g1in = 0;
+                #define GLB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
+                fprintf(stderr,"[gate1] func_00026E80 ret r3=%08X | LS2FB0=%08X LS2FB4=%08X LS2FB8=%08X | LS1E0=%08X LS1E4=%08X LS1E8=%08X | r1=%05X r29=%08X r32=%08X r16=%08X r22=%08X r8=%08X r6=%08X\n",
+                    ctx->gpr[3]._u32[0], GLB(0x2FB0),GLB(0x2FB4),GLB(0x2FB8), GLB(0x1E0),GLB(0x1E4),GLB(0x1E8),
+                    ctx->gpr[1]._u32[0], ctx->gpr[29]._u32[0], ctx->gpr[32]._u32[0],
+                    ctx->gpr[16]._u32[0], ctx->gpr[22]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[6]._u32[0]);
+                #undef GLB
+                fflush(stderr); _g1--;
+            }
+        }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
-        /* YDKJ_SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
+        /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {
             fprintf(stderr,"[spu-trace] STEPCAP pc=0x%05X after %llu steps; last %d PCs:",

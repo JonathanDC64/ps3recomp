@@ -287,6 +287,20 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
                                  u32 clearMode, u32 direction);
 s32 cellSpursEventFlagAttachLv2EventQueue(CellSpursEventFlag* eventFlag);
 
+/* Task LS patterns / context save area sizing, and the queue surface Saints
+ * Row 2's taskset build path calls. ABI for the first two is read off that
+ * call site (see the block comment in cellSpurs.c); pointer args are guest
+ * EAs, so they are taken as u64 and translated inside. */
+s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea);
+s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea);
+s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total);
+s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea);
+s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
+s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
+s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+                                u32 size, u32 depth, u32 direction);
+s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
+
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode);

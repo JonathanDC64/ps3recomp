@@ -392,6 +392,24 @@ static void dest_mask(u32 op0, char* m)
  * FragmentProgramDecompiler::BuildCode (gcm_enums.h). */
 #define FP_CTRL_32BIT_EXPORTS 0x40u
 
+/* The four colour exports live at fixed register indices, one set per export
+ * width: r0/r2/r3/r4 with 32-bit exports and h0/h4/h6/h8 with 16-bit ones
+ * (rsx_commands.h, SHADER_CONTROL 0x40; RPCS3 FragmentProgramDecompiler's
+ * BuildCode table). Everything else in the file is a plain temp. */
+#define FP_MAX_COLOR_TARGETS 4
+static const u32 fp_export_reg[2][FP_MAX_COLOR_TARGETS] = {
+    { 0, 2, 3, 4 },   /* 32-bit exports: r */
+    { 0, 4, 6, 8 },   /* 16-bit exports: h */
+};
+
+/* Which colour target a destination register is, or -1 for a plain temp. */
+static int fp_export_target(u32 index, int half)
+{
+    for (int t = 0; t < FP_MAX_COLOR_TARGETS; t++)
+        if (fp_export_reg[half][t] == index) return t;
+    return -1;
+}
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
@@ -415,47 +433,14 @@ static int rsx_fp_decompile_internal(
     if (out_constant_count)
         *out_constant_count = buffered_constant_count;
 
+    /* The BODY is emitted first and the preamble is inserted in front of it
+     * afterwards. main's signature names the return type, and the return type
+     * is a struct as soon as the program turns out to write a second colour
+     * export -- which is only known once every instruction has been decoded.
+     * Emitting the preamble here would mean guessing it. */
     Out o = { out, out_size, 0, 1 };
-
-    /* Preamble: PSInput matches the backend's placeholder layout; temp/half
-     * register files; texture+sampler banks for TEX. */
+    out[0] = '\0';
     out_puts(&o,
-        "struct PSInput {\n"
-        "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
-        "    float4 fog : FOG;\n"
-        "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
-        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
-        "};\n");
-    /* Texture bank. With no cube units (the default) emit the exact legacy
-     * array declaration so 2D-only programs are byte-identical. When any unit
-     * is a cubemap, declare each unit individually at its t-register so the
-     * cube units can be TextureCube while the rest stay Texture2D. */
-    if (tex_cube_mask == 0) {
-        out_puts(&o, "Texture2D    rsx_tex[16] : register(t0);\n");
-    } else {
-        char decl[64];
-        for (u32 u = 0; u < 16; u++) {
-            snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
-                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
-            out_puts(&o, decl);
-        }
-    }
-    out_puts(&o,
-        "SamplerState rsx_samp[16] : register(s0);\n"
-    );
-    if (buffered) {
-        char constants_decl[192];
-        snprintf(
-            constants_decl, sizeof(constants_decl),
-            "cbuffer PSConstants : register(b1) {\n"
-            "    float4 fp_constants[%u];\n"
-            "    float4 fp_alpha;\n"
-            "};\n",
-            buffered_constant_count ? buffered_constant_count : 1u);
-        out_puts(&o, constants_decl);
-    }
-    out_puts(&o,
-        "float4 main(PSInput input) : SV_TARGET {\n"
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
          * register lane before writing it (the hardware reads undefined), but
@@ -465,12 +450,33 @@ static int rsx_fp_decompile_internal(
          * to 0 (NV40 CC power-up state). Dead in non-predicated programs. */
         "    float4 cc0 = (float4)0; float4 cc1 = (float4)0;\n");
 
-    int wrote_r0 = 0, wrote_h0 = 0;
+    /* Which colour export each register file received a write to, indexed
+     * [half][target]. The whole file is tracked, not just target 0, because
+     * the highest one written decides how many SV_TARGETs come out. */
+    int wrote[2][FP_MAX_COLOR_TARGETS];
+    memset(wrote, 0, sizeof wrote);
     int count = 0;
     u32 off = 0;
     u32 constant_slot = 0;
 
+    /* Open IFE/LOOP/REP blocks: the byte offset each one's else branch starts
+     * at (0 = none) and where it ends. See the branch case below. */
+    enum { FP_MAX_BLOCKS = 32 };
+    u32 blk_else[FP_MAX_BLOCKS], blk_end[FP_MAX_BLOCKS];
+    int blk_loop[FP_MAX_BLOCKS];
+    int n_blk = 0, n_loop = 0, loops_open = 0;
+
     while (off + 16 <= max_bytes) {
+        /* Close blocks ending here, innermost first, then open an else. Ends
+         * before elses, as RPCS3's FragmentProgramDecompiler::Decompile does. */
+        while (n_blk > 0 && blk_end[n_blk - 1] == off) {
+            out_puts(&o, "    }\n");
+            loops_open -= blk_loop[--n_blk];
+        }
+        if (n_blk > 0 && blk_else[n_blk - 1] == off) {
+            out_puts(&o, "    } else {\n");
+            blk_else[n_blk - 1] = 0;
+        }
         u32 w0 = rsx_fp_read_word(ucode + off + 0);
         u32 w1 = rsx_fp_read_word(ucode + off + 4);
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
@@ -546,8 +552,59 @@ static int rsx_fp_decompile_internal(
         if (has_k)
             constant_slot++;
 
+        /* Flow control: SRC1.branch set, and OPDEST's opcode field selects
+         * BRK/CAL/IFE/LOOP/REP/RET (RPCS3 RSXFragmentProgram.h, 0x40..0x45).
+         * IFE carries the else and end addresses in SRC1/SRC2 [0:30] as word
+         * offsets; LOOP/REP carry end/init/increment counters in SRC1 [2:9],
+         * [10:17], [19:26] and the end address in SRC2. The condition is the
+         * exec_if test on the first component of the condition swizzle.
+         * Skipping these ran both sides of every if/else: Crazy Taxi's uber
+         * material shader then overwrote its lit colour with a COLOR0 the
+         * vertex program never writes, and the whole city drew black. */
         if (is_branch) {
-            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+            char cond[64], line[160];
+            if (is_uncond)
+                snprintf(cond, sizeof cond, "true");
+            else if (is_never)
+                snprintf(cond, sizeof cond, "false");
+            else
+                snprintf(cond, sizeof cond, "cc%u.%c %s 0.0", cc_read, cswz[0], cmp_op);
+            const u32 end_at = (w3 & 0x7FFFFFFFu) << 2;
+            switch (opcode) {
+            case 0x02: /* IFE */
+            case 0x03: /* LOOP */
+            case 0x04: /* REP */
+                if (n_blk == FP_MAX_BLOCKS || end_at <= off) {
+                    out_puts(&o, "    /* TODO: malformed flow-control op skipped */\n");
+                    break;
+                }
+                if (opcode == 0x02) {
+                    const u32 else_at = (w2 & 0x7FFFFFFFu) << 2;
+                    blk_else[n_blk] = else_at != end_at ? else_at : 0;
+                    blk_loop[n_blk] = 0;
+                    snprintf(line, sizeof line, "    if (%s) {\n", cond);
+                } else {
+                    const u32 end_n = (w2 >> 2) & 0xFFu, init = (w2 >> 10) & 0xFFu;
+                    const u32 inc = (w2 >> 19) & 0xFFu;
+                    blk_else[n_blk] = 0;
+                    blk_loop[n_blk] = 1;
+                    snprintf(line, sizeof line,
+                             "    if (%s) [loop] for (int _l%d = %u; _l%d < %u; _l%d += %u) {\n",
+                             cond, n_loop, init, n_loop, end_n, n_loop, inc ? inc : 1u);
+                    n_loop++;
+                    loops_open++;
+                }
+                blk_end[n_blk++] = end_at;
+                out_puts(&o, line);
+                break;
+            case 0x00: /* BRK */
+                snprintf(line, sizeof line, "    if (%s) break;\n", cond);
+                if (loops_open) out_puts(&o, line);
+                break;
+            default:   /* CAL / RET: no subroutine support yet */
+                out_puts(&o, "    /* TODO: CAL/RET flow-control op skipped */\n");
+                break;
+            }
             if (w0 & FP_END) break;
             continue;
         }
@@ -600,6 +657,12 @@ static int rsx_fp_decompile_internal(
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
+        /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
+         * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
+        case OP_LIF:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, (%s).y, (%s).y > 0.0 ? exp2((%s).w) : 0.0, 1.0)", a, a, a);
+            break;
         /* Texture/branch fences: ordering hints with no result -- no-op. */
         case OP_FENCT: case OP_FENCB: rhs[0] = '\0'; handled = 0; break;
         case OP_SLT: snprintf(rhs, sizeof(rhs), "(float4)((%s) <  (%s))", a, b); break;
@@ -635,6 +698,18 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             break;
+        case OP_TXB: case OP_TXL: {
+            /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
+             * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
+             * are TXB: unhandled, they sampled nothing and output alpha 0. */
+            const int cube = (tex_cube_mask >> tex_unit) & 1u;
+            char tn[32];
+            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
+                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
+                     cube ? "xyz" : "xy", b);
+            break;
+        }
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
@@ -736,12 +811,17 @@ static int rsx_fp_decompile_internal(
                 out_puts(&o, "    }\n");
             }
 
-            if (has_dest && !dst_half && dst_idx == 0) wrote_r0 = 1;
-            if (has_dest && dst_half  && dst_idx == 0) wrote_h0 = 1;
+            if (has_dest) {
+                const int target = fp_export_target(dst_idx, dst_half);
+                if (target >= 0) wrote[dst_half][target] = 1;
+            }
         }
 
         if (w0 & FP_END) break;
     }
+    /* A block whose end address is at or past END never saw it: close it. */
+    while (n_blk-- > 0)
+        out_puts(&o, "    }\n");
 
     /* Fragment color output register selection. The NV40 hardware picks the
      * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from
@@ -751,24 +831,108 @@ static int rsx_fp_decompile_internal(
      * shaders accumulate into fp32 temps (r2/r3/r4) but write their FINAL
      * color to h0 — the old "wrote_r0 => return r0" heuristic returned a stale
      * intermediate, producing flat/constant surfaces. */
+    int half_exports;
     if (ctrl == RSX_FP_CTRL_AUTO) {
         /* No control word (standalone tests): legacy heuristic. */
-        if (wrote_r0 || !wrote_h0)
-            out_puts(&o, "    float4 _o = r[0];\n"
-                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
-        else
-            out_puts(&o, "    float4 _o = h[0];\n"
-                         "    return (_o == _o) ? _o : (float4)0;\n}\n");
-    } else if (ctrl & FP_CTRL_32BIT_EXPORTS) {
-        out_puts(&o, "    float4 _o = r[0];\n"
-                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
+        half_exports = (wrote[0][0] || !wrote[1][0]) ? 0 : 1;
     } else {
-        out_puts(&o, "    float4 _o = h[0];\n"
-                     "    return (_o == _o) ? _o : (float4)0;\n}\n");
+        half_exports = (ctrl & FP_CTRL_32BIT_EXPORTS) ? 0 : 1;
     }
-    (void)wrote_r0; (void)wrote_h0;
+    const char* export_file = half_exports ? "h" : "r";
 
-    if (!o.ok) return -1;
+    /* How many colour targets the program feeds: one past the highest export
+     * register of the selected file it wrote. A program that writes only the
+     * first keeps the single-value return it has always had, byte for byte;
+     * only a program that reaches the second, third or fourth grows a struct.
+     * Writes to the OTHER file's export registers do not count -- r2/r3/r4 are
+     * ordinary temps under 16-bit exports, and accumulating into them while
+     * the colour goes to h0 is what most material shaders do. */
+    u32 targets = 1;
+    for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
+        if (wrote[half_exports][t]) { targets = t + 1; break; }
+
+    if (targets == 1) {
+        char tail[96];
+        snprintf(tail, sizeof(tail),
+                 "    float4 _o = %s[0];\n"
+                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
+        out_puts(&o, tail);
+    } else {
+        /* Multiple render targets. The NaN guard is per target: a poisoned
+         * G-buffer plane is as fatal as a poisoned colour one, and the planes
+         * are computed independently. */
+        out_puts(&o, "    PSOutput _out;\n");
+        for (u32 t = 0; t < targets; t++) {
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "    float4 _o%u = %s[%u];\n"
+                     "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
+                     t, export_file, fp_export_reg[half_exports][t],
+                     t, t, t, t);
+            out_puts(&o, line);
+        }
+        out_puts(&o, "    return _out;\n}\n");
+    }
+
+    /* Preamble: PSInput matches the backend's placeholder layout; temp/half
+     * register files; texture+sampler banks for TEX. Built here, in front of
+     * the body, now that the return type is known. */
+    char preamble[2048];
+    Out p = { preamble, sizeof(preamble), 0, 1 };
+    preamble[0] = '\0';
+    out_puts(&p,
+        "struct PSInput {\n"
+        "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
+        "    float4 fog : FOG;\n"
+        "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
+        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+        "};\n");
+    /* Texture bank. With no cube units (the default) emit the exact legacy
+     * array declaration so 2D-only programs are byte-identical. When any unit
+     * is a cubemap, declare each unit individually at its t-register so the
+     * cube units can be TextureCube while the rest stay Texture2D. */
+    if (tex_cube_mask == 0) {
+        out_puts(&p, "Texture2D    rsx_tex[16] : register(t0);\n");
+    } else {
+        char decl[64];
+        for (u32 u = 0; u < 16; u++) {
+            snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
+                     ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
+            out_puts(&p, decl);
+        }
+    }
+    out_puts(&p,
+        "SamplerState rsx_samp[16] : register(s0);\n"
+    );
+    if (buffered) {
+        char constants_decl[192];
+        snprintf(
+            constants_decl, sizeof(constants_decl),
+            "cbuffer PSConstants : register(b1) {\n"
+            "    float4 fp_constants[%u];\n"
+            "    float4 fp_alpha;\n"
+            "};\n",
+            buffered_constant_count ? buffered_constant_count : 1u);
+        out_puts(&p, constants_decl);
+    }
+    if (targets == 1) {
+        out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
+    } else {
+        out_puts(&p, "struct PSOutput {\n");
+        for (u32 t = 0; t < targets; t++) {
+            char member[64];
+            snprintf(member, sizeof(member),
+                     "    float4 t%u : SV_TARGET%u;\n", t, t);
+            out_puts(&p, member);
+        }
+        out_puts(&p, "};\n"
+                     "PSOutput main(PSInput input) {\n");
+    }
+
+    if (!o.ok || !p.ok) return -1;
+    if (o.len + p.len + 1 > out_size) return -1;
+    memmove(out + p.len, out, o.len + 1);
+    memcpy(out, preamble, p.len);
     return count;
 }
 
@@ -830,6 +994,27 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
     return (float)(raw & 0xFFu) / 255.0f;
 }
 
+/* The comparison the alpha test has to pass. The alpha it tests is colour
+ * target 0's, which for a single-target program is the returned value itself
+ * and for an MRT one is the returned struct's first member -- the NV40 alpha
+ * test has one input however many targets the program feeds. `cmp` is the
+ * CELL_GCM function minus 0x200, with NEVER (0) spelled out and ALWAYS (7)
+ * already handled by the caller. */
+static void fp_alpha_pass_expr(u32 cmp, const char* alpha, char* out, u32 out_size)
+{
+    static const char* op[8] = { NULL, "<", "==", "<=", ">", "!=", ">=", NULL };
+    if (cmp == 0 || cmp >= 7 || !op[cmp])
+        snprintf(out, out_size, "false");
+    else
+        snprintf(out, out_size, "%s.a %s _rsx_alpha_ref", alpha, op[cmp]);
+}
+
+/* Where that alpha lives, and what type the value being returned has. */
+static int fp_returns_struct(const char* hlsl)
+{
+    return strstr(hlsl, "struct PSOutput") != NULL;
+}
+
 int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
 {
     if (!hlsl || out_size == 0)
@@ -854,19 +1039,16 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref)
     memcpy(output, expression, (size_t)(terminator - expression));
     output[terminator - expression] = '\0';
 
-    static const char* pass_expr[8] = {
-        "false", "_rsx_out.a < _rsx_alpha_ref",
-        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
-        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
-        "_rsx_out.a >= _rsx_alpha_ref", "true"
-    };
+    const int mrt = fp_returns_struct(hlsl);
+    char pass[96];
+    fp_alpha_pass_expr(cmp, mrt ? "_rsx_out.t0" : "_rsx_out", pass, sizeof(pass));
     char suffix[512];
     const int n = snprintf(suffix, sizeof(suffix),
-        "    float4 _rsx_out = %s;\n"
+        "    %s _rsx_out = %s;\n"
         "    const float _rsx_alpha_ref = %.9g;\n"
         "    if (!(%s)) discard;\n"
         "    return _rsx_out;\n}\n",
-        output, (double)ref, pass_expr[cmp]);
+        mrt ? "PSOutput" : "float4", output, (double)ref, pass);
     if (n < 0 || (u32)n >= sizeof(suffix))
         return -1;
     const size_t prefix = (size_t)(marker - hlsl);
@@ -902,20 +1084,17 @@ int rsx_fp_apply_alpha_test_buffered(
     memcpy(output, expression, (size_t)(terminator - expression));
     output[terminator - expression] = '\0';
 
-    static const char* pass_expr[8] = {
-        "false", "_rsx_out.a < _rsx_alpha_ref",
-        "_rsx_out.a == _rsx_alpha_ref", "_rsx_out.a <= _rsx_alpha_ref",
-        "_rsx_out.a > _rsx_alpha_ref", "_rsx_out.a != _rsx_alpha_ref",
-        "_rsx_out.a >= _rsx_alpha_ref", "true"
-    };
+    const int mrt = fp_returns_struct(hlsl);
+    char pass[96];
+    fp_alpha_pass_expr(cmp, mrt ? "_rsx_out.t0" : "_rsx_out", pass, sizeof(pass));
     char suffix[512];
     const int n = snprintf(
         suffix, sizeof(suffix),
-        "    float4 _rsx_out = %s;\n"
+        "    %s _rsx_out = %s;\n"
         "    const float _rsx_alpha_ref = fp_alpha.x;\n"
         "    if (!(%s)) discard;\n"
         "    return _rsx_out;\n}\n",
-        output, pass_expr[cmp]);
+        mrt ? "PSOutput" : "float4", output, pass);
     if (n < 0 || (u32)n >= sizeof(suffix))
         return -1;
     const size_t prefix = (size_t)(marker - hlsl);
@@ -999,4 +1178,89 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
         if (w0 & FP_END) break;
     }
     return h;
+}
+
+/* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
+ *
+ * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
+ * TEXELS, not normalised units. ps1_netemu composites the PS1 framebuffer with
+ * exactly that: format 0xE2 (A1R5G5B5 | UNNORM | LINEAR) over a 1024x512
+ * texture, and a quad whose texture coordinates run 1..638 by 2..474 --
+ *
+ *     [uvdbg] unit=0 ps1fb 1024x512 pitch=2048 fmt=0xE2
+ *     [uvdbg]   v0 pos(-1.0 -1.0) tc(1.0000 2.0000)
+ *     [uvdbg]   v2 pos(0.8 0.8)   tc(638.0000 474.0000)
+ *
+ * The bit was only ever masked OUT of the base format so the decoder could
+ * recognise A1R5G5B5, and never honoured for addressing. So the sampler was
+ * handed coordinates hundreds of times out of range, which under clamp lands on
+ * one edge texel for the whole quad -- a flat, uniform result. That is the
+ * black screen: the PS1 renders, the composite pass runs, and it samples one
+ * corner texel.
+ *
+ * D3D12 has no unnormalised addressing mode, so the division has to happen in
+ * the shader. Doing it as a post-pass over the generated HLSL rather than
+ * inside the emitter keeps it beside rsx_fp_apply_alpha_test, which already
+ * works this way, and leaves every non-UNNORM program byte-identical.
+ *
+ * Cube units are skipped: their coordinate is a float3 direction, and
+ * RSX_TEX_FMT_UNNORM has no meaning for one.
+ */
+int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                              const u32 dim[][2], u32 cube_mask)
+{
+    if (!hlsl || !unnorm_mask) return 0;
+    int patched = 0;
+
+    for (u32 u = 0; u < 16; u++) {
+        if (!((unnorm_mask >> u) & 1u)) continue;
+        if ((cube_mask >> u) & 1u) continue;
+        const u32 w = dim[u][0], h = dim[u][1];
+        if (!w || !h) continue;
+
+        /* Both spellings the emitter produces for a 2D unit. */
+        char needles[2][40];
+        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
+        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+
+        for (int nidx = 0; nidx < 2; nidx++) {
+            const char* needle = needles[nidx];
+            const u32 nlen = (u32)strlen(needle);
+            for (;;) {
+                char* at = strstr(hlsl, needle);
+                if (!at) break;
+                /* The '(' of Sample(, then its matching ')'. */
+                char* open = at + nlen - 1;   /* the ',' ... step back to '(' */
+                while (open > at && *open != '(') open--;
+                if (*open != '(') break;
+                int depth = 0;
+                char* p = open;
+                for (; *p; p++) {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') { depth--; if (!depth) break; }
+                }
+                if (*p != ')') break;
+
+                char scale[80];
+                snprintf(scale, sizeof scale, " * float2(%.9g, %.9g)",
+                         1.0 / (double)w, 1.0 / (double)h);
+                const u32 slen = (u32)strlen(scale);
+                const u32 used = (u32)strlen(hlsl);
+                if (used + slen + 1 > hlsl_size) return -1;
+
+                memmove(p + slen, p, used - (u32)(p - hlsl) + 1);
+                memcpy(p, scale, slen);
+                patched++;
+
+                /* Mark this call site done so the next strstr moves past it:
+                 * the inserted text is inside the call, so an unmarked scan
+                 * would find the same site forever. */
+                memcpy(at, "rsx_TEX", 7);
+            }
+        }
+        /* Restore the marker. */
+        for (char* q = hlsl; (q = strstr(q, "rsx_TEX")) != NULL; )
+            memcpy(q, "rsx_tex", 7);
+    }
+    return patched;
 }

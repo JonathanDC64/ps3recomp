@@ -97,6 +97,7 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 #else
   #include <pthread.h>
   #include <unistd.h>
+  #include <time.h>
   typedef pthread_t thread_t;
   typedef pthread_mutex_t mutex_t;
   #define mutex_init(m)    pthread_mutex_init(m, NULL)
@@ -137,9 +138,19 @@ typedef struct {
 } AudioNotifySlot;
 static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
 
+/* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
+static u64            s_audio_start_us = 0;
+
 /* Mixing thread */
+static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
+#ifndef _WIN32
+/* Is s_mix_thread a thread that exists and has not been joined? The Win32
+ * branch asks that of the HANDLE itself, which it nulls after closing;
+ * pthread_t has no such value, so carry the flag. */
+static int           s_mix_thread_live = 0;
+#endif
 static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
@@ -195,6 +206,16 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
                        num_samples * 2 * sizeof(float));
     }
 }
+
+/* SDL queues without bound: keep about four blocks ahead of the device. */
+static int audio_backend_room(void)
+{
+    if (!s_sdl_audio_dev) return -1;
+    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
+           CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+}
+
+static void audio_backend_wait(void) { SDL_Delay(1); }
 
 static u32 audio_backend_queued_samples(void)
 {
@@ -329,9 +350,10 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
 
     UINT32 available = s_wasapi_buf_frames - padding;
-    if (num_samples > available)
+    if (num_samples > available) {
+        g_audio_dropped += num_samples - available;
         num_samples = available;
-
+    }
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
@@ -342,13 +364,29 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     }
 }
 
-static u32 audio_backend_queued_samples(void)
+/* Frames the device can take right now; -1 with no device open. */
+static int audio_backend_room(void)
 {
-    if (!s_wasapi_client) return 0;
+    if (!s_wasapi_client) return -1;
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
-    return padding;
+    const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr)) {
+        /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
+         * change, sleep, ...): pace on the clock rather than spin. */
+        static int _n = 0; if (_n++ < 4)
+            fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
+        return -1;
+    }
+    return (int)(s_wasapi_buf_frames - padding);
 }
+
+/* Block until the device has consumed some of its buffer. */
+static void audio_backend_wait(void)
+{
+    if (s_wasapi_event) WaitForSingleObject(s_wasapi_event, 10);
+    else Sleep(1);
+}
+
 
 #endif /* AUDIO_BACKEND_WASAPI */
 
@@ -460,16 +498,12 @@ static void audio_mix_one_block(void)
          * cleared block is an observable consumption signal for producers. */
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
 
-        /* Advance read index and publish it to the guest-visible counter so the
-         * game can tell how far playback has consumed. The counter is a 64-bit
-         * big-endian value: LBP's audio watchdog reads it with `ld` and compares
-         * the LOW word (`ld r0,0(r11)` / `cmpw r9,r0` at 0x484144), so the live
-         * bits are bytes [4..7]. A 32-bit store here only ever wrote bytes
-         * [0..3] -- the half the game never looks at -- so it saw a frozen index
-         * and tripped "LIBAUDIO DROPOUT - POSITION NO LONGER INCREMENTING". */
+        /* Keep the monotonic counter for tags/timestamps, but publish the
+         * ring slot to the guest. SurMixer multiplies this value by the block
+         * size directly; an unbounded counter walks beyond the audio buffer. */
         port->read_index++;
         if (port->read_idx_addr)
-            vm_write64((u32)port->read_idx_addr, port->read_index);
+            vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -506,7 +540,29 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
+     * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
+     * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
+     * dropped the surplus: 20% of the audio thrown away, and a guest mixer
+     * (GH3's FMOD) that could not keep ahead of the read index played gaps.
+     * With no device, pace on the performance counter instead. */
+    LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+    unsigned long long blocks = 0;
     while (s_mix_thread_running) {
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        if (room < 0) {
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            const long long due = q0.QuadPart +
+                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+            if (now.QuadPart < due) { Sleep(1); continue; }
+            /* More than 50 ms behind (device just went away, a debugger
+             * stop): drop the backlog instead of mixing it in a burst. */
+            if (now.QuadPart - due > qf.QuadPart / 20)
+                q0.QuadPart = now.QuadPart -
+                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+        }
+        blocks++;
         /* Mix and submit one block */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -517,19 +573,30 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
+        { static FILE* _wf = (FILE*)-1;
+          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
+            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
+            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
+              if (!nz) z++; }
+            if (now - t0 >= 5000) {
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
+                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
+                #if AUDIO_BACKEND_WASAPI
+                        (unsigned)s_wasapi_buf_frames, 10);
+#else
+                        0u, 10);
+#endif
+                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
 
         /* Notify event queues */
         audio_notify_event_queues();
-
-        /* Wait approximately one audio period (~5.333ms).
-         * Adjust based on how much is queued to avoid buffer overrun. */
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            Sleep(5);
-        } else {
-            Sleep(2);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -575,6 +642,7 @@ static int audio_start_mix_thread(void)
         s_mix_thread_running = 0;
         return -1;
     }
+    s_mix_thread_live = 1;
 #endif
     return 0;
 }
@@ -589,7 +657,16 @@ static void audio_stop_mix_thread(void)
         s_mix_thread = NULL;
     }
 #else
-    pthread_join(s_mix_thread, NULL);
+    /* Same guard. Init leaves s_audio_initialized set even when the mixing
+     * thread failed to start ("continuing silently" -- a title without audio
+     * still runs), so Quit reaches here with s_mix_thread never assigned.
+     * pthread_t has no null value to test, and joining an unset one, or
+     * joining the same one twice, is undefined rather than an error the way
+     * WaitForSingleObject on a null HANDLE is. */
+    if (s_mix_thread_live) {
+        pthread_join(s_mix_thread, NULL);
+        s_mix_thread_live = 0;
+    }
 #endif
 }
 
@@ -621,6 +698,16 @@ s32 cellAudioInit(void)
         /* Don't fail -- games should still run without audio */
     }
 
+
+#ifdef _WIN32
+    { LARGE_INTEGER f, c;
+      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
+          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
+#else
+    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
+#endif
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -708,23 +795,16 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     u32 buf_samples = (u32)(nblk * CELL_AUDIO_BLOCK_SAMPLES * nch);
     port->buf_size = buf_samples * (u32)sizeof(float);
 
-    /* Audio buffers live in GUEST memory, but the base must be a window NOTHING
-     * else claims. It used to be 0x01000000, commented "free window" -- it is not:
-     * that is where ports put their HLE OPD arena (Tokyo Jungle's HLE_OPD_BASE is
-     * exactly 0x01000000), and the memset below wiped 128 KB of it. Every import
-     * whose OPD lived there began dispatching to a NULL address the moment the
-     * game opened an audio port -- and a null bctr returns with r3 untouched, so
-     * the guest reads its own first argument back as a status code. That is why
-     * Tokyo Jungle reported "failed to set notify queue (23A0)": 0x23A0 was the
-     * key it had just passed in, echoed back by a call that never happened. */
-#define CELL_AUDIO_GUEST_BASE 0x60000000u   /* clear of HLE, heaps, RSX and libsre */
-    static u32 s_audio_guest = CELL_AUDIO_GUEST_BASE;
-    u32 guest_buf  = s_audio_guest;
-    s_audio_guest += (port->buf_size + 0xFFFFFu) & ~0xFFFFFu;
-    u32 guest_ridx = s_audio_guest;
-    s_audio_guest += 0x100000u;
-    /* Not part of the pre-committed main-memory map: commit before touching. */
-    vm_commit(guest_buf, (guest_ridx + 0x100000u) - guest_buf);
+    /* Keep audio outside sys_memory (0x40000000..0x50000000), the HLE heap
+     * (0x50000000..0x58000000), and sys_vm (0x60000000..0x70000000).
+     * Reserve two 1-MB pages per port so reopening reuses its own storage. */
+    u32 guest_buf = 0x58000000u + (u32)found * 0x200000u;
+    u32 guest_ridx = guest_buf + 0x100000u;
+    if (vm_commit(guest_buf, 0x200000u) != CELL_OK) {
+        port->in_use = 0;
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
+    }
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
     memset(port->buffer, 0, port->buf_size);
@@ -756,7 +836,7 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    /* buffer points INTO the guest vm_base arena (bump-allocated in PortOpen),
+    /* buffer points INTO the guest vm_base arena (reserved per port in PortOpen),
      * not a host malloc -- do NOT free() it (that corrupts the host heap).
      * The guest window is reclaimed wholesale when vm_base is released. */
     s_ports[portNum].buffer = NULL;
@@ -805,6 +885,56 @@ s32 cellAudioPortStop(u32 portNum)
     s_ports[portNum].running = 0;
     mutex_unlock(&s_audio_mutex);
 
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
+{
+    uint32_t tag_ea = (uint32_t)(uintptr_t)tag;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!tag_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    AudioPortSlot* port = &s_ports[portNum];
+    u64 nblk = port->param.nBlock ? port->param.nBlock : 1;
+    if (blockNo >= nblk) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PARAM;
+    }
+    u64 t = port->read_index + blockNo - (port->read_index % nblk);
+    if (blockNo < port->read_index % nblk) t += nblk;
+    mutex_unlock(&s_audio_mutex);
+
+    vm_write64(tag_ea, t);
+    return CELL_OK;
+}
+
+s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
+{
+    uint32_t stamp_ea = (uint32_t)(uintptr_t)stamp;
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+    if (!s_ports[portNum].in_use)
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    if (!stamp_ea)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+    u64 global_counter = s_ports[portNum].read_index;
+    mutex_unlock(&s_audio_mutex);
+    if (tag > global_counter)
+        return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
+
+    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    vm_write64(stamp_ea, t);
     return CELL_OK;
 }
 

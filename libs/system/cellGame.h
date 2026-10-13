@@ -80,6 +80,13 @@ extern "C" {
 #define CELL_GAME_ERROR_BROKEN         (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x05)
 #define CELL_GAME_ERROR_INTERNAL       (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x06)
 #define CELL_GAME_ERROR_PARAM          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x07)
+
+/* --- cellHddGame (cellSysutil exports; structs alias the CellGameData ones) --- */
+#define CELL_HDDGAME_RET_OK              0
+#define CELL_HDDGAME_ISNEWDATA_EXIST     0   /* the HDD game dir already exists */
+#define CELL_HDDGAME_ISNEWDATA_NODIR     1
+#define CELL_HDDGAME_ERROR_CBRESULT    (s32)0x8002ba01
+#define CELL_HDDGAME_ERROR_PARAM       (s32)0x8002ba04
 #define CELL_GAME_ERROR_NOAPP          (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x08)
 #define CELL_GAME_ERROR_ACCESS_ERROR   (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x09)
 #define CELL_GAME_ERROR_NOSPACE        (s32)(CELL_ERROR_BASE_SYSUTIL_GAME | 0x20)
@@ -125,6 +132,7 @@ void cellGame_init_from_paramsfo(const char* sfo_path);
 
 /* Central title-id accessor (so other modules don't hardcode placeholders). */
 const char* cellGame_get_title_id(void);
+const char* cellGame_get_title(void);
 
 /* Set the game's title string */
 void cellGame_set_title(const char* title);
@@ -143,6 +151,11 @@ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);
 
+s32 cellGameDataCheckCreate(u32 version, const char* dirName, u32 errDialog,
+                            void* funcStat, u32 container);
+s32 cellHddGameCheck(u32 version, const char* dirName, u32 errDialog,
+                     void* funcStat, u32 container);
+
 s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
                              void* funcStat, u32 container);
 
@@ -160,6 +173,11 @@ s32 cellGameDeleteGameData(const char* dirName);
 s32 cellGameGetSizeKB(s32* sizeKB);
 
 s32 cellGameGetLocalWebContentPath(char* path);
+
+/* Show a system content-error message. type >= 100 means the title exits
+ * right after; the type and dirName are the only record of what it objected
+ * to, so the implementation logs them. */
+s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName);
 
 #ifdef __cplusplus
 }

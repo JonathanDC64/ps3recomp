@@ -18,6 +18,12 @@ u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c;(void)ch; u128 z; memset(&z
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c;(void)ch;(void)v; }
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c;(void)ch; return 1; }
 
+/* The rest of the runtime the interpreter reaches: probes off, nothing lifted. */
+int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_smc_watch;
+spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(void)a; return 0; }
+void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
+void spu_ls_watch_slow(uint32_t l, int w, const uint8_t* p, uint32_t pc, uint32_t lr) { (void)l;(void)w;(void)p;(void)pc;(void)lr; }
+
 /* .text of the assembled snippet (big-endian words, verbatim). */
 static const unsigned char PROG[] = {
     0x40,0x80,0x02,0x82, 0x40,0x80,0x03,0x83, 0x18,0x00,0xc1,0x04,
@@ -28,6 +34,7 @@ static const unsigned char PROG[] = {
 int main(void) {
     static spu_context ctx;
     memset(&ctx, 0, sizeof ctx);
+    spu_context_init(&ctx, 0);          /* ls points at ls_store */
     memcpy(ctx.ls, PROG, sizeof PROG);
     ctx.gpr[1]._u32[0] = 0x100;   /* stack pointer (store target base) */
 
@@ -57,11 +64,21 @@ int main(void) {
     };
     static spu_context lc;
     memset(&lc, 0, sizeof lc);
+    spu_context_init(&lc, 0);
     memcpy(lc.ls, LOOP, sizeof LOOP);
     spu_dispatch(&lc, 0);                 /* enters via the computed-branch entry point */
     printf("loop r2=%u stop=0x%X\n", lc.gpr[2]._u32[0], lc.stop_code);
     assert(lc.gpr[2]._u32[0] == 5);       /* loop terminated at the bound */
     assert(lc.status == SPU_STATUS_STOPPED_BY_STOP);
+
+    /* --- a drain's return point is a rejoin point: il $2,5 then il $3,7 at
+     * stop at 4 -- the interpreter must stop before the second il. */
+    static spu_context dc;
+    memset(&dc, 0, sizeof dc);
+    spu_context_init(&dc, 0);
+    memcpy(dc.ls, PROG, sizeof PROG);
+    spu_interp_run_until(&dc, 0, 4);
+    assert(dc.pc == 4 && dc.gpr[2]._u32[0] == 5 && dc.gpr[3]._u32[0] == 0);
 
     printf("spu_interp_selftest: PASS\n");
     return 0;

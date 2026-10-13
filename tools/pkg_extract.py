@@ -15,6 +15,9 @@ pure-Python AES now finishes in seconds. Usage:
 import hashlib, os, struct, sys
 
 PS3_GPKG_KEY = bytes.fromhex("2e7b71d7c9c9a14ea3221f188828b8f8")
+# PSP/PS1-Classic packages (pkg_type==2, ext-header key_type 1) use the same
+# CTR construction with a different key.
+PSP_PKG_KEY  = bytes.fromhex("07f2c68290b50d2c33818d709b60e62b")
 
 try:                                    # fast C AES; a project dependency (requirements.txt)
     from Crypto.Cipher import AES as _AES
@@ -89,16 +92,24 @@ def _ecb_encrypt(key: bytes, blocks: bytes) -> bytes:
 def _keystream(used, riv, hdr60, start_block, nblocks) -> bytes:
     """Keystream for blocks [start_block, start_block+nblocks) -- seekable, so only the
     range we actually XOR is generated."""
-    if used == "finalized":
+    if used in ("finalized", "psp"):
         base = int.from_bytes(riv, "big")
         ctrs = b"".join(((base + start_block + i) & ((1 << 128) - 1)).to_bytes(16, "big")
                         for i in range(nblocks))
-        return _ecb_encrypt(PS3_GPKG_KEY, ctrs)
-    base = int.from_bytes(hdr60[0x38:0x40], "big")
+        return _ecb_encrypt(PS3_GPKG_KEY if used == "finalized" else PSP_PKG_KEY, ctrs)
+    # Debug/non-finalized: SHA-1 keystream over a 0x40-byte block built from the
+    # 16-byte QA digest at header 0x60 as qa[0:8] qa[0:8] qa[8:16] qa[8:16], the
+    # rest zero, with the block index in the last 8 bytes. (Matches RPCS3's
+    # PKGLoader; hashing the raw 0x40 bytes at 0x60 instead does not decrypt.)
+    qa = hdr60[0x00:0x10]
     out = bytearray()
     for i in range(nblocks):
-        k = bytearray(hdr60)
-        k[0x38:0x40] = ((base + start_block + i) & ((1 << 64) - 1)).to_bytes(8, "big")
+        k = bytearray(0x40)
+        k[0x00:0x08] = qa[0:8]
+        k[0x08:0x10] = qa[0:8]
+        k[0x10:0x18] = qa[8:16]
+        k[0x18:0x20] = qa[8:16]
+        k[0x38:0x40] = ((start_block + i) & ((1 << 64) - 1)).to_bytes(8, "big")
         out += hashlib.sha1(bytes(k)).digest()[:0x10]
     return bytes(out)
 
@@ -155,6 +166,15 @@ def main():
     def parse_table(used):
         hdr_len = min(data_size, item_count * 0x20 + (1 << 20))   # entries + name area
         dec = decrypt_range(used, 0, hdr_len)
+        # A PSP/PS1-Classic package mixes both keys: the entry structs are PSP-keyed,
+        # but each entry's *name and payload* pick their key from bit 28 of its flags
+        # (set -> PSP key, clear -> PS3 key). A plain PS3 package never sets bit 28,
+        # so the same rule leaves it on the PS3 key throughout.
+        alt = {used: dec}
+        def with_key(k, off, n):
+            if k not in alt:
+                alt[k] = decrypt_range(k, 0, hdr_len)
+            return alt[k][off:off + n]
         names = []
         for i in range(item_count):
             e = dec[i * 0x20:(i + 1) * 0x20]
@@ -162,14 +182,16 @@ def main():
                 return None
             no, ns = struct.unpack(">II", e[:8])
             fo, fs = struct.unpack(">QQ", e[8:0x18])
-            nm = dec[no:no + ns]
+            flags = struct.unpack(">I", e[0x18:0x1C])[0]
+            k = used if used == "debug" else ("psp" if flags & 0x10000000 else "finalized")
+            nm = with_key(k, no, ns)
             if not nm or any(c < 0x20 or c > 0x7E for c in nm):
                 return None
-            names.append((nm.decode(), fo, fs))
+            names.append((nm.decode(), fo, fs, k))
         return names
 
     used = None
-    for cand in (("debug" if rev == 0 else "finalized"), "finalized", "debug"):
+    for cand in (("debug" if rev == 0 else "finalized"), "finalized", "psp", "debug"):
         names = parse_table(cand)
         if names:
             used = cand
@@ -178,13 +200,20 @@ def main():
     print(f"rev=0x{rev:04X} keystream={used} items={item_count}"
           f"{'  (pycryptodome)' if _HAVE_PYCRYPTO else '  (pure-python AES)'}")
 
+    # --list: the file table alone. Decrypting a multi-GB package to find out what is
+    # in it is a slow way to ask a cheap question.
+    if "--list" in sys.argv:
+        for nm, fo, fs, k in names:
+            print(f"  {fs:>12}  {nm}  [{k}]")
+        return
+
     os.makedirs(outd, exist_ok=True)
-    for nm, fo, fs in names:
+    for nm, fo, fs, k in names:
         if only and os.path.basename(nm) != only:
             continue
         if fs <= 0:
             continue
-        blob = decrypt_range(used, fo, fs)
+        blob = decrypt_range(k, fo, fs)
         op = out_path(outd, nm)
         os.makedirs(os.path.dirname(op), exist_ok=True)
         open(op, "wb").write(blob)

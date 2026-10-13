@@ -22,7 +22,7 @@ TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 
 from ppu_disasm import Instruction                  # noqa: E402
-from ppu_lifter import PPULifter, LiftedFunction    # noqa: E402
+from ppu_lifter import PPULifter, LiftedFunction, _last_line_is_terminator  # noqa: E402
 
 
 def emit(mnemonic: str, operands: str = "") -> str:
@@ -51,7 +51,16 @@ def main() -> int:
     # The CTR-based call it mirrors, unchanged.
     assert bctrl == "ps3_indirect_call(ctx); DRAIN_TRAMPOLINE(ctx);", bctrl
 
-    print("ok: blr returns; blrl/bnelrl dispatch via LR and continue")
+    # A chunk that ends on a conditional branch falls through when it is not
+    # taken, so it needs the fall-through tail; an unconditional one does not.
+    bdnz = emit("bdnz", "0x1000")
+    assert bdnz.startswith("if ("), bdnz
+    assert not _last_line_is_terminator([f"    {bdnz}"]), bdnz
+    assert _last_line_is_terminator(["    goto loc_00001000;"])
+    assert _last_line_is_terminator(["    return;"])
+
+    print("ok: blr returns; blrl/bnelrl dispatch via LR and continue; "
+          "conditional branches fall through")
     return 0
 
 

@@ -23,11 +23,11 @@ fingerprint computed here is byte-identical to runtime/spu/spu_workload.c's
 spu_workload_fingerprint() over spu_elf_image_size() bytes, so registrations and
 the images the title passes to cellSpurs line up.
 
-Example (LittleBigPlanet, 23 images):
+Example:
   python tools/build_spu_workloads.py \
-      --images lbp_spu --lifted lbp_spu/lifted \
-      --out lbp/gen/spu_workloads.c \
-      --register-fn lbp_spu_register_all --constructor --title lbp
+      --images <port>/spu/images --lifted <port>/spu \
+      --out <port>/spu/spu_workloads.c \
+      --register-fn port_spu_register_all --constructor --title <port>
 """
 import argparse, glob, os, re, subprocess, sys
 
@@ -59,6 +59,19 @@ def fnv1a64(b):
     for x in b:
         h = ((h ^ x) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return h
+
+def text_fp(b):
+    """Fingerprint of the executable PT_LOAD's file bytes -- what lands in local
+    store. A raw SPU whose program the PPU streams in by proxy DMA never hands
+    the runtime the ELF, only these bytes (runtime/spu/spu_raw.c)."""
+    phoff, phes, phn = be32(b, 0x1C), be16(b, 0x2A), be16(b, 0x2C)
+    for i in range(phn):
+        o = phoff + i * phes
+        if be32(b, o) == 1 and be32(b, o + 0x18) & 1:
+            off, fsz = be32(b, o + 4), be32(b, o + 0x10)
+            return fnv1a64(b[off:off + fsz])
+    return None
+
 
 def is_spu_elf(b):
     return (len(b) >= 0x34 and b[0:4] == b"\x7fELF"
@@ -96,6 +109,15 @@ def main():
                     help="name of the emitted registration function")
     ap.add_argument("--title", default="spu", help="label used in comments")
     ap.add_argument("--lifter", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "spu_lifter.py"))
+    ap.add_argument("--extra-funcs", action="append", default=[],
+                    metavar="IMAGE=ADDR[,ADDR...]",
+                    help="Extra function entry addresses for one image, passed "
+                         "through to spu_lifter --extra-funcs. Repeatable. An SPU "
+                         "image entered by an INTERRUPT VECTOR needs this: the "
+                         "handler is not reachable from the entry point by any "
+                         "branch, so --auto-functions cannot see it, and dispatch "
+                         "to it lands on address 0 at runtime. "
+                         "e.g. --extra-funcs pm_wwsjob=0xA2C")
     ap.add_argument("--constructor", action="store_true",
                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
@@ -107,7 +129,15 @@ def main():
     if not elfs:
         sys.exit(f"[build_spu_workloads] no *.elf in {args.images}")
 
+    extra_funcs = {}
+    for spec in args.extra_funcs:
+        if "=" not in spec:
+            sys.exit(f"[build_spu_workloads] --extra-funcs wants IMAGE=ADDR, got {spec!r}")
+        k, v = spec.split("=", 1)
+        extra_funcs[k.strip()] = v.strip()
+
     imgs = []  # (img, prefix, fingerprint, e_entry)
+    text_fps = {}  # img -> executable-segment fingerprint
     for e in elfs:
         b = open(e, "rb").read()
         if not is_spu_elf(b):
@@ -122,6 +152,9 @@ def main():
             os.makedirs(outdir, exist_ok=True)
             cmd = [sys.executable, args.lifter, e, "--auto-functions", e,
                    "--symbol-prefix", prefix, "-o", outdir]
+            if img in extra_funcs:
+                cmd += ["--extra-funcs", extra_funcs[img]]
+                print(f"[build_spu_workloads] {img}: extra entries {extra_funcs[img]}")
             print(f"[build_spu_workloads] LIFT {img}  (prefix {prefix})")
             if subprocess.run(cmd).returncode != 0:
                 sys.exit(f"[build_spu_workloads] lift FAILED for {img}")
@@ -133,6 +166,7 @@ def main():
         sz = img_size(b)
         e_entry = be32(b, 0x18)
         imgs.append((img, prefix, fnv1a64(b[:sz]), e_entry))
+        text_fps[img] = text_fp(b)
 
     if not imgs:
         sys.exit("[build_spu_workloads] no SPU images lifted")
@@ -168,6 +202,8 @@ def main():
     for i, (img, prefix, fp, ent) in enumerate(imgs, 1):
         L.append(f"    spu_begin_image({i}); {prefix}spu_recomp_register();")
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
+        if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
+            L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

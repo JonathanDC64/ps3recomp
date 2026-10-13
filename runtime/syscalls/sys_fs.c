@@ -3,6 +3,7 @@
  */
 
 #include "sys_fs.h"
+#include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@
 #else
   #include <unistd.h>
   #include <dirent.h>
+  #include <time.h>     /* nanosleep: the delay in the open-retry loop */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -93,8 +95,22 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     if (!path || !*path || stat(path, &st) == 0)
         return;
     char* p = strstr(path, "/PS3_GAME/");
-    if (!p)
+    if (!p) {
+        /* The reverse: sys_fs flattens any "USRDIR/" path to <root>/USRDIR/...,
+         * which misses on a disc-layout tree. GH3's Bink movies (ATVI, INTRO --
+         * the attract loop) opened as <root>/USRDIR/DATA/MOVIES and failed. */
+        char* u = strstr(path, "/USRDIR/");
+        if (!u) u = strstr(path, "\\USRDIR\\");
+        if (!u) return;
+        char alt[1024];
+        size_t head = (size_t)(u - path);
+        if (head + 10 + strlen(u) >= sizeof alt) return;
+        memcpy(alt, path, head);
+        snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
+        fs_normalize_sep(alt);
+        if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
         return;
+    }
     char alt[1024];
     size_t head = (size_t)(p - path);
     if (head + 1 >= sizeof alt)
@@ -128,6 +144,21 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
+    /* /dev_flash is FIRMWARE, not game data. ppu_fs.cpp serves it from a real
+     * dev_flash tree ($PS3_DEV_FLASH); this layer was missing the same branch, so
+     * a firmware path opened through the raw syscall resolved to <root>/... and
+     * missed. ps1_netemu loads its PS1 BIOS as /dev_flash/ps1emu/ps1_rom.bin and
+     * refuses to boot without it. Keep both halves of the split filesystem agreed. */
+    {
+        static const char* fw = NULL; static int fw_init = 0;
+        if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
+        if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", fw, ps3_path + 11);
+            fs_normalize_sep(host_path);
+            return;
+        }
+    }
+
     /* Strip a known mount prefix so this sys_fs layer resolves to the SAME host
      * tree as the cellFs layer (ppu_fs.cpp host_path). Previously /dev_bdvd/X
      * mapped to <root>/dev_bdvd/X -- a directory that doesn't exist -- so a title
@@ -150,6 +181,18 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * not, so they fall through to sagemono's mount-prefix stripping below. */
     const char* usrp = strstr(ps3_path, "USRDIR/");
     if (usrp) {
+        /* PS3_USRDIR_BASE: a title installed as a full /dev_hdd0/game/<ID> tree
+         * keeps its USRDIR there, not at the vfs root, so the flattening above
+         * sends it to a directory that does not exist. ps1_netemu writes its
+         * settings with a bare "/USRDIR/CONFIG" and read them back the same way;
+         * both missed, and it printed "save config file: /USRDIR/CONFIG" /
+         * "failed" on every boot. Opt-in so flattened trees keep the old path. */
+        const char* ub = getenv("PS3_USRDIR_BASE");
+        if (ub && *ub) {
+            snprintf(host_path, (size_t)host_path_size, "%s/%s", ub, usrp);
+            fs_normalize_sep(host_path);
+            return;
+        }
         rel = usrp;                        /* "USRDIR/..." */
     } else {
         /* Otherwise strip a known mount prefix so this sys_fs layer resolves to the
@@ -265,6 +308,14 @@ int64_t sys_fs_open(ppu_context* ctx)
         }
     } }
 
+    /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
+     * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
+     * returns plaintext. Decrypt once into a cache file and open that instead, so
+     * every read/seek/stat path below stays unchanged. (libs/filesystem/edat.c) */
+    { char dec_path[1200];
+      const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
+      if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
+
     /* Find free fd slot */
     int slot = -1;
     for (int i = 0; i < SYS_FS_FD_MAX; i++) {
@@ -335,6 +386,13 @@ int64_t sys_fs_open(ppu_context* ctx)
         for (int _r = 0; !fp && _r < 3000; _r++) {
 #ifdef _WIN32
             Sleep(1);
+#else
+            /* The delay is the retry. 3000 iterations is meant to be about
+             * three seconds of waiting for a transient share lock or handle
+             * pressure to clear; without it the loop spends microseconds
+             * calling fopen 3000 times on a condition that has not changed,
+             * and the recovery this exists for never happens. */
+            { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
 #endif
             fp = fopen(host_path, mode);
         }
@@ -408,14 +466,37 @@ int64_t sys_fs_read(ppu_context* ctx)
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
+    /* The VM commits pages on first user-mode touch; a read the CRT hands to
+     * the kernel (anything past its 4 KB buffer) into a still-reserved page
+     * fails instead, and fread comes back short. GH3's Bink reader saw that
+     * as a read error on every movie and never decoded a frame -- solid green
+     * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
+    if (size) vm_commit(buf_addr, (uint32_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
+
+    /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
+     *
+     * The PS1 title under test streams its intro movie off the disc image and
+     * never stops -- 560 s undriven and the blit counter is still climbing. If
+     * the offsets here keep advancing, the stream is progressing and the movie
+     * genuinely has not reached its end; if they repeat, the disc read is stuck
+     * and the movie is looping over the same sectors forever. Those need
+     * opposite fixes and nothing else distinguishes them. */
+    { static int s_ft = -1;
+      if (s_ft < 0) { const char* e = getenv("PS3_FSTRACE");
+                      s_ft = e ? (atoi(e) > 0 ? atoi(e) : 200) : 0; }
+      if (s_ft) { static unsigned long fn;
+          if ((++fn % (unsigned long)s_ft) == 0)
+              fprintf(stderr, "[fs] n=%lu fd=%d off=%ld size=%llu -> %llu\n",
+                      fn, fd, pos_before, (unsigned long long)size,
+                      (unsigned long long)nread); } }
 
     if (nread_addr != 0) {
         write_be64(nread_addr, (uint64_t)nread);
     }
 
     /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
-     * not go through the cellFs HLE), so YDKJ_FSDBG in ppu_fs.cpp never fires. */
+     * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
     { extern char* getenv(const char*);
       if (getenv("FLOW_FSDBG")) {
         const unsigned char* b = (const unsigned char*)buf;

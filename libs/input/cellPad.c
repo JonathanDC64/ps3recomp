@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 
 /* ---------------------------------------------------------------------------
@@ -78,6 +79,8 @@ static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
 static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+/* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
+static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
@@ -110,6 +113,80 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     if (val > 255) val = 255;
     return (u8)val;
 }
+
+/* Keyboard fallback for port 0.
+ *
+ * The only backend here is XInput, so on a machine with no controller plugged
+ * in a title gets a pad that is reported present and never presses anything --
+ * it can be watched but not played. That is what The Simpsons Arcade Game hit:
+ * it reached its attract loop and no input existed to start a game.
+ *
+ * Only fills in for port 0, only when XInput found nothing there, so a real
+ * controller always wins and nothing changes for a port that has one. Keys are
+ * read only while a window of THIS process is in the foreground, so typing in
+ * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
+ * disable it entirely.
+ *
+ * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+ * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+ * so a title that reads the stick instead is playable too. */
+#ifdef _WIN32
+static int pad_host_window_focused(void)
+{
+    HWND fg = GetForegroundWindow();
+    if (!fg) return 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void pad_poll_keyboard(void)
+{
+    static int off = -1;
+    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    if (off) return;
+
+    PadHostState* hs = &s_host_state[0];
+    if (!pad_host_window_focused()) {
+        /* Release everything on focus loss, or a key held while alt-tabbing
+         * would stay down forever. */
+        hs->buttons = 0;
+        hs->analog_lx = hs->analog_ly = 128;
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->connected = 1;
+        return;
+    }
+
+    static const struct { int vk; u16 btn; } map[] = {
+        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
+        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
+        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
+    };
+
+    u16 btns = 0;
+    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+
+    hs->buttons   = btns;
+    hs->connected = 1;
+    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    hs->analog_rx = hs->analog_ry = 128;
+    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+
+    { static int said = 0;
+      if (!said && btns) { said = 1;
+          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          fflush(stdout); } }
+}
+#endif
 
 static void pad_poll_xinput(void)
 {
@@ -317,57 +394,53 @@ static void pad_shutdown_backend(void)
  * Poll dispatcher
  * -----------------------------------------------------------------------*/
 
-#ifdef _WIN32
-/* Keyboard fallback (default on): when no XInput controller occupies port 0
- * (e.g. a DualSense over Bluetooth, which isn't XInput), present port 0 as a
- * connected pad driven by the keyboard, so menus/dialogs are usable without a
- * controller. GetAsyncKeyState is global (no window focus needed). Disable with
- * DES_NO_KBD=1. Keymap printed once. */
-static void pad_poll_keyboard(void)
+/* Re-poll the host at most every PAD_POLL_INTERVAL_MS; serve cached state in
+ * between.
+ *
+ * XInputGetState is a driver call, and on a slot with nothing plugged in it is
+ * an expensive one: measured at 97.6 us for a sweep of the 7 host ports on a
+ * machine with no controller attached. cellPadGetData ran that sweep on EVERY
+ * call, and a guest that polls the pad from a spin loop -- The Simpsons Arcade
+ * Game does, in its input stage -- therefore spends its whole main thread
+ * inside the input driver.
+ *
+ * 4 ms is 250 Hz, well above the 60 Hz a title can actually observe (and above
+ * a real DualShock 3's own report rate), so no game can tell the difference,
+ * including one sampling for button-press edges. */
+#define PAD_POLL_INTERVAL_MS 4
+
+static unsigned long long pad_now_ms(void)
 {
-    static int dis = -1;
-    if (dis < 0) { dis = getenv("DES_NO_KBD") ? 1 : 0;
-        if (!dis) fprintf(stderr, "[cellPad] keyboard fallback ON (port 0): "
-            "Enter=START  Space/J=CROSS(X)  K=CIRCLE(O)  L=TRIANGLE  H=SQUARE  "
-            "Arrows=Dpad  RShift=SELECT  U=L1 I=R1  (DES_NO_KBD=1 to disable)\n"); }
-    if (dis) return;
-    if (s_host_state[0].connected) return;   /* a real XInput pad owns port 0 */
-
-    #define KD(vk) ((GetAsyncKeyState(vk) & 0x8000) != 0)
-    u16 b = 0;
-    if (KD(VK_RETURN))                 b |= CELL_PAD_CTRL_START;
-    if (KD(VK_RSHIFT))                 b |= CELL_PAD_CTRL_SELECT;
-    if (KD(VK_UP))                     b |= CELL_PAD_CTRL_UP;
-    if (KD(VK_DOWN))                   b |= CELL_PAD_CTRL_DOWN;
-    if (KD(VK_LEFT))                   b |= CELL_PAD_CTRL_LEFT;
-    if (KD(VK_RIGHT))                  b |= CELL_PAD_CTRL_RIGHT;
-    if (KD('J') || KD(VK_SPACE))       b |= CELL_PAD_CTRL_CROSS;
-    if (KD('K'))                       b |= CELL_PAD_CTRL_CIRCLE;
-    if (KD('L'))                       b |= CELL_PAD_CTRL_TRIANGLE;
-    if (KD('H'))                       b |= CELL_PAD_CTRL_SQUARE;
-    if (KD('U'))                       b |= CELL_PAD_CTRL_L1;
-    if (KD('I'))                       b |= CELL_PAD_CTRL_R1;
-    #undef KD
-
-    s_host_state[0].connected = 1;
-    s_host_state[0].analog_lx = s_host_state[0].analog_ly = 128;
-    s_host_state[0].analog_rx = s_host_state[0].analog_ry = 128;
-    { static u16 prev = 0; if (b != prev) { prev = b;
-        if (b) fprintf(stderr, "[cellPad] KBD port 0 buttons=0x%04X (D1=0x%02X D2=0x%02X)\n",
-                       (unsigned)b, (unsigned)(b & 0xFF), (unsigned)((b >> 8) & 0xFF)); } }
-    s_host_state[0].buttons = b;
-}
+#ifdef _WIN32
+    return (unsigned long long)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull +
+           (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
+}
 
 static void pad_poll_backend(void)
 {
+    /* Benign race: two threads may poll in the same tick. That costs one extra
+     * sweep, never a missed or stale-forever read. */
+    static unsigned long long s_last_ms = 0;
+    unsigned long long now = pad_now_ms();
+    if (s_last_ms && now - s_last_ms < PAD_POLL_INTERVAL_MS) return;
+    s_last_ms = now;
+    /* A real pad streams reports at roughly this rate whether or not anything
+     * changed, and libpad buffers them; a fresh sweep is a fresh report for
+     * every port. cellPadGetData hands each one out exactly once. */
+    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
+
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    pad_poll_keyboard();   /* fork 053a7c6: keyboard fallback when no XInput pad */
+    if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
 }
 
@@ -382,11 +455,15 @@ s32 cellPadInit(u32 max_connect)
     if (s_pad_initialized)
         return CELL_PAD_ERROR_ALREADY_OPENED;
 
-    if (max_connect == 0 || max_connect > CELL_PAD_MAX_PORT_NUM)
+    /* The bound is the 127-slot pad table, not the 7 ports: larger requests
+     * are accepted and clamped. Resistance: Fall of Man asks for 8; rejected,
+     * the library stayed closed, every GetInfo failed and the title never
+     * polled the pad -- stuck on "Press the START button". */
+    if (max_connect == 0 || max_connect > 127)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_pad_initialized = 1;
-    s_max_connect = max_connect;
+    s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
 
@@ -504,8 +581,12 @@ skip_inject: ;
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
-    data->button[0] = (u16)len;
-    data->button[1] = 0; /* reserved */
+    /* button[0] is reserved and 0 on hardware; button[1] carries the pad mode
+     * in its high nibble (0x7) and len/2 in its low one. GH3 drops any packet
+     * whose button[0] is non-zero -- with len (8) there, every press was
+     * received and thrown away, and "Press any button" never advanced. */
+    data->button[0] = 0;
+    data->button[1] = (u16)(0x70 | ((len / 2) & 0xF));
 
     /* Digital buttons. hs->buttons packs both halves into one 16-bit mask
      * (SELECT=bit0..LEFT=bit7 = DIGITAL1; L2=bit8..SQUARE=bit15 = DIGITAL2).
@@ -515,17 +596,104 @@ skip_inject: ;
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
 
-    /* LBP_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
+    /* PAD_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
      * seconds of polling so boot screens that wait for input advance without a
      * human at the pad. Env-gated test scaffolding, off by default. */
     { static int s_ap = -1; static unsigned s_apn = 0;
-      if (s_ap < 0) s_ap = getenv("LBP_AUTOPRESS") ? 1 : 0;
+      if (s_ap < 0) s_ap = getenv("PAD_AUTOPRESS") ? 1 : 0;
       if (s_ap && port_no == 0) {
           unsigned ph = s_apn++ % 240;
           if (ph < 12)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= 0x40;   /* CROSS */
           else if (ph >= 120 && ph < 132)
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
+      } }
+
+    /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a
+     * given wall-clock second, each held ~250 ms. PAD_AUTOPRESS only pulses
+     * CROSS and START, which is enough to clear a "press start" screen but not
+     * to navigate a menu: You Don't Know Jack needs DOWN to move off its name
+     * field before CROSS means anything. Masks are CELL_PAD_CTRL_* packed as
+     * (DIGITAL2 << 8) | DIGITAL1: START 0x0008, UP 0x0010, DOWN 0x0040,
+     * LEFT 0x0080, RIGHT 0x0020, CROSS 0x4000, CIRCLE 0x2000, TRIANGLE 0x1000.
+     * Legit input simulation on the same footing as PAD_AUTOPRESS/PAD_STICK. */
+    { static int s_sc = -1;
+      static struct { double t; unsigned mask; } ev[32]; static int n_ev = 0;
+      static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
+      if (s_sc < 0) {
+          s_sc = 0;
+          const char* e = getenv("PAD_SCRIPT");
+          if (e && *e) {
+              s_sc = 1; t0 = GetTickCount64();
+              const char* p = e;
+              while (*p && n_ev < 32) {
+                  double t = strtod(p, (char**)&p);
+                  if (*p == ':') p++;
+                  unsigned m = (unsigned)strtoul(p, (char**)&p, 0);
+                  ev[n_ev].t = t; ev[n_ev].mask = m; n_ev++;
+                  while (*p == ',' || *p == ' ') p++;
+              }
+              printf("[cellPad] PAD_SCRIPT: %d event(s)\n", n_ev);
+          }
+      }
+      if (s_sc && port_no == 0) {
+          double now = (double)(GetTickCount64() - t0) / 1000.0;
+          /* Latch, do not window. A fixed time window is missed whenever the
+           * title stops polling the pad for longer than the window (it does
+           * exactly that on a loading screen), so the press silently never
+           * happens. Fire on the first poll at or after the event time and
+           * hold it for a fixed number of polls, which is what a real press
+           * looks like regardless of poll rate. */
+          static int fired[32], held[32];
+          for (int i = 0; i < n_ev; i++) {
+              if (!fired[i] && now >= ev[i].t) { fired[i] = 1; held[i] = 40; }
+              if (held[i] > 0) {
+                  held[i]--;
+                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(ev[i].mask & 0xFF);
+                  data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((ev[i].mask >> 8) & 0xFF);
+                  static int said[32];
+                  if (!said[i]) { said[i] = 1;
+                      printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
+              }
+          }
+      } }
+
+    /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
+     * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
+     * of polls and empty the file. A driver outside the process can then look
+     * at the log or a frame dump, decide which screen the title is on, and
+     * write the next button -- which a fixed time schedule cannot do, because
+     * a menu system with several screens wanders when driven blind.
+     *
+     *   echo 0x0008 > pad.txt    # START
+     *   echo 0x4000 > pad.txt    # CROSS
+     *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
+     *                            # long hold; the default is 40)
+     */
+    { static int s_pf = -1; static char pf_path[512];
+      static unsigned held_mask = 0; static int held_n = 0;
+      if (s_pf < 0) { const char* e = getenv("PAD_FILE");
+                      s_pf = (e && *e) ? 1 : 0;
+                      if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
+      if (s_pf && port_no == 0) {
+          if (held_n <= 0) {
+              FILE* f = fopen(pf_path, "rb");
+              if (f) {
+                  char buf[64]; buf[0] = 0;
+                  if (fgets(buf, sizeof buf, f)) {
+                      char* rest;
+                      unsigned m = (unsigned)strtoul(buf, &rest, 0);
+                      int n = (int)strtol(rest, 0, 0);
+                      if (m) { held_mask = m; held_n = n > 0 ? n : 40;
+                               printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
+                  }
+                  fclose(f);
+                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+              }
+          }
+          if (held_n > 0) { held_n--;
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(held_mask & 0xFF);
+              data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
       } }
 
     /* Analog sticks */
@@ -536,13 +704,17 @@ skip_inject: ;
      * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
     { static int s_st = -1;
       static unsigned char s_v[4] = {128,128,128,128};
+      /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
+       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
+      static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
+      if (!s_t0) s_t0 = GetTickCount64();
       if (s_st < 0) { const char* e = getenv("PAD_STICK");
         s_st = e ? 1 : 0;
         if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d", &a,&b,&c,&d);
+                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+      if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
@@ -591,6 +763,27 @@ skip_inject: ;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_R1]       = hs->press_r1;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_L2]       = hs->trigger_l2;
         data->button[CELL_PAD_BTN_OFFSET_PRESS_R2]       = hs->trigger_r2;
+        /* A button whose digital bit is set reads full pressure. Injected
+         * input (PAD_FILE/PAD_SCRIPT/PAD_AUTOPRESS, keyboard) only sets the
+         * digital bits, and the host values above zeroed any pressure it had
+         * written -- so a title keying its menus off the pressure words (GH3,
+         * Tornado Outbreak's title screen) never saw the press. */
+        static const struct { u8 word; u8 bit; u8 off; } pm[] = {
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x20, CELL_PAD_BTN_OFFSET_PRESS_RIGHT },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x80, CELL_PAD_BTN_OFFSET_PRESS_LEFT },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x10, CELL_PAD_BTN_OFFSET_PRESS_UP },
+            { CELL_PAD_BTN_OFFSET_DIGITAL1, 0x40, CELL_PAD_BTN_OFFSET_PRESS_DOWN },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x10, CELL_PAD_BTN_OFFSET_PRESS_TRIANGLE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x20, CELL_PAD_BTN_OFFSET_PRESS_CIRCLE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x40, CELL_PAD_BTN_OFFSET_PRESS_CROSS },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x80, CELL_PAD_BTN_OFFSET_PRESS_SQUARE },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x04, CELL_PAD_BTN_OFFSET_PRESS_L1 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x08, CELL_PAD_BTN_OFFSET_PRESS_R1 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x01, CELL_PAD_BTN_OFFSET_PRESS_L2 },
+            { CELL_PAD_BTN_OFFSET_DIGITAL2, 0x02, CELL_PAD_BTN_OFFSET_PRESS_R2 } };
+        for (unsigned k = 0; k < sizeof pm / sizeof pm[0]; k++)
+            if ((data->button[pm[k].word] & pm[k].bit) && data->button[pm[k].off] < 255)
+                data->button[pm[k].off] = 255;
     }
 
     /* Sensor data (only meaningful if SENSOR_ON) */
@@ -604,6 +797,38 @@ skip_inject: ;
     }  /* end connected block */
 
 emit:
+    /* A non-zero len means "here is a CHANGE packet" -- the constant is literally
+     * named CELL_PAD_LEN_CHANGE_DEFAULT. Hardware reports len = 0 once the port
+     * has nothing new, and titles DRAIN on that: The Simpsons Arcade Game's
+     * input stage is
+     *
+     *     while (cellPadGetData(port, &d) == CELL_OK && d.len > 0) { ... }
+     *
+     * (func_0013CFA8, loop 0x13D648 -> 0x13D040). Reporting a change on every
+     * call made that loop infinite: the main thread pegged one core inside
+     * libpad and the title never got past its first rendered screen.
+     *
+     * So hand out one packet per host report and report len = 0 for any read
+     * after that until the next one arrives (pad_poll_backend sets the flag when
+     * it actually re-polls, every PAD_POLL_INTERVAL_MS). That is what the
+     * hardware does: a pad streams reports at a fixed rate whether or not
+     * anything changed, and libpad buffers them.
+     *
+     * Reporting only on CHANGE instead is wrong and was tried: a HELD button
+     * produces exactly one packet, so a title that reads button[] only when
+     * len > 0 sees the press for a single frame and then sees nothing. In this
+     * game that came out as jump being the only control that seemed to work and
+     * attack firing once.
+     *
+     * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+    {
+        static int always = -1;
+        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
+        if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
+            if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
+            else                        s_data_fresh[port_no] = 0;
+        }
+    }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
@@ -616,7 +841,8 @@ emit:
 /* cellPadGetInfo (v1 API, NID 0x3AAAD464) — used by PSL1GHT's ioPadGetInfo.
  * Layout (RPCS3 cellPad.h CellPadInfo, all big-endian):
  *   +0x00 u32 max_connect        +0x04 u32 now_connect   +0x08 u32 system_info
- *   +0x0C u16 vendor_id[7]       +0x1A u16 product_id[7] +0x28 u8 status[7]
+ *   +0x0C u16 vendor_id[127]     +0x10A u16 product_id[127] +0x208 u8 status[127]
+ *   (CELL_MAX_PADS / PSL1GHT MAX_PADS = 127 -- NOT 7; see below)
  * Leaving this unimplemented let the guest read stack garbage as pad state and
  * run off into the weeds before ever reaching gcm init. */
 s32 cellPadGetInfo(CellPadInfo2* info)
@@ -629,19 +855,33 @@ s32 cellPadGetInfo(CellPadInfo2* info)
 
     pad_poll_backend();
 
+    /* Present a virtual pad on port 0 when nothing physical is attached, the
+     * same as cellPadGetInfo2 does.
+     *
+     * The two entry points disagreed: GetInfo2 carried the fallback and GetInfo
+     * did not, so which one a title imports decided whether it believed a
+     * controller existed. The Orange Box's chooser imports GetInfo (v1) and
+     * never GetInfo2, so it saw zero pads, opened "SIXAXIS wireless controller
+     * not detected", took the auto-OK, and opened it again -- forever, before
+     * it ever finished booting. Both entry points describe the same hardware
+     * and have to answer the same way. */
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
-        if (s_host_state[i].connected) connected++;
+        if (s_host_state[i].connected || i == 0) connected++;
 
     vm_write32(gaddr + 0x00, s_max_connect);
     vm_write32(gaddr + 0x04, connected);
     vm_write32(gaddr + 0x08, 0);                       /* system_info */
+    /* CellPadInfo (v1) sizes its arrays by CELL_MAX_PADS = 127, not by the 7
+     * ports: vendor_id[127] @0x0C, product_id[127] @0x10A, status[127] @0x208.
+     * Packed for 7 ports, status landed at 0x28 and GH3 -- which reads
+     * info+0x208+port -- saw port 0 disconnected and never polled the pad. */
     for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
         int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
-                  s_host_state[i].connected);
-        vm_write16(gaddr + 0x0C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
-        vm_write16(gaddr + 0x1A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
-        vm_write8(gaddr + 0x28 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
+                  (s_host_state[i].connected || i == 0));
+        vm_write16(gaddr + 0x00C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
+        vm_write16(gaddr + 0x10A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
+        vm_write8(gaddr + 0x208 + i, on ? CELL_PAD_STATUS_CONNECTED : 0);
     }
     return CELL_OK;
 }
@@ -763,6 +1003,39 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_port_setting[port_no] = port_setting;
+    return CELL_OK;
+}
+
+/* cellPadInfoPressMode (NID 0x0E2DFAAD) / cellPadSetPressMode (NID 0xF83F8182)
+ *
+ * Press mode makes the digital buttons report an analog 0..255 pressure in the
+ * extended part of CellPadData. A DS3 supports it, and the virtual pad reported
+ * by cellPadGetInfo/GetInfo2 already advertises CELL_PAD_CAPABILITY_PRESS_MODE,
+ * so these have to agree with that claim rather than fall through to the
+ * unresolved-NID path.
+ *
+ * Info returns 1 when the port supports press mode; Set toggles it, recorded in
+ * the same s_port_setting word cellPadSetPortSetting uses so a title that reads
+ * the setting back sees what it asked for. */
+s32 cellPadInfoPressMode(u32 port_no)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    return 1;                                  /* supported */
+}
+
+s32 cellPadSetPressMode(u32 port_no, u32 mode)
+{
+    if (!s_pad_initialized)
+        return CELL_PAD_ERROR_NOT_OPENED;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (mode)
+        s_port_setting[port_no] |= CELL_PAD_SETTING_PRESS_ON;
+    else
+        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_PRESS_ON;
     return CELL_OK;
 }
 

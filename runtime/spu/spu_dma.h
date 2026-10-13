@@ -20,11 +20,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#ifdef _WIN32
-#include <windows.h>
-#endif
 #include <stdio.h>
-#include <stdlib.h>   /* getenv (SPU_QLOG diagnostic) */
+#include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,25 +31,21 @@ extern uint8_t* vm_base;
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
- * SPU / lv2-heap / stack pages are committed). A garbage EA — e.g. one the SPURS
- * kernel computes from an incomplete context during bring-up — must be treated
- * as a failed DMA, NOT crash the host emulator with an access violation. On
- * Windows we query the page state; the whole [ea, ea+size) range must be
- * committed and accessible. Returns 1 if the range is safe to memcpy. */
+ * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
+ * as a failed DMA, NOT crash the host emulator with an access violation.
+ * Queries the page state and demand-commits on first touch; the whole
+ * [ea, ea+size) range must be committed and accessible.
+ * Returns 1 if the range is safe to memcpy. */
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
 {
-    /* The flat VM reserves the FULL 32-bit guest space and demand-commits
-     * pages on first touch (ppu_loader's vectored handler), so every 32-bit
-     * EA is safe host memory by construction -- a garbage EA reads zeros /
-     * commits an empty page, exactly like vm_read32. The old implementation
-     * additionally VirtualQuery'd the range on EVERY MFC transfer: VTune
-     * measured that at 94 CPU-seconds in a 50 s movie run -- 60x the entire
-     * lifted-SPU execution cost, and the real reason the Bink intro decoded
-     * at 1-2 FPS. Bounds-check only. */
+    /* The VM reserves the full 32-bit guest space but only commits specific
+     * regions (main mem, stack, RSX). A DMA to an uncommitted page must
+     * commit it on demand rather than crash. A bitmap caches the per-64K-page
+     * committed state so the steady-state cost is two bit tests; only a first
+     * touch per page pays the VirtualQuery syscall. */
     uint32_t e = (uint32_t)ea;
     if (size == 0) return 0;
     if ((uint64_t)e + (uint64_t)size > 0x100000000ull) return 0;   /* past 4 GB */
-#ifdef _WIN32
     if (!vm_base) return 0;
     /* Committed-page bitmap as a self-healing CACHE of VirtualQuery. The
      * demand-commit fault handler seeds it, but regions the host commits
@@ -70,15 +63,6 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           uint8_t* p = vm_base + ((uintptr_t)pg[i] << 16);
           if (VirtualQuery(p, &mbi, sizeof mbi) == 0) return 0;
           if (mbi.State != MEM_COMMIT) {
-              /* COMMIT it, do not refuse it. The PPU demand-commits guest
-               * pages on first touch; the SPU had no equivalent and simply
-               * dropped the transfer, so the two processors disagreed about
-               * which memory exists. An SPU-written output buffer is the case
-               * that breaks -- the SPU is the FIRST writer, so the page has
-               * never faulted, and the job's results vanish. Worse, a job that
-               * then polls for its own output spins forever: four of Tokyo
-               * Jungle's twelve images wedged this way, each burning 4096
-               * skipped transfers per run before the runaway guard stopped it. */
               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
@@ -86,7 +70,6 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
-#endif
     return 1;
 }
 
@@ -202,6 +185,26 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               " size=%u covers 0x%08X\n",
                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
                       (uint32_t)s_w); } }
+    /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
+     * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
+    { static uint32_t s_lo = 1, s_hi;
+      if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
+          if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+      if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
+          static int _n = 0;
+          if (_n++ < 64)
+              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
+                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          /* ...and every 5 s, the bytes PUT into / GOT from the range. */
+          { static volatile long long s_put, s_get; static unsigned long long s_t0;
+            extern unsigned long long ps3_ms_now(void);
+            if ((cmd & 0xF0) == 0x20) s_put += size; else if ((cmd & 0xF0) == 0x40) s_get += size;
+            unsigned long long now = ps3_ms_now();
+            if (!s_t0) s_t0 = now;
+            if (now - s_t0 >= 5000) {
+                fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
+                        s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
+                s_put = s_get = 0; s_t0 = now; } } } }
     /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
      * are the ones the SDK's own dma.h asserts: a non-zero size, at most
      * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
@@ -303,10 +306,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                           i, buckets[i], 10);
           }
       } }
-    /* LBP_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
+    /* SPU_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
      * host thread samples "in ntdll" because VirtualQuery dominates). Prints
      * every 64k-th transfer per thread: enough to see the loop's pc/ea. */
-    { static int s_t = -1; if (s_t < 0) { const char* e = getenv("LBP_MFC_TRACE");
+    { static int s_t = -1; if (s_t < 0) { const char* e = getenv("SPU_MFC_TRACE");
         s_t = e ? atoi(e) : 0; if (e && !s_t) s_t = 1; }
       if (s_t) { static _Thread_local unsigned long long _n; ++_n;
         /* level 2+: also print each thread's first 192 transfers (setup DMAs
@@ -352,7 +355,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         } } }
     /* cellAudio port-ring window: log every guest write into it (rare, load-
      * bearing -- the audio OUTPUT path). Same env gate as the sampler. */
-    { static int s_pr = -1; if (s_pr < 0) s_pr = getenv("LBP_MFC_TRACE") ? 1 : 0;
+    { static int s_pr = -1; if (s_pr < 0) s_pr = getenv("SPU_MFC_TRACE") ? 1 : 0;
       if (s_pr && (cmd & 0x20) && !(cmd & 0x40) &&
           (((uint32_t)ea >= 0x01000000u && (uint32_t)ea < 0x01800000u) ||
            ((uint32_t)ea >= 0x00927D00u && (uint32_t)ea < 0x00928000u))) {
@@ -430,7 +433,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
     { static int s_t = -1; static int s_img = -2;
-      if (s_t < 0) s_t = getenv("YDKJ_DMATRACE") ? 1 : 0;
+      if (s_t < 0) s_t = getenv("SPU_DMATRACE_ALL") ? 1 : 0;
       if (s_img == -2) { const char* e = getenv("YDKJ_DMA_IMG"); s_img = e ? atoi(e) : -1; }
       /* YDKJ_DMA_IMG=N: trace ONLY image N, uncapped (the 300-cap otherwise fills
        * with the always-running PM's DMA and hides a late image entirely). */
@@ -453,6 +456,64 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     { extern int g_cri_video_dma;
       if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
           g_cri_video_dma = 1; }
+    /* SPU_DSP_IMAGE_EA -- recover an SPU image load whose source address the
+     * title lost. You Don't Know Jack's FMOD mixer relocates a DSP plugin into
+     * local store and calls it, but the descriptor it builds carries a NULL
+     * source address, so the transfer reads guest memory at 0, the mixer calls
+     * into zeros, its job ends, and the event flag the menu waits on is never
+     * set. The plugin itself is present and known: _sys_spu_image_import parsed
+     * it moments earlier, and its segments are contiguous in the source image
+     * (segment 0 at 0x4D3900 + (0x2C00 - 0x80) lands exactly on segment 1's
+     * 0x4D6480), so a transfer of the image's span belongs at segment 0's
+     * address. Match on the size the import recorded and substitute it.
+     *
+     * This is opt-in: it repairs a pointer the guest should have supplied, so
+     * it must not mask the real defect by default. */
+    /* SPU_DUMP_GET=<hexEA>: dump the source bytes the first time an SPU fetches
+     * from that address. Fixed BSS structures have the same address in a
+     * reference run, so this is what a dump from real hardware diffs against. */
+    if (mfc_is_get(cmd) && size && vm_base) {
+        static uint32_t s_dg = 0xFFFFFFFFu;
+        if (s_dg == 0xFFFFFFFFu) { const char* e = getenv("SPU_DUMP_GET");
+                                   s_dg = e ? (uint32_t)strtoul(e, 0, 0) : 0; }
+        if (s_dg && (uint32_t)ea == s_dg) {
+            static int done = 0;
+            if (!done) { done = 1;
+                uint32_t n = size > 128 ? 128 : size;
+                fprintf(stderr, "[get-dump] img%d GET 0x%08X size=%u pc=0x%05X\n",
+                        spu->image_id, (uint32_t)ea, size, (uint32_t)spu->pc & SPU_LS_MASK);
+                for (uint32_t o = 0; o < n; o += 16) {
+                    fprintf(stderr, "  +0x%03X:", o);
+                    for (uint32_t i = 0; i < 16; i += 4) {
+                        const uint8_t* q = vm_base + (uint32_t)ea + o + i;
+                        fprintf(stderr, " %02X%02X%02X%02X", q[0], q[1], q[2], q[3]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+                fflush(stderr);
+            }
+        }
+    }
+    /* The DSP descriptor arrives as a 368-byte GET shortly before the section
+     * load; remember where it came from so the substitution below can name it.
+     * That guest address is what a write-watch needs to find its producer. */
+    static uint32_t s_desc_ea = 0;
+    if (mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
+    if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
+        static int s_di = -1;
+        if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
+        extern uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
+        if (s_di && g_spu_image_src_ea) {
+            static int _n = 0;
+            if (_n++ < 8)
+                fprintf(stderr, "[dsp-image] img%d GET ea=0 size=%u dest=0x%05X -> 0x%08X "
+                        "(last imported SPU image: ls_start=0x%X span=%u) descriptor@0x%08X\n",
+                        spu->image_id, size, lsa, g_spu_image_src_ea,
+                        g_spu_image_ls_start, g_spu_image_span, s_desc_ea);
+            ea = g_spu_image_src_ea;
+            ea_ptr = vm_base + (uint32_t)ea;   /* the copy reads ea_ptr, not ea */
+        }
+    }
     /* DIAGNOSTIC (LBP_SKIP_NULL_DMA): a GET from a null/near-null EA reads guest
      * memory at ~0 (the ELF header / low mem) = garbage. The FMOD SPU mixer's DSP
      * buffer pointers are 0 in our run; if the real task would SKIP a null DSP
@@ -503,7 +564,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
          * overlay never loads. Dump the descriptor content to see where the
          * real source EA was dropped. */
-        { static int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("LBP_OVL_DIAG") ? 1 : 0;
+        { static int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("SPU_OVL_DIAG") ? 1 : 0;
           if (s_ovl) {
               /* overlay-load map: image-6 GET of a code-sized chunk into the
                * high LS overlay region, with its (now-correct) plugin source.
@@ -560,7 +621,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * functions resident for this context. */
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
-        /* LBP_SPU_WATCH: a DMA GET landing on a watched LS line is how the PPU
+        /* SPU_LS_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);
           for (int _i = 0; _i < _n; _i++) {
@@ -575,8 +636,71 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               }
           } }
     } else if (mfc_is_put(cmd)) {
-        /* PUT: local store -> main memory */
-        memcpy(ea_ptr, ls_ptr, size);
+        /* PUT: local store -> main memory.
+         *
+         * A plain PUT is a store by another processor as far as every SPU
+         * holding a reservation on the lines it covers is concerned: on
+         * hardware those reservations are lost and their SPUs take
+         * SPU_EVENT_LR. Unannounced, a peer's pending PUTLLC compares its
+         * snapshot against a line this copy has already replaced and commits
+         * over it, and a peer parked on RdEventStat sleeps through the write.
+         *
+         * So when the span touches a reserved line the copy and the notify run
+         * as ONE critical section under the lock-line lock -- the same contract
+         * the PPU store path and the PUTLLC commit keep, and the only way the
+         * copy cannot land inside a peer's compare-and-commit window. Spans
+         * that touch no reserved line keep the lock-free copy: bulk asset PUTs
+         * are large and hot, and the scan is a bitmap bit per 128 bytes against
+         * a global that stays zero until an SPU reserves its first line.
+         *
+         * The unreserved path re-checks afterwards because a line can be
+         * reserved between the scan and the end of the copy. That peer's
+         * snapshot may be torn, so it gets its event and loses its reservation
+         * rather than committing against a line it never saw whole. */
+        {
+            extern int  spu_coh_is_reserved(uint32_t);
+            extern void spu_coh_notify_write(uint32_t);
+            extern void spu_coh_notify_write_except(uint32_t, const void*);
+            extern void spu_lockline_lock(void);
+            extern void spu_lockline_unlock(void);
+            extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+            spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
+            uint32_t a0 = (uint32_t)ea & ~127u;
+            uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
+            int span_reserved = 0;
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+                if (a == a1) break;
+            }
+            if (span_reserved) {
+                spu_lockline_lock();
+                memcpy(ea_ptr, ls_ptr, size);
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                    if (a == a1) break;
+                }
+                spu_lockline_unlock();
+            } else {
+                memcpy(ea_ptr, ls_ptr, size);
+                for (uint32_t a = a0; ; a += 128u) {
+                    if (spu_coh_is_reserved(a)) {
+                        spu_lockline_lock();
+                        spu_coh_notify_write_except(a, spu);
+                        spu_lockline_unlock();
+                    }
+                    if (a == a1) break;
+                }
+            }
+        }
+        /* Tell whoever is listening where this PUT landed.
+         *
+         * A title whose SPUs build the RSX command stream never tells libgcm
+         * where that stream is -- it hands the RSX a `put` offset and nothing
+         * else -- so the DMA that writes it is the only evidence of which
+         * buffer the RSX is actually bound to. The GCM layer installs this to
+         * find the pushbuffer; NULL for every title that does not. */
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
@@ -646,9 +770,13 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
         uint64_t ea = (ea_base & 0xFFFFFFFF00000000ull) | eal;
 
         if (xfer_size) {
-            int rc = mfc_do_transfer(spu, dest_lsa, ea, xfer_size, base_cmd);
+            /* Each list element occupies whole LS quadwords, even for
+             * 1/2/4/8-byte transfers. The EA supplies its byte offset within
+             * the first quadword. Keep the rounded cursor for stall/resume. */
+            uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
+            int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
             if (rc != 0) return rc;
-            dest_lsa += xfer_size;
+            dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
 
         if (stall_notify) {
@@ -707,6 +835,17 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
         fprintf(stderr, "[mfc-list] RESUME img=%d tag=%u elem@0x%05X left=%u\n",
                 spu->image_id, t, spu->list_stall_elem_lsa[t],
                 spu->list_stall_remaining[t]); }
+    /* What the stall handler left in the remaining elements, and where they are
+     * about to land. If the handler was supposed to fill in the claimed job's
+     * EA and did not, the elements read back empty and the transfer is a no-op
+     * -- which looks identical to "the pipeline never ran" from the PPU side. */
+    { uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
+      fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
+              spu->list_stall_dest_lsa[t], _e);
+      for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
+          fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
+                  spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
+      fprintf(stderr, "\n"); }
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);
@@ -771,6 +910,258 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
     int rc = 0;
+
+    /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
+     * covers one word, with the SPU id, its pc and the value the word holds
+     * after the transfer.
+     *
+     * Written for one question. func_000D2298 -- the R3000 event callback the
+     * scheduler fires at 0x106050 -- spins on
+     *
+     *     while (*(s + 0x88) != *(s + 0x00)) yield();     s = *(TOC-0x7D4C)
+     *                                                       = 0x002DEF80
+     *
+     * and a freeze pins it at produced=0xDD, consumed=0xDC: one short, forever.
+     * Nothing in that module's code stores +0x88, so the consumer count is
+     * written from outside -- an SPU DMA is the obvious candidate, and this
+     * says outright whether that is true. Watch 0x002DF008. */
+    { static int s_we = -2; static uint32_t s_wa;
+      if (s_we == -2) { const char* e = getenv("SPU_WATCHEA");
+                        s_we = e ? 1 : 0;
+                        s_wa = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
+      if (s_we && vm_base && (uint32_t)ea <= s_wa && s_wa < (uint32_t)ea + size) {
+          static unsigned long wn;
+          /* SPU_WATCHEA_EVERY=<n> (default 64): print every nth hit. 1
+           * shows the last transfers before a freeze, which a stride skips --
+           * but at ~1000 lines/second it also changes the timing enough to
+           * stop the freeze happening at all, so it is not the default. */
+          static unsigned long s_wev;
+          if (!s_wev) { const char* e2 = getenv("SPU_WATCHEA_EVERY");
+                        s_wev = e2 ? strtoul(e2, 0, 0) : 64ul;
+                        if (!s_wev) s_wev = 64ul; }
+          if (wn <= 12 || (wn % s_wev) == 0) {
+              uint32_t v; memcpy(&v, vm_base + s_wa, 4);
+              v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+              fprintf(stderr, "[watchea] n=%lu spu%u cmd=0x%02X ea=0x%08X"
+                              " size=%u lsa=0x%05X pc=0x%05X -> [0x%08X]=0x%08X\n",
+                      wn, spu->spu_id & 7u, cmd & 0xFFu, (uint32_t)ea, size,
+                      lsa, (uint32_t)spu->pc & SPU_LS_MASK, s_wa, v);
+          }
+      } }
+
+    /* SPU_WATCHLSA=<hex LS addr>: every DMA whose LOCAL STORE range covers one
+     * word, with the value that word holds after the transfer.
+     *
+     * The mirror image of SPU_WATCHEA, and it exists for the last unknown in
+     * the spu4 deadlock. GETLLAR is verified correct at the moment it runs
+     * (SPU_LLARWATCH: lsa=0x10800, and the word that lands equals memory), and
+     * resv_line has exactly one writer in the whole runtime -- that same
+     * GETLLAR. Yet at a freeze the snapshot holds the fresh produced value and
+     * the local-store mirror at 0x10800 holds the previous one. So something
+     * writes that mirror back to a stale value AFTER the GETLLAR, and a DMA is
+     * the only thing that can do it without going through spu_ls_write128.
+     * Watch LS 0x10800. */
+    { static int s_wl = -2; static uint32_t s_wlsa;
+      if (s_wl == -2) { const char* e7 = getenv("SPU_WATCHLSA");
+                        s_wl = e7 ? 1 : 0;
+                        s_wlsa = e7 ? (uint32_t)strtoul(e7, 0, 16) : 0u; }
+      if (s_wl && lsa <= s_wlsa && s_wlsa < lsa + size) {
+          static unsigned long wl;
+          if (++wl <= 12 || (wl % 256) == 0) {
+              const uint8_t* q = spu->ls + (s_wlsa & SPU_LS_MASK);
+              fprintf(stderr, "[watchlsa] n=%lu spu%u cmd=0x%02X ea=0x%08X"
+                              " lsa=0x%05X size=%u pc=0x%05X ->"
+                              " LS[0x%05X]=0x%02X%02X%02X%02X\n",
+                      wl, spu->spu_id & 7u, cmd & 0xFFu, (uint32_t)ea, lsa,
+                      size, (uint32_t)spu->pc & SPU_LS_MASK, s_wlsa,
+                      q[0], q[1], q[2], q[3]);
+          }
+      } }
+
+    /* SPU_ROWCOV=<hex EA>: DMA write coverage of the 2048-byte VRAM row starting
+     * there, as a count per 64-byte block, plus the current bytes.
+     *
+     * This exists to check a claim before it is believed. The 24-bit display
+     * region is coherent for ~104 pixels and patterned after, which reads like
+     * a transfer that writes one third of each row -- but watching a single byte
+     * at offset 512 (well inside the "missing" part) showed 218 DMA writes
+     * covering it. Those cannot both be true as stated. Coverage per block over
+     * a whole row says whether the row is fully written with wrong DATA, or
+     * partly written, and those are completely different bugs. */
+    { static int s_rc = -2; static uint32_t s_rcb;
+      if (s_rc == -2) { const char* e8 = getenv("SPU_ROWCOV");
+                        s_rc = e8 ? 1 : 0;
+                        s_rcb = e8 ? (uint32_t)strtoul(e8, 0, 16) : 0u; }
+      if (s_rc && vm_base && mfc_is_put(cmd) &&
+          (uint32_t)ea < s_rcb + 2048u && (uint32_t)ea + size > s_rcb) {
+          static unsigned long blk[32]; static unsigned long rn;
+          const uint32_t lo = (uint32_t)ea > s_rcb ? (uint32_t)ea : s_rcb;
+          const uint32_t hi = ((uint32_t)ea + size < s_rcb + 2048u)
+                            ? (uint32_t)ea + size : s_rcb + 2048u;
+          for (uint32_t b = (lo - s_rcb) >> 6; b <= (hi - 1u - s_rcb) >> 6; b++)
+              if (b < 32u) blk[b]++;
+          if ((++rn % 4096) == 0) {
+              fprintf(stderr, "[rowcov] %lu puts touching row 0x%08X;"
+                              " writes per 64B block:\n ", rn, s_rcb);
+              for (int b = 0; b < 32; b++) fprintf(stderr, " %lu", blk[b]);
+              fprintf(stderr, "\n bytes:");
+              for (int b = 0; b < 32; b++) {
+                  const uint8_t* q = vm_base + s_rcb + (uint32_t)b * 64u;
+                  fprintf(stderr, " %02X%02X", q[0], q[1]);
+              }
+              fprintf(stderr, "\n"); fflush(stderr);
+          }
+      } }
+
+    /* SPU_VRAMPC=1: which SPU CODE writes PS1 VRAM, bucketed by the symbol it
+     * falls in.
+     *
+     * Both SPU modules in ps1_netemu ship a .symtab (read in situ from the
+     * firmware -- the extracted copies are truncated at the symtab), so the
+     * rasteriser s functions have real names and known LS extents:
+     *
+     *   0x00188..0x0034F  BlockClear(GpuBlockClearCmd const*)
+     *   0x00350..0x00757  Host2Local_Body(GpuH2LBodyCmd const*)
+     *   0x00758..0x00927  Host2Local(GpuH2LCmd const*)
+     *   0x00928..0x010F7  Local2Local(GpuL2LCmd const*)
+     *   0x010F8..0x051E7  main
+     *   0x051E8..0x086FF  DrawRect<0..3>(Code, int)
+     *   0x08700..0x1493B  DrawEdge<0..3, 0..4>       -- the polygon rasteriser
+     *
+     * Every VRAM write traced so far came from 0x002E0 (BlockClear) or
+     * 0x004DC/0x00598 (Host2Local_Body) and none from the DrawRect/DrawEdge
+     * range, which would mean no geometry is rasterised at all -- the missing
+     * 3D. That was noticed from three sampled addresses, so count them all. */
+    { static int s_vp = -1;
+      if (s_vp < 0) s_vp = getenv("SPU_VRAMPC") ? 1 : 0;
+      if (s_vp && mfc_is_put(cmd) &&
+          (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
+          static unsigned long long b[8]; static unsigned long long n;
+          static unsigned long long bytes[8];
+          const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
+          int k = pc < 0x00188u ? 0
+                : pc < 0x00350u ? 1     /* BlockClear */
+                : pc < 0x00758u ? 2     /* Host2Local_Body */
+                : pc < 0x00928u ? 3     /* Host2Local */
+                : pc < 0x010F8u ? 4     /* Local2Local */
+                : pc < 0x051E8u ? 5     /* main */
+                : pc < 0x08700u ? 6     /* DrawRect */
+                : pc < 0x1493Cu ? 7     /* DrawEdge */
+                : 0;
+          b[k]++; bytes[k] += size;
+          /* And WHERE in the row the blit lands. PS1 VRAM rows are 2048 bytes;
+           * in 24-bit mode a 320-pixel frame is 960 bytes, so buffer 0 is
+           * bytes 0..959, buffer 1 is 960..1919, and anything past that is the
+           * texture region. During the blank phase every VRAM write is a
+           * Host2Local_Body blit -- the movie is still streaming -- yet the
+           * screen shows nothing, so which of those three the frames land in is
+           * the whole question. */
+          { static unsigned long long zone[4];
+            const uint32_t inrow = ((uint32_t)ea - 0x40600000u) % 2048u;
+            const int z = inrow < 960u ? 0 : inrow < 1920u ? 1 : 2;
+            zone[z] += size;
+            if ((n % 20000) == 0)
+                fprintf(stderr, "[vramzone] buf0(0..959)=%lluKB"
+                                " buf1(960..1919)=%lluKB tex(1920+)=%lluKB\n",
+                        zone[0] >> 10, zone[1] >> 10, zone[2] >> 10); }
+          if ((++n % 20000) == 0) {
+              static const char* nm[8] = { "other", "BlockClear",
+                  "Host2Local_Body", "Host2Local", "Local2Local", "main",
+                  "DrawRect", "DrawEdge" };
+              fprintf(stderr, "[vrampc] %llu VRAM puts;", n);
+              for (int q = 0; q < 8; q++)
+                  if (b[q]) fprintf(stderr, " %s=%llu(%lluKB)",
+                                    nm[q], b[q], bytes[q] >> 10);
+              fprintf(stderr, "\n"); fflush(stderr);
+          }
+      } }
+
+    /* SPU_H2LSRC=1: for each Host2Local_Body write to PS1 VRAM, the bytes it is
+     * copying OUT of local store next to the bytes already at the destination.
+     *
+     * A PUT copies LS to memory verbatim -- there is no merge inside the DMA
+     * engine. So "the writes write the old bytes back" can only mean the LS
+     * buffer itself already holds those bytes when the PUT is issued. This
+     * prints both sides at that instant, which decides between:
+     *
+     *   LS holds the pattern   -> the SPU never wrote real pixels into it, and
+     *                            the question moves upstream of the blit
+     *   LS holds real pixels   -> the destination comparison was wrong
+     *
+     * Host2Local_Body is LS 0x00350..0x00757 (from the firmware .symtab). */
+    { static int s_hs = -1;
+      if (s_hs < 0) s_hs = getenv("SPU_H2LSRC") ? 1 : 0;
+      if (s_hs && vm_base && mfc_is_put(cmd) && size >= 16u &&
+          (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
+          const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
+          if (pc >= 0x00350u && pc < 0x00758u) {
+              static unsigned long hn;
+              if (++hn <= 10 || (hn % 200000) == 0) {
+                  const uint8_t* src = spu->ls + (lsa & SPU_LS_MASK);
+                  const uint8_t* dst = vm_base + (uint32_t)ea;
+                  int same = 1;
+                  for (uint32_t q = 0; q < 16u; q++)
+                      if (src[q] != dst[q]) { same = 0; break; }
+                  fprintf(stderr, "[h2lsrc] n=%lu pc=0x%05X ea=0x%08X size=%u"
+                                  " LS=", hn, pc, (uint32_t)ea, size);
+                  for (uint32_t q = 0; q < 12u; q++) fprintf(stderr, "%02X", src[q]);
+                  fprintf(stderr, " VRAM=");
+                  for (uint32_t q = 0; q < 12u; q++) fprintf(stderr, "%02X", dst[q]);
+                  fprintf(stderr, " %s\n", same ? "IDENTICAL" : "differ");
+              }
+          }
+      } }
+
+    /* SPU_PUTEA=1: the first few FULL destination addresses per SPU. The 1 MB
+     * bucket histogram showed spu1..3 writing only bucket 0 and spu0 buckets
+     * 1..3, with nothing in bucket 4 -- where the composite samples PS1 VRAM
+     * (RSX local + 0x400000). Buckets keep only 4 address bits, so that may be
+     * an artifact of where RSX local memory actually sits; the full EA settles
+     * it. */
+    { static int s_pe = -1; if (s_pe < 0) s_pe = getenv("SPU_PUTEA") ? 1 : 0;
+      if (s_pe && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
+          static int shown[8];
+          const unsigned sp2 = spu->spu_id & 7u;
+          if (shown[sp2]++ < 6)
+              fprintf(stderr, "[putea] spu%u cmd=0x%02X ea=0x%016llX size=%u lsa=0x%05X\n",
+                      sp2, cmd & 0xFFu, (unsigned long long)ea, size, lsa);
+      } }
+
+    /* SPU_PUTHIST=1: where the SPUs actually WRITE, by 1 MB destination bucket
+     * and transfer size.
+     *
+     * The PS1 GPU cores rasterise into VRAM by DMA, not by store, so this is
+     * the only ground truth for what they produce. The PS1 framebuffer holds a
+     * 24-pixel-period pattern from a six-entry palette while the texture half
+     * of VRAM decodes to correct game art -- so the rasteriser runs and the
+     * asset upload works, and the question is what geometry these transfers
+     * actually have. */
+    { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+      if (s_ph && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
+          static unsigned long long n[8][16], byt[8][16], nsz[8][8], tot;
+          const unsigned sp = spu->spu_id & 7u;
+          const unsigned bucket = (unsigned)((ea >> 20) & 15u);
+          unsigned sb = 0;
+          { uint32_t z = size; while (z > 16u && sb < 7u) { z >>= 1; sb++; } }
+          n[sp][bucket]++; byt[sp][bucket] += size; nsz[sp][sb]++;
+          if ((++tot % 4096ull) == 0) {
+              fprintf(stderr, "[puthist] %llu puts\n", tot);
+              for (unsigned q = 0; q < 8; q++)
+                  for (unsigned b = 0; b < 16; b++)
+                      if (n[q][b])
+                          fprintf(stderr, "   spu%u ea~0x%X00000  %llu puts  %llu bytes\n",
+                                  q, b, n[q][b], byt[q][b]);
+              for (unsigned q = 0; q < 8; q++) {
+                  int any = 0;
+                  for (unsigned b = 0; b < 8; b++) if (nsz[q][b]) any = 1;
+                  if (!any) continue;
+                  fprintf(stderr, "   spu%u sizes:", q);
+                  for (unsigned b = 0; b < 8; b++)
+                      if (nsz[q][b]) fprintf(stderr, " <=%u:%llu", 16u << b, nsz[q][b]);
+                  fprintf(stderr, "\n");
+              }
+          }
+      } }
 
     /* cri build (YDKJ_CRI_CHAIN): when the kernel DMA-loads the TASKSET policy
      * module (libsre guest 0x30023680) to LS 0xA00, switch this SPU's image to 23
@@ -843,16 +1234,28 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 
     /* DMA trace for the cri task (image 22): log each transfer's LS/EA/size so we
      * can see the work-fetch GET (func_000040F0) that precedes the branch-to-0 and
-     * whether its source EA holds valid work-queue data. Env YDKJ_DMATRACE. */
+     * whether its source EA holds valid work-queue data. Env SPU_DMATRACE_ALL. */
     {
-        static int64_t dt=-2; if (dt==-2){ const char* e=getenv("YDKJ_DMATRACE"); dt=e?1:0; }
-        /* SPU_DMATRACE=<img> traces one image; YDKJ_DMATRACE keeps the old
+        static int64_t dt=-2; if (dt==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt=e?1:0; }
+        /* SPU_DMATRACE=<img> traces one image; SPU_DMATRACE_ALL keeps the old
          * hardcoded pair. Seeing a job's FIRST transfers is how you tell a bad
          * parameter block from a bad address computed later. */
+        /* SPU_DMATRACE takes an IMAGE ID, and that is a trap worth defusing:
+         * "=1" reads like "on" and actually selects image 1, so tracing a
+         * title whose work runs on image 4 prints NOTHING and reads as "this
+         * SPU issues no DMA at all". That produced a confidently wrong writeup
+         * for Guitar Hero III, whose task is in fact busy. Accept "all", and
+         * announce once what was armed so silence is never ambiguous. */
         static int64_t only=-2;
-        if (only==-2){ const char* e=getenv("SPU_DMATRACE"); only = e ? strtol(e,0,0) : -1; }
+        if (only==-2){ const char* e=getenv("SPU_DMATRACE");
+            only = !e ? -1 : ((strcmp(e,"all")==0 || strcmp(e,"ALL")==0) ? -3
+                                                                        : strtol(e,0,0));
+            if (e) fprintf(stderr, "[DMA] SPU_DMATRACE armed for %s\n",
+                           only==-3 ? "ALL images" : "one image id "
+                                                     "(a bare number is an IMAGE ID, not on/off)");
+        }
         if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
-            (only >= 0 && spu->image_id == only)) {
+            only==-3 || (only >= 0 && spu->image_id == only)) {
             static int _n=0; if (_n++ < 160)
                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
                         spu->image_id, cmd, lsa, (unsigned long long)ea, size, tag);
@@ -907,9 +1310,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * movie-plane main-heap region (0x40C00000..0x41000000) -- so if the log
      * stays empty the task only ever does <=128B control DMAs (stuck in the
      * SPURS job-queue kernel, never dispatching decode); if plane-sized PUTs
-     * appear we learn where the decoded frame actually lands. Env LBP_DMATRACE. */
+     * appear we learn where the decoded frame actually lands. Env SPU_DMATRACE_RAW. */
     {
-        static int64_t bt=-2; if (bt==-2){ const char* e=getenv("LBP_DMATRACE"); bt=e?1:0; }
+        static int64_t bt=-2; if (bt==-2){ const char* e=getenv("SPU_DMATRACE_RAW"); bt=e?1:0; }
         if (bt && spu->image_id==3) {
             uint32_t ea32 = (uint32_t)ea;
             int is_put   = ((cmd & 0x20) && !(cmd & 0x40));   /* PUT-family */
@@ -1007,6 +1410,15 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * supplies the low-32 EA; only EAH carries through. Passing `lsa` as the
      * list address read list elements from the transfer DESTINATION. */
     if (mfc_is_list(cmd)) {
+        /* List DMAs are rare, and they skip the per-element trace above, so
+         * they are easy to miss entirely while diagnosing a pipeline that
+         * never fills. Always report the issue: the DESTINATION lsa is the
+         * value the whole transfer hangs on. */
+        { static int _l = 0; if (_l++ < 32)
+            fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
+                    "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
+                    spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
+                    size, size / 8, tag); }
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
                                   ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
@@ -1055,7 +1467,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* After a cri-task GET, dump the bytes it just read (the task context) so we
      * can tell if eaContext holds valid SPURS work data or garbage. */
     {
-        static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("YDKJ_DMATRACE"); dt2=e?1:0; }
+        static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
         if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
             static int _g=0; if (_g++ < 6) {
                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);

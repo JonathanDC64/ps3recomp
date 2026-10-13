@@ -61,7 +61,7 @@ extern "C" {
 #define CELL_GCM_MAX_ZCULL_COUNT        8
 
 /* Report / label limits */
-#define CELL_GCM_MAX_REPORT_COUNT       256
+#define CELL_GCM_MAX_REPORT_COUNT       65536   /* the 1 MB report area, 16 bytes each */
 #define CELL_GCM_MAX_LABEL_COUNT        256
 
 /* Report data size (timestamp u64 + value u32 + pad u32 = 16 bytes) */
@@ -230,6 +230,8 @@ void cellGcmSetFlipMode(u32 mode);
 
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void);
+void cellGcmSetWaitFlipUnsafe(void);
+u32 cellGcmGetReport(u32 type, u32 index);
 
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void);
@@ -238,6 +240,19 @@ void cellGcmResetFlipStatus(void);
 u32 cellGcmGetFlipStatus(void);
 
 /* NID: 0xDC09357E */
+/* --- sys_rsx_* bridge (libs/video/sys_rsx.c) -----------------------------
+ * A firmware module links libgcm statically and reaches RSX through the lv2
+ * syscalls, so no cellGcm* import ever runs. These let the syscall layer drive
+ * the same state the HLE path sets up. */
+u32  cellGcm_syscall_bringup(u32 local_size);   /* -> RSX local memory base */
+u32  cellGcm_control_guest_addr(void);          /* put/get/ref triple EA */
+void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size);
+void cellGcm_syscall_iounmap(u32 io, u32 size);
+void cellGcm_syscall_set_fifo(u32 put, u32 get);
+/* Hand the display buffers the title has registered so far to the draw
+ * engine, for an engine that comes up after cellGcmSetDisplayBuffer ran. */
+void cellGcm_replay_display_buffers_to_engine(void);
+
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
 
@@ -354,7 +369,8 @@ s32 cellGcmSetTileInfo(u8 index, u8 location, u32 offset, u32 size,
 void* cellGcmGetNotifyDataAddress(u32 index);
 
 /* Timestamp location query */
-u32 cellGcmGetTimeStampLocation(u32 index, u32* location);
+/* location is CELL_GCM_LOCATION_LOCAL/_MAIN, as in the Report variants. */
+u64 cellGcmGetTimeStampLocation(u32 index, u32 location);
 
 /* Default FIFO size configuration */
 s32 cellGcmSetDefaultFifoSize(u32 size);
@@ -416,6 +432,8 @@ void cellGcmSetVBlankFrequency(u32 freq);
 
 /* User command */
 void cellGcmSetUserCommand(u32 cmd);
+/* Host FIFO consumer: defer the retired command to ppu_gcm_pump. */
+void cellGcmQueueUserCommand(u32 cmd);
 
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);

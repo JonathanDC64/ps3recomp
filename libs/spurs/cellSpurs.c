@@ -60,6 +60,7 @@ typedef struct {
     u32         minContention;
     u32         maxContention;
     u32         readyCount;
+    int         started;       /* its SPU program has been dispatched        */
 } SpursWorkload;
 
 typedef struct {
@@ -109,6 +110,28 @@ typedef struct {
 
 static EventFlagSync s_ef_sync[MAX_EVENT_FLAGS];
 
+/* PPU threads inside cellSpursEventFlagWait. The SPU sets a flag with
+ * GETLLAR/PUTLLC on the guest struct, which never touched the waiter's
+ * condition variable, so every wait ran out its 2 ms poll: FMOD's mixer waits
+ * on its SPU task once or twice per 5.3 ms audio block, fell behind, and
+ * GH3's songs played ~60% silence (heard as static). */
+static volatile long s_ef_ppu_waiters;
+static void ef_line_committed(uint32_t line)
+{
+    if (!s_ef_ppu_waiters) return;
+    for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
+        EventFlagSync* s = &s_ef_sync[i];
+        if (!s->initialized || (s->ea & ~127u) != line) continue;
+        /* Take the waiter's lock so the wake cannot fall between its check of
+         * the flag and its sleep. Caller holds no lock-line lock. */
+#ifdef _WIN32
+        EnterCriticalSection(&s->cs); WakeAllConditionVariable(&s->cv); LeaveCriticalSection(&s->cs);
+#else
+        pthread_mutex_lock(&s->mtx); pthread_cond_broadcast(&s->cond); pthread_mutex_unlock(&s->mtx);
+#endif
+    }
+}
+
 static EventFlagSync* ef_sync_find(uint32_t ea)
 {
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
@@ -123,7 +146,8 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
         if (!s_ef_sync[i].initialized) {
             s_ef_sync[i].ea = ea;
-            s_ef_sync[i].initialized = 1;
+            { extern void (*g_spu_line_commit_hook)(uint32_t);
+              g_spu_line_commit_hook = ef_line_committed; }
 #ifdef _WIN32
             InitializeCriticalSection(&s_ef_sync[i].cs);
             InitializeConditionVariable(&s_ef_sync[i].cv);
@@ -131,6 +155,7 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
             pthread_mutex_init(&s_ef_sync[i].mtx, NULL);
             pthread_cond_init(&s_ef_sync[i].cond, NULL);
 #endif
+            s_ef_sync[i].initialized = 1;
             return &s_ef_sync[i];
         }
     }
@@ -243,36 +268,58 @@ extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
  * wait-slot registration is needed — and deliberately NOT written, so the
  * SPU-side lifted Set code takes its "no PPU waiter" path and simply ORs
  * bits that our poll then observes. */
+/* The flag struct is ONE 128-byte line the SPU task library updates with
+ * GETLLAR/PUTLLC. A PPU read-modify-write of it must hold the lock-line lock
+ * for its whole span, or a PUTLLC landing between the read and the write is
+ * silently undone: an SPU wait registered there is lost, nothing ever signals
+ * the task, and its PPU partner blocks for good (GH3: FMOD's mixer deadlocked
+ * at boot in 1 run of ~4). Raw accesses inside: vm_write16 would take the
+ * same (non-recursive) lock. The end notifies reserving SPUs, under the lock
+ * as spu_coh_notify_write expects. */
+extern void spu_lockline_lock(void);
+extern void spu_lockline_unlock(void);
+extern int  spu_coh_is_reserved(uint32_t);
+extern void spu_coh_notify_write(uint32_t);
+static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
+static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+static inline void ef_line_end(uint32_t ea)
+{
+    if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
+    spu_lockline_unlock();
+}
+
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
-    u16 events        = vm_read16(ea + EF_EVENTS);
-    u16 used          = (u16)(vm_read16(ea + EF_SPU_USED_SLOTS) &
-                              ~vm_read16(ea + EF_SPU_PENDING_RECV));
-    u16 waitmode      = vm_read16(ea + EF_SPU_WAIT_MODE);
+    spu_lockline_lock();
+    u16 events        = ef_r16(ea + EF_EVENTS);
+    u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
+                              ~ef_r16(ea + EF_SPU_PENDING_RECV));
+    u16 waitmode      = ef_r16(ea + EF_SPU_WAIT_MODE);
     u16 eventsToClear = 0;
     u16 pendingRecv   = 0;
 
     for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
         u16 bit = (u16)(0x8000u >> s);
         if (!(used & bit)) continue;
-        u16 mask = vm_read16(ea + EF_SPU_WAIT_MASK_ARR + 2u * s);
+        u16 mask = ef_r16(ea + EF_SPU_WAIT_MASK_ARR + 2u * s);
         u16 rel  = (u16)((events | bits) & mask);
         int mode_and = (waitmode & bit) != 0;
         if ((mask & ~rel) == 0 || (!mode_and && rel != 0)) {
             eventsToClear |= rel;
             pendingRecv   |= bit;
-            vm_write16(ea + EF_PENDING_RECV_EVT + 2u * s, rel);
+            ef_w16(ea + EF_PENDING_RECV_EVT + 2u * s, rel);
         }
     }
 
     events = (u16)(events | bits);
     if (pendingRecv) {
-        vm_write16(ea + EF_SPU_PENDING_RECV,
-                   (u16)(vm_read16(ea + EF_SPU_PENDING_RECV) | pendingRecv));
+        ef_w16(ea + EF_SPU_PENDING_RECV,
+               (u16)(ef_r16(ea + EF_SPU_PENDING_RECV) | pendingRecv));
         if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
             events = (u16)(events & ~eventsToClear);
     }
-    vm_write16(ea + EF_EVENTS, events);
+    ef_w16(ea + EF_EVENTS, events);
+    ef_line_end(ea);   /* before signalling: signal_task takes its own locks */
 
     for (int s = 0; s < CELL_SPURS_EVENT_FLAG_MAX_WAIT_SLOTS; s++) {
         if (pendingRecv & (0x8000u >> s)) {
@@ -452,9 +499,7 @@ static struct SpursInst* spurs_inst_find(u32 ea)
     return NULL;
 }
 
-#ifdef _WIN32
 static DWORD WINAPI spurs_kernel_thread(LPVOID p);
-#endif
 
 static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
 {
@@ -477,12 +522,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     *(vm_base + spurs_ea + SPURS_NSPUS) = (u8)si->nspus;
     vm_write64(spurs_ea + SPURS_WKL_FLAG, 0xFFFFFFFFFFFFFFFFull); /* no receiver */
 
-#ifdef _WIN32
     if (!si->kernel_live) {
         si->kernel_live = 1;
         CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     }
-#endif
     printf("[cellSpurs] Initialize \"%s\" ea=0x%08X nSpus=%u (real BE instance + kernel poll)\n",
            si->prefix, spurs_ea, si->nspus);
     return CELL_OK;
@@ -507,7 +550,7 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
-static void spurs_cancel_attached_queues(void);  /* defined with the queue table */
+static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
 
 s32 cellSpursFinalize(CellSpurs* spurs)
 {
@@ -525,7 +568,7 @@ s32 cellSpursFinalize(CellSpurs* spurs)
      *
      * Done BEFORE the instance lookup: that lookup fails here, and a failed
      * handle is no reason to strand a thread. */
-    spurs_cancel_attached_queues();
+    spurs_cancel_attached_queues((u32)(uintptr_t)spurs);
 
     struct SpursInst* si = spurs_inst_find((u32)(uintptr_t)spurs);
     if (!si)
@@ -653,6 +696,13 @@ extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
 extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 
 static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
+/* WHICH SPURS instance attached each queue. A title with more than one instance
+ * -- Tokyo Jungle boots one for its data install and keeps a second for audio --
+ * finalises them separately, and cancelling every queue on any Finalize kills
+ * the surviving instance's queues too. That reads to the title as "the SPU
+ * stopped answering": its sound engine's receives fail with ECANCELED and it
+ * tears itself down. Cancel only the queues the instance being finalised owns. */
+static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 
 /* SPU task completion -> lv2 event queue, the other half of the PM's job.
@@ -696,17 +746,42 @@ void spurs_notify_task_completion(void)
 
 /* Release anyone blocked on the completion queues SPURS attached; see
  * cellSpursFinalize. */
-static void spurs_cancel_attached_queues(void)
+static void spurs_cancel_attached_queues(u32 spurs_ea)
 {
-    for (int i = 0; i < s_spurs_event_queue_n; i++)
-        sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
-    s_spurs_event_queue_n = 0;
+    int keep = 0;
+    for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        /* owner 0 means "attached before we tracked owners" -- cancel those on
+         * any finalize, which is the old behaviour and the safe default. */
+        u32 owner = s_spurs_event_queue_owner[i];
+        if (spurs_ea == 0 || owner == 0 || owner == spurs_ea) {
+            sys_event_queue_cancel_by_id(s_spurs_event_queue[i]);
+        } else {
+            s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
+            s_spurs_event_queue_owner[keep] = owner;
+            keep++;
+        }
+    }
+    s_spurs_event_queue_n = keep;
+}
+
+/* SPU user-event port -> lv2 queue, for SPU code running under SPURS.
+ *
+ * A SPURS task signals the PPU with send_event(port, ...) exactly as a raw SPU
+ * thread does, but there is no lv2 SPU thread group to hold the port binding,
+ * so the lv2 delivery path had nowhere to look and dropped the event -- and
+ * with it the ack the SPU then blocks on in SPU_RdInMbox. Havok's SPU task
+ * stalls on the first physics step that way (port 2), and the PPU step waits
+ * for it forever. */
+static u32 s_spurs_port_queue[64];
+
+uint32_t spurs_port_queue(uint32_t port)
+{
+    return port < 64 ? s_spurs_port_queue[port] : 0;
 }
 
 s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
                                  s32 isDynamic)
 {
-    (void)isDynamic;
     /* KEEP the queue id. SPURS signals the application through the queue it
      * attaches here, and this discarded it -- so nothing SPURS ever did could
      * wake a thread sitting in sys_event_queue_receive on it. Tokyo Jungle
@@ -719,21 +794,39 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
         int dup = 0;
         for (int i = 0; i < s_spurs_event_queue_n; i++)
             if (s_spurs_event_queue[i] == queue) dup = 1;
-        if (!dup) s_spurs_event_queue[s_spurs_event_queue_n++] = queue;
+        if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
+                    s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
     }
 
     if (!spurs || !port) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u8* port_h = GUEST_PTR(port, u8*);
 
-    *port_h = 0; /* give it port 0 */
-    printf("[cellSpurs] AttachLv2EventQueue(queue=%u)\n", queue);
+    /* Static: the caller names the port in *port. Dynamic: pick a free one,
+     * 0x10..0x3F first (the low ports are the ones titles ask for by number),
+     * and hand it back. This used to write 0 either way, so every attach
+     * landed on port 0 and the SPU's real port number routed nowhere. */
+    u32 p = *port_h;
+    if (isDynamic) {
+        p = 64;
+        for (u32 i = 0x10; i < 64 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+        for (u32 i = 0; i < 0x10 && p == 64; i++) if (!s_spurs_port_queue[i]) p = i;
+        if (p == 64) return CELL_SPURS_CORE_ERROR_BUSY;
+        *port_h = (u8)p;
+    } else if (p >= 64) {
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    } else if (s_spurs_port_queue[p]) {
+        return CELL_SPURS_CORE_ERROR_BUSY;
+    }
+    s_spurs_port_queue[p] = queue;
+    printf("[cellSpurs] AttachLv2EventQueue(queue=%u) port=%u%s\n", queue, p,
+           isDynamic ? " (dynamic)" : "");
     return CELL_OK;
 }
 
 s32 cellSpursDetachLv2EventQueue(CellSpurs* spurs, u8 port)
 {
-    (void)port;
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (port < 64) s_spurs_port_queue[port] = 0;
     printf("[cellSpurs] DetachLv2EventQueue(port=%u)\n", port);
     return CELL_OK;
 }
@@ -799,7 +892,6 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     printf("[cellSpurs] DestroyTaskset()\n");
-    taskset->initialized = 0;
     return CELL_OK;
 }
 
@@ -810,7 +902,6 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     printf("[cellSpurs] ShutdownTaskset()\n");
-    taskset->shutdownRequested = 1;
     return CELL_OK;
 }
 
@@ -891,9 +982,22 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         return CELL_SPURS_TASK_ERROR_STAT;
     }
 
-    /* Find a free task slot */
-    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
-        if (!s_tasks[i].in_use) {
+    /* Find a free task slot IN THIS TASKSET: the first task id whose bit in the
+     * taskset's enabled bitset (+0x30, 128 bits, task 0 = MSB) is clear. Task
+     * exit clears that bit (spu_taskset_task_exited), so ids recycle the way
+     * real SPURS recycles them. The old scan of the global s_tasks[] never
+     * freed a slot unless the task was joined; Havok creates a task per step
+     * and never joins, so after 128 steps CreateTask failed and the physics
+     * step waited forever for a task that was never started.
+     * ponytail: s_tasks[] is shared by every taskset and now only records the
+     * last task per slot id -- enough for JoinTask2's lookup; key it by
+     * (taskset, id) if a title joins tasks in two tasksets at once. */
+    u32 free_slot = CELL_SPURS_MAX_TASK;
+    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
+        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    if (free_slot < CELL_SPURS_MAX_TASK) {
+        u32 i = free_slot;
+        {
             s_tasks[i].in_use = 1;
             s_tasks[i].id = s_next_task_id++;
             s_tasks[i].active = 1;
@@ -901,23 +1005,19 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             s_tasks[i].exitCode = 0;
             s_tasks[i].entryPoint = elf;
 
-            /* The assigned task id goes back to the guest BIG-ENDIAN.
+            /* The guest reads this out-param BIG-ENDIAN, and a native store
+             * put it in host order: task 1 came back to the game as 0x01000000,
+             * which it then handed to _cellSpursSendSignal. No task by that id
+             * exists, the signal was dropped, and the SPU task sat in
+             * WAIT_SIGNAL while the PPU waited on the event flag it would have
+             * set -- a two-sided deadlock from one missing byte swap.
              *
-             * A host-endian store here is the whole Demon's Souls SPURS deadlock:
-             * the game reads its taskId back as bswap32(1) = 0x01000000 and hands
-             * that straight to _cellSpursSendSignal, whose delivery path rejects
-             * anything >= 128 (spu_taskset_signal_task) and silently drops the
-             * signal. The taskset's SIGNALLED bitset then stays empty, SPU task 1
-             * parks in WAIT_SIGNAL forever, never sets event flag 0x01CE7800, and
-             * the PPU blocks in cellSpursEventFlagWait on it -- each side waiting
-             * for the other. Verified with PS3_HLE_ARGS=E0A6DBE4: the guest really
-             * does pass r4=0x01000000, i.e. it is echoing back what we wrote.
-             *
-             * Same bug class as the libs/ guest-pointer sweep (a scalar the guest
-             * reads back needs vm_write*, not a bare store through a host pointer). */
-            if (taskId_ea) vm_write32(taskId_ea, (uint32_t)s_tasks[i].id);
+             * Hand back the SLOT INDEX, not the global counter: `i` is what
+             * spurs_taskset_add_task() sets as the taskset's bitset bit and
+             * what spu_taskset_signal_task() looks up, so the id the guest
+             * signals with has to be the same number. */
+            if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
             (void)taskId_h;
-            taskset->taskCount++;
 
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
@@ -937,7 +1037,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * pointer that reads back 0 (the task GETs from EA 0 -> some field of
              * its work descriptor is null in our run). Each of the 4 arg words that
              * looks like a valid guest EA gets 64 bytes dumped as BE u32s. */
-            if (getenv("LBP_TASKSET_TRACE")) {
+            if (getenv("SPURS_TASKSET_TRACE")) {
                 for (int a = 0; a < 4; a++) {
                     uint32_t p = task_arg[a];
                     if (p < 0x10000 || p >= 0x50000000u) continue;   /* not a plausible EA */
@@ -1010,6 +1110,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         }
     }
 
+    fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
+            taskset_ea);
     return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
@@ -1059,6 +1161,37 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
           printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
                  attr->argument_ea, (u32)(uintptr_t)argument);
+      } }
+    /* SPURS_TASKATTR_DESC: a THIRD caller shape, found in Saints Row 2. Its
+     * taskset builder (func_009F56E0) does not pass eaContext/sizeContext/
+     * lsPattern as separate arguments at all -- r7 points at a 3-word
+     * DESCRIPTOR it fills immediately before the call, and r8 is the argument:
+     *
+     *   009F58D0  addi r7, r1, 128     ; r7 = sp+0x80  -> the descriptor
+     *   009F58D4  addi r8, r1, 176     ; r8 = sp+0xB0  -> CellSpursTaskArgument
+     *   009F58E8  stw  r9,  0x80(r1)   ;   [0] context EA
+     *   009F58EC  stw  r11, 0x84(r1)   ;   [1] context size, straight out of
+     *                                  ;       cellSpursTaskGetContextSaveAreaSize
+     *   009F58F0  stw  r25, 0x88(r1)   ;   [2] CellSpursTaskLsPattern*
+     *
+     * Read the 8-argument way, sizeContext comes out as r8 -- a STACK ADDRESS,
+     * not a size (the log shows szctx=267382952 = 0x0FEFF0A8) -- and lsPattern
+     * comes out of r9, which this caller never sets, so it is 0. Those are
+     * exactly the conditions the SPU task library refuses to run a blocking
+     * task under, and the tasks then park in WAIT_SIGNAL forever doing 0 ms of
+     * work apiece, which is the symptom this title shows. Off by default: the
+     * R8-form above is right for YDKJ and Jackbox and they are unaffected. */
+    { static int s_desc = -1;
+      if (s_desc < 0) s_desc = getenv("SPURS_TASKATTR_DESC") ? 1 : 0;
+      if (s_desc) {
+          uint32_t d = (uint32_t)eaContext;          /* r7 */
+          attr->eaContext    = vm_read32(d + 0);
+          attr->sizeContext  = vm_read32(d + 4);
+          attr->lsPattern_ea = vm_read32(d + 8);
+          attr->argument_ea  = (u32)sizeContext;     /* r8 */
+          printf("[cellSpurs] TaskAttr DESC-form: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
+                 d, (u32)attr->eaContext, attr->sizeContext,
+                 attr->lsPattern_ea, attr->argument_ea);
       } }
     printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
@@ -1346,12 +1479,12 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
             }
             printf("\n");
         }
-        /* PM-COMPLETENESS PROBE (LBP_PM_DUMP): the wwsjob job-manager PM is
+        /* PM-COMPLETENESS PROBE (SPURS_PM_DUMP): the wwsjob job-manager PM is
          * ASSEMBLED at runtime -- the embedded ELF (LS 0xA00) has zero HOLES at
          * LS 0xAEE..0x11B0 and the executeStage lives at LS 0x14f4, both filled
          * by SPURS setup. Report whether OUR runtime's PM has that code or the
          * holes, and (once) write the whole image out so we can re-lift it. */
-        if (getenv("LBP_PM_DUMP") && pm_ea && pm_sz >= 0x2200 && pm_sz <= 0x4000) {
+        if (getenv("SPURS_PM_DUMP") && pm_ea && pm_sz >= 0x2200 && pm_sz <= 0x4000) {
             u32 exe = vm_read32(pm_ea + 0xAF4);          /* LS 0x14f4 executeStage */
             int zeros = 0; for (u32 o = 0xEE; o < 0x7B0; o += 4)
                 if (vm_read32(pm_ea + o) == 0) zeros += 4;
@@ -1494,8 +1627,14 @@ static WklPm* spurs_resolve_pm(u32 wid)
     return r->fn ? r : NULL;
 }
 
-#ifdef _WIN32
-/* One virtual SPU running a workload's policy module. The WWS job manager
+/* Thread creation, waiting and Sleep come from runtime/platform/win32_compat.h
+ * off Windows (included at the top of this file), which is what lets the three
+ * thread bodies below stand as written on every host. SetThreadStackGuarantee
+ * has no POSIX counterpart -- it reserves stack for the stack-overflow
+ * exception handler, and there is no such handler here -- so it stays behind
+ * an _WIN32 guard where it is used.
+ *
+ * One virtual SPU running a workload's policy module. The WWS job manager
  * runs concurrently across N SPUs (RPCS3: jobmanagerCellSpursKernel0..N): each
  * claims jobs from the shared queue and advances its own lane of the sync
  * barrier. Running the SPUs SEQUENTIALLY deadlocks -- SPU 0 completes its job,
@@ -1509,7 +1648,9 @@ struct spurs_pm_worker_arg {
 };
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
+#ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#endif
     struct spurs_pm_worker_arg* a = (struct spurs_pm_worker_arg*)p;
     spu_run_policy_module(a->fn, a->image_id, a->pm, a->pm_size,
                           a->arg, a->wid, a->ea, a->spu_num);
@@ -1518,7 +1659,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
+#ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
+#endif
     struct SpursInst* si = (struct SpursInst*)p;
     static volatile long s_pm_off = -1;
     if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
@@ -1719,7 +1862,6 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
         }
     }
 }
-#endif
 
 s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
@@ -1771,7 +1913,44 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs,
 s32 cellSpursWakeUp(CellSpurs* spurs)
 {
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    /* In a full implementation, wake the worker threads */
+
+    /* Start the SPU program of every runnable workload on this instance.
+     *
+     * cellSpursAddWorkload only REGISTERS the policy module -- it publishes the
+     * workload into the BE instance and returns. WakeUp is what the guest
+     * expects to actually put it on an SPU, and this was a stub returning
+     * CELL_OK, so a title whose work is a WORKLOAD (rather than a taskset task,
+     * which cellSpursCreateTask does dispatch) never ran any SPU code at all.
+     *
+     * Guitar Hero III is one: its job library does AddWorkload(pm, 6720 bytes)
+     * -> SetExceptionEventHandler -> ReadyCountStore(8) -> WakeUp, and the
+     * decompression jobs it then queues are picked up by that program. With
+     * WakeUp inert the jobs were submitted, counted, and never executed or
+     * retired -- the PPU blocked forever on a counter nothing could decrement,
+     * while the only SPU images running were the two taskset tasks.
+     *
+     * Dispatch is async for the same reason CreateTask uses it: a workload
+     * policy module is a persistent worker, and running it inline would block
+     * this PPU thread forever. Guarded by `started` so a second WakeUp (they
+     * are common -- the guest calls it whenever it adds work) does not spawn
+     * another copy. */
+    const uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
+    for (u32 i = 0; i < CELL_SPURS_MAX_WORKLOAD; i++) {
+        SpursWorkload* w = &s_workloads[i];
+        if (!w->in_use || w->started || w->spurs_ea != spurs_ea) continue;
+        if (!w->pm || !w->sizePm) continue;
+        const uint8_t* host = GUEST_PTR(w->pm, const uint8_t*);
+        if (!host) continue;
+        w->started = 1;
+        fprintf(stderr, "[cellSpurs] WakeUp: starting workload %u pm=0x%08X size=%u\n",
+                i, (uint32_t)(uintptr_t)w->pm, w->sizePm);
+        fflush(stderr);
+        /* One instance. readyCount is how many SPUs the workload MAY run on,
+         * and running 2 or 4 changes nothing for the title this was written
+         * against -- measured, not assumed -- so the conservative reading
+         * stands until a title needs otherwise. */
+        spu_workload_dispatch_async(host, w->sizePm, (uint32_t)w->data);
+    }
     return CELL_OK;
 }
 
@@ -1858,6 +2037,32 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
     return CELL_OK;
 }
 
+/* SPURS_EF_STATS=1: per flag, how many PPU waits completed in the last 5 s
+ * and their mean / max duration -- one SPU task round trip each. */
+static void ef_wait_stats(uint32_t ea, long long t0)
+{
+    static int on = -1; if (on < 0) on = getenv("SPURS_EF_STATS") ? 1 : 0;
+    if (!on) return;
+    static uint32_t fea[8]; static unsigned n[8]; static double sum[8], mx[8];
+    static long long last; static SRWLOCK lk = SRWLOCK_INIT;
+    LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+    double us = (now.QuadPart - t0) * 1e6 / (double)f.QuadPart;
+    AcquireSRWLockExclusive(&lk);
+    for (int i = 0; i < 8; i++)
+        if (fea[i] == ea || !fea[i]) { fea[i] = ea; n[i]++; sum[i] += us; if (us > mx[i]) mx[i] = us; break; }
+    if (!last) last = now.QuadPart;
+    if ((now.QuadPart - last) > 5 * f.QuadPart) {
+        for (int i = 0; i < 8 && fea[i]; i++) {
+            fprintf(stderr, "[ef-stats] flag=0x%08X waits=%.1f/s mean=%.0fus max=%.0fus%c",
+                    fea[i], n[i] * (double)f.QuadPart / (now.QuadPart - last),
+                    n[i] ? sum[i] / n[i] : 0.0, mx[i], 10);
+            n[i] = 0; sum[i] = mx[i] = 0;
+        }
+        last = now.QuadPart;
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
 s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
                            u32 mode)
 {
@@ -1888,6 +2093,8 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (s_force < 0) s_force = getenv("SPURS_EF_FORCE") ? 1 : 0;
     unsigned waits = 0;
     u16 current;
+    __atomic_add_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
+    LARGE_INTEGER ef_t0; QueryPerformanceCounter(&ef_t0);
     for (;;) {
         current = vm_read16(ea + EF_EVENTS);
 
@@ -1922,6 +2129,8 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         }
     }
 
+    __atomic_sub_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
+    ef_wait_stats(ea, ef_t0.QuadPart);
     /* Hand back the observed bits; consume the received ones on AUTO clear. */
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
@@ -1930,8 +2139,13 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+        /* Clear from the CURRENT word: bits an SPU set since `current` was
+         * read must survive. */
+        spu_lockline_lock();
+        ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
+        ef_line_end(ea);
+    }
 
     sync->ppu_wait_mask = 0;   /* no longer blocked: stop the round notify */
     ef_unlock(sync);
@@ -1972,8 +2186,11 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
-    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO)
-        vm_write16(ea + EF_EVENTS, (u16)(current & ~received));
+    if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
+        spu_lockline_lock();
+        ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
+        ef_line_end(ea);
+    }
 
     ef_unlock(sync);
     return CELL_OK;
@@ -1990,7 +2207,9 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    vm_write16(ea + EF_EVENTS, (u16)(vm_read16(ea + EF_EVENTS) & ~bits));
+    spu_lockline_lock();
+    ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
+    ef_line_end(ea);
     ef_unlock(sync);
 
     return CELL_OK;
@@ -2419,40 +2638,79 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
-extern uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
-extern int g_spurs_job_mbox_valid;
+#ifdef _WIN32
+#  define SPURS_JOB_TLS __declspec(thread)
+#else
+#  define SPURS_JOB_TLS __thread
+#endif
+extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
+extern SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
 /* SPURS_EVENT_D3=<n>: probe. The value a job query returns to the PPU is read
  * from the completion event's data3 field (the guest stores r7 at sp+0xB8 and
  * reads the count back from sp+0xBC). This lets that be confirmed by observing
  * the returned count change, without having to guess the real value first. */
+static int d3_probe_valid = 0;
 static u64 spurs_event_data3_probe(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("SPURS_EVENT_D3"); v = e ? atoi(e) : 0; }
+    if (v < 0) { const char* e = getenv("SPURS_EVENT_D3");
+                 d3_probe_valid = e ? 1 : 0; v = e ? atoi(e) : 0; }
     return (u64)(unsigned)v;
 }
 
-static void jc_signal_done(u32 jc_ea)
+static void jc_signal_done(u32 jc_ea, int job_index)
 {
     /* Carry the job's mailbox answer in the completion event. On hardware the
      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
      * synthetic payload means the caller reads back zero for whatever it
-     * asked. Keep the chain EA in data1 for anything that used it. */
-    u64 d2 = 0, d3 = 0;
+     * asked. Keep the chain EA in data1 for anything that used it.
+     *
+     * data2 is WHICH job finished: the PPU side of a job chain counts on it.
+     * GT5P's audio service does
+     *     do { JobGuardNotify; receive(q); i = data2; run_callback(i); }
+     *     while (i + 1 < queued);
+     * so a data2 pinned at 0 never ends that loop -- with the chain's lwmutex
+     * held, which blocks the main thread's teardown behind it. A chain-level
+     * signal (job_index < 0) sends 0. */
+    u64 d2 = (u64)(unsigned)(job_index < 0 ? 0 : job_index);
+    u64 mbox = 0, d3 = 0;
+    (void)spurs_event_data3_probe();   /* prime d3_probe_valid */
+    /* A PPU-side query submits a job and reads the reply out of the completion
+     * event's data3 (the guest stores r7 at sp+0xB8 and reads the value back
+     * from sp+0xBC, the low half). Tokyo Jungle asks each DSP module for its
+     * input and output bus count this way -- commands 0x105 and 0x106 -- and
+     * the SPU answers both in its outbound mailbox. We computed that mailbox
+     * and then dropped it, pushing 0, so every module registered with a bus
+     * count of 0 and the bus setup rejected the first bus it was asked for
+     * ("sgxbus.c: out of range bus"): the check errors when count < requested,
+     * and 0 < 1.
+     *
+     * Only the two count queries are forwarded. Neighbouring commands
+     * (0x102/0x103/0x104) reply with LS ADDRESSES rather than counts, and
+     * func_00201D38 stores each reply into module+0x1C/+0x20/+0x24. The
+     * mailbox never goes in data2, which is the job index above: a mailbox
+     * value there would end the consumer's wait early. */
+    enum { SGX_Q_IN_BUSES = 0x105, SGX_Q_OUT_BUSES = 0x106 };
+    const int answers_a_count = (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
+                                 g_spurs_job_cmd == SGX_Q_OUT_BUSES);
     if (g_spurs_job_mbox_valid) {
-        d2 = g_spurs_job_mbox;
-        d3 = g_spurs_job_mbox_intr;
+        mbox = g_spurs_job_mbox;
+        d3 = g_spurs_job_mbox_intr; (void)d3;
         g_spurs_job_mbox_valid = 0;
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
-                                            SPURS_EVENT_PORT, jc_ea, 0,
-                                            spurs_event_data3_probe());
+                                            SPURS_EVENT_PORT, jc_ea, d2,
+                                            d3_probe_valid
+                                                ? spurs_event_data3_probe()
+                                                : (answers_a_count ? mbox : 0));
         static int n = 0;
         if (n++ < 8)
-            printf("[cellSpurs] chain 0x%08X work done -> event queue %u (rc=%d)\n",
-                   jc_ea, s_spurs_event_queue[i], rc);
+            printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
+                   "(data2=%llu rc=%d)\n",
+                   jc_ea, job_index, s_spurs_event_queue[i],
+                   (unsigned long long)d2, rc);
     }
 }
 
@@ -2476,14 +2734,15 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 
         if (cmd != 0 && op == 0) {                    /* JOB */
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
-            jc_run_one_job((u32)(cmd & ~7ull), jobs++, size_desc);
+            int idx = jobs++;
+            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times
              * and sat in event_queue_receive 30 times -- so batching the
              * completion into one event per pass leaves it waiting for
              * completions that, from its point of view, never arrive. */
-            jc_signal_done(jc_ea);
+            jc_signal_done(jc_ea, idx);
             pc += 8; continue;
         }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
@@ -2492,7 +2751,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
-                if (jobs) jc_signal_done(jc_ea);
+                if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
             if (ext == (7 | (14 << 3))) {                     /* RET */
@@ -2518,26 +2777,24 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
            jc_ea, jobs);
 }
 
-#ifdef _WIN32
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
-    /* TIMING PROBE (LBP_JC_DELAY=ms): the real jm2 chain walker is async and
+    /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
      * picks up jobs as the PPU appends them + fills their descriptors. Our walk
      * is one-shot; if it reads descriptors before the PPU populates the I/O
      * (n_dma=0, empty ioBuffer), deferring the walk should let real I/O appear.
      * Confirms timing-vs-never before committing to the async rewrite. */
-    { const char* d = getenv("LBP_JC_DELAY");
+    { const char* d = getenv("SPURS_JC_DELAY");
       if (d && *d) Sleep((unsigned)atoi(d)); }
     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
                s_jobchains[slot].size_desc);
     s_jobchains[slot].running = 0;
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
-    jc_signal_done(s_jobchains[slot].jc_ea);
+    jc_signal_done(s_jobchains[slot].jc_ea, -1);
     return 0;
 }
-#endif
 
 /* cellSpursRunJobChain -- start job chain execution (async, like the real one). */
 /* cellSpursRunJobChain(const CellSpursJobChain* jobChain) -- ONE argument.
@@ -2566,14 +2823,12 @@ static s32 jc_start(u64 jc_ea, const char* who)
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
-#ifdef _WIN32
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
             else s_jobchains[i].running = 0;
         }
-#endif
         return CELL_OK;
     }
     printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);
@@ -2585,11 +2840,56 @@ s32 cellSpursRunJobChain(u64 jc_ea)
     return jc_start(jc_ea, "RunJobChain");
 }
 
+/* cellSpursShutdownJobChain(CellSpursJobChain*) -- the other half of the pair.
+ *
+ * A title that starts a chain with Run/Kick ends it with Shutdown, then blocks
+ * in Join until the chain has actually stopped. Leaving Shutdown unimplemented
+ * is not harmless: the import logs UNIMPLEMENTED and returns whatever was in
+ * r3, so the caller reads a garbage result for "did the shutdown take?" and a
+ * title that checks it can decide the subsystem failed and tear itself down.
+ *
+ * Clearing `running` is what makes the pair honest: the host walker stops
+ * grabbing new work, and the Join that follows has something true to observe.
+ * Found in Tokyo Jungle, whose sound engine shuts its chain down during init
+ * and then reports "failed to recv data from SPU" when the handshake does not
+ * complete. */
+s32 cellSpursShutdownJobChain(u64 jc_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea == (u32)jc_ea) {
+            s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+            return CELL_OK;
+        }
+    }
+    /* Not one of ours: still CELL_OK -- the chain is, trivially, not running. */
+    return CELL_OK;
+}
+
 /* cellSpursJoinJobChain(const CellSpursJobChain*) -- one argument, as above. */
 s32 cellSpursJoinJobChain(u64 jc_ea)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] JoinJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    /* Run/Kick walk the chain on a host thread, so Join has to wait for it.
+     * Returning at once told the title its jobs were done while they were
+     * still running. The Simpsons Arcade Game runs and joins a chain every
+     * frame, and those jobs DMA the fragment programs and vertices of draws
+     * already queued in the FIFO: the RSX drain then reached the draws first
+     * (black frames, glyph quads built from half-written vertices), and the
+     * next frame's Run was coalesced away while this walker was still busy,
+     * so that frame's data was never written at all. */
+    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+        if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
+        while (s_jobchains[i].running) {
+#ifdef _WIN32
+            Sleep(0);
+#else
+            usleep(0);
+#endif
+        }
+    }
     return CELL_OK;
 }
 
@@ -2627,9 +2927,40 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
                               u64 buffer_ea, u32 size, u32 depth, u32 direction)
 {
     (void)spurs_ea;
+    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!size || !depth)         return CELL_SPURS_TASK_ERROR_INVAL;
+
+    /* Same 128-byte big-endian line as the LF variant below, and the title's
+     * own call says so: it passes q=0x032B2980 with buffer=0x032B2A00, exactly
+     * 0x80 apart, just as its LFQueue passes 0x4059FD00/0x4059FD80. The
+     * consumer is task 5 (image 1), whose CellSpursTaskArgument points into
+     * this same 0x032B2xxx block and which reads the line with GETLLAR/PUTLLC,
+     * so leaving it uninitialised handed recompiled SPU code a zero-depth
+     * queue to reason about. */
+    uint32_t q = (uint32_t)queue_ea;
+    for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
+    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
+     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
+     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
+     * the queue look permanently empty no matter what a producer wrote. */
+    vm_write32(q + 0x0C, depth);
+    vm_write32(q + 0x10, size);
+    vm_write32(q + 0x14, depth);
+    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);
+    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
+     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
+     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
+     * write there marching through it one byte per dequeue --
+     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
+     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
+     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
+     * Whatever holds direction/init, it is not these offsets. */
+    vm_write64(q + 0x70, (u64)(uint32_t)taskset_ea);
+    memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
+
     static int _n = 0;
     if (_n++ < 8)
-        printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u)\n",
+        printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)taskset_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
     return CELL_OK;
 }
@@ -2644,13 +2975,108 @@ s32 cellSpursQueueClear(u64 queue_ea)
 /* SDK ABI: cellSpursQueuePushBody(CellSpursQueue*, const void* buffer, bool isBlocking) */
 s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 {
+    /* SPURS_QUEUE_PUSH=1 -- EXPERIMENT, off by default.
+     *
+     * A deliberately self-revealing probe rather than a finished push. The
+     * waiter half of the protocol is known (see PROGRESS.md phase 19): the
+     * 16-byte group at queue+0x20 is a ring of blocked task ids, byte[0] the
+     * count and byte[13] the cursor. The DATA half is not: which ring slot an
+     * element belongs in has never been observed, because nothing has ever
+     * pushed and so the consumer has never taken its non-empty path.
+     *
+     * So push into a CANDIDATE slot (a counter kept in the push1 half of the
+     * line at +0x0C), wake the registered waiter, and let the consumer's own
+     * DMA say where it actually looks. Its read address names the correct slot
+     * whether or not the guess was right, which turns one run into the answer.
+     * Everything is logged for that reason. */
+    static int s_exp = -1;
+    if (s_exp < 0) s_exp = getenv("SPURS_QUEUE_PUSH") ? 1 : 0;
+
     static int _n = 0;
-    if (_n < 8)
-        printf("[cellSpurs] QueuePushBody(q=0x%08X data=0x%08X blocking=%u)\n",
-               (u32)queue_ea, (u32)data_ea, isBlocking);
-    else if (_n == 8)
-        printf("[cellSpurs] QueuePushBody further logs suppressed\n");
-    _n++;
+    if (!s_exp) {
+        if (_n < 8)
+            printf("[cellSpurs] QueuePushBody(q=0x%08X data=0x%08X blocking=%u)\n",
+                   (u32)queue_ea, (u32)data_ea, isBlocking);
+        else if (_n == 8)
+            printf("[cellSpurs] QueuePushBody further logs suppressed\n");
+        _n++;
+        return CELL_OK;
+    }
+
+    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    uint32_t q   = (uint32_t)queue_ea;
+    uint32_t sz  = vm_read32(q + 0x10);
+    uint32_t dep = vm_read32(q + 0x14);
+    uint32_t buf = (uint32_t)vm_read64(q + 0x18);
+    uint32_t tsp = (uint32_t)vm_read64(q + 0x70);      /* eaSignal: taskset */
+    if (!sz || !dep || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    /* Derived ring model (see PROGRESS.md phase 22). Working the dataflow of
+     * the consumer's decision at 0x12914..0x129D0 backwards:
+     *
+     *   r11 = normalise(W0)        W0 = queue+0x00
+     *   r2  = normalise(W1)        W1 = queue+0x04
+     *   r60 = W3                   W3 = queue+0x0C
+     *     where normalise(v) is  cgti/nor/selb  ==  (v >= 0 ? v : ~v)
+     *
+     *   r81 = r2 - r11
+     *   r79 = (r2 + r60) - (r11 - r60)  =  r2 - r11 + 2*r60
+     *   r68 = (r11 > r2) ? r79 : r81    =  (r2 - r11) mod 2*r60
+     *   ceqi r77, r68, 0                -> the EMPTY test
+     *
+     * and, separately at 0x129A8..0x129B8,
+     *
+     *   r14 = (r60 > r11) ? r11 : r11 - r60   =  index mod r60
+     *
+     * which is the buffer slot. So this is an ordinary ring: W0 is the pop
+     * index, W1 the push index, indices run modulo 2*W3, and the slot is the
+     * index modulo W3 -- the standard scheme that keeps "full" distinguishable
+     * from "empty". W3 is therefore the depth.
+     *
+     * And that is the bug: the initialiser left queue+0x0C at ZERO, so r60 = 0
+     * and the whole computation degenerates -- occupancy is (W1-W0) mod 0 and
+     * the slot is index mod 0. With both indices at 0 the empty test is
+     * trivially true, which is precisely why the consumer parked every time and
+     * never once read the element buffer, whatever the producer wrote. */
+    uint8_t* qp = vm_base + q;
+
+    int32_t  sync  = (int32_t)vm_read32(q + 0x00);          /* W0, pop  */
+    int32_t  tail  = (int32_t)vm_read32(q + 0x04);          /* W1, push */
+    int32_t  mod   = (int32_t)vm_read32(q + 0x0C);          /* W3       */
+    if (mod <= 0) mod = (int32_t)dep;                       /* pre-fix queues */
+
+    int32_t  nsync = (sync < 0) ? ~sync : sync;             /* normalise */
+    int32_t  cur   = (tail < 0) ? ~tail : tail;
+    uint32_t slot  = (uint32_t)(cur % mod);
+
+    memcpy(vm_base + buf + (size_t)slot * sz, vm_base + (uint32_t)data_ea, sz);
+
+    int32_t  nxt   = (cur + 1) % (2 * mod);
+    int32_t  ntail = nxt;
+    vm_write32(q + 0x04, (uint32_t)ntail);
+
+    /* Waiter ring at +0x20: byte[0] = count, byte[1..12] = task ids. */
+    uint32_t waiters = qp[0x20];
+    int woke = -1;
+    if (waiters > 0 && waiters <= 3 && tsp) {
+        /* The entry area is m_bs[1..3] ONLY -- bytes 0x21..0x23. Shifting the
+         * whole 16-byte group (as a first cut of this did) walks straight over
+         * direction at +0x24 and init at +0x2C and corrupts the header; the
+         * trace caught it as direction turning from 00000002 into 00020000. */
+        woke = qp[0x21];
+        qp[0x21] = qp[0x22];
+        qp[0x22] = qp[0x23];
+        qp[0x23] = 0;
+        qp[0x20] = (uint8_t)(waiters - 1);
+        extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+        spu_taskset_signal_task(tsp, (uint32_t)woke);
+    }
+
+    if (_n++ < 16)
+        printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
+               "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
+               _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
     return CELL_OK;
 }
 
@@ -2735,5 +3161,277 @@ s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
     if (_n++ < 8) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
+    return CELL_OK;
+}
+
+/* =========================================================================
+ * Task LS patterns and context save area sizing.
+ *
+ * Saints Row 2 builds every taskset through this sequence (func_009F56E0):
+ *
+ *   _cellSpursTasksetAttributeInitialize(attr, ...)
+ *   cellSpursTasksetAttributeSetName(attr, name)
+ *   cellSpursTasksetAttributeSetTasksetSize(attr, size)
+ *   cellSpursCreateTasksetWithAttribute(spurs, taskset, attr)
+ *   ...
+ *   _cellSpursQueueInitialize(...) / cellSpursQueueAttachLv2EventQueue(q)
+ *   cellSpursTaskGetReadOnlyAreaPattern(&ro,   elf)
+ *   cellSpursTaskGetContextSaveAreaSize (&size, &ls)   ls = default & ~ro
+ *   _cellSpursTaskAttributeInitialize(attr2, .., size, &ls, ..)
+ *
+ * The ABI of the last two is not guesswork -- it is readable straight off the
+ * call site. At 0x009F5878 the caller sets r3 = sp+0x70 and r4 = r25, where
+ * r25 = sp+0x90 (set at 0x009F5744) is exactly the 16-byte pattern the two
+ * `andc`+`std` pairs at 0x009F5888..0x009F5894 had just built. After the call
+ * it does `lwz r11, 0x70(r1)` -- reading a u32 back out of r3 -- checks it
+ * against 0x2D400 and bails if it does not fit, then stores the size and the
+ * pattern pointer side by side at sp+0x84/sp+0x88 for the task attribute. So:
+ *
+ *   s32 cellSpursTaskGetContextSaveAreaSize(u32* size_out,
+ *                                           const CellSpursTaskLsPattern* ls);
+ *
+ * A task's context save area holds the SPU register file plus every 2 KB local
+ * store block the task may dirty; the read-only blocks (its code/rodata, which
+ * can simply be reloaded from the ELF) are masked out by the caller first.
+ * Local store is 256 KB and the pattern is 128 bits, so one bit == 2 KB.
+ * =====================================================================*/
+
+#define SPURS_LS_BLOCK      2048u    /* 256 KB local store / 128 pattern bits */
+#define SPURS_CTX_HDR       2048u    /* 128 SPU registers x 16 bytes          */
+#define SPURS_CTX_ALIGN     128u     /* CELL_SPURS_TASK_CONTEXT_SAVE_AREA_ALIGN */
+
+/* cellSpursTaskGetReadOnlyAreaPattern(CellSpursTaskLsPattern* pattern,
+ *                                     const void* elf)
+ *
+ * Mark the local-store blocks covered by the image's NON-writable PT_LOAD
+ * segments. The caller clears these out of its default pattern, so anything we
+ * fail to report simply ends up saved as well -- costing context space, never
+ * correctness. Bit numbering is PPC-style (bit 0 = MSB of the first word), and
+ * the size path below only ever popcounts the result, so a bit-order mistake
+ * here cannot change the computed size.
+ */
+s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea)
+{
+    if (!pattern_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    u64 word[2] = { 0, 0 };
+
+    if (elf_ea) {
+        const uint8_t* img = vm_base + (uint32_t)elf_ea;
+        if (img[0] == 0x7F && img[1] == 'E' && img[2] == 'L' && img[3] == 'F' &&
+            img[4] == 1 /*ELFCLASS32*/ && img[5] == 2 /*ELFDATA2MSB*/) {
+            uint32_t e_phoff = ((uint32_t)img[0x1C] << 24) | ((uint32_t)img[0x1D] << 16) |
+                               ((uint32_t)img[0x1E] << 8)  |  (uint32_t)img[0x1F];
+            uint16_t e_phentsize = (uint16_t)((img[0x2A] << 8) | img[0x2B]);
+            uint16_t e_phnum     = (uint16_t)((img[0x2C] << 8) | img[0x2D]);
+            if (e_phentsize < 0x20) e_phentsize = 0x20;
+
+            for (uint16_t i = 0; i < e_phnum; i++) {
+                const uint8_t* ph = img + e_phoff + (size_t)i * e_phentsize;
+                #define BE32(p) (((uint32_t)(p)[0] << 24) | ((uint32_t)(p)[1] << 16) | \
+                                 ((uint32_t)(p)[2] << 8)  |  (uint32_t)(p)[3])
+                uint32_t p_type  = BE32(ph + 0x00);
+                uint32_t p_vaddr = BE32(ph + 0x08);
+                uint32_t p_memsz = BE32(ph + 0x14);
+                uint32_t p_flags = BE32(ph + 0x18);
+                #undef BE32
+                if (p_type != 1 /*PT_LOAD*/ || !p_memsz) continue;
+                if (p_flags & 2 /*PF_W*/)                continue;   /* writable: must be saved */
+                if ((uint64_t)p_vaddr + p_memsz > SPU_LS_SIZE) continue;
+
+                uint32_t first = p_vaddr / SPURS_LS_BLOCK;
+                uint32_t last  = (p_vaddr + p_memsz - 1) / SPURS_LS_BLOCK;
+                for (uint32_t b = first; b <= last && b < 128; b++)
+                    word[b >> 6] |= (u64)1 << (63 - (b & 63));
+            }
+        }
+    }
+
+    vm_write64((uint32_t)pattern_ea,     word[0]);
+    vm_write64((uint32_t)pattern_ea + 8, word[1]);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] TaskGetReadOnlyAreaPattern(elf=0x%08X) -> %016llX %016llX\n",
+               (u32)elf_ea, (unsigned long long)word[0], (unsigned long long)word[1]);
+    return CELL_OK;
+}
+
+/* cellSpursTaskGetContextSaveAreaSize(u32* size_out,
+ *                                     const CellSpursTaskLsPattern* lsPattern) */
+s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
+{
+    if (!size_out_ea || !pattern_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+
+    u64 hi = vm_read64((uint32_t)pattern_ea);
+    u64 lo = vm_read64((uint32_t)pattern_ea + 8);
+
+    uint32_t blocks = 0;
+    for (int i = 0; i < 64; i++) {
+        if (hi & ((u64)1 << i)) blocks++;
+        if (lo & ((u64)1 << i)) blocks++;
+    }
+
+    uint32_t size = SPURS_CTX_HDR + blocks * SPURS_LS_BLOCK;
+    size = (size + (SPURS_CTX_ALIGN - 1)) & ~(SPURS_CTX_ALIGN - 1);
+
+    vm_write32((uint32_t)size_out_ea, size);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] TaskGetContextSaveAreaSize(ls=%016llX %016llX, %u blocks) -> %u (0x%X)\n",
+               (unsigned long long)hi, (unsigned long long)lo, blocks, size, size);
+    return CELL_OK;
+}
+
+/* cellSpursBarrierInitialize(CellSpursTaskset* taskset, CellSpursBarrier* barrier,
+ *                            u32 total)
+ *
+ * A barrier is 128 bytes, 128-aligned, opaque in the SDK: the PPU only
+ * initialises it, and the tasks of `taskset` meet at it from the SPU through
+ * the barrier code linked into their own images. That code reads the count
+ * of tasks still to arrive as a u32 at +0x04 and the owning taskset's EA at
+ * +0x34, the layout reverse engineering of the SPU side has found; the rest
+ * starts zeroed. Up to 128 tasks, one per taskset slot.
+ */
+s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total)
+{
+    if (!taskset_ea || !barrier_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if ((taskset_ea & 127u) || (barrier_ea & 127u)) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!total || total > 128u) return CELL_SPURS_TASK_ERROR_INVAL;
+
+    for (uint32_t o = 0; o < 128u; o += 8u) vm_write64((uint32_t)barrier_ea + o, 0);
+    vm_write32((uint32_t)barrier_ea + 0x04, total);
+    vm_write32((uint32_t)barrier_ea + 0x34, (uint32_t)taskset_ea);
+
+    printf("[cellSpurs] BarrierInitialize(taskset=0x%08X, barrier=0x%08X, total=%u)\n",
+           (u32)taskset_ea, (u32)barrier_ea, total);
+    return CELL_OK;
+}
+
+/* cellSpursGetTasksetInfo(const CellSpursTaskset* taskset, CellSpursTasksetInfo* info)
+ *
+ * CellSpursTasksetInfo is 128 per-task entries of 0x48 bytes, then the
+ * taskset's own fields: argument (u64, +0x2400), workload id (+0x2408), last
+ * scheduled task (+0x240C), name, exception handler and its argument
+ * (+0x2410..+0x241B), and the taskset's size (+0x241C). The taskset-level
+ * fields are filled from the taskset itself; the per-task entries are left
+ * zeroed, which reads as "no task", since nothing here tracks a task's state
+ * the way the SPU kernel does. Twisted Metal's post-FX init reads the
+ * workload id back from it.
+ */
+#define TSI_ARGUMENT     0x2400u
+#define TSI_WORKLOAD     0x2408u
+#define TSI_LAST_TASK    0x240Cu
+#define TSI_SIZE         0x241Cu
+#define TSI_BYTES        0x2420u
+
+s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
+{
+    if (!taskset_ea || !info_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (taskset_ea & 127u) return CELL_SPURS_TASK_ERROR_ALIGN;
+
+    const uint32_t ts = (uint32_t)taskset_ea, info = (uint32_t)info_ea;
+    for (uint32_t o = 0; o < TSI_BYTES; o += 4u) vm_write32(info + o, 0);
+    vm_write64(info + TSI_ARGUMENT, vm_read64(ts + CSTS_ARGS));
+    vm_write32(info + TSI_WORKLOAD, vm_read32(ts + CSTS_WID));
+    vm_write32(info + TSI_LAST_TASK, 0);
+    vm_write32(info + TSI_SIZE, vm_read32(ts + CSTS_SIZE_FIELD));
+    return CELL_OK;
+}
+
+/* cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute*, u32 size)
+ * CreateTaskset ignores the attribute entirely (it builds the real BE layout
+ * itself), so record the request and accept it. */
+s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
+{
+    if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    return CELL_OK;
+}
+
+/* cellSpursQueueAttachLv2EventQueue(CellSpursQueue*)
+ * The queue's completion signalling runs through our own event-flag path, so
+ * there is no lv2 queue to bind; accept and log. */
+s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] QueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
+ *      const void* buffer, u32 size, u32 depth, u32 direction)
+ *
+ * This one CANNOT be a stub, because the consumer is recompiled SPU code that
+ * reads the queue out of main memory itself. Disassembling image 1 around the
+ * task's WAIT_SIGNAL call site (LS 0x12B80) shows the real protocol: it builds
+ * a 128-byte line at LS 0x80 and commits it with
+ *
+ *   wrch MFC_LSA,0x80 / MFC_EAH / MFC_EAL / MFC_Size,128 / MFC_Cmd,0xB4 (PUTLLC)
+ *   rdch MFC_RdAtomicStat ; brnz -> retry
+ *
+ * i.e. a GETLLAR/PUTLLC lock-line atomic on the queue's own cache line. So the
+ * bytes in guest memory ARE the interface, and they have to be the real
+ * big-endian CellSyncLFQueue: one 128-byte, 128-aligned line.
+ *
+ *   0x00 pop1     0x10 size     0x18 buffer(u64)  0x24 direction  0x2C init
+ *   0x08 push1    0x14 depth    0x20 bs[4]        0x28 v1         0x70 eaSignal
+ *
+ * The title's own call corroborates the size: it passes q=0x4059FD00 with
+ * buffer=0x4059FD80, exactly 128 bytes later.
+ *
+ * NOTE: libs/sync/cellSync.c has a CellSyncLFQueue too, but that one is a
+ * HOST-native struct (atomic_uint, a 64-bit host buffer pointer). It is fine
+ * for a queue both of whose ends are HLE, and completely wrong here -- writing
+ * it into guest memory would hand the SPU a host pointer where a 32-bit big-
+ * endian EA belongs. Hence a separate, guest-accurate initializer rather than
+ * delegating to it.
+ *
+ * What is set here is only what the arguments determine outright: size, depth,
+ * buffer, direction, and the init flag, over a zeroed line (the documented
+ * empty state). The bs[]/v1 slot state machine is left zero -- see PROGRESS.md;
+ * it is not guessed at. */
+s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+                                u32 size, u32 depth, u32 direction)
+{
+    if (!queue_ea || !buffer_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!size || !depth)         return CELL_SPURS_TASK_ERROR_INVAL;
+
+    uint32_t q = (uint32_t)queue_ea;
+    for (uint32_t o = 0; o < 128; o += 4) vm_write32(q + o, 0);
+
+    /* W3 at +0x0C is the ring modulus the consumer reduces indices by: the
+     * empty test is (W1-W0) mod 2*W3 and the buffer slot is index mod W3
+     * (derived at 0x12914..0x129B8). Leaving it zero degenerated both and made
+     * the queue look permanently empty no matter what a producer wrote. */
+    vm_write32(q + 0x0C, depth);
+    vm_write32(q + 0x10, size);
+    vm_write32(q + 0x14, depth);
+    vm_write64(q + 0x18, (u64)(uint32_t)buffer_ea);   /* bcptr<void,u64> */
+    /* NOT direction at +0x24 and NOT init at +0x2C. Both sit inside the
+     * 16-byte group at +0x20..+0x2F that the consumer owns and shifts wholesale
+     * (shlqbyi <group>,1 at 0x12A0C). The trace shows the two values we used to
+     * write there marching through it one byte per dequeue --
+     *   +0x24: 00000002 -> 00000200 -> 00020000 -> 02000000
+     *   +0x2C: 00000001 -> 00000100 -> 00010000 -> 01000000
+     * -- i.e. we were feeding garbage into the SPU's own state every cycle.
+     * Whatever holds direction/init, it is not these offsets. */                          /* init: constructed */
+    vm_write64(q + 0x70, (u64)(uint32_t)owner_ea);    /* eaSignal <- taskset/spurs */
+
+    memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
+
+    static int _n = 0;
+    if (_n++ < 8)
+        printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
+               (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+{
+    static int _n = 0;
+    if (_n++ < 8) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }

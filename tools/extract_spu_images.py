@@ -59,25 +59,45 @@ def parse_spu_elf_size(buf: bytes, off: int) -> int | None:
         e_shentsize, = struct.unpack_from(">H", hdr, 0x3A)
         e_shnum,     = struct.unpack_from(">H", hdr, 0x3C)
 
-    end = max(e_shoff + e_shnum * e_shentsize,
-              e_phoff + e_phnum * e_phentsize)
+    # Must agree EXACTLY with spu_elf_image_size() in runtime/spu/spu_workload.c:
+    # that function decides how many bytes the dispatcher fingerprints when the
+    # guest hands an image to cellSpurs, so an image extracted to a different
+    # length gets a different FNV-1a-64 and never matches.
+    #
+    # Two things were off, both making the extract SHORT. It counted only
+    # PT_LOAD extents, and it seeded `end` with the program-header table extent
+    # instead of the section-header table's. Scott Pilgrim's SPU images have no
+    # section headers and a non-PT_LOAD segment past the last PT_LOAD, so every
+    # one came out 52 bytes short -- and all ten registered under fingerprints
+    # nothing would ever dispatch.
+    end = e_shoff + e_shnum * e_shentsize
 
-    # Walk program headers and account for each PT_LOAD's file extent.
     ph_off = off + e_phoff
-    ph_sz  = e_phnum * e_phentsize
-    if ph_off + ph_sz <= len(buf):
-        for i in range(e_phnum):
+    if ph_off + e_phnum * e_phentsize <= len(buf):
+        for i in range(e_phnum):                       # every segment, not just PT_LOAD
             base = ph_off + i * e_phentsize
             if ei_class == 1:
-                p_type   = struct.unpack_from(">I", buf, base)[0]
                 p_offset = struct.unpack_from(">I", buf, base + 4)[0]
                 p_filesz = struct.unpack_from(">I", buf, base + 16)[0]
             else:
-                p_type   = struct.unpack_from(">I", buf, base)[0]
                 p_offset = struct.unpack_from(">Q", buf, base + 8)[0]
                 p_filesz = struct.unpack_from(">Q", buf, base + 32)[0]
-            if p_type == 1:   # PT_LOAD
-                end = max(end, p_offset + p_filesz)
+            end = max(end, p_offset + p_filesz)
+
+    sh_off = off + e_shoff
+    if e_shnum and sh_off + e_shnum * e_shentsize <= len(buf):
+        for i in range(e_shnum):                       # non-NOBITS section content
+            base = sh_off + i * e_shentsize
+            if ei_class == 1:
+                sh_type   = struct.unpack_from(">I", buf, base + 4)[0]
+                sh_offset = struct.unpack_from(">I", buf, base + 16)[0]
+                sh_size   = struct.unpack_from(">I", buf, base + 20)[0]
+            else:
+                sh_type   = struct.unpack_from(">I", buf, base + 4)[0]
+                sh_offset = struct.unpack_from(">Q", buf, base + 24)[0]
+                sh_size   = struct.unpack_from(">Q", buf, base + 32)[0]
+            if sh_type != 8:   # SHT_NOBITS occupies no file space
+                end = max(end, sh_offset + sh_size)
 
     return end
 

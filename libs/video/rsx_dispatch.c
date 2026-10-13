@@ -28,6 +28,7 @@
  *   0x1740+i*4 VTXFMT[i] type[0:3] size[4:7] stride[8:15] frequency[16:31]
  *   0x1808 VERTEX_BEGIN_END  arg = primitive, 0 = end
  *   0x1814 VB_VERTEX_BATCH   first[0:23] (count-1)[24:31]
+ *   0x1818 INLINE_ARRAY     vertex data pushed through the FIFO itself
  *   0x181C IDXBUF_OFFSET     0x1820 IDXBUF_FORMAT location[0:3] type[4:11]
  *   0x1824 VB_INDEX_BATCH    first[0:23] (count-1)[24:31]
  *   0x1D8C CLEAR_DEPTH_VALUE  0x1D90 CLEAR_COLOR_VALUE (A8R8G8B8)
@@ -42,6 +43,8 @@
 #include "rsx_dispatch.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -73,6 +76,7 @@
 #define M_VTXFMT                0x1740
 #define M_VERTEX_BEGIN_END      0x1808
 #define M_VB_VERTEX_BATCH       0x1814
+#define M_INLINE_ARRAY          0x1818
 #define M_IDXBUF_OFFSET         0x181C
 #define M_IDXBUF_FORMAT         0x1820
 #define M_VB_INDEX_BATCH        0x1824
@@ -89,6 +93,8 @@
 #define M_VP_UPLOAD_FROM_ID     0x1E9C
 #define M_VP_UPLOAD_CONST_ID    0x1EFC
 #define M_VP_UPLOAD_CONST       0x1F00
+#define M_GCM_FLIP_HEAD_0       0xE920
+#define M_GCM_FLIP_HEAD_1       0xE924
 #define M_GCM_DRIVER_FLIP       0xE944
 /* Primitive restart: a sentinel index value that breaks a TRIANGLE_STRIP/
  * FAN mid-draw with no connecting triangle (RPCS3 oracle: gcm_enums.h
@@ -168,10 +174,13 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_INLINE_ARRAY,      1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_GCM_FLIP_HEAD_0,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(rsx, M_GCM_FLIP_HEAD_1,   1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
 
     /* State the getters decode */
@@ -243,12 +252,75 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     memcpy(rsx->constants, words, count * sizeof(u32));
 }
 
+/* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
+ * attribute register a disabled array feeds. Only the 4F form was decoded, so a
+ * colour set with SetVertexData4ub read as the (0,0,0,1) default: Tornado
+ * Outbreak's UI draws its vertex colour that way, alpha 0 failed the alpha test
+ * on every glyph, and 58 draws a frame reached an all-black screen. Fold each
+ * variant into the 4F slots rsx_dsp_vertex_default reads. Offsets and packing
+ * from the SDK (gcm_implementation_sub.h; x is the LOW byte/half). */
+static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
+{
+    u32 w; memcpy(&w, &v, 4);
+    rsx->regs[(M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2] = w;
+}
+
+static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
+{
+    float f;
+    u32 attr, word;
+    if (m >= 0x1E40 && m < 0x1E80) {                  /* DATA1F: (x,0,0,1) */
+        attr = (m - 0x1E40) >> 2; memcpy(&f, &arg, 4);
+        vtx_const_set(rsx, attr, 0, f); vtx_const_set(rsx, attr, 1, 0.0f);
+        vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1880 && m < 0x1900) {           /* DATA2F: (x,y,0,1) */
+        attr = (m - 0x1880) >> 3; word = ((m - 0x1880) >> 2) & 1; memcpy(&f, &arg, 4);
+        vtx_const_set(rsx, attr, word, f);
+        if (word == 0) { vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f); }
+    } else if (m >= 0x1500 && m < 0x1600) {           /* DATA3F: (x,y,z,1) */
+        attr = (m - 0x1500) >> 4; word = ((m - 0x1500) >> 2) & 3; memcpy(&f, &arg, 4);
+        if (word < 3) vtx_const_set(rsx, attr, word, f);
+        if (word == 0) vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1900 && m < 0x1940) {           /* DATA2S: (x,y,0,1), unnormalised */
+        attr = (m - 0x1900) >> 2;
+        vtx_const_set(rsx, attr, 0, (float)(int16_t)(arg & 0xFFFF));
+        vtx_const_set(rsx, attr, 1, (float)(int16_t)(arg >> 16));
+        vtx_const_set(rsx, attr, 2, 0.0f); vtx_const_set(rsx, attr, 3, 1.0f);
+    } else if (m >= 0x1940 && m < 0x1980) {           /* DATA4UB: normalised bytes */
+        attr = (m - 0x1940) >> 2;
+        for (u32 c = 0; c < 4; c++)
+            vtx_const_set(rsx, attr, c, (float)((arg >> (8 * c)) & 0xFF) / 255.0f);
+    } else if ((m >= 0x1980 && m < 0x1A00) ||         /* DATA4S: unnormalised */
+               (m >= 0x0A80 && m < 0x0B00)) {         /* DATA_SCALED4S: normalised */
+        const u32 base = m >= 0x1980 ? 0x1980u : 0x0A80u;
+        const float k = m >= 0x1980 ? 1.0f : 1.0f / 32767.0f;
+        attr = (m - base) >> 3; word = ((m - base) >> 2) & 1;
+        vtx_const_set(rsx, attr, word * 2 + 0, (float)(int16_t)(arg & 0xFFFF) * k);
+        vtx_const_set(rsx, attr, word * 2 + 1, (float)(int16_t)(arg >> 16) * k);
+    }
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
     const u32 idx = method >> 2;
+    /* regs[] covers methods 0..0xFFFC (subchannel bits included). A larger
+     * value is not a method -- and indexing with it wrote past regs[] into
+     * vp[] and constants[]: Tornado Outbreak's c[461] held two copies of a
+     * "load constant 461" command header, i.e. FIFO words stored as shader
+     * constants. Drop it, and say what it was. */
+    if (idx >= RSX_DSP_NUM_REGS) {
+        static int n = 0;
+        if (n++ < 8)
+            fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
+                    method, arg);
+        return;
+    }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
+    if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
+        (method >= 0x0A80 && method < 0x0B00))
+        vtx_const_fold(rsx, method, arg);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
@@ -272,6 +344,14 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
         if (slot < RSX_DSP_NUM_CONSTANTS)
             rsx->constants[slot][word & 3] = arg;
+        /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
+         * slot range (first 400) -- what a shader's constants really were. */
+        { static int lo = -2, hi = 0, n = 0;
+          if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
+                          if (e) sscanf(e, "%d,%d", &lo, &hi); }
+          if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
+              fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
+                      "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
     }
 
@@ -285,12 +365,48 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (arg) {
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
+            rsx->inline_len = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
             rsx->in_begin_end = 0;
+            /* Hand an inline stream over BEFORE end: the sink reads end as
+             * "draw what you have", so a batch delivered after it would be
+             * drawn one primitive late, or not at all. */
+            if (rsx->inline_len && rsx->sink.inline_array)
+                rsx->sink.inline_array(rsx->sink.user, rsx,
+                                       rsx->inline_data, rsx->inline_len);
+            rsx->inline_len = 0;
             if (rsx->sink.end)
                 rsx->sink.end(rsx->sink.user, rsx);
+        }
+        break;
+
+    /* INLINE_ARRAY: the vertex stream travels IN the pushbuffer rather than
+     * being fetched from a vertex array, so there is no (first, count) --
+     * every word between BEGIN_END(prim) and BEGIN_END(0) is vertex data.
+     * The layout is still the ordinary VTXFMT declaration: enabled
+     * attributes packed in ascending index order, one vertex every stride
+     * bytes. Store the words back in guest byte order so the consumer
+     * decodes them with the same big-endian readers a vertex array uses;
+     * the dispatcher never interprets them.
+     *
+     * A title that builds geometry this way (Guitar Hero III draws its
+     * entire 2D layer as inline QUADS) previously issued draws that arrived
+     * carrying no vertices at all: the backend saw BEGIN/END with nothing
+     * between them and counted an empty group. */
+    case M_INLINE_ARRAY:
+        if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
+            rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
+            rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
+            rsx->inline_data[rsx->inline_len + 2] = (u8)(arg >> 8);
+            rsx->inline_data[rsx->inline_len + 3] = (u8)arg;
+            rsx->inline_len += 4;
+        } else if (rsx->inline_len) {
+            /* Truncating leaves a torn final vertex; drop the whole stream
+             * and count it instead of drawing something half-read. */
+            rsx->inline_len = 0;
+            rsx->inline_dropped++;
         }
         break;
 
@@ -306,6 +422,8 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                                        arg & 0xFFFFFF, (arg >> 24) + 1);
         break;
 
+    case M_GCM_FLIP_HEAD_0:
+    case M_GCM_FLIP_HEAD_1:
     case M_GCM_DRIVER_FLIP:
         if (rsx->sink.flip)
             rsx->sink.flip(rsx->sink.user, rsx, arg);

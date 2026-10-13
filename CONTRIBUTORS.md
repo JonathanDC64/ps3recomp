@@ -147,6 +147,25 @@ same engine then needed the FIFO subchannel treated as a binding slot rather
 than an engine selector, HDR (`F_W16Z16Y16X16`) colour surfaces, and
 fragment-output NaN guards — all on top of his engine, not in place of it.
 
+
+*The 2026-09 batch (#152-#161), from getting Yakuza: Dead Souls running on a Mac*
+- **Lifted SPU threads** — a thread runs its own lifted image in its own
+  architectural context, with lv2 copy semantics for the four thread arguments
+  (games reuse one guest args block across a group and rewrite it between calls,
+  so reading it lazily hands every thread the previous thread's values) (#152).
+- **lv2 condition signals retained; static guest mutexes registered** (#153).
+- **cellAudio** — guest ring indices wrapped, block tags and timestamps
+  provided (#154).
+- **cellSysutil** — dialog completions delivered from the guest callback poll
+  (#155).
+- **sceNpTrophy** first-use slots and registration completion (#156);
+  **cellGame** content-volume space and guest paths (#157); **cellSaveData**
+  callback ABI and guest file-request execution (#158).
+- **RSX: full FIFO driver methods, serialized callbacks and MRT exports** (#159).
+- **macOS native host, Metal rendering and game runner** (#160) — the second
+  platform backend, and the reason aarch64 is proven rather than assumed.
+- **sceNp** local score service initialized while offline (#161).
+
 ### Jonathan Del Corpo — [@JonathanDC64](https://github.com/JonathanDC64)
 Correctness and robustness fixes distilled from a **Demon's Souls** port that
 stress-tested the toolkit against a ~106k-function title. The title-agnostic wins
@@ -264,6 +283,64 @@ that work stands on its own (the `caner/ppu-*`, `c6*/c7*`, and the core SPU
 subsystem commits); the faithful-adoption branch is a parallel re-derivation, and
 credit for the underlying design belongs to them.
 
+
+*The 2026-09 cellGame batch, from LittleBigPlanet*
+- **cellGame content root** — the host directory `/dev_hdd0/game` maps to has to
+  be the same one `ppu_fs.cpp` resolves that mount to. When the two disagreed,
+  a title wrote its game data into one directory and read it back from another,
+  found nothing, and reported the data as **corrupt** rather than missing (#163).
+- **`cellGameContentErrorDialog`** implemented (#162), and the per-build LBP SPU
+  sources made optional (#164).
+
+This batch also surfaced a gap nobody could have found alone: with it, **Twisted
+Metal reaches `cellGameCreateGameData` for the first time**, and that path calls
+`cellGameSetParamString`, which nothing implemented. Exactly the kind of thing a
+port owner cannot see from inside their own title.
+
+*The 2026-09-10 SPU lifter and EDAT batch*
+- **`bi $rN` classified by basic block, not by function** — `compute_link_returns`
+  bounded both backward scans by the enclosing lifted *function*, but the lifter
+  splits long straight-line runs into several functions that chain by
+  fallthrough, and a split is not a control-flow edge. A scan that stops there
+  stops mid-block, having seen only part of it, which defeats the predecessor
+  refinement the function already does (#169).
+- **`hbra`/`hbrr` decoded as the 7-bit opcodes they are** — only `hbr` is the
+  11-bit RR form; testing the other two against a 9-bit field can never match, so
+  a stub carrying a branch hint decoded to UNKNOWN and the SPU fell into
+  branch-to-0. Found independently of the identical fix already in the tree,
+  from a different witness (#166).
+- **`--extra-funcs` passthrough** in `build_spu_workloads` (#165) and
+  `lift_jobmods` (#170). An SPU address reached only by an indirect branch is
+  invisible to `--auto-functions`; an image entered by an *interrupt vector* has
+  no branch path from its entry point at all. The job modules need it most —
+  they all stream into the same LS 0x4000 buffer with one resident at a time, so
+  a BRANCH-TO-0 names an address with no module attached to it.
+- **EDAT license types 1 and 2, and the 0x08/0x10/0x20 flags** — `edat.c` handled
+  only self-keyed SDATs and license-type-3 "free" EDATs with one of four public
+  klicensees, refusing everything else up front. Adds the missing HMAC-SHA1 hash
+  modes 0x01 and 0x04 alongside the AES-CMAC mode 0x02 that was there (#167).
+- **List-DMA issue tracing** — a list DMA takes its own path through the MFC and
+  never reaches `mfc_do_transfer`, so the always-on per-transfer trace never saw
+  one. Two lines that turn a run where everything downstream depends on a single
+  invisible list command into something you can read: the destination LSA at
+  issue, and what a stall handler leaves behind (#168).
+
+*The 2026-09-16 WWS job-manager batch, from LittleBigPlanet*
+- **`bi $rN` through a non-r0 link register returns through that register**
+  (#174) — Sony's compiler links through r4/r5/r6/r8/r78 as well as r0, and
+  `SPU_RET` always took r0, so every such return unwound the host stack and the
+  job manager restarted on every job.
+- **`lift_jobmods` seeds the entries modules reach only through data** (#175) —
+  the post-header stub and the hand-built return addresses that 46 of 47 job
+  modules use.
+- **SPU drain resumes at a lifted entry and unwinds an `iret` to the frame that
+  took the interrupt** (#176).
+- **The taskset syscall HLE'd for a standalone task on a planted context**
+  (#177) — LBP's audio tasks died on their first syscall and the loader waited
+  forever on their event flag.
+- **`_sys_spu_image_import` writes the segment source at +0x10** (#178) — the
+  FMOD mixer DMA'd its DSP overlay from EA 0 and jumped into zeroed local store.
+
 ### Paulo Adriano Alves — [@pauloadrianoalves](https://github.com/pauloadrianoalves)
 Initial **PPU boot path** and supporting tooling (PR #3, partially incorporated
 in **v0.6.2** — the SPU portions were superseded by the v0.6.0 SPU subsystem and
@@ -322,9 +399,110 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
   documented command against its tool's real argument parser turned up four more
   in the guide and two in the README. Fixed.
 
+### tomspilman — [@tomspilman](https://github.com/tomspilman)
+- **Found `spu_lifter.py --header-name` silently ignored** (#181) — the flag set
+  the output filename but the emitted `#include` stayed hardcoded to
+  `spu_recomp.h`, so any image lifted under a custom header name produced a
+  source file that could not compile. Every in-tree caller happens to pass the
+  default, which is exactly why it survived: a flag that only breaks for the
+  second person to use it.
+
 ### Filedownloader-tech — [@Filedownloader-tech](https://github.com/Filedownloader-tech)
 - **Build failure report with a full log** (#89) — the kind of report that can
   actually be acted on.
+
+### gabryboy12-ai — [@gabryboy12-ai](https://github.com/gabryboy12-ai)
+- **Put Linux and macOS back on the build** (#191) — three recent commits had
+  reached for Win32 API that GCC/Clang builds do not have (a bare
+  `__declspec(thread)`, `LONG`/`InterlockedExchange`/`Sleep` outside `_WIN32`,
+  and `GetFileAttributesA` in two diagnostic gates), so master stopped building
+  off Windows. Fixed each the way the file already did it, and gave the compat
+  layer a POSIX `GetFileAttributesA` with a test.
+- **A Vulkan RSX backend** (#182, #192) — Linux had no renderer. Opt-in,
+  `libvulkan` loaded at run time, Vulkan 1.0 core only: clears, the fixed-function
+  fallback path, depth, textures and an SDL2 window first, then the guest's own
+  vertex/fragment programs through an HLSL → SPIR-V translator on the shared
+  register-file draw engine. Every `ps3recomp_host` scene passes on it under
+  the Khronos validation layer — on lavapipe in CI, and on a Nintendo Switch's
+  Tegra X1.
+- **Vulkan stencil** (#231): the depth format now carries stencil
+  (`D32_SFLOAT_S8_UINT` first), so the engine's stencil state takes effect.
+  Verified with a two-pass stencil scene on lavapipe and on the Switch.
+
+### André Brum — [@andrebrumdev](https://github.com/andrebrumdev)
+Lifter and RSX correctness found bringing up *God of War II HD* and *Ben 10
+Omniverse* — every fix arrives with a test that fails on master.
+- **Jump-table base register arbitrated by validated targets** (#179, fixing his
+  own report #115) — with `lwzx rD,rA,rB` either operand can be the table base;
+  the lifter took the first one it could resolve, so an absolute table whose
+  index also came off r2 lost its dispatcher silently.
+- **Callee-save slots snapshotted only for a real epilogue restore** (#207) — a
+  reload of a frame local written by `stvx` or through a pointer read the stale
+  value from fragment entry; a Ben 10 dialog band drew half a tile off-centre.
+  Same PR: **`vcmpequb.`/`vcmpequh.` set CR6**, closing the last gap in the
+  family.
+- **`SET_TRANSFORM_CONSTANT` is a 32-dword window, not 64** (#208) — three
+  registers above it were landing in the vertex constant file, inside God of
+  War's skinning palette: 46% of samples had a non-rigid bone, now 0.1%.
+- **`-msse4.1` probed instead of assumed** (#206) — Apple clang 21 and aarch64
+  GCC reject it outright.
+
+### Kurtisone — [@Kurtisone](https://github.com/Kurtisone)
+Draw-engine, Vulkan and SPURS fixes found bringing up *Twisted Metal* on
+Linux/Vulkan. Each one comes with a measurement or a test, and most of v0.14.0
+came from this work.
+- **Surfaces read through guest memory in another format** (#236): a depth
+  buffer read as colour, a Z16 shadow map, a float packed into RGBA8. Write
+  serials let the engine pick the newer of the two surfaces at one address.
+  Plus `RSX_ENGINE_PASS_DUMP` to find which pass of a frame first goes wrong
+  (#237).
+- NV3089 surface coherence (#224), display buffers and flips handed to the
+  engine (#223), texel-addressed coordinates (#221), B8 (#220), Z16 far-plane
+  clears (#235).
+- Vulkan: RGBA16F targets (#222), cube maps (#229), images sized by the device
+  limit (#227), cached readbacks (#245), and dumping every nth frame (#219).
+- **An SPU-signalled SPURS task wakes at once** (#242). It used to wait out a
+  1 s timeout, which made one frame of post-FX take 4.1 s.
+- SPURS taskset fields kept out of guest memory (#240), barrier and
+  `GetTasksetInfo` (#241), IO-table-first offsets (#238), a POSIX
+  `ps3_ms_now` (#244), real POSIX lwmutex/lwcond (#225), safe stack scans
+  (#217), SPU disassembler `orbi`/`xorhi`/`xorbi` (#239), `--chunk-lines`
+  (#216), `PS3_NULL_READ_STACK` (#226) and `g_ppu_main_ctx` (#228).
+
+### undecuple — [@undecuple](https://github.com/undecuple)
+- **Real video decode in cellVdec** (#215): H.264 and MPEG-2 through FFmpeg,
+  loaded at run time and never linked. Pictures come out in display order, with
+  pic items, PICOUT and EndSeq flush, in YUV420/UYVY/ARGB/RGBA. The loader is
+  reusable for cellAdec and cellDmux.
+- A detailed set of about 60 general fixes from a *Killzone 3* port (#214),
+  each with a focused test against v0.13.0.
+
+### robbe1912 — [@robbe1912](https://github.com/robbe1912)
+- **D3D12 fragment-program source capacity** (#230): a 256-instruction program
+  produced 57 KB of HLSL against a 32 KB buffer and was dropped as a decompile
+  failure. Comes with a synthetic regression fixture.
+
+### tekulvw — [@tekulvw](https://github.com/tekulvw)
+- **SPU interpreter `ILH`** (#234): it had shared `IL`'s case and repeated a
+  32-bit immediate instead of a halfword. The test runs the real interpreter.
+
+### deucebucket — [@deucebucket](https://github.com/deucebucket)
+- Reported that `fw_spu/` was tracking decrypted firmware PRXs and lifted C,
+  against our own firmware policy (#210). It came out in #212.
+
+### bojogon7 — [@bojogon7](https://github.com/bojogon7)
+- Added [AnyPS5](https://github.com/boykopovar/AnyPS5) to the README's list of
+  sibling recompilation projects (#209).
+
+---
+
+## Third-party code
+
+- **ATRAC3 / ATRAC3plus decoders** (`third_party/at3_standalone`, used by
+  `cellAtrac`) — from [FFmpeg](https://ffmpeg.org/), as extracted to a
+  standalone library by the [PPSSPP](https://github.com/hrydgard/ppsspp) project
+  (`ext/at3_standalone`). LGPL-2.1-or-later, kept as a separable component; see
+  its `README.txt` and `COPYING.LGPLv2.1`.
 
 ---
 

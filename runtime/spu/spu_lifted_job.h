@@ -14,12 +14,17 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
-#include "spu_interp.h"        /* spu_interp_run — un-lifted SPU images */
+#include "spu_interp.h"
+#include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 typedef void (*spu_lifted_entry_fn)(spu_context*);
+/* Guest RAM base, for decoding a raw SPU thread's argument block. */
+extern uint8_t* vm_base;
+
+
 
 /* Run an UN-LIFTED SPU image via the interpreter. Same context/LS/ABI bring-up
  * as spu_run_lifted_job (r1 = LS top, LS in/out, raw-thread arg EA in r3), but
@@ -48,6 +53,13 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
      * the waiting PPU. */
     ctx.spu_id       = spu_id;
     ctx.spu_group_id = group_id;
+    /* SPU_CTX_LOG=1: one line per job context, with its address. "Three
+     * contexts for one dispatch" is otherwise unanswerable -- every other
+     * probe sees contexts only once they reserve. */
+    { static int s_cl = -1;
+      if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+      if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d entry=0x%05X\n",
+                          (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
     ctx.image_id = image_id;
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
@@ -89,6 +101,10 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
             g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
     }
     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);
+    /* `ctx` is about to go out of scope: take it out of the reserving set
+     * first, or the coherency walk dereferences this stack frame after it is
+     * gone. See spu_coh_unregister. */
+    spu_coh_unregister(&ctx);
     return (int32_t)ctx.stop_code;
 }
 
@@ -110,17 +126,64 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
  * eaContext+0x10 descriptor: {0x40-marker handle, eaContext, queue/lock EA,
  * ...}). The claim CAS computes its atomic EA from r3.word2/3 & 0xFFFFFF80, so a
  * zero there locks address 0 and the runtime finds "no ready task". */
+/* Optional per-run setup for a RAW SPU THREAD (sys_spu_thread_*), as opposed to
+ * a SPURS job. Pass NULL for the job case and nothing changes.
+ *
+ * A raw SPU thread is a persistent worker: it inits, hands the PPU a ready
+ * handshake, then idles on its inbound mailbox waiting for commands. Three
+ * things it needs that a fire-and-forget job does not:
+ *
+ *   inmbox_val    the command the PPU just wrote with
+ *                 sys_spu_thread_write_spu_mb, pre-loaded so the worker's
+ *                 `rdch SPU_RdInMbox` returns it.
+ *   park_on_empty park (halt) instead of spinning when the inbox is empty, so
+ *                 the run ENDS at the idle point and the host thread is free.
+ *   spu_id        without it, a WrOutMbox the worker issues cannot be matched
+ *                 back to an lv2 SPU thread, so the completion event is dropped
+ *                 and the PPU waits in sys_event_queue_receive forever. The
+ *                 interpreter path already sets this; the lifted path did not.
+ */
+typedef struct spu_run_opts {
+    uint32_t inmbox_val;
+    int      park_on_empty;
+    uint32_t spu_id;
+    uint32_t group_id;
+} spu_run_opts;
+
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
                                              uint8_t* local_store,
                                              uint32_t args_ea,
                                              int image_id,
                                              int spurs_task_abi,
-                                             const uint32_t* r3_override)
+                                             const uint32_t* r3_override,
+                                             const spu_run_opts* opts)
 {
     if (!entry) return -1;
     spu_context ctx;
     spu_context_init(&ctx, 0);
+    { static int s_cl = -1;
+      if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+      if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
+                          (void*)&ctx, image_id); fflush(stderr); } }
     ctx.image_id = image_id;     /* select this image's indirect-branch table */
+    if (opts) {
+        ctx.spu_id              = opts->spu_id;
+        ctx.spu_group_id        = opts->group_id;
+        ctx.park_on_empty_inmbox = opts->park_on_empty;
+        if (opts->inmbox_val) spu_channel_write(&ctx.ch_in_mbox, opts->inmbox_val);
+        /* Publish the LIVE context for the duration of the run so the PPU side
+         * (sys_spu_thread_write_spu_mb) can poke this worker's mailbox and wake
+         * it where it stands, instead of restarting it from its entry.
+         *
+         * This is what makes a persistent worker actually persistent: blocking
+         * inside rdch keeps the host thread's C stack alive, so the SPU's
+         * register state survives the wait. Park-and-restart cannot do that --
+         * local store persists but registers do not, so a re-run re-executes
+         * init and consumes the next command as though it were a startup
+         * parameter. */
+        extern void spu_thread_publish_ctx(uint32_t tid, void* c);
+        if (opts->spu_id) spu_thread_publish_ctx(opts->spu_id, &ctx);
+    }
     /* Initialize the SPU stack pointer to the top of local store (the SPU ABI
      * expects r1 = top-16, 16-byte aligned, with a NULL back-chain). Without
      * this it is 0 from spu_context_init, so the first `r1 -= frame` wraps
@@ -136,10 +199,29 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     int taskset_ctx = (_LB(0x27C4) == 0xA70u);
     if (spurs_task_abi) {
         if (r3_override) {
-            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle      */
-            ctx.gpr[3]._u32[1] = args_ea;          /* eaContext (DMA'd first) */
-            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA           */
+            /* Pass the game's own CellSpursTaskArgument through UNCHANGED.
+             *
+             * Word 1 used to be overwritten with args_ea, the eaContext this
+             * runtime's HLE task-attribute handler had recorded. That is the
+             * word the task DMAs its 64-byte context from (func_00003ED8 puts
+             * it in MFC_EAL), and the substituted address is a PPU STACK
+             * temporary: by the third task the frame has already been recycled,
+             * so the task DMAs stack junk and decodes garbage.
+             *
+             * The game's own word 1 is the task's persistent control block --
+             * 0x006B4500 / 0x006B4780 / 0x006B4A00 for the three cri decode
+             * tasks. Those are load-bearing: the PPU waits on control+0x100
+             * (0x006B4600 / 0x006B4880 / 0x006B4B00), which is exactly the flag
+             * the task is supposed to set when a work cycle completes. Pointing
+             * the task at a different context is why it never sets it.
+             *
+             * A substituted eaContext remains the fallback below, for a task
+             * whose real argument this runtime never captured. */
+            ctx.gpr[3]._u32[0] = r3_override[0];   /* 0x40-marker handle       */
+            ctx.gpr[3]._u32[1] = r3_override[1];   /* task control block EA    */
+            ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
             ctx.gpr[3]._u32[3] = r3_override[3];
+            if (!ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
         } else if (image_id == 22) {
             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
@@ -163,7 +245,29 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
             ctx.gpr[3]._u32[1] = args_ea;       /* eaContext -> r3.word1 */
         }
     } else {
-        ctx.gpr[3]._u32[0] = args_ea;                           /* simple-job arg -> r3 */
+        /* RAW SPU THREAD (opts set): sys_spu_thread_argument is FOUR u64s
+         * (arg1..arg4) passed in r3..r6 -- not the address of that block. Each
+         * is a 64-bit EA the SPU reads as {word0 = EA-low, word1 = EA-high},
+         * so the guest u64's low half goes in word0 and the high half in word1
+         * (plain big-endian doubleword order would put the EA in word1 and trip
+         * the EA-high==0 assert in spu_dma.h on any real pointer argument).
+         * This is the same decode spu_run_interp_job already does.
+         *
+         * Handing the raw path `args_ea` itself instead made the worker read a
+         * pointer-to-its-arguments where it expected argument one: MultiStream's
+         * mixer ran ~12 hops of CRT, touched no channels at all, and returned
+         * (branch to LS 0) without ever reaching its service loop. */
+        if (opts && args_ea && vm_base) {
+            for (int i = 0; i < 4; i++) {
+                const uint8_t* p_ = vm_base + args_ea + i * 8;
+                uint32_t hi = ((uint32_t)p_[0]<<24)|((uint32_t)p_[1]<<16)|((uint32_t)p_[2]<<8)|p_[3];
+                uint32_t lo = ((uint32_t)p_[4]<<24)|((uint32_t)p_[5]<<16)|((uint32_t)p_[6]<<8)|p_[7];
+                ctx.gpr[3 + i]._u32[0] = lo;
+                ctx.gpr[3 + i]._u32[1] = hi;
+            }
+        } else {
+            ctx.gpr[3]._u32[0] = args_ea;                       /* simple-job arg -> r3 */
+        }
     }
     /* The r3_override path already carries the game's 0x0040xxxx marker (which
      * passes the (r3.word0>>16)==0x40 gate), so do NOT clobber it. The earlier
@@ -184,15 +288,51 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
         }
     }
     #undef _LB
-    if (taskset_ctx && getenv("LBP_TASKSET_TRACE")) {
+    if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
                 "r4=%08X %08X %08X %08X\n", image_id,
                 ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
                 ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
         fflush(stderr);
     }
+    int _halted = 0;
     { extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
-      spu_run_with_halt(entry, &ctx); }                         /* run with halt pad   */
+      _halted = spu_run_with_halt(entry, &ctx); }               /* run with halt pad   */
+    /* Raw-worker run summary (env SPU_WORKER_TRACE). A worker that produces no
+     * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
+     * and the difference between "parked at its idle poll" and "fell over after
+     * three instructions" is invisible without this. */
+    if (opts && getenv("SPU_WORKER_TRACE")) {
+        fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
+                "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
+                ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
+                (unsigned)(ctx.pc & SPU_LS_MASK),
+                (unsigned)ctx.ch_in_mbox.count,
+                (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value,
+                (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
+        fflush(stderr);
+    }
+
+    /* Raw-thread completion signal. Hardware raises a PPU event only from
+     * WrOutIntrMbox; the plain mailbox is PPU-polled. A worker that reports
+     * completion on the PLAIN mailbox would otherwise never wake the PPU
+     * blocked in sys_event_queue_receive. Same one-per-RUN rule the
+     * interpreter path uses -- one event per WRITE oversupplies the queue.
+     * Jobs (opts == NULL) keep their old behaviour exactly. */
+    if (opts && !spu_channel_has_data(&ctx.ch_out_intr_mbox) &&
+        spu_channel_has_data(&ctx.ch_out_mbox)) {
+        extern void (*g_spu_out_mbox_hook)(uint32_t, uint32_t, int, uint32_t);
+        if (g_spu_out_mbox_hook)
+            g_spu_out_mbox_hook(ctx.spu_group_id, ctx.spu_id, 1, ctx.ch_out_mbox.value);
+    }
+    if (opts && opts->spu_id) {
+        extern void spu_thread_publish_ctx(uint32_t tid, void* c);
+        spu_thread_publish_ctx(opts->spu_id, 0);   /* run over: ctx is a stack local */
+    }
+    /* ctx is a stack local that may have taken a lock-line reservation; left
+     * in the reserver set it is walked by the next PPU store to that line.
+     * GH3's Havok task returning is what first hit it. */
+    spu_coh_unregister(&ctx);
 
     /* SPURS task exit code (fork 9404ead / 4b1348d, re-attached post-merge).
      * When the leaf ends via `stop 0` (CELL_SPURS_TASK_SYSCALL_EXIT) its code must
@@ -217,7 +357,7 @@ static inline int32_t spu_run_lifted_job_img(spu_lifted_entry_fn entry,
                                              uint32_t args_ea,
                                              int image_id)
 {
-    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0);
+    return spu_run_lifted_job_abi(entry, local_store, args_ea, image_id, 0, 0, 0);
 }
 
 static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,
