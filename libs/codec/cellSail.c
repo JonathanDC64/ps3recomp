@@ -1,10 +1,13 @@
 /*
  * ps3recomp - cellSail HLE implementation
  *
- * Stub. Player lifecycle and state management work.
- * No actual media playback occurs — games typically show
- * a black screen for cutscenes, which is acceptable for
- * initial recompilation testing.
+ * Player lifecycle, state and events are modelled call by call. A PAMF
+ * stream with MPEG-2 video and LPCM audio is played for real (sail_movie.c*:
+ * Media Foundation on Windows): the graphics adapter hands out decoded frames
+ * in buffers the title allocates through its own pAlloc callback, the sound
+ * adapter hands out float PCM, and the end of the stream is reported when the
+ * last frame has been shown. Anything else -- or PS3_SAIL_MOVIES=0, or a host
+ * without a decoder -- ends at once, as before.
  */
 
 #include "ps3emu/guest_call.h"
@@ -15,6 +18,9 @@
 #include <stdlib.h>   /* getenv -- Clang errors on the implicit declaration MSVC allows */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 #include "cellPamf.h"           /* pamf_reader_init_host: a PAMF database is a reader */
+#include "sail_movie.h"
+#include "../../runtime/memory/vm.h"   /* vm_commit */
+#include "ps3emu/ps3_knob.h"            /* ps3_env_int */
 /* runtime/syscalls/sys_fs.c: the guest -> host path mapping cellFs uses too. */
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size);
 #ifdef _WIN32
@@ -40,7 +46,11 @@ static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
  * the title passed as `pSelf`. Declared here because the adapter setters below
  * need it -- they take that same pointer, not an index into s_players[]. */
 static struct { u32 self_ea, allocator_ea, callback_ea, arg_ea; int in_use; int state;
-                u32 desc; /* descriptor added with AddDescriptor (0 = none) */ }
+                u32 desc; /* descriptor added with AddDescriptor (0 = none) */
+                u32 gfx_ea, snd_ea;   /* adapters set with Set*Adapter (0 = none) */
+                SailMovie* movie;     /* open stream being played (NULL = none) */
+                u32 session;          /* FrameInfo.sessionId of the open stream */
+                int playing;          /* started and its end not reported yet */ }
     s_sail_players[CELL_SAIL_PLAYER_MAX];
 
 /* A CellSailPlayer is a GUEST POINTER, not a small integer handle.
@@ -194,6 +204,178 @@ static void sail_call(int slot, u32 call, u64 userParam, u32 via, u32 to)
     sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, to);
 }
 
+/* A finished stream: the source reports end of stream and the player drops
+ * back to OPENED, which is what a title waiting out a movie (Midway's logo
+ * AVIs, Demon's Souls' intro) watches for. */
+static void sail_ended(int slot)
+{
+    s_sail_players[slot].playing = 0;
+    s_sail_players[slot].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    sail_notify(slot, SAIL_EV_SOURCE_EOS, 0, 0);
+    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION);
+    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED);
+}
+
+/* ---------------------------------------------------------------------------
+ * Adapters
+ *
+ * The title's adapter structs are zeroed and our state is kept here, keyed by
+ * their EA. CellSailGraphicsAdapterFuncs is {pMakeup, pCleanup, pFormatChanged,
+ * pAlloc, pFree} (guest OPDs); pAlloc(pArg, size, num, ppFrame) returns how
+ * many frame buffers it put in ppFrame[]. Frame and sound buffers are handed
+ * to the title as CellSailGraphicsFrameInfo / CellSailSoundFrameInfo:
+ * {u32 pBuffer; u32 sessionId; u32 tag; s32 status; u64 pts}.
+ * -----------------------------------------------------------------------*/
+#define SAIL_ADAPTERS     8
+#define SAIL_GFX_FRAMES   4      /* frame buffers asked of pAlloc per stream */
+#define SAIL_SND_SLOTS    4      /* sound buffers rotated through */
+#define SAIL_SND_SLOT     0x10000u
+/* Guest scratch for the pAlloc out-array and the sound buffers: past the
+ * cellAudio port window (0x58000000 + 8 x 2 MB), outside sys_memory, the HLE
+ * heap and sys_vm. One 1 MB page per player. */
+#define SAIL_SCRATCH      0x59800000u
+#define SAIL_SCRATCH_SIZE 0x100000u
+
+typedef struct {
+    u32 self_ea, funcs_ea, arg_ea;
+    int is_gfx;
+    u8  pref[32];           /* CellSailVideoFormat from SetPreferredFormat */
+    int have_pref;
+    u32 frame[SAIL_GFX_FRAMES];
+    int nframe, next;       /* frames allocated for `session`, next to fill */
+    u32 frame_session;
+    int samples;            /* sound: sampleNum of the last GetFrame */
+    u32 tag;
+    u32 last_buf;           /* graphics: frame handed out last, and its pts */
+    u64 last_pts;
+} SailAdapter;
+
+static SailAdapter s_adapters[SAIL_ADAPTERS];
+
+static SailAdapter* sail_adapter(u32 ea, int create, int is_gfx)
+{
+    for (int i = 0; i < SAIL_ADAPTERS; i++)
+        if (s_adapters[i].self_ea == ea) return &s_adapters[i];
+    if (!create) return NULL;
+    for (int i = 0; i < SAIL_ADAPTERS; i++)
+        if (!s_adapters[i].self_ea) {
+            memset(&s_adapters[i], 0, sizeof s_adapters[i]);
+            s_adapters[i].self_ea = ea;
+            s_adapters[i].is_gfx = is_gfx;
+            return &s_adapters[i];
+        }
+    return NULL;
+}
+
+/* The player an adapter is attached to (slot), or -1. */
+static int sail_adapter_player(u32 ea)
+{
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
+        if (s_sail_players[i].in_use &&
+            (s_sail_players[i].gfx_ea == ea || s_sail_players[i].snd_ea == ea))
+            return i;
+    return -1;
+}
+
+static u32 sail_scratch(int slot)
+{
+    static int committed[CELL_SAIL_PLAYER_MAX];
+    const u32 ea = SAIL_SCRATCH + (u32)slot * SAIL_SCRATCH_SIZE;
+    if (!committed[slot]) {
+        if (vm_commit(ea, SAIL_SCRATCH_SIZE) != CELL_OK) return 0;
+        committed[slot] = 1;
+    }
+    return ea;
+}
+
+/* PS3_SAIL_MOVIES=0: never play, every stream ends at once (the old answer). */
+static int sail_movies_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = ps3_env_int("PS3_SAIL_MOVIES", 1) != 0;
+    return on;
+}
+
+static const char* sail_desc_uri(u32 desc);   /* descriptors are below */
+
+static void sail_free_frames(int slot);       /* with the adapters, below */
+
+/* The frame fetches run on the title's audio and render threads while
+ * CloseStream / Finalize run on another: Demon's Souls closes a movie that is
+ * skipped with START while its mixer is inside cellSailSoundAdapterGetFrame.
+ * The movie pointer is read under this lock (shared) and replaced under it
+ * (exclusive). Guest callbacks are never made while it is held, so a
+ * callback that closes the stream cannot deadlock against it. */
+static SRWLOCK s_movie_lock = SRWLOCK_INIT;
+
+static SailMovie* sail_movie_get(int slot)   /* returns with the lock shared */
+{
+    AcquireSRWLockShared(&s_movie_lock);
+    return s_sail_players[slot].movie;
+}
+
+static void sail_movie_put(void)
+{
+    ReleaseSRWLockShared(&s_movie_lock);
+}
+
+/* The open movie's stream info and session; 0 when none is open. */
+static int sail_movie_info_of(int slot, SailMovieInfo* mi, u32* session)
+{
+    memset(mi, 0, sizeof *mi);
+    SailMovie* m = sail_movie_get(slot);
+    if (m) sail_movie_info(m, mi);
+    if (session) *session = s_sail_players[slot].session;
+    sail_movie_put();
+    return m != NULL;
+}
+
+static void sail_close_movie(int slot)
+{
+    sail_free_frames(slot);
+    AcquireSRWLockExclusive(&s_movie_lock);
+    SailMovie* m = s_sail_players[slot].movie;
+    s_sail_players[slot].movie = NULL;
+    ReleaseSRWLockExclusive(&s_movie_lock);
+    sail_movie_close(m);   /* nothing can reach it now */
+    s_sail_players[slot].playing = 0;
+}
+
+/* Opens the descriptor's stream for playback, if it is one we can play. */
+static void sail_open_movie(int slot)
+{
+    sail_close_movie(slot);
+    const u32 desc = s_sail_players[slot].desc;
+    if (!sail_movies_on() || !desc) return;
+    const char* uri = sail_desc_uri(desc);
+    if (!uri) return;
+    static const char scheme[] = "x-cell-fs://";
+    const char* guest_path = strncmp(uri, scheme, sizeof scheme - 1) == 0 ? uri + sizeof scheme - 1 : uri;
+    char host[1024];
+    sys_fs_translate_path(guest_path, host, (int)sizeof host);
+    int coding = SAIL_MOVIE_ARGB;
+    SailAdapter* g = sail_adapter(s_sail_players[slot].gfx_ea, 0, 1);
+    if (g && g->have_pref && g->pref[0] == 1 /* RGBA_INTERLEAVED */) coding = SAIL_MOVIE_RGBA;
+    SailMovie* m = sail_movie_open(host, coding);
+    static u32 session;
+    AcquireSRWLockExclusive(&s_movie_lock);
+    s_sail_players[slot].movie = m;
+    s_sail_players[slot].session = ++session;
+    ReleaseSRWLockExclusive(&s_movie_lock);
+    if (!m)
+        printf("[cellSail] %s: not playable here, it will end at once\n", guest_path);
+}
+
+/* Called from the frame fetches: once the movie has run out, report its end
+ * (on the title's thread, as the real player's events would arrive). */
+static void sail_check_end(int slot, int eos)
+{
+    if (eos && InterlockedExchange((volatile LONG*)&s_sail_players[slot].playing, 0)) {
+        printf("[cellSail] stream ended\n");
+        sail_ended(slot);
+    }
+}
+
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 {
     printf("[cellSail] PlayerBoot(0x%08X, user=0x%llX)\n", handle, (unsigned long long)userParam);
@@ -216,6 +398,7 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, u64 userParam)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPEN_TRANSITION);
+    sail_open_movie(_sp);
     if (s_sail_players[_sp].desc)
         sail_notify(_sp, SAIL_EV_STREAM_OPENED, 0, s_sail_players[_sp].desc);
     sail_completed(_sp, SAIL_CALL_OPEN_STREAM, userParam);
@@ -231,6 +414,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle, u64 userParam)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_CLOSE_TRANSITION);
+    sail_close_movie(_sp);
     if (s_sail_players[_sp].desc)
         sail_notify(_sp, SAIL_EV_STREAM_CLOSED, 0, s_sail_players[_sp].desc);
     sail_completed(_sp, SAIL_CALL_CLOSE_STREAM, userParam);
@@ -283,16 +467,12 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle, u32 pCommand, u64 userParam
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
-    /* Immediately signal finished since we don't play anything */
-    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_START, userParam, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING);
-    /* Nothing decodes the stream, so it has already ended: the source reports
-     * end of stream and a finished stream drops the player back to OPENED,
-     * which is what a title waiting out a movie (Midway's logo AVIs, Demon's
-     * Souls' intro) watches for. */
-    sail_notify(_sp, SAIL_EV_SOURCE_EOS, 0, 0);
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION);
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED);
+    s_sail_players[_sp].playing = 1;
+    SailMovie* m = sail_movie_get(_sp);
+    if (m) sail_movie_start(m);                        /* ends from the frame fetches */
+    sail_movie_put();
+    if (!m) sail_ended(_sp);                           /* nothing to play: over already */
     return CELL_OK;
 }
 
@@ -303,6 +483,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle, u64 userParam)
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
+    s_sail_players[_sp].playing = 0;
     sail_call(_sp, SAIL_CALL_STOP, userParam, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED);
     return CELL_OK;
 }
@@ -352,6 +533,7 @@ s32 cellSailPlayerFinalize(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_close_movie(_sp);
     memset(&s_sail_players[_sp], 0, sizeof(s_sail_players[_sp]));
     return CELL_OK;
 }
@@ -493,12 +675,12 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
  * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index; (void)adapter;
-    u32 self_ea = (u32)handle;
-    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
-            return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    (void)index;
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    s_sail_players[_sp].snd_ea = (u32)(uintptr_t)adapter;
+    return CELL_OK;
 }
 
 /* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
@@ -513,12 +695,12 @@ s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* 
  * going to exit. Look the player up the way Initialize2 stored it. */
 s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, void* adapter)
 {
-    (void)index; (void)adapter;
-    u32 self_ea = (u32)handle;
-    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
-        if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
-            return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    (void)index;
+    const int _sp = sail_player_slot((u32)handle);
+    if (_sp < 0)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    s_sail_players[_sp].gfx_ea = (u32)(uintptr_t)adapter;
+    return CELL_OK;
 }
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
@@ -615,6 +797,12 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
         }
     }
     return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+}
+
+static const char* sail_desc_uri(u32 desc)
+{
+    const int d = sail_desc_slot(desc);
+    return d < 0 ? NULL : s_descs[d].uri;
 }
 
 s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
@@ -820,13 +1008,16 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
 }
 
 /* cellSailSoundAdapterInitialize(pSelf, pCallbacks, pArg) -- NID 0x3D0D3B72.
- * Same reasoning: zero it rather than leave the guest reading stale memory. */
+ * Same reasoning: zero it rather than leave the guest reading stale memory.
+ * Our side of the adapter is kept in s_adapters. */
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
     printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    SailAdapter* a = sail_adapter(pSelf, 1, 0);
+    if (a) { a->funcs_ea = pCallbacks; a->arg_ea = pArg; }
     return CELL_OK;
 }
 
@@ -839,40 +1030,218 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
  * rather than a stale address that faults or is silently followed. */
 s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
-    (void)pArg;
     printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
+    SailAdapter* a = sail_adapter(pSelf, 1, 1);
+    if (a) { a->funcs_ea = pCallbacks; a->arg_ea = pArg; }
     return CELL_OK;
 }
 
 /* cellSailGraphicsAdapterSetPreferredFormat(pSelf, pFormat)
  *
- * Records nothing: we do not decode video, so there is no format to honour.
- * It must still answer CELL_OK for a valid adapter, because a title that reads
- * an error here concludes its graphics adapter is unusable. */
+ * pFormat is a CellSailVideoFormat (32 bytes): s8 coding, scan, bitsPerColor,
+ * frameRate; s16 width, height; s32 pitch, alpha; s8 colorMatrix, aspectRatio,
+ * colorRange, reserved1; s32 reserved2; s64 reserved3. Kept for the coding
+ * (ARGB or RGBA) and as the template GetFormat answers from. It must answer
+ * CELL_OK for a valid adapter: a title that reads an error here concludes its
+ * graphics adapter is unusable. */
 s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 {
-    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
-           pSelf, pFormat);
     if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    SailAdapter* a = sail_adapter(pSelf, 1, 1);
+    if (a && pFormat) {
+        for (int i = 0; i < 32; i++) a->pref[i] = vm_read8(pFormat + (u32)i);
+        a->have_pref = 1;
+    }
+    printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X coding=%d %dx%d pitch=%d)\n",
+           pSelf, a ? (s8)a->pref[0] : -1, a ? (s16)(a->pref[4] << 8 | a->pref[5]) : 0,
+           a ? (s16)(a->pref[6] << 8 | a->pref[7]) : 0,
+           a ? (s32)((u32)a->pref[8] << 24 | a->pref[9] << 16 | a->pref[10] << 8 | a->pref[11]) : 0);
     return CELL_OK;
 }
 
-/* Frame fetches. Nothing decodes yet, so there is never a frame or a sample
- * block to hand out: answer EMPTY, which titles poll past. Faking CELL_OK
- * made them read a frame descriptor nothing had filled in. */
-s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
+/* Frame buffers for the open stream, asked of the title's pAlloc the first
+ * time a frame is due. */
+static void sail_alloc_frames(int slot, SailAdapter* a, u32 size)
 {
-    (void)pInfo;
-    return pSelf ? (s32)CELL_SAIL_ERROR_EMPTY : (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    if (a->frame_session == s_sail_players[slot].session && a->nframe > 0) return;
+    a->nframe = 0;
+    a->next = 0;
+    a->last_buf = 0;
+    a->frame_session = s_sail_players[slot].session;
+    const u32 pAlloc = a->funcs_ea ? vm_read32(a->funcs_ea + 12) : 0;
+    const u32 out = sail_scratch(slot);
+    if (!pAlloc || !out || !g_ps3_guest_caller) return;
+    for (int i = 0; i < SAIL_GFX_FRAMES; i++) vm_write32(out + 4u * i, 0);
+    /* The guest call returns nothing to us: count what pAlloc filled in. */
+    g_ps3_guest_caller(pAlloc, a->arg_ea, size, SAIL_GFX_FRAMES, out, 0, 0, 0, 0);
+    for (int i = 0; i < SAIL_GFX_FRAMES; i++) {
+        const u32 f = vm_read32(out + 4u * i);
+        if (!f) break;
+        a->frame[a->nframe++] = f;
+    }
+    printf("[cellSail] %d frame buffers of 0x%X bytes from the title, first at 0x%08X\n",
+           a->nframe, size, a->frame[0]);
 }
 
+/* Gives the frame buffers back through pFree when the stream closes. */
+static void sail_free_frames(int slot)
+{
+    SailAdapter* a = sail_adapter(s_sail_players[slot].gfx_ea, 0, 1);
+    if (!a || !a->nframe) return;
+    const u32 pFree = a->funcs_ea ? vm_read32(a->funcs_ea + 16) : 0;
+    const u32 out = sail_scratch(slot);
+    if (pFree && out && g_ps3_guest_caller) {
+        for (int i = 0; i < a->nframe; i++) vm_write32(out + 4u * i, a->frame[i]);
+        g_ps3_guest_caller(pFree, a->arg_ea, (u64)a->nframe, out, 0, 0, 0, 0, 0);
+    }
+    a->nframe = 0;
+    a->frame_session = 0;
+}
+
+static void sail_frame_info(u32 pInfo, u32 buf, u32 session, u32 tag, u64 pts)
+{
+    vm_write32(pInfo + 0, buf);
+    vm_write32(pInfo + 4, session);
+    vm_write32(pInfo + 8, tag);
+    vm_write32(pInfo + 12, 0);
+    vm_write64(pInfo + 16, pts);
+}
+
+/* The newest frame that is due, in the next of the title's frame buffers;
+ * EMPTY while none is (titles poll past that). */
+s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
+{
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    const int slot = sail_adapter_player(pSelf);
+    SailAdapter* a = sail_adapter(pSelf, 0, 1);
+    SailMovieInfo mi;
+    u32 session = 0;
+    if (slot < 0 || !a || !pInfo || !sail_movie_info_of(slot, &mi, &session))
+        return (s32)CELL_SAIL_ERROR_EMPTY;
+    int no = 0, eos = 0;
+    if (mi.width > 0) {
+        const u32 pitch = (u32)mi.width * 4u;
+        sail_alloc_frames(slot, a, pitch * (u32)mi.height);   /* a guest call: unlocked */
+        if (a->nframe > 0) {
+            const u32 buf = a->frame[a->next];
+            SailMovie* m = sail_movie_get(slot);
+            const int got = m && s_sail_players[slot].session == session &&
+                            sail_movie_video(m, vm_ptr8(buf), (int)pitch, &no, &eos);
+            sail_movie_put();
+            if (!m || s_sail_players[slot].session != session) return (s32)CELL_SAIL_ERROR_EMPTY;
+            if (got) {
+                a->next = (a->next + 1) % a->nframe;
+                a->last_buf = buf;
+                a->last_pts = (u64)no * 90000u * (u64)mi.fps_den / (u64)mi.fps_num;
+                sail_frame_info(pInfo, buf, s_sail_players[slot].session, ++a->tag, a->last_pts);
+                return CELL_OK;
+            }
+            /* No new frame due: hand the current one out again. Demon's Souls
+             * draws the movie quad only on a frame GetFrame filled, so EMPTY
+             * between two movie frames flashed the screen black whenever the
+             * game ran faster than the movie. */
+            if (!eos && a->last_buf && a->frame_session == s_sail_players[slot].session) {
+                sail_frame_info(pInfo, a->last_buf, s_sail_players[slot].session, a->tag, a->last_pts);
+                return CELL_OK;
+            }
+        }
+    } else {
+        SailMovie* m = sail_movie_get(slot);
+        if (m) sail_movie_video(m, NULL, 0, &no, &eos);   /* audio-only: still reports the end */
+        sail_movie_put();
+    }
+    sail_check_end(slot, eos);
+    return (s32)CELL_SAIL_ERROR_EMPTY;
+}
+
+/* cellSailGraphicsAdapterGetFormat(pSelf, pFormat): the format of the frames
+ * the adapter hands out. Titles read it when FrameInfo.sessionId changes. */
+s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat)
+{
+    if (!pSelf || !pFormat) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    const int slot = sail_adapter_player(pSelf);
+    SailAdapter* a = sail_adapter(pSelf, 0, 1);
+    SailMovieInfo mi = {0};
+    if (slot >= 0) sail_movie_info_of(slot, &mi, NULL);
+    u8 f[32];
+    memset(f, 0, sizeof f);
+    if (a && a->have_pref) memcpy(f, a->pref, sizeof f);
+    f[0] = (a && a->have_pref && a->pref[0] == 1) ? 1 : 0;          /* RGBA / ARGB interleaved */
+    f[1] = 0;                                                      /* progressive */
+    f[2] = 8;                                                      /* bits per colour */
+    f[3] = mi.fps_num == 30000 ? 3 : mi.fps_num == 24000 ? 0 : mi.fps_num == 25 ? 2
+         : mi.fps_num == 30 ? 4 : mi.fps_num == 24 ? 1 : (u8)0xFF;
+    f[4] = (u8)(mi.width >> 8);  f[5] = (u8)mi.width;
+    f[6] = (u8)(mi.height >> 8); f[7] = (u8)mi.height;
+    const u32 pitch = (u32)mi.width * 4u;
+    f[8] = (u8)(pitch >> 24); f[9] = (u8)(pitch >> 16); f[10] = (u8)(pitch >> 8); f[11] = (u8)pitch;
+    f[12] = 0; f[13] = 0; f[14] = 0; f[15] = 0xFF;                 /* alpha 255 */
+    f[16] = 1;                                                     /* BT.709 */
+    f[17] = 1;                                                     /* square pixels */
+    f[18] = 0;                                                     /* full range (converted) */
+    for (int i = 0; i < 32; i++) vm_write8(pFormat + (u32)i, f[i]);
+    return CELL_OK;
+}
+
+/* cellSailSoundAdapterGetFrame(pSelf, samples, pInfo): `samples` frames of
+ * interleaved big-endian float PCM in a buffer of ours. */
 s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
 {
-    (void)samples; (void)pInfo;
-    return pSelf ? (s32)CELL_SAIL_ERROR_EMPTY : (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    const int slot = sail_adapter_player(pSelf);
+    SailAdapter* a = sail_adapter(pSelf, 1, 0);
+    if (slot < 0 || !a || !pInfo || !samples) return (s32)CELL_SAIL_ERROR_EMPTY;
+    const u32 base = sail_scratch(slot);
+    SailMovie* m = sail_movie_get(slot);     /* held to the end: no guest calls below */
+    SailMovieInfo mi;
+    if (m) sail_movie_info(m, &mi);
+    if (!m || mi.channels <= 0 || mi.rate <= 0 || !base) {
+        sail_movie_put();
+        return (s32)CELL_SAIL_ERROR_EMPTY;
+    }
+    if (samples * (u32)mi.channels * 4u > SAIL_SND_SLOT) samples = SAIL_SND_SLOT / (4u * (u32)mi.channels);
+    if (a->samples != (int)samples) {
+        printf("[cellSail] sound frames of %u samples x %d ch\n", samples, mi.channels);
+        a->samples = (int)samples;
+    }
+    const u32 buf = base + SAIL_SND_SLOT * (1u + (u32)a->next);   /* slot 0 holds ppFrame */
+    int eos = 0;
+    const int got = sail_movie_audio(m, (float*)vm_ptr8(buf), (int)samples, 1, &eos) > 0;
+    const u32 session = s_sail_players[slot].session;
+    sail_movie_put();
+    if (got) {
+        a->next = (a->next + 1) % SAIL_SND_SLOTS;
+        sail_frame_info(pInfo, buf, session, ++a->tag,
+                        (u64)a->tag * samples * 90000u / (u64)mi.rate);
+        return CELL_OK;
+    }
+    if (mi.width <= 0) sail_check_end(slot, eos);   /* video reports the end when there is one */
+    return (s32)CELL_SAIL_ERROR_EMPTY;
+}
+
+/* cellSailSoundAdapterGetFormat(pSelf, pFormat): CellSailAudioFormat {s8
+ * coding (LPCM_FLOAT32 1), chNum; s16 sampleNum; s32 fs, chLayout, reserved0;
+ * s64 reserved1}. PAMF LPCM is in Blu-ray order: L R, or L C R Ls Rs LFE. */
+s32 cellSailSoundAdapterGetFormat(u32 pSelf, u32 pFormat)
+{
+    if (!pSelf || !pFormat) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    const int slot = sail_adapter_player(pSelf);
+    SailAdapter* a = sail_adapter(pSelf, 0, 0);
+    SailMovieInfo mi = {0};
+    if (slot >= 0) sail_movie_info_of(slot, &mi, NULL);
+    const int ch = mi.channels;
+    const int layout = ch == 1 ? 1 : ch == 2 ? 2 : ch == 6 ? 8 : ch == 8 ? 11 : 0;
+    vm_write8(pFormat + 0, 1);
+    vm_write8(pFormat + 1, (u8)ch);
+    vm_write16(pFormat + 2, (u16)(a ? a->samples : 0));
+    vm_write32(pFormat + 4, (u32)mi.rate);
+    vm_write32(pFormat + 8, (u32)layout);
+    vm_write32(pFormat + 12, 0xFFFFFFFFu);
+    vm_write64(pFormat + 16, 0);
+    return CELL_OK;
 }
 
 s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u64 pts)
@@ -889,11 +1258,15 @@ s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf, u64 pts)
 
 s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
 {
+    SailAdapter* a = sail_adapter(pSelf, 0, 1);
+    if (a) memset(a, 0, sizeof *a);
     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
 }
 
 s32 cellSailSoundAdapterFinalize(u32 pSelf)
 {
+    SailAdapter* a = sail_adapter(pSelf, 0, 0);
+    if (a) memset(a, 0, sizeof *a);
     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
 }
 
