@@ -70,9 +70,13 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
-/* b1 per-draw FP slot: rsx_texscale[4] + rsx_alphatest + fp_k[64]
- * = 69 float4 = 1104 B, rounded to D3D12's 256-byte CBV alignment. */
-#define VP_FPCB_STRIDE    1280
+/* b1 per-draw FP slot, in float4s: rsx_texscale[16], rsx_alphatest, then the
+ * program's inline constants fp_constants[FPCB_KMAX]. (17 + 128) * 16 = 2320 B,
+ * rounded up to D3D12's 256-byte CBV alignment. */
+#define FPCB_ALPHA        16
+#define FPCB_K            17
+#define FPCB_KMAX         128
+#define VP_FPCB_STRIDE    2560
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -2000,23 +2004,7 @@ static int dr_num_rts(const D3D12DrawRecord* dr)
     return n;
 }
 
-/* Replace every occurrence of `find` with `repl` inside a NUL-terminated buffer,
- * shifting the tail. Used to retarget generated HLSL (2D sampler -> cube). */
-static void hlsl_replace_all(char* buf, size_t cap, const char* find, const char* repl)
-{
-    size_t fl = strlen(find), rl = strlen(repl);
-    if (!fl) return;
-    char* at = buf;
-    while ((at = strstr(at, find)) != NULL) {
-        size_t used = strlen(buf) + 1;
-        if (used + rl - fl > cap) return;
-        memmove(at + rl, at + fl, used - (size_t)(at - buf) - fl);
-        memcpy(at, repl, rl);
-        at += rl;
-    }
-}
-
-/* Which of a draw's texture units are cube textures, as a 4-bit mask. */
+/* Which of a draw's texture units are cube textures, as a bit mask. */
 static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 {
     /* ON by default (RSX_CUBE_TEX=0 to disable). This was off while the cube path
@@ -2044,6 +2032,133 @@ static ID3D12PipelineState* vp_fp_insert(const VPFPEntry* e)
     }
     s_d3d.vp_fp[s_d3d.vp_fp_n++] = *e;
     return e->pso;
+}
+
+/* The debug rewrites below (FP_ONE, FP_SHOW, FP_IDCOLOR, FP_TEX, FP_KILL) edit
+ * the colour-0 output of a translated program. Its spelling depends on the
+ * decompiler version: "_po.c0 = X;" (older), "float4 _o = X;" (one target) or
+ * "float4 _o0 = X;" (several). They anchored on the first only and silently did
+ * nothing with the current decompiler. Returns the start of X (or of the whole
+ * statement with want_stmt) and sets *end to its ';', or NULL. */
+static char* fp_out_anchor(char* hlsl, char** end, int want_stmt)
+{
+    static const char* const pats[] = { "_po.c0 = ", "float4 _o = ", "float4 _o0 = " };
+    for (int i = 0; i < 3; i++) {
+        char* rp = strstr(hlsl, pats[i]);
+        char* semi = rp ? strchr(rp, ';') : NULL;
+        if (semi) { *end = semi; return want_stmt ? rp : rp + strlen(pats[i]); }
+    }
+    return NULL;
+}
+
+/* Replace the colour-0 expression with expr. Returns 1 if it was replaced. */
+static int fp_set_out(char* hlsl, size_t cap, const char* expr)
+{
+    char* semi; char* rp = fp_out_anchor(hlsl, &semi, 0);
+    if (!rp) return 0;
+    size_t newlen = strlen(expr), tail = strlen(semi) + 1;
+    if ((size_t)(rp - hlsl) + newlen + tail >= cap) return 0;
+    memmove(rp + newlen, semi, tail);
+    memcpy(rp, expr, newlen);
+    return 1;
+}
+
+/* Insert `ins` in front of the ')' that closes the call whose '(' is at open.
+ * Returns the position just past the inserted text, or NULL. */
+static char* hlsl_insert_before_close(char* hlsl, size_t cap, char* open, const char* ins)
+{
+    int depth = 0;
+    char* p = open;
+    for (; *p; p++) {
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (--depth == 0) break; }
+    }
+    if (*p != ')') return NULL;
+    const size_t il = strlen(ins), used = strlen(hlsl);
+    if (used + il + 1 > cap) return NULL;
+    memmove(p + il, p, used - (size_t)(p - hlsl) + 1);
+    memcpy(p, ins, il);
+    return p + il;
+}
+
+/* Wire a decompiled program to this backend's per-draw b1 slot (see
+ * VP_FPCB_STRIDE and vp_record_cb):
+ *  - its cbuffer declaration becomes the b1 layout (texel scales, alpha test,
+ *    inline constants);
+ *  - each 2D Sample() coordinate is multiplied by rsx_texscale[unit], which is
+ *    1/size for a texture addressed in texels (format bit 0x40) and 1 otherwise;
+ *  - the alpha test runs on colour target 0 before returning (D3D12 has no
+ *    fixed-function one). Its state is per draw, so the pipeline key does not
+ *    need it.
+ * The previous decompiler emitted the scale and test itself; the current one
+ * leaves them to the backend, and this path had lost both. Returns 0 on
+ * failure (buffer too small or an unexpected program shape). */
+static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
+{
+    static const char decl[] =
+        "cbuffer PSConstants : register(b1) {\n"
+        "    float4 rsx_texscale[16];\n"
+        "    float4 rsx_alphatest;   /* x enable, y reference, z function - 0x200 */\n"
+        "    float4 fp_constants[128];\n"
+        "};\n"
+        "bool rsx_alpha_pass(float a) {\n"
+        "    const float r = rsx_alphatest.y; const int f = (int)rsx_alphatest.z;\n"
+        "    return f == 1 ? a < r : f == 2 ? a == r : f == 3 ? a <= r :\n"
+        "           f == 4 ? a > r : f == 5 ? a != r : f == 6 ? a >= r : f == 7;\n"
+        "}\n";
+    /* Replace the decompiler's declaration, or add ours in front of main. */
+    char* at = strstr(hlsl, "cbuffer PSConstants : register(b1) {");
+    char* end = at ? strstr(at, "};\n") : NULL;
+    if (at && !end) return 0;
+    if (!buffered && at) return 0;
+    if (!at) {
+        at = strstr(hlsl, "float4 main(");
+        if (!at) at = strstr(hlsl, "struct PSOutput {");
+        if (!at) return 0;
+        end = at;
+    } else {
+        end += 3;
+    }
+    {
+        const size_t dl = sizeof(decl) - 1, used = strlen(hlsl);
+        const size_t old = (size_t)(end - at);
+        if (used - old + dl + 1 > cap) return 0;
+        memmove(at + dl, end, used - (size_t)(end - hlsl) + 1);
+        memcpy(at, decl, dl);
+    }
+    /* Texel scale on every 2D Sample() of each unit. */
+    for (u32 u = 0; u < RSX_FP_UNITS; u++) {
+        if ((cube_mask >> u) & 1u) continue;
+        char needle[2][48], ins[32];
+        snprintf(needle[0], sizeof needle[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
+        snprintf(needle[1], sizeof needle[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+        snprintf(ins, sizeof ins, " * rsx_texscale[%u].xy", u);
+        for (int k = 0; k < 2; k++) {
+            char* from = hlsl;
+            char* hit;
+            while ((hit = strstr(from, needle[k])) != NULL) {
+                char* open = strchr(hit, '(');
+                from = open ? hlsl_insert_before_close(hlsl, cap, open, ins) : NULL;
+                if (!from) return 0;
+            }
+        }
+    }
+    /* Alpha test on target 0, just before the final return. */
+    {
+        char* ret = NULL;
+        for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
+            ret = p;
+        if (!ret) return 0;
+        const char* test = strstr(hlsl, "struct PSOutput")
+            ? "    if (rsx_alphatest.x > 0.5 && !rsx_alpha_pass(_out.t0.a)) discard;\n"
+            : "    if (rsx_alphatest.x > 0.5 && !rsx_alpha_pass(_o.a)) discard;\n";
+        if (!strstr(hlsl, "float4 _o = ") && !strstr(hlsl, "PSOutput _out;")) return 0;
+        const size_t tl = strlen(test), used = strlen(hlsl);
+        if (used + tl + 1 > cap) return 0;
+        memmove(ret + tl, ret, used - (size_t)(ret - hlsl) + 1);
+        memcpy(ret, test, tl);
+    }
+    return 1;
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
@@ -2154,12 +2269,37 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
                     fp_addr, cube_mask, ns, 10); } } }
     static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
-    /* Signature changed when the newer decompiler was adopted: the third
-     * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
-     * backend does not track that register, so let the decompiler infer it. */
-    (void)exp32;
-    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+    /* The third parameter is SET_SHADER_CONTROL. Only its 32_BITS_EXPORTS bit
+     * matters to the decompiler, and the draw records it (exp32, also part of
+     * the cache key). It decides whether the colour comes from r0 or h0; the
+     * old inference ("r0 was written, so r0") picked a stale temp for programs
+     * that use r0 as scratch and finish in h0 (Demon's Souls's level shaders).
+     *
+     * Buffered: inline constants become fp_constants[i] reads from b1, which
+     * vp_record_cb refills from the guest ucode for every draw. The cache key
+     * hashes the code without its constants, so a program compiled with its
+     * constants baked in kept the values of its first draw for the rest of the
+     * run while the title re-patched them per material (Demon's Souls's level
+     * surfaces drew black or saturated). The cube mask goes to the decompiler
+     * so cube units are declared and sampled as cubes. */
+    u32 kcount = 0;
+    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+                                         hlsl, sizeof(hlsl), &kcount);
+    int buffered = n > 0 && kcount <= FPCB_KMAX;
+    if (n > 0 && !buffered) {
+        /* More constants than b1 holds: bake them, as before. */
+        static int said = 0;
+        if (said++ < 4)
+            fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
+                            "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
+        n = rsx_fp_decompile_ex(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+                                hlsl, sizeof(hlsl));
+    }
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return vp_fp_insert(&key); }
+    if (!fp_bind_b1(hlsl, sizeof hlsl, cube_mask, buffered)) {
+        static int _e=0; if(_e++<16) printf("[FP] b1 binding failed (fp=0x%08X)\n", fp_addr);
+        return vp_fp_insert(&key);
+    }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2199,20 +2339,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
            * so this switch appeared to have no effect and was useless for
            * identifying which program draws what. Rewrite the expression with a
            * proper length-changing splice. */
-          char* rp = strstr(hlsl, "_po.c0 = ");
-          if (rp) {
-              char* semi = strchr(rp, ';');
-              if (semi) {
-                  static const char rep[] = "_po.c0 = (1.0).xxxx";
-                  size_t oldlen = (size_t)(semi - rp), newlen = sizeof(rep) - 1;
-                  size_t tail = strlen(semi) + 1;
-                  if ((rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                      memmove(rp + newlen, semi, tail);
-                      memcpy(rp, rep, newlen);
-                  }
-                  (void)oldlen;
-              }
-          }
+          fp_set_out(hlsl, sizeof hlsl, "(1.0).xxxx");
       } }
     /* FP_TEX=1: make every program output its unit-0 texture sample verbatim.
      * Separates "the texture is wrong" from "the shading tints it" in one run,
@@ -2227,7 +2354,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * "this surface is correct and something else is missing behind it". */
     { const char* kf = getenv("FP_KILL");
       if (kf && (u32)strtoul(kf, NULL, 16) == fp_addr) {
-          char* rp = strstr(hlsl, "PSOut _po;");
+          char* semi; char* rp = strstr(hlsl, "PSOut _po;");
+          if (!rp) rp = strstr(hlsl, "PSOutput _out;");
+          if (!rp) rp = fp_out_anchor(hlsl, &semi, 1);
           if (rp) {
               const char* ins = "discard; ";
               size_t nl = strlen(ins), tail = strlen(rp) + 1;
@@ -2241,38 +2370,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     { const char* sh = getenv("FP_SHOW");
       const char* only = getenv("FP_TEX_FP");
       if (sh && (!only || (u32)strtoul(only, NULL, 16) == fp_addr)) {
-          char* rp = strstr(hlsl, "_po.c0 = ");
-          if (rp) { char* semi = strchr(rp, ';');
-            if (semi) {
-                char rep[256];
-                snprintf(rep, sizeof rep, "_po.c0 = float4((%s).xyz, 1.0)", sh);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                    fprintf(stderr, "[FPSHOW] fp=0x%X output replaced with %s%c",
-                            fp_addr, sh, 10);
-                }
-            } }
+          char rep[256];
+          snprintf(rep, sizeof rep, "float4((%s).xyz, 1.0)", sh);
+          if (fp_set_out(hlsl, sizeof hlsl, rep))
+              fprintf(stderr, "[FPSHOW] fp=0x%X output replaced with %s%c",
+                      fp_addr, sh, 10);
       } }
-    /* Retarget the samplers the guest bound as CUBE textures. The decompiler
-     * always emits 2D samplers; a cube is sampled with a 3-component direction
-     * and no texel-scale, and the emitted coordinate always ends in the fixed
-     * tail ".xy * rsx_texscale[N].xy", so both edits are exact replacements. */
+    /* Cube units are declared and sampled as cubes by the decompiler itself
+     * (it is given the mask). */
     if (cube_mask) {
-        for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-            if (!(cube_mask & (1u << _u))) continue;
-            char f1[64], r1[64], f2[64], r2[64];
-            snprintf(f1, sizeof f1, "Texture2D    rsx_tex%d", _u);
-            snprintf(r1, sizeof r1, "TextureCube  rsx_tex%d", _u);
-            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
-            snprintf(f1, sizeof f1, "Texture2D rsx_tex%d", _u);
-            snprintf(r1, sizeof r1, "TextureCube rsx_tex%d", _u);
-            hlsl_replace_all(hlsl, sizeof hlsl, f1, r1);
-            snprintf(f2, sizeof f2, ".xy * rsx_texscale[%d].xy", _u);
-            snprintf(r2, sizeof r2, ".xyz");
-            hlsl_replace_all(hlsl, sizeof hlsl, f2, r2);
-        }
         { static int _n = 0; if (_n++ < 4)
             fprintf(stderr, "[CUBE] fp=0x%X compiled with cube units mask 0x%X%c",
                     fp_addr, cube_mask, 10); }
@@ -2281,70 +2387,49 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * from its address. One frame then shows which program paints which surface,
      * instead of one run per candidate to test them by elimination. */
     if (getenv("FP_IDCOLOR")) {
-        char* rp = strstr(hlsl, "_po.c0 = ");
-        if (rp) {
-            char* semi = strchr(rp, ';');
-            if (semi) {
-                /* Mix properly: every fp address in a title tends to share low
-                 * bits (they all end 0x01/0x81 here), so a single multiply left
-                 * one channel constant across all programs and made distinct
-                 * shaders look like the same colour. */
-                u32 hsh = fp_addr * 2654435761u;
-                hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
-                /* Force the top bit on in each channel: a hash that happens to
-                 * land near black is indistinguishable from "this surface was
-                 * never painted", which is the exact question the mode exists
-                 * to answer. */
-                float cr = (float)(((hsh >> 16) & 0x7F) | 0x80) / 255.0f;
-                float cg = (float)(((hsh >>  8) & 0x7F) | 0x80) / 255.0f;
-                float cb = (float)(((hsh      ) & 0x7F) | 0x80) / 255.0f;
-                char rep[128];
-                snprintf(rep, sizeof rep, "_po.c0 = float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                    fprintf(stderr, "[FPID] fp=0x%X -> rgb(%.0f,%.0f,%.0f)%c",
-                            fp_addr, cr*255, cg*255, cb*255, 10);
-                }
-            }
-        }
+        /* Mix properly: every fp address in a title tends to share low
+         * bits (they all end 0x01/0x81 here), so a single multiply left
+         * one channel constant across all programs and made distinct
+         * shaders look like the same colour. */
+        u32 hsh = fp_addr * 2654435761u;
+        hsh ^= hsh >> 13; hsh *= 0x5BD1E995u; hsh ^= hsh >> 15;
+        /* Force the top bit on in each channel: a hash that happens to
+         * land near black is indistinguishable from "this surface was
+         * never painted", which is the exact question the mode exists
+         * to answer. */
+        float cr = (float)(((hsh >> 16) & 0x7F) | 0x80) / 255.0f;
+        float cg = (float)(((hsh >>  8) & 0x7F) | 0x80) / 255.0f;
+        float cb = (float)(((hsh      ) & 0x7F) | 0x80) / 255.0f;
+        char rep[128];
+        snprintf(rep, sizeof rep, "float4(%.3f,%.3f,%.3f,1.0)", cr, cg, cb);
+        if (fp_set_out(hlsl, sizeof hlsl, rep))
+            fprintf(stderr, "[FPID] fp=0x%X -> rgb(%.0f,%.0f,%.0f)%c",
+                    fp_addr, cr*255, cg*255, cb*255, 10);
     }
     /* FP_TEX=<unit>: output that unit's sample verbatim. FP_TEX_FP=<hex> limits
      * it to one program, so one surface can be inspected without repainting the
-     * whole scene. FP_TEX_UV=1 samples with the same texcoord the program uses
-     * for that unit rather than tc0. */
+     * whole scene. */
     if (getenv("FP_TEX") && (!getenv("FP_TEX_FP") ||
         (u32)strtoul(getenv("FP_TEX_FP"), NULL, 16) == fp_addr)) {
         int _un = atoi(getenv("FP_TEX"));
-        if (_un < 0 || _un > 3) _un = 0;
-        char* rp = strstr(hlsl, "_po.c0 = ");
-        if (rp) {
-            char* semi = strchr(rp, ';');
-            if (semi) {
-                char rep[160];
-                /* FP_TEX_UV=1: sample at a fixed centre UV instead of the
-                 * interpolated texcoord. If the texture is populated but the
-                 * texcoords never arrive, the normal path samples texel (0,0)
-                 * -- usually black -- and looks exactly like an empty texture.
-                 * This tells the two apart. */
-                if (getenv("FP_TEX_UV"))
-                    snprintf(rep, sizeof rep,
-                             "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, float2(0.5, 0.5))",
-                             _un, _un);
-                else
-                snprintf(rep, sizeof rep,
-                         "_po.c0 = rsx_tex%d.Sample(rsx_samp%d, input.tc0.xy * rsx_texscale[%d].xy)",
-                         _un, _un, _un);
-                size_t newlen = strlen(rep), tail = strlen(semi) + 1;
-                fprintf(stderr, "[FP_TEX] program 0x%X rewritten to sample unit %d%c",
-                        fp_addr, _un, 10);
-                if ((size_t)(rp - hlsl) + newlen + tail < sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                }
-            }
-        }
+        if (_un < 0 || _un >= RSX_FP_UNITS) _un = 0;
+        /* The bank is an array unless a cube unit made the decompiler declare
+         * each unit by name. */
+        const int arr = strstr(hlsl, "rsx_tex[16]") != NULL;
+        char tex[32];
+        if (arr) snprintf(tex, sizeof tex, "rsx_tex[%d].Sample(rsx_samp[%d]", _un, _un);
+        else     snprintf(tex, sizeof tex, "rsx_tex%d.Sample(rsx_samp[%d]", _un, _un);
+        char rep[160];
+        /* FP_TEX_UV=1: sample at a fixed centre UV instead of the
+         * interpolated texcoord. If the texture is populated but the
+         * texcoords never arrive, the normal path samples texel (0,0)
+         * -- usually black -- and looks exactly like an empty texture.
+         * This tells the two apart. */
+        snprintf(rep, sizeof rep, "%s, %s)", tex,
+                 getenv("FP_TEX_UV") ? "float2(0.5, 0.5)" : "input.tc0.xy");
+        if (fp_set_out(hlsl, sizeof hlsl, rep))
+            fprintf(stderr, "[FP_TEX] program 0x%X rewritten to sample unit %d%c",
+                    fp_addr, _un, 10);
     }
     /* FP_FORCE=1: replace the translated body with solid magenta -- isolates
      * geometry/transform problems from texture/blend problems. */
@@ -3144,7 +3229,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     if (s_d3d.vp_fpcb_mapped) {
         float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
             + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
-        for (int _u = 0; _u < 4; _u++) {
+        for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             float sx = 1.0f, sy = 1.0f;
             if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
                 dr->tex[_u].w && dr->tex[_u].h) {
@@ -3162,12 +3247,14 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
               if (((dr->alpha_ctl >> 16) & 1u) && _at++ < 4)
                   printf("[ALPHATEST] enable func=%u ref=%u\n",
                          (dr->alpha_ctl >> 8) & 0xFFu, dr->alpha_ctl & 0xFFu); }
-            ts[16] = (float)((dr->alpha_ctl >> 16) & 1u);
-            ts[17] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
-            ts[18] = (float)((dr->alpha_ctl >> 8) & 0x07u);
-            ts[19] = 0.0f;
+            float* at = &ts[FPCB_ALPHA * 4];
+            at[0] = (float)((dr->alpha_ctl >> 16) & 1u);
+            at[1] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
+            at[2] = (float)((dr->alpha_ctl >> 8) & 0x07u);
+            at[3] = 0.0f;
         } else {
-            ts[16] = 0.0f; ts[17] = 0.0f; ts[18] = 7.0f; ts[19] = 0.0f;
+            float* at = &ts[FPCB_ALPHA * 4];
+            at[0] = 0.0f; at[1] = 0.0f; at[2] = 7.0f; at[3] = 0.0f;
         }
 
         /* fp_k[]: the program's inline fragment constants, re-read from the
@@ -3181,7 +3268,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[FPCB_K * 4], FPCB_KMAX);
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
@@ -3192,8 +3279,8 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                   fprintf(stderr, "[FPK] tex0=0x%08X fp=0x%08X k0=(%g %g %g %g)"
                                   " k1=(%g %g %g %g)%c",
                           dr->tex[0].raw, dr->fp_addr,
-                          ts[20], ts[21], ts[22], ts[23],
-                          ts[24], ts[25], ts[26], ts[27], 10);
+                          ts[FPCB_K*4+0], ts[FPCB_K*4+1], ts[FPCB_K*4+2], ts[FPCB_K*4+3],
+                          ts[FPCB_K*4+4], ts[FPCB_K*4+5], ts[FPCB_K*4+6], ts[FPCB_K*4+7], 10);
                   const u32 raw = dr->fp_addr & ~0x3u;
                   const u32 ea_main  = cellGcmResolveLocated(0, raw);
                   const u32 ea_local = cellGcmResolveLocated(1, raw);
@@ -6000,8 +6087,24 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
-      for (u32 k = 0; k < count; k++)
-          read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+      if (!state->restart_index_enable) {
+          for (u32 k = 0; k < count; k++)
+              read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+      } else {
+          /* Primitive restart: the restart index drops the triangle in
+           * progress and the list resumes after it. */
+          u32 o = 0, n = 0, tri[3];
+          for (u32 k = 0; k < count; k++) {
+              const u32 ix = read_guest_index(state, first + k);
+              if (ix == state->restart_index) { n = 0; continue; }
+              tri[n++] = ix;
+              if (n == 3) {
+                  for (int j = 0; j < 3; j++) read_vp_vertex(state, tri[j], &out[(o + j)*16]);
+                  o += 3; n = 0;
+              }
+          }
+          count = o;
+      }
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* IDXDBG=<hex shader_program>: index range for that program's draws. An
      * index past the vertex array reads unmapped guest memory as zero, which
@@ -6198,8 +6301,8 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
 }
 
 /* Indexed TRIANGLE_STRIP / TRIANGLE_FAN, expanded CPU-side into a triangle
- * list (the whole VP path draws lists; CullMode is NONE so strip parity
- * winding doesn't matter). DeferredShading's spline tube meshes -- the
+ * list (the whole VP path draws lists). The guest's face culling is honoured,
+ * so strip parity winding matters. DeferredShading's spline tube meshes -- the
  * octopus tentacles -- are indexed strips. */
 static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count, int fan)
 {
@@ -6212,13 +6315,36 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     if (tris * 3 > maxv) tris = maxv / 3;
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
-    u32 o = 0;
-    for (u32 t = 0; t < tris; t++) {
-        u32 i0 = fan ? 0 : t;
-        read_vp_vertex(state, read_guest_index(state, first + i0),    &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 1), &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 2), &out[o*16]); o++;
+    /* Expand to a triangle list. Two things the old loop missed:
+     *  - Strip triangles alternate winding; every odd one is emitted with its
+     *    first two vertices swapped (as the non-indexed path does), or culling
+     *    removes half of a culled strip.
+     *  - Primitive restart (SET_RESTART_INDEX_ENABLE): an index equal to the
+     *    restart index ends the strip or fan, and the next one starts after
+     *    it. Without it the restart index was fetched as a vertex (past the
+     *    end of the array) and stretched triangles across the screen. */
+    const int restart = state->restart_index_enable != 0;
+    const u32 ridx = state->restart_index;
+    u32 o = 0, base = 0;     /* base: index position where the current strip starts */
+    u32 cap = tris * 3;
+    for (u32 k = 0; k + 2 < count && o + 3 <= cap; k++) {
+        const u32 i2 = read_guest_index(state, first + k + 2);
+        if (restart && i2 == ridx) { base = k + 3; k += 2; continue; }
+        if (k < base) continue;
+        const u32 a = fan ? base : k;
+        const u32 ia = read_guest_index(state, first + a);
+        const u32 ib = read_guest_index(state, first + k + 1);
+        if (restart && (ia == ridx || ib == ridx)) continue;
+        const u32 t = k - base;
+        u32 v0 = ia, v1 = ib;
+        if (!fan && (t & 1)) { v0 = ib; v1 = ia; }
+        read_vp_vertex(state, v0, &out[o*16]); o++;
+        read_vp_vertex(state, v1, &out[o*16]); o++;
+        read_vp_vertex(state, i2, &out[o*16]); o++;
     }
+    { static int said = 0;
+      if (restart && !said) { said = 1;
+          fprintf(stderr, "[D3D12] primitive restart in use (index 0x%X)%c", ridx, 10); } }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
 }

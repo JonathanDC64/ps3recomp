@@ -790,6 +790,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->shader_dirty = 1;
         return 0;
     }
+    if (method == NV4097_SET_RESTART_INDEX_ENABLE) {
+        state->restart_index_enable = data & 1u;
+        return 0;
+    }
+    if (method == NV4097_SET_RESTART_INDEX) {
+        state->restart_index = data;
+        return 0;
+    }
     if (method == NV4097_SET_INDEX_ARRAY_ADDRESS) {
         state->index_array_offset = data;
         return 0;

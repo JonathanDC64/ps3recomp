@@ -141,6 +141,8 @@ extern "C" {
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
 #define NV4097_SET_SHADER_CONTROL               0x00001D60
+#define NV4097_SET_RESTART_INDEX_ENABLE         0x00001DAC
+#define NV4097_SET_RESTART_INDEX                0x00001DB0
 /* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
  * instead of h0/h4/h6/h8 (half). */
 #define CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS 0x00000040
@@ -330,6 +332,8 @@ typedef struct rsx_state {
     u32 begin_epoch;
     u32 index_array_offset;
     u32 index_array_dma;
+    u32 restart_index_enable; /* SET_RESTART_INDEX_ENABLE: an index equal to   */
+    u32 restart_index;        /* restart_index ends the strip/fan in progress  */
 
     /* Shader state */
     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,

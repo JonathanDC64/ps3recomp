@@ -341,7 +341,21 @@ static const char* input_expr(u32 input_src)
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
-        return "float4(0,0,0,0)";      /* TC8/TC9/FACING not plumbed */
+        /* TC8/TC9: VP outputs o15/o6 (RPCS3's register tables). Demon's Souls
+         * passes per-vertex fog through them (colour * TC8 + TC9); read as
+         * zero they turned its level surfaces black. The PSInput declares
+         * them only for programs that read them (see the preamble). */
+        if (input_src == 0xC) return "input.tc8";
+        if (input_src == 0xD) return "input.tc9";
+        /* FACING (and anything else) is not plumbed. Say which, once each: a
+         * program that reads one silently gets zero. */
+        { static unsigned seen = 0;
+          if (input_src < 32 && !(seen & (1u << input_src))) {
+              seen |= 1u << input_src;
+              fprintf(stderr, "[FP] input register %u (14 = facing) "
+                              "is read but not plumbed; it reads as zero%c", input_src, 10);
+          } }
+        return "float4(0,0,0,0)";
     }
 }
 
@@ -885,8 +899,13 @@ static int rsx_fp_decompile_internal(
         "    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
         "    float4 fog : FOG;\n"
         "    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
-        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
-        "};\n");
+        "    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n");
+    /* TEXCOORD8/9 only when read, so every other program is unchanged and
+     * still links against vertex shaders that stop at TEXCOORD7. They follow
+     * TEXCOORD7 in the vertex shader's output too. */
+    if (strstr(out, "input.tc8") || strstr(out, "input.tc9"))
+        out_puts(&p, "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
+    out_puts(&p, "};\n");
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1123,11 +1142,12 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
-        int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
+        /* The same test the decompiler applies when it numbers fp_constants[]
+         * (and rsx_fp_collect_constants): any source of type CONST, branch or
+         * not. Skipping branches here, as this did, shifted every later
+         * constant by one slot in a program whose branch word happened to
+         * carry CONST-type bits. */
+        int has_k = fp_instruction_has_constant(w1, w2, w3);
         if (has_k) {
             if (off + 16 <= max_bytes) {
                 for (int i = 0; i < 4; i++) {
@@ -1169,12 +1189,8 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
         off += 16;
-        int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
-            ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
-             (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
-             (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
-        if (has_k) off += 16;            /* skip the constant, do not hash it */
+        if (fp_instruction_has_constant(w1, w2, w3))
+            off += 16;                   /* skip the constant, do not hash it */
         if (w0 & FP_END) break;
     }
     return h;
