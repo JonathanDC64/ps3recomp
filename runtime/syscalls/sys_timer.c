@@ -114,6 +114,7 @@ void (*g_shadow_stack_dump_hook)(void) = 0;
 static __declspec(thread) int64_t t_last_end;
 static __declspec(thread) unsigned t_streak;
 static __declspec(thread) HANDLE t_timer;
+static __declspec(thread) int t_timer_hr;   /* t_timer is high-resolution */
 #endif
 
 int64_t sys_timer_usleep(ppu_context* ctx)
@@ -299,12 +300,13 @@ int64_t sys_timer_usleep(ppu_context* ctx)
           const int64_t gap_ticks = (int64_t)(200 * (uint64_t)s_qpc_freq.QuadPart / 1000000ULL);
           if (t_last_end && qpc_start.QuadPart - t_last_end <= gap_ticks) t_streak++;
           else t_streak = 0;
+          if (!s_spin && !t_timer) {
+              /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+). */
+              t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
+              t_timer_hr = t_timer != NULL;
+              if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+          }
           if (!s_spin && t_streak >= 64) {
-              if (!t_timer) {
-                  /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+). */
-                  t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
-                  if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-              }
               if (t_timer) {
                   LARGE_INTEGER due;
                   due.QuadPart = -((LONGLONG)usec * 10);
@@ -315,6 +317,24 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                   return CELL_OK;
               }
           }
+          /* A long sub-ms sleep that is not part of a streak (Demon's Souls'
+           * audio streamer: usleep(800) x3 between event-flag waits, ~330/s)
+           * spun its whole length in SwitchToThread -- half a core in the
+           * kernel. Sleep all but the last USLEEP_SPIN_TAIL_US on the
+           * high-resolution timer, then spin the tail to the same QPC
+           * deadline. The tail covers the timer's wake latency: it fires on
+           * ~0.5 ms boundaries here, so a 250 us tail let usleep(800) average
+           * 1040 us; 500 gives ~830 us at ~13% of a core (was 50%). -1
+           * disables the timer part. Needs the high-resolution timer; a plain
+           * one rounds to the 1 ms tick and would oversleep. */
+          { static int s_tail = -1;
+            PS3_KNOB(s_tail, getenv("USLEEP_SPIN_TAIL_US") ? atoi(getenv("USLEEP_SPIN_TAIL_US")) : 500);
+            if (!s_spin && t_timer_hr && s_tail >= 0 && usec > (uint64_t)s_tail + 100) {
+                LARGE_INTEGER due;
+                due.QuadPart = -((LONGLONG)(usec - (uint64_t)s_tail) * 10);
+                SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(t_timer, INFINITE);
+            } }
         }
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
