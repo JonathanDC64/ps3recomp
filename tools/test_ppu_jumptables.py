@@ -257,6 +257,8 @@ def main() -> int:
     test_base_before_fallthrough_split()
     test_const_base_no_table()
     test_const_base_needs_constant()
+    test_spilled_base()
+    test_spilled_slot_not_a_toc_load()
     test_multi_toc_prefers_targets_near_the_dispatcher()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
@@ -280,6 +282,36 @@ def test_const_base_no_table():
     got = discover([w_li(8, 0x14), w_addis(8, 8, 1), w_add(8, 8, 7),
                     w_mtctr(8), w_bctr()], mem)
     check("constant-base computed jump", got, [base, base + 4, base + 8, base + 12])
+
+
+def test_spilled_base():
+    """The base is TOC-loaded before a loop, spilled, and reloaded at the
+    dispatch (Demon's Souls func_01275EC0):
+
+        lwz r10,16(r2); std r10,0x88(r1); ... cmplwi r3,2; ld r11,0x88(r1)
+        slwi r9,r3,2; lwzx r0,r9,r11; add r11,r0,r11; mtctr r11; bctr
+
+    The target is computed back into the base register, so the nearest
+    definition of r11 is the `add` after the table load, not the reload.
+    """
+    table = 0x11000
+    mem = {TOC + 16: table,
+           table + 0: 0x100, table + 4: 0x200, table + 8: 0x300,
+           table + 12: 0xFFFFFFFF}
+    got = discover([w_lwz(10, 2, 16), w_std(10, 1, 0x88), w_cmplwi(0, 3, 2),
+                    w_ld(11, 1, 0x88), w_slwi(9, 3, 2), w_lwzx(0, 9, 11),
+                    w_add(11, 0, 11), w_mtctr(11), w_bctr()], mem)
+    check("offset table, base spilled to the stack", got, [0x11100, 0x11200, 0x11300])
+
+
+def test_spilled_slot_not_a_toc_load():
+    """The slot holds a value that is not a TOC load: no table."""
+    table = 0x11000
+    mem = {TOC + 16: table, table + 0: 0x100, table + 4: 0x200}
+    got = discover([w_li(10, 0x40), w_std(10, 1, 0x88), w_cmplwi(0, 3, 2),
+                    w_ld(11, 1, 0x88), w_slwi(9, 3, 2), w_lwzx(0, 9, 11),
+                    w_add(11, 0, 11), w_mtctr(11), w_bctr()], mem)
+    check("spilled slot without a TOC load is not a table", got, None)
 
 
 def test_const_base_needs_constant():

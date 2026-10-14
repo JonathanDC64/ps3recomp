@@ -3799,6 +3799,12 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             else:
                 continue
             break
+        # Only definitions BEFORE the table load can be the base it read. The
+        # jump arithmetic may reuse the base register for the target -- `lwzx
+        # r0,r9,r11; extsw r0,r0; add r11,r0,r11; mtctr r11` -- and that `add`,
+        # being nearest the bctr, used to be taken as the definition of r11 and
+        # rejected as not a load.
+        _pre = [x for x in win_cand if x.addr < lwzx.addr]
         for cand in _cands:
             disp = None; r_base = None; base_is_ld = False
             disp2 = None; disp2_is_ld = False
@@ -3826,13 +3832,41 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # Widening is safe for the cases that already worked: the walk stops
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
-            for w in reversed(win_cand):
+            for _wi in range(len(_pre) - 1, -1, -1):
+                w = _pre[_wi]
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and a[1].endswith('(r1)'):
+                    # SPILLED base: the TOC load happens before a loop, the
+                    # base is saved to a stack slot, and the dispatch inside
+                    # the loop reloads it: `lwz r10,0x5BC(r2); std
+                    # r10,0x388(r1)` ... `ld r11,0x388(r1); lwzx r0,r9,r11`.
+                    # Read as a two-level base through r1 it never resolved,
+                    # so the switch lifted to an indirect call into its own
+                    # body. (Demon's Souls func_01275EC0: a 0x6C-case byte-
+                    # code interpreter run while a level loads; the unresolved
+                    # case left every later object unbuilt and the game froze
+                    # behind the loading screen.) Follow the nearest store to
+                    # that slot, then the nearest definition of the stored reg.
+                    _slot = mem_disp(a[1])
+                    for _si in range(_wi - 1, -1, -1):
+                        s = _pre[_si]
+                        b = [x.strip() for x in s.operands.split(',')]
+                        if (s.mnemonic in ('std', 'stw') and len(b) == 2 and
+                                b[1].endswith('(r1)') and mem_disp(b[1]) == _slot):
+                            for y in reversed(_pre[:_si]):
+                                c = [x.strip() for x in y.operands.split(',')]
+                                if not c or c[0] != b[0] or y.mnemonic.startswith(('st', 'lf')):
+                                    continue
+                                if y.mnemonic in ('lwz', 'ld') and len(c) == 2 and '(r2)' in c[1]:
+                                    disp = mem_disp(c[1]); r_base = cand
+                                    base_is_ld = (y.mnemonic == 'ld')
+                                break           # nearest def of the stored reg decides
+                            break               # nearest store to the slot decides
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
                     # table address is not in the TOC itself but in a global the
