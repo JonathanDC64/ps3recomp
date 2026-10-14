@@ -467,6 +467,9 @@ static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
 static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
 static double s_perf_gpu = 0.0, s_perf_pre = 0.0, s_perf_srv = 0.0, s_perf_pso = 0.0;
 static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0;
+/* Vertex programs decompiled + compiled at draw-record time (vp_get_vs).
+ * Booked under "guest", not render_frame, since it runs while recording. */
+static int s_perf_vs_compiles = 0; static double s_perf_vs = 0.0;
 static u64    s_perf_nverts = 0;
 static u64    s_perf_texbytes = 0;
 static int    s_perf_ntex = 0;
@@ -1788,6 +1791,8 @@ static int vp_get_vs(const rsx_state* st)
         if (s_d3d.vp_vs[i].hash == hash) return i;
 
     static char hlsl[262144];
+    const double vs_t0 = perf_on() ? perf_now() : 0.0;
+    s_perf_vs_compiles++;
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
     if (ni <= 0) return -1;
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
@@ -1846,6 +1851,7 @@ static int vp_get_vs(const rsx_state* st)
     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
                             "main", "vs_5_0", 0, 0, &vb, &e);
     if (e) e->lpVtbl->Release(e);
+    if (perf_on()) s_perf_vs += perf_now() - vs_t0;
     if (FAILED(hr) || !vb) {
         static int _e=0; if (_e++<4) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
         return -1;
@@ -4868,7 +4874,8 @@ rtt_dump_done:;
             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
             fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
-                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
+                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
+                            " [vs compile %.2fs, %d]%c",
                     20.0 / fr,
                     s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
                     s_perf_vtx, 100.0 * s_perf_vtx / fr,
@@ -4878,10 +4885,12 @@ rtt_dump_done:;
                     s_perf_srv, 100.0 * s_perf_srv / fr,
                     s_perf_pso, 100.0 * s_perf_pso / fr,
                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
-                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
+                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr,
+                    s_perf_vs, s_perf_vs_compiles, 10);
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
+            s_perf_vs_compiles = 0; s_perf_vs = 0.0;
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }
     }
