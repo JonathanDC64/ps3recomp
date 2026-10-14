@@ -447,10 +447,16 @@ extern "C" int sail_movie_video(SailMovie* m, uint8_t* dst, int pitch, int* fram
     if (!m->has_video) { *eos = m->demux_done && m->a_cnt == 0; return 0; }
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const double t = (double)(now.QuadPart - m->t0.QuadPart) / (double)m->qf.QuadPart;
-    const int due = (int)(t * m->info.fps_num / m->info.fps_den);
+    /* One frame per call, in order, half a frame early; frames are dropped
+     * only to catch up more than two behind. Taking the newest due frame
+     * instead made a title that fetches at the movie's own rate (Demon's
+     * Souls: once per 29.97 Hz flip) land on either side of a frame boundary
+     * by a millisecond's jitter: two frames in one call, none in the next,
+     * a skip and a repeat several times a second. */
+    const int due = (int)(t * m->info.fps_num / m->info.fps_den + 0.5);
     bool got = false;
     Frame cur;
-    while (!m->vq.empty() && m->vq.front().no <= due) {
+    while (!m->vq.empty() && m->vq.front().no <= due && (!got || cur.no < due - 2)) {
         if (got) m->pool.push_back(std::move(cur.px));
         cur = std::move(m->vq.front());
         m->vq.pop_front();
