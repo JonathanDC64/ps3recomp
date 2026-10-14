@@ -1353,6 +1353,58 @@ static u32 gcm_spu_block_for_put(u32 put)
  *
  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
  * is not, it deadlocks the title. Sweep the skipped range first. */
+/* RSX_CENSUS=<n>: every n-th frame (counted in FIFO flip words), what that
+ * frame's FIFO carried: SET_BEGIN_END batches by primitive, the draw methods
+ * (DRAW_ARRAYS, DRAW_INDEX_ARRAY, INLINE_ARRAY, ARRAY_ELEMENT16/32), and every
+ * method rsx_process_method did not handle. Release builds log nothing for an
+ * unhandled method, so a draw the title sends in a form we do not decode is
+ * invisible without this. Read it against the backend's record count. */
+static int  s_census_every = -1;
+static u32  s_census_prim[16], s_census_draw[8], s_census_frame = 0;
+static u32  s_census_unk_m[32], s_census_unk_n[32];
+static void gcm_census_flip(void)
+{
+    if (s_census_every <= 0) return;
+    if ((++s_census_frame % (u32)s_census_every) == 0) {
+        fprintf(stderr, "[census] frame %u: begin", s_census_frame);
+        for (int k = 0; k < 16; k++)
+            if (s_census_prim[k]) fprintf(stderr, " p%d=%u", k, s_census_prim[k]);
+        fprintf(stderr, " | arrays=%u indexed=%u inline=%u elem16=%u elem32=%u report=%u | unhandled",
+                s_census_draw[0], s_census_draw[1], s_census_draw[2], s_census_draw[3],
+                s_census_draw[4], s_census_draw[5]);
+        for (int k = 0; k < 32 && s_census_unk_n[k]; k++)
+            fprintf(stderr, " 0x%04X=%u", s_census_unk_m[k], s_census_unk_n[k]);
+        fputc(10, stderr);
+    }
+    memset(s_census_prim, 0, sizeof s_census_prim);
+    memset(s_census_draw, 0, sizeof s_census_draw);
+    memset(s_census_unk_n, 0, sizeof s_census_unk_n);
+}
+
+static void gcm_census_method(u32 m, u32 data, int handled)
+{
+    if (s_census_every < 0) { const char* e = getenv("RSX_CENSUS");
+                              s_census_every = e ? atoi(e) : 0;
+                              if (s_census_every > 0) fprintf(stderr, "[census] every %d frames%c", s_census_every, 10); }
+    if (s_census_every <= 0) return;
+    /* A frame ends at a flip request, whichever way the title issues it (FIFO
+     * flip word or the cellGcmSetFlipCommand call). */
+    { static u32 last = 0; const u32 now = s_flip_request_count;
+      if (now != last) { last = now; gcm_census_flip(); } }
+    if (m == 0x1808 && data) s_census_prim[data & 15]++;
+    else if (m == 0x1814) s_census_draw[0]++;
+    else if (m == 0x1824) s_census_draw[1]++;
+    else if (m == 0x1818) s_census_draw[2]++;
+    else if (m == 0x180C) s_census_draw[3]++;
+    else if (m == 0x1810) s_census_draw[4]++;
+    else if (m == 0x1800) s_census_draw[5]++;
+    if (!handled) {
+        for (int k = 0; k < 32; k++) {
+            if (s_census_unk_n[k] && s_census_unk_m[k] == m) { s_census_unk_n[k]++; return; }
+            if (!s_census_unk_n[k]) { s_census_unk_m[k] = m; s_census_unk_n[k] = 1; return; }
+        }
+    }
+}
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     static int n = 0;
@@ -1964,7 +2016,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    { const u32 md = vm_read32(dea);
+                      const int hr = rsx_process_method(&s_state, m, md);
+                      gcm_census_method(m, md, hr == 0); }
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
