@@ -209,7 +209,14 @@ typedef struct {
  * so every draw past the fourth got slot -1 from vp_upload_tex_slot ("out of
  * slots") and drew UNTEXTURED. That reads as a correctly-lit but solid black
  * object, which is indistinguishable from a missing texture upload. */
-#define VP_TEX_SLOTS 96
+/* 96 was not enough either: a Demon's Souls level frame binds up to ~130
+ * distinct textures, depending on what the camera sees. Every texture first
+ * bound after the slots ran out drew with nothing in its unit, so whatever
+ * came last in the frame -- the HUD, always -- vanished whenever the view
+ * was busy. Lookups go through a hash index (vp_tex_find), so the count can
+ * be generous; a slot only holds a resource once a texture lands in it. */
+#define VP_TEX_SLOTS 1024
+#define VP_TEX_HASH  4096   /* power of two, > 2 x VP_TEX_SLOTS */
 
 /* Decompiled-VS cache: one entry per distinct vertex-program ucode seen at
  * draw time (hashed). Apps switch VPs between draws (gcm/cube: its MVP cube VP
@@ -2841,6 +2848,52 @@ static int vp_tex_fmt_ok(u32 basef)
     }
 }
 
+/* Slot lookup by (bound offset, size, format, cube) through an open-
+ * addressed index, rebuilt whenever a slot takes a different texture (new
+ * uploads only, which cost far more than the rebuild). */
+static short s_vp_tex_index[VP_TEX_HASH];   /* slot + 1, 0 = empty */
+static int   s_vp_tex_index_dirty = 1;
+
+static u32 vp_tex_hash(u32 key, u32 w, u32 h, u32 fmt, int cube)
+{
+    u32 x = key * 0x9E3779B1u ^ (w << 16 | h) * 0x85EBCA77u ^ (fmt << 1 | (u32)cube) * 0xC2B2AE3Du;
+    return (x ^ (x >> 15)) & (VP_TEX_HASH - 1);
+}
+
+static int vp_tex_find(u32 key, u32 w, u32 h, u32 fmt, int cube)
+{
+    if (s_vp_tex_index_dirty) {
+        memset(s_vp_tex_index, 0, sizeof s_vp_tex_index);
+        for (int i = 0; i < VP_TEX_SLOTS; i++) {
+            const VPTexSlot* c = &s_d3d.vp_tex[i];
+            if (!c->res) continue;
+            u32 b = vp_tex_hash(c->key, c->w, c->h, c->fmt, c->cube);
+            while (s_vp_tex_index[b]) b = (b + 1) & (VP_TEX_HASH - 1);
+            s_vp_tex_index[b] = (short)(i + 1);
+        }
+        s_vp_tex_index_dirty = 0;
+    }
+    for (u32 b = vp_tex_hash(key, w, h, fmt, cube); s_vp_tex_index[b]; b = (b + 1) & (VP_TEX_HASH - 1)) {
+        const int i = s_vp_tex_index[b] - 1;
+        const VPTexSlot* c = &s_d3d.vp_tex[i];
+        if (c->res && c->key == key && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube)
+            return i;
+    }
+    return -1;
+}
+
+/* A slot not used this frame, round robin, so the textures a frame stops
+ * using are the ones evicted, oldest first. -1 when all are in use. */
+static int vp_tex_free_slot(void)
+{
+    static int cursor;
+    for (int n = 0; n < VP_TEX_SLOTS; n++) {
+        const int i = (cursor + n) % VP_TEX_SLOTS;
+        if (!s_d3d.vp_tex[i].used) { cursor = (i + 1) % VP_TEX_SLOTS; return i; }
+    }
+    return -1;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
@@ -2887,10 +2940,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * here was a GCC/Clang extension MSVC rejects.) */
     #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
     int slot = -1, freeslot = -1;
-    for (int i = 0; i < VP_TEX_SLOTS; i++) {
+    for (int i = vp_tex_find(key_off, w, h, fmt, cube); i >= 0; i = -1) {
         VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
-            && c->cube == cube) {
+        {
             if (c->used) return i;                /* already bound this frame */
             { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
               if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
@@ -2904,8 +2956,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
             if (cs == c->csum) { c->used = 1; return i; }
             slot = i; break;                      /* stale: fall through and redo */
         }
-        if (!c->used && freeslot < 0) freeslot = i;
     }
+    if (slot < 0) freeslot = vp_tex_free_slot();
     /* TEX_OFF_BIAS=1: sample the image one whole level-0 BELOW the bound offset.
      * Measured on the Rubber Ducky demo: at the bind offset every texture reads
      * as all-zero, while [off - w*h*bpp, off) holds the image (3800-4160 of 4298
@@ -2959,7 +3011,13 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* A stale cache entry (slot >= 0) re-uses its own slot; otherwise take a
      * free one. Without this the stale path fell through to freeslot and either
      * duplicated the texture into a second slot or bailed when none was free. */
-    if (slot < 0 && freeslot < 0) return -1;      /* out of slots this frame */
+    if (slot < 0 && freeslot < 0) {               /* out of slots this frame */
+        static int warned;
+        if (!warned) { warned = 1;
+            fprintf(stderr, "[TEX] all %d texture slots in use this frame: later textures "
+                            "draw unbound%c", VP_TEX_SLOTS, 10); }
+        return -1;
+    }
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;
@@ -3415,6 +3473,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
 
+    if (t->key != key_off || t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)
+        s_vp_tex_index_dirty = 1;
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1;
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
