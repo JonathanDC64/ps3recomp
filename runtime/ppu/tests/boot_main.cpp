@@ -907,6 +907,163 @@ static void prof_hit(int tab, uint64_t key)
         if (!s_prof_key[tab][i]) { s_prof_key[tab][i] = key; s_prof_ct[tab][i] = 1; return; }
     }
 }
+/* Name exe RVAs from the link map beside the exe (des_boot.map): the nearest
+ * symbol at or below each. One pass over the map, only when asked. */
+static void map_names(const uint64_t* rva, int n, char (*name)[48])
+{
+    uint64_t best[64] = {0};
+    for (int i = 0; i < n; i++) snprintf(name[i], 48, "rva=0x%llX", (unsigned long long)rva[i]);
+    char path[MAX_PATH];
+    DWORD len = GetModuleFileNameA(NULL, path, sizeof path);
+    if (!len || len < 4 || len >= sizeof path) return;
+    memcpy(path + len - 4, ".map", 5);
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char ln[512], sym[256];
+    unsigned long long va, base = 0x140000000ull;
+    while (fgets(ln, sizeof ln, f)) {
+        if (strstr(ln, "Preferred load address is")) { sscanf(strstr(ln, "is") + 2, "%llx", &base); continue; }
+        if (sscanf(ln, " %*x:%*x %255s %llx", sym, &va) != 2 || va < base) continue;
+        const uint64_t r = va - base;
+        for (int i = 0; i < n && i < 64; i++)
+            if (r <= rva[i] && r >= best[i]) {
+                best[i] = r;
+                if (rva[i] - r < 0x100000)
+                    snprintf(name[i], 48, "%.40s%s", sym, rva[i] == r ? "" : "+");
+            }
+    }
+    fclose(f);
+}
+
+/* cpu [sec]: CPU per host thread over the last sec seconds (default 5), with
+ * the guest thread name (or the host thread's start function), split by where
+ * the time went:
+ *   app  the exe: lifted guest code and the runtime
+ *   os   ntdll/kernel32/KernelBase: yields, spin-waits and syscalls -- time a
+ *        waiting thread burns instead of blocking shows up here
+ *   dll  everything else (graphics driver, D3D12, audio)
+ * and the exe function with the most time ("hot"; for an os/dll sample, the
+ * exe function that called out, so a spin-wait names its caller). Each thread
+ * is sampled every ~5 ms and the cycles it ran since the last sample are
+ * credited to where it is now, so a blocked thread costs nothing.
+ * ponytail: at most 256 threads; 16 hot functions per thread. */
+static void dbg_cpu(unsigned sec)
+{
+    enum { MAXT = 256, HOT = 16 };
+    struct T {
+        DWORD tid; HANDLE h; ULONG64 cyc, cat[3]; FILETIME k0, u0; double ms;
+        uint64_t hk[HOT]; ULONG64 hc[HOT]; uint64_t start;
+    };
+    static T t[MAXT];
+    int nt = 0;
+    const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, PVOID, ULONG, PULONG);
+    NtQIT qit = (NtQIT)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || nt >= MAXT) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                  FALSE, te.th32ThreadID);
+            if (!h) continue;
+            T* x = &t[nt++]; memset(x, 0, sizeof *x);
+            x->tid = te.th32ThreadID; x->h = h;
+            QueryThreadCycleTime(h, &x->cyc);
+            FILETIME c0, e0; GetThreadTimes(h, &c0, &e0, &x->k0, &x->u0);
+            PVOID sa = NULL;
+            if (qit) qit(h, 9 /* ThreadQuerySetWin32StartAddress */, &sa, sizeof sa, NULL);
+            x->start = (uint64_t)(uintptr_t)sa;
+        } while (Thread32Next(snap, &te));
+    }
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+
+    HMODULE os[3] = { GetModuleHandleA("ntdll.dll"), GetModuleHandleA("kernel32.dll"),
+                      GetModuleHandleA("KernelBase.dll") };
+    const ULONGLONG t0 = GetTickCount64(), end = t0 + sec * 1000ull;
+    while (GetTickCount64() < end) {
+        for (int i = 0; i < nt; i++) {
+            T* x = &t[i];
+            ULONG64 c = 0;
+            if (!QueryThreadCycleTime(x->h, &c)) continue;
+            const ULONG64 d = c - x->cyc; x->cyc = c;
+            if (d < 1000) continue;                      /* did not run */
+            if (SuspendThread(x->h) == (DWORD)-1) continue;
+            CONTEXT ctx; ctx.ContextFlags = CONTEXT_FULL;
+            int cat = 2; uint64_t hot = 0;
+            if (GetThreadContext(x->h, &ctx)) {
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ctx.Rip, &m);
+                cat = (uintptr_t)m == exe ? 0 : (m && (m == os[0] || m == os[1] || m == os[2])) ? 1 : 2;
+                /* first exe frame: the leaf itself, or who called out of the exe */
+                for (int dpt = 0; dpt < 16 && ctx.Rip; dpt++) {
+                    DWORD64 base = 0;
+                    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                    if ((uintptr_t)(ctx.Rip - exe) < 0x40000000u) {
+                        hot = rf ? base + rf->BeginAddress - exe : ctx.Rip - exe; break;
+                    }
+                    if (!rf) break;
+                    void* hd; DWORD64 ef;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &ef, NULL);
+                }
+            }
+            ResumeThread(x->h);
+            x->cat[cat] += d;
+            if (hot) {
+                int k = 0;
+                while (k < HOT && x->hk[k] && x->hk[k] != hot) k++;
+                if (k < HOT) { x->hk[k] = hot; x->hc[k] += d; }
+            }
+        }
+        Sleep(5);
+    }
+    const double wall = (double)(GetTickCount64() - t0);
+    for (int i = 0; i < nt; i++) {
+        FILETIME c1, e1, k1, u1; GetThreadTimes(t[i].h, &c1, &e1, &k1, &u1);
+        ULONGLONG a = ((ULONGLONG)k1.dwHighDateTime << 32 | k1.dwLowDateTime) +
+                      ((ULONGLONG)u1.dwHighDateTime << 32 | u1.dwLowDateTime);
+        ULONGLONG b = ((ULONGLONG)t[i].k0.dwHighDateTime << 32 | t[i].k0.dwLowDateTime) +
+                      ((ULONGLONG)t[i].u0.dwHighDateTime << 32 | t[i].u0.dwLowDateTime);
+        t[i].ms = (double)(a - b) / 10000.0;
+        CloseHandle(t[i].h);
+    }
+    /* busiest first; name the top 24 threads' start and hot functions */
+    int ord[MAXT]; for (int i = 0; i < nt; i++) ord[i] = i;
+    for (int i = 1; i < nt; i++) for (int j = i; j > 0 && t[ord[j]].ms > t[ord[j - 1]].ms; j--)
+        { int s = ord[j]; ord[j] = ord[j - 1]; ord[j - 1] = s; }
+    const int show = nt < 24 ? nt : 24;
+    uint64_t rv[64]; char nm[64][48]; int nr = 0;
+    int hot_of[24], start_of[24];
+    for (int r = 0; r < show; r++) {
+        T* x = &t[ord[r]];
+        int hb = -1; for (int k = 0; k < HOT; k++) if (x->hk[k] && (hb < 0 || x->hc[k] > x->hc[hb])) hb = k;
+        hot_of[r] = hb >= 0 ? nr : -1; if (hb >= 0) rv[nr++] = x->hk[hb];
+        start_of[r] = (uintptr_t)(x->start - exe) < 0x40000000u ? nr : -1;
+        if (start_of[r] >= 0) rv[nr++] = x->start - exe;
+    }
+    map_names(rv, nr, nm);
+    double tot = 0; for (int i = 0; i < nt; i++) tot += t[i].ms;
+    dbg_printf("  %u threads, %.2f cores busy over %.1f s (cpu%% = of one core)%c", (unsigned)nt,
+               tot / wall, wall / 1000.0, 10);
+    dbg_printf("  %-6s %6s %5s %5s %5s  %-28s %s%c", "host", "cpu%", "app", "os", "dll", "thread", "hot", 10);
+    for (int r = 0; r < show; r++) {
+        T* x = &t[ord[r]];
+        if (x->ms < wall * 0.005) break;
+        const ULONG64 cs = x->cat[0] + x->cat[1] + x->cat[2];
+        char who[64] = "";
+        for (int g = 0; g < PPU_THREAD_MAX; g++)
+            if (g_ppu_threads[g].state != PPU_THREAD_STATE_FREE && g_ppu_threads[g].host_tid == x->tid)
+                snprintf(who, sizeof who, "ppu %d \"%.20s\"", g + 1, g_ppu_threads[g].name);
+        if (!who[0]) snprintf(who, sizeof who, "%s", start_of[r] >= 0 ? nm[start_of[r]] : "(dll thread)");
+        dbg_printf("  %-6lu %6.1f %4.0f%% %4.0f%% %4.0f%%  %-28.28s %s%c", (unsigned long)x->tid,
+                   100.0 * x->ms / wall,
+                   cs ? 100.0 * x->cat[0] / cs : 0.0, cs ? 100.0 * x->cat[1] / cs : 0.0,
+                   cs ? 100.0 * x->cat[2] / cs : 0.0, who, hot_of[r] >= 0 ? nm[hot_of[r]] : "-", 10);
+    }
+}
+
 static void dbg_prof(DWORD tid, unsigned sec)
 {
     /* Suspending ourselves never resumes: the console would hang for good. */
@@ -1000,6 +1157,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
             dbg_printf("  gstacks [n]      guest shadow stack of every thread, n frames%c", 10);
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
+            dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
@@ -1122,6 +1280,9 @@ static DWORD WINAPI debug_console(LPVOID param)
                 p = end;
             }
             dbg_printf("  qbset 0x%08X = %u: %u member(s)%c", a, b, n, 10);
+        } else if (!strcmp(verb, "cpu")) {
+            sscanf(cmd, "%*s %u", &a);
+            dbg_cpu(a ? a : 5);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "ctx") && sscanf(cmd, "%*s %u", &a) == 1) {

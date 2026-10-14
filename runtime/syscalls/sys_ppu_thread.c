@@ -241,6 +241,7 @@ uint64_t ppu_thread_register_main(void)
         strncpy(t->name, "main", sizeof(t->name) - 1);
 #ifdef _WIN32
         t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+        t->host_tid = GetCurrentThreadId();   /* the boot thread runs main */
 #else
         pthread_mutex_init(&t->finish_mutex, NULL);
         pthread_cond_init(&t->finish_cond, NULL);

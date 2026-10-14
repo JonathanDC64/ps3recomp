@@ -738,15 +738,18 @@ skip_inject: ;
       static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
       /* Live: the console's setenv PAD_STICK=... re-reads it, and the window
        * then counts from that moment (setenv PAD_STICK=128,0,128,128,0,5 walks
-       * forward for five seconds). At startup it counts from the first poll. */
-      static unsigned s_stg = 0;
+       * forward for five seconds). At startup it counts from the first poll.
+       * Only a new value restarts the window, not a setenv of another knob. */
+      static unsigned s_stg = 0; static char s_last[64] = "\1";   /* never a real value */
       if (s_stg != ps3_env_gen) { s_stg = ps3_env_gen;
         const char* e = getenv("PAD_STICK");
-        s_st = e ? 1 : 0; s_t0 = GetTickCount64(); s_from = 0; s_until = 1e30;
-        if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
-                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
-                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
+        if (strncmp(s_last, e ? e : "", sizeof s_last - 1)) {
+          snprintf(s_last, sizeof s_last, "%s", e ? e : "");
+          s_st = e ? 1 : 0; s_t0 = GetTickCount64(); s_from = 0; s_until = 1e30;
+          if (e) { int a=128,b=128,c=128,d=128;
+                   sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
+                   s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
+                   s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } } }
       if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                   hs->connected = 1; }
