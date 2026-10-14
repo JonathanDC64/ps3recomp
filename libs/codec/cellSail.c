@@ -1122,6 +1122,17 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
     if (slot < 0 || !a || !pInfo || !sail_movie_info_of(slot, &mi, &session))
         return (s32)CELL_SAIL_ERROR_EMPTY;
     int no = 0, eos = 0;
+    static unsigned calls, handed, handed0;
+    static ULONGLONG t0;
+    if (++calls == 1 || calls % 300 == 0) {
+        const ULONGLONG now = GetTickCount64();
+        const double dt = t0 ? (double)(now - t0) / 1000.0 : 0.0;
+        printf("[cellSail] video GetFrame #%u: %u frames handed out, playing=%d, "
+               "last 300 calls %.1f/s, new frames %.1f/s\n",
+               calls, handed, s_sail_players[slot].playing, dt > 0 ? 300.0 / dt : 0.0,
+               dt > 0 ? (handed - handed0) / dt : 0.0);
+        t0 = now; handed0 = handed;
+    }
     if (mi.width > 0) {
         const u32 pitch = (u32)mi.width * 4u;
         sail_alloc_frames(slot, a, pitch * (u32)mi.height);   /* a guest call: unlocked */
@@ -1134,6 +1145,7 @@ s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
             if (!m || s_sail_players[slot].session != session) return (s32)CELL_SAIL_ERROR_EMPTY;
             if (got) {
                 a->next = (a->next + 1) % a->nframe;
+                handed++;
                 a->last_buf = buf;
                 a->last_pts = (u64)no * 90000u * (u64)mi.fps_den / (u64)mi.fps_num;
                 sail_frame_info(pInfo, buf, s_sail_players[slot].session, ++a->tag, a->last_pts);
@@ -1209,10 +1221,14 @@ s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
     }
     const u32 buf = base + SAIL_SND_SLOT * (1u + (u32)a->next);   /* slot 0 holds ppFrame */
     int eos = 0;
+    static unsigned calls, filled;
+    if (++calls % 2000 == 0)
+        printf("[cellSail] sound GetFrame #%u: %u filled\n", calls, filled);
     const int got = sail_movie_audio(m, (float*)vm_ptr8(buf), (int)samples, 1, &eos) > 0;
     const u32 session = s_sail_players[slot].session;
     sail_movie_put();
     if (got) {
+        filled++;
         a->next = (a->next + 1) % SAIL_SND_SLOTS;
         sail_frame_info(pInfo, buf, session, ++a->tag,
                         (u64)a->tag * samples * 90000u / (u64)mi.rate);

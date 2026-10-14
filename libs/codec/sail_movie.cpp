@@ -236,6 +236,8 @@ void emit_frame(SailMovie* m, IMFSample* s)
     m->cv.wait(lk, [&] { return m->stop || m->vq.size() < kVideoQueue; });
     if (m->stop) return;
     m->vq.push_back(Frame{ std::move(px), m->decoded++ });
+    if (m->decoded == 1 || m->decoded % 300 == 0)
+        fprintf(stderr, "[sail_movie] decoded %d frames%c", m->decoded, 10);
 }
 
 void pump_output(SailMovie* m)
