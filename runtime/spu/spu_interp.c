@@ -245,6 +245,19 @@ static int spu_step(spu_context* ctx) {
     case SPU_fcmeq:  DST = spu_fcmeq(A,B); break;
     case SPU_fesd:   DST = spu_fesd(A); break;
     case SPU_frds:   DST = spu_frds(A); break;
+    /* double precision: same helpers as the lift. The FMA forms are RR with
+     * rt as the accumulator. */
+    case SPU_dfa:    DST = spu_dfa(A,B); break;
+    case SPU_dfs:    DST = spu_dfs(A,B); break;
+    case SPU_dfm:    DST = spu_dfm(A,B); break;
+    case SPU_dfma:   DST = spu_dfma(A,B,DST); break;
+    case SPU_dfms:   DST = spu_dfms(A,B,DST); break;
+    case SPU_dfnms:  DST = spu_dfnms(A,B,DST); break;
+    case SPU_dfnma:  DST = spu_dfnma(A,B,DST); break;
+    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
+    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
+    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
+    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
     case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
     case SPU_fms:  DSTC = spu_fms(A,B,T); break;
     case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
