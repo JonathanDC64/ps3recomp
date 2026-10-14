@@ -1456,6 +1456,22 @@ void spu_taskset_shutdown(uint32_t taskset_ea)
 
 /* cellSpursJoinTaskset: wait (bounded) until no task thread of the taskset is
  * still running. Returns how many are still alive at the deadline. */
+/* Host-side view of a taskset for diagnostics: task threads alive, how many
+ * of them are parked in WAIT_SIGNAL, and the ids (< 64) they run. */
+void spu_taskset_report(uint32_t taskset_ea)
+{
+    ts_lock();
+    int i = ts_life_idx(taskset_ea);
+    LONG live = i >= 0 ? s_ts_life[i].live : 0;
+    uint64_t ids = i >= 0 ? s_ts_life[i].ids : 0;
+    ts_unlock();
+    int parked = 0;
+    for (int k = 0; k < SPU_PARKED_MAX; k++)
+        if (s_parked[k] && (uint32_t)(s_parked[k] >> 32) == taskset_ea) parked++;
+    fprintf(stderr, "[spu_workload] taskset 0x%08X: %ld task threads alive, %d parked, ids<64=0x%llX\n",
+            taskset_ea, (long)live, parked, (unsigned long long)ids);
+}
+
 int spu_taskset_join(uint32_t taskset_ea, unsigned timeout_ms)
 {
     extern unsigned long long ps3_ms_now(void);

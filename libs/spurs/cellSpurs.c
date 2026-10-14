@@ -1161,6 +1161,35 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 
     fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
             taskset_ea);
+    /* Once: why are they all taken? Count each state bitset of the BE taskset
+     * (running +0x00, ready +0x10, pending +0x20, enabled +0x30, signalled
+     * +0x40, waiting +0x50) and list the task ELFs holding the ids. Tasks that
+     * returned have cleared their bit (spu_taskset_task_exited); what remains
+     * is either parked (waiting/signal) or never ran. */
+    { static u32 said_ts[4]; int seen = 0, slot = -1;
+      for (int k = 0; k < 4; k++) { if (said_ts[k] == taskset_ea) seen = 1; else if (!said_ts[k] && slot < 0) slot = k; }
+      if (!seen && slot >= 0) {
+          said_ts[slot] = taskset_ea;
+          static const char* nm[6] = { "running", "ready", "pending", "enabled", "signalled", "waiting" };
+          int cnt[6] = {0};
+          for (int s = 0; s < 6; s++)
+              for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
+                  if (vm_read8(taskset_ea + 0x10 * s + t / 8) & (0x80u >> (t % 8))) cnt[s]++;
+          fprintf(stderr, "[cellSpurs] taskset 0x%08X bits:", taskset_ea);
+          for (int s = 0; s < 6; s++) fprintf(stderr, " %s=%d", nm[s], cnt[s]);
+          fprintf(stderr, "; new task elf=0x%08X%c", elf_ea, 10);
+          u32 elfs[8] = {0}; int ne[8] = {0}, nd = 0;
+          for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++) {
+              u32 e = vm_read32(taskset_ea + 0x80 + 0x30 * t + 0x14);
+              int k = 0; while (k < nd && elfs[k] != e) k++;
+              if (k == nd && nd < 8) elfs[nd++] = e;
+              if (k < nd) ne[k]++;
+          }
+          for (int k = 0; k < nd; k++)
+              fprintf(stderr, "[cellSpurs]   elf=0x%08X holds %d ids%c", elfs[k], ne[k], 10);
+          { extern void spu_taskset_report(uint32_t); spu_taskset_report(taskset_ea); }
+          { extern void ps3_exit_on(const char*); ps3_exit_on("task-ids"); }
+      } }
     return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
