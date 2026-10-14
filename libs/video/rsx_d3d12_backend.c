@@ -7181,8 +7181,22 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
               read_vp_vertex_c(state, read_guest_index(state, first + k), &out[k*16]);
       } else {
           /* Primitive restart: the restart index drops the triangle in
-           * progress and the list resumes after it. */
+           * progress and the list resumes after it.
+           *
+           * One BEGIN/END can carry several DRAW_INDEX_ARRAY ranges (at most
+           * 256 indices each), and the RSX assembles them as one stream: a
+           * triangle may start in one range and end in the next. Demon's
+           * Souls' particles come as (0,32) (32,256) (288,12). Dropping the
+           * two indices left over at the end of each range put the rest out
+           * of phase, so sparks and smoke drew as slivers joining one
+           * particle to the next, different every frame. The partial
+           * triangle now carries into the next contiguous range of the same
+           * BEGIN/END. */
+          static struct { int valid; u32 epoch, next, n, tri[2]; } carry;
           u32 o = 0, n = 0, tri[3];
+          if (carry.valid && carry.epoch == state->begin_epoch && carry.next == first) {
+              n = carry.n; tri[0] = carry.tri[0]; tri[1] = carry.tri[1];
+          }
           for (u32 k = 0; k < count; k++) {
               const u32 ix = read_guest_index(state, first + k);
               if (ix == state->restart_index) { n = 0; continue; }
@@ -7192,6 +7206,8 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
                   o += 3; n = 0;
               }
           }
+          carry.valid = 1; carry.epoch = state->begin_epoch; carry.next = first + count;
+          carry.n = n; carry.tri[0] = tri[0]; carry.tri[1] = tri[1];
           count = o;
       }
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
