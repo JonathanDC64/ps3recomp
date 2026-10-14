@@ -2276,11 +2276,14 @@ static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
     /* Texel scale on every 2D Sample() of each unit. */
     for (u32 u = 0; u < RSX_FP_UNITS; u++) {
         if ((cube_mask >> u) & 1u) continue;
-        char needle[2][48], ins[32];
+        /* Every spelling the decompiler emits for a 2D unit: a program with a
+         * shadow unit declares its samplers one by one (rsx_sampN). */
+        char needle[3][48], ins[32];
         snprintf(needle[0], sizeof needle[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
         snprintf(needle[1], sizeof needle[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
+        snprintf(needle[2], sizeof needle[2], "rsx_tex%u.Sample(rsx_samp%u,", u, u);
         snprintf(ins, sizeof ins, " * rsx_texscale[%u].xy", u);
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < 3; k++) {
             char* from = hlsl;
             char* hit;
             while ((hit = strstr(from, needle[k])) != NULL) {
