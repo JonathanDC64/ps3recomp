@@ -97,6 +97,10 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             s_state.window_closed = 1;
             DestroyWindow(hwnd);
         }
+        if (wp == VK_F9 && !(lp & (1 << 30))) {   /* frame capture (cellGcmSys.c); not auto-repeat */
+            extern void cellGcm_replay_hotkey(void);
+            cellGcm_replay_hotkey();
+        }
         return 0;
     }
 

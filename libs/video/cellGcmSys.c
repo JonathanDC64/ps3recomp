@@ -3888,14 +3888,38 @@ static void rcap_finish(void)
            (unsigned long long)(mem >> 20), 10);
 }
 
-/* Start a capture if RSX_REPLAY_CAP names a file not captured yet. */
+/* F9 in the game window (cellGcm_replay_hotkey, from the backend's window
+ * procedure) captures the next frame to RSX_HOTKEY_DIR/cap_NNN.rcap (default
+ * directory "rsx_hotkey", relative to the working directory), numbered from
+ * 000 per run. For a person playing to grab the frame that looks wrong. */
+static volatile LONG s_rcap_hotkey, s_rcap_hotkey_done;
+
+void cellGcm_replay_hotkey(void)
+{
+    InterlockedIncrement(&s_rcap_hotkey);
+    ps3_env_bump();   /* rcap_try_start looks again */
+}
+
+/* Start a capture if RSX_REPLAY_CAP names a file not captured yet, or F9
+ * was pressed. */
 static void rcap_try_start(void)
 {
     static char armed[512] = "";
     static unsigned gen;
     if (gen == ps3_env_gen) return;
+    if (s_rcap_f) return;   /* one at a time; look again when it is done */
     gen = ps3_env_gen;
     const char* e = getenv("RSX_REPLAY_CAP");
+    char hk[512];
+    if (s_rcap_hotkey != s_rcap_hotkey_done) {
+        const char* dir = getenv("RSX_HOTKEY_DIR");
+        if (!dir || !*dir) dir = "rsx_hotkey";
+        CreateDirectoryA(dir, NULL);
+        snprintf(hk, sizeof hk, "%s/cap_%03ld.rcap", dir, (long)s_rcap_hotkey_done);
+        s_rcap_hotkey_done++;
+        if (s_rcap_hotkey != s_rcap_hotkey_done) ps3_env_bump();   /* pressed again meanwhile */
+        e = hk;
+    }
     if (!e || !*e || !strcmp(e, armed)) return;
     snprintf(armed, sizeof armed, "%s", e);
     s_rcap_f = fopen(e, "wb");

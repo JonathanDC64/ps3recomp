@@ -565,6 +565,10 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
+        if (wp == VK_F9 && !(lp & (1 << 30))) {   /* not auto-repeat */
+            extern void cellGcm_replay_hotkey(void);
+            cellGcm_replay_hotkey();
+        }
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
@@ -6147,10 +6151,15 @@ skip_dump_consider: ;
      * is restored to PRESENT after each readback. */
     { const char* cap = getenv("RSX_CAP");
       if (cap) {
-        static int s_cap_parsed = 0;
+        /* Re-parsed whenever the value changes, so the console can arm one
+         * capture after another in a running game (`setenv RSX_CAP=1:3`,
+         * then a different RSX_CAP_DIR and `RSX_CAP=2:3`); a start below the
+         * current frame count captures at once. */
+        static char s_cap_last[64];
         static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
-        if (!s_cap_parsed) {
-            s_cap_parsed = 1;
+        if (strncmp(cap, s_cap_last, sizeof s_cap_last - 1) != 0) {
+            strncpy(s_cap_last, cap, sizeof s_cap_last - 1);
+            s_cap_done = 0;
             u32 a = 0, b = 1, c = 1;
             int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
             s_cap_start  = (n >= 1 && a) ? a : 200;
@@ -6826,6 +6835,41 @@ static void vp_attrs_dbg(const rsx_state* state)
                   ai, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], nfin, nnan, 10); } } }
 }
 
+static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u32 nverts)
+{
+    /* RSX_DBG_VTX=<hex tex0 raw> (live, re-armed by every setenv): for the
+     * next 8 draws that bind that texture, print every enabled vertex
+     * attribute of the first 4 vertices as the VP reads them, and the
+     * non-zero constant range. RSX_DBG_VTX=fp:<hex>[:n] matches the fragment
+     * program instead and prints vertex 0 of the next n draws (default 80):
+     * one line per quad of a HUD. For "drawn but invisible" questions. */
+    { static unsigned gen; static u32 want = 0, by_fp = 0; static int n = 0, lim = 8;
+      if (gen != ps3_env_gen) { const char* dv = getenv("RSX_DBG_VTX");
+          gen = ps3_env_gen; n = 0; by_fp = dv && strncmp(dv, "fp:", 3) == 0;
+          if (by_fp) { char* e; want = (u32)strtoul(dv + 3, &e, 16);
+                       lim = *e == ':' ? atoi(e + 1) : 80; }
+          else { want = dv ? (u32)strtoul(dv, NULL, 16) : 0; lim = 8; } }
+      if (want && (by_fp ? state->shader_program == want : s_d3d.cur_texs[0].raw == want) && n < lim) { n++;
+        if (by_fp) nverts = nverts ? 1 : 0;
+        if (by_fp) fprintf(stderr, "[DBGVTX] #%d t0=0x%08X", n, s_d3d.cur_texs[0].raw);
+        fprintf(stderr, "[DBGVTX] fp=0x%08X first=%u verts=%u", state->shader_program, first, nverts);
+        { int lo = -1, hi = -1, nz = 0;
+          for (int r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
+              const float* m = state->vertex_constants[r];
+              if (m[0] || m[1] || m[2] || m[3]) { if (lo < 0) lo = r; hi = r; nz++; }
+          }
+          fprintf(stderr, " | constants: %d non-zero, slots %d..%d%c", nz, lo, hi, 10); }
+        for (u32 k = 0; k < nverts && k < 4; k++) {
+            fprintf(stderr, "  v%u", k);
+            for (int a = 0; a < 16; a++)
+                if (state->vertex_attribs[a].enabled)
+                    fprintf(stderr, " a%d=(%.3f,%.3f,%.3f,%.3f)", a, out[k*16+a].v[0],
+                            out[k*16+a].v[1], out[k*16+a].v[2], out[k*16+a].v[3]);
+            fprintf(stderr, "%c", 10);
+        }
+      } }
+}
+
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
@@ -6855,6 +6899,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
                     c[k][8].v[0],c[k][8].v[1]);
               fclose(f); } } }
     }
+    dbg_vtx_dump(state, out, first, o);
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
 }
@@ -6889,26 +6934,6 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
           fprintf(stderr, "[IDXDBG] tris first=%u count=%u a0off=0x%X stride=%u%c",
                   first, count, state->vertex_attribs[0].offset,
                   state->vertex_attribs[0].stride, 10); } }
-    /* RSX_DBG_VTX=<hex tex0 offset>: dump attribute-0 positions for the draws that
-     * bind that texture. The duck's texture resolves and its 9960 draws all
-     * target the backbuffer, yet none of its texels reach the screen -- so the
-     * question is whether its vertices are where they should be. */
-    { static const char* dv = (const char*)1; static u32 want = 0; static int n = 0;
-      if (dv == (const char*)1) { dv = getenv("RSX_DBG_VTX");
-                                  want = dv ? (u32)strtoul(dv, NULL, 16) : 0; }
-      if (want && s_d3d.cur_texs[0].raw == want && n < 6) { n++;
-        fprintf(stderr, "[DUCKVTX] first=%u count=%u", first, count);
-        for (u32 k = 0; k < count && k < 4; k++)
-            fprintf(stderr, "  v%u=(%.2f,%.2f,%.2f)", k,
-                    out[k*16].v[0], out[k*16].v[1], out[k*16].v[2]);
-        { int lo = -1, hi = -1, nz = 0;
-          for (int r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
-              const float* m = state->vertex_constants[r];
-              if (m[0] || m[1] || m[2] || m[3]) { if (lo < 0) lo = r; hi = r; nz++; }
-          }
-          fprintf(stderr, "  | constants: %d non-zero, slots %d..%d", nz, lo, hi); }
-        fprintf(stderr, "%c", 10);
-      } }
     if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
         static int _n=0; if (_n++ < 1) {
         FILE* f = fopen("vtx_dump.txt", "w");
@@ -6920,6 +6945,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
                 out[k*16+2].v[0],out[k*16+2].v[1],out[k*16+2].v[2],
                 out[k*16+9].v[0],out[k*16+9].v[1],out[k*16+9].v[2],out[k*16+9].v[3]);
           fclose(f); } } }
+    dbg_vtx_dump(state, out, first, count);
     s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
     return count;
 }
@@ -6953,6 +6979,7 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
         read_vp_vertex_c(state, first + i1, &out[o*16]); o++;
         read_vp_vertex_c(state, first + i2, &out[o*16]); o++;
     }
+    dbg_vtx_dump(state, out, first, o);
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
 }
@@ -7015,6 +7042,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
                 fclose(f);
             } } }
     }
+    dbg_vtx_dump(state, out, first, o);
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
 }
@@ -7245,6 +7273,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
                 read_guest_index(state, first+2),
                 a0->offset, vbase, nz, a0->stride, a0->size, a0->type,
                 out[0].v[0], out[0].v[1], out[0].v[2], 10); } }
+    dbg_vtx_dump(state, out, first, count);
     s_d3d.vp_vb_offset += count * VP_VERT_STRIDE;
     return count;
 }
@@ -7297,6 +7326,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     { static int said = 0;
       if (restart && !said) { said = 1;
           fprintf(stderr, "[D3D12] primitive restart in use (index 0x%X)%c", ridx, 10); } }
+    dbg_vtx_dump(state, out, first, o);
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
 }
