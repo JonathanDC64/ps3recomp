@@ -90,8 +90,9 @@ void     ps3_title_options_init(void) {}
  * GH3's main PPU thread and ~35% of the RSX thread in gameplay. Defining the
  * import slot here (an object in the link beats the import library's lazy
  * definition) routes every dllimport'ed getenv call through this cache.
- * Nothing in the runtime mutates the environment after startup, so a value is
- * looked up once and the pointer stays valid forever. Reads are lock-free:
+ * Only the debug console changes the environment after startup, through
+ * cached_setenv below; otherwise a value is looked up once and the pointer
+ * stays valid forever. Reads are lock-free:
  * a slot's key is published last, after its value.
  * ponytail: 1024 open-addressed slots, fixed; names past that fall back to the OS lookup. */
 namespace {
@@ -163,6 +164,27 @@ char* __cdecl cached_getenv(const char* name)
     }
     ReleaseSRWLockExclusive(&s_env_lock);
     return (char*)val;
+}
+
+/* The console's setenv: set the variable and replace its cached value, so the
+ * next getenv sees it. The old value is leaked on purpose, because a reader may
+ * still hold it. */
+void cached_setenv(const char* name, const char* value)
+{
+    _putenv_s(name, value);
+    const char* v = (value && *value) ? _strdup(value) : NULL;
+    AcquireSRWLockExclusive(&s_env_lock);
+    unsigned i = env_hash(name) & 1023, n = 0;
+    for (; n <= 1023; n++, i = (i + 1) & 1023) {
+        if (!s_env[i].key) {
+            s_env[i].val = v;
+            MemoryBarrier();
+            s_env[i].key = _strdup(name);
+            break;
+        }
+        if (!_stricmp(s_env[i].key, name)) { s_env[i].val = v; break; }
+    }
+    ReleaseSRWLockExclusive(&s_env_lock);
 }
 }
 extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
@@ -948,6 +970,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
+            dbg_printf("  setenv K=V       set a diagnostic knob now (K= clears it)%c", 10);
         } else if (!strcmp(verb, "gstacks")) {
             /* Guest shadow stacks of every registered thread, innermost first
              * (needs a --shadow-stack lift and a title that registers them). */
@@ -1080,6 +1103,14 @@ static DWORD WINAPI debug_console(LPVOID param)
                 memcpy(vm_base + a, &be, 4);
                 dbg_printf("  [0x%08X] = 0x%08X%c", a, b, 10);
             } else dbg_printf("  vm_base not live yet%c", 10);
+        } else if (!strcmp(verb, "setenv")) {
+            /* Turn a diagnostic on mid-run, e.g. a frame dump once a level is
+             * up. Only knobs the code re-reads with getenv() see the change. */
+            char kv[256] = {0};
+            sscanf(cmd, "%*s %255s", kv);
+            char* eq = strchr(kv, '=');
+            if (eq) { *eq = 0; cached_setenv(kv, eq + 1); dbg_printf("  %s=%s%c", kv, eq + 1, 10); }
+            else dbg_printf("  usage: setenv K=V%c", 10);
         } else if (!strcmp(verb, "knobs")) {
             char pfx[64] = {0};
             sscanf(cmd, "%*s %63s", pfx);
