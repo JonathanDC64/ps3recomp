@@ -833,6 +833,35 @@ static void dbg_mem(uint32_t ea, uint32_t len)
     }
 }
 
+/* find <start> <len> <hex bytes>: every place a byte pattern sits in guest
+ * memory (capped at 32), e.g. the source of a value the title copies into a
+ * GPU buffer. Only committed host pages are read, so a sparse range is safe. */
+static void dbg_find(uint32_t ea, uint32_t len, const char* hex)
+{
+    if (!vm_base) { dbg_printf("  vm_base not live yet%c", 10); return; }
+    uint8_t pat[64]; size_t pn = 0;
+    for (const char* h = hex; h[0] && h[1] && pn < sizeof pat; h += 2) {
+        unsigned v; if (sscanf(h, "%2x", &v) != 1) break; pat[pn++] = (uint8_t)v;
+    }
+    if (!pn) { dbg_printf("  usage: find <start> <len> <hexbytes>%c", 10); return; }
+    int hits = 0;
+    uint64_t end = (uint64_t)ea + len;
+    for (uint64_t at = ea; at < end && hits < 32; ) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(vm_base + at, &mi, sizeof mi)) break;
+        uint64_t rend = (uint64_t)((uint8_t*)mi.BaseAddress + mi.RegionSize - vm_base);
+        if (rend > end) rend = end;
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            for (uint64_t i = at; i + pn <= rend && hits < 32; i += 4)
+                if (!memcmp(vm_base + i, pat, pn)) {
+                    dbg_printf("  hit 0x%08X%c", (uint32_t)i, 10); hits++;
+                }
+        }
+        at = rend;
+    }
+    dbg_printf("  %d hit(s)%c", hits, 10);
+}
+
 static void dbg_knobs(const char* prefix)
 {
     /* Which diagnostics this run was actually started with. */
@@ -1143,6 +1172,10 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  vm_base  %s%c", vm_base ? "live" : "not mapped", 10);
         } else if (!strcmp(verb, "mem") && sscanf(cmd, "%*s %x %u", &a, &b) >= 1) {
             dbg_mem(a, b);
+        } else if (!strcmp(verb, "find")) {
+            char hx[160] = {0};
+            if (sscanf(cmd, "%*s %x %x %159s", &a, &b, hx) == 3) dbg_find(a, b, hx);
+            else dbg_printf("  usage: find <start> <len> <hexbytes>%c", 10);
         } else if (!strcmp(verb, "poke32") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
             if (vm_base) {
                 uint32_t be = ((b & 0xFF) << 24) | ((b & 0xFF00) << 8) |

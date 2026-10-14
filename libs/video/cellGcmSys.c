@@ -1157,6 +1157,15 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            /* GCM2D_WATCH=<lo>-<hi> (hex destination offsets): log the inline
+             * writes landing there (capped), e.g. a fragment program's
+             * constant slots, to see whether the title's patch reaches them. */
+            { static int wi = -1; static u32 wlo, whi; static int wn = 0;
+              if (wi < 0) { const char* e = getenv("GCM2D_WATCH"); wi = 0;
+                            if (e && sscanf(e, "%x-%x", &wlo, &whi) == 2) wi = 1; }
+              u32 doff = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
+              if (wi && doff >= wlo && doff <= whi && wn++ < 400)
+                  fprintf(stderr, "[GCM2D-WATCH] off=0x%X = 0x%08X%c", doff, data, 10); }
             vm_write32(base + py * dst_pitch + px * 4, data);
             return;
         }
