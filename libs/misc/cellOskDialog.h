@@ -17,13 +17,29 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_OSK_ERROR_NOT_INITIALIZED          0x8002B301
-#define CELL_OSK_ERROR_ALREADY_INITIALIZED      0x8002B302
-#define CELL_OSK_ERROR_INVALID_PARAMETER        0x8002B303
-#define CELL_OSK_ERROR_DIALOG_NOT_LOADED        0x8002B304
-#define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    0x8002B305
-#define CELL_OSK_ERROR_ABORT                    0x8002B306
-#define CELL_OSK_ERROR_UNKNOWN                  0x8002B3FF
+/* As the SDK numbers them. The names below used to have values of their own
+ * in 0x8002B3xx, which is cellMsgDialog's range; they are kept as aliases. */
+#define CELL_OSKDIALOG_ERROR_IME_ALREADY_IN_USE 0x8002B501
+#define CELL_OSKDIALOG_ERROR_GET_SIZE_ERROR     0x8002B502
+#define CELL_OSKDIALOG_ERROR_UNKNOWN            0x8002B503
+#define CELL_OSKDIALOG_ERROR_PARAM              0x8002B504
+/* A second LoadAsync while one dialog is up is a sysutil BUSY. */
+#define CELL_OSKDIALOG_SYSUTIL_ERROR_BUSY       0x8002B105
+
+#define CELL_OSK_ERROR_NOT_INITIALIZED          CELL_OSKDIALOG_ERROR_UNKNOWN
+#define CELL_OSK_ERROR_ALREADY_INITIALIZED      CELL_OSKDIALOG_ERROR_UNKNOWN
+#define CELL_OSK_ERROR_INVALID_PARAMETER        CELL_OSKDIALOG_ERROR_PARAM
+#define CELL_OSK_ERROR_DIALOG_NOT_LOADED        CELL_OSKDIALOG_ERROR_UNKNOWN
+#define CELL_OSK_ERROR_DIALOG_ALREADY_LOADED    CELL_OSKDIALOG_SYSUTIL_ERROR_BUSY
+#define CELL_OSK_ERROR_ABORT                    CELL_OSKDIALOG_ERROR_UNKNOWN
+#define CELL_OSK_ERROR_UNKNOWN                  CELL_OSKDIALOG_ERROR_UNKNOWN
+
+/* Sysutil callback status codes the dialog posts. */
+#define CELL_SYSUTIL_OSKDIALOG_LOADED           0x0502
+#define CELL_SYSUTIL_OSKDIALOG_FINISHED         0x0503
+#define CELL_SYSUTIL_OSKDIALOG_UNLOADED         0x0504
+#define CELL_SYSUTIL_OSKDIALOG_INPUT_ENTERED    0x0505
+#define CELL_SYSUTIL_OSKDIALOG_INPUT_CANCELED   0x0506
 
 /* ---------------------------------------------------------------------------
  * Dialog result codes
@@ -80,7 +96,7 @@ typedef struct CellOskDialogInputFieldInfo {
 
 typedef struct CellOskDialogCallbackReturnParam {
     s32                 result;         /* CELL_OSK_DIALOG_INPUT_FIELD_RESULT_* */
-    u32                 numCharsResultString;
+    u32                 numCharsResultString;   /* IN: capacity of pResultString */
     CellOskDialogChar*  pResultString;
 } CellOskDialogCallbackReturnParam;
 
@@ -118,7 +134,9 @@ s32 cellOskDialogSetSeparateWindowOption(u32 option);
 
 s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result);
 
-/* Set a default response string (call before LoadAsync if desired) */
+/* Set a default response string (call before LoadAsync if desired). With
+ * one set, or PS3_OSK_TEXT in the environment, the dialog answers at once
+ * instead of asking on the host. */
 void cellOskDialogSetDefaultResponse(const char* text);
 
 #ifdef __cplusplus

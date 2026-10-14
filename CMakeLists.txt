@@ -139,6 +139,7 @@ if(WIN32)
         xinput      # XInput for gamepad
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
+        user32 gdi32  # cellOskDialog's host text-input window
     )
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off

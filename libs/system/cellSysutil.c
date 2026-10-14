@@ -60,10 +60,26 @@ static SysutilEvent s_event_queue[SYSUTIL_EVENT_QUEUE_SIZE];
 static int          s_event_head = 0;  /* next read */
 static int          s_event_tail = 0;  /* next write */
 
+/* Host threads post too (cellOskDialog's input window), while a guest thread
+ * drains, so the ring is locked. */
+#ifdef _WIN32
+#include <windows.h>
+static SRWLOCK s_event_lock = SRWLOCK_INIT;
+#define EVENT_LOCK()   AcquireSRWLockExclusive(&s_event_lock)
+#define EVENT_UNLOCK() ReleaseSRWLockExclusive(&s_event_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_event_lock = PTHREAD_MUTEX_INITIALIZER;
+#define EVENT_LOCK()   pthread_mutex_lock(&s_event_lock)
+#define EVENT_UNLOCK() pthread_mutex_unlock(&s_event_lock)
+#endif
+
 void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 {
+    EVENT_LOCK();
     int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
     if (next == s_event_head) {
+        EVENT_UNLOCK();
         printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
         return;
     }
@@ -71,6 +87,20 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
     s_event_queue[s_event_tail].status = status;
     s_event_queue[s_event_tail].param  = param;
     s_event_tail = next;
+    EVENT_UNLOCK();
+}
+
+/* Take the oldest queued event; 0 when there is none. */
+static int sysutil_pop_event(SysutilEvent* out)
+{
+    EVENT_LOCK();
+    const int any = s_event_head != s_event_tail;
+    if (any) {
+        *out = s_event_queue[s_event_head];
+        s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
+    }
+    EVENT_UNLOCK();
+    return any;
 }
 
 /* Dialog and other one-shot completions carry their own OPD, rather than a
@@ -227,10 +257,8 @@ s32 cellSysutilCheckCallback(void)
      * Stops when the queue empties OR when no guest caller is installed
      * (in which case we drop pending events to avoid stalling).
      */
-    while (s_event_head != s_event_tail) {
-        SysutilEvent e = s_event_queue[s_event_head];
-        s_event_head = (s_event_head + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
-
+    SysutilEvent e;
+    while (sysutil_pop_event(&e)) {
         if (e.slot < 0 || e.slot >= CELL_SYSUTIL_MAX_CALLBACKS) continue;
         if (!s_callbacks[e.slot].registered) continue;
         if (!s_callbacks[e.slot].guest_opd) continue;
