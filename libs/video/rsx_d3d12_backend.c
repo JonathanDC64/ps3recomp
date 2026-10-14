@@ -4938,13 +4938,18 @@ rtt_dump_done:;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
 
     /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
-     * into a readback buffer this frame and writes rt_save.bmp (half-float
-     * RTs are tonemapped |v| -> byte). */
+     * into a readback buffer this frame and writes rt_save_<offset>.bmp
+     * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
+     * the console's setenv can save one target after another in a live run. */
     static ID3D12Resource* s_rtsave_buf = NULL;
+    static u64 s_rtsave_cap = 0;
     static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
-    static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi;
+    static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi, s_rtsave_off;
     { const char* sv = getenv("RTT_SAVERT");
       static int _done = 0;
+      static char _last[32] = "";
+      if (sv && strncmp(sv, _last, sizeof _last - 1) != 0) {
+          strncpy(_last, sv, sizeof _last - 1); _done = 0; }
       static u32 _skip = 0xFFFFFFFFu;
       if (_skip == 0xFFFFFFFFu) { const char* sk = getenv("RTT_SAVERT_SKIP");
           _skip = sk ? (u32)strtoul(sk, NULL, 0) : 0; }   /* frame 60 is far too
@@ -4976,7 +4981,10 @@ rtt_dump_done:;
             fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
                     rt, r->w, r->h, bpp, pitch, (int)r->dxgi,
                     (unsigned long long)((u64)pitch * r->h));
+            if (s_rtsave_buf && s_rtsave_cap < (u64)pitch * r->h) {
+                s_rtsave_buf->lpVtbl->Release(s_rtsave_buf); s_rtsave_buf = NULL; }
             if (!s_rtsave_buf) {
+                s_rtsave_cap = (u64)pitch * r->h;
                 D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
                 D3D12_RESOURCE_DESC rd = {0};
                 rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -5006,6 +5014,7 @@ rtt_dump_done:;
                 s_rtsave_state = 1;
                 s_rtsave_w = r->w; s_rtsave_h = r->h;
                 s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
+                s_rtsave_off = (u32)strtoul(sv, NULL, 16);
                 fprintf(stderr, "[RTT_SAVERT] copy queued: rt=%d %ux%u pitch=%u\n",
                         rt, r->w, r->h, pitch);
                 _done = 1;
@@ -5126,13 +5135,15 @@ skip_dump_consider: ;
     }
 
     if (s_rtsave_state) {
-        fprintf(stderr, "[RTT_SAVERT] writing rt_save.bmp %ux%u\n", s_rtsave_w, s_rtsave_h);
+        char _rtname[64];
+        snprintf(_rtname, sizeof _rtname, "rt_save_%08X.bmp", s_rtsave_off);
+        fprintf(stderr, "[RTT_SAVERT] writing %s %ux%u\n", _rtname, s_rtsave_w, s_rtsave_h);
         if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
                         wait_for_gpu();
                         if (perf_on()) s_perf_gpu += perf_now() - _g; }
         void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)s_rtsave_pitch * s_rtsave_h};
         if (SUCCEEDED(s_rtsave_buf->lpVtbl->Map(s_rtsave_buf, 0, &rr, &mp)) && mp) {
-            FILE* f = fopen("rt_save.bmp", "wb");
+            FILE* f = fopen(_rtname, "wb");
             if (f) {
                 u32 w = s_rtsave_w, h = s_rtsave_h;
                 u32 rowb = (w * 3 + 3) & ~3u;
@@ -5199,7 +5210,7 @@ skip_dump_consider: ;
                 }
                 free(line);
                 fclose(f);
-                printf("[D3D12] wrote rt_save.bmp (%ux%u dxgi=%u)\n", w, h, s_rtsave_dxgi);
+                printf("[D3D12] wrote %s (%ux%u dxgi=%u)\n", _rtname, w, h, s_rtsave_dxgi);
             }
             s_rtsave_buf->lpVtbl->Unmap(s_rtsave_buf, 0, NULL);
         }
