@@ -65,6 +65,11 @@ void     cellGame_init_from_paramsfo(const char* sfo_path);  /* libs/system/cell
  * table is registered and vm_base is live, before the game runs. */
 void     ps3_load_prx_modules(void) __attribute__((weak));
 void     ps3_load_prx_modules(void) {}
+/* Optional hook: a title's own host-side options (user-facing knobs that act on
+ * the game's state, not workarounds). Weak default is a no-op. Called once the
+ * lifted function table is registered, so it may re-register addresses. */
+void     ps3_title_options_init(void) __attribute__((weak));
+void     ps3_title_options_init(void) {}
 }
 
 #include <string.h>
@@ -1284,6 +1289,7 @@ int main(int argc, char** argv)
 
     fprintf(stderr,"[boot-dbg] before ppu_recomp_register\n"); fflush(stderr);
     ppu_recomp_register();   /* lifted function table -> address map */
+    ps3_title_options_init(); /* title options (weak no-op by default) */
     fprintf(stderr,"[boot-dbg] after ppu_recomp_register; before ps3_load_prx_modules\n"); fflush(stderr);
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
     fprintf(stderr,"[boot-dbg] after prx; before ppu_hle_init\n"); fflush(stderr);
