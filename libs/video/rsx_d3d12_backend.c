@@ -189,11 +189,13 @@ typedef struct {
     ID3DBlob* vs;
     int uses_c03;
 } VPVSEntry;
-#define VP_VS_CACHE 16  /* wave uses 5+ distinct VPs; at 4 the cache
-                         * thrashed every frame and eviction shifted slots
-                         * under recorded vs_idx values -- the display mesh
-                         * drew with the WRONG vertex program (sub-rect +
-                         * edge slivers instead of fullscreen) */
+/* The per-draw VS cache grows and never evicts. Draws record a slot index
+ * (vs_idx) and PSO keys carry it, so a slot must keep meaning the same
+ * program for the life of the run. A fixed 16-entry cache that evicted by
+ * shifting both broke that (draws picked up the WRONG program) and, in a 3D
+ * scene with more than 16 programs, recompiled vertex programs every frame.
+ * Entries are one blob per distinct guest program, which the title bounds. */
+#define VP_VS_CACHE_INIT 64
 
 /* Compiled guest-FP pipeline cache: decompiled VS (by cache slot) + decompiled
  * PS (fragment ucode at fp_addr). */
@@ -216,14 +218,18 @@ typedef struct {
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
-    ID3D12PipelineState* pso;
+    ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
  * distinct (fp, vs, blend, rt, cmask, ucode-hash) combinations than that in a
  * single frame, so the FIFO evicted entries that were needed again immediately
  * and ~17 shaders were recompiled EVERY frame -- about half the frame's CPU
- * time. Entries are small (a PSO pointer plus key fields). */
-#define VP_FP_CACHE 256
+ * time. Entries are small (a PSO pointer plus key fields).
+ * It grows and never evicts: a 3D scene outgrew 256 entries and recompiled
+ * every frame, and an evicted PSO was released while recorded command lists
+ * could still reference it. Keys that fail to build are cached too (pso
+ * NULL), so a bad program costs one compile, not one per draw. */
+#define VP_FP_CACHE_INIT 256
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -310,10 +316,10 @@ typedef struct {
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
-    VPVSEntry             vp_vs[VP_VS_CACHE];   /* per-draw decompiled VS cache  */
-    int                   vp_vs_n;
-    VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
-    int                   vp_fp_n;
+    VPVSEntry*            vp_vs;                /* per-draw decompiled VS cache  */
+    int                   vp_vs_n, vp_vs_cap;
+    VPFPEntry*            vp_fp;                /* guest-FP PSO cache            */
+    int                   vp_fp_n, vp_fp_cap;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
     struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[4];
@@ -1769,9 +1775,27 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
     return h ? h : 1u;
 }
 
+/* Append a program to the per-draw VS cache. vs NULL records a program that
+ * failed to decompile or compile, so it is not retried on every draw. */
+static int vp_vs_insert(u32 hash, ID3DBlob* vs, int uses_c03)
+{
+    if (s_d3d.vp_vs_n >= s_d3d.vp_vs_cap) {
+        const int cap = s_d3d.vp_vs_cap ? s_d3d.vp_vs_cap * 2 : VP_VS_CACHE_INIT;
+        VPVSEntry* grown = (VPVSEntry*)realloc(s_d3d.vp_vs, sizeof(VPVSEntry) * (size_t)cap);
+        if (!grown) { if (vs) vs->lpVtbl->Release(vs); return -1; }
+        s_d3d.vp_vs = grown; s_d3d.vp_vs_cap = cap;
+    }
+    const int slot = s_d3d.vp_vs_n++;
+    s_d3d.vp_vs[slot].hash     = hash;
+    s_d3d.vp_vs[slot].vs       = vs;
+    s_d3d.vp_vs[slot].uses_c03 = uses_c03;
+    return vs ? slot : -1;
+}
+
 static int vp_get_vs(const rsx_state* st)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
     if (!st || st->vp_ucode_bytes < 16) return -1;
     /* Start at the instruction SET_TRANSFORM_PROGRAM_START selects, not at 0.
      * The microcode store holds every resident program -- this title keeps its
@@ -1786,15 +1810,20 @@ static int vp_get_vs(const rsx_state* st)
     if (vstart >= st->vp_ucode_bytes) vstart = 0;
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = st->vp_ucode_bytes - vstart;
+    /* Key the program by its own instructions, up to its end bit. The store
+     * holds every resident program, so hashing to the end of the store made
+     * each program's key change whenever any program after it was uploaded. */
+    { const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
+      if (instrs) vlen = instrs * 16u; }
     u32 hash = vp_hash_ucode(vuc, vlen);
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
-        if (s_d3d.vp_vs[i].hash == hash) return i;
+        if (s_d3d.vp_vs[i].hash == hash) return s_d3d.vp_vs[i].vs ? i : -1;
 
     static char hlsl[262144];
     const double vs_t0 = perf_on() ? perf_now() : 0.0;
     s_perf_vs_compiles++;
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
-    if (ni <= 0) return -1;
+    if (ni <= 0) return vp_vs_insert(hash, NULL, 0);
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -1854,20 +1883,12 @@ static int vp_get_vs(const rsx_state* st)
     if (perf_on()) s_perf_vs += perf_now() - vs_t0;
     if (FAILED(hr) || !vb) {
         static int _e=0; if (_e++<4) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
-        return -1;
+        return vp_vs_insert(hash, NULL, 0);
     }
-    int slot;
-    if (s_d3d.vp_vs_n < VP_VS_CACHE) slot = s_d3d.vp_vs_n++;
-    else {  /* evict slot 0 */
-        if (s_d3d.vp_vs[0].vs) s_d3d.vp_vs[0].vs->lpVtbl->Release(s_d3d.vp_vs[0].vs);
-        memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry)*(VP_VS_CACHE-1));
-        slot = VP_VS_CACHE - 1;
-    }
-    s_d3d.vp_vs[slot].hash = hash;
-    s_d3d.vp_vs[slot].vs   = vb;
-    s_d3d.vp_vs[slot].uses_c03 =
+    const int slot = vp_vs_insert(hash, vb,
         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
-         strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
+         strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0);
+    if (slot < 0) return -1;
     { static int _n=0; if (_n++<6) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
      * trigger reads s_d3d.current_rsx_state, which by frame end no longer has
@@ -2006,6 +2027,19 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+/* Append a finished (or failed: pso NULL) key to the guest-FP PSO cache. */
+static ID3D12PipelineState* vp_fp_insert(const VPFPEntry* e)
+{
+    if (s_d3d.vp_fp_n >= s_d3d.vp_fp_cap) {
+        const int cap = s_d3d.vp_fp_cap ? s_d3d.vp_fp_cap * 2 : VP_FP_CACHE_INIT;
+        VPFPEntry* grown = (VPFPEntry*)realloc(s_d3d.vp_fp, sizeof(VPFPEntry) * (size_t)cap);
+        if (!grown) return e->pso;              /* uncached, still usable */
+        s_d3d.vp_fp = grown; s_d3d.vp_fp_cap = cap;
+    }
+    s_d3d.vp_fp[s_d3d.vp_fp_n++] = *e;
+    return e->pso;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 cube_mask)
@@ -2061,6 +2095,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
+    VPFPEntry key;
+    memset(&key, 0, sizeof key);
+    key.fp_addr = fp_addr; key.vs_idx = vs_idx; key.vs_hash = vs_hash;
+    key.gen = s_d3d.vp_gen; key.blend = blend; key.nrt = nrt;
+    key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
+    key.cmask = cmask; key.cull = cull; key.cube_mask = cube_mask;
+    key.pso = NULL;
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -2112,7 +2153,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * backend does not track that register, so let the decompiler infer it. */
     (void)exp32;
     int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
-    if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+    if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return vp_fp_insert(&key); }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2327,7 +2368,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
                    e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
         if (e) e->lpVtbl->Release(e);
-        return NULL;
+        return vp_fp_insert(&key);
     }
     if (e) e->lpVtbl->Release(e);
 
@@ -2414,31 +2455,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
         static int _e3=0; if (_e3++<16) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
-        return NULL;
+        return vp_fp_insert(&key);
     }
     { static int _ok=0; if (_ok++<32) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
 
-    /* insert (evict oldest when full) */
-    if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
-        if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
-        memmove(&s_d3d.vp_fp[0], &s_d3d.vp_fp[1], sizeof(VPFPEntry) * (VP_FP_CACHE - 1));
-        s_d3d.vp_fp_n = VP_FP_CACHE - 1;
-    }
-    s_d3d.vp_fp[s_d3d.vp_fp_n].fp_addr = fp_addr;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_idx  = vs_idx;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].vs_hash = vs_hash;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].gen     = s_d3d.vp_gen;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].blend   = blend;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].nrt     = nrt;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].rtfmt   = (u32)rtfmt;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].exp32   = exp32;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
-    s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
-    s_d3d.vp_fp_n++;
-    return pso;
+    key.pso = pso;
+    return vp_fp_insert(&key);
 }
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
