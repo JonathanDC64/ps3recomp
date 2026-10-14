@@ -125,9 +125,11 @@ s32 cellSailFutureIsDone(u32 pSelf, u32 pResult);
 
 s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo);
 s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u64 pts);
+s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTimePosition);
 s32 cellSailGraphicsAdapterFinalize(u32 pSelf);
 s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo);
 s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf, u64 pts);
+s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTimePosition);
 s32 cellSailSoundAdapterFinalize(u32 pSelf);
 s32 cellSailPlayerPause(CellSailPlayerHandle handle);
 

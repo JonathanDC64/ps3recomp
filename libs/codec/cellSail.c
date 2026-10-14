@@ -1287,6 +1287,32 @@ s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf, u64 pts)
     return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARG;
 }
 
+/* cellSail*AdapterPtsToTimePosition(pSelf, pts, pTimePosition): a frame's
+ * pts (90 kHz) as a stream time in microseconds. Demon's Souls times the
+ * subtitles of its movies with it (FUN_00fd8cc4 divides by 1e6); faking
+ * CELL_OK left its out value unwritten and the first subtitle on screen for
+ * the whole movie. Our pts count from 0 at the start of the stream. */
+static s32 sail_pts_to_time(u32 pSelf, u64 pts, u32 pTimePosition)
+{
+    if (!pSelf || !pTimePosition) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    static unsigned calls;
+    if (++calls == 1 || calls % 300 == 0)
+        printf("[cellSail] PtsToTimePosition #%u: pts %llu -> %llu us\n", calls,
+               (unsigned long long)pts, (unsigned long long)(pts * 100u / 9u));
+    vm_write64(pTimePosition, pts * 100u / 9u);
+    return CELL_OK;
+}
+
+s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTimePosition)
+{
+    return sail_pts_to_time(pSelf, pts, pTimePosition);
+}
+
+s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTimePosition)
+{
+    return sail_pts_to_time(pSelf, pts, pTimePosition);
+}
+
 s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
 {
     SailAdapter* a = sail_adapter(pSelf, 0, 1);
