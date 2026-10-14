@@ -16,6 +16,9 @@
 #endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
+/* Set by a title whose lift keeps a guest shadow stack: publishes the calling
+ * thread's shadow stack so the debug console can print every thread's. */
+void (*g_ds_register_shadow_hook)(unsigned long long guest_tid) = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
@@ -119,6 +122,9 @@ static void* ppu_host_thread_proc(void* param)
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+
+    /* Publish this thread's guest shadow stack to the debug console. */
+    if (g_ds_register_shadow_hook) g_ds_register_shadow_hook(info->ctx.thread_id);
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,

@@ -22,6 +22,16 @@
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>   /* exit-on: CreateThread, TerminateProcess */
+#endif
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
 /* Single flat NID -> handler table (all modules share it; resolution is by
@@ -179,6 +189,78 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+
+/* Exit-on-condition for test runs: a probe asks one question, and once the
+ * answer is in the log there is no reason to idle to the timeout.
+ *   EXIT_ON=<tag>[,<tag>...]  exit when a diagnostic reports that tag
+ *                             (e.g. gcm-wedge); "any" matches every tag
+ *   EXIT_ON_HLE=<nid>         exit on the first call of that import
+ *   EXIT_DELAY_MS=<n>         keep running n ms after the trigger (default 0)
+ * Exits by TerminateProcess after flushing: the other guest threads are
+ * mid-flight, and a normal exit would run destructors under them. */
+static DWORD WINAPI ps3_exit_thread(LPVOID p)
+{
+    const char* e = getenv("EXIT_DELAY_MS");
+    if (e) Sleep((DWORD)atoi(e));
+    fprintf(stderr, "[exit-on] %s: exiting\n", (const char*)p);
+    fflush(stdout); fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
+extern "C" void ps3_exit_now(const char* tag)
+{
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    fprintf(stderr, "[exit-on] triggered by %s\n", tag);
+    CloseHandle(CreateThread(NULL, 0, ps3_exit_thread, (LPVOID)tag, 0, NULL));
+}
+extern "C" void ps3_exit_on(const char* tag)
+{
+    static const char* want = (const char*)-1;
+    if (want == (const char*)-1) want = getenv("EXIT_ON");
+    if (!want || !tag) return;
+    const size_t n = strlen(tag);
+    int hit = !strcmp(want, "any");
+    for (const char* p = want; !hit && (p = strstr(p, tag)); p += n)
+        if ((p == want || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) hit = 1;
+    if (hit) ps3_exit_now(tag);
+}
+
+/* HLE_FIRST=1: log the first call of every import, with a timestamp, the guest
+ * thread and the caller. A title that "stops advancing" usually stops right
+ * before it would have used something new, so the tail of this list says
+ * which phase it reached and what it touched last. */
+extern "C" unsigned long long ps3_ms_now(void);
+static void hle_first_seen(uint32_t nid, const char* name, ppu_context* ctx)
+{
+    static int on = -1; static uint32_t exit_nid = 0;
+    if (on < 0) { on = getenv("HLE_FIRST") ? 1 : 0;
+                  const char* e = getenv("EXIT_ON_HLE");
+                  if (e) { exit_nid = (uint32_t)strtoul(e, 0, 16); on |= 2; } }
+    if (!on) return;
+    if (exit_nid == nid) {
+        fprintf(stderr, "[exit-on] first call of 0x%08X %s by tid %u\n", nid, name ? name : "?",
+                ctx ? (unsigned)ctx->thread_id : 0u);
+        ps3_exit_now("EXIT_ON_HLE");
+    }
+    if (!(on & 1)) return;
+    static volatile uint32_t seen[4096];
+    uint32_t h = (nid * 2654435761u) >> 20;
+    for (uint32_t i = 0; i < 4096; i++, h = (h + 1) & 4095) {
+        uint32_t cur = seen[h];
+        if (cur == nid) return;
+        if (cur == 0) {
+            cur = __sync_val_compare_and_swap(&seen[h], 0u, nid);
+            if (cur == nid) return;
+            if (cur != 0) continue;
+            fprintf(stderr, "[hle-first] t=%llu tid=%u nid=0x%08X %s lr=0x%08X\n", ps3_ms_now(),
+                    ctx ? (unsigned)ctx->thread_id : 0u, nid, name ? name : "?",
+                    ctx ? (uint32_t)ctx->lr : 0u);
+            return;
+        }
+    }
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -656,6 +738,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * "cellPadInit", which for a game that needs a guitar controller is
              * a very convincing wrong answer to chase. */
             g_last_hle_name = g_ctx[i].name;
+            hle_first_seen(nid, g_ctx[i].name, ctx);
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
             g_ctx[i].fn(ctx);
@@ -735,6 +818,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     }
     g_last_hle_name = e->name;
     ps3_msf("hle:%s", e->name);
+    hle_first_seen(nid, e->name, ctx);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {

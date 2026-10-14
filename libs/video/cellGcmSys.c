@@ -79,6 +79,8 @@ static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
  * while it's blocked in the FIFO-wrap recycle callback -- would show a
  * clear+few-draws frame as a visible flicker). */
 static volatile u32 s_flip_request_count = 0;
+/* FIFO flip words decoded so far (GCM_RATES compares it with presents). */
+volatile u32 g_gcm_flip_words = 0;
 
 u32 cellGcm_flip_request_count(void)
 {
@@ -1715,7 +1717,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * problem, both stopping together is the guest's. */
             { static unsigned long long flips = 0; static int dbg = -1;
               if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
-              ++flips;
+              ++flips; g_gcm_flip_words++;
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
@@ -2042,6 +2044,48 @@ static void gcm_rsx_process_fifo_unlocked(void)
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
+
+    /* Label-255 wedge report (once). Demon's Souls paces every frame on RSX
+     * label 255; when it stops moving while the walker keeps flipping, the
+     * walker is re-running a `flip; JUMP <frame start>` loop and the fence
+     * release it needs is somewhere it no longer goes. Print the loop (the
+     * step trace) and what the title wrote just before `put`, so the two can
+     * be compared.
+     *
+     * Keyed on flips, not time: every real frame releases the label at least
+     * once, so flips that keep coming while it stands still are the walker
+     * replaying. A slow loading frame (no flips, label still) never reports.
+     * GCM_WEDGE_FLIPS (default 64) flips without a label move report;
+     * 0 turns it off. */
+    { static int lim = -1; static u32 lab0 = 0xFFFFFFFFu, flips0 = 0; static ULONGLONG t_lab = 0; static int said = 0, armed_out = 0;
+      if (lim < 0) { const char* e = getenv("GCM_WEDGE_FLIPS"); lim = e ? atoi(e) : 64; }
+      if (lim > 0 && said < 6 && vm_base) {
+          const u32 lab = vm_read32(0x20000FF0u); const ULONGLONG now = GetTickCount64();
+          if (lab != lab0) {
+              if (armed_out) fprintf(stderr, "[gcm-wedge] label255 moved again 0x%X -> 0x%X after %llums%c",
+                                     lab0, lab, (unsigned long long)(now - t_lab), 10);
+              armed_out = 0; lab0 = lab; t_lab = now; flips0 = g_gcm_flip_words; }
+          else if (!armed_out && g_gcm_flip_words - flips0 >= (u32)lim) {
+              armed_out = 1; if (++said >= 6) said = 6;
+              fprintf(stderr, "[gcm-wedge] label255=0x%X unchanged for %u flips (%llums); get=0x%08X put=0x%08X flipwords=%u\n",
+                      lab, g_gcm_flip_words - flips0, (unsigned long long)(now - t_lab), s_fifo_getoff, put, g_gcm_flip_words);
+              for (u32 t = 0; t < GCM_TRACE_N; t++) {
+                  u32 k = (s_tr_i + t) % GCM_TRACE_N;
+                  if (!s_tr_w[k]) continue;
+                  fprintf(stderr, "[gcm-wedge] step io=%08X w=%08X type=%u method=0x%04X count=%u\n",
+                          s_tr_off[k], s_tr_w[k], s_tr_w[k] >> 29, s_tr_w[k] & 0x1FFCu, (s_tr_w[k] >> 18) & 0x7FFu);
+              }
+              for (int k = 0; k <= 6; k++) {
+                  u32 io = s_fifo_getoff + (u32)(k * 4), ea = gcm_io2ea(io);
+                  if (ea) fprintf(stderr, "[gcm-wedge] get%+d io=%08X w=%08X%c", k * 4, io, vm_read32(ea), 10);
+              }
+              for (int k = -24; k <= 2; k++) {
+                  u32 io = put + (u32)(k * 4), ea = gcm_io2ea(io);
+                  if (ea) fprintf(stderr, "[gcm-wedge] put%+d io=%08X w=%08X\n", k * 4, io, vm_read32(ea));
+              }
+              { extern void ps3_exit_on(const char*); ps3_exit_on("gcm-wedge"); }
+          }
+      } }
 
     /* Publish progress: get chases put; ref advances at most ONE queued fence
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
@@ -2491,6 +2535,11 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
+        { static int n = 0;
+          if (n++ < 8)
+              fprintf(stderr, "[cellGcmSys] flip-wrap: JUMP->begin written at io=0x%08X (get=0x%08X end-cur=0x%X ctx=0x%08X cb=0x%08X->0x%08X)\n",
+                      gcm_ea2io(cur + 4), s_fifo_getoff, end - (cur + 4), ctx, vm_read32(ctx + 0xC),
+                      vm_read32(ctx + 0xC) ? vm_read32(vm_read32(ctx + 0xC)) : 0); }
         return 1;
     }
     vm_write32(ctx + 8, cur + 4);

@@ -6,6 +6,7 @@
  */
 
 #include "sceNp.h"
+#include "../../runtime/ps3_log.h"  /* ps3_log_verbose */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>   /* getenv (NP_NO_FIRE_CB) */
@@ -95,7 +96,7 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
      * time it asked for its NP ID online. */
     npId = GUEST_PTR(npId, SceNpId*);
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
+    if (ps3_log_verbose()) printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, np_psnr_online_id());
     return CELL_OK;
 }
 
@@ -133,7 +134,7 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
     strncpy(onlineName->data, np_psnr_online_id(),
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
 
-    printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
+    if (ps3_log_verbose()) printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
            userId, np_psnr_online_id());
     return CELL_OK;
 }

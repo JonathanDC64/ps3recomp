@@ -695,13 +695,20 @@ skip_inject: ;
       static unsigned held_mask = 0; static int held_n = 0;
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
                       s_pf = (e && *e) ? 1 : 0;
-                      if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0; } }
+                      if (s_pf) { strncpy(pf_path, e, sizeof pf_path - 1); pf_path[sizeof pf_path - 1] = 0;
+                                  printf("[cellPad] PAD_FILE=%s\n", pf_path); fflush(stdout); } }
       if (s_pf && port_no == 0) {
+          /* Heartbeat every 2000 polls: separates "not polled", "file not
+           * opened" and "opened but empty" when a press seems to be ignored. */
+          static unsigned hb_poll, hb_open, hb_text;
+          if (++hb_poll % 2000 == 0) {
+              printf("[cellPad] PAD_FILE polls=%u opened=%u text=%u held=%d\n",
+                     hb_poll, hb_open, hb_text, held_n); fflush(stdout); }
           if (held_n <= 0) {
               FILE* f = fopen(pf_path, "rb");
               if (f) {
-                  char buf[64]; buf[0] = 0;
-                  if (fgets(buf, sizeof buf, f)) {
+                  char buf[64]; buf[0] = 0; hb_open++;
+                  if (fgets(buf, sizeof buf, f)) { hb_text++;
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);

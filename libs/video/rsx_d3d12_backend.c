@@ -1313,6 +1313,26 @@ static void dump_backbuffer_bmp(void)
     if (FAILED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mapped)) || !mapped)
         return;
 
+    /* CELLMARK_DUMP_CHANGED=1: write a frame only when it differs from the
+     * last one written. A sampled hash (every 8th row, every 16th pixel) is
+     * enough to tell a logo or a menu change from a re-presented frame, and a
+     * long static screen then costs one file instead of hundreds. */
+    { static int chg = -1; static unsigned long long last = 0;
+      if (chg < 0) chg = getenv("CELLMARK_DUMP_CHANGED") ? 1 : 0;
+      if (chg) {
+          unsigned long long hsh = 1469598103934665603ull;
+          for (u32 y = 0; y < s_d3d.height; y += 8) {
+              const u32* row = (const u32*)((unsigned char*)mapped + (u64)y * s_d3d.readback_pitch);
+              for (u32 x = 0; x < s_d3d.width; x += 16) hsh = (hsh ^ row[x]) * 1099511628211ull;
+          }
+          if (hsh == last) {
+              D3D12_RANGE wr0 = {0, 0};
+              s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr0);
+              return;
+          }
+          last = hsh;
+      } }
+
     static int idx = 0;
     char path[512];
     const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
@@ -5204,6 +5224,21 @@ skip_dump_consider: ;
                      s_tframes * 1000.0 / (double)(tnow - s_tt0),
                      s_dbg_last_draws, s_d3d.width, s_d3d.height);
             SetWindowTextA(s_d3d.hwnd, tb);
+            /* GCM_RATES=1: the same once-a-second sample on stderr, beside
+             * the FIFO flip words decoded and how far RSX label 255 moved --
+             * the fence a title like Demon's Souls paces its frames on. */
+            { static int on = -1; static u32 fw0, l0;
+              if (on < 0) on = getenv("GCM_RATES") ? 1 : 0;
+              extern uint8_t* vm_base;
+              if (on && vm_base) {
+                  extern volatile u32 g_gcm_flip_words;
+                  const u8* lp = vm_base + 0x20000FF0u;
+                  u32 fw = g_gcm_flip_words, l = ((u32)lp[0] << 24) | ((u32)lp[1] << 16) | ((u32)lp[2] << 8) | lp[3];
+                  fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s label255=%08X (+%u) draws=%u%c",
+                          (unsigned long long)tnow, s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                          fw - fw0, l, l - l0, s_dbg_last_draws, 10);
+                  fw0 = fw; l0 = l;
+              } }
             s_tframes = 0;
             s_tt0 = tnow;
         }

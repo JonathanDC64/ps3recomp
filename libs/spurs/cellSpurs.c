@@ -1077,7 +1077,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             { extern void spu_workload_set_dispatch_task(uint32_t, uint32_t);
               spu_workload_set_dispatch_task(taskset_ea, i); }
 
-            printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
+            if (ps3_log_verbose()) printf("[cellSpurs] CreateTask(id=%u, entry=%p, arg=%08X %08X %08X %08X"
                    " ctx=0x%08X lsp=%08X %08X %08X %08X)\n",
                    s_tasks[i].id, elf, task_arg[0], task_arg[1], task_arg[2], task_arg[3],
                    context_ea, task_lsp[0], task_lsp[1], task_lsp[2], task_lsp[3]);
@@ -1208,7 +1208,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
       if (s_r8) {
           attr->argument_ea  = (u32)sizeContext;   /* r8 */
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
-          printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
+          if (ps3_log_verbose()) printf("[cellSpurs] TaskAttr R8-form: argument_ea=0x%08X (was 0x%08X)\n",
                  attr->argument_ea, (u32)(uintptr_t)argument);
       } }
     /* SPURS_TASKATTR_DESC: a THIRD caller shape, found in Saints Row 2. Its
@@ -1238,11 +1238,11 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
           attr->sizeContext  = vm_read32(d + 4);
           attr->lsPattern_ea = vm_read32(d + 8);
           attr->argument_ea  = (u32)sizeContext;     /* r8 */
-          printf("[cellSpurs] TaskAttr DESC-form: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
+          if (ps3_log_verbose()) printf("[cellSpurs] TaskAttr DESC-form: desc=0x%08X -> ctx=0x%08X size=%u lsp=0x%08X arg=0x%08X\n",
                  d, (u32)attr->eaContext, attr->sizeContext,
                  attr->lsPattern_ea, attr->argument_ea);
       } }
-    printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
+    if (ps3_log_verbose()) printf("[cellSpurs] _TaskAttributeInitialize(eaElf=0x%08X ctx=0x%08X szctx=%u lsp=0x%08X arg=0x%08X)\n",
            (u32)eaElf, (u32)eaContext, sizeContext,
            attr->lsPattern_ea, attr->argument_ea);
     return CELL_OK;
@@ -2290,7 +2290,7 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
 s32 _cellSpursSendSignal(void* taskset, u32 taskId)
 {
     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+    if (ps3_log_verbose()) printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
     /* Real delivery now that SPU tasks execute (comment was stale). */
     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
     return CELL_OK;
@@ -2373,7 +2373,7 @@ s32 _cellSpursJobChainAttributeInitialize(u32 jmRevision, u32 sdkRevision, u64 a
     vm_write32((u32)attr_ea + JCATTR_MAX_SIZE_D, 0);
     vm_write32((u32)attr_ea + JCATTR_INIT_SPU,   0);
     vm_write32((u32)attr_ea + JCATTR_NAME,       0);
-    printf("[cellSpurs] _JobChainAttributeInitialize(attr=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u maxCont=%u)\n",
+    if (ps3_log_verbose()) printf("[cellSpurs] _JobChainAttributeInitialize(attr=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u maxCont=%u)\n",
            (u32)attr_ea, (u32)entry_ea, sizeJobDescriptor, maxGrabbedJob, maxContention);
     return CELL_OK;
 }
@@ -2427,7 +2427,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
         }
         _n++;
     }
-    printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
+    if (ps3_log_verbose()) printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
@@ -2748,7 +2748,7 @@ static void jc_signal_done(u32 jc_ea, int job_index)
                                                 : (answers_a_count ? mbox : 0));
         static int n = 0;
         if (n++ < 8)
-            printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
+            if (ps3_log_verbose()) printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
                    "(data2=%llu rc=%d)\n",
                    jc_ea, job_index, s_spurs_event_queue[i],
                    (unsigned long long)d2, rc);
@@ -2791,7 +2791,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                if (ps3_log_verbose()) printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
                 return;
             }
@@ -2889,7 +2889,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         s_jobchains[i].run_count++;
-        if (s_jobchains[i].run_count <= 3) {
+        static int s_dumped = 0;   /* chains are recreated per use: cap globally too */
+        if (s_jobchains[i].run_count <= 3 && (ps3_log_verbose() || s_dumped++ < 6)) {
             printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);

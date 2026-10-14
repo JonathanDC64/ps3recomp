@@ -156,6 +156,22 @@ static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
+
+/* FS_TIME=1: a timestamped open/close timeline. Each close reports what the
+ * descriptor did while open (reads, bytes, host time inside fread/fwrite, time
+ * held open) so a slow load splits into "waiting between requests" and "inside
+ * host I/O". */
+extern "C" unsigned long long ps3_ms_now(void);
+struct fs_tstat { unsigned long long t_open, rd_us, wr_us, rd_b, wr_b; uint32_t rd_n, wr_n; };
+static fs_tstat g_fd_t[FS_MAX];
+static int fs_time_on(void) { static int on = -1; if (on < 0) on = getenv("FS_TIME") ? 1 : 0; return on; }
+static unsigned long long fs_us_now(void)
+{
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)(c.QuadPart * 1000000 / f.QuadPart);
+}
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
 static int fd_alloc_file(FILE* f)
@@ -244,6 +260,11 @@ static void cellFsOpen(ppu_context* ctx)
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+    if (fs_time_on() && fd < FS_MAX) {
+        memset(&g_fd_t[fd], 0, sizeof g_fd_t[fd]); g_fd_t[fd].t_open = ps3_ms_now();
+        fprintf(stderr, "[fst] t=%llu open fd=%d tid=%lu '%s'\n", g_fd_t[fd].t_open, fd,
+                (unsigned long)GetCurrentThreadId(), gpath);
+    }
     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -338,6 +359,12 @@ static void cellFsSdataOpen(ppu_context* ctx)
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
+    if (fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
+    if (fs_time_on() && fd < FS_MAX) {
+        memset(&g_fd_t[fd], 0, sizeof g_fd_t[fd]); g_fd_t[fd].t_open = ps3_ms_now();
+        fprintf(stderr, "[fst] t=%llu open fd=%d tid=%lu '%s'\n", g_fd_t[fd].t_open, fd,
+                (unsigned long)GetCurrentThreadId(), gpath);
+    }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -346,6 +373,11 @@ static void cellFsClose(ppu_context* ctx)
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
+    if (fs_time_on() && fd >= 0 && fd < FS_MAX && g_files[fd]) {
+        const fs_tstat& t = g_fd_t[fd]; unsigned long long now = ps3_ms_now();
+        fprintf(stderr, "[fst] t=%llu close fd=%d held=%llums reads=%u/%lluB/%lluus writes=%u/%lluB/%lluus '%s'\n",
+                now, fd, now - t.t_open, t.rd_n, t.rd_b, t.rd_us, t.wr_n, t.wr_b, t.wr_us, g_fd_path[fd]);
+    }
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (g_fd_usm[fd] && getenv("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
         fclose(g_files[fd]); g_files[fd] = nullptr; g_fd_usm[fd] = 0;
@@ -386,7 +418,9 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    unsigned long long rd_t0 = fs_time_on() ? fs_us_now() : 0;
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    if (rd_t0) { g_fd_t[fd].rd_us += fs_us_now() - rd_t0; g_fd_t[fd].rd_b += n; g_fd_t[fd].rd_n++; }
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -453,7 +487,9 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+    unsigned long long wr_t0 = fs_time_on() ? fs_us_now() : 0;
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    if (wr_t0) { g_fd_t[fd].wr_us += fs_us_now() - wr_t0; g_fd_t[fd].wr_b += n; g_fd_t[fd].wr_n++; }
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {

@@ -511,7 +511,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         if (!sz) continue;
         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
         run[t / 8] |= m;
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+        if (ps3_log_verbose()) fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", t, taskset_ea, elf, done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
         spu_workload_set_dispatch_task(taskset_ea, t);
@@ -732,7 +732,7 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
+                    if (ps3_log_verbose()) fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
                             "taskset=0x%08X task=%u\n", j->image_id,
                             j->taskset_ea, j->taskid); fflush(stderr);
                 }
@@ -985,7 +985,7 @@ static void spu_async_run(spu_async_job* j)
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+            if (ps3_log_verbose()) fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
@@ -1558,7 +1558,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
+    if (ps3_log_verbose()) fprintf(stderr,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;

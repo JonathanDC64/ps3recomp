@@ -591,6 +591,9 @@ extern "C" const char* g_last_hle_name;
 /* Defined with the debug console below; writes to stderr and, when the
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
+extern "C" void (*g_ds_register_shadow_hook)(unsigned long long);
+extern "C" void ds_print_all_shadows(void (*)(const char*, ...), unsigned) __attribute__((weak));
+extern "C" void ps3_exit_now(const char* tag);
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
  * and writing then deadlocks the watchdog -- and with it every thread that
@@ -924,12 +927,19 @@ static DWORD WINAPI debug_console(LPVOID param)
 
         if (!strcmp(verb, "help")) {
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
+            dbg_printf("  gstacks [n]      guest shadow stack of every thread, n frames%c", 10);
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
+        } else if (!strcmp(verb, "gstacks")) {
+            /* Guest shadow stacks of every registered thread, innermost first
+             * (needs a --shadow-stack lift and a title that registers them). */
+            sscanf(cmd, "%*s %u", &a);
+            if (ds_print_all_shadows) ds_print_all_shadows(dbg_printf, a ? a : 14);
+            else dbg_printf("  no shadow stacks in this build%c", 10);
         } else if (!strcmp(verb, "threads")) {
             dump_threads("console", self);
         } else if (!strcmp(verb, "find32") && sscanf(cmd, "%*s %x", &a) == 1) {
@@ -1064,7 +1074,8 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  ? '%s' -- try 'help'%c", verb, 10);
         }
 
-        if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+        /* End marker: a driver script waits for this rather than sleeping. */
+        if (s_dbg_out) { fprintf(s_dbg_out, "[dbg] done%c", 10); fclose(s_dbg_out); s_dbg_out = NULL; }
     }
     return 0;
 }
@@ -1322,6 +1333,22 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
+    if (g_ds_register_shadow_hook) g_ds_register_shadow_hook(1);
+    /* PS3_PIDFILE=<path>: append this process id, so a test script can stop
+     * the instances it started without touching any other copy running. */
+    if (const char* pf = getenv("PS3_PIDFILE")) {
+        if (FILE* f = fopen(pf, "a")) { fprintf(f, "%lu\n", (unsigned long)GetCurrentProcessId()); fclose(f); }
+    }
+    /* EXIT_AFTER_MS=<n>: a hard stop for test runs, from inside the process,
+     * so a probe does not need an external timeout to end. */
+    if (const char* e = getenv("EXIT_AFTER_MS")) {
+        static DWORD s_after; s_after = (DWORD)atoi(e);
+        CloseHandle(CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+            Sleep(s_after);
+            ps3_exit_now("EXIT_AFTER_MS");
+            Sleep(INFINITE);
+            return 0; }, NULL, 0, NULL));
+    }
     int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     /* A guest that called sys_process_exit never reaches this line: that path
