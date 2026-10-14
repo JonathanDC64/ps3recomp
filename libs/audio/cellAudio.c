@@ -360,7 +360,13 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     BYTE* buf = NULL;
     HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
+        /* AUDIO_MUTE=1 (live): submit silence. The device is fed at the same
+         * rate, so the audio clock and the game's pacing are unchanged
+         * (PS3_NO_AUDIO, by contrast, takes the title's no-audio path). */
+        static int mute = -1;
+        PS3_KNOB(mute, getenv("AUDIO_MUTE") && getenv("AUDIO_MUTE")[0] != '0' ? 1 : 0);
+        if (mute) memset(buf, 0, num_samples * 2 * sizeof(float));
+        else      memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
     }
 }
