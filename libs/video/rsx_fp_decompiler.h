@@ -121,6 +121,16 @@ int rsx_fp_decompile_buffered_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     char* out, u32 out_size, u32* out_constant_count);
 
+/* The _ex2 forms add d2c_mask: bit N set => unit N is a depth surface read
+ * through an A8R8G8B8/D8R8G8B8 format. It is declared Texture2D<float> (the
+ * backend binds the depth view) and its samples are decoded to the colour
+ * RSX would fetch from the surface's bytes (rsx_d2c in the output). */
+int rsx_fp_decompile_ex2(const u8* ucode, u32 max_bytes, u32 ctrl,
+                         u32 tex_cube_mask, u32 d2c_mask, char* out, u32 out_size);
+int rsx_fp_decompile_buffered_ex2(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 d2c_mask,
+    char* out, u32 out_size, u32* out_constant_count);
+
 /* Extract the exact runtime inline-CONST payload. Returns the slot count on
  * success or -1 for an unterminated/truncated/oversized program. */
 int rsx_fp_collect_constants(

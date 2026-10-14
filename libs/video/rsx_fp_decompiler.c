@@ -455,9 +455,12 @@ int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 ou
 }
 
 static int rsx_fp_decompile_internal(
-    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 d2c_mask,
     int buffered, char* out, u32 out_size, u32* out_constant_count)
 {
+    /* Units declared one by one (rsx_texN) instead of as the rsx_tex[] array:
+     * any cube, shadow or depth-as-colour unit needs its own type. */
+    const u32 tex_indiv = tex_cube_mask | d2c_mask;
     if (!ucode || !out || out_size == 0) return -1;
 
     u32 buffered_constant_count = 0;
@@ -711,7 +714,12 @@ static int rsx_fp_decompile_internal(
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
-            if ((tex_cube_mask >> (16 + tex_unit)) & 1u)
+            if ((d2c_mask >> tex_unit) & 1u)
+                /* A depth surface read through a colour format: decode the
+                 * 24-bit depth into the bytes RSX would fetch (rsx_d2c). */
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_d2c(rsx_tex%u.Sample(rsx_samp[%u], (%s).xy))", tex_unit, tex_unit, a);
+            else if ((tex_cube_mask >> (16 + tex_unit)) & 1u)
                 /* Shadow map: compare the coordinate's z with the stored depth
                  * (the sampler carries the guest's zfunc); RSX returns the
                  * result in every channel. */
@@ -722,7 +730,7 @@ static int rsx_fp_decompile_internal(
                 /* Cubemap: sample with the full 3-component direction vector. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
+            else if (tex_indiv)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             else
@@ -730,7 +738,11 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
-            if ((tex_cube_mask >> (16 + tex_unit)) & 1u)
+            if ((d2c_mask >> tex_unit) & 1u)
+                snprintf(rhs, sizeof(rhs),
+                         "rsx_d2c(rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w))",
+                         tex_unit, tex_unit, a, a);
+            else if ((tex_cube_mask >> (16 + tex_unit)) & 1u)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.SampleCmpLevelZero(rsx_samp[%u], (%s).xy / (%s).w, "
                          "(%s).z / (%s).w).xxxx", tex_unit, tex_unit, a, a, a, a);
@@ -739,7 +751,7 @@ static int rsx_fp_decompile_internal(
                  * the direction directly. */
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xyz)", tex_unit, tex_unit, a);
-            else if (tex_cube_mask)
+            else if (tex_indiv)
                 snprintf(rhs, sizeof(rhs),
                          "rsx_tex%u.Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
@@ -760,10 +772,12 @@ static int rsx_fp_decompile_internal(
                 break;
             }
             char tn[32];
-            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
-            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
+            snprintf(tn, sizeof(tn), tex_indiv ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            const int d2c = (d2c_mask >> tex_unit) & 1u;
+            snprintf(rhs, sizeof(rhs), "%s%s.%s(rsx_samp[%u], (%s).%s, (%s).x)%s",
+                     d2c ? "rsx_d2c(" : "", tn,
                      opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
-                     cube ? "xyz" : "xy", b);
+                     cube ? "xyz" : "xy", b, d2c ? ")" : "");
             break;
         }
         case OP_KIL:
@@ -947,7 +961,7 @@ static int rsx_fp_decompile_internal(
     /* Preamble: PSInput matches the backend's placeholder layout; temp/half
      * register files; texture+sampler banks for TEX. Built here, in front of
      * the body, now that the return type is known. */
-    char preamble[2048];
+    char preamble[4096];
     Out p = { preamble, sizeof(preamble), 0, 1 };
     preamble[0] = '\0';
     out_puts(&p,
@@ -966,13 +980,13 @@ static int rsx_fp_decompile_internal(
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
      * cube units can be TextureCube while the rest stay Texture2D. */
-    if (tex_cube_mask == 0) {
+    if (tex_indiv == 0) {
         out_puts(&p, "Texture2D    rsx_tex[16] : register(t0);\n");
     } else {
         char decl[64];
         for (u32 u = 0; u < 16; u++) {
             snprintf(decl, sizeof(decl), "%s rsx_tex%u : register(t%u);\n",
-                     ((tex_cube_mask >> (16 + u)) & 1u) ? "Texture2D<float>"
+                     ((tex_cube_mask >> (16 + u)) & 1u) || ((d2c_mask >> u) & 1u) ? "Texture2D<float>"
                      : ((tex_cube_mask >> u) & 1u) ? "TextureCube" : "Texture2D  ", u, u);
             out_puts(&p, decl);
         }
@@ -980,6 +994,17 @@ static int rsx_fp_decompile_internal(
     /* Shadow units need a SamplerComparisonState, which cannot share an array
      * with plain samplers: declare them one by one and rename the body's
      * rsx_samp[N] to rsx_sampN. Programs without shadow units are unchanged. */
+    /* Depth read as A8R8G8B8 / D8R8G8B8 (RPCS3
+     * RSXFragmentTextureDepthConversion.glsl, which names Demon's Souls): the
+     * unit holds the 24-bit depth, RSX fetches the surface's bytes, and the
+     * colour comes out as (Z[15:8], Z[7:0], stencil, Z[23:16]) / 255. The
+     * stencil byte is not bound and reads 0. */
+    if (d2c_mask)
+        out_puts(&p,
+            "float4 rsx_d2c(float d) {\n"
+            "    const uint v = (uint)round(saturate(d) * 16777215.0);\n"
+            "    return float4((v >> 8) & 255u, v & 255u, 0u, (v >> 16) & 255u) / 255.0;\n"
+            "}\n");
     const u32 shadow_mask = tex_cube_mask >> 16;
     if (!shadow_mask) {
         out_puts(&p,
@@ -1041,7 +1066,14 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, 0, out, out_size, NULL);
+}
+
+int rsx_fp_decompile_ex2(const u8* ucode, u32 max_bytes, u32 ctrl,
+                         u32 tex_cube_mask, u32 d2c_mask, char* out, u32 out_size)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, tex_cube_mask, d2c_mask, 0, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -1049,7 +1081,16 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 0, 1, out, out_size,
+        out_constant_count);
+}
+
+int rsx_fp_decompile_buffered_ex2(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 d2c_mask,
+    char* out, u32 out_size, u32* out_constant_count)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, tex_cube_mask, d2c_mask, 1, out, out_size,
         out_constant_count);
 }
 

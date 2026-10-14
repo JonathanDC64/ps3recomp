@@ -118,6 +118,8 @@ typedef struct {
     } tex[RSX_FP_UNITS];
     int tex_rt[RSX_FP_UNITS];   /* pre-pass: OffRT index sampled by unit, -1 = none */
     int tex_z[RSX_FP_UNITS];    /* pre-pass: depth surface (s_zeta) sampled by unit, -1 = none */
+    u32 d2c_mask;       /* pre-pass: units reading a depth surface through a colour
+                         * format (the decompiler decodes them; PSO key) */
     int tex_slot;       /* legacy single-slot path (atlas); -1 = none */
     int vs_idx;         /* VPVSEntry slot for this draw's vertex program (-1 = primary) */
     int blend;          /* guest blend enable at draw time */
@@ -248,6 +250,7 @@ typedef struct {
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
+    u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -2319,7 +2322,7 @@ static void vp_pso_knobs_check(void)
 static void fp_seen_note(u32 ea, u32 len);
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 depth, u32 cube_mask)
+                                          u32 depth, u32 cube_mask, u32 d2c_mask)
 {
     vp_pso_knobs_check();
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;
@@ -2371,7 +2374,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].depth == depth &&
-            s_d3d.vp_fp[i].cube_mask == cube_mask)
+            s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].d2c_mask == d2c_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     VPFPEntry key;
@@ -2380,6 +2383,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.gen = s_d3d.vp_gen; key.blend = blend; key.nrt = nrt;
     key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
+    key.d2c_mask = d2c_mask;
     key.pso = NULL;
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -2404,7 +2408,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             VPFPEntry* q = &s_d3d.vp_fp[i];
             if (q->fp_addr != fp_addr) continue;
             n++;
-            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%c", fp_addr,
+            fprintf(stderr, "[PSOMISS] fp=0x%X differs:%s%s%s%s%s%s%s%s%s%c", fp_addr,
                     q->vs_idx != vs_idx        ? " vs_idx"     : "",
                     q->vs_hash != vs_hash      ? " vs_hash"    : "",
                     q->gen != s_d3d.vp_gen     ? " gen"        : "",
@@ -2412,7 +2416,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     q->nrt != nrt              ? " nrt"        : "",
                     q->rtfmt != (u32)rtfmt     ? " rtfmt"      : "",
                     q->ucode_hash != uhash     ? " ucode_hash" : "",
-                    q->cube_mask != cube_mask  ? " cube_mask"  : "", 10);
+                    q->cube_mask != cube_mask  ? " cube_mask"  : "",
+                    q->d2c_mask != d2c_mask    ? " d2c_mask"   : "", 10);
             break;
         } } }
     /* CUBEKEYDBG=1: which (program, cube mask) pairs are being compiled. If one
@@ -2441,8 +2446,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * surfaces drew black or saturated). The cube mask goes to the decompiler
      * so cube units are declared and sampled as cubes. */
     u32 kcount = 0;
-    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
-                                         hlsl, sizeof(hlsl), &kcount);
+    int n = rsx_fp_decompile_buffered_ex2(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+                                          d2c_mask, hlsl, sizeof(hlsl), &kcount);
     int buffered = n > 0 && kcount <= FPCB_KMAX;
     if (n > 0 && !buffered) {
         /* More constants than b1 holds: bake them, as before. */
@@ -2450,8 +2455,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (said++ < 4)
             fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
                             "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
-        n = rsx_fp_decompile_ex(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
-                                hlsl, sizeof(hlsl));
+        n = rsx_fp_decompile_ex2(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+                                 d2c_mask, hlsl, sizeof(hlsl));
     }
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return vp_fp_insert(&key); }
     if (!fp_bind_b1(hlsl, sizeof hlsl, cube_mask, buffered)) {
@@ -3821,6 +3826,12 @@ static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(int slot)
     return h;
 }
 
+/* The same surface as a read-only depth-stencil view: depth-tested and
+ * sampled by one draw. The resource is then in ZETA_READ_STATE. */
+#define ZETA_READ_STATE ((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_DEPTH_READ | \
+                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv_ro(int slot) { return zeta_dsv(MAX_ZETA + slot); }
+
 static int zeta_find(u32 off)
 {
     for (int i = 0; i < MAX_ZETA; i++)
@@ -3851,7 +3862,7 @@ static int zeta_get(u32 off, u32 w, u32 h)
     if (!h) h = s_d3d.height;
     if (!s_zeta_dsv_heap) {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-        hd.NumDescriptors = MAX_ZETA;
+        hd.NumDescriptors = MAX_ZETA * 2;   /* writable, then read-only */
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
         if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(
                 s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_zeta_dsv_heap)))
@@ -3896,6 +3907,8 @@ static int zeta_get(u32 off, u32 w, u32 h)
     dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, z->res, &dd, zeta_dsv(slot));
+    dd.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
+    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, z->res, &dd, zeta_dsv_ro(slot));
     s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zeta_dsv(slot),
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
     printf("[ZETA] depth surface 0x%08X %ux%u (slot %d)\n", off, w, h, slot);
@@ -5045,10 +5058,31 @@ rtt_dump_done:;
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
+        dr->d2c_mask = 0;
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * RSX_FP_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
+            /* An A8R8G8B8 / D8R8G8B8 unit over a depth surface reads the depth
+             * buffer's bytes as colour (RPCS3 RSXThread.cpp "redirected"
+             * textures; Demon's Souls's light shafts and depth of field read
+             * the scene depth this way). Bind the depth view; the fragment
+             * program decodes it (rsx_d2c). The unit's remap is not applied:
+             * the titles seen use the identity (0xAAE4), as RPCS3 notes. A
+             * colour target at the same offset wins: that is what was drawn. */
+            if (dr->tex[_u].set && ((dr->tex[_u].fmt & 0x9F) == 0x85 ||
+                                    (dr->tex[_u].fmt & 0x9F) == 0x9E)) {
+                static int en = -1;
+                PS3_KNOB(en, ps3_env_int("RSX_DEPTH_AS_COLOR", 1));
+                int zs = en && off_rt_find(dr->tex[_u].raw) < 0 ? zeta_find(dr->tex[_u].raw) : -1;
+                if (zs >= 0) {
+                    dr->tex_z[_u] = zs;
+                    dr->d2c_mask |= 1u << _u;
+                    srv_write(wslot, s_zeta[zs].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    continue;
+                }
+            }
             /* A depth-format unit reads the depth surface rendered at its offset
              * (a shadow map). With nothing rendered there it samples nothing. */
             if (dr->tex[_u].set && rsx_fmt_is_depth(dr->tex[_u].fmt & 0x9F)) {
@@ -5161,7 +5195,7 @@ rtt_dump_done:;
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       dr_cube_mask(dr));
+                                       dr_cube_mask(dr), dr->d2c_mask);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5357,6 +5391,7 @@ rtt_dump_done:;
             float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
             int cur_z = -1;                        /* zeta: -1 = shared buffer  */
+            int cur_zro = 0;                       /* cur_z bound read-only     */
             int cur_nocol = 0;                     /* depth-only pass bound     */
             double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
@@ -5396,6 +5431,14 @@ rtt_dump_done:;
                        ? zeta_find(dr->zeta) : -1;
                 if (wz < 0 && cur_z >= 0 && !(dr->depth & 1u) && !(dr->clr_flags & 3u))
                     wz = cur_z;   /* depth unused: don't rebind just to drop it */
+                /* A draw that samples the depth surface it is bound to and does
+                 * not write depth (Demon's Souls's light shafts test against
+                 * the scene depth and fade by it) binds it read-only, so it can
+                 * be a depth target and a texture at once, as on RSX. */
+                int wro = 0;
+                if (wz >= 0 && !(dr->depth & 2u) && !(dr->clr_flags & 3u))
+                    for (int _u = 0; _u < RSX_FP_UNITS; _u++)
+                        if (dr->tex_z[_u] == wz) { wro = 1; break; }
                 /* Colour target NONE: a depth-only pass. It binds no colour
                  * target and takes the depth surface's size -- bound to the
                  * backbuffer, the 2048x2048 shadow atlas was clipped to the
@@ -5403,9 +5446,11 @@ rtt_dump_done:;
                 const int nocol = dr->ctgt == 0;
                 if (want != cur_rt || wantm[0] != cur_m[0] ||
                     wantm[1] != cur_m[1] || wantm[2] != cur_m[2] || wz != cur_z ||
-                    nocol != cur_nocol) {
-                    D3D12_CPU_DESCRIPTOR_HANDLE dsv_op = wz >= 0 ? zeta_dsv(wz) : dsv_handle;
-                    if (wz >= 0) zeta_transition(wz, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                    wro != cur_zro || nocol != cur_nocol) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE dsv_op = wz < 0 ? dsv_handle
+                                                       : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
+                    if (wz >= 0) zeta_transition(wz, wro ? ZETA_READ_STATE
+                                                         : D3D12_RESOURCE_STATE_DEPTH_WRITE);
                     D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
                     UINT nrt = 1;
                     rh[0] = rtv_handle;
@@ -5437,6 +5482,7 @@ rtt_dump_done:;
                         s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
                             D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
                     cur_z = wz;
+                    cur_zro = wro;
                     cur_nocol = nocol;
                     /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
                      * at the moment they bind it. The guest's own clears may go
@@ -5523,7 +5569,7 @@ rtt_dump_done:;
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                                dr_cube_mask(dr)) : NULL;
+                                                dr_cube_mask(dr), dr->d2c_mask) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
@@ -5556,7 +5602,9 @@ rtt_dump_done:;
                 for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
                     int tz = dr->tex_z[_u];
                     if (tz >= 0) {
-                        if (tz == cur_z)   /* bound as this draw's depth: unreadable */
+                        if (tz == cur_z && cur_zro)   /* bound read-only: readable */
+                            ;
+                        else if (tz == cur_z)   /* bound as this draw's depth: unreadable */
                             srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, NULL,
                                       DXGI_FORMAT_R8G8B8A8_UNORM,
                                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
