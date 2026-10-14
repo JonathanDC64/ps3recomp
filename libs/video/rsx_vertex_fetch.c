@@ -108,3 +108,67 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         break;
     }
 }
+
+void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* pl)
+{
+    pl->st = st;
+    memcpy(pl->konst, st->vertex_data4f, sizeof pl->konst);
+    pl->n_on = 0;
+    if (!vm_base) return;
+    static int nofreq = -1;
+    PS3_KNOB(nofreq, getenv("VP_NOFREQ") ? 1 : 0);
+    for (u32 i = 0; i < 16; i++) {
+        const rsx_vertex_attrib* a = &st->vertex_attribs[i];
+        if (!a->enabled || a->stride == 0) continue;
+        rsx_fetch_slot* s = &pl->on[pl->n_on++];
+        s->idx = i;
+        s->off = a->offset & 0x7FFFFFFFu;
+        s->stride = a->stride;
+        s->n = a->size ? a->size : 4; if (s->n > 4) s->n = 4;
+        s->type = a->type;
+        s->freq = (a->frequency > 1 && !nofreq) ? a->frequency : 0;
+        s->modulo = (st->frequency_divider_op >> i) & 1u;
+        s->main = (a->offset & 0x80000000u) != 0;
+        /* LOCAL resolves as base + offset (cellGcmResolveLocated(1, x)). */
+        s->local_addr = s->main ? 0 : cellGcmResolveLocated(1, 0);
+    }
+}
+
+void rsx_fetch_vertex(const rsx_fetch_plan* pl, u32 vi, float out[16][4])
+{
+    memcpy(out, pl->konst, sizeof pl->konst);
+    for (u32 k = 0; k < pl->n_on; k++) {
+        const rsx_fetch_slot* s = &pl->on[k];
+        u32 ei = vi;
+        if (s->freq) ei = s->modulo ? vi % s->freq : vi / s->freq;
+        const u32 off = s->off + ei * s->stride;
+        const u8* p = vm_base + (s->main ? cellGcmResolveLocated(0, off)
+                                         : s->local_addr + off);
+        float* o = out[s->idx];
+        const u32 n = s->n;
+        switch (s->type) {
+        case 2:
+            for (u32 c = 0; c < n; c++) o[c] = rsx_rd_bef(p + c * 4);
+            break;
+        case 3:
+            for (u32 c = 0; c < n; c++) o[c] = rsx_rd_half_be(p + c * 2);
+            break;
+        case 4:
+            for (u32 c = 0; c < n; c++) o[c] = p[c] / 255.0f;
+            break;
+        case 1:
+            for (u32 c = 0; c < n; c++)
+                o[c] = (float)(s16)((p[c*2] << 8) | p[c*2+1]) / 32767.0f;
+            break;
+        case 5:
+            for (u32 c = 0; c < n; c++) o[c] = (float)(s16)((p[c*2] << 8) | p[c*2+1]);
+            break;
+        case 7:
+            for (u32 c = 0; c < n; c++) o[c] = (float)p[c];
+            break;
+        default:   /* unusual types keep the reference path (and its log) */
+            rsx_fetch_attrib(pl->st, (int)s->idx, vi, o);
+            break;
+        }
+    }
+}

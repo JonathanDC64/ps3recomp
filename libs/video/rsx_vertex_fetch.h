@@ -68,6 +68,25 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
+/* A draw's vertex fetch, decided once. rsx_fetch_attrib re-derives every
+ * attribute's enable, type, divisor and context DMA for every vertex and every
+ * one of the 16 slots; a level frame in Demon's Souls fetches about a million
+ * vertices, and that re-derivation was most of the cost. The plan snapshots
+ * the constant registers and lists only the enabled arrays; rsx_fetch_vertex
+ * then gives exactly what 16 rsx_fetch_attrib calls give. The state must not
+ * change between rsx_fetch_plan_init and the fetches. */
+typedef struct rsx_fetch_slot {
+    u32 idx, off, stride, n, type, freq, modulo, main, local_addr;
+} rsx_fetch_slot;
+typedef struct rsx_fetch_plan {
+    const rsx_state* st;
+    float konst[16][4];        /* the constant vertex attribute registers */
+    u32 n_on;                  /* enabled arrays, in slot order           */
+    rsx_fetch_slot on[16];
+} rsx_fetch_plan;
+void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* pl);
+void rsx_fetch_vertex(const rsx_fetch_plan* pl, u32 vi, float out[16][4]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -6577,16 +6577,55 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
 /* Fill all 16 attribute slots for one vertex. The per-attribute work lives in
  * rsx_vertex_fetch.c so the Metal and null backends read guest vertices the
  * same way this one does, rather than each porting the logic again. */
+/* VP_FETCH_FAST (live, default 1): each VP upload starts with
+ * vp_plan_begin, which builds the draw's fetch plan (rsx_fetch_plan_init) and
+ * opens a new generation of the vertex cache. 0 = the per-attribute
+ * rsx_fetch_attrib path and no cache, for A/B. */
+static rsx_fetch_plan s_vp_plan;
+static int s_vp_fast = 1;
+#define VP_VC_N 256u
+static u32 s_vc_key[VP_VC_N], s_vc_tag[VP_VC_N], s_vc_gen;
+static VPSlot s_vc_v[VP_VC_N][16];
+
+static void vp_plan_begin(const rsx_state* state)
+{
+    static int fast = -1;
+    PS3_KNOB(fast, ps3_env_int("VP_FETCH_FAST", 1));
+    s_vp_fast = fast != 0;
+    if (s_vp_fast) rsx_fetch_plan_init(state, &s_vp_plan);
+    if (++s_vc_gen == 0) { memset(s_vc_tag, 0, sizeof s_vc_tag); s_vc_gen = 1; }
+}
+
 static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
-    for (int i = 0; i < 16; i++) {
-        rsx_fetch_attrib(state, i, vi, out16[i].v);
-        if (i == 0) {
-            const rsx_vertex_attrib* a = &state->vertex_attribs[0];
-            u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-            rsx_vtx_pos_dbg(state, out16[0].v, n);
-        }
+    if (s_vp_fast && s_vp_plan.st == state) {
+        /* Built on the stack, then one copy: out16 is usually the upload
+         * heap, which is write-combined. */
+        float tmp[16][4];
+        rsx_fetch_vertex(&s_vp_plan, vi, tmp);
+        memcpy(out16, tmp, sizeof tmp);
+    } else {
+        for (int i = 0; i < 16; i++)
+            rsx_fetch_attrib(state, i, vi, out16[i].v);
     }
+    { const rsx_vertex_attrib* a = &state->vertex_attribs[0];
+      u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
+      rsx_vtx_pos_dbg(state, out16[0].v, n); }
+}
+
+/* For uploads that emit the same vertex more than once (strips and fans
+ * expanded to lists, indexed draws): a direct-mapped cache of this draw's
+ * fetched vertices. A guest vertex cannot change within one draw, so a hit is
+ * exactly what a fetch would return. */
+static void read_vp_vertex_c(const rsx_state* state, u32 vi, VPSlot* out16)
+{
+    if (!s_vp_fast) { read_vp_vertex(state, vi, out16); return; }
+    const u32 h = (vi ^ (vi >> 8)) & (VP_VC_N - 1);
+    if (s_vc_tag[h] != s_vc_gen || s_vc_key[h] != vi) {
+        read_vp_vertex(state, vi, s_vc_v[h]);
+        s_vc_key[h] = vi; s_vc_tag[h] = s_vc_gen;
+    }
+    memcpy(out16, s_vc_v[h], VP_VERT_STRIDE);
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
@@ -6753,6 +6792,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     u32 quads = count / 4;
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
@@ -6788,6 +6828,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n++ < 12)
@@ -6854,6 +6895,7 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
@@ -6867,9 +6909,9 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
         /* strip winding alternates per triangle to keep facing consistent */
         u32 i1 = t + 1, i2 = t + 2;
         if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
-        read_vp_vertex(state, first + i0, &out[o*16]); o++;
-        read_vp_vertex(state, first + i1, &out[o*16]); o++;
-        read_vp_vertex(state, first + i2, &out[o*16]); o++;
+        read_vp_vertex_c(state, first + i0, &out[o*16]); o++;
+        read_vp_vertex_c(state, first + i1, &out[o*16]); o++;
+        read_vp_vertex_c(state, first + i2, &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
@@ -6900,6 +6942,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     u32 quads = count / 4;
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
@@ -6910,7 +6953,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
         for (u32 k = 0; k < 4; k++)
-            read_vp_vertex(state, read_guest_index(state, first + q*4 + k), c[k]);
+            read_vp_vertex_c(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
         if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 6) {
@@ -6943,6 +6986,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n++ < 12)
@@ -6954,7 +6998,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     { double _tv = perf_on() ? perf_now() : 0.0;
       if (!state->restart_index_enable) {
           for (u32 k = 0; k < count; k++)
-              read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+              read_vp_vertex_c(state, read_guest_index(state, first + k), &out[k*16]);
       } else {
           /* Primitive restart: the restart index drops the triangle in
            * progress and the list resumes after it. */
@@ -6964,7 +7008,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
               if (ix == state->restart_index) { n = 0; continue; }
               tri[n++] = ix;
               if (n == 3) {
-                  for (int j = 0; j < 3; j++) read_vp_vertex(state, tri[j], &out[(o + j)*16]);
+                  for (int j = 0; j < 3; j++) read_vp_vertex_c(state, tri[j], &out[(o + j)*16]);
                   o += 3; n = 0;
               }
           }
@@ -7175,6 +7219,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    vp_plan_begin(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
@@ -7205,9 +7250,9 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         const u32 t = k - base;
         u32 v0 = ia, v1 = ib;
         if (!fan && (t & 1)) { v0 = ib; v1 = ia; }
-        read_vp_vertex(state, v0, &out[o*16]); o++;
-        read_vp_vertex(state, v1, &out[o*16]); o++;
-        read_vp_vertex(state, i2, &out[o*16]); o++;
+        read_vp_vertex_c(state, v0, &out[o*16]); o++;
+        read_vp_vertex_c(state, v1, &out[o*16]); o++;
+        read_vp_vertex_c(state, i2, &out[o*16]); o++;
     }
     { static int said = 0;
       if (restart && !said) { said = 1;
