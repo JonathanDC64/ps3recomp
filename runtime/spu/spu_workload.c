@@ -194,6 +194,15 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 
 /* ---- dispatch ---------------------------------------------------------- */
 
+/* Runs per lifted image id (index = image id, 0 = unknown), counted at each
+ * dispatch HIT on the sync, job and async paths. Read by the debug console's
+ * `spu` verb: shows which SPU programs a title is running right now. */
+volatile unsigned long long g_spu_image_runs[64];
+static void spu_count_run(int image_id)
+{
+    g_spu_image_runs[(unsigned)image_id < 64 ? image_id : 0]++;
+}
+
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {
@@ -225,6 +234,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
         return 0;
     }
 
+    spu_count_run(image_id);
     fprintf(stderr,
         "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
         (unsigned long long)fp, entry, args_ea, image_id);
@@ -495,7 +505,7 @@ static int ts_trace(uint32_t taskset_ea)
 }
 #define TS_TRACE(ea, ...) do { if (ts_trace(ea)) { \
     extern unsigned long long ps3_ms_now(void); \
-    fprintf(stderr, "[ts-trace] t=%llu ", ps3_ms_now()); \
+    fprintf(stderr, "[ts-trace] t=%llu ts=%08X ", ps3_ms_now(), (unsigned)(ea)); \
     fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
 
 /* Start task `t` of a taskset from its task_info ELF (ts_lock held). */
@@ -1153,6 +1163,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
      * lock, and it starved the guest threads competing for that lock badly
      * enough to change what the title does (see ps3_log.h). Milestones stay;
      * the per-job pair is verbose-only. */
+    spu_count_run(image_id);
     int verbose = ps3_log_verbose();
     if (verbose) {
         fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
@@ -1630,6 +1641,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     if (!j) return 0;
     j->image = image; j->image_size = image_size; j->args_ea = args_ea;
     j->fn = fn; j->image_id = image_id;
+    spu_count_run(image_id);
     /* Capture the taskset+taskid NOW (PPU thread, right after cellSpursCreateTask
      * set the globals for THIS task). Reading them later in the async thread races
      * the next CreateTask overwriting the single-slot globals -- with two audio

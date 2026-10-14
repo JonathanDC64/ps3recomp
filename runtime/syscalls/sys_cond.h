@@ -49,6 +49,15 @@ typedef struct sys_cond_info {
 
 extern sys_cond_info g_sys_conds[SYS_COND_MAX];
 
+/* Sync history ring (sys_cond.c): see sync_hist(). op: C/D cond create/destroy,
+ * W/w cond wait enter/return, S/A signal/signal_all, M/X mutex create/destroy. */
+#define SYNC_HIST_N 65536
+typedef struct { uint32_t t_ms; uint32_t id; uint32_t tid; uint32_t lr;
+                 uint32_t extra; int32_t res; uint8_t op; } sync_hist_ent;
+extern sync_hist_ent g_sync_hist[SYNC_HIST_N];
+extern volatile long g_sync_hist_n;
+void sync_hist(char op, uint32_t id, const ppu_context* ctx, uint32_t extra, int32_t res);
+
 /* Syscall handlers */
 int64_t sys_cond_create(ppu_context* ctx);
 int64_t sys_cond_destroy(ppu_context* ctx);

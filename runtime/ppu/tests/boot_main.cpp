@@ -195,6 +195,8 @@ extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
  * offset (RVA) so it can be symbolized with llvm-symbolizer against the PDB. */
 extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
 extern "C" const char* g_last_hle_name;
+extern "C" volatile unsigned long long g_spu_image_runs[64];  /* spu_workload.c */
+extern "C" ppu_context* volatile g_ppu_main_ctx;            /* ppu_loader.cpp: main thread ctx */
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
@@ -428,6 +430,7 @@ static void present_guest_frame(void)
  * shows its loop's PC dominating the histogram. This is the tool that
  * answers "where does thread X spend its wall time" without a debugger. */
 #include "../../syscalls/sys_ppu_thread.h"
+#include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
     struct Site { uint32_t tid, cia; uint32_t hits; };
@@ -968,6 +971,9 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
+            dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
+            dbg_printf("  ctx <tid>        a guest thread's live registers (lr = where it is parked)%c", 10);
+            dbg_printf("  synchist <id> [n] cond/mutex history for an id (create, wait, signal, destroy)%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
@@ -1087,6 +1093,45 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  qbset 0x%08X = %u: %u member(s)%c", a, b, n, 10);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
+        } else if (!strcmp(verb, "ctx") && sscanf(cmd, "%*s %u", &a) == 1) {
+            /* ctx <tid>: that guest thread's live registers. Read unlocked from
+             * the thread's own context, so a running thread gives a torn view;
+             * a parked one (the usual question) gives where it is parked: lr is
+             * the return address into the function that made the blocking call. */
+            if (a >= 1 && a <= PPU_THREAD_MAX && g_ppu_threads[a - 1].state != PPU_THREAD_STATE_FREE) {
+                /* the main thread's context lives on the loader's frame */
+                const ppu_context* c = (a == 1 && g_ppu_main_ctx) ? g_ppu_main_ctx : &g_ppu_threads[a - 1].ctx;
+                dbg_printf("  tid %u \"%s\" cia=0x%08X lr=0x%08X ctr=0x%08X r1=0x%08X r2=0x%08X%c", a,
+                           g_ppu_threads[a - 1].name, (unsigned)c->cia, (unsigned)c->lr, (unsigned)c->ctr,
+                           (unsigned)c->gpr[1], (unsigned)c->gpr[2], 10);
+                for (int r = 0; r < 32; r += 8)
+                    dbg_printf("  r%-2d %08X %08X %08X %08X %08X %08X %08X %08X%c", r,
+                               (unsigned)c->gpr[r], (unsigned)c->gpr[r + 1], (unsigned)c->gpr[r + 2],
+                               (unsigned)c->gpr[r + 3], (unsigned)c->gpr[r + 4], (unsigned)c->gpr[r + 5],
+                               (unsigned)c->gpr[r + 6], (unsigned)c->gpr[r + 7], 10);
+            } else dbg_printf("  no thread %u%c", a, 10);
+        } else if (!strcmp(verb, "synchist") && sscanf(cmd, "%*s %x", &a) == 1) {
+            /* synchist <hex id> [n]: the last n (default 40) sync-history events
+             * for that id, oldest first. Cond ops: C create (x=mutex, r=id
+             * address), D destroy, W/w wait enter/return (x=mutex), S/A signal
+             * (x=waiters then). Mutex ops (same id space, separate objects):
+             * M create (x=id address), X destroy (x=owner, r=lock count). */
+            unsigned want = 40; sscanf(cmd, "%*s %*x %u", &want);
+            const long n = g_sync_hist_n;
+            const long lo = n > SYNC_HIST_N ? n - SYNC_HIST_N : 0;
+            static long hits[4096]; unsigned nh = 0;
+            for (long i = n - 1; i >= lo && nh < want && nh < 4096; i--)
+                if (g_sync_hist[i & (SYNC_HIST_N - 1)].id == a) hits[nh++] = i;
+            while (nh--) {
+                const sync_hist_ent* e = &g_sync_hist[hits[nh] & (SYNC_HIST_N - 1)];
+                dbg_printf("  t=%u %c id=0x%X tid=%u lr=0x%08X x=0x%X r=0x%08X%c", e->t_ms, e->op,
+                           e->id, e->tid, e->lr, e->extra, (unsigned)e->res, 10);
+            }
+        } else if (!strcmp(verb, "spu")) {
+            /* SPU program runs per lifted image id since start (dispatch HITs). */
+            for (int k = 0; k < 64; k++)
+                if (g_spu_image_runs[k])
+                    dbg_printf("  image %2d: %llu run(s)%c", k, g_spu_image_runs[k], 10);
         } else if (!strcmp(verb, "hle")) {
             dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
                        g_last_hle_name ? g_last_hle_name : "", 10);

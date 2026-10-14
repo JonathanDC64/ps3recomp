@@ -136,6 +136,8 @@ int64_t sys_mutex_create(ppu_context* ctx)
     }
 
     mtx_table_unlock();
+    { extern void sync_hist(char, uint32_t, const ppu_context*, uint32_t, int32_t);
+      sync_hist('M', mutex_id, ctx, id_out_addr, 0); }
     return CELL_OK;
 }
 
@@ -168,6 +170,8 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
 
     m->active = 0;
     mtx_table_unlock();
+    { extern void sync_hist(char, uint32_t, const ppu_context*, uint32_t, int32_t);
+      sync_hist('X', mutex_id, ctx, (uint32_t)m->owner_tid, m->lock_count); }
     return CELL_OK;
 }
 

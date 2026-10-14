@@ -325,9 +325,43 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
+/* SEM_LR=1: log each new (op, semaphore, thread, caller, caller's caller) the
+ * first time it is seen. One line per distinct site, so it can stay on for a
+ * whole run: it maps which code waits on and posts each semaphore, and a site
+ * that stops appearing in a later phase shows up as missing from the tail. */
+extern uint32_t vm_read32(uint64_t a);
+static void sem_lr_seen(char op, ppu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("SEM_LR") ? 1 : 0;
+    if (!on) return;
+    const uint32_t id = (uint32_t)ctx->gpr[3], lr = (uint32_t)ctx->lr;
+    const uint32_t sp = (uint32_t)ctx->gpr[1];
+    const uint32_t up = sp ? vm_read32(sp + 4) : 0;       /* back chain (low word) */
+    const uint32_t lr2 = up ? vm_read32(up + 20) : 0;     /* LR save of that frame */
+    const uint32_t key = (id * 2654435761u) ^ (lr * 40503u) ^ (lr2 * 97u) ^
+                         ((uint32_t)ctx->thread_id << 24) ^ (uint32_t)op;
+    static volatile uint32_t seen[8192];
+    uint32_t h = (key * 2654435761u) >> 19;
+    for (uint32_t i = 0; i < 8192; i++, h = (h + 1) & 8191) {
+        uint32_t cur = seen[h];
+        if (cur == key) return;
+        if (cur == 0) {
+            cur = __sync_val_compare_and_swap(&seen[h], 0u, key);
+            if (cur == key) return;
+            if (cur != 0) continue;
+            extern unsigned long long ps3_ms_now(void);
+            fprintf(stderr, "[sem-lr] t=%llu %s sem=%u tid=%llu lr=0x%08X lr2=0x%08X%c", ps3_ms_now(),
+                    op == 'p' ? "post" : "wait", id, (unsigned long long)ctx->thread_id, lr, lr2, 10);
+            return;
+        }
+    }
+}
+
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    sem_lr_seen('w', ctx);
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (n++ < 12)
@@ -546,6 +580,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
+    sem_lr_seen('p', ctx);
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 

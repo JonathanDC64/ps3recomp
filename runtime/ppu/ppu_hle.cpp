@@ -261,6 +261,44 @@ static void hle_first_seen(uint32_t nid, const char* name, ppu_context* ctx)
     }
 }
 
+/* HLE_LR=<hex nid>[,<hex nid>...]: log each new (nid, caller) pair, with the
+ * thread and the caller's caller. HLE_FIRST names only the first caller of an
+ * import; a title that creates SPURS tasks from five places needs all five. */
+static void hle_lr_seen(uint32_t nid, const char* name, ppu_context* ctx)
+{
+    static int init = 0; static uint32_t want[16]; static int nwant = 0;
+    if (!init) { const char* e = getenv("HLE_LR");
+                 while (e && *e && nwant < 16) { char* end; want[nwant++] = (uint32_t)strtoul(e, &end, 16);
+                                                 e = (*end == ',') ? end + 1 : NULL; }
+                 init = 1; }
+    if (!nwant || !ctx) return;
+    int hit = 0;
+    for (int k = 0; k < nwant; k++) if (want[k] == nid) hit = 1;
+    if (!hit) return;
+    const uint32_t lr = (uint32_t)ctx->lr;
+    const uint32_t key = nid ^ (lr * 2654435761u);
+    static volatile uint32_t seen[1024];
+    uint32_t h = (key * 2654435761u) >> 22;
+    for (uint32_t i = 0; i < 1024; i++, h = (h + 1) & 1023) {
+        uint32_t cur = seen[h];
+        if (cur == key) return;
+        if (cur == 0) {
+            cur = __sync_val_compare_and_swap(&seen[h], 0u, key);
+            if (cur == key) return;
+            if (cur != 0) continue;
+            /* the caller's caller: the caller saved its LR in the frame above
+             * its own (back chain at sp+0, LR at +16; both 64-bit, low words) */
+            const uint32_t sp = (uint32_t)ctx->gpr[1];
+            const uint32_t up = sp ? vm_read32(sp + 4) : 0;
+            const uint32_t lr2 = up ? vm_read32(up + 20) : 0;
+            fprintf(stderr, "[hle-lr] t=%llu tid=%u nid=0x%08X %s lr=0x%08X lr2=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X%c",
+                    ps3_ms_now(), (unsigned)ctx->thread_id, nid, name ? name : "?", lr, lr2,
+                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], 10);
+            return;
+        }
+    }
+}
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -738,7 +776,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * "cellPadInit", which for a game that needs a guitar controller is
              * a very convincing wrong answer to chase. */
             g_last_hle_name = g_ctx[i].name;
-            hle_first_seen(nid, g_ctx[i].name, ctx);
+            hle_first_seen(nid, g_ctx[i].name, ctx); hle_lr_seen(nid, g_ctx[i].name, ctx);
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
             g_ctx[i].fn(ctx);
@@ -819,6 +857,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     g_last_hle_name = e->name;
     ps3_msf("hle:%s", e->name);
     hle_first_seen(nid, e->name, ctx);
+    hle_lr_seen(nid, e->name, ctx);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {

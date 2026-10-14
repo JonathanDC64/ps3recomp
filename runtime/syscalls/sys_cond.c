@@ -19,6 +19,24 @@ struct sys_cond_waiter {
 sys_cond_info g_sys_conds[SYS_COND_MAX];
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
 
+/* Sync history: a ring of the last 64K cond and mutex lifecycle events
+ * (create/destroy) and cond waits and signals, with the guest thread, the
+ * caller and the result. Always on -- one store per event -- and read by the
+ * debug console's `synchist <id>` verb, which answers "who created, signalled
+ * and destroyed the cond this thread is parked on" after the fact. Ids are
+ * recycled, so read a cond's history from its last create forward. */
+sync_hist_ent g_sync_hist[SYNC_HIST_N];
+volatile long g_sync_hist_n;
+extern unsigned long long ps3_ms_now(void);
+void sync_hist(char op, uint32_t id, const ppu_context* ctx, uint32_t extra, int32_t res)
+{
+    const long i = __sync_add_and_fetch(&g_sync_hist_n, 1) - 1;
+    sync_hist_ent* e = &g_sync_hist[(unsigned long)i & (SYNC_HIST_N - 1)];
+    e->t_ms = (uint32_t)ps3_ms_now(); e->op = (uint8_t)op; e->id = id;
+    e->tid = ctx ? (uint32_t)ctx->thread_id : 0; e->lr = ctx ? (uint32_t)ctx->lr : 0;
+    e->extra = extra; e->res = res;
+}
+
 #ifdef _WIN32
 static SRWLOCK s_table_lock = SRWLOCK_INIT;
 static void table_lock(void) { AcquireSRWLockExclusive(&s_table_lock); }
@@ -90,6 +108,7 @@ int64_t sys_cond_create(ppu_context* ctx)
             p[0] = (uint8_t)(id >> 24); p[1] = (uint8_t)(id >> 16);
             p[2] = (uint8_t)(id >> 8); p[3] = (uint8_t)id;
         }
+        sync_hist('C', i + 1, ctx, mid, (int32_t)out);
         if (getenv("PS3_SYNCLOG") || getenv("YDKJ_SYNCLOG")) {
             char name[9]; memcpy(name, c->name, 8); name[8] = 0;
             fprintf(stderr, "[SYNC] cond_create id=%u name='%s' mutex=%u id_at=0x%08X lr=0x%08X\n",
@@ -115,6 +134,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     else { c->active = 0; g_cond_id_addr[id] = 0; }
     cond_unlock(c);
     table_unlock();
+    sync_hist('D', id, ctx, 0, result);
     return result;
 }
 
@@ -152,6 +172,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
     }
+    sync_hist('W', LV2_ARG_U32(ctx, 0), ctx, c->mutex_id, 0);
     struct sys_cond_waiter waiter = {NULL, 0};
     struct sys_cond_waiter** tail = &c->waiters;
     while (*tail) tail = &(*tail)->next;
@@ -221,6 +242,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    sync_hist('w', LV2_ARG_U32(ctx, 0), ctx, c->mutex_id, result);
     return result;
 }
 
@@ -262,6 +284,11 @@ static int64_t signal_cond(uint32_t id, int all)
 static int64_t signal_cond_traced(ppu_context* ctx, int all)
 {
     uint32_t id = LV2_ARG_U32(ctx, 0);
+    { int waiting = 0;
+      sys_cond_info* c = acquire_cond(id);
+      if (c) { for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) waiting += !w->signalled;
+               cond_unlock(c); }
+      sync_hist(all ? 'A' : 'S', id, ctx, (uint32_t)waiting, c ? 0 : (int32_t)CELL_ESRCH); }
     if (cond_traced(id)) {
         int waiting = 0;
         sys_cond_info* c = acquire_cond(id);
