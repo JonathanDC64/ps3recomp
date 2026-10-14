@@ -106,6 +106,11 @@ static volatile int s_flip_pending = 0;
 
 static void rcap_flip_boundary(void);
 
+/* Set by a present backend that wants the frame boundary where the title put
+ * it: called on the drain thread when the walker reaches a flip in the
+ * command stream, after everything queued before it. */
+void (*g_gcm_fifo_flip_hook)(void) = NULL;
+
 int cellGcm_take_flip_pending(void)
 {
     int v = s_flip_pending;
@@ -1803,6 +1808,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
+            if (g_gcm_fifo_flip_hook) g_gcm_fifo_flip_hook();
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -2595,10 +2601,31 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
 {
     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
         !s_display_buffer_set[bufferId]) return 0;
-    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+    /* Out of room: ask the title's callback (ctx+0xC) for more, as libgcm's
+     * flip does (RPCS3 gcmSetPrepareFlip: current + 2 words >= end calls it
+     * with 8, then writes the flip at current whatever it did).
+     * GCM_FLIP_CALLBACK=0 skips the call and the past-end case below. */
+    static int cb_on = -1;
+    PS3_KNOB(cb_on, ps3_env_int("GCM_FLIP_CALLBACK", 1));
+    { const u32 cb = vm_read32(ctx + 0xC);
+      if (cb_on && cb && cur + 8 >= end && g_ps3_guest_caller) {
+          g_ps3_guest_caller(cb, ctx, 8, 0, 0, 0, 0, 0, 0);
+          end = vm_read32(ctx + 4); cur = vm_read32(ctx + 8);
+      } }
+    if (gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+    /* Already past end: the title runs its command buffer itself and `end`
+     * means nothing. Demon's Souls: a 32 KB ring at begin, frames written on
+     * past it, a callback that only returns 0. Refusing here sent all its
+     * flips down the immediate path, which is not ordered with the FIFO, so
+     * the backend had to guess where each frame ended (half-drawn frames,
+     * without the HUD or the post chain, whenever the game hitched). libgcm
+     * writes its 8-byte flip command there, so the title has room for our
+     * 4-byte marker. */
+    const int past_end = cb_on && cur >= end;
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
-    if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+    if (!past_end && cur + 8 + GCM_RECYCLE_SLACK > end) return 0;
     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
@@ -2617,7 +2644,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * then replayed `begin`..JUMP, and label 255 stopped (logos frozen on
      * Havok: flip-wrap at get=0x005FF6A4, then get stuck at the JUMP). */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin), io_cur = gcm_ea2io(cur);
-    if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    if (!past_end && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN && s_fifo_getoff <= io_cur) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);

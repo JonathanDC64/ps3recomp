@@ -6449,9 +6449,48 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     }
 }
 
+/* Frames end at the title's flips once the command stream carries them
+ * (cellGcmSys calls d3d12_fifo_flip when the walker reaches one), which is
+ * where the RSX ends a frame. Until then -- and for a title that flips
+ * outside the stream, or with RSX_PRESENT_AT_FLIP=0 -- display clears are
+ * the boundary, with the heuristics in d3d12_clear_display. Those depended
+ * on when the PPU's immediate flip landed relative to the walker: whenever
+ * Demon's Souls hitched, a frame went out without its post chain and HUD. */
+static int s_fifo_flip_present;
+
+static int present_at_flip_on(void)
+{
+    static int v = -1;
+    PS3_KNOB(v, ps3_env_int("RSX_PRESENT_AT_FLIP", 1));
+    return v;
+}
+
+static void d3d12_fifo_flip(void)
+{
+    if (!present_at_flip_on() || !s_d3d.initialized) { s_fifo_flip_present = 0; return; }
+    s_fifo_flip_present = 1;
+    /* Same display gate as the other presents: offscreen pass work alone
+     * keeps accumulating until its composite arrives. */
+    int has_display = 0;
+    for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
+        if (!s_d3d.draws[i].is_clear && s_d3d.draws[i].rt_off == 0) { has_display = 1; break; }
+    if (!has_display) { s_pc_flip_nodisp++; return; }
+    if (blink_dbg())
+        printf("[FLIP] presenting %u draws at the title's flip%c", s_d3d.draw_count, 10);
+    render_frame();
+    s_pc_flip_render++;
+    s_clear_presents++;   /* framed presents are on: the ticker stays out */
+    { extern void cellGcm_rcap_cut(void); cellGcm_rcap_cut(); }
+    s_dbg_clears_since_present = 0;
+    s_d3d.draw_count   = 0;
+    s_d3d.vb_offset    = 0;
+    s_d3d.vp_vb_offset = 0;
+}
+
 static void d3d12_clear_display(const float cc[4])
 {
     memcpy(s_d3d.clear_color, cc, 4 * sizeof(float));
+    if (s_fifo_flip_present && present_at_flip_on()) return;   /* the flip ends the frame */
 
     /* A DISPLAY clear marks the start of a new visible frame. If a completed
      * frame is still accumulated (the drain gulped across a frame boundary --
@@ -8035,6 +8074,7 @@ static rsx_backend s_d3d12_backend = {0};
 
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
+    { extern void (*g_gcm_fifo_flip_hook)(void); g_gcm_fifo_flip_hook = d3d12_fifo_flip; }
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;
