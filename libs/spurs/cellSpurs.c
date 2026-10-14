@@ -850,6 +850,9 @@ uint32_t spurs_hle_connect_port_mask(uint32_t queue, uint64_t mask, uint8_t* por
 uint32_t spurs_hle_disconnect_port(uint32_t port)
 {
     if (port >= 64 || !s_spurs_port_queue[port]) return CELL_ENOTCONN;
+    if (getenv("SPU_EVT_TRACE"))
+        printf("[cellSpurs] lv2 disconnect_event_all_threads on HLE SPURS: port=%u (queue=%u)\n",
+               port, s_spurs_port_queue[port]);
     s_spurs_port_queue[port] = 0;
     return CELL_OK;
 }

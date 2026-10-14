@@ -538,6 +538,31 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
         }
     }
+    /* SPU_GET_LOG=<img>:<size>[,<img>:<size>...]: log every GET an image
+     * makes of that size (0 = any size) with its first 32 bytes. A task's
+     * job descriptor is one fixed-size GET at entry, so this shows what each
+     * dispatch was asked to do across frames. Uncapped; pick a narrow spec. */
+    if (mfc_is_get(cmd) && size && vm_base) {
+        static int s_gl_n = -1; static int s_gl_img[8]; static uint32_t s_gl_sz[8];
+        if (s_gl_n < 0) { s_gl_n = 0; const char* e = getenv("SPU_GET_LOG");
+            while (e && *e && s_gl_n < 8) { char* q;
+                s_gl_img[s_gl_n] = (int)strtol(e, &q, 0);
+                s_gl_sz[s_gl_n] = (*q == ':') ? (uint32_t)strtoul(q + 1, &q, 0) : 0;
+                s_gl_n++; e = (*q == ',') ? q + 1 : NULL; } }
+        for (int i = 0; i < s_gl_n; i++)
+            if (spu->image_id == s_gl_img[i] && (!s_gl_sz[i] || size == s_gl_sz[i])) {
+                extern unsigned long long ps3_ms_now(void);
+                const uint8_t* q = vm_base + (uint32_t)ea;
+                uint32_t n = size < 32 ? size : 32;
+                fprintf(stderr, "[get-log] t=%llu img%d pc=0x%05X ea=0x%08X size=%u:",
+                        ps3_ms_now(), spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
+                        (uint32_t)ea, size);
+                for (uint32_t o = 0; o + 4 <= n; o += 4)
+                    fprintf(stderr, " %02X%02X%02X%02X", q[o], q[o+1], q[o+2], q[o+3]);
+                fputc('\n', stderr); fflush(stderr);
+                break;
+            }
+    }
     /* The DSP descriptor arrives as a 368-byte GET shortly before the section
      * load; remember where it came from so the substitution below can name it.
      * That guest address is what a write-watch needs to find its producer. */

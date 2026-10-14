@@ -1649,9 +1649,11 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (n++ < 16)
-            fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
-                    code & 63, spu->image_id, value); }
+        /* Per port: one noisy port must not hide the first drop on another. */
+        if (code < 128) { static unsigned n[64]; unsigned k = n[code & 63]++;
+            if (k < 4 || (k & (k - 1)) == 0)
+                fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X, drop #%u)\n",
+                        code & 63, spu->image_id, value, k + 1); }
         return 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
