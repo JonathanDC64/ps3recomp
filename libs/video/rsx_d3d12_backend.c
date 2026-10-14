@@ -3269,6 +3269,27 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
                 rsx_fp_extract_consts(vm_base + foff, 4096, &ts[FPCB_K * 4], FPCB_KMAX);
+            /* FPK_FP=<hex fp_addr>: that program's constants, each time they
+             * change (capped). Shows whether the title's per-material patches
+             * reach the draw, for one surface at a time. */
+            { static const char* e = (const char*)1; static u32 want = 0;
+              static float last[FPCB_KMAX * 4]; static int nk = 0, np = 0;
+              if (e == (const char*)1) { e = getenv("FPK_FP");
+                                         want = e ? (u32)strtoul(e, NULL, 16) : 0; }
+              if (want && dr->fp_addr == want && np < 40 && vm_base && foff != 0xFFFFFFFFu) {
+                  const float* k = &ts[FPCB_K * 4];
+                  int cnt = 0;
+                  for (int q = FPCB_KMAX - 1; q >= 0; q--)
+                      if (k[q*4] || k[q*4+1] || k[q*4+2] || k[q*4+3]) { cnt = q + 1; break; }
+                  if (cnt != nk || memcmp(last, k, sizeof(float) * 4 * (size_t)cnt)) {
+                      np++; nk = cnt; memcpy(last, k, sizeof(float) * 4 * (size_t)cnt);
+                      fprintf(stderr, "[FPK_FP] fp=0x%X tex0=0x%X n=%u:", dr->fp_addr,
+                              dr->tex[0].raw, dr->vertex_count);
+                      for (int q = 0; q < cnt; q++)
+                          fprintf(stderr, " k%d=(%g,%g,%g,%g)", q, k[q*4], k[q*4+1], k[q*4+2], k[q*4+3]);
+                      fputc(10, stderr);
+                  }
+              } }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
@@ -4174,10 +4195,10 @@ static void render_frame(void)
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
             D3D12DrawRecord* r = &s_d3d.draws[_d];
-            fprintf(stderr, "[RTT]  op%02u %s rt=0x%X mrt=0x%X/0x%X/0x%X t0=0x%X fp=0x%X n=%u cmask=%X vp=%u,%u %ux%u blend=%d\n",
+            fprintf(stderr, "[RTT]  op%02u %s rt=0x%X mrt=0x%X/0x%X/0x%X t0=0x%X fp=0x%X%s n=%u cmask=%X vp=%u,%u %ux%u blend=%d\n",
                 _d, r->is_clear?"CLR ":(r->is_vp?"draw":"leg "), r->rt_off,
                 r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
-                r->tex[0].raw, r->fp_addr, r->vertex_count,
+                r->tex[0].raw, r->fp_addr, r->fp_exp32 ? "" : "/h", r->vertex_count,
                 r->cmask, r->vp_x, r->vp_y, r->vp_w, r->vp_h, r->blend);
         }
     } }
@@ -5048,6 +5069,29 @@ rtt_dump_done:;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
 
+    /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
+     * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program
+     * compiles once. When any of them changes (the console's setenv), bump the
+     * pipeline generation so every program rebuilds with the new value: one
+     * live run can then look at register after register. */
+    { static char last[512] = ""; static int init = 0;
+      static const char* const knobs[] = { "FP_SHOW", "FP_TEX", "FP_ONE", "FP_KILL",
+                                           "FP_IDCOLOR", "FP_TEX_FP" };
+      char cur[512]; size_t at = 0;
+      cur[0] = 0;
+      for (int k = 0; k < 6; k++) {
+          const char* v = getenv(knobs[k]);
+          int w = snprintf(cur + at, sizeof cur - at, "%s=%s;", knobs[k], v ? v : "");
+          if (w > 0 && (size_t)w < sizeof cur - at) at += (size_t)w;
+      }
+      if (init && strcmp(cur, last)) {
+          s_d3d.vp_gen++;
+          fprintf(stderr, "[FP] debug knobs changed (%s): rebuilding pipelines%c", cur, 10);
+      }
+      init = 1;
+      memcpy(last, cur, sizeof last);
+    }
+
     /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
      * into a readback buffer this frame and writes rt_save_<offset>.bmp
      * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
@@ -5767,8 +5811,23 @@ static void vp_attrs_dbg(const rsx_state* state)
      * happens to start with, which is never the mesh being investigated. */
     { static const char* e = (const char*)1; static u32 want = 0;
       if (e == (const char*)1) { e = getenv("VP_ATTRS_FP");
-          want = e ? (u32)strtoul(e, NULL, 0) : 0; }
-      if (want && (!state || state->shader_program != want)) return; }
+          want = e ? (u32)strtoul(e, NULL, 16) : 0; }   /* hex, like FP_PICK */
+      if (want && (!state || state->shader_program != want)) return;
+      /* With a program picked, also write the vertex program its first draw
+       * runs (vp_pick.hlsl): the attribute list says what is fed, this says
+       * what is read and how the outputs are formed. */
+      static int wrote = 0;
+      if (want && !wrote && state->vp_ucode_bytes >= 16) {
+          extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+          static char vh[262144];
+          u32 vs0 = state->transform_program_start * 16u;
+          if (vs0 >= state->vp_ucode_bytes) vs0 = 0;
+          const int ni = rsx_vp_decompile(state->vp_ucode + vs0, state->vp_ucode_bytes - vs0,
+                                          vh, sizeof vh);
+          FILE* f = ni > 0 ? fopen("vp_pick.hlsl", "w") : NULL;
+          if (f) { fprintf(f, "/* fp=0x%X start=%u */\n%s", want, vs0 / 16u, vh); fclose(f); }
+          wrote = 1;
+      } }
     /* VP_CONSTS=<i,j,...>: print those vertex constants whenever their values
      * change (capped). A VS that derives colour purely from constants renders
      * black if the guest's uploads never landed, which the attrib dump can't show. */
@@ -5992,6 +6051,7 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
@@ -6036,6 +6096,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
     u32 quads = count / 4;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (quads * 6 > maxv) quads = maxv / 6;
@@ -6309,6 +6370,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    vp_attrs_dbg(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
