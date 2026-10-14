@@ -36,6 +36,7 @@
 #endif
 
 #if PAD_BACKEND_XINPUT
+  #include "pad_hid_sony.h"
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
@@ -83,6 +84,22 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
+/* Pressure values for hosts with digital buttons: 0 or 255. */
+static void pad_press_from_buttons(PadHostState* hs)
+{
+    const u16 btns = hs->buttons;
+    hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+    hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+    hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+    hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+    hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+    hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+    hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+    hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+    hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+}
+
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
@@ -122,8 +139,10 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * it can be watched but not played. That is what The Simpsons Arcade Game hit:
  * it reached its attract loop and no input existed to start a game.
  *
- * Only fills in for port 0, only when XInput found nothing there, so a real
- * controller always wins and nothing changes for a port that has one. Keys are
+ * Drives port 0. With no pad there it stands in for one; with a pad there
+ * (XInput, or a Sony pad over HID) it is merged in -- keys OR into the
+ * buttons, and the arrows take over the left stick only while held -- so
+ * the keyboard keeps working with a controller plugged in. Keys are
  * read only while a window of THIS process is in the foreground, so typing in
  * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
  * disable it entirely.
@@ -148,13 +167,18 @@ static void pad_poll_keyboard(void)
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
+    const int pad = hs->connected;   /* a real pad on port 0: merge into it */
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
-        hs->buttons = 0;
-        hs->analog_lx = hs->analog_ly = 128;
-        hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
+        if (!pad) {
+            hs->buttons = 0;
+            hs->analog_lx = hs->analog_ly = 128;
+            hs->analog_rx = hs->analog_ry = 128;
+            hs->trigger_l2 = hs->trigger_r2 = 0;
+            pad_press_from_buttons(hs);
+            hs->connected = 1;
+        }
         return;
     }
 
@@ -172,19 +196,30 @@ static void pad_poll_keyboard(void)
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
         if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
 
-    hs->buttons   = btns;
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    if (!pad) {
+        hs->buttons   = btns;
+        hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+                             (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+        hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+                             (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+        hs->analog_rx = hs->analog_ry = 128;
+        hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+        hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    } else if (btns) {
+        hs->buttons |= btns;
+        if (btns & (CELL_PAD_CTRL_LEFT | CELL_PAD_CTRL_RIGHT))
+            hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 : 255);
+        if (btns & (CELL_PAD_CTRL_UP | CELL_PAD_CTRL_DOWN))
+            hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 : 255);
+        if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+        if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+    }
+    pad_press_from_buttons(hs);
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          printf("[cellPad] keyboard input on port 0 (%s)\n", pad ? "merged with the pad" : "no pad");
           fflush(stdout); } }
 }
 #endif
@@ -239,16 +274,26 @@ static void pad_poll_xinput(void)
         s_host_state[i].trigger_r2 = gp->bRightTrigger;
 
         /* Pressure-sensitive buttons: XInput has digital only, so 0 or 255 */
-        s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
-        s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
-        s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
-        s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
-        s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
-        s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
-        s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
-        s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
-        s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
-        s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        pad_press_from_buttons(&s_host_state[i]);
+    }
+}
+
+/* Sony pads over HID (pad_hid_sony.c) take the host ports XInput left
+ * empty, in connection order. */
+static void pad_poll_hid(void)
+{
+    PadHidSonyState hid[PAD_HID_SONY_MAX];
+    const int n = pad_hid_sony_poll(hid, PAD_HID_SONY_MAX);
+    for (int k = 0, i = 0; k < n; k++) {
+        while (i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) i++;
+        if (i >= PAD_MAX_HOST_PORTS) break;
+        PadHostState* hs = &s_host_state[i];
+        hs->connected  = 1;
+        hs->buttons    = hid[k].buttons;
+        hs->analog_lx  = hid[k].lx; hs->analog_ly = hid[k].ly;
+        hs->analog_rx  = hid[k].rx; hs->analog_ry = hid[k].ry;
+        hs->trigger_l2 = hid[k].l2; hs->trigger_r2 = hid[k].r2;
+        pad_press_from_buttons(hs);
     }
 }
 
@@ -437,11 +482,12 @@ static void pad_poll_backend(void)
 
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
+    pad_poll_hid();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_poll_keyboard();
 #endif
 }
 
