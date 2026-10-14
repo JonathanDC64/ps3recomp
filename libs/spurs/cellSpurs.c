@@ -905,6 +905,8 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     spurs_taskset_init(taskset_ea, spurs_ea, args, /*wid*/0,
                        (uint32_t)sizeof(CellSpursTaskset), /*evf1*/0, /*evf2*/0);
     g_ydkj_real_taskset_ea = taskset_ea;
+    /* Known from now on, so tasks an SPU adds to it start (spu_workload.c). */
+    { extern void spu_taskset_created(uint32_t); spu_taskset_created(taskset_ea); }
 
     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
@@ -1149,11 +1151,17 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz)
+                if (sz) {
+                    /* Running from now, not from when its thread starts (see
+                     * spu_taskset_mark_running). */
+                    extern void spu_taskset_mark_running(uint32_t, uint32_t, int);
+                    spu_taskset_mark_running(taskset_ea, i, 1);
                     /* Async: SPURS tasks are persistent workers — running them
                      * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                    if (!spu_workload_dispatch_async(host_elf, (uint32_t)sz,
+                                                     (uint32_t)(uintptr_t)context))
+                        spu_taskset_mark_running(taskset_ea, i, 0);
+                }
             }
             return CELL_OK;
         }

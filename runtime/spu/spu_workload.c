@@ -370,7 +370,7 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
  * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
-#define TS_TRACK 8
+#define TS_TRACK 32
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
 static volatile LONG s_ts_lock;
 static uint8_t* ts_running(uint32_t taskset_ea)
@@ -482,10 +482,33 @@ int spu_taskset_job_stale(void)
     return t_job_ts && spu_taskset_gen(t_job_ts) != t_job_gen;
 }
 
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+/* Start task `t` of a taskset from its task_info ELF (ts_lock held). */
+static void ts_start_task_locked(uint32_t taskset_ea, uint8_t* ts, uint8_t* run,
+                                 uint32_t t, const char* why)
 {
     extern uint8_t* vm_base;
     extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+    const uint8_t m = (uint8_t)(0x80u >> (t & 7));
+    const uint8_t* ti = ts + 0x80 + 0x30 * t;
+    uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
+                   ((uint32_t)ti[0x16] << 8) | ti[0x17];
+    uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
+                   ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
+    if (!elf) return;
+    size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
+    if (!sz) return;
+    ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
+    run[t / 8] |= m;
+    if (ps3_log_verbose()) fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X (%s)\n",
+                                   t, taskset_ea, elf, why);
+    g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
+    spu_workload_set_dispatch_task(taskset_ea, t);
+    spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+}
+
+static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+{
+    extern uint8_t* vm_base;
     if (spu_taskset_job_stale()) return;   /* its taskset is gone: start nothing */
     ts_lock();
     uint8_t* ts = vm_base + taskset_ea;
@@ -501,21 +524,60 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         uint8_t m = (uint8_t)(0x80u >> (t & 7));
         if (!(ts[0x30 + t / 8] & m) || (run[t / 8] & m)) continue;
         if (!((ts[0x10 + t / 8] | ts[0x20 + t / 8]) & m)) continue;
-        const uint8_t* ti = ts + 0x80 + 0x30 * t;
-        uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
-                       ((uint32_t)ti[0x16] << 8) | ti[0x17];
-        uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
-                       ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
-        if (!elf) continue;
-        size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
-        if (!sz) continue;
-        ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
-        run[t / 8] |= m;
-        if (ps3_log_verbose()) fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_set_dispatch_task(taskset_ea, t);
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
+        ts_start_task_locked(taskset_ea, ts, run, t, "after a task exited");
+    }
+    ts_unlock();
+}
+
+/* cellSpursCreateTask dispatches its task itself. Mark it running HERE, before
+ * its thread exists: the thread marks itself only once it starts, and a task
+ * of the same taskset exiting in between started every ready task not yet
+ * marked -- this one a second time. Under load that repeats (Havok's taskset
+ * reached 1009 task threads for 128 ids). */
+void spu_taskset_mark_running(uint32_t taskset_ea, uint32_t taskid, int on)
+{
+    spu_taskset_mark(taskset_ea, taskid, on);
+}
+
+/* Make a taskset known before any of its tasks has run, so an SPU's write to
+ * its header is recognised (spu_taskset_line_written). cellSpursCreateTaskset. */
+void spu_taskset_created(uint32_t taskset_ea)
+{
+    if (!taskset_ea) return;
+    ts_lock();
+    (void)ts_running(taskset_ea);
+    ts_unlock();
+}
+
+/* Tasks an SPU creates. SPU code can add a task to a taskset itself: Demon's
+ * Souls' images 3 and 4 set a task's enabled bit and then its pending_ready bit
+ * with two PUTLLCs on the taskset header -- what the PPU's cellSpursCreateTask
+ * plus task start do. On hardware the taskset policy module then schedules it.
+ * Nothing here did: pending tasks were started only when another task of the
+ * same taskset exited, so these never ran, never exited, and held their ids
+ * until every one of the 128 was taken ("no free task id").
+ *
+ * Called (from spu_taskset_line_committed) after a committed SPU lock-line
+ * write. If the line is a known
+ * taskset's header (the bitsets live in its first 128 bytes), start every
+ * enabled task that is pending_ready and not running. Only PENDING tasks: a
+ * ready one came from our PPU-side CreateTask, which dispatched it already. */
+static void spu_taskset_line_written(uint32_t line_ea)
+{
+    extern uint8_t* vm_base;
+    int known = 0;
+    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == line_ea) { known = 1; break; }
+    if (!known || !vm_base) return;
+    uint8_t* ts = vm_base + line_ea;
+    uint64_t p[2];
+    memcpy(p, ts + 0x20, 16);
+    if (!(p[0] | p[1])) return;
+    ts_lock();
+    uint8_t* run = ts_running(line_ea);
+    for (uint32_t t = 0; t < 128 && run; t++) {
+        uint8_t m = (uint8_t)(0x80u >> (t & 7));
+        if (!(ts[0x30 + t / 8] & m) || !(ts[0x20 + t / 8] & m) || (run[t / 8] & m)) continue;
+        ts_start_task_locked(line_ea, ts, run, t, "an SPU set it pending");
     }
     ts_unlock();
 }
@@ -1273,6 +1335,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * re-checks. */
 void spu_taskset_line_committed(uint32_t line)
 {
+    spu_taskset_line_written(line);
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
