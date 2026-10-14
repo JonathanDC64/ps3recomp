@@ -327,6 +327,46 @@ int main(void)
         check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
     }
 
+    /* Source precision modifiers (SRC1 word bits 19-27) and the COL0/COL1
+     * clamp. Demon's Souls's fog ramp: MUL h1.w, h1 (saturated), c. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x02) | (1u<<12) | OUTREG(1) | OUTHALF | END); /* MUL h1.w */
+        put_word(prog + 4, T_TEMP | REG(1) | (1u<<8) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(2) | SWZ_IDENT | (4u << 19));        /* src0 sat */
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src0_prec_sat", hlsl, "saturate((h[1]).xyzw)) * ((r[2]).xyzw)");
+    }
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x03) | OUTMASK_ALL | END);                   /* ADD r0 */
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u<<17) | EXEC_ALWAYS); /* -r1 */
+        put_word(prog + 8, T_TEMP | REG(2) | SWZ_IDENT | (1u<<18) | (2u << 19) | (3u << 22));
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("src0_prec_fx12_neg_last", hlsl, "-(clamp((r[1]).xyzw, -2.0, 2.0))");
+        check("src1_abs_then_fx9", hlsl, "clamp(abs((r[2]).xyzw), -1.0, 1.0)");
+    }
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(2) | END);        /* MOV r0, COL1 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("col1_saturated", hlsl, "saturate((input.col1).xyzw)");
+    }
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x02) | OUTMASK_ALL | (2u << 22) | END);      /* MUL fx12 */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("dst_fx12_clamp", hlsl, "_v = clamp(_v, -2.0, 2.0);");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

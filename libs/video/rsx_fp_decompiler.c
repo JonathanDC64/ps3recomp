@@ -43,6 +43,15 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
+#define FP_SRC2_ABS         (1u << 18) /* in DWORD3 */
+/* Per-source precision modifiers, all three in DWORD2 (RPCS3 SRC1
+ * src0_prec_mod/src1_prec_mod/src2_prec_mod), and the destination's precision
+ * in DWORD0 bits 22-23. Values: 0 fp32, 1 fp16, 2 fx12 [-2,2], 3 fx9 [-1,1],
+ * 4 saturate [0,1]. */
+#define FP_SRC0_PREC_SHIFT  19
+#define FP_SRC1_PREC_SHIFT  22
+#define FP_SRC2_PREC_SHIFT  25
+#define FP_OUT_PREC_SHIFT   22
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
@@ -310,10 +319,11 @@ typedef struct {
     int half;
     int negate;
     int abs;
+    u32 prec;       /* precision modifier, FP_SRCn_PREC_SHIFT */
     char swz[5];    /* e.g. "xyzw" */
 } Src;
 
-static void decode_src(u32 w, int abs_bit, Src* s)
+static void decode_src(u32 w, int abs_bit, u32 prec, Src* s)
 {
     static const char comp[4] = {'x','y','z','w'};
     s->type   = (w & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT;
@@ -321,6 +331,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     s->half   = (w & FP_SRC_HALF) ? 1 : 0;
     s->negate = (w & FP_SRC_NEGATE) ? 1 : 0;
     s->abs    = abs_bit ? 1 : 0;
+    s->prec   = prec & 7u;
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
@@ -379,14 +390,27 @@ static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
             snprintf(base, sizeof(base), "float4(0,0,0,0)");
     }
 
-    char swz[160];
-    snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
+    char x[256], t[256];
+    snprintf(x, sizeof(x), "(%s).%s", base, s->swz);
 
-    const char* pre = "";
-    const char* post = "";
-    if (s->abs)    { pre = "abs("; post = ")"; }
-    if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
-    else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
+    /* Modifiers in RPCS3's order (FragmentProgramDecompiler::GetSRC): a
+     * saturate clamps before abs, the other precisions after it, and the
+     * negate comes last. Reads of COL0/COL1 are clamped to [0,1] by the
+     * hardware. Demon's Souls's level shaders saturate their fog ramp this
+     * way (`MUL h1.w, h1_sat, c`); without it far surfaces blended past the
+     * fog colour into black. fp16 (1) is not modelled: these registers are
+     * fp32 here. */
+    u32 prec = s->prec;
+    if (s->type == FP_REG_TYPE_INPUT && (input_src == 0x1 || input_src == 0x2)) {
+        snprintf(t, sizeof(t), "saturate(%s)", x); memcpy(x, t, sizeof(x));
+        prec = 0;
+    }
+    if (prec == 4) { snprintf(t, sizeof(t), "saturate(%s)", x); memcpy(x, t, sizeof(x)); }
+    if (s->abs)    { snprintf(t, sizeof(t), "abs(%s)", x);      memcpy(x, t, sizeof(x)); }
+    if (prec == 2) { snprintf(t, sizeof(t), "clamp(%s, -2.0, 2.0)", x); memcpy(x, t, sizeof(x)); }
+    if (prec == 3) { snprintf(t, sizeof(t), "clamp(%s, -1.0, 1.0)", x); memcpy(x, t, sizeof(x)); }
+    if (s->negate) snprintf(buf, bufsz, "-(%s)", x);
+    else           snprintf(buf, bufsz, "%s", x);
 }
 
 /* Dest write-mask letters from OPDEST bits 9..12 (X..W). */
@@ -532,9 +556,9 @@ static int rsx_fp_decompile_internal(
         else                         cmp_op = "==";  /* exec_eq only */
 
         Src s0, s1, s2;
-        decode_src(w1, w1 & FP_SRC0_ABS, &s0);
-        decode_src(w2, w2 & FP_SRC1_ABS, &s1);
-        decode_src(w3, 0,                &s2);
+        decode_src(w1, w1 & FP_SRC0_ABS, w2 >> FP_SRC0_PREC_SHIFT, &s0);
+        decode_src(w2, w2 & FP_SRC1_ABS, w2 >> FP_SRC1_PREC_SHIFT, &s1);
+        decode_src(w3, w3 & FP_SRC2_ABS, w2 >> FP_SRC2_PREC_SHIFT, &s2);
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -553,7 +577,7 @@ static int rsx_fp_decompile_internal(
             has_k = 1;
         }
 
-        char a[200], b[200], c[200];
+        char a[288], b[288], c[288];
         emit_src(
             &s0, input_src, k, has_k, buffered, constant_slot,
             a, sizeof(a));
@@ -624,7 +648,7 @@ static int rsx_fp_decompile_internal(
         }
 
         /* Build the RHS expression for this opcode. */
-        char rhs[640];
+        char rhs[1024];
         int handled = 1;
         switch (opcode) {
         case OP_NOP: rhs[0] = '\0'; handled = 0; break;
@@ -761,6 +785,20 @@ static int rsx_fp_decompile_internal(
             dest_mask(w0, m);
 
             const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+            /* Without saturate, an fx12/fx9 destination clamps the result,
+             * except for the opcodes RPCS3 exempts (SetDst) and a MOV between
+             * fp16 temporaries. */
+            if (!(w0 & FP_OUT_SAT)) {
+                const u32 dprec = (w0 >> FP_OUT_PREC_SHIFT) & 3u;
+                int exempt = opcode == OP_NRM || opcode == OP_MAX || opcode == OP_MIN ||
+                             opcode == OP_COS || opcode == OP_SIN || opcode == OP_RFL ||
+                             opcode == OP_FRC || opcode == OP_LIT || opcode == OP_LIF ||
+                             opcode == OP_LG2;
+                if (opcode == OP_MOV && dst_half && s0.half && s0.type == FP_REG_TYPE_TEMP)
+                    exempt = 1;
+                if (!exempt && dprec == 2) sat = " _v = clamp(_v, -2.0, 2.0);";
+                if (!exempt && dprec == 3) sat = " _v = clamp(_v, -1.0, 1.0);";
+            }
             /* NV40 per-instruction result-scale modifier (SRC1 word bits
              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
              * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
@@ -780,14 +818,14 @@ static int rsx_fp_decompile_internal(
             if (has_dest && is_uncond && !set_cond) {
                 /* Common unconditional path — kept byte-identical so the 39
                  * non-predicated programs in this capture emit unchanged. */
-                char line[800];
+                char line[1280];
                 snprintf(line, sizeof(line),
                          "    { float4 _v = (float4)(%s)%s;%s %s[%u].%s = _v.%s; }\n",
                          rhs, scale_txt[res_scale], sat, reg, dst_idx, m, m);
                 out_puts(&o, line);
             } else {
                 /* Predicated and/or CC-writing instruction. */
-                char buf[1200];
+                char buf[1600];
                 snprintf(buf, sizeof(buf),
                          "    { float4 _v = (float4)(%s)%s;%s\n",
                          rhs, scale_txt[res_scale], sat);
