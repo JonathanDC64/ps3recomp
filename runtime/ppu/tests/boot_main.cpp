@@ -538,7 +538,16 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
-            if (rsx_pump_messages() != 0) { rsx_ok = 0; }
+            /* The player closed the window: that is quitting the game. Only
+             * stopping the presents left the title running headless, a
+             * process with no window that never ended. Terminate rather than
+             * ExitProcess: guest threads are still running and may hold CRT
+             * locks the DLL-detach path would wait on. */
+            if (rsx_pump_messages() != 0) {
+                printf("[boot] window closed -- exiting%c", 10);
+                fflush(stdout); fflush(stderr);
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
                 s_pf += fired; s_pres++;
