@@ -28,10 +28,15 @@ extern "C" {
 #define CELL_ATRAC_ERROR_DECODER_WAS_CREATED   0x80610323
 #define CELL_ATRAC_ERROR_ALLDATA_WAS_DECODED   0x80610331
 #define CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY   0x80610341
+#define CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG   0x80610342
+#define CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER  0x80610351
 #define CELL_ATRAC_ERROR_UNSET_LOOP_NUM        0x80610361
 #define CELL_ATRAC_ERROR_ILLEGAL_SAMPLE        0x80610371
+#define CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE    0x80610372
 
-#define CELL_ATRAC_ALLDATA_IS_ON_MEMORY  (-1)
+#define CELL_ATRAC_ALLDATA_IS_ON_MEMORY              (-1)
+#define CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY  (-2)
+#define CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY     (-3)
 
 s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte,
                                   u32 uiBufferByte, u32 puiWorkMemByte);
@@ -53,6 +58,15 @@ s32 cellAtracGetBitrate(u32 pHandle, u32 puiBitrate);
 s32 cellAtracGetLoopInfo(u32 pHandle, u32 piLoopNum, u32 puiLoopStatus);
 s32 cellAtracSetLoopNum(u32 pHandle, s32 iLoopNum);
 s32 cellAtracResetPlayPosition(u32 pHandle, u32 uiSample, u32 uiWriteByte);
+s32 cellAtracGetStreamDataInfo(u32 pHandle, u32 ppucWritePointer, u32 puiWritableByte,
+                               u32 puiReadPosition);
+s32 cellAtracAddStreamData(u32 pHandle, u32 uiAddByte);
+s32 cellAtracGetVacantSize(u32 pHandle, u32 puiVacantSize);
+s32 cellAtracIsSecondBufferNeeded(u32 pHandle);
+s32 cellAtracGetSecondBufferInfo(u32 pHandle, u32 puiReadPosition, u32 puiDataByte);
+s32 cellAtracSetSecondBuffer(u32 pHandle, u32 pucSecondBufferAddr, u32 uiSecondBufferByte);
+s32 cellAtracGetBufferInfoForResetting(u32 pHandle, u32 uiSample, u32 pBufferInfo);
+s32 cellAtracGetInternalErrorInfo(u32 pHandle, u32 piResult);
 
 #ifdef __cplusplus
 }

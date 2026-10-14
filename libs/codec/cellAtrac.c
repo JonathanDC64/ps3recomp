@@ -14,16 +14,28 @@
  * Game's three tracks: first + fact[0] lands exactly on the last frame
  * boundary of the data chunk, and each loop spans the whole track.
  *
- * ponytail: no streaming (GetStreamDataInfo/AddStreamData/second buffer) and
- * no plain ATRAC3 -- nothing that runs needs them yet. A title that streams
- * gets a loud log line from SetDataAndGetMemSize; add the ring-buffer
- * bookkeeping then (PPSSPP's sceAtrac is the model).
+ * Streaming. A title that does not fit the whole file in its buffer hands
+ * over the first part (uiReadByte of a uiBufferByte ring) and then refills:
+ * GetStreamDataInfo says where in the ring to write, how much, and which file
+ * offset comes next; the title copies that and calls AddStreamData. Every
+ * byte that arrives is also copied into a host image of the whole file, and
+ * the decoder reads only that image. So a frame that straddles the ring's
+ * wrap, a loop back to an earlier frame, or a ring the title has since
+ * overwritten never matter: once the whole file has arrived, nothing more is
+ * asked for, and loops replay from the image. The ring maps file offset X to
+ * ring offset (X - ring_base) mod uiBufferByte; ring_base moves only on a
+ * reset (GetBufferInfoForResetting puts the reset point at the ring start).
+ * Demon's Souls' MagicOrchestra streams all of its ATRAC tracks this way and
+ * takes the no-second-buffer path (IsSecondBufferNeeded = 0).
+ *
+ * ponytail: no plain ATRAC3, and the second buffer is never needed.
  */
 
 #include "cellAtrac.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../third_party/at3_standalone/at3_bridge.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define AT3P_SAMPLES   2048
@@ -39,7 +51,16 @@ typedef struct {
 
 typedef struct {
     u32 handle_ea;             /* 0 = free */
-    const u8* file;
+    const u8* file;            /* = img */
+    u8* img;                   /* host copy of the whole file (img_size)     */
+    u32 img_size;
+    u32 recv_end;              /* file bytes [0, recv_end) are in img         */
+    int streaming;             /* the whole file was not on memory at SetData */
+    u32 buf_ea, buf_size;      /* the title's ring                            */
+    u32 ring_base;             /* file offset at ring offset 0                */
+    u32 last_writable;         /* what GetStreamDataInfo last offered         */
+    u32 reset_read;            /* GetBufferInfoForResetting's read position   */
+    int warned_short;
     AtracTrackInfo t;
     void* dec;
     s32 pos;                   /* next decoder-stream index to output */
@@ -126,7 +147,17 @@ static int decode_frame(AtracSlot* s, s32 k)
     while (s->next_frame <= k) {
         const u32 at = s->t.data_off + (u32)s->next_frame * s->t.block_align;
         int n = 0;
-        if (at3p_decode(s->dec, s->pcm[0], s->pcm[1], &n, s->file + at,
+        if (at + s->t.block_align > s->recv_end) {
+            /* Not streamed in yet: the title fell behind. Silence, once
+             * logged, rather than decoding whatever the image holds. */
+            if (!s->warned_short) {
+                s->warned_short = 1;
+                fprintf(stderr, "[cellAtrac] handle=0x%08X: frame %d not streamed in yet "
+                                "(have %u of %u bytes); silence\n",
+                        s->handle_ea, s->next_frame, s->recv_end, s->img_size);
+            }
+            memset(s->pcm, 0, sizeof(s->pcm));
+        } else if (at3p_decode(s->dec, s->pcm[0], s->pcm[1], &n, s->file + at,
                         (int)s->t.block_align) < 0 || n != AT3P_SAMPLES) {
             /* A bad frame decodes as silence rather than ending the track. */
             memset(s->pcm, 0, sizeof(s->pcm));
@@ -138,6 +169,47 @@ static int decode_frame(AtracSlot* s, s32 k)
 }
 
 static int looping(const AtracSlot* s) { return s->t.loop_start >= 0 && s->loop_num != 0; }
+
+static void slot_free(AtracSlot* s)
+{
+    if (s->dec) at3p_close(s->dec);
+    free(s->img);
+    memset(s, 0, sizeof(*s));
+}
+
+/* File offset of the first byte the decoder still needs. */
+static u32 needed_from(const AtracSlot* s)
+{
+    const s32 k = s->pos / AT3P_SAMPLES;
+    return s->t.data_off + (u32)(k > 0 ? k - 1 : 0) * s->t.block_align;
+}
+
+/* The remain-frame value Decode and GetRemainFrame report: frames streamed
+ * in beyond the one being decoded, or the "on memory" codes. */
+static s32 remain_frames(const AtracSlot* s)
+{
+    if (!s->streaming) return CELL_ATRAC_ALLDATA_IS_ON_MEMORY;
+    if (s->recv_end >= s->img_size)
+        return s->t.loop_start >= 0 ? CELL_ATRAC_LOOP_STREAM_DATA_IS_ON_MEMORY
+                                    : CELL_ATRAC_NONLOOP_STREAM_DATA_IS_ON_MEMORY;
+    const u32 next = s->t.data_off + (u32)(s->pos / AT3P_SAMPLES + 1) * s->t.block_align;
+    return s->recv_end > next ? (s32)((s->recv_end - next) / s->t.block_align) : 0;
+}
+
+/* How much the title may write now, and where: no more than the ring holds
+ * beyond what the decoder still needs, no more than is left of the file, and
+ * not past the ring's end (the title copies one contiguous run). */
+static u32 stream_writable(const AtracSlot* s, u32* ring_off)
+{
+    *ring_off = s->buf_size ? (s->recv_end - s->ring_base) % s->buf_size : 0;
+    if (!s->streaming || s->recv_end >= s->img_size || !s->buf_size) return 0;
+    const u32 need = needed_from(s);
+    const u32 ahead = s->recv_end > need ? s->recv_end - need : 0;
+    u32 w = s->buf_size > ahead ? s->buf_size - ahead : 0;
+    if (w > s->img_size - s->recv_end) w = s->img_size - s->recv_end;
+    if (w > s->buf_size - *ring_off) w = s->buf_size - *ring_off;
+    return w;
+}
 
 s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte,
                                   u32 uiBufferByte, u32 puiWorkMemByte)
@@ -153,23 +225,30 @@ s32 cellAtracSetDataAndGetMemSize(u32 pHandle, u32 pucBufferAddr, u32 uiReadByte
         fprintf(stderr, "[cellAtrac] SetData: not an ATRAC3plus file (0x%08X)\n", (u32)rc);
         return rc;
     }
-    if (uiReadByte < t.data_off + t.data_bytes)
-        fprintf(stderr, "[cellAtrac] SetData: %u of %u bytes on memory -- STREAMING is "
-                        "not implemented; this track will decode garbage\n",
-                uiReadByte, t.data_off + t.data_bytes);
-    if (s->dec) at3p_close(s->dec);
-    memset(s, 0, sizeof(*s));
+    const u32 total = t.data_off + t.data_bytes;
+    u8* img = (u8*)malloc(total);
+    if (!img) return (s32)CELL_ATRAC_ERROR_API_FAIL;
+    const u32 have = uiReadByte < total ? uiReadByte : total;
+    memcpy(img, file, have);
+    slot_free(s);
     s->handle_ea = pHandle;
-    s->file = file;
+    s->img = img;
+    s->img_size = total;
+    s->file = img;
+    s->recv_end = have;
+    s->streaming = have < total;
+    s->buf_ea = pucBufferAddr;
+    s->buf_size = uiBufferByte >= uiReadByte ? uiBufferByte : uiReadByte;
     s->t = t;
     s->pos = t.first;
     s->next_frame = 0;         /* start of the stream, like the console */
     s->pcm_frame = -1;
-    (void)uiBufferByte;
     if (puiWorkMemByte) vm_write32(puiWorkMemByte, 0x1000);
-    fprintf(stderr, "[cellAtrac] SetData handle=0x%08X ch=%u frames=%u first=%d end=%d loop=[%d,%d)\n",
+    fprintf(stderr, "[cellAtrac] SetData handle=0x%08X ch=%u frames=%u first=%d end=%d loop=[%d,%d)"
+                    " %s %u/%u bytes, ring %u\n",
             pHandle, t.channels, t.data_bytes / t.block_align, t.first, t.end,
-            t.loop_start, t.loop_end);
+            t.loop_start, t.loop_end, s->streaming ? "streaming" : "on memory",
+            have, total, s->buf_size);
     return CELL_OK;
 }
 
@@ -196,8 +275,7 @@ s32 cellAtracDeleteDecoder(u32 pHandle)
 {
     AtracSlot* s = slot_of(pHandle);
     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
-    if (s->dec) at3p_close(s->dec);
-    memset(s, 0, sizeof(*s));
+    slot_free(s);
     return CELL_OK;
 }
 
@@ -233,14 +311,104 @@ s32 cellAtracDecode(u32 pHandle, u32 pfOutAddr, u32 puiSamples, u32 puiFinishfla
     s->pos += n;
     if (puiSamples) vm_write32(puiSamples, (u32)n);
     if (puiFinishflag) vm_write32(puiFinishflag, !looping(s) && s->pos >= s->t.end);
-    if (piRemainFrame) vm_write32(piRemainFrame, (u32)CELL_ATRAC_ALLDATA_IS_ON_MEMORY);
+    if (piRemainFrame) vm_write32(piRemainFrame, (u32)remain_frames(s));
     return CELL_OK;
 }
 
 s32 cellAtracGetRemainFrame(u32 pHandle, u32 piRemainFrame)
 {
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    vm_write32(piRemainFrame, (u32)remain_frames(s));
+    return CELL_OK;
+}
+
+s32 cellAtracGetStreamDataInfo(u32 pHandle, u32 ppucWritePointer, u32 puiWritableByte,
+                               u32 puiReadPosition)
+{
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    u32 off;
+    s->last_writable = stream_writable(s, &off);
+    if (ppucWritePointer) vm_write32(ppucWritePointer, s->buf_ea + off);
+    if (puiWritableByte) vm_write32(puiWritableByte, s->last_writable);
+    if (puiReadPosition) vm_write32(puiReadPosition, s->recv_end);
+    return CELL_OK;
+}
+
+s32 cellAtracAddStreamData(u32 pHandle, u32 uiAddByte)
+{
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    if (!s->streaming) return (s32)CELL_ATRAC_ERROR_ALLDATA_IS_ONMEMORY;
+    if (uiAddByte > s->last_writable) return (s32)CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG;
+    const u32 off = s->buf_size ? (s->recv_end - s->ring_base) % s->buf_size : 0;
+    memcpy(s->img + s->recv_end, vm_base + s->buf_ea + off, uiAddByte);
+    s->recv_end += uiAddByte;
+    s->last_writable -= uiAddByte;
+    return CELL_OK;
+}
+
+s32 cellAtracGetVacantSize(u32 pHandle, u32 puiVacantSize)
+{
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    u32 v = 0;
+    if (s->streaming && s->recv_end < s->img_size) {
+        const u32 need = needed_from(s);
+        const u32 ahead = s->recv_end > need ? s->recv_end - need : 0;
+        v = s->buf_size > ahead ? s->buf_size - ahead : 0;
+    }
+    vm_write32(puiVacantSize, v);
+    return CELL_OK;
+}
+
+/* The second buffer holds the tail after a streamed loop's end on the
+ * console; with the whole file kept on the host it is never needed. */
+s32 cellAtracIsSecondBufferNeeded(u32 pHandle)
+{
+    return slot_of(pHandle) ? 0 : (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+}
+
+s32 cellAtracGetSecondBufferInfo(u32 pHandle, u32 puiReadPosition, u32 puiDataByte)
+{
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    if (puiReadPosition) vm_write32(puiReadPosition, 0);
+    if (puiDataByte) vm_write32(puiDataByte, 0);
+    return (s32)CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER;
+}
+
+s32 cellAtracSetSecondBuffer(u32 pHandle, u32 pucSecondBufferAddr, u32 uiSecondBufferByte)
+{
+    (void)pucSecondBufferAddr; (void)uiSecondBufferByte;
+    return slot_of(pHandle) ? (s32)CELL_ATRAC_ERROR_NONEED_SECOND_BUFFER
+                            : (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+}
+
+/* CellAtracBufferInfo: write address, writable bytes, minimum bytes, file
+ * read position. A streamed reset refills the ring from its start with the
+ * file from one frame before the target (the decoder overlaps frames). */
+s32 cellAtracGetBufferInfoForResetting(u32 pHandle, u32 uiSample, u32 pBufferInfo)
+{
+    AtracSlot* s = slot_of(pHandle);
+    if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    const s32 p = s->t.first + (s32)uiSample;
+    if (p >= s->t.end) return (s32)CELL_ATRAC_ERROR_ILLEGAL_SAMPLE;
+    const s32 k = p / AT3P_SAMPLES;
+    s->reset_read = s->t.data_off + (u32)(k > 0 ? k - 1 : 0) * s->t.block_align;
+    const int stream = s->streaming && s->recv_end < s->img_size;
+    vm_write32(pBufferInfo + 0, s->buf_ea);
+    vm_write32(pBufferInfo + 4, stream ? s->buf_size : 0);
+    vm_write32(pBufferInfo + 8, stream ? 2 * s->t.block_align : 0);
+    vm_write32(pBufferInfo + 12, s->reset_read);
+    return CELL_OK;
+}
+
+s32 cellAtracGetInternalErrorInfo(u32 pHandle, u32 piResult)
+{
     if (!slot_of(pHandle)) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
-    vm_write32(piRemainFrame, (u32)CELL_ATRAC_ALLDATA_IS_ON_MEMORY);
+    vm_write32(piResult, 0);
     return CELL_OK;
 }
 
@@ -319,11 +487,19 @@ s32 cellAtracSetLoopNum(u32 pHandle, s32 iLoopNum)
 
 s32 cellAtracResetPlayPosition(u32 pHandle, u32 uiSample, u32 uiWriteByte)
 {
-    (void)uiWriteByte;
     AtracSlot* s = slot_of(pHandle);
     if (!s) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
     const s32 p = s->t.first + (s32)uiSample;
     if (p >= s->t.end) return (s32)CELL_ATRAC_ERROR_ILLEGAL_SAMPLE;
+    if (uiWriteByte && s->streaming && s->recv_end < s->img_size) {
+        /* The title refilled the ring from its start with the file from
+         * reset_read (GetBufferInfoForResetting). */
+        if (uiWriteByte > s->buf_size || s->reset_read + uiWriteByte > s->img_size)
+            return (s32)CELL_ATRAC_ERROR_ILLEGAL_RESET_BYTE;
+        memcpy(s->img + s->reset_read, vm_base + s->buf_ea, uiWriteByte);
+        s->ring_base = s->reset_read;
+        s->recv_end = s->reset_read + uiWriteByte;
+    }
     s->pos = p;
     return CELL_OK;
 }
