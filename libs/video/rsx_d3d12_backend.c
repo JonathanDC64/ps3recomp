@@ -598,6 +598,20 @@ static int init_d3d12(u32 width, u32 height)
         }
     }
 
+    /* D3D12_DRED=1: Device Removed Extended Data (auto-breadcrumbs + page
+     * faults). Part of the D3D12 runtime, so it works without the Graphics
+     * Tools debug layer; dred_report() prints it once when the device is lost. */
+    if (getenv("D3D12_DRED")) {
+        ID3D12DeviceRemovedExtendedDataSettings* ds = NULL;
+        if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings,
+                                             (void**)&ds)) && ds) {
+            ds->lpVtbl->SetAutoBreadcrumbsEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->lpVtbl->SetPageFaultEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            ds->lpVtbl->Release(ds);
+            printf("[D3D12] DRED enabled\n");
+        } else printf("[D3D12] DRED unavailable\n");
+    }
+
     /* Create DXGI factory */
     IDXGIFactory4* factory = NULL;
     hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
@@ -1263,6 +1277,55 @@ static int init_d3d12(u32 width, u32 height)
 /* ---------------------------------------------------------------------------
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
+
+/* D3D12_DRED=1: on the first device removal, print the reason, the command
+ * history around the last completed breadcrumb, and the page-fault address. */
+static void dred_report(const char* where)
+{
+    static int done = 0;
+    if (done || !getenv("D3D12_DRED") || !s_d3d.device) return;
+    HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+    if (rr == S_OK) return;
+    done = 1;
+    fprintf(stderr, "[DRED] device removed at %s: reason 0x%08lX%c", where, (long)rr, 10);
+    ID3D12DeviceRemovedExtendedData* d = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device,
+            &IID_ID3D12DeviceRemovedExtendedData, (void**)&d)) || !d) {
+        fprintf(stderr, "[DRED] no DRED interface%c", 10); return;
+    }
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bo = {0};
+    if (SUCCEEDED(d->lpVtbl->GetAutoBreadcrumbsOutput(d, &bo))) {
+        static const char* nm[] = { "SETMARKER","BEGINEVENT","ENDEVENT","DRAWINSTANCED",
+            "DRAWINDEXEDINSTANCED","EXECUTEINDIRECT","DISPATCH","COPYBUFFERREGION",
+            "COPYTEXTUREREGION","COPYRESOURCE","COPYTILES","RESOLVESUBRESOURCE",
+            "CLEARRENDERTARGETVIEW","CLEARUNORDEREDACCESSVIEW","CLEARDEPTHSTENCILVIEW",
+            "RESOURCEBARRIER" };
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bo.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+            u32 last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+            fprintf(stderr, "[DRED] list %p: %u ops, last completed %u%c",
+                    (void*)n->pCommandList, n->BreadcrumbCount, last, 10);
+            if (last >= n->BreadcrumbCount) continue;   /* list finished */
+            u32 a = last > 12 ? last - 12 : 0, b = last + 12 < n->BreadcrumbCount ? last + 12 : n->BreadcrumbCount;
+            for (u32 k = a; k < b; k++) {
+                u32 op = (u32)n->pCommandHistory[k];
+                fprintf(stderr, "[DRED]   %s%5u %s (%u)%c", k == last ? ">>" : "  ", k,
+                        op < sizeof nm / sizeof nm[0] ? nm[op] : "op", op, 10);
+            }
+        }
+    }
+    D3D12_DRED_PAGE_FAULT_OUTPUT po = {0};
+    if (SUCCEEDED(d->lpVtbl->GetPageFaultAllocationOutput(d, &po))) {
+        fprintf(stderr, "[DRED] page fault VA 0x%llX%c", (unsigned long long)po.PageFaultVA, 10);
+        for (const D3D12_DRED_ALLOCATION_NODE* a = po.pHeadExistingAllocationNode; a; a = a->pNext)
+            fprintf(stderr, "[DRED]   existing alloc type %d %s%c", (int)a->AllocationType,
+                    a->ObjectNameA ? a->ObjectNameA : "", 10);
+        for (const D3D12_DRED_ALLOCATION_NODE* a = po.pHeadRecentFreedAllocationNode; a; a = a->pNext)
+            fprintf(stderr, "[DRED]   freed alloc type %d %s%c", (int)a->AllocationType,
+                    a->ObjectNameA ? a->ObjectNameA : "", 10);
+    }
+    d->lpVtbl->Release(d);
+    fflush(stderr);
+}
 
 static void wait_for_gpu(void)
 {
@@ -2167,6 +2230,7 @@ static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
     return 1;
 }
 
+static void fp_seen_note(u32 ea, u32 len);
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 cube_mask)
@@ -2200,6 +2264,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     {
         u32 usz = rsx_fp_program_size(vm_base + off, 4096);
         if (usz == 0) usz = 64;
+        fp_seen_note(off, usz);
         s_perf_pso_hashbytes += (int)usz;
         if (getenv("FP_CONSTBUF") && getenv("FP_CONSTBUF")[0] == '0') {
             uhash = 2166136261u;
@@ -3783,6 +3848,15 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
  * (it costs a GPU wait plus a CPU conversion per frame).
  * -----------------------------------------------------------------------*/
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
+/* RSX_WRITE_COLOR_LOG: guest ranges of the fragment programs drawn with,
+ * so a write-back that lands on live ucode is reported. */
+static u32 s_fp_seen[512][2]; static int s_fp_seen_n;
+static void fp_seen_note(u32 ea, u32 len)
+{
+    for (int i = 0; i < s_fp_seen_n; i++) if (s_fp_seen[i][0] == ea) return;
+    if (s_fp_seen_n < 512) { s_fp_seen[s_fp_seen_n][0] = ea; s_fp_seen[s_fp_seen_n][1] = len; s_fp_seen_n++; }
+}
+
 static int write_color_on(void)
 {
     static int on = -1;
@@ -3865,6 +3939,7 @@ static u32 rsx_swz_index(u32 x, u32 y, u32 lw, u32 lh)
 }
 
 /* Store the copies in guest memory (after the GPU finished the frame). */
+static u8* s_wc_shadow; static u32 s_wc_len;   /* RSX_WRITE_COLOR_LOG */
 static void rt_writeback_store(void)
 {
     extern uint8_t* vm_base;
@@ -3886,6 +3961,27 @@ static void rt_writeback_store(void)
          * cannot place a surface the title keeps in main memory. */
         u32 dst = cellGcmResolveLocated(r->gdma != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER, r->off);
         if (!dst || dst == 0xFFFFFFFFu) continue;
+        { static int lg = -1; if (lg < 0) { const char* e = getenv("RSX_WRITE_COLOR_LOG"); lg = e ? atoi(e) : 0; }
+          if (lg > 0) { lg--;
+            /* Did anything else write the surface since our last store? */
+            static u8* shadow[MAX_OFF_RTS]; static u32 shoff[MAX_OFF_RTS], shlen[MAX_OFF_RTS];
+            u32 len = swz ? ((1u << lw) << lh) * bpp : gp * r->h;
+            u32 ndiff = 0, first = 0;
+            if (shadow[i] && shoff[i] == r->off && shlen[i] == len)
+                for (u32 k = 0; k < len; k++)
+                    if (shadow[i][k] != vm_base[dst + k]) { if (!ndiff) first = k; ndiff++; }
+            fprintf(stderr, "[WRITE-COLOR] off=0x%X -> 0x%08X %ux%u fmt=0x%08X pitch=%u dma=0x%X%s foreign=%u first=+0x%X%c",
+                    r->off, dst, r->w, r->h, r->gfmt, gp, r->gdma, swz ? " swz" : "", ndiff, first, 10);
+            for (int q = 0; q < s_fp_seen_n; q++) {
+                u32 fa = s_fp_seen[q][0], fl = s_fp_seen[q][1];
+                if (fa < dst + len && dst < fa + fl)
+                    fprintf(stderr, "[WRITE-COLOR] !! surface 0x%X [0x%08X,+0x%X) overlaps FP ucode 0x%08X+0x%X%c",
+                            r->off, dst, len, fa, fl, 10);
+            }
+            if (!shadow[i] || shlen[i] != len) { free(shadow[i]); shadow[i] = (u8*)malloc(len); shlen[i] = len; }
+            shoff[i] = r->off;
+            s_wc_shadow = shadow[i]; s_wc_len = len;
+          } }
         void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * r->h};
         if (FAILED(r->rb->lpVtbl->Map(r->rb, 0, &rr, &mp)) || !mp) continue;
         for (u32 y = 0; y < r->h; y++) {
@@ -3909,6 +4005,7 @@ static void rt_writeback_store(void)
         }
         D3D12_RANGE nw = {0, 0};
         r->rb->lpVtbl->Unmap(r->rb, 0, &nw);
+        if (s_wc_shadow) { memcpy(s_wc_shadow, vm_base + dst, s_wc_len); s_wc_shadow = NULL; }
     }
 }
 
@@ -5427,9 +5524,11 @@ skip_dump_consider: ;
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
 
+    dred_report("frame submit");
     if (write_color_on()) {
         double _g = perf_on() ? perf_now() : 0.0;
         wait_for_gpu();
+        dred_report("write-back wait");
         if (perf_on()) s_perf_gpu += perf_now() - _g;
         rt_writeback_store();
     }
