@@ -804,8 +804,8 @@ static ppu_context* g_resv_ctxs[PPU_RESV_MAX];
 static volatile LONG g_resv_ctx_n = 0;
 /* Sharded by address: a single global lock convoyed all stwcx (workers spinning
  * on a descheduled holder -> loader too slow to finish jobs). Shard by the
- * 16-byte-block of ea so unrelated structures never serialize; same-structure
- * contention (which is inherent) still serializes on one slot. */
+ * 128-byte reservation granule (see "Line granularity" below), so unrelated
+ * structures never serialize and every store-conditional on one line does. */
 #define PPU_RESV_LOCKS 1024
 static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
 /* PPU_RESV_STORE=1 -> also invalidate reservations on PLAIN stores (vm_write32/64)
@@ -880,26 +880,47 @@ extern "C" void ppu_report_guest_lrs(void)
  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
  * narrow race. Skips already-invalid slots. */
+/* Line granularity.
+ *
+ * lwarx reserves the whole 128-byte line on Cell, and a store to any byte of
+ * it loses the reservation. Lock-free code relies on that when it reserves one
+ * word and reads its partner on the same line: lwarx the pop count, read the
+ * push count, stwcx the pop count. Tracked per word, a commit to the push count
+ * between the read and the stwcx leaves the pop-count reservation standing, the
+ * stwcx succeeds against a stale view, and a waiter can go to sleep on a queue
+ * that has work in it. The SPU side of exactly this race was the in-game hang
+ * (the PUTLLC hooks below); PPU against PPU is the same race.
+ *
+ * PPU_RESV_WORD=1 restores per-word tracking (A/B). */
+static inline uint32_t resv_mask()
+{
+    static uint32_t m = 0;
+    if (!m) m = getenv("PPU_RESV_WORD") ? ~3u : ~127u;
+    return m;
+}
 extern "C" void ppu_resv_break_store(uint64_t ea)
 {
-    uint32_t a = (uint32_t)ea & ~3u;
+    const uint32_t m = resv_mask();
+    uint32_t a = (uint32_t)ea & m;
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
-        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & ~3u) == a)
+        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & m) == a)
             c->reserve_addr = PPU_RESV_INVALID;
     }
 }
-static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
+static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 7) & (PPU_RESV_LOCKS - 1)]; }
 static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
-static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */
+static inline void ppu_resv_break(uint64_t addr)   /* MUST hold the line's slot */
 {
-    uint64_t a = (uint32_t)addr;   /* match the inline guard: reserve_addr holds (uint32_t)ea */
+    const uint32_t m = resv_mask();
+    const uint32_t a = (uint32_t)addr & m;
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_resv_ctxs[i];
-        if (c && c->reserve_addr == a) c->reserve_addr = PPU_RESV_INVALID;
+        if (c && c->reserve_addr < PPU_RESV_INVALID && ((uint32_t)c->reserve_addr & m) == a)
+            c->reserve_addr = PPU_RESV_INVALID;
     }
 }
 /* RESV_DIAG: detect a stwcx whose ctx isn't in the registry -- if that fires,
@@ -1027,7 +1048,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
                                            0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     ppu_context* self = g_active_ctx;
     if (resv_diag() && self) resv_check_reg(self);
-    volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a 16-byte-block slot */
+    volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a line, so a slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
@@ -1060,21 +1081,19 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
  * and sent no event; the value-CAS on the pop word still succeeded, and the
  * PPU slept on a queue that held a record.
  *
- * The SPU takes the store-conditional slot locks of all eight 16-byte blocks
- * of the line around its compare and commit, so a PPU store-conditional on the
- * line runs entirely before (the SPU's compare then sees its store) or after
- * (its reservation is gone). The line is 128-aligned, so the eight slots are
- * consecutive and never wrap; a PPU thread holds one slot at most, so taking
- * them in ascending order cannot deadlock against it or another SPU. */
+ * The SPU takes the line's store-conditional slot lock around its compare and
+ * commit, so a PPU store-conditional on the line runs entirely before (the
+ * SPU's compare then sees its store) or after (its reservation is gone). A PPU
+ * thread holds one slot at most, so this cannot deadlock against it. */
 static void ppu_resv_line_enter(uint32_t line)
 {
     if (resv_off()) return;
-    for (uint32_t b = 0; b < 128; b += 16) resv_lock(resv_slot((line & ~127u) + b));
+    resv_lock(resv_slot(line & ~127u));   /* one slot per line */
 }
 static void ppu_resv_line_leave(uint32_t line)
 {
     if (resv_off()) return;
-    for (uint32_t b = 0; b < 128; b += 16) resv_unlock(resv_slot((line & ~127u) + b));
+    resv_unlock(resv_slot(line & ~127u));
 }
 static void ppu_resv_line_break(uint32_t line)
 {
