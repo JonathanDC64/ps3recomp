@@ -629,6 +629,7 @@ extern "C" const char* g_last_hle_name;
 static void dbg_printf(const char* fmt, ...);
 extern "C" void (*g_ds_register_shadow_hook)(unsigned long long);
 extern "C" void ds_print_all_shadows(void (*)(const char*, ...), unsigned) __attribute__((weak));
+extern "C" void ppu_guard_page_rearm(uint32_t guest_ea, int noaccess);   /* ppu_loader.cpp */
 extern "C" void ps3_exit_now(const char* tag);
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
@@ -971,6 +972,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
             dbg_printf("  setenv K=V       set a diagnostic knob now (K= clears it)%c", 10);
+            dbg_printf("  guard <hex> [rw] arm the page guard on a guest word now%c", 10);
         } else if (!strcmp(verb, "gstacks")) {
             /* Guest shadow stacks of every registered thread, innermost first
              * (needs a --shadow-stack lift and a title that registers them). */
@@ -1103,6 +1105,11 @@ static DWORD WINAPI debug_console(LPVOID param)
                 memcpy(vm_base + a, &be, 4);
                 dbg_printf("  [0x%08X] = 0x%08X%c", a, b, 10);
             } else dbg_printf("  vm_base not live yet%c", 10);
+        } else if (!strcmp(verb, "guard") && sscanf(cmd, "%*s %x", &a) == 1) {
+            /* The PPU_GUARD_EA knob arms at load, which is too early for heap
+             * memory the title allocates later. Arm it once the object exists. */
+            ppu_guard_page_rearm(a, strstr(cmd, " rw") != NULL);
+            dbg_printf("  guard on 0x%08X%c", a, 10);
         } else if (!strcmp(verb, "setenv")) {
             /* Turn a diagnostic on mid-run, e.g. a frame dump once a level is
              * up. Only knobs the code re-reads with getenv() see the change. */

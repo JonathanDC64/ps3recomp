@@ -1191,9 +1191,12 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
         { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
           /* PPU_GUARD_CHANGE=1: name every writer that changes the watched word,
            * not just one that zeroes it -- for a value that is wrong, not lost. */
-          { static int en = -1; if (en < 0) en = getenv("PPU_GUARD_CHANGE") ? 1 : 0;
+          /* PPU_GUARD_CHANGE=<n> reports the first n changes (1 means 24). */
+          { static int en = -1;
+            if (en < 0) { const char* e = getenv("PPU_GUARD_CHANGE");
+                          en = e ? (atoi(e) > 1 ? atoi(e) : 24) : 0; }
             static int _c = 0;
-            if (en && nowv != s_guard_pre && _c++ < 24) {
+            if (en && nowv != s_guard_pre && _c++ < en) {
                 fprintf(stderr, "[GUARD] CHANGED 0x%08X: 0x%08X -> 0x%08X cia=0x%08X lr=0x%08X\n",
                         s_guard_ea, s_guard_pre, nowv,
                         g_active_ctx ? g_active_ctx->cia : 0, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
