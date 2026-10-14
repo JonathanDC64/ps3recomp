@@ -288,12 +288,16 @@ static u32 sail_scratch(int slot)
     return ea;
 }
 
-/* PS3_SAIL_MOVIES=0: never play, every stream ends at once (the old answer). */
-static int sail_movies_on(void)
+/* PS3_SAIL_MOVIES=0: never play, every stream ends at once (the old answer).
+ * PS3_SAIL_MOVIES=<text> (diagnostic): play only movies whose path contains
+ * <text> (e.g. "title"), so a test reaches a later movie without sitting
+ * through the unskippable ones before it. Default 1: play everything. */
+static int sail_movie_wanted(const char* path)
 {
-    static int on = -1;
-    if (on < 0) on = ps3_env_int("PS3_SAIL_MOVIES", 1) != 0;
-    return on;
+    const char* e = getenv("PS3_SAIL_MOVIES");
+    if (!e || !*e || strcmp(e, "1") == 0) return 1;
+    if (strcmp(e, "0") == 0) return 0;
+    return strstr(path, e) != NULL;
 }
 
 static const char* sail_desc_uri(u32 desc);   /* descriptors are below */
@@ -346,9 +350,9 @@ static void sail_open_movie(int slot)
 {
     sail_close_movie(slot);
     const u32 desc = s_sail_players[slot].desc;
-    if (!sail_movies_on() || !desc) return;
+    if (!desc) return;
     const char* uri = sail_desc_uri(desc);
-    if (!uri) return;
+    if (!uri || !sail_movie_wanted(uri)) return;
     static const char scheme[] = "x-cell-fs://";
     const char* guest_path = strncmp(uri, scheme, sizeof scheme - 1) == 0 ? uri + sizeof scheme - 1 : uri;
     char host[1024];

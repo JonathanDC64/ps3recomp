@@ -36,6 +36,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -82,6 +83,7 @@ struct SailMovie {
     int         src_ch = 0;                   /* channels in the file (info.channels: handed out) */
     float       a_frame[8] = {};              /* one input frame being assembled */
     int         a_fill = 0;
+    size_t      tone_pos = 0;                 /* SAIL_AUDIO_TONE phase, in frames */
 
     LARGE_INTEGER qf{}, t0{};
     bool        started = false;
@@ -478,8 +480,17 @@ extern "C" int sail_movie_audio(SailMovie* m, float* dst, int frames, int big_en
     if (!m->started || !want) return 0;
     if (m->a_cnt < want) { *eos = m->demux_done; return 0; }
     const size_t cap = m->aring.size();
+    /* SAIL_AUDIO_TONE=<peak> (diagnostic, e.g. 0.2): replace the track with a
+     * sine per channel, 250 Hz x (channel + 1), to see in an AUDIO_WAV
+     * capture where each channel lands in the title's mix and at what gain. */
+    static const double tone = [] { const char* e = getenv("SAIL_AUDIO_TONE"); return e ? atof(e) : 0.0; }();
     for (size_t i = 0; i < want; i++) {
         float v = m->aring[(m->a_rd + i) % cap];
+        if (tone > 0) {
+            const int c = (int)(i % (size_t)m->info.channels);
+            const double t = (double)(m->tone_pos + i / (size_t)m->info.channels) / m->info.rate;
+            v = (float)(tone * sin(6.283185307179586 * 250.0 * (c + 1) * t));
+        }
         if (big_endian) {
             uint32_t u; memcpy(&u, &v, 4);
             u = _byteswap_ulong(u);
@@ -489,6 +500,7 @@ extern "C" int sail_movie_audio(SailMovie* m, float* dst, int frames, int big_en
     }
     m->a_rd = (m->a_rd + want) % cap;
     m->a_cnt -= want;
+    m->tone_pos += (size_t)frames;
     return frames;
 }
 
