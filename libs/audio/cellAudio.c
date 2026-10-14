@@ -53,6 +53,14 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #include <windows.h>
   #include <mmdeviceapi.h>
   #include <audioclient.h>
+  #include <avrt.h>
+  #pragma comment(lib, "avrt.lib")
+  #ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+  #define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
+  #endif
+  #ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+  #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
+  #endif
   #include <process.h>
 
   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
@@ -217,7 +225,12 @@ static int audio_backend_room(void)
            CELL_AUDIO_BLOCK_SAMPLES * 4 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
-static void audio_backend_wait(void) { SDL_Delay(1); }
+/* The device is about to run dry: under one block queued. */
+static int audio_backend_starving(void)
+{
+    return s_sdl_audio_dev &&
+           SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < CELL_AUDIO_BLOCK_SAMPLES;
+}
 
 static u32 audio_backend_queued_samples(void)
 {
@@ -280,14 +293,24 @@ static int audio_backend_init(void)
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
     wfx.cbSize          = 0;
 
-    /* Request event-driven mode with a ~20ms buffer */
-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
+    /* Event-driven mode with an AUDIO_BUF_MS buffer (default 40 ms). The
+     * mixer keeps it about one block ahead of the device, so this is only
+     * the ceiling on how far it may run ahead -- headroom for a scheduling
+     * hiccup -- not added latency. */
+    long buf_ms = 40;
+    { const char* e = getenv("AUDIO_BUF_MS"); if (e && atol(e) > 0) buf_ms = atol(e); }
+    REFERENCE_TIME buf_duration = (REFERENCE_TIME)buf_ms * 10000; /* 100 ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
+    /* AUTOCONVERTPCM | SRC_DEFAULT_QUALITY: the shared-mode mixer converts
+     * and resamples, so an endpoint whose mix format is not 48 kHz stereo
+     * float (a 44.1 kHz or 7.1 device) plays instead of failing Initialize
+     * with AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008). From soyjxck's fork. */
+    const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     hr = s_wasapi_client->lpVtbl->Initialize(
         s_wasapi_client,
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
         buf_duration, 0, &wfx, NULL);
 
     if (FAILED(hr)) {
@@ -295,7 +318,7 @@ static int audio_backend_init(void)
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            0, buf_duration, 0, &wfx, NULL);
+            convert, buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);
@@ -388,11 +411,11 @@ static int audio_backend_room(void)
     return (int)(s_wasapi_buf_frames - padding);
 }
 
-/* Block until the device has consumed some of its buffer. */
-static void audio_backend_wait(void)
+/* The device is about to run dry: under one block queued. */
+static int audio_backend_starving(void)
 {
-    if (s_wasapi_event) WaitForSingleObject(s_wasapi_event, 10);
-    else Sleep(1);
+    const int room = audio_backend_room();
+    return room >= 0 && (UINT32)room > s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES;
 }
 
 
@@ -473,8 +496,16 @@ static void audio_mix_one_block(void)
               }
           } }
 
-        /* Read one block at the current read_index */
-        u32 block_idx = (u32)(port->read_index % nblock);
+        /* Read one block at the current read_index -- or AUDIO_LAG_BLOCKS
+         * (default 1) behind it. The title writes at the index we publish,
+         * so with a lag of L the block mixed now was due L block-times ago:
+         * a producer up to L * 5.33 ms late is still heard, for L * 5.33 ms
+         * more latency. Demon's Souls with steady pacing and no lag still
+         * left ~1 block in 1000 unwritten in time. */
+        static int lag = -1;
+        PS3_KNOB(lag, getenv("AUDIO_LAG_BLOCKS") ? atoi(getenv("AUDIO_LAG_BLOCKS")) : 1);
+        const u32 lag_b = (lag <= 0 || nblock < 3) ? 0u : ((u32)lag < nblock - 1u ? (u32)lag : nblock - 2u);
+        u32 block_idx = (u32)((port->read_index + nblock - lag_b) % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
 
@@ -601,30 +632,55 @@ static void audio_notify_event_queues(void)
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
-    printf("[cellAudio] Mixing thread started\n");
+    /* MMCSS "Pro Audio" puts the mixer in the scheduler class Windows keeps
+     * for audio engines, ahead of the game's own threads, so a busy frame
+     * cannot hold it off and run the device dry. AUDIO_MMCSS=0 turns it off;
+     * if avrt refuses, the thread is TIME_CRITICAL instead. */
+    { const char* e = getenv("AUDIO_MMCSS");
+      DWORD task_index = 0;
+      HANDLE mm = (e && e[0] == '0') ? NULL : AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index);
+      if (mm) AvSetMmThreadPriority(mm, AVRT_PRIORITY_HIGH);
+      else SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+      printf("[cellAudio] Mixing thread started (%s)\n", mm ? "MMCSS Pro Audio" : "TIME_CRITICAL"); }
 
-    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
-     * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
-     * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
-     * dropped the surplus: 20% of the audio thrown away, and a guest mixer
-     * (GH3's FMOD) that could not keep ahead of the read index played gaps.
-     * With no device, pace on the performance counter instead. */
+    /* One block every 5.33 ms by the performance counter, as the hardware
+     * consumes them. Pacing on device room alone mixed in PAIRS: WASAPI
+     * drains its buffer a 10 ms period at a time, so room for two blocks
+     * opened at once and two were mixed back to back. The title writes one
+     * block per notify, at the index we publish, so the second read of each
+     * pair found that block still cleared: 46.6% of Demon's Souls' blocks
+     * played as silence, a constant buzz over all of its sound
+     * (AUDIO_GAPS=1 / AUDIO_WRITEPOS=1). The device buffer is now only a
+     * check on clock drift: no room means our clock runs ahead of the DAC's,
+     * so the schedule slips a block; nearly empty means it runs behind, so
+     * it gains one. With no device the counter alone paces the mix.
+     * (soyjxck's fork found and fixed the same thing, be94e5a5.) */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE;
+    HANDLE pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     while (s_mix_thread_running) {
-        const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
-        if (room < 0) {
-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            const long long due = q0.QuadPart +
-                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
-            if (now.QuadPart < due) { Sleep(1); continue; }
-            /* More than 50 ms behind (device just went away, a debugger
-             * stop): drop the backlog instead of mixing it in a burst. */
-            if (now.QuadPart - due > qf.QuadPart / 20)
-                q0.QuadPart = now.QuadPart -
-                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const long long due = q0.QuadPart + (long long)blocks * period;
+        if (now.QuadPart < due) {
+            /* Sub-millisecond lateness does not matter (the title has a whole
+             * block to write the next one), so no spin: one timer wait. */
+            const long long wait_us = (due - now.QuadPart) * 1000000LL / qf.QuadPart;
+            if (pace_timer && wait_us > 0) {
+                LARGE_INTEGER rel; rel.QuadPart = -wait_us * 10;
+                SetWaitableTimer(pace_timer, &rel, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(pace_timer, 10);
+            } else {
+                Sleep(wait_us >= 1000 ? 1 : 0);
+            }
+            continue;
         }
+        /* More than 50 ms behind (a debugger stop, the device going away):
+         * drop the backlog instead of mixing it in a burst. */
+        if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart = now.QuadPart - (long long)blocks * period;
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { q0.QuadPart += period; continue; }   /* DAC slower: slip */
+        if (blocks > 8 && audio_backend_starving()) q0.QuadPart -= period;                   /* DAC faster: gain */
         blocks++;
         /* Mix and submit one block */
         audio_mix_one_block();
