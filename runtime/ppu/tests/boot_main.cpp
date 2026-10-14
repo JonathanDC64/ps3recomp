@@ -518,7 +518,18 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * window DXGI Present throttles hard, which previously stalled these ticks and
      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
      * and catch up in a bounded burst so present latency never slows the game. */
-    ULONGLONG next_tick = GetTickCount64();
+    /* Vblanks on the performance counter at the PS3's 59.94 Hz. They were
+     * GetTickCount64 + 16 ms: 62.5 Hz, so a title flipping every other
+     * vblank ran at 31.25/s and a 29.97 fps movie showed a frame twice
+     * about once a second; and GetTickCount64 moves in ~15.6 ms steps, so
+     * ticks came in uneven bursts. VBLANK_MHZ (millihertz, default 59940)
+     * sets the rate; 60000 is NTSC-exact 60 Hz. */
+    LARGE_INTEGER qpf, qpc;
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&qpc);
+    const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
+    const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
+    long long next_tick = qpc.QuadPart;
     for (;;) {
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
@@ -532,8 +543,9 @@ static DWORD WINAPI vblank_ticker(LPVOID)
           PS3_KNOB(kms, ps3_env_int("FIFO_KICK_MS", 1));
           cellGcm_fifo_kick_wait(kms >= 1 ? (unsigned)kms : 1u); }
         ULONGLONG now = GetTickCount64();
+        QueryPerformanceCounter(&qpc);
         int fired = 0;
-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
+        while (qpc.QuadPart - next_tick >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining further: the flip fires
@@ -552,10 +564,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * Doing it here (not after present) keeps those fences advancing at 60Hz
              * even when present() throttles on a hidden/occluded window. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;                 /* ~60 Hz */
+            next_tick += tick_qpc;
             fired++;
         }
-        if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
+        if (fired >= 240) next_tick = qpc.QuadPart;   /* fell too far behind -> resync */
         /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
          * titles fence EVERY render pass on an RSX label the drain writes;
          * at 16ms per fence wave's six passes paced the guest to ~7 fps.
