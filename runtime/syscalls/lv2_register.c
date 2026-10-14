@@ -1692,6 +1692,10 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+            if (rc == 0 && !spu->spu_group_id) {
+                extern void spurs_note_spu_event(uint32_t queue);
+                spurs_note_spu_event(queue);
+            }
         }
         { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_EVT_TRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-evt] img=%d grp=0x%X port=%u -> queue=%u data0=0x%06X data1=0x%08X result=0x%08X\n",

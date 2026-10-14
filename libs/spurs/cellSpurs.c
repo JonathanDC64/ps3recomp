@@ -705,6 +705,43 @@ static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 static u32 s_spurs_event_queue_owner[MAX_SPURS_QUEUES];
 static int s_spurs_event_queue_n = 0;
 
+/* Queues that SPU code has really sent an event to, through a SPURS port.
+ *
+ * Two places below post events SPURS never sends on hardware: the job-chain
+ * completion broadcast (jc_signal_done) and the task-completion inject. They
+ * stand in for SPU-side signalling the HLE does not route, and they go to every
+ * attached queue. On a queue whose SPU side does signal it for real, they are
+ * extra wakeups in that queue's own protocol, and that protocol can count them.
+ *
+ * Demon's Souls's Havok PPU thread waits on queue 5 for a semaphore whose SPU
+ * side (the FX task) sends one port-3 event per waiter it wakes. Each extra
+ * wakeup makes the PPU loop register as a waiter again, so the waiter count in
+ * the semaphore word only grows. In one run 45 of the first 64 events on queue
+ * 5 were synthetic (37 from HighGraphics' job chain, 8 task-completion
+ * injects). The count overflowed into the port byte of the same word, and the
+ * FX task then sent to ports 12 and 14, which nothing is bound to.
+ *
+ * Once a queue has a real SPU producer, it gets only real events.
+ * SPURS_SYNTH_ALL=1 restores the old broadcast (A/B). */
+static volatile long s_spurs_event_queue_spu[MAX_SPURS_QUEUES];
+
+void spurs_note_spu_event(uint32_t queue)
+{
+    for (int i = 0; i < s_spurs_event_queue_n; i++)
+        if (s_spurs_event_queue[i] == queue && !s_spurs_event_queue_spu[i]) {
+            s_spurs_event_queue_spu[i] = 1;
+            fprintf(stderr, "[spurs] queue %u has a real SPU producer; "
+                    "synthetic completions no longer go to it%c", queue, 10);
+        }
+}
+
+static int spurs_queue_has_spu_producer(int i)
+{
+    static int s_all = -1;
+    if (s_all < 0) s_all = getenv("SPURS_SYNTH_ALL") ? 1 : 0;
+    return !s_all && s_spurs_event_queue_spu[i];
+}
+
 /* SPU task completion -> lv2 event queue, the other half of the PM's job.
  *
  * SPURS signals the application through the queues attached with
@@ -734,6 +771,7 @@ void spurs_notify_task_completion(void)
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
         uint32_t q = s_spurs_event_queue[i];
         if (!q || sys_event_queue_waiters(q) <= 0) continue;
+        if (spurs_queue_has_spu_producer(i)) continue;
         /* SPURS completion source key; data words carry no task identity yet --
          * if a handler turns out to demand a specific payload this is where it
          * goes, and the receiver-side trace will say so. */
@@ -758,6 +796,7 @@ static void spurs_cancel_attached_queues(u32 spurs_ea)
         } else {
             s_spurs_event_queue[keep]       = s_spurs_event_queue[i];
             s_spurs_event_queue_owner[keep] = owner;
+            s_spurs_event_queue_spu[keep]   = s_spurs_event_queue_spu[i];
             keep++;
         }
     }
@@ -795,6 +834,7 @@ s32 cellSpursAttachLv2EventQueue(CellSpurs* spurs, u32 queue, u8* port,
         for (int i = 0; i < s_spurs_event_queue_n; i++)
             if (s_spurs_event_queue[i] == queue) dup = 1;
         if (!dup) { s_spurs_event_queue_owner[s_spurs_event_queue_n] = (u32)(uintptr_t)spurs;
+                    s_spurs_event_queue_spu[s_spurs_event_queue_n]   = 0;
                     s_spurs_event_queue[s_spurs_event_queue_n++] = queue; }
     }
 
@@ -2781,6 +2821,7 @@ static void jc_signal_done(u32 jc_ea, int job_index)
         g_spurs_job_mbox_valid = 0;
     }
     for (int i = 0; i < s_spurs_event_queue_n; i++) {
+        if (spurs_queue_has_spu_producer(i)) continue;
         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
                                             SPURS_EVENT_PORT, jc_ea, d2,
                                             d3_probe_valid
