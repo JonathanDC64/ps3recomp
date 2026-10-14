@@ -126,6 +126,10 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_clip_h = (data >> 16) & 0xFFFF;
         state->surface_dirty = 1;
         return 0;
+    case NV4097_SET_CONTEXT_DMA_COLOR_A: state->surface_color_dma[0] = data; return 0;
+    case NV4097_SET_CONTEXT_DMA_COLOR_B: state->surface_color_dma[1] = data; return 0;
+    case NV4097_SET_CONTEXT_DMA_COLOR_C: state->surface_color_dma[2] = data; return 0;
+    case NV4097_SET_CONTEXT_DMA_COLOR_D: state->surface_color_dma[3] = data; return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
         { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
@@ -383,7 +387,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||
-        (method >= 0x280 && method <= 0x28C))
+        (method >= 0x280 && method <= 0x28C) ||
+        method == 0x18C || method == 0x194 || method == 0x1B4 || method == 0x1B8)
         return process_surface_method(state, method, data);
 
     /* Texture methods: 0x1A00..0x1A00 + 16*0x20 - 1 */

@@ -45,8 +45,8 @@ extern "C" {
  * 0xFEED0000 is RSX local memory and 0xFEED0001 is IO-mapped main memory.
  * RSX offsets are two overlapping number spaces, so this is what tells a
  * surface at offset X from a texture at offset X in the other one. Decoded
- * by rsx_dispatch (rsx_dsp_surface.color_location); rsx_state has no field
- * for it and rsx_process_method ignores it. */
+ * by rsx_dispatch (rsx_dsp_surface.color_location) and kept in
+ * rsx_state.surface_color_dma for the d3d12 colour write-back. */
 #define NV4097_SET_CONTEXT_DMA_COLOR_A         0x00000194
 /* ...and the same for colour target B, which sits BELOW A in the register
  * file rather than after it (C and D are at 0x1B4 and 0x1B8). An MRT set
@@ -57,6 +57,8 @@ extern "C" {
 /* ...and the same question for the depth buffer, which a texture unit coming
  * back to sample it has to agree with. */
 #define NV4097_SET_CONTEXT_DMA_ZETA            0x00000198
+#define NV4097_SET_CONTEXT_DMA_COLOR_C         0x000001B4
+#define NV4097_SET_CONTEXT_DMA_COLOR_D         0x000001B8
 #define CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER 0xFEED0000
 #define CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER  0xFEED0001
 
@@ -248,6 +250,7 @@ typedef struct rsx_state {
     u32 surface_format;
     u32 surface_color_offset[RSX_MAX_RENDER_TARGETS];
     u32 surface_color_pitch[RSX_MAX_RENDER_TARGETS];
+    u32 surface_color_dma[RSX_MAX_RENDER_TARGETS];  /* SET_CONTEXT_DMA_COLOR_A..D: 0xFEED0000 local, 0xFEED0001 main */
     u32 surface_zeta_offset;
     u32 surface_zeta_pitch;
     u32 surface_clip_x, surface_clip_y;
