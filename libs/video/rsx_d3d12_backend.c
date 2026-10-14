@@ -2035,8 +2035,8 @@ static u8 gl_blend_op_d3d(u32 e)
 /* Pack the guest's face-culling state for the PSO key.
  * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW.
  * RSX/GL enums: CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408;
- * FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds cull_face/front_face with
- * plain 1/0 before any register arrives, so treat those defaults as BACK/CW. */
+ * FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds the reset state, BACK
+ * and CCW. */
 static u32 rsx_cull_key(const rsx_state* st)
 {
     if (!st || !st->cull_face_enable) return 0;

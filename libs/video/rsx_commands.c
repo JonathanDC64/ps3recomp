@@ -70,8 +70,10 @@ void rsx_state_init(rsx_state* state)
     state->depth_mask = 1;
 
     /* Default cull */
-    state->cull_face = 1; /* BACK */
-    state->front_face = 0; /* CW */
+    /* RSX reset state, as GL: cull BACK, front face CCW. Games that never
+     * send SET_FRONT_FACE (Demon's Souls) rely on the CCW default. */
+    state->cull_face = 0x0405; /* BACK */
+    state->front_face = 0x0901; /* CCW */
 
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
