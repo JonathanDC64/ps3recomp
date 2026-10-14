@@ -293,6 +293,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             const uint32_t nw = ((uint32_t)sp[4] << 24) | ((uint32_t)sp[5] << 16) | ((uint32_t)sp[6] << 8) | sp[7];
             /* Armed by the NEXT transfer, so this PUT's own copy is not trapped. */
             if (s_nw && !s_armed && nw == s_nw) { s_armed = 1; s_arm_pending = s_arm_abs ? s_off : (uint32_t)ea + s_off; } } } }
+    /* SPU_PUT_WATCH=<hex lo>-<hex hi>: log every PUT landing in [lo, hi) with
+     * the image, pc and first 16 source bytes -- who writes a ring or queue
+     * buffer, and what. */
+    { static int s_pw = -1; static uint32_t s_pwlo, s_pwhi;
+      if (s_pw < 0) { const char* e = getenv("SPU_PUT_WATCH"); s_pw = 0;
+          if (e) { char* d; s_pwlo = (uint32_t)strtoul(e, &d, 16);
+                   if (*d == '-') { s_pwhi = (uint32_t)strtoul(d + 1, 0, 16); s_pw = 1; } } }
+      if (s_pw && mfc_is_put(cmd) && (uint32_t)ea < s_pwhi && (uint32_t)ea + size > s_pwlo) {
+          const uint8_t* sp = &spu->ls[lsa & SPU_LS_MASK];
+          fprintf(stderr, "[put-watch] img=%d pc=0x%05X ea=0x%08X size=%u "
+                      "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size,
+                      sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7],
+                      sp[8], sp[9], sp[10], sp[11], sp[12], sp[13], sp[14], sp[15]); } }
     if (s_arm_pending) {
         static int s_seen = 0;
         if (s_seen++) { extern void ppu_guard_page_rearm(uint32_t, int);

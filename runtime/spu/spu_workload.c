@@ -482,6 +482,22 @@ int spu_taskset_job_stale(void)
     return t_job_ts && spu_taskset_gen(t_job_ts) != t_job_gen;
 }
 
+/* SPURS_TS_TRACE=<hex taskset ea> (or 1 for every taskset): log each task
+ * start, exit, signal and WAIT_SIGNAL of that taskset, timestamped, without
+ * PS3_VERBOSE -- which is too slow to reach a level. Answers "did the tasks
+ * that feed this PPU wait still run, and what did the last one do". */
+static int ts_trace(uint32_t taskset_ea)
+{
+    static int init = 0; static uint32_t want = 0;
+    if (!init) { const char* e = getenv("SPURS_TS_TRACE");
+                 want = e ? (uint32_t)strtoul(e, NULL, 16) : 0; init = 1; }
+    return want && taskset_ea && (want == 1 || want == taskset_ea);
+}
+#define TS_TRACE(ea, ...) do { if (ts_trace(ea)) { \
+    extern unsigned long long ps3_ms_now(void); \
+    fprintf(stderr, "[ts-trace] t=%llu ", ps3_ms_now()); \
+    fprintf(stderr, __VA_ARGS__); fflush(stderr); } } while (0)
+
 /* Start task `t` of a taskset from its task_info ELF (ts_lock held). */
 static void ts_start_task_locked(uint32_t taskset_ea, uint8_t* ts, uint8_t* run,
                                  uint32_t t, const char* why)
@@ -501,6 +517,7 @@ static void ts_start_task_locked(uint32_t taskset_ea, uint8_t* ts, uint8_t* run,
     run[t / 8] |= m;
     if (ps3_log_verbose()) fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X (%s)\n",
                                    t, taskset_ea, elf, why);
+    TS_TRACE(taskset_ea, "start task %u elf=0x%08X (%s)\n", t, elf, why);
     g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
     spu_workload_set_dispatch_task(taskset_ea, t);
     spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
@@ -509,6 +526,8 @@ static void ts_start_task_locked(uint32_t taskset_ea, uint8_t* ts, uint8_t* run,
 static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 {
     extern uint8_t* vm_base;
+    TS_TRACE(taskset_ea, "task %u exited%s\n", done_task,
+             spu_taskset_job_stale() ? " (stale taskset)" : "");
     if (spu_taskset_job_stale()) return;   /* its taskset is gone: start nothing */
     ts_lock();
     uint8_t* ts = vm_base + taskset_ea;
@@ -598,6 +617,7 @@ static void spu_async_run(spu_async_job* j)
         return;
     }
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+    TS_TRACE(j->taskset_ea, "task %u running image=%d\n", j->taskid, j->image_id);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
@@ -1289,6 +1309,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
+    TS_TRACE(taskset_ea, "signal task %u\n", taskId);
 #else
     pthread_mutex_lock(&s_sig_lock);
     spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
@@ -1358,6 +1379,7 @@ void spu_taskset_line_committed(uint32_t line)
 int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
+    TS_TRACE(taskset_ea, "task %u WAIT_SIGNAL\n", taskId);
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
