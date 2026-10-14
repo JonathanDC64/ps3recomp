@@ -6954,15 +6954,17 @@ static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u
      * attribute of the first 4 vertices as the VP reads them, and the
      * non-zero constant range. RSX_DBG_VTX=fp:<hex>[:n] matches the fragment
      * program instead and prints vertex 0 of the next n draws (default 80):
-     * one line per quad of a HUD. For "drawn but invisible" questions. */
-    { static unsigned gen; static u32 want = 0, by_fp = 0; static int n = 0, lim = 8;
+     * one line per quad of a HUD. fp:<hex>:<n>:<v> prints v vertices of each.
+     * For "drawn but invisible" and "drawn in the wrong place" questions. */
+    { static unsigned gen; static u32 want = 0, by_fp = 0, fp_verts = 1; static int n = 0, lim = 8;
       if (gen != ps3_env_gen) { const char* dv = getenv("RSX_DBG_VTX");
           gen = ps3_env_gen; n = 0; by_fp = dv && strncmp(dv, "fp:", 3) == 0;
           if (by_fp) { char* e; want = (u32)strtoul(dv + 3, &e, 16);
-                       lim = *e == ':' ? atoi(e + 1) : 80; }
+                       lim = *e == ':' ? (int)strtol(e + 1, &e, 10) : 80;
+                       fp_verts = *e == ':' ? (u32)atoi(e + 1) : 1; }
           else { want = dv ? (u32)strtoul(dv, NULL, 16) : 0; lim = 8; } }
       if (want && (by_fp ? state->shader_program == want : s_d3d.cur_texs[0].raw == want) && n < lim) { n++;
-        if (by_fp) nverts = nverts ? 1 : 0;
+        if (by_fp && nverts > fp_verts) nverts = fp_verts;
         if (by_fp) fprintf(stderr, "[DBGVTX] #%d t0=0x%08X", n, s_d3d.cur_texs[0].raw);
         fprintf(stderr, "[DBGVTX] fp=0x%08X first=%u verts=%u", state->shader_program, first, nverts);
         { int lo = -1, hi = -1, nz = 0;
@@ -6971,7 +6973,7 @@ static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u
               if (m[0] || m[1] || m[2] || m[3]) { if (lo < 0) lo = r; hi = r; nz++; }
           }
           fprintf(stderr, " | constants: %d non-zero, slots %d..%d%c", nz, lo, hi, 10); }
-        for (u32 k = 0; k < nverts && k < 4; k++) {
+        for (u32 k = 0; k < nverts && (by_fp || k < 4); k++) {
             fprintf(stderr, "  v%u", k);
             for (int a = 0; a < 16; a++)
                 if (state->vertex_attribs[a].enabled)
