@@ -226,7 +226,7 @@ static u32 s_cb_used, s_cb_cap;
 #define MTL_VP_CACHE     1024
 #define MTL_FP_CACHE     2048
 #define MTL_PSO_CACHE    2048
-#define MTL_FP_MAX_BYTES 4096u     /* bound on a fragment program, as D3D12 */
+#define MTL_FP_MAX_BYTES RSX_FP_MAX_BYTES     /* bound on a fragment program, as D3D12 */
 
 typedef struct { u32 hash; id<MTLFunction> fn; } MtlVpEntry;
 typedef struct { u64 key;  id<MTLFunction> fn; u32 nconst; } MtlFpEntry;

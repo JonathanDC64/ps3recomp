@@ -21,7 +21,13 @@ extern "C" {
 #define RSX_FP_BUFFERED_CONSTANTS_API 1
 #define RSX_FP_MAX_INLINE_CONSTANTS 2048u
 
-/* Source capacity for native backends decoding up to 4096 bytecode bytes.
+/* How far the backends scan guest memory for a fragment program's END bit.
+ * Every walk stops at END, so this bounds only a corrupt program. It was 4096,
+ * which Demon's Souls's character shaders pass (4352-4736 bytes): with no END
+ * in reach the decompile failed and the player drew black. RPCS3 has no cap. */
+#define RSX_FP_MAX_BYTES (64u * 1024u)
+
+/* Source capacity for native backends decoding a fragment program.
  * Predicated instructions can expand beyond 32 KiB of HLSL. This is a caller
  * allocation size, not a limit imposed by the decompiler API. */
 #define RSX_FP_HLSL_BUFFER_SIZE (256u * 1024u)

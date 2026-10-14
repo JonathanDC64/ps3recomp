@@ -2369,7 +2369,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * so hashing them made the pipeline key move every draw. */
     u32 uhash;
     {
-        u32 usz = rsx_fp_program_size(vm_base + off, 4096);
+        u32 usz = rsx_fp_program_size(vm_base + off, RSX_FP_MAX_BYTES);
         if (usz == 0) usz = 64;
         fp_seen_note(off, usz);
         s_perf_pso_hashbytes += (int)usz;
@@ -2378,7 +2378,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
         } else {
-            uhash = rsx_fp_code_hash(vm_base + off, 4096);
+            uhash = rsx_fp_code_hash(vm_base + off, RSX_FP_MAX_BYTES);
         }
     }
 
@@ -2463,7 +2463,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * surfaces drew black or saturated). The cube mask goes to the decompiler
      * so cube units are declared and sampled as cubes. */
     u32 kcount = 0;
-    int n = rsx_fp_decompile_buffered_ex2(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+    int n = rsx_fp_decompile_buffered_ex2(vm_base + off, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
                                           d2c_mask, hlsl, sizeof(hlsl), &kcount);
     int buffered = n > 0 && kcount <= FPCB_KMAX;
     if (n > 0 && !buffered) {
@@ -2472,7 +2472,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         if (said++ < 4)
             fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
                             "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
-        n = rsx_fp_decompile_ex2(vm_base + off, 4096, exp32 ? 0x40u : 0u, cube_mask,
+        n = rsx_fp_decompile_ex2(vm_base + off, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
                                  d2c_mask, hlsl, sizeof(hlsl));
     }
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return vp_fp_insert(&key); }
@@ -3550,7 +3550,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[FPCB_K * 4], FPCB_KMAX);
+                rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_BYTES, &ts[FPCB_K * 4], FPCB_KMAX);
             /* FPK_FP=<hex fp_addr>: that program's constants, each time they
              * change (capped). Shows whether the title's per-material patches
              * reach the draw, for one surface at a time. */

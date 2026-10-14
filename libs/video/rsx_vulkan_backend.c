@@ -1038,7 +1038,7 @@ static int vk_ensure_vertex_buffer(VkDeviceSize bytes)
 #define VK_VP_CACHE      256
 #define VK_FP_CACHE      512
 #define VK_GPIPE_CACHE   512
-#define VK_FP_MAX_BYTES  4096u              /* bound on a fragment program, as Metal/D3D12 */
+#define VK_FP_MAX_BYTES  RSX_FP_MAX_BYTES  /* bound on a fragment program, as Metal/D3D12 */
 #define VK_HLSL_BYTES    (256u * 1024u)
 #define VK_SPV_WORDS     (256u * 1024u)
 #define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u)
