@@ -815,9 +815,20 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
  * path costs one predictable branch. */
 extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+extern "C" void (*g_ppu_resv_line_enter)(uint32_t);   /* spu_channels.c */
+extern "C" void (*g_ppu_resv_line_break)(uint32_t);
+extern "C" void (*g_ppu_resv_line_leave)(uint32_t);
+static void ppu_resv_line_enter(uint32_t line);
+static void ppu_resv_line_break(uint32_t line);
+static void ppu_resv_line_leave(uint32_t line);
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+    if (!g_ppu_resv_line_break) {
+        g_ppu_resv_line_enter = ppu_resv_line_enter;
+        g_ppu_resv_line_leave = ppu_resv_line_leave;
+        g_ppu_resv_line_break = ppu_resv_line_break;
+    }
     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
 }
@@ -1037,6 +1048,48 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
                            __builtin_return_address(0));
     }
     return ok;
+}
+
+/* SPU lock-line commits vs PPU reservations (hooks declared in spu_channels.c).
+ *
+ * A PPU reservation covers the whole 128-byte line on Cell, so an SPU PUTLLC
+ * to any word of the line makes the PPU's next stwcx./stdcx. fail. Without it,
+ * Demon's Souls lost a wakeup in its SPURS queue: the PPU popper reserved the
+ * pop word, read the push word, saw the queue empty and stored "waiting" into
+ * the pop word; an SPU push committed the push word in between, saw no waiter
+ * and sent no event; the value-CAS on the pop word still succeeded, and the
+ * PPU slept on a queue that held a record.
+ *
+ * The SPU takes the store-conditional slot locks of all eight 16-byte blocks
+ * of the line around its compare and commit, so a PPU store-conditional on the
+ * line runs entirely before (the SPU's compare then sees its store) or after
+ * (its reservation is gone). The line is 128-aligned, so the eight slots are
+ * consecutive and never wrap; a PPU thread holds one slot at most, so taking
+ * them in ascending order cannot deadlock against it or another SPU. */
+static void ppu_resv_line_enter(uint32_t line)
+{
+    if (resv_off()) return;
+    for (uint32_t b = 0; b < 128; b += 16) resv_lock(resv_slot((line & ~127u) + b));
+}
+static void ppu_resv_line_leave(uint32_t line)
+{
+    if (resv_off()) return;
+    for (uint32_t b = 0; b < 128; b += 16) resv_unlock(resv_slot((line & ~127u) + b));
+}
+static void ppu_resv_line_break(uint32_t line)
+{
+    /* Order the commit's stores before reading the reservations, so a PPU that
+     * read the line before the commit is seen here. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const uint32_t lo = line & ~127u;
+    long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
+    for (long i = 0; i < n; i++) {
+        ppu_context* c = g_resv_ctxs[i];
+        if (!c) continue;
+        const uint64_t r = *(volatile uint64_t*)&c->reserve_addr;
+        if (r < PPU_RESV_INVALID && (uint32_t)r - lo < 128u)
+            c->reserve_addr = PPU_RESV_INVALID;
+    }
 }
 
 /* ---- page-guard watchpoint (find raw memcpy/vector stores that vm_write* can't

@@ -76,6 +76,17 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* PPU reservations on a line an SPU atomic writes (installed by ppu_loader.cpp).
+ * On Cell the reservation granule is the whole 128-byte line: a PUTLLC that
+ * changes ANY word of it kills a PPU lwarx/ldarx reservation on another word.
+ * The PPU's stwcx. is emulated as a compare-and-swap of its own word, so
+ * without this a PPU commit built on a stale read of a neighbouring word
+ * succeeded. enter/leave take the PPU store-conditional locks for the line
+ * (before the lock-line lock, the order the PPU side uses), so no stwcx. can
+ * fall between the compare and the commit; break drops the reservations. */
+void (*g_ppu_resv_line_enter)(uint32_t line) = 0;
+void (*g_ppu_resv_line_break)(uint32_t line) = 0;
+void (*g_ppu_resv_line_leave)(uint32_t line) = 0;
 /* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
 void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
@@ -855,12 +866,14 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            if (g_ppu_resv_line_break) g_ppu_resv_line_break(ea);
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -946,6 +959,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
+        if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
@@ -954,10 +968,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
+        if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
         spu_lockline_lock();
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        if (g_ppu_resv_line_break) g_ppu_resv_line_break(ea);
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a
@@ -966,6 +982,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
         spu_lockline_unlock();
+        if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         return 1;
