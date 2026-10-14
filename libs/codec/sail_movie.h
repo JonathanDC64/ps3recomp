@@ -55,6 +55,11 @@ int sail_movie_audio(SailMovie* m, float* dst, int frames, int big_endian, int* 
 
 void sail_movie_close(SailMovie* m);
 
+/* Nonzero when a track of more than two channels is handed out as stereo
+ * (SAIL_AUDIO_DOWNMIX, default on). The stream database shows the title the
+ * same channel count, so it sets up the matching mix. */
+int sail_movie_downmix(void);
+
 #ifdef __cplusplus
 }
 #endif

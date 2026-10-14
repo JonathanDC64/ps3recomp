@@ -21,6 +21,8 @@
  */
 #include "sail_movie.h"
 
+#include <cstdlib>
+
 #ifdef _WIN32
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -76,6 +78,10 @@ struct SailMovie {
 
     std::vector<float> aring;
     size_t      a_rd = 0, a_cnt = 0;          /* in floats */
+    int         a_half = -1;                  /* first byte of a sample split across packets */
+    int         src_ch = 0;                   /* channels in the file (info.channels: handed out) */
+    float       a_frame[8] = {};              /* one input frame being assembled */
+    int         a_fill = 0;
 
     LARGE_INTEGER qf{}, t0{};
     bool        started = false;
@@ -115,7 +121,8 @@ bool read_header(SailMovie* m)
             const int fs = d[3] & 0x0F, bits = d[4] >> 6;
             if (fs == 1 && bits == 1) {          /* 48 kHz, 16-bit: all PAMF LPCM in practice */
                 m->lpcm_sub = s[5];
-                m->info.channels = d[2] & 0x0F;
+                m->src_ch = d[2] & 0x0F;
+                m->info.channels = m->src_ch;
                 m->info.rate = 48000;
             } else {
                 fprintf(stderr, "[sail_movie] LPCM fs code %d bits code %d not handled%c", fs, bits, 10);
@@ -295,18 +302,55 @@ void feed_video(SailMovie* m, const uint8_t* p, size_t n)
 
 /* ---- audio ------------------------------------------------------------ */
 
+/* One input frame -> the frame handed to the title. PAMF LPCM 5.1 is L R C
+ * Ls Rs LFE. Demon's Souls reads only stereo correctly (a 5.1 advert came out
+ * as a mono mash at -45 dB), so by default a track of more than two channels
+ * is folded to stereo -- ITU-R BS.775 weights, scaled so it cannot clip, LFE
+ * dropped. SAIL_AUDIO_DOWNMIX=0 hands 5.1 over in the order cellSail's layout
+ * 8 promises (L C R Ls Rs LFE), for a title that mixes it itself. */
+void audio_frame(SailMovie* m, const float* f, float* out)
+{
+    const int ch = m->src_ch;
+    if (m->info.channels == ch) {
+        for (int c = 0; c < ch; c++) out[c] = f[c];
+        if (ch == 6) { out[1] = f[2]; out[2] = f[1]; }
+        return;
+    }
+    const float k = 0.70710678f;
+    const float c = ch > 2 ? f[2] : 0.0f;
+    const float ls = ch > 3 ? f[3] : 0.0f, rs = ch > 4 ? f[4] : ls;
+    const float g = 1.0f / (1.0f + k + (ch > 3 ? k : 0.0f));
+    out[0] = (f[0] + k * c + k * ls) * g;
+    out[1] = (f[1] + k * c + k * rs) * g;
+}
+
 void feed_lpcm(SailMovie* m, const uint8_t* p, size_t n)
 {
-    const int ch = m->info.channels;
-    if (ch <= 0) return;
-    const size_t samples = n / 2;
+    const int ch = m->src_ch, out_ch = m->info.channels;
+    if (ch <= 0 || ch > 8) return;
     std::lock_guard<std::mutex> lk(m->mu);
     const size_t cap = m->aring.size();
-    for (size_t i = 0; i < samples; i++) {
-        const int16_t v = (int16_t)(p[2*i] << 8 | p[2*i+1]);
-        if (m->a_cnt == cap) { m->a_rd = (m->a_rd + 1) % cap; m->a_cnt--; }   /* drop oldest */
-        m->aring[(m->a_rd + m->a_cnt) % cap] = v * (1.0f / 32768.0f);
-        m->a_cnt++;
+    /* The PCM runs on across PES packets: a payload can end in the middle
+     * of a sample (odd length), and its other byte opens the next one. Each
+     * packet was decoded on its own, so after an odd one every sample was read
+     * a byte off -- full-scale white noise until the next odd packet put it
+     * back, which is what the movies played for seconds at a time. */
+    for (size_t i = 0; i < n; i++) {
+        if (m->a_half < 0) { m->a_half = p[i]; continue; }
+        m->a_frame[m->a_fill++] = (int16_t)(m->a_half << 8 | p[i]) * (1.0f / 32768.0f);
+        m->a_half = -1;
+        if (m->a_fill < ch) continue;
+        m->a_fill = 0;
+        /* Full (the title stopped pulling sound): drop the oldest whole
+         * frame -- a single sample would swap the channels from then on. */
+        if (m->a_cnt + (size_t)out_ch > cap) {
+            m->a_rd = (m->a_rd + (size_t)out_ch) % cap;
+            m->a_cnt -= (size_t)out_ch;
+        }
+        float out[8];
+        audio_frame(m, m->a_frame, out);
+        for (int c = 0; c < out_ch; c++)
+            m->aring[(m->a_rd + m->a_cnt++) % cap] = out[c];
     }
 }
 
@@ -371,11 +415,12 @@ extern "C" SailMovie* sail_movie_open(const char* host_path, int coding)
         delete m;
         return nullptr;
     }
+    if (m->src_ch > 2 && sail_movie_downmix()) m->info.channels = 2;
     if (m->info.channels > 0) m->aring.resize((size_t)m->info.rate * m->info.channels * kAudioSeconds);
     QueryPerformanceFrequency(&m->qf);
     m->th = std::thread(demux, m);
-    fprintf(stderr, "[sail_movie] %s: video %dx%d @ %d/%d, LPCM %d ch%c", host_path,
-            m->info.width, m->info.height, m->info.fps_num, m->info.fps_den, m->info.channels, 10);
+    fprintf(stderr, "[sail_movie] %s: video %dx%d @ %d/%d, LPCM %d ch (handed out as %d)%c", host_path,
+            m->info.width, m->info.height, m->info.fps_num, m->info.fps_den, m->src_ch, m->info.channels, 10);
     return m;
 }
 
@@ -467,3 +512,9 @@ extern "C" int sail_movie_audio(SailMovie*, float*, int, int, int* eos) { *eos =
 extern "C" void sail_movie_close(SailMovie*) {}
 
 #endif
+
+extern "C" int sail_movie_downmix(void)
+{
+    static const int on = [] { const char* e = getenv("SAIL_AUDIO_DOWNMIX"); return !e || atoi(e) != 0; }();
+    return on;
+}

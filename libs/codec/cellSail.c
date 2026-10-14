@@ -897,6 +897,17 @@ s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
     void* hdr = sail_read_pamf_header(s_descs[d].uri, &size);
     if (!hdr)
         return (s32)CELL_SAIL_ERROR_INVALID_FD;
+    /* Movie sound comes out as stereo when it is downmixed (sail_movie.h).
+     * Demon's Souls reads the LPCM channel count from this reader and sets
+     * up a 5.1 or a stereo mix to match, so it must see the same 2. */
+    if (sail_movie_downmix() && size >= 0x88) {
+        u8* h = (u8*)hdr;
+        for (u32 i = 0; i < h[0x87] && 0x88 + (i + 1) * 48 <= size; i++) {
+            u8* e = h + 0x88 + i * 48;
+            if (e[0] == 0x80 /* LPCM */ && (e[16 + 2] & 0x0F) > 2)
+                e[16 + 2] = (u8)((e[16 + 2] & 0xF0) | 2);
+        }
+    }
     const s32 rc = pamf_reader_init_host((u32)(uintptr_t)dbAddr, hdr, size);
     if (rc != CELL_OK)
         printf("[cellSail] PAMF header of %s rejected: 0x%08X\n", s_descs[d].uri, (u32)rc);
