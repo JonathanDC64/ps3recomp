@@ -9,6 +9,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "ps3emu/ps3_knob.h"
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
@@ -191,7 +192,7 @@ static u32 s_flip_handler_opd     = 0;
 static int gcm_flipcb_on_tick_only(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("GCM_FLIPCB_ONTICK") ? 1 : 0;
+    PS3_KNOB(v, getenv("GCM_FLIPCB_ONTICK") ? 1 : 0);
     return v;
 }
 
@@ -704,7 +705,7 @@ void cellGcm_request_tick(void)
      * JUMP out of it. Off by default: a title whose FIFO never drains would
      * stop flipping entirely. */
     { static int need = -1;
-      if (need < 0) { const char* e = getenv("GCM_FLIP_NEEDS_FIFO"); need = e ? atoi(e) : 0; }
+      PS3_KNOB(need, ps3_env_int("GCM_FLIP_NEEDS_FIFO", 0));
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
           GCM_PENDING_SET(s_fifo_getoff == put ? 3 : 1);
@@ -725,7 +726,7 @@ void ppu_gcm_pump(void)
     u64 user = GCM_USER_PENDING_TAKE();
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
-      if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
+      PS3_KNOB(d, getenv("GCM_PUMP_DBG") ? 1 : 0);
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
@@ -978,7 +979,7 @@ static void nv3089_blit(void)
        * no mip levels, which shows up as aliased blocky tiles and a noise patch
        * where a minified surface should be, and the shell that samples the
        * pyramid draws untextured. NV309E_BLIT=0 disables. */
-      if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
+      PS3_KNOB(en, ps3_env_int("NV309E_BLIT", 1));
       if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
           (1u << l2w) == out_w && (1u << l2h) == out_h) {
         int sl = (s_nv3089.src_dma != 0xFEED0001u);
@@ -1002,7 +1003,7 @@ static void nv3089_blit(void)
               }
           } }
         { static int _n = 0; static int cap = -1;
-          if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+          PS3_KNOB(cap, ps3_env_int("NV3089_DBG", 0));
           if (cap && _n < cap) { _n++;
             printf("[NV3089] swizzled %ux%u fmt=0x%X src=0x%08X -> NV309E dst=0x%08X%c",
                    out_w, out_h, f, src2, dst2, 10); } }
@@ -1080,7 +1081,7 @@ static void nv3089_blit(void)
         nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
     }
     { static int _n = 0; static int cap = -1;
-      if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("NV3089_DBG", 0));
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
@@ -1094,7 +1095,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
      * subchannel is silently dropped -- which looks like a blit using stale
      * destination state rather than like missing state. */
     { static int tr = -1;
-      if (tr < 0) { const char* e = getenv("GCM2D_TRACE"); tr = e ? atoi(e) : 0; }
+      PS3_KNOB(tr, ps3_env_int("GCM2D_TRACE", 0));
       if (tr) {
           static u8 seen[8][1024]; static u64 n = 0;
           u32 mi = (method >> 2) & 1023;
@@ -1204,7 +1205,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
     /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
      * only that SOMETHING was unhandled, not enough to implement it. */
     static int warned = 0, wcap = -1;
-    if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
+    PS3_KNOB(wcap, ps3_env_int("GCM2D_DBG", 8));
     if (warned < wcap) { warned++;
         printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
     if (0)
@@ -1476,7 +1477,7 @@ static void gcm_fifo_dump_around(u32 getoff)
 
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
-    { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
+    { static int _d = -1; PS3_KNOB(_d, getenv("GCM_REFLOG") ? 1 : 0);
       if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
@@ -1511,7 +1512,7 @@ static void gcm_ref_publish_one(void)
     /* stderr, deliberately: [DRAIN] uses printf and stdout is block-buffered
      * when redirected, so its interleaving with an stderr probe is not a
      * timeline. Same stream = same ordering. */
-    { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_REFPUB") ? 1 : 0;
+    { static int _rd = -1; PS3_KNOB(_rd, getenv("GCM_REFPUB") ? 1 : 0);
       if (_rd) { static unsigned long _n = 0; if (++_n <= 24)
         fprintf(stderr, "[refpub] t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
@@ -1699,7 +1700,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * somewhere get can never reach. The [FIFOSTEP] trace only ever fired on a
      * bad branch, which is exactly the case where the drift is silent. */
     { static int snap = -1;
-      if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
+      PS3_KNOB(snap, ps3_env_int("GCM_FIFO_SNAP", 0));
       if (snap > 0 && put && put != s_fifo_getoff) {   /* idle passes say nothing */
           snap--;
           fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
@@ -1762,7 +1763,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             /* GCM_FLIPCTX=<n>: the words around the first n flip words -- what a
              * frame's tail looks like (park, JUMP to the next frame, ...). */
             { static int fc = -1, fn = 0;
-              if (fc < 0) { const char* e = getenv("GCM_FLIPCTX"); fc = e ? atoi(e) : 0; }
+              PS3_KNOB(fc, ps3_env_int("GCM_FLIPCTX", 0));
               if (fn < fc) { fn++;
                   fprintf(stderr, "[flipctx] #%d io=%08X put=%08X:", fn, s_fifo_getoff, put);
                   for (int k = -6; k <= 10; k++) {
@@ -1777,7 +1778,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * this counter still climbing while presents do not is a runtime
              * problem, both stopping together is the guest's. */
             { static unsigned long long flips = 0; static int dbg = -1;
-              if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+              PS3_KNOB(dbg, getenv("GCM_FLIPCOUNT") ? 1 : 0);
               ++flips; g_gcm_flip_words++;
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
@@ -1807,7 +1808,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
 
         if (type == 1) {                       /* JUMP: 0x20000000 | offset */
-            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+            { static int _rd = -1; PS3_KNOB(_rd, getenv("GCM_RECDBG") ? 1 : 0);
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
             { u32 tgt = w & 0x1FFFFFFCu;
@@ -1854,7 +1855,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * and any handler that derives the constant slot from the method
              * offset writes them all on top of each other. */
             { static int tf = -1;
-              if (tf < 0) { const char* e = getenv("TCONST_FIFO"); tf = e ? atoi(e) : 0; }
+              PS3_KNOB(tf, ps3_env_int("TCONST_FIFO", 0));
               if (tf && subch == 0) {
                   static u32 hist[2048]; static u32 tot[2048]; static int dumped = 0;
                   u32 mi = (method >> 2) & 2047;
@@ -1897,7 +1898,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * ever writes would wedge the drain permanently, and RELEASE on
              * its own is the half that unblocks a waiting guest. */
             static int blk = -1;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
+            PS3_KNOB(blk, ps3_env_int("GCM_SEMA_ACQUIRE", 0));
             if (blk) { sem_blocked = 1; break; }
         }
                 }
@@ -1916,7 +1917,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * USER_CMD interrupt, which is what ps1_netemu's flip path
                  * blocks on. */
                 { static int sd = -1; static unsigned long s7 = 0;
-                  if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
+                  PS3_KNOB(sd, getenv("GCM_SUBCH7") ? 1 : 0);
                   if (sd && subch == 7 && (s7++ < 16))
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
@@ -1960,7 +1961,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
                  */
                 static int s1_2d = -1;
-                if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
+                PS3_KNOB(s1_2d, ps3_env_int("GCM_SUBCH1_2D", 0));
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -2003,7 +2004,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * for any run, live engine or not, so the method stream and the
                  * backend's draw callbacks can be compared in one measurement. */
                 { static int fdbg = -1;
-                  if (fdbg < 0) fdbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
+                  PS3_KNOB(fdbg, getenv("RSX_LIVE_FEED_DBG") ? 1 : 0);
                   if (fdbg) {
                       static long long n_be = 0, n_va = 0, n_ia = 0, tick = 0;
                       const u32 cm = m & 0x1FFCu;
@@ -2121,7 +2122,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * GCM_WEDGE_FLIPS (default 64) flips without a label move report;
      * 0 turns it off. */
     { static int lim = -1; static u32 lab0 = 0xFFFFFFFFu, flips0 = 0; static ULONGLONG t_lab = 0; static int said = 0, armed_out = 0;
-      if (lim < 0) { const char* e = getenv("GCM_WEDGE_FLIPS"); lim = e ? atoi(e) : 64; }
+      PS3_KNOB(lim, ps3_env_int("GCM_WEDGE_FLIPS", 64));
       if (lim > 0 && said < 6 && vm_base) {
           const u32 lab = vm_read32(0x20000FF0u); const ULONGLONG now = GetTickCount64();
           if (lab != lab0) {
@@ -2286,7 +2287,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * walker says it is drained: is the title reading `get`, or something else?
      * If the overflow survives this, `get` is not what it consults. */
     { static int eq = -1;
-      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+      PS3_KNOB(eq, ps3_env_int("GCM_GET_EQ_PUT", 0));
       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
 
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
@@ -2358,7 +2359,7 @@ static void gcm_fifo_next_fragment(u32 ctx_ea)
         Sleep(1);
     }
     static int s_recdbg = -1;
-    if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+    PS3_KNOB(s_recdbg, getenv("GCM_RECDBG") ? 1 : 0);
     if (s_recdbg)
         fprintf(stderr, "[REC-FRAG] cur=%08X -> frag %08X..%08X put=%08X get=%08X spins=%d\n",
                 current, nb, ne, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), s_fifo_getoff, spins);
@@ -2376,7 +2377,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
     static int s_recdbg = -1;
-    if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+    PS3_KNOB(s_recdbg, getenv("GCM_RECDBG") ? 1 : 0);
     if (s_recdbg)
         fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
                 GetCurrentThreadId(), begin, current,
@@ -2495,7 +2496,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
      * all (that counter stays at zero for the whole run); it flips through
      * cellGcmSetFlip, so this is where its frame rate actually is. */
     { static int dbg = -1;
-      if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
+      PS3_KNOB(dbg, getenv("GCM_FLIPCOUNT") ? 1 : 0);
       if (dbg) {
           extern unsigned long long ps3_ms_now(void);
           static unsigned long long n = 0, t0 = 0;
@@ -2769,7 +2770,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
      * at an offset nothing ever writes usually means the offset came from an EA
      * in a space we classified wrongly, and that is only visible here. */
     { static int cap = -1, k = 0;
-      if (cap < 0) { const char* e = getenv("A2O_DBG"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("A2O_DBG", 0));
       if (cap && k < cap) { k++;
         u32 nz = 0;
         for (u32 i = 0; i < 0x400u; i += 13) if (vm_base && vm_base[address + i]) nz++;
@@ -2866,7 +2867,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     vm_write32(off_ea, 0);
-    { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
+    { static int _d = -1; PS3_KNOB(_d, getenv("A2O_FAILDBG") ? 1 : 0);
       if (_d) { static int _n = 0; if (_n++ < 12)
           fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
                   address, 10); } }

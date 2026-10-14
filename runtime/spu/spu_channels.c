@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -239,7 +240,7 @@ void spu_halt(spu_context* ctx)
  * YDKJ_E60. Called from the lifted taskset policy. */
 void spu_dbg_e60(spu_context* ctx)
 {
-    static int s_e = -1; if (s_e < 0) s_e = getenv("YDKJ_E60") ? 1 : 0;
+    static int s_e = -1; PS3_KNOB(s_e, getenv("YDKJ_E60") ? 1 : 0);
     if (!s_e) return;
     static int _d = 0; if (_d++ >= 6) return;
     const uint8_t* L = ctx->ls;
@@ -325,7 +326,7 @@ void spu_stop(spu_context* ctx)
      * default DO NOT halt. Env YDKJ_STOP_HALT forces a hard halt (longjmp) for
      * A/B experiments (it makes the kernel terminate, which the game restarts). */
     static int s_halt = -1;
-    if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+    PS3_KNOB(s_halt, getenv("YDKJ_STOP_HALT") ? 1 : 0);
     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
     if (s_halt) spu_halt(ctx);
 }
@@ -561,7 +562,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_POLLTRACE") ? 1 : 0);
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
         if ((++s_n % 2000000) == 0 || ea != s_lastea) {
           if ((s_n % 2000000) == 0)
@@ -638,7 +639,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
      * touches my taskset (0x0F000000), to watch the task-activation state machine
      * (why task0 isn't selected+first-run). running@0 ready@0x10 pending@0x20
      * enabled@0x30 signalled@0x40 waiting@0x50 (each 16B; word0 = MSB, task0=bit127). */
-    { static int s_td = -1; if (s_td < 0) s_td = (getenv("YDKJ_CRI_CHAIN") && getenv("SPU_ATOMTRACE")) ? 1 : 0;
+    { static int s_td = -1; PS3_KNOB(s_td, (getenv("YDKJ_CRI_CHAIN") && getenv("SPU_ATOMTRACE")) ? 1 : 0);
       if (s_td && ea >= 0x0F000000u && ea < 0x0F001900u) {
         extern uint8_t* vm_base;
         static int _t=0; if (vm_base && _t++ < 24) {
@@ -682,7 +683,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
       if (s_ae == 1 && ((uint32_t)ea & ~127u) == s_aea) {
           static int _n = 0, s_cap = -1;
           /* SPU_ATOM_EA_MAX=<n>: lines to print (default 48, 0 = unlimited). */
-          if (s_cap < 0) { const char* m = getenv("SPU_ATOM_EA_MAX"); s_cap = m ? atoi(m) : 48; }
+          PS3_KNOB(s_cap, ps3_env_int("SPU_ATOM_EA_MAX", 48));
           if (!s_cap || _n++ < s_cap) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
@@ -794,7 +795,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * late, and a busy consumer (whose line keeps
          * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it. */
         { static int s_nap = -1;
-          if (s_nap < 0) { const char* e = getenv("SPU_LLAR_NAP"); s_nap = e ? atoi(e) : 1; }
+          PS3_KNOB(s_nap, ps3_env_int("SPU_LLAR_NAP", 1));
           static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
           static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
           if (s_nap) {
@@ -888,7 +889,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * lock-line lock, which is what spu_coh_notify_write expects. */
             ctx->resv_valid = 0;
             { static int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              PS3_KNOB(s_w, getenv("SPU_PUTLLC_WHY") ? 1 : 0);
               if (s_w) { static unsigned long long n;
                   if ((++n % 100000) == 1)
                       /* ...and the first four words of the line being written.
@@ -914,7 +915,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
              * "failed" alone cannot distinguish a lost reservation from a line
              * another agent is rewriting -- opposite causes, opposite fixes. */
             { static int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              PS3_KNOB(s_w, getenv("SPU_PUTLLC_WHY") ? 1 : 0);
               if (s_w) {
                   static unsigned long long n_noresv, n_ea, n_line;
                   if (!ctx->resv_valid)            n_noresv++;
@@ -1065,17 +1066,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * depth climbs and stays, nobody is polling and the message is stranded.
          * That is the difference between "the PPU is slow" and "the PPU never
          * looks", which no other probe here distinguishes. */
-        { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
+        { static int _d = -1; PS3_KNOB(_d, getenv("SPU_DBG_MBOX") ? 1 : 0);
           if (_d) { static unsigned long _n = 0; if (++_n <= 24)
             fprintf(stderr, "[spu-outmbox] spu=%X wrote 0x%08X depth=%u\n",
                     ctx->spu_id, v, (unsigned)ctx->ch_out_mbox.count); } }
-        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_MBOXTRACE") ? 1 : 0;
+        { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_MBOXTRACE") ? 1 : 0);
           if (s_t) fprintf(stderr, "[spu-mbox] OUT  grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
         /* Plain mailbox data is consumed by the following interrupt request. */
         break;
     case SPU_WrOutIntrMbox:
-        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_MBOXTRACE") ? 1 : 0;
+        { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_MBOXTRACE") ? 1 : 0);
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }
         if (g_spu_user_event_hook && g_spu_user_event_hook(ctx, v)) break;
@@ -1127,7 +1128,7 @@ int g_spu_force_ch_block = 0;
 static int yz_ch_block(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("SPU_CH_BLOCK") ? 1 : 0;
+    PS3_KNOB(v, getenv("SPU_CH_BLOCK") ? 1 : 0);
     return v || g_spu_force_ch_block;
 }
 
@@ -1257,7 +1258,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 
     uint32_t v = 0;
 
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_POLLTRACE") ? 1 : 0);
       if (s_t) { static uint64_t s_c[10] = {0}; static uint64_t s_tot = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdSigNotify1)?1:(channel==SPU_RdSigNotify2)?2:
                 (channel==SPU_RdDec)?3:(channel==SPU_RdEventStat)?4:(channel==SPU_RdEventMask)?5:
@@ -1447,7 +1448,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
               for (int i = 0; i < 128; i++) if (c[i])
                   fprintf(stderr, "   rchcnt ch%-3d %llu%c", i, c[i], 10);
               fflush(stderr); } } }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_POLLTRACE") ? 1 : 0);
       if (s_t) { static uint64_t s_cnt[8] = {0}; static uint64_t s_total = 0;
         int b = (channel==SPU_RdInMbox)?0:(channel==SPU_RdEventStat)?1:(channel==SPU_RdSigNotify1)?2:
                 (channel==SPU_RdSigNotify2)?3:(channel==MFC_RdTagStat)?4:(channel==SPU_WrOutMbox)?5:
@@ -1981,7 +1982,7 @@ static void spu_ef_deliver_owed(spu_context* ctx, uint32_t wobj)
 {
     (void)ctx;
     static int s_od = -1;
-    if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+    PS3_KNOB(s_od, getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0);
     if (!s_od || !wobj || !vm_base) return;
     extern uint16_t spu_ef_bits_take(uint32_t);
     uint16_t bits = spu_ef_bits_take(wobj);
@@ -2013,7 +2014,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
      * caller does shufb(arg,...) -> stqd 0x2FD0 and only then sets r3 = number
      * (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller
      * leftovers and hides what the task actually asked for. */
-    { static int s_sa = -1; if (s_sa < 0) s_sa = getenv("YDKJ_SYSCALL_ARG") ? 1 : 0;
+    { static int s_sa = -1; PS3_KNOB(s_sa, getenv("YDKJ_SYSCALL_ARG") ? 1 : 0);
       if (s_sa) { static int _n = 0; if (_n++ < 40) {
         const uint8_t* a = &ctx->ls[0x2FD0];
         fprintf(stderr, "[spu] syscall num=%u LS[0x2FD0]=%02X%02X%02X%02X %02X%02X%02X%02X"
@@ -2368,7 +2369,7 @@ void spu_indirect_branch(spu_context* ctx)
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
       if (spu_irq_regs_maybe_restore(ctx)) {
-          static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+          static int s_it = -1; PS3_KNOB(s_it, getenv("SPU_IRQTRACE") ? 1 : 0);
           static int _r = 0;
           if (s_it && _r++ < 200)
               fprintf(stderr, "[irq] IRET restore at srr0=0x%05X\n", ctx->pc & SPU_LS_MASK);
@@ -2382,7 +2383,7 @@ void spu_indirect_branch(spu_context* ctx)
             /* Module exit: the workload returned to the kernel (drained/yield).
              * Print gated: fires once per policy run = thousands/sec. */
             g_spurs_pm_exited = 1;
-            { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_PM_TRACE") ? 1 : 0;
+            { static int s_t = -1; PS3_KNOB(s_t, getenv("SPURS_PM_TRACE") ? 1 : 0);
               if (s_t) { static unsigned long _n = 0; unsigned long n = ++_n;
                 if (n <= 64 || (n & 0xFFF) == 0)
                     fprintf(stderr, "[spurs-pm] exit-to-kernel#%lu (r3=0x%08X polls=%u)\n",
@@ -2435,7 +2436,7 @@ void spu_indirect_branch(spu_context* ctx)
      * Inject r4 = taskset EA (0x0F000000) at the policy entry dispatch (this is the
      * exact point before the entry reads r4, after the kernel's arg setup). */
     if (ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID && !getenv("YDKJ_NO_CRI_R4")) {
-        static int s_r4 = -1; if (s_r4 < 0) s_r4 = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
+        static int s_r4 = -1; PS3_KNOB(s_r4, getenv("YDKJ_CRI_CHAIN") ? 1 : 0);
         if (s_r4) {
             /* Force ctxt->taskset @LS 0x27B8 = the REAL game taskset EA on every
              * image-23 branch, so the policy's atomic reads + context-EA computation
@@ -2454,7 +2455,7 @@ void spu_indirect_branch(spu_context* ctx)
      * pages the task's indirect branches land in; dump the set periodically. If
      * coverage stays in the kernel/wait region (~0x13xxx) the decode routine never
      * runs; if it spans a wide high range, decode executes but doesn't output. */
-    { static int s_cov = -1; if (s_cov < 0) s_cov = getenv("SPU_IBCOV") ? 1 : 0;
+    { static int s_cov = -1; PS3_KNOB(s_cov, getenv("SPU_IBCOV") ? 1 : 0);
       if (s_cov && ctx->image_id == 3) {
         static uint8_t pages[64] = {0};   /* 64 pages * 0x1000 = 256KB LS */
         static uint64_t hits = 0;
@@ -2467,7 +2468,7 @@ void spu_indirect_branch(spu_context* ctx)
             for (int i = 0; i < 64; i++) if (pages[i]) p += snprintf(line+p, sizeof(line)-p, " 0x%X", i<<12);
             fprintf(stderr, "%s\n", line); }
       } }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_POLLTRACE") ? 1 : 0);
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_last = 0; static uint64_t s_run = 0;
         if (ctx->pc == s_last) s_run++; else { s_last = ctx->pc; s_run = 1; }
         if ((++s_n % 2000000) == 0)
@@ -3028,14 +3029,14 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
      * arms g_barrier_sync_watch, so the budget covers the post-ticket claim/
      * stage pass instead of boot-time idle polling. */
     { static int s_aw = -1;
-      if (s_aw < 0) s_aw = getenv("SPU_TRACE_AT_WALL") ? 1 : 0;
+      PS3_KNOB(s_aw, getenv("SPU_TRACE_AT_WALL") ? 1 : 0);
       if (s_aw) { extern uint32_t g_barrier_sync_watch;
                   if (!g_barrier_sync_watch) { s_trace_suppress = 1; return; } } }
     /* SPU_TRACE_FLOWCTX=1: trace ONLY the run the SPURS_PM_FLOW tracer armed
      * (the stalled queue's spu0 dispatch) -- post-wall idle dispatches of the
      * other 13 jobmanager wids otherwise exhaust the budget in under a second. */
     { static int s_fc = -1;
-      if (s_fc < 0) s_fc = getenv("SPU_TRACE_FLOWCTX") ? 1 : 0;
+      PS3_KNOB(s_fc, getenv("SPU_TRACE_FLOWCTX") ? 1 : 0);
       if (s_fc) { extern void* volatile g_pm_flow_ctx;
                   if (g_pm_flow_ctx != (void*)ctx) { s_trace_suppress = 1; return; } } }
     /* SPU_TRACE_IMG=<n>: trace only contexts running image n (e.g. 1 = the

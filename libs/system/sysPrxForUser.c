@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "ps3emu/ps3_knob.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
@@ -893,7 +894,7 @@ static u32 yz_heap_alloc(u32 size, u32 align)
 
     u32 user = (raw + 16 + align - 1) & ~(align - 1);
     { static int dbg = -1;
-      if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
+      PS3_KNOB(dbg, getenv("SYS_HEAP_DBG") ? 1 : 0);
       if (dbg) { static int n = 0; if (n++ < 400)
           fprintf(stderr, "[heap] alloc size=%u align=%u -> 0x%08X (raw 0x%08X, bin %u)%c",
                   size, align, user, raw, b, 10); } }
@@ -912,7 +913,7 @@ static void yz_heap_free(u32 user)
     if (b >= YZ_BINS || off > (1u << b)) return;         /* corrupt header */
     u32 raw = user - off;
     { static int dbg = -1;
-      if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
+      PS3_KNOB(dbg, getenv("SYS_HEAP_DBG") ? 1 : 0);
       if (dbg) { static int n = 0; if (n++ < 400)
           fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
     vm_write32(user - 12, 0);                            /* poison: catch double free */

@@ -51,6 +51,7 @@
  */
 
 #include "../../runtime/syscalls/lv2_syscall_table.h"
+#include "ps3emu/ps3_knob.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"          /* VM_HLE_INJECT_BASE */
 #include "../../include/ps3emu/error_codes.h"
@@ -138,7 +139,7 @@
 static int s_rsx_dbg = -1;
 static int rsx_dbg(void)
 {
-    if (s_rsx_dbg < 0) s_rsx_dbg = getenv("SYS_RSX_DBG") ? 1 : 0;
+    PS3_KNOB(s_rsx_dbg, getenv("SYS_RSX_DBG") ? 1 : 0);
     return s_rsx_dbg;
 }
 

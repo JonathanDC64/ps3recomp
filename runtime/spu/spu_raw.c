@@ -27,6 +27,7 @@
  */
 
 #include "spu_raw.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_context.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"
@@ -100,7 +101,7 @@ static raw_spu s_spu[SPU_RAW_COUNT];
 static int dbg(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("SPU_RAW_DBG") ? 1 : 0;
+    PS3_KNOB(v, getenv("SPU_RAW_DBG") ? 1 : 0);
     return v;
 }
 
@@ -582,7 +583,7 @@ static int64_t sc_raw_spu_set_int_mask(ppu_context* ctx)
      * so if the guest only enables 0x1|0x2 that write raises nothing and the PPU
      * has to poll. If it stopped polling, the message sits unread and the SPUs
      * spin. This prints enough to tell those apart. */
-    { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
+    { static int _d = -1; PS3_KNOB(_d, getenv("SPU_DBG_MBOX") ? 1 : 0);
       if (_d) fprintf(stderr, "[spu-mask] spu%u class=%llu mask=0x%llX\n",
               n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
     return CELL_OK;

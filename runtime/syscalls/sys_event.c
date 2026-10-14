@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "ps3emu/ps3_knob.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -332,7 +333,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * doing something, the question is where it is parked at the END, and the
      * last dump in the log answers that. */
     { static int every = -1;
-      if (every < 0) { const char* e = getenv("WAITBT_EVERY"); every = e ? atoi(e) : 0; }
+      PS3_KNOB(every, ps3_env_int("WAITBT_EVERY", 0));
       if (every > 0) {
           static unsigned n[8][8] = {{0}};
           unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
@@ -978,7 +979,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     uint64_t data1   = LV2_ARG_U64(ctx, 1);
     uint64_t data2   = LV2_ARG_U64(ctx, 2);
     uint64_t data3   = LV2_ARG_U64(ctx, 3);
-    static int s_send_stack = -1; if (s_send_stack < 0) s_send_stack = getenv("PS3_EVT_SEND_STACK") != NULL;
+    static int s_send_stack = -1; PS3_KNOB(s_send_stack, getenv("PS3_EVT_SEND_STACK") != NULL);
     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
@@ -1212,7 +1213,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
      * (as if the flag were set) breaks the spin and lets the game progress into
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
-    { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
+    { static int s_f = -1; PS3_KNOB(s_f, getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0);
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
         static int _n=0; if(_n++<4) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
@@ -1251,7 +1252,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
      * bits) to see if the game advances into its real render/content code. Blunt;
      * identifies the gate. */
-    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
+    { static int s_fe = -1; PS3_KNOB(s_fe, getenv("PS3_EVF_FORCE") ? 1 : 0);
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
         static int _n = 0; if (_n++ < 20)
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",

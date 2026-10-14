@@ -17,6 +17,7 @@
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #include "ppu_recomp.h"   /* ppu_context */
+#include "ps3emu/ps3_knob.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
@@ -308,7 +309,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * exactly that shape. Every guest frame goes through HLE calls, so the last
      * dump in the log names the frame the loop was in when it stopped. */
     { static int every = -1;
-      if (every < 0) { const char* e = getenv("HLE_BT_EVERY"); every = e ? atoi(e) : 0; }
+      PS3_KNOB(every, ps3_env_int("HLE_BT_EVERY", 0));
       if (every > 0 && ctx) {
           static unsigned n[8] = {0};
           unsigned t = (unsigned)ctx->thread_id & 7;

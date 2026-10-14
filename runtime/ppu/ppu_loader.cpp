@@ -21,6 +21,7 @@
 /* Hoisted: code below was added above the original include block, so these
  * have to be visible from here rather than 160 lines further down. */
 #include <stdint.h>
+#include "ps3emu/ps3_knob.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -823,7 +824,7 @@ static void ppu_resv_line_break(uint32_t line);
 static void ppu_resv_line_leave(uint32_t line);
 extern "C" void ppu_resv_register(ppu_context* c)
 {
-    if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+    PS3_KNOB(g_resv_store_active, getenv("PPU_RESV_STORE") ? 1 : 0);
     if (!g_ppu_resv_line_break) {
         g_ppu_resv_line_enter = ppu_resv_line_enter;
         g_ppu_resv_line_leave = ppu_resv_line_leave;
@@ -926,7 +927,7 @@ static inline void ppu_resv_break(uint64_t addr)   /* MUST hold the line's slot 
 /* RESV_DIAG: detect a stwcx whose ctx isn't in the registry -- if that fires,
  * that thread's reservations are never broken by others (ABA slips through), and
  * the fix is to register it (not plain-store invalidation). One line per ctx. */
-static inline int resv_diag() { static int v = -1; if (v < 0) v = getenv("RESV_DIAG") ? 1 : 0; return v; }
+static inline int resv_diag() { static int v = -1; PS3_KNOB(v, getenv("RESV_DIAG") ? 1 : 0); return v; }
 static void resv_check_reg(ppu_context* self)
 {
     long n = g_resv_ctx_n; if (n > PPU_RESV_MAX) n = PPU_RESV_MAX;
@@ -944,7 +945,7 @@ static void resv_check_reg(ppu_context* self)
  * CAS iff the big-endian word still equals `expected`, and on success break every
  * other thread's reservation on that word so their stwcx retries. */
 /* PPU_RESV_OFF=1 -> plain value-CAS (v0 baseline, for A/B diagnosis). */
-static inline int resv_off() { static int v = -1; if (v < 0) v = getenv("PPU_RESV_OFF") ? 1 : 0; return v; }
+static inline int resv_off() { static int v = -1; PS3_KNOB(v, getenv("PPU_RESV_OFF") ? 1 : 0); return v; }
 /* A successful stwcx./stdcx. is a STORE, and the write watch could not see
  * one: PPU_WWATCH hooks vm_write*, and a lifted stwcx. goes straight to a
  * host compare-exchange on guest memory. So any field maintained with
@@ -976,7 +977,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * PPU hammering the same 128-byte line is one of only two agents that can
      * be taking it. */
     if (coh) { static int s_w = -1;
-        if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+        PS3_KNOB(s_w, getenv("SPU_PUTLLC_WHY") ? 1 : 0);
         if (s_w) { static unsigned long long n;
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
@@ -1007,7 +1008,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * it in. "Which address" is the whole question, and nothing could answer
      * it -- so count failures per address and name the top ones. */
     { static int s_cf = -1;
-      if (s_cf < 0) s_cf = getenv("PPU_CAS_FAIL") ? 1 : 0;
+      PS3_KNOB(s_cf, getenv("PPU_CAS_FAIL") ? 1 : 0);
       if (s_cf && !ok) {
           enum { CF_N = 64 };
           static uint32_t cf_ea[CF_N]; static uint32_t cf_n[CF_N];
@@ -1490,7 +1491,7 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
  * per iteration (so the consecutive HOTREAD detectors reset). */
 static void vm_hotmap(uint32_t ea, int width)
 {
-    static int en = -1; if (en < 0) en = getenv("PPU_HOTMAP") ? 1 : 0;
+    static int en = -1; PS3_KNOB(en, getenv("PPU_HOTMAP") ? 1 : 0);
     if (!en) return;
     enum { NB = 4096 };
     static uint32_t addr[NB]; static uint32_t cnt[NB]; static unsigned long long tot = 0;
@@ -1744,7 +1745,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
     /* Frequency histogram (PPU_HOTMAP): find busy-loop polled addresses even
      * when the loop reads several addresses per iteration (so the consecutive
      * HOTREAD detector resets). Dumps the hottest addresses periodically. */
-    { static int en=-1; if (en<0) en = getenv("PPU_HOTMAP") ? 1 : 0;
+    { static int en=-1; PS3_KNOB(en, getenv("PPU_HOTMAP") ? 1 : 0);
       if (en) { enum { NB=2048 }; static uint32_t addr[NB]; static uint32_t cnt[NB];
         static uint64_t tot=0; uint32_t ea=(uint32_t)a; uint32_t h=(ea>>2)&(NB-1);
         if (addr[h]!=ea){addr[h]=ea;cnt[h]=0;} cnt[h]++;
@@ -2022,13 +2023,13 @@ struct flow_alloc_rec { uint32_t ptr, size, lr, id; };
 static flow_alloc_rec g_alloc_ring[8192];
 static uint32_t       g_alloc_ring_idx = 0;
 void flow_record_alloc(unsigned int ptr, unsigned int size, unsigned int lr) {
-    static int en = -1; if (en < 0) en = getenv("PS3_ALLOCTAG") ? 1 : 0;
+    static int en = -1; PS3_KNOB(en, getenv("PS3_ALLOCTAG") ? 1 : 0);
     if (!en || !ptr) return;
     flow_alloc_rec& r = g_alloc_ring[g_alloc_ring_idx & 8191];
     r.ptr = ptr; r.size = size; r.lr = lr; r.id = ++g_alloc_ring_idx;
 }
 void flow_lookup_alloc(unsigned int p) {
-    static int en = -1; if (en < 0) en = getenv("PS3_ALLOCTAG") ? 1 : 0;
+    static int en = -1; PS3_KNOB(en, getenv("PS3_ALLOCTAG") ? 1 : 0);
     if (!en) return;
     static int n = 0; if (n++ >= 4) return;
     const flow_alloc_rec* best = 0;
@@ -2329,7 +2330,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
 {
     static int en = -1;
-    if (en < 0) en = getenv("ALLOCPROBE") ? 1 : 0;
+    PS3_KNOB(en, getenv("ALLOCPROBE") ? 1 : 0);
     if (!en) return 0;
     if (size < 0x40000000u) return 0;            /* sane size -> ignore */
     static int n = 0;
@@ -2374,7 +2375,7 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
 void ppu_dbg4(const char* tag, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
     static int en = -1;
-    if (en < 0) en = getenv("ALLOCPROBE") ? 1 : 0;
+    PS3_KNOB(en, getenv("ALLOCPROBE") ? 1 : 0);
     if (!en) return;
     static int n = 0;
     if (n++ >= 16) return;
@@ -2491,8 +2492,8 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     static int on = -1;
-    if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
-    { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+    PS3_KNOB(on, getenv("PPU_CSCHECK") ? 1 : 0);
+    { static int hg = -1; PS3_KNOB(hg, getenv("PS3_ICALL_GATE") ? 1 : 0);
       if (hg) { const uint32_t tgt = (uint32_t)ctx->ctr; icall_hist(ctx, tgt, 0);
                 ps3_indirect_call_impl(ctx); icall_hist(ctx, tgt, 1); return; } }
     if (!on) { ps3_indirect_call_impl(ctx); return; }
@@ -2525,7 +2526,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * between the last frame a title drew and the first it did not is the only
      * way to see which way the dispatch went. */
     { static int on = -1;
-      if (on < 0) on = getenv("BCTRL_RING") ? 1 : 0;
+      PS3_KNOB(on, getenv("BCTRL_RING") ? 1 : 0);
       if (on) {
           unsigned t = (unsigned)ctx->thread_id & 15;
           g_bctrl_ring[t][g_bctrl_pos[t] & (BCTRL_RING_N - 1)] = (uint32_t)ctx->ctr;
@@ -3233,7 +3234,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * TTY_NO_DEDUPE=1 restores the raw firehose. */
         { static char last[128]; static unsigned long long run_len = 0;
           static int dedupe = -1;
-          if (dedupe < 0) dedupe = getenv("TTY_NO_DEDUPE") ? 0 : 1;
+          PS3_KNOB(dedupe, getenv("TTY_NO_DEDUPE") ? 0 : 1);
           if (dedupe && vm_base && wlen > 0 && wlen < sizeof(last)) {
               char cur[128]; uint32_t cn = wlen;
               for (uint32_t i = 0; i < cn; i++) cur[i] = (char)vm_read8(buf + i);
@@ -3345,14 +3346,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * guest thread runs ~42,000 R3000 instructions in 30 ms, then parks in
          * ntdll forever with no further [sc] line. The last ENTER without a
          * matching exit names the call that blocked. */
-        { static int _se = -1; if (_se < 0) _se = getenv("PS3_SCENTER") ? 1 : 0;
+        { static int _se = -1; PS3_KNOB(_se, getenv("PS3_SCENTER") ? 1 : 0);
           if (_se) { static unsigned long _n = 0;
             fprintf(stderr, "[sc-enter] #%lu num=%llu tid=%u a3=0x%llX a4=0x%llX lr=0x%08X\n",
                     ++_n, (unsigned long long)num, (unsigned)ctx->thread_id,
                     (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                     (unsigned)ctx->lr);
             fflush(stderr); } }
-        static int s_sbp = -1; if (s_sbp < 0) s_sbp = getenv("PS3_SCBLOCK_PROF") ? 1 : 0;
+        static int s_sbp = -1; PS3_KNOB(s_sbp, getenv("PS3_SCBLOCK_PROF") ? 1 : 0);
         if (s_sbp) {
             static ULONGLONG s_acc[1024]={0}; static uint32_t s_cnt[1024]={0}; static ULONGLONG s_win=0;
             uint32_t _a3=(uint32_t)ctx->gpr[3], _a4=(uint32_t)ctx->gpr[4], _a5=(uint32_t)ctx->gpr[5];

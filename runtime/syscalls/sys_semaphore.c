@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "ps3emu/ps3_knob.h"
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -197,7 +198,7 @@ void lbp_unstick_once(void)
 static void sem_report_bad_id(ppu_context* ctx, uint32_t sem_id, const char* op)
 {
     static int on = -1;
-    if (on < 0) on = getenv("SEM_BADID") ? 1 : 0;
+    PS3_KNOB(on, getenv("SEM_BADID") ? 1 : 0);
     if (!on) return;
     static uint64_t seen[32]; static int nseen = 0;
     uint64_t key = ((uint64_t)sem_id << 32) | (uint32_t)ctx->lr;
@@ -333,7 +334,7 @@ extern uint32_t vm_read32(uint64_t a);
 static void sem_lr_seen(char op, ppu_context* ctx)
 {
     static int on = -1;
-    if (on < 0) on = getenv("SEM_LR") ? 1 : 0;
+    PS3_KNOB(on, getenv("SEM_LR") ? 1 : 0);
     if (!on) return;
     const uint32_t id = (uint32_t)ctx->gpr[3], lr = (uint32_t)ctx->lr;
     const uint32_t sp = (uint32_t)ctx->gpr[1];
@@ -363,7 +364,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     sem_lr_seen('w', ctx);
     int64_t r = sys_semaphore_wait_impl(ctx);
-    static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
+    static int d = -1; PS3_KNOB(d, getenv("SEM_ERRDBG") ? 1 : 0);
     if (d && r) { static int n = 0; if (n++ < 12)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
@@ -371,7 +372,7 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 }
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
-    { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
+    { static int _d = -1; PS3_KNOB(_d, getenv("SEM_WAITDBG") ? 1 : 0);
       if (_d) { static int _n = 0; if (_n++ < 20)
           fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
                   (unsigned long long)ctx->thread_id, 10); } }

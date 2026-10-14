@@ -10,6 +10,7 @@
  */
 
 #include <stdlib.h>
+#include "ps3emu/ps3_knob.h"
 #include "rsx_fp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
@@ -1200,7 +1201,7 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
         if (w0 & FP_END) break;
     }
     { static int dbg = -1;
-      if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
+      PS3_KNOB(dbg, ps3_env_int("FP_KDBG", 0));
       if (dbg) { static int m = 0; if (m++ < 3) {
         fprintf(stderr, "[FPK] %d consts%c", n, 10);
         for (int _q = 0; _q < n; _q++)

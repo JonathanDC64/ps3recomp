@@ -47,6 +47,7 @@
 #endif
 
 #include "sysNet.h"
+#include "ps3emu/ps3_knob.h"
 #include "../../runtime/ppu/ppu_context.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
@@ -569,7 +570,7 @@ static int host_recv_flags(int32_t flags)
 static int net_trace(void)
 {
     static int t = -1;
-    if (t < 0) t = getenv("PS3_NET_TRACE") ? 1 : 0;
+    PS3_KNOB(t, getenv("PS3_NET_TRACE") ? 1 : 0);
     return t;
 }
 

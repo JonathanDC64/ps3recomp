@@ -6,6 +6,7 @@
  */
 
 #include "cellMsgDialog.h"
+#include "ps3emu/ps3_knob.h"
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
@@ -168,7 +169,7 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
      * trying to run, so this waits behind MSGDIALOG_NOBUTTON_WAITS=1 until the
      * stall behind it is understood. */
     static int nobutton_waits = -1;
-    if (nobutton_waits < 0) nobutton_waits = getenv("MSGDIALOG_NOBUTTON_WAITS") ? 1 : 0;
+    PS3_KNOB(nobutton_waits, getenv("MSGDIALOG_NOBUTTON_WAITS") ? 1 : 0);
     int stays_open = has_progress ||
                      (nobutton_waits &&
                       button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE);

@@ -7,6 +7,7 @@
  */
 
 #include "cellAdec.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -201,7 +202,7 @@ s32 cellAdecEndSeq(CellAdecHandle handle)
      * hundreds of times against a single StartSeq, and the image has eight
      * EndSeq call sites -- the backtrace says which one. */
     { static int _n = -1;
-      if (_n < 0) _n = getenv("ADEC_WHO") ? 0 : -2;
+      PS3_KNOB(_n, getenv("ADEC_WHO") ? 0 : -2);
       if (_n >= 0 && _n < 8) { _n++;
           /* The guest lr, not a host backtrace. ppu_guest_caller maps host
            * frames to the nearest lifted function, and here it landed on

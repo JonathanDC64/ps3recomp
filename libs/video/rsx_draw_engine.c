@@ -11,6 +11,7 @@
  * probe, and every YZ_PERF_PROFILE block.
  */
 #include "rsx_draw_engine.h"
+#include "ps3emu/ps3_knob.h"
 
 #include "rsx_fp_decompiler.h"
 #include "rsx_primitives.h"
@@ -660,7 +661,7 @@ static u32 s_coherence_cap;
 static int eng_coherence_log(void)
 {
     static int left = -1;
-    if (left < 0) { const char* e = getenv("RSX_ENGINE_COHERENCE_LOG"); left = e ? atoi(e) : 0; }
+    PS3_KNOB(left, ps3_env_int("RSX_ENGINE_COHERENCE_LOG", 0));
     return left > 0 ? left-- : 0;
 }
 

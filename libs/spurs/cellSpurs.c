@@ -10,6 +10,7 @@
  */
 
 #include "cellSpurs.h"
+#include "ps3emu/ps3_knob.h"
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ps3_log.h"
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
@@ -355,7 +356,7 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
          * idempotent, so covering both costs nothing and removes the race that
          * made this fire in only 1 of 4 runs. */
         { static int s_od = -1;
-          if (s_od < 0) s_od = getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0;
+          PS3_KNOB(s_od, getenv("SPURS_EF_OBJ_DELIVER") ? 1 : 0);
           if (s_od) {
               vm_write16(obj + EF_EVENTS, bits);
               for (uint32_t s = 0; s < 16; s++)
@@ -366,7 +367,7 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
     }
     if (!pendingRecv) {
         static int s_wp = -1;
-        if (s_wp < 0) s_wp = getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0;
+        PS3_KNOB(s_wp, getenv("SPURS_EF_WAKE_PARKED") ? 1 : 0);
 
         if (s_wp && vm_read8(ea + EF_DIRECTION) == 2) {
             uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
@@ -426,7 +427,7 @@ void spurs_ef_notify_taskset_round(uint32_t taskset_ea)
 {
     if (!taskset_ea) return;
     static int s_off = -1;
-    if (s_off < 0) s_off = getenv("SPURS_NO_ROUND_NOTIFY") ? 1 : 0;
+    PS3_KNOB(s_off, getenv("SPURS_NO_ROUND_NOTIFY") ? 1 : 0);
     if (s_off) return;
 
     for (int i = 0; i < MAX_EVENT_FLAGS; i++) {
@@ -738,7 +739,7 @@ void spurs_note_spu_event(uint32_t queue)
 static int spurs_queue_has_spu_producer(int i)
 {
     static int s_all = -1;
-    if (s_all < 0) s_all = getenv("SPURS_SYNTH_ALL") ? 1 : 0;
+    PS3_KNOB(s_all, getenv("SPURS_SYNTH_ALL") ? 1 : 0);
     return !s_all && s_spurs_event_queue_spu[i];
 }
 
@@ -762,7 +763,7 @@ static int spurs_queue_has_spu_producer(int i)
 void spurs_notify_task_completion(void)
 {
     static int s_off = -1;
-    if (s_off < 0) s_off = getenv("SPURS_NO_TASK_EVENT") ? 1 : 0;
+    PS3_KNOB(s_off, getenv("SPURS_NO_TASK_EVENT") ? 1 : 0);
     if (s_off) return;
 
     extern int sys_event_queue_inject(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -1284,7 +1285,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * r9/r10 never written. Two unrelated callers agreeing settles it, so this
      * is now the default; SPURS_TASKATTR_LEGACY=1 restores the old 8-arg read. */
     { static int s_r8 = -1;
-      if (s_r8 < 0) s_r8 = getenv("SPURS_TASKATTR_LEGACY") ? 0 : 1;
+      PS3_KNOB(s_r8, getenv("SPURS_TASKATTR_LEGACY") ? 0 : 1);
       if (s_r8) {
           attr->argument_ea  = (u32)sizeContext;   /* r8 */
           attr->lsPattern_ea = 0;                  /* r9 was a leftover */
@@ -1311,7 +1312,7 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
      * work apiece, which is the symptom this title shows. Off by default: the
      * R8-form above is right for YDKJ and Jackbox and they are unaffected. */
     { static int s_desc = -1;
-      if (s_desc < 0) s_desc = getenv("SPURS_TASKATTR_DESC") ? 1 : 0;
+      PS3_KNOB(s_desc, getenv("SPURS_TASKATTR_DESC") ? 1 : 0);
       if (s_desc) {
           uint32_t d = (uint32_t)eaContext;          /* r7 */
           attr->eaContext    = vm_read32(d + 0);
@@ -1785,7 +1786,7 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 #endif
     struct SpursInst* si = (struct SpursInst*)p;
     static volatile long s_pm_off = -1;
-    if (s_pm_off < 0) s_pm_off = getenv("PS3_NO_SPURS_PM") ? 1 : 0;
+    PS3_KNOB(s_pm_off, getenv("PS3_NO_SPURS_PM") ? 1 : 0);
 
     fprintf(stderr, "[spurs-kern] \"%s\" poll thread live: ea=0x%08X pm=%s\n",
             si->prefix, si->ea, s_pm_off ? "DISABLED (PS3_NO_SPURS_PM)" : "enabled");
@@ -2162,7 +2163,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
  * and their mean / max duration -- one SPU task round trip each. */
 static void ef_wait_stats(uint32_t ea, long long t0)
 {
-    static int on = -1; if (on < 0) on = getenv("SPURS_EF_STATS") ? 1 : 0;
+    static int on = -1; PS3_KNOB(on, getenv("SPURS_EF_STATS") ? 1 : 0);
     if (!on) return;
     static uint32_t fea[8]; static unsigned n[8]; static double sum[8], mx[8];
     static long long last; static SRWLOCK lk = SRWLOCK_INIT;
@@ -2211,7 +2212,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
      * one — that is the signal naming the workload that is not executing.
      * SPURS_EF_FORCE=1 restores the old fake for A/B comparison only. */
     static int s_force = -1;
-    if (s_force < 0) s_force = getenv("SPURS_EF_FORCE") ? 1 : 0;
+    PS3_KNOB(s_force, getenv("SPURS_EF_FORCE") ? 1 : 0);
     unsigned waits = 0;
     u16 current;
     __atomic_add_fetch(&s_ef_ppu_waiters, 1, __ATOMIC_SEQ_CST);
@@ -2965,7 +2966,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
 static s32 jc_start(u64 jc_ea, const char* who)
 {
     static int s_off = -1;
-    if (s_off < 0) s_off = getenv("PS3_NO_JOBCHAIN") ? 1 : 0;
+    PS3_KNOB(s_off, getenv("PS3_NO_JOBCHAIN") ? 1 : 0);
 
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
@@ -3144,7 +3145,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
      * whether or not the guess was right, which turns one run into the answer.
      * Everything is logged for that reason. */
     static int s_exp = -1;
-    if (s_exp < 0) s_exp = getenv("SPURS_QUEUE_PUSH") ? 1 : 0;
+    PS3_KNOB(s_exp, getenv("SPURS_QUEUE_PUSH") ? 1 : 0);
 
     static int _n = 0;
     if (!s_exp) {

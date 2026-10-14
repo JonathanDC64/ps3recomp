@@ -11,6 +11,7 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -502,13 +503,13 @@ SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      
 SPU_GATE int g_wws_read_probe = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
-    if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+    PS3_KNOB(g_spu_ls_probe, getenv("SPU_LS_LOWREAD") ? 1 : 0);
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
      * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
      * returns its own instruction words. Report each distinct low address once,
      * with the pc, to find which pointer was never filled in. */
     { static int s_lw = -1;
-      if (s_lw < 0) s_lw = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+      PS3_KNOB(s_lw, getenv("SPU_LS_LOWREAD") ? 1 : 0);
       if (s_lw && lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
           static uint32_t seen[24]; static int n = 0; int known = 0;
           uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
@@ -597,7 +598,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
 extern int g_spu_smc_watch;
 static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
-    if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+    PS3_KNOB(g_spu_smc_watch, getenv("SPU_SMC_WATCH") ? 1 : 0);
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
      * target LS line falls inside that image's CODE segment (the segment
      * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
@@ -821,7 +822,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
 static inline void spu_pchist_tick(const spu_context* ctx)
 {
     static int en = -1;
-    if (en < 0) en = getenv("SPU_PCHIST") ? 1 : 0;
+    PS3_KNOB(en, getenv("SPU_PCHIST") ? 1 : 0);
     if (!en) return;
     static unsigned long long b[8][8], n;
     const unsigned sp = (unsigned)(ctx->spu_id & 7u);

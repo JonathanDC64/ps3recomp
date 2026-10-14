@@ -3,6 +3,7 @@
  */
 
 #include "sys_timer.h"
+#include "ps3emu/ps3_knob.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -254,7 +255,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 
     /* POLLSITE: resolve the host chain of the 1ms poller (LBP bringup) to
      * guest functions -- names the stage that is starving. */
-    { static int _ps = -1; if (_ps < 0) _ps = getenv("POLLSITE") ? 12 : 0;
+    { static int _ps = -1; PS3_KNOB(_ps, getenv("POLLSITE") ? 12 : 0);
       if (_ps > 0 && usec == 1000) { _ps--;
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
@@ -294,7 +295,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
         { static int s_spin = -1;
-          if (s_spin < 0) s_spin = getenv("USLEEP_SPIN") ? 1 : 0;
+          PS3_KNOB(s_spin, getenv("USLEEP_SPIN") ? 1 : 0);
           const int64_t gap_ticks = (int64_t)(200 * (uint64_t)s_qpc_freq.QuadPart / 1000000ULL);
           if (t_last_end && qpc_start.QuadPart - t_last_end <= gap_ticks) t_streak++;
           else t_streak = 0;

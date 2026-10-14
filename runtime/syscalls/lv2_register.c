@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>   /* calloc, free */
+#include "ps3emu/ps3_knob.h"
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "sys_ppu_thread.h"
@@ -892,7 +893,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * pointers are where the job DMAs from and to, so a job that writes
          * only scratch is either reading the wrong descriptor or the descriptor
          * does not name the buffer we expect. */
-        { static int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
+        { static int _wd = -1; PS3_KNOB(_wd, getenv("SPU_WORKDESC_DUMP") ? 1 : 0);
           if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
               fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
               for (int r = 0; r < 16; r++) {
@@ -901,13 +902,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                       fprintf(stderr, " %08X", vm_read_be32(work_ea + r*16 + c*4));
                   fprintf(stderr, "%c", 10);
               } } } }
-        { static int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
+        { static int _wh = -1; PS3_KNOB(_wh, getenv("SPU_WORKDESC_HDR") ? 1 : 0);
           if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
               fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
                       t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
                       (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
           if (_wh && work_ea > 0x1000000u && vm_base) { } }
-        { static int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
+        { static int _sd = -1; PS3_KNOB(_sd, getenv("SPU_SEED_DBG") ? 1 : 0);
           if (_sd) { static int _n = 0; if (_n++ < 12)
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
                       t->tid, entry, t->args_ea, work_ea, 10); } }
@@ -918,7 +919,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
         LARGE_INTEGER _t0, _t1, _fq; QueryPerformanceCounter(&_t0);
         int32_t frc = spu_run_interp_job(ls, entry, t->args_ea, -1, t->tid, t->group_id,
                                          getenv("RD_SPU_FRAME_MBOX") ? work_ea : 0u);
-        { static int _sp = -1; if (_sp < 0) _sp = getenv("SPU_SPEED") ? 1 : 0;
+        { static int _sp = -1; PS3_KNOB(_sp, getenv("SPU_SPEED") ? 1 : 0);
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
               extern uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
@@ -963,7 +964,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
       if (vm_base && s_d < 4) {
         s_d++;
         static int _idump = -1;
-        if (_idump < 0) _idump = getenv("YDKJ_INSTDUMP") ? 1 : 0;
+        PS3_KNOB(_idump, getenv("YDKJ_INSTDUMP") ? 1 : 0);
         /* Dump BOTH candidate instance addrs: the real one is 0x40009F00 (init arg);
          * 0x40009D00 was the old hardcoded guess. See which libsre actually populated. */
         if (_idump) {
@@ -1718,7 +1719,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
                 spurs_note_spu_event(queue);
             }
         }
-        { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_EVT_TRACE") ? 1 : 0;
+        { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_EVT_TRACE") ? 1 : 0);
           if (s_t) fprintf(stderr, "[spu-evt] img=%d grp=0x%X port=%u -> queue=%u data0=0x%06X data1=0x%08X result=0x%08X\n",
                            spu->image_id, spu->spu_group_id, port, queue,
                            value & 0xFFFFFFu, data, result); }
@@ -1931,7 +1932,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
     uint32_t type      = (uint32_t)ctx->gpr[6];
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_LSREAD_TRACE") ? 1 : 0);
       static int n = 0;
       if (s_t && n++ < 12)
           { extern void ppu_guest_caller(char*, size_t);
@@ -1952,7 +1953,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
               v = (v << 8) | jls[ls_offset + k];
           for (int k = 0; k < 8; k++)
               vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
-          { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
+          { static int s_t = -1; PS3_KNOB(s_t, getenv("SPU_LSREAD_TRACE") ? 1 : 0);
             static int n = 0;
             if (s_t && n++ < 8)
                 fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
@@ -2718,7 +2719,7 @@ int lv2_try_syscall(ppu_context* ctx)
     /* LV2_ERRDBG=1: every syscall that returns non-OK, deduped by (number,
      * result). A guest that asserts on a result once per frame is easier to
      * find from this side than by reading its lifted code. */
-    { static int _ed = -1; if (_ed < 0) _ed = getenv("LV2_ERRDBG") ? 1 : 0;
+    { static int _ed = -1; PS3_KNOB(_ed, getenv("LV2_ERRDBG") ? 1 : 0);
       if (_ed && (int32_t)ctx->gpr[3] != 0) {
           static uint64_t seen[64]; static int ns = 0;
           uint64_t k = ((uint64_t)num << 32) | (uint32_t)ctx->gpr[3];

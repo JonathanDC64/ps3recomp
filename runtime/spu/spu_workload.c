@@ -6,6 +6,7 @@
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
 #include "spu_workload.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -306,7 +307,7 @@ static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static int spu_persist_ls_enabled(void)
-{ static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
+{ static int _p = -1; PS3_KNOB(_p, getenv("LBP_PERSIST_LS") ? 1 : 0); return _p; }
 
 /* ---- Global SPU execution serialization (LBP_SPU_SERIAL) ------------------
  * Default runs each SPU task on its own detached host thread, so N tasks race:
@@ -319,7 +320,7 @@ static int spu_persist_ls_enabled(void)
  * a single SPU's task scheduling; with LBP_WS_DRAIN a genuinely unsignalled
  * task drains and releases. Opt-in; default keeps concurrent per-thread SPU. */
 static int spu_serial_enabled(void)
-{ static int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
+{ static int _s = -1; PS3_KNOB(_s, getenv("LBP_SPU_SERIAL") ? 1 : 0); return _s; }
 #ifdef _WIN32
 static SRWLOCK s_spu_serial = SRWLOCK_INIT;
 void spu_serial_acquire(void){ if (spu_serial_enabled()) AcquireSRWLockExclusive(&s_spu_serial); }
@@ -1331,7 +1332,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
-    { static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
+    { static int s_on = -1; PS3_KNOB(s_on, getenv("SPU_SIG_STATS") ? 1 : 0);
       if (s_on) {
           static uint32_t ts[32], tk[32]; static uintptr_t ca[32]; static unsigned cnt[32];
           static unsigned long long t0;

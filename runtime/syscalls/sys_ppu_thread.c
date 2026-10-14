@@ -3,6 +3,7 @@
  */
 
 #include <setjmp.h>
+#include "ps3emu/ps3_knob.h"
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -457,7 +458,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
      * lazily by the OS via STACK_SIZE_PARAM_IS_A_RESERVATION). */
 #ifdef _WIN32
-    if (g_gate_on < 0) g_gate_on = getenv("PPU_THREADGATE") ? 1 : 0;
+    PS3_KNOB(g_gate_on, getenv("PPU_THREADGATE") ? 1 : 0);
     /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
@@ -560,7 +561,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
      * cannot keep running past its own exit. */
     {
         static int allow = -1;
-        if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
+        PS3_KNOB(allow, getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1);
         if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
     }
     return CELL_OK;
@@ -726,7 +727,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * the live context instead of deriving it: no TOC arithmetic, no
      * assumption about which callback is running. */
     { static int sw = -1;
-      if (sw < 0) sw = getenv("PS1_SPINWAIT") ? 1 : 0;
+      PS3_KNOB(sw, getenv("PS1_SPINWAIT") ? 1 : 0);
       if (sw) {
           static unsigned long n;
           extern uint32_t vm_read32(uint64_t);
@@ -756,7 +757,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
      * drawing commands, and nothing else distinguishes "running the game" from
      * "spinning in a wait loop". */
     { static int pc_on = -1;
-      if (pc_on < 0) pc_on = getenv("PS1_R3000_PC") ? 1 : 0;
+      PS3_KNOB(pc_on, getenv("PS1_R3000_PC") ? 1 : 0);
       if (pc_on) {
           const uint32_t lr = (uint32_t)ctx->lr;
           if (lr >= 0x001066A8u && lr < 0x00108348u) {
@@ -936,7 +937,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                * BIOS, reported once, so "CdInit was entered" becomes an
                * observation rather than a deduction. */
               { static int cen = -1;
-                if (cen < 0) cen = getenv("PS1_PC_CENSUS") ? 1 : 0;
+                PS3_KNOB(cen, getenv("PS1_PC_CENSUS") ? 1 : 0);
                 if (cen) {
                     /* 0xBFC00000..0xBFC80000 in 64-byte buckets = 8192 flags */
                     static unsigned char seen[8192];

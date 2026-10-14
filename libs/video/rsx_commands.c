@@ -15,6 +15,7 @@
  */
 
 #include "rsx_commands.h"
+#include "ps3emu/ps3_knob.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -134,7 +135,7 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
     case NV4097_SET_CONTEXT_DMA_COLOR_D: state->surface_color_dma[3] = data; return 0;
     case NV4097_SET_SURFACE_COLOR_AOFFSET:
         state->surface_color_offset[0] = data;
-        { static int _s = -1; if (_s < 0) _s = getenv("SURFDBG") ? 1 : 0;
+        { static int _s = -1; PS3_KNOB(_s, getenv("SURFDBG") ? 1 : 0);
           static unsigned _seen[32]; static int _n = 0;
           if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
               if (!f && _n < 32) { _seen[_n++] = data;
@@ -643,7 +644,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
-        { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
+        { static int _d = -1; PS3_KNOB(_d, getenv("VDATA_DBG") ? 1 : 0);
           static int _n = 0;
           if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
@@ -651,7 +652,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
-        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && _n++ < 200)
+        { static int _n=0, _e=-1; PS3_KNOB(_e, getenv("LOAD_DBG") ? 1 : 0); if (_e && _n++ < 200)
             fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
         return 0;
@@ -694,7 +695,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
-            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && _sq++ < 500)
+            { static int _sq=0, _e=-1; PS3_KNOB(_e, getenv("SEQ_DBG") ? 1 : 0); if (_e && slot==256 && lane==0 && _sq++ < 500)
                 fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
@@ -765,14 +766,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
-        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && _sq++ < 500)
+        { static int _sq=0, _e=-1; PS3_KNOB(_e, getenv("SEQ_DBG") ? 1 : 0); if (_e && _sq++ < 500)
             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
                     state->surface_color_offset[0], state->vertex_constants[256][0],
                     state->vertex_constants[257][1]); }
         /* MVPDBG: dump every non-zero vertex-constant slot the FIRST time a
          * G-buffer draw (surf0=0xCC0000) is dispatched -- the true MVP the GPU
          * will use, read live (no snapshot/parity indirection). */
-        static int s_mvp = -1; if (s_mvp < 0) s_mvp = getenv("MVPDBG") ? 1 : 0;
+        static int s_mvp = -1; PS3_KNOB(s_mvp, getenv("MVPDBG") ? 1 : 0);
         if (s_mvp && state->surface_color_offset[0] == 0xCC0000) {
             static int _once = 0;
             if (!_once) { _once = 1;

@@ -2,6 +2,7 @@
  * ps3recomp - RSX guest vertex fetch (see rsx_vertex_fetch.h)
  */
 #include "rsx_vertex_fetch.h"
+#include "ps3emu/ps3_knob.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +53,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
     u32 ei = vi;
     if (a->frequency > 1) {
         static int nofreq = -1;                 /* VP_NOFREQ: instancing kill-switch */
-        if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
+        PS3_KNOB(nofreq, getenv("VP_NOFREQ") ? 1 : 0);
         if (!nofreq)
             ei = (st->frequency_divider_op & (1u << idx))
                      ? (vi % a->frequency)      /* MODULO: repeat mesh */
@@ -98,7 +99,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
         break;
     default:
-        { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
+        { static int t = -1; PS3_KNOB(t, getenv("VTX_TYPEDBG") ? 1 : 0);
           if (t) { static u32 seen = 0;
               if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
                   fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u\n",

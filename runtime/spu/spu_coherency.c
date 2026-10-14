@@ -11,6 +11,7 @@
  */
 
 #include <stdlib.h>
+#include "ps3emu/ps3_knob.h"
 #include "spu_coherency.h"
 
 #include <stdint.h>
@@ -200,7 +201,7 @@ void spu_coh_notify_write(uint32_t ea)
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
             { static int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
+              PS3_KNOB(s_w, getenv("SPU_PUTLLC_WHY") ? 1 : 0);
               if (s_w) { static unsigned long long n;
                   if ((++n % 200000) == 1)
                       fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",

@@ -20,6 +20,7 @@
  */
 
 #include "rsx_live_draw.h"
+#include "ps3emu/ps3_knob.h"
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 
@@ -89,7 +90,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #else
 /* Cached per call site: several of these sit on per-draw paths. */
 #define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
-    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
+    PS3_KNOB(_ld_diag, getenv(name) != NULL); _ld_diag; })
 #endif
 #include <string.h>
 
@@ -1385,7 +1386,7 @@ static void decode_render_state(render_state_t* rs)
     /* LD_NO_DEPTH=1: disable the depth test on every draw. A probe for draws
      * that vanish -- Tornado Outbreak's UI text fails its depth test here (not
      * yet understood), and this is how its menus are readable meanwhile. */
-    { static int nd = -1; if (nd < 0) nd = getenv("LD_NO_DEPTH") ? 1 : 0; if (nd) rs->depth_test = 0; }
+    { static int nd = -1; PS3_KNOB(nd, getenv("LD_NO_DEPTH") ? 1 : 0); if (nd) rs->depth_test = 0; }
     rs->depth_write = rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1;
     rs->depth_func  = rsx_dsp_reg(&g.rsx, M_DEPTH_FUNC);
     rs->cull_enable = rsx_dsp_reg(&g.rsx, M_CULL_FACE_ENABLE) & 1;
@@ -1838,7 +1839,7 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
          * This flips alpha to opaque so that theory can be tested in one run
          * instead of argued about. */
         { static int fo = -1;
-          if (fo < 0) fo = getenv("LD_FORCE_A1_OPAQUE") ? 1 : 0;
+          PS3_KNOB(fo, getenv("LD_FORCE_A1_OPAQUE") ? 1 : 0);
           s[0] = fo ? 255 : ((v & 0x8000) ? 255 : 0); }
         s[1] = (u8)(((v >> 10) & 0x1F) * 255 / 31);
         s[2] = (u8)(((v >> 5) & 0x1F) * 255 / 31);
@@ -2086,7 +2087,7 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
      * Counting non-zero SOURCE bytes covers every format and separates "the
      * upload never happened" from "decode ate it". */
     { static int ts = -1; static int tsn = 0;
-      if (ts < 0) ts = getenv("LD_TEXSRC_DBG") ? 1 : 0;
+      PS3_KNOB(ts, getenv("LD_TEXSRC_DBG") ? 1 : 0);
       if (ts && tsn < 16) {
           u32 nz = 0;
           for (u32 q = 0; q < span; q++) if (src[q]) nz++;
@@ -2288,7 +2289,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
          * "is the video decode producing an image?" without guessing from the
          * composited frame. ponytail: one-shot debug, costs nothing when off. */
         { static int pd = -1; static int pdn = 0;
-          if (pd < 0) { const char* e = getenv("LD_PLANE_DUMP"); pd = e ? atoi(e) : 0; }
+          PS3_KNOB(pd, ps3_env_int("LD_PLANE_DUMP", 0));
           if (pd && (int)g_ld_frames >= pd && m == 0 && base_fmt == TEX_FMT_B8 && mw >= 320 && pdn < 6) {
               char fn[128];
               snprintf(fn, sizeof fn, "scratch/plane_%02d_%ux%u_p%u.pgm", pdn, mw, mh, pitch);
@@ -2467,7 +2468,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
              * decoding a half-written image. Pure observation; it changes
              * nothing. Counts per source so one torn texture is attributable. */
             { static int race = -1;
-              if (race < 0) race = getenv("LD_TEX_RACE") ? 1 : 0;
+              PS3_KNOB(race, getenv("LD_TEX_RACE") ? 1 : 0);
               if (race && readable) {
                   int r2 = 0;
                   const u64 again = texture_content_hash(t, &r2);
@@ -2492,7 +2493,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
              * is rarely BOUND, the span is unreadable so `readable` is 0, or
              * the hash genuinely does not change. Count all three. */
             { static int fbd = -1;
-              if (fbd < 0) fbd = getenv("LD_FBDBG") ? 1 : 0;
+              PS3_KNOB(fbd, getenv("LD_FBDBG") ? 1 : 0);
               if (fbd && t->location == 1u && t->offset == 0x400000u) {
                   static unsigned long long checks = 0, unread = 0, changed = 0;
                   checks++;
@@ -4149,7 +4150,7 @@ static int ld_current_vertex_layout(rsx_vertex_layout_plan* layout)
 static void ld_pso_bail(int* said, const char* reason)
 {
     static int dbg = -1;
-    if (dbg < 0) dbg = getenv("LD_PSO_DBG") ? 1 : 0;
+    PS3_KNOB(dbg, getenv("LD_PSO_DBG") ? 1 : 0);
     if (!dbg || *said) return;
     *said = 1;
     fprintf(stderr, "[pso-bail] %s\n", reason);
@@ -4223,7 +4224,7 @@ static ID3D12PipelineState* get_pso(
      * different export mode gets its own PSO. Kill-switch RSX_FP_CTRL_AUTO=1
      * restores the old heuristic for the A/B. */
     static int ctrl_auto = -1;
-    if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+    PS3_KNOB(ctrl_auto, getenv("RSX_FP_CTRL_AUTO") ? 1 : 0);
     const u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : rsx_dsp_shader_control(&g.rsx);
     u32 cube_mask = 0;
     for (u32 unit = 0; unit < RSX_DSP_NUM_TEXTURES; unit++) {
@@ -4794,7 +4795,7 @@ static void fetch_batches(void)
      * the phantom vertex. Kill-switch RSX_NO_RESTART shared with the
      * harness for byte-exact A/B. */
     static int s_no_restart = -1;
-    if (s_no_restart < 0) s_no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
+    PS3_KNOB(s_no_restart, getenv("RSX_NO_RESTART") ? 1 : 0);
     const int restart_en = !s_no_restart && rsx_dsp_restart_index_enabled(&g.rsx, ia.is_u32);
     const u32 restart_val = rsx_dsp_restart_index(&g.rsx);
     for (u32 r = 0; r < dc.n_idx && dc.fetch_ok; r++)
@@ -5411,7 +5412,7 @@ static void ld_profile_present(u32 frame)
 static int ld_target_trace_enabled(void)
 {
     static int enabled = -1;
-    if (enabled < 0) enabled = getenv("RSX_TARGET_TRACE") ? 1 : 0;
+    PS3_KNOB(enabled, getenv("RSX_TARGET_TRACE") ? 1 : 0);
     return enabled;
 }
 
@@ -5948,7 +5949,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
           if (!open_gate) return;
       } }
     static int a010_only = -1;
-    if (a010_only < 0) a010_only = getenv("RSX_DRAW_CSV_A010_ONLY") != NULL;
+    PS3_KNOB(a010_only, getenv("RSX_DRAW_CSV_A010_ONLY") != NULL);
     if (a010_only) {
         if (InterlockedCompareExchange(
                 &g_yz_a010_root_active, 0, 0) == 0)
@@ -6805,7 +6806,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
       } }
     /* LD_FORCE_VA=1: debug -- inline draws whose UB4 vertex colour (attr 3)
      * has alpha 0 everywhere get alpha 255, to see what a faded-out element is. */
-    { static int fva = -1; if (fva < 0) fva = getenv("LD_FORCE_VA") ? 1 : 0;
+    { static int fva = -1; PS3_KNOB(fva, getenv("LD_FORCE_VA") ? 1 : 0);
       if (fva && dc.inl && dc.inl_stride) {
           rsx_dsp_vertex_attr va; rsx_dsp_get_vertex_attr(&g.rsx, 3, &va);
           if (va.type == RSX_VTX_TYPE_UNORM8 && va.size == 4) {
@@ -6866,7 +6867,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
      * renderer reads the right bytes" was never actually tested for the second
      * one. This lists them. */
     { static int lu = -1; static u32 seen[8]; static int ns;
-      if (lu < 0) lu = getenv("LD_UNITS") ? 1 : 0;
+      PS3_KNOB(lu, getenv("LD_UNITS") ? 1 : 0);
       if (lu) {
           u32 key = 0; int ps1 = 0;
           for (u32 q = 0; q < SRV_TABLE_SIZE; q++) {
@@ -6906,7 +6907,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * if the screen stays blank it is not. Nothing else distinguishes those
          * two, and the override is one line. */
         { static int fb0 = -1;
-          if (fb0 < 0) fb0 = getenv("LD_PS1_BUF0") ? 1 : 0;
+          PS3_KNOB(fb0, getenv("LD_PS1_BUF0") ? 1 : 0);
           if (fb0 && t.location == 1u && t.offset == 0x4003C0u)
               t.offset = 0x400000u; }
         if (!t.enabled) continue;
@@ -6949,7 +6950,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
          * entirely by these UVs, and every pixel the PS1 draws lives at
          * x >= 640 while columns 0..639 are black. */
         { static int uvd = -1;
-          if (uvd < 0) uvd = getenv("LD_UVDBG") ? 1 : 0;
+          PS3_KNOB(uvd, getenv("LD_UVDBG") ? 1 : 0);
           if (uvd && t.location == 1u && t.offset == 0x400000u) {
               static unsigned long n = 0;
               if (n++ < 4) {
@@ -7040,7 +7041,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
              * III does that: every bind lands on a surface and not one real
              * texture is ever created, so the screen stays black. */
             static int alias_dbg = -1;
-            if (alias_dbg < 0) alias_dbg = getenv("LD_ALIAS_DBG") != NULL;
+            PS3_KNOB(alias_dbg, getenv("LD_ALIAS_DBG") != NULL);
             if (alias_dbg) {
                 static u32 n_hit = 0;
                 if (n_hit++ < 24)
@@ -7449,7 +7450,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * and those conclusions are void. Establish that X would be visible
          * before concluding X never happens. */
         { static int ct = -1;
-          if (ct < 0) ct = getenv("LD_CLEAR_TEST") ? 1 : 0;
+          PS3_KNOB(ct, getenv("LD_CLEAR_TEST") ? 1 : 0);
           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
@@ -8658,7 +8659,7 @@ void rsx_live_draw_present(u32 buffer_id)
        * of firing at a frame number. Needs PS1_PC=1, which is what samples it. */
       int gate;
       { static int onv = -1;
-        if (onv < 0) onv = getenv("LD_SURF_DUMP_ON_VRAM") ? 1 : 0;
+        PS3_KNOB(onv, getenv("LD_SURF_DUMP_ON_VRAM") ? 1 : 0);
         gate = onv ? (g_ld_ps1_vram_ready != 0) : (g_ld_frames >= at);
         /* LD_SURF_DUMP_GATE=<file>: fire when <file> appears instead. */
         static const char* gf = (const char*)-1;
@@ -8779,7 +8780,7 @@ void rsx_live_draw_present(u32 buffer_id)
      * presents as a black frame. Counting them separates "we present the wrong
      * buffer" from "we present the right buffer too early". */
     { static int dbg = -1;
-      if (dbg < 0) dbg = getenv("LD_PRESENT_DBG") ? 1 : 0;
+      PS3_KNOB(dbg, getenv("LD_PRESENT_DBG") ? 1 : 0);
       if (dbg) {
           static unsigned long long n = 0, blank = 0;
           n++;
@@ -9295,7 +9296,7 @@ void rsx_live_draw_present(u32 buffer_id)
            * signal. Finding the LIVE pc needs the interpreter's register, not
            * this field. */
           { static int pc_on = -1;
-            if (pc_on < 0) pc_on = getenv("PS1_PC") ? 1 : 0;
+            PS3_KNOB(pc_on, getenv("PS1_PC") ? 1 : 0);
             if (pc_on) {
                 extern uint32_t vm_read32(uint64_t);
                 /* One read of +0x108 cannot tell a reset loop from a field that
@@ -9407,7 +9408,7 @@ void rsx_live_draw_present(u32 buffer_id)
                        * here has to be byte-swapped. Reading it big-endian
                        * would produce plausible-looking nonsense. */
                       { static int ev = -1; static int ev_done = 0;
-                        if (ev < 0) ev = getenv("PS1_EVENTS") ? 1 : 0;
+                        PS3_KNOB(ev, getenv("PS1_EVENTS") ? 1 : 0);
                         static int ev_beats = 0;
                         if (ev && !ev_done && ++ev_beats >= 3) {
                             ev_done = 1;
@@ -9478,7 +9479,7 @@ void rsx_live_draw_present(u32 buffer_id)
                        * R3000; if they reach it, it is the rasteriser or the
                        * composite. Opposite halves of the pipeline. */
                       { static int gh = -1;
-                        if (gh < 0) gh = getenv("PS1_GP0HIST") ? 1 : 0;
+                        PS3_KNOB(gh, getenv("PS1_GP0HIST") ? 1 : 0);
                         if (gh && rbase && roff >= 0x4000u) {
                             unsigned cls[8] = {0}; unsigned pk_types[8] = {0};
                             for (u32 k = 1; k <= 64u; k++) {
@@ -9529,7 +9530,7 @@ void rsx_live_draw_present(u32 buffer_id)
                        * the question is what these packets actually contain --
                        * PS1 GP0 drawing commands, or only state and sync. */
                       { static int rd2 = -1; static int shown = 0;
-                        if (rd2 < 0) rd2 = getenv("PS1_RINGDUMP") ? 1 : 0;
+                        PS3_KNOB(rd2, getenv("PS1_RINGDUMP") ? 1 : 0);
                         if (rd2 && shown < 3 && rbase && roff >= 0x300u) {
                             shown++;
                             for (int k = 3; k >= 1; k--) {
@@ -9601,7 +9602,7 @@ void rsx_live_draw_present(u32 buffer_id)
     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
      * a title whose content starts after the boot clears is invisible otherwise. */
     static int ld_dump_every = -1;
-    if (ld_dump_every < 0) { const char* e = getenv("RSX_DUMP_EVERY"); ld_dump_every = e ? atoi(e) : 0; }
+    PS3_KNOB(ld_dump_every, ps3_env_int("RSX_DUMP_EVERY", 0));
     if (LD_DIAG_ENABLED("RSX_DUMP") &&
         (g_ld_frames <= 8 || (ld_dump_every > 0 && (g_ld_frames % (u32)ld_dump_every) == 0))) {
         /* Dump the presented color surface (RENDER_TARGET state -> safe). */

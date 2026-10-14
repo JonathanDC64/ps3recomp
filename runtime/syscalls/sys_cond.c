@@ -6,6 +6,7 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "ps3emu/ps3_knob.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -191,7 +192,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
      * lift), once per wait. Names what a parked thread is waiting for when the
      * host stack only shows ntdll. */
     static int s_cs = -1;
-    if (s_cs < 0) s_cs = getenv("COND_SHADOW") ? 1 : 0;
+    PS3_KNOB(s_cs, getenv("COND_SHADOW") ? 1 : 0);
     int cs_said = !s_cs;
     while (!waiter.signalled) {
         DWORD ms = INFINITE;

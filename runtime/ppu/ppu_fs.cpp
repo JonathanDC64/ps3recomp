@@ -14,6 +14,7 @@
  * through vm_base in big-endian.
  */
 #include "ppu_recomp.h"      /* ppu_context */
+#include "ps3emu/ps3_knob.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
@@ -164,7 +165,7 @@ static DIR*  g_dirs[FS_MAX];
 extern "C" unsigned long long ps3_ms_now(void);
 struct fs_tstat { unsigned long long t_open, rd_us, wr_us, rd_b, wr_b; uint32_t rd_n, wr_n; };
 static fs_tstat g_fd_t[FS_MAX];
-static int fs_time_on(void) { static int on = -1; if (on < 0) on = getenv("FS_TIME") ? 1 : 0; return on; }
+static int fs_time_on(void) { static int on = -1; PS3_KNOB(on, getenv("FS_TIME") ? 1 : 0); return on; }
 static unsigned long long fs_us_now(void)
 {
     static LARGE_INTEGER f; LARGE_INTEGER c;

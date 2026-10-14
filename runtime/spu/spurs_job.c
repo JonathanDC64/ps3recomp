@@ -36,6 +36,7 @@
  */
 
 #include "spu_coherency.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_workload.h"
 #include "spu_context.h"
 
@@ -374,7 +375,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
     { uint32_t _cb = g32(job_ea + 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+    { static int s_t = -1; PS3_KNOB(s_t, getenv("SPURS_JOB_MBOX") ? 1 : 0);
       static int n = 0;
       if (s_t && n++ < 16 && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",

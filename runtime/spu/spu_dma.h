@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -218,7 +219,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * "code 0x00000000 not registered".
      *
      * SPU_DMA_LAX=1 restores the old permissive behaviour. */
-    { static int s_lax = -1; if (s_lax < 0) s_lax = getenv("SPU_DMA_LAX") ? 1 : 0;
+    { static int s_lax = -1; PS3_KNOB(s_lax, getenv("SPU_DMA_LAX") ? 1 : 0);
       if (!s_lax) {
           /* A PUT into the null page is the same class of accident: lv2 reserves
            * the low 64 KB and no title DMAs there on purpose, so an EA that
@@ -245,7 +246,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
-    { static int s_dc = -1; if (s_dc < 0) s_dc = getenv("SPU_DMACHK") ? 1 : 0;
+    { static int s_dc = -1; PS3_KNOB(s_dc, getenv("SPU_DMACHK") ? 1 : 0);
       if (s_dc) { static int _n = 0;
           int bad = (size == 0) || (size > 0x4000)
                  || (size >= 16 && (size & 15))
@@ -259,7 +260,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_GETHIST=1: the same accounting for GETs, on the SOURCE side. A solver
      * whose inputs read back as zeros produces zeros no matter how many
      * instructions it runs. */
-    { static int s_gh = -1; if (s_gh < 0) s_gh = getenv("SPU_GETHIST") ? 1 : 0;
+    { static int s_gh = -1; PS3_KNOB(s_gh, getenv("SPU_GETHIST") ? 1 : 0);
       if (s_gh && mfc_is_get(cmd) && vm_base) {
           static uint32_t seen[48]; static int ns = 0;
           uint32_t k = (uint32_t)ea & ~0xFFFFu;
@@ -311,7 +312,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         static int s_seen = 0;
         if (s_seen++) { extern void ppu_guard_page_rearm(uint32_t, int);
             ppu_guard_page_rearm(s_arm_pending, !s_arm_abs); s_arm_pending = 0; } }
-    { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+    { static int s_ph = -1; PS3_KNOB(s_ph, getenv("SPU_PUTHIST") ? 1 : 0);
       if (s_ph) { static unsigned long long ngets, nputs, nother;
           if (mfc_is_get(cmd)) ngets++; else if (mfc_is_put(cmd)) nputs++; else nother++;
           if (((ngets + nputs + nother) % 5000) == 0)
@@ -399,7 +400,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         } } }
     /* cellAudio port-ring window: log every guest write into it (rare, load-
      * bearing -- the audio OUTPUT path). Same env gate as the sampler. */
-    { static int s_pr = -1; if (s_pr < 0) s_pr = getenv("SPU_MFC_TRACE") ? 1 : 0;
+    { static int s_pr = -1; PS3_KNOB(s_pr, getenv("SPU_MFC_TRACE") ? 1 : 0);
       if (s_pr && (cmd & 0x20) && !(cmd & 0x40) &&
           (((uint32_t)ea >= 0x01000000u && (uint32_t)ea < 0x01800000u) ||
            ((uint32_t)ea >= 0x00927D00u && (uint32_t)ea < 0x00928000u))) {
@@ -437,7 +438,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * A job that DMAs a small buffer to a garbage EA in a tight loop is
          * usually an SPU-side assert/print path, and the payload names the
          * actual complaint -- far more useful than the address it failed at. */
-        { static int s_d = -1; if (s_d < 0) s_d = getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0;
+        { static int s_d = -1; PS3_KNOB(s_d, getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0);
           if (s_d && s_warned <= 2) {
             const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
             fprintf(stderr, "  LS[0x%05X] ascii: ", lsa);
@@ -457,7 +458,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * -- a completion-write attempt -- and (b) any GET payload carrying a
      * 0xD00Cxxxx dword -- the completion EA arriving in a loaded job buffer.
      * Answers whether the EA ever reaches / is ever written by the SPU. */
-    { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+    { static int s_se = -1; PS3_KNOB(s_se, getenv("SPU_STACKEA_WATCH") ? 1 : 0);
       if (s_se) {
         uint32_t e32 = (uint32_t)ea;
         if ((e32 & 0xFF000000u) == 0xD0000000u ||   /* DMA targeting the PPU stack */
@@ -477,7 +478,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
     { static int s_t = -1; static int s_img = -2;
-      if (s_t < 0) s_t = getenv("SPU_DMATRACE_ALL") ? 1 : 0;
+      PS3_KNOB(s_t, getenv("SPU_DMATRACE_ALL") ? 1 : 0);
       if (s_img == -2) { const char* e = getenv("YDKJ_DMA_IMG"); s_img = e ? atoi(e) : -1; }
       /* YDKJ_DMA_IMG=N: trace ONLY image N, uncapped (the 300-cap otherwise fills
        * with the always-running PM's DMA and hides a late image entirely). */
@@ -570,7 +571,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     if (mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
     if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
         static int s_di = -1;
-        if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
+        PS3_KNOB(s_di, getenv("SPU_DSP_IMAGE_EA") ? 1 : 0);
         extern uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
         if (s_di && g_spu_image_src_ea) {
             static int _n = 0;
@@ -591,7 +592,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * event flag) vs still loops. If it progresses, the null buffers are tolerable
      * and our lift is DMAing where HW skips; if not, the buffers must be real. */
     if (mfc_is_get(cmd) && (uint32_t)ea < 0x10000u) {
-        static int s_skip = -1; if (s_skip < 0) s_skip = getenv("LBP_SKIP_NULL_DMA") ? 1 : 0;
+        static int s_skip = -1; PS3_KNOB(s_skip, getenv("LBP_SKIP_NULL_DMA") ? 1 : 0);
         if (s_skip) {
             static int _n = 0; if (_n++ < 20)
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
@@ -633,7 +634,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
          * overlay never loads. Dump the descriptor content to see where the
          * real source EA was dropped. */
-        { static int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("SPU_OVL_DIAG") ? 1 : 0;
+        { static int s_ovl = -1; PS3_KNOB(s_ovl, getenv("SPU_OVL_DIAG") ? 1 : 0);
           if (s_ovl) {
               /* overlay-load map: image-6 GET of a code-sized chunk into the
                * high LS overlay region, with its (now-correct) plugin source.
@@ -661,7 +662,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
-        { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+        { static int s_se = -1; PS3_KNOB(s_se, getenv("SPU_STACKEA_WATCH") ? 1 : 0);
           if (s_se && size >= 4) { static int _n = 0;
             for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
                 uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
@@ -965,7 +966,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
-    { static int s_ch = -1; if (s_ch < 0) s_ch = getenv("SPU_CMDHIST") ? 1 : 0;
+    { static int s_ch = -1; PS3_KNOB(s_ch, getenv("SPU_CMDHIST") ? 1 : 0);
       if (s_ch) { static unsigned long long h[256][8]; static unsigned long long n;
           h[cmd & 0xFF][spu->image_id & 7]++;
           if ((++n % 300) == 0) {
@@ -1102,7 +1103,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * range, which would mean no geometry is rasterised at all -- the missing
      * 3D. That was noticed from three sampled addresses, so count them all. */
     { static int s_vp = -1;
-      if (s_vp < 0) s_vp = getenv("SPU_VRAMPC") ? 1 : 0;
+      PS3_KNOB(s_vp, getenv("SPU_VRAMPC") ? 1 : 0);
       if (s_vp && mfc_is_put(cmd) &&
           (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
           static unsigned long long b[8]; static unsigned long long n;
@@ -1159,7 +1160,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      *
      * Host2Local_Body is LS 0x00350..0x00757 (from the firmware .symtab). */
     { static int s_hs = -1;
-      if (s_hs < 0) s_hs = getenv("SPU_H2LSRC") ? 1 : 0;
+      PS3_KNOB(s_hs, getenv("SPU_H2LSRC") ? 1 : 0);
       if (s_hs && vm_base && mfc_is_put(cmd) && size >= 16u &&
           (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
           const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
@@ -1187,7 +1188,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * (RSX local + 0x400000). Buckets keep only 4 address bits, so that may be
      * an artifact of where RSX local memory actually sits; the full EA settles
      * it. */
-    { static int s_pe = -1; if (s_pe < 0) s_pe = getenv("SPU_PUTEA") ? 1 : 0;
+    { static int s_pe = -1; PS3_KNOB(s_pe, getenv("SPU_PUTEA") ? 1 : 0);
       if (s_pe && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
           static int shown[8];
           const unsigned sp2 = spu->spu_id & 7u;
@@ -1205,7 +1206,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * of VRAM decodes to correct game art -- so the rasteriser runs and the
      * asset upload works, and the question is what geometry these transfers
      * actually have. */
-    { static int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+    { static int s_ph = -1; PS3_KNOB(s_ph, getenv("SPU_PUTHIST") ? 1 : 0);
       if (s_ph && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
           static unsigned long long n[8][16], byt[8][16], nsz[8][8], tot;
           const unsigned sp = spu->spu_id & 7u;
@@ -1238,7 +1239,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * instead of image-22's lift_pol (sys-service). The cri task (0x3000+) is
      * registered under both 22 and 23, so it still resolves after the switch. */
     if (lsa == 0xA00u && (uint32_t)ea == 0x30023680u) {
-        static int s_cc = -1; if (s_cc < 0) s_cc = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
+        static int s_cc = -1; PS3_KNOB(s_cc, getenv("YDKJ_CRI_CHAIN") ? 1 : 0);
         if (s_cc) {
             spu->image_id = 23;
             fprintf(stderr, "[cri-chain] taskset policy DMA'd to LS 0xA00 -> SPU image -> 23\n");
@@ -1516,7 +1517,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * shareableWriteIfDiscarded=(f>>12)&1, logBufSet=(f>>5)&0xF, logBuf=f&0x1F.
          * Answers lifter-vs-builder: are shareable-output UseBuffer + kRunJob +
          * store commands PRESENT in the list the PPU built? */
-        { static int s_cd = -1; if (s_cd < 0) s_cd = getenv("SPU_CMDDUMP") ? 1 : 0;
+        { static int s_cd = -1; PS3_KNOB(s_cd, getenv("SPU_CMDDUMP") ? 1 : 0);
           if (s_cd) { static int _c = 0; if (_c++ < 6) {
             static const char* NM[8] = {"kNop","kReserveBufSet","kUseBuffer",
                 "kUnreserveBufSets","kReqDepDec","kRunJob","kEndCommand","kInvalid"};

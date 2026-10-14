@@ -23,6 +23,7 @@
  * kernel side: select = "no contention, keep running", exit = end of run.
  */
 #include "spu_context.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_workload.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +72,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * dispatches drain the queue one ticket at a time (the persistent-LS claim
      * that motivated the cache predates the r4 word0/word1 layout fix). */
     static int s_fresh = -1;
-    if (s_fresh < 0) s_fresh = getenv("SPURS_PM_FRESH") ? 1 : 0;
+    PS3_KNOB(s_fresh, getenv("SPURS_PM_FRESH") ? 1 : 0);
     /* Reset the persistent context when the workload's DATA (queue EA)
      * changes: the game re-points a wid at a NEW job queue once the old one
      * drains, and a real SPURS kernel reloads the policy module fresh on a
@@ -92,7 +93,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * spu_lifted_job.h reports "two contexts" for a run that has five, and
          * makes correct multi-SPU execution look like duplicated state. */
         { static int s_cl = -1;
-          if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+          PS3_KNOB(s_cl, getenv("SPU_CTX_LOG") ? 1 : 0);
           if (s_cl) fprintf(stderr, "[spu-ctx] new POLICY context %p wid=%u spu_num=%u\n",
                             (void*)ctx, wid, spu_num); }
         memset(ctx, 0, sizeof(*ctx));
@@ -175,7 +176,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * Default off; SPURS_PM_TRACE=1 restores them (first 64 + every 4096th
      * so an enabled trace can't flood either). */
     static int s_trace = -1;
-    if (s_trace < 0) s_trace = getenv("SPURS_PM_TRACE") ? 1 : 0;
+    PS3_KNOB(s_trace, getenv("SPURS_PM_TRACE") ? 1 : 0);
     static unsigned long s_runs = 0;
     unsigned long runno = ++s_runs;
     int log_this = s_trace && (runno <= 64 || (runno & 0xFFF) == 0);
@@ -196,7 +197,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     extern volatile unsigned g_spu_putllc_sync_hit;
     extern uint32_t g_barrier_sync_watch;
     static int s_flow = -1;
-    if (s_flow < 0) s_flow = getenv("SPURS_PM_FLOW") ? 1 : 0;
+    PS3_KNOB(s_flow, getenv("SPURS_PM_FLOW") ? 1 : 0);
     unsigned putllc_before = g_spu_putllc_sync_hit;
     (void)g_spu_putllc_count;
     /* Trace ONLY the stalled queue's own runs: wkl_data == the sync EA the PPU
@@ -211,7 +212,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * guest dump shows a working SPU has 0x11B0 bound and runJobNum=0, ours
      * has 0x11B0 == 0 and runJobNum == -1. */
     static int s_flow_all = -1;
-    if (s_flow_all < 0) s_flow_all = getenv("SPURS_PM_FLOW_ALL") ? 1 : 0;
+    PS3_KNOB(s_flow_all, getenv("SPURS_PM_FLOW_ALL") ? 1 : 0);
     int tracing = (s_flow && spu_num == 0 && g_pm_flow_ctx == 0 &&
                    (s_flow_all ||
                     (g_barrier_sync_watch &&
@@ -241,7 +242,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * spu_run_with_halt halted at. Answers: does re-entry advance the pipeline
      * or reset/stall it? Only wid<=1 (jobmanager) traced, first 4000 runs. */
     static int s_pipe = -1;
-    if (s_pipe < 0) s_pipe = getenv("SPURS_PM_PIPE") ? 1 : 0;
+    PS3_KNOB(s_pipe, getenv("SPURS_PM_PIPE") ? 1 : 0);
     /* trace ALL workloads (the jobmanager is wid=12, not <=1); 4000-run cap bounds volume */
     int pipe_this = s_pipe && spu_num == 0;
     uint32_t st_before = 0;
@@ -261,7 +262,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * and 0xC00-GET counters across each run names that dispatch and shows the
      * LS pipeline state it left behind. */
     static int s_claimlog = -1;
-    if (s_claimlog < 0) s_claimlog = getenv("SPURS_PM_CLAIMLOG") ? 1 : 0;
+    PS3_KNOB(s_claimlog, getenv("SPURS_PM_CLAIMLOG") ? 1 : 0);
     unsigned batch_before = g_wws_batch_gets;
     unsigned claim_before = g_spu_putllc_sync_hit;
 

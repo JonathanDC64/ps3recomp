@@ -11,6 +11,7 @@
  */
 
 #include <time.h>
+#include "ps3emu/ps3_knob.h"
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,7 +144,7 @@ static int pad_host_window_focused(void)
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
-    if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
     if (off) return;
 
     PadHostState* hs = &s_host_state[0];
@@ -509,7 +510,7 @@ static void pad_trace(int which, u32 port)
 {
     static int on = -1; static unsigned long long t0 = 0;
     static unsigned n[2][8];
-    if (on < 0) on = getenv("PAD_TRACE") ? 1 : 0;
+    PS3_KNOB(on, getenv("PAD_TRACE") ? 1 : 0);
     if (!on) return;
     if (port < 8) n[which][port]++;
     unsigned long long now = GetTickCount64();
@@ -621,7 +622,7 @@ skip_inject: ;
      * seconds of polling so boot screens that wait for input advance without a
      * human at the pad. Env-gated test scaffolding, off by default. */
     { static int s_ap = -1; static unsigned s_apn = 0;
-      if (s_ap < 0) s_ap = getenv("PAD_AUTOPRESS") ? 1 : 0;
+      PS3_KNOB(s_ap, getenv("PAD_AUTOPRESS") ? 1 : 0);
       if (s_ap && port_no == 0) {
           unsigned ph = s_apn++ % 240;
           if (ph < 12)
@@ -735,9 +736,13 @@ skip_inject: ;
       /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
        * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
       static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
-      if (!s_t0) s_t0 = GetTickCount64();
-      if (s_st < 0) { const char* e = getenv("PAD_STICK");
-        s_st = e ? 1 : 0;
+      /* Live: the console's setenv PAD_STICK=... re-reads it, and the window
+       * then counts from that moment (setenv PAD_STICK=128,0,128,128,0,5 walks
+       * forward for five seconds). At startup it counts from the first poll. */
+      static unsigned s_stg = 0;
+      if (s_stg != ps3_env_gen) { s_stg = ps3_env_gen;
+        const char* e = getenv("PAD_STICK");
+        s_st = e ? 1 : 0; s_t0 = GetTickCount64(); s_from = 0; s_until = 1e30;
         if (e) { int a=128,b=128,c=128,d=128;
                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
@@ -851,7 +856,7 @@ emit:
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
     {
         static int always = -1;
-        if (always < 0) always = getenv("PAD_ALWAYS_CHANGE") ? 1 : 0;
+        PS3_KNOB(always, getenv("PAD_ALWAYS_CHANGE") ? 1 : 0);
         if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;

@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "ps3emu/ps3_knob.h"
 #include <setjmp.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -69,7 +70,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
      * a plain trampoline that never reaches spu_indirect_branch. The drain sees
      * every step, so catch it here too. Step 0 is the real entry. */
     static int s_no_ls0 = -1;
-    if (s_no_ls0 < 0) s_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
+    PS3_KNOB(s_no_ls0, getenv("SPU_NO_LS0_END") ? 1 : 0);
     /* SPU_EXITTRACE=<img>: remember the last PCs this image executed and dump
      * them when the job ends. "Why did it exit here" is a question about the
      * path taken, and a forward trace from the entry never reaches far enough
@@ -120,7 +121,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
         g_pm_flow_buf[g_pm_flow_n++] = ctx->pc;
 
     static int s_on = -1;
-    if (s_on < 0) s_on = getenv("SPU_JOBDRAIN") ? 1 : 0;
+    PS3_KNOB(s_on, getenv("SPU_JOBDRAIN") ? 1 : 0);
     if (!s_on || ctx->image_id != 2 || !ctx->policy_mode) return;
 
     /* 0x2318 = the type-2 load's ring-full bail (resets scan, retries). */
@@ -200,7 +201,7 @@ volatile unsigned g_sn_defer     = 0;
 unsigned spu_sn_defer_ticks(void)
 {
     static int s_n = -1;
-    if (s_n < 0) { const char* e = getenv("SPU_SN_DEFER"); s_n = e ? atoi(e) : 0; }
+    PS3_KNOB(s_n, ps3_env_int("SPU_SN_DEFER", 0));
     return (unsigned)(s_n < 0 ? 0 : s_n);
 }
 
@@ -253,7 +254,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                 if (f && ctx->host_depth <= f->depth)
                     ctx->irq_frame = f->prev;      /* returned to its loop the ordinary way */
                 if (f && ctx->host_depth > f->depth) {
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static int s_it = -1; PS3_KNOB(s_it, getenv("SPU_IRQTRACE") ? 1 : 0);
                       static int _n = 0;
                       if (s_it && _n++ < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
@@ -264,7 +265,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                     /* Taken by the top-level driver loop (depth 0), which
                      * keeps no frame: the driver's own restart re-enters at
                      * srr0 with the host stack empty, which is that frame. */
-                    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+                    { static int s_it = -1; PS3_KNOB(s_it, getenv("SPU_IRQTRACE") ? 1 : 0);
                       static int _n = 0;
                       if (s_it && _n++ < 200)
                           fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
@@ -308,7 +309,7 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->srr0 = ctx->pc;             /* resume point for iret */
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
-    { static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
+    { static int s_it = -1; PS3_KNOB(s_it, getenv("SPU_IRQTRACE") ? 1 : 0);
       if (s_it) { static int _n = 0; if (_n++ < 200)
         fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
                 ctx->srr0 & SPU_LS_MASK, ctx->host_depth,

@@ -17,6 +17,7 @@
 #ifdef _WIN32
 
 #include <time.h>
+#include "ps3emu/ps3_knob.h"
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -447,7 +448,7 @@ static void subvp_note(u32 x, u32 y, u32 w, u32 h)
 static void subvp_capture(u32 fi)
 {
     static int en = -1;
-    if (en < 0) { const char* e = getenv("SUBVP_RTT"); en = e ? atoi(e) : 0; }
+    PS3_KNOB(en, ps3_env_int("SUBVP_RTT", 0));
     if (!en || !s_d3d.device || !s_subvp_n) return;
     for (int i = 0; i < s_subvp_n; i++) {
         if (!s_subvp[i].res) {
@@ -522,7 +523,7 @@ static double perf_now(void)
 static int perf_on(void)
 {
     static int v = -1;
-    if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
+    PS3_KNOB(v, ps3_env_int("PERF", 0));
     return v;
 }
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
@@ -1424,7 +1425,7 @@ static void dump_backbuffer_bmp(void)
      * enough to tell a logo or a menu change from a re-presented frame, and a
      * long static screen then costs one file instead of hundreds. */
     { static int chg = -1; static unsigned long long last = 0;
-      if (chg < 0) chg = getenv("CELLMARK_DUMP_CHANGED") ? 1 : 0;
+      PS3_KNOB(chg, getenv("CELLMARK_DUMP_CHANGED") ? 1 : 0);
       if (chg) {
           unsigned long long hsh = 1469598103934665603ull;
           for (u32 y = 0; y < s_d3d.height; y += 8) {
@@ -1587,7 +1588,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
         /* TEXUP_DBG=1: texture uploads per second. A cache that misses every
          * draw re-uploads megabytes per frame, which is the kind of GPU work
          * that trips a 2-second TDR while looking like nothing in a draw count. */
-        { static int td = -1; if (td < 0) td = getenv("TEXUP_DBG") ? 1 : 0;
+        { static int td = -1; PS3_KNOB(td, getenv("TEXUP_DBG") ? 1 : 0);
           if (td) { static long long n = 0, bytes = 0; static clock_t t0 = 0;
               n++; bytes += (long long)pitch * h;
               const clock_t now = clock();
@@ -1902,7 +1903,7 @@ static int vp_get_vs(const rsx_state* st)
      * through the wrong program.
      * VP_START_OFF=1 restores the old always-from-zero behaviour. */
     u32 vstart = 0;
-    { static int off = -1; if (off < 0) off = getenv("VP_START_OFF") ? 1 : 0;
+    { static int off = -1; PS3_KNOB(off, getenv("VP_START_OFF") ? 1 : 0);
       if (!off) vstart = st->transform_program_start * 16u; }
     if (vstart >= st->vp_ucode_bytes) vstart = 0;
     const u8* vuc = st->vp_ucode + vstart;
@@ -2065,7 +2066,7 @@ static u32 rsx_depth_key(const rsx_state* st)
 
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
-    { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
+    { static int _bd = -1; PS3_KNOB(_bd, getenv("BLENDDBG") ? 1 : 0);
       if (_bd) { static u32 seen[32]; static int ns=0;
         u32 sk = (enable?0x80000000u:0u) | (st ? (st->blend_sfactor & 0xFFFFu) : 0u);
         int f=0; for (int k2=0;k2<ns;k2++) if (seen[k2]==sk) f=1;
@@ -2110,7 +2111,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
      * per-face stride fixed (each face is a whole mip pyramid, not one mip-0
      * image) all six faces decode as clean environment art. */
     static int en = -1;
-    if (en < 0) { const char* e = getenv("RSX_CUBE_TEX"); en = e ? atoi(e) : 1; }
+    PS3_KNOB(en, ps3_env_int("RSX_CUBE_TEX", 1));
     if (!en) return 0;
     u32 m = 0;
     for (int u = 0; u < RSX_FP_UNITS; u++) if (dr->tex[u].set && dr->tex[u].cube) m |= 1u << u;
@@ -2257,11 +2258,37 @@ static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
     return 1;
 }
 
+/* Knobs baked into a pipeline when it is built. The cache keys don't hold
+ * them, so after the console changes one of them every pipeline is rebuilt
+ * (vp_gen); other setenvs leave the cache alone. */
+static void vp_pso_knobs_check(void)
+{
+    static unsigned seen_gen = 0, sig = 0;
+    if (seen_gen == ps3_env_gen) return;
+    seen_gen = ps3_env_gen;
+    static const char* const names[] = {
+        "CULL_OFF", "CULL_FLIP", "DEPTH_OFF", "CMASK_FORCE", "FP_CONSTBUF", "FP_FORCE",
+        "FP_IDCOLOR", "FP_KILL", "FP_OFF", "FP_ONE", "FP_PICK", "FP_SHOW", "FP_SUB",
+        "FP_TEX", "FP_TEX_FP", "FP_TEX_UV", NULL };
+    unsigned h = 2166136261u;
+    for (int i = 0; names[i]; i++) {
+        const char* v = getenv(names[i]);
+        for (const char* c = v ? v : ""; *c; c++) h = (h ^ (unsigned char)*c) * 16777619u;
+        h = (h ^ 0xFFu) * 16777619u;
+    }
+    if (sig && h != sig) {
+        s_d3d.vp_gen++;
+        fprintf(stderr, "[D3D12] pipeline knobs changed: rebuilding pipelines%c", 10);
+    }
+    sig = h;
+}
+
 static void fp_seen_note(u32 ea, u32 len);
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 depth, u32 cube_mask)
 {
+    vp_pso_knobs_check();
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
@@ -2328,7 +2355,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * constants are patched into the shader bytes, so a program whose constants
      * animate yields a new hash -- and a new pipeline -- every time. */
     { static int hd = -1;
-      if (hd < 0) { const char* e = getenv("HASHDBG"); hd = e ? atoi(e) : 0; }
+      PS3_KNOB(hd, ps3_env_int("HASHDBG", 0));
       if (hd) { static u32 fps[32]; static u32 cnt[32]; static int nf = 0;
         int idx = -1;
         for (int i = 0; i < nf; i++) if (fps[i] == fp_addr) idx = i;
@@ -2338,7 +2365,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[HASHDBG] fp=0x%X has produced %u distinct compiles%c",
                     fp_addr, cnt[idx], 10); } } }
     { static int md = -1;
-      if (md < 0) { const char* e = getenv("PSOMISSDBG"); md = e ? atoi(e) : 0; }
+      PS3_KNOB(md, ps3_env_int("PSOMISSDBG", 0));
       if (md) { static int n = 0;
         for (int i = 0; i < s_d3d.vp_fp_n && n < 12; i++) {
             VPFPEntry* q = &s_d3d.vp_fp[i];
@@ -2359,7 +2386,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * program shows several masks, the mask is unstable and is the reason the
      * pipeline cache thrashes with cube support on. */
     { static int ck = -1;
-      if (ck < 0) { const char* e = getenv("CUBEKEYDBG"); ck = e ? atoi(e) : 0; }
+      PS3_KNOB(ck, ps3_env_int("CUBEKEYDBG", 0));
       if (ck) { static u32 seen[64][2]; static int ns = 0; int known = 0;
         for (int i = 0; i < ns; i++)
             if (seen[i][0] == fp_addr && seen[i][1] == cube_mask) known = 1;
@@ -2401,7 +2428,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
-    { static int fl = -1; if (fl < 0) fl = getenv("FP_LIST") ? 1 : 0;
+    { static int fl = -1; PS3_KNOB(fl, getenv("FP_LIST") ? 1 : 0);
       if (fl) fprintf(stderr, "[FPLIST] fp=0x%08X instrs=%d hlsl=%u bytes%c",
                       fp_addr, n, (unsigned)strlen(hlsl), 10); }
     if (getenv("FP_DUMP")) { static int _d=0; if (_d++ < 4) {
@@ -2583,14 +2610,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* Guest face culling. CULL_OFF=1 forces double-sided, the old
      * unconditional behaviour -- geometry that vanishes under culling is a
      * winding/front-face problem, not a missing draw. */
-    { static int _co = -1; if (_co < 0) _co = getenv("CULL_OFF") ? 1 : 0;
+    { static int _co = -1; PS3_KNOB(_co, getenv("CULL_OFF") ? 1 : 0);
       pd.RasterizerState.CullMode = (!_co && (cull & 1u))
           ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
           : D3D12_CULL_MODE_NONE;
       /* CULL_FLIP=1: invert the front-face convention. Our VP path may hand
        * D3D the opposite winding from the guest's, in which case honouring
        * CULL_FACE culls exactly the faces it should keep. */
-      static int _cfl = -1; if (_cfl < 0) _cfl = getenv("CULL_FLIP") ? 1 : 0;
+      static int _cfl = -1; PS3_KNOB(_cfl, getenv("CULL_FLIP") ? 1 : 0);
       pd.RasterizerState.FrontCounterClockwise =
           (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
@@ -2621,7 +2648,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* CMASK_FORCE=1: ignore the guest colour mask (write RGBA on every draw).
      * A mis-decoded mask makes geometry rasterize correctly and write nothing,
      * which is indistinguishable from "the draw never happened". */
-    { static int _cf = -1; if (_cf < 0) _cf = getenv("CMASK_FORCE") ? 1 : 0;
+    { static int _cf = -1; PS3_KNOB(_cf, getenv("CMASK_FORCE") ? 1 : 0);
       if (_cf) cmask = 0xF; }
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
@@ -2639,7 +2666,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * which reordering alone cannot, because a relocated draw still fails the
      * depth test against whatever is already in the buffer. Diagnostic. */
     { static int doff = -1;
-      if (doff < 0) { const char* e = getenv("DEPTH_OFF"); doff = e ? atoi(e) : 0; }
+      PS3_KNOB(doff, ps3_env_int("DEPTH_OFF", 0));
       if (doff) { pd.DepthStencilState.DepthEnable = FALSE;
                   pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } }
     pd.SampleDesc.Count = 1;
@@ -2680,12 +2707,12 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
      * the shader needs destR=1, destG=2, destB=3, destA=0 to see real RGBA.
      *   1 = identity   2 = rotate (the ARGB fix)   3 = BGRA swap */
     { static int fixed = -1;
-      if (fixed < 0) { const char* e = getenv("TEX_REMAP_ID"); fixed = e ? atoi(e) : 0; }
+      PS3_KNOB(fixed, ps3_env_int("TEX_REMAP_ID", 0));
       if (fixed == 1) return 0u | (1u<<3) | (2u<<6) | (3u<<9) | (1u<<12);
       if (fixed == 2) return 1u | (2u<<3) | (3u<<6) | (0u<<9) | (1u<<12);
       if (fixed == 3) return 2u | (1u<<3) | (0u<<6) | (3u<<9) | (1u<<12); }
     /* D3D12 mapping: destR | destG<<3 | destB<<6 | destA<<9 | valid bit */
-    { static int _rd = -1; if (_rd < 0) _rd = getenv("REMAPDBG") ? 1 : 0;
+    { static int _rd = -1; PS3_KNOB(_rd, getenv("REMAPDBG") ? 1 : 0);
       if (_rd) { static u32 seen[32]; static int ns=0;
         u32 k = (basef << 16) | (c1 & 0xFFFFu); int f=0;
         for (int i2=0;i2<ns;i2++) if (seen[i2]==k) f=1;
@@ -2763,7 +2790,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * path costing 0.01s for 775 calls. Kept because it is the right lever if a
      * title ever does hit an upload-bound frame. */
     { static int budget = -1;
-      if (budget < 0) { const char* e = getenv("TEX_BUDGET"); budget = e ? atoi(e) : 0; }
+      PS3_KNOB(budget, ps3_env_int("TEX_BUDGET", 0));
       if (budget > 0) {
           static u64 last_frame = ~0ull; static int used = 0;
           if (last_frame != (u64)s_d3d.frame_count) { last_frame = (u64)s_d3d.frame_count; used = 0; }
@@ -2832,7 +2859,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * exactly the mipmap pyramid total (L0 * 4/3), which is what the guest
      * reserves per texture. */
     { static int bias = -1;
-      if (bias < 0) { const char* e = getenv("TEX_OFF_BIAS"); bias = e ? atoi(e) : 0; }
+      PS3_KNOB(bias, ps3_env_int("TEX_OFF_BIAS", 0));
       if (bias == 1) { u32 sz = w * h * bpp; if (off > sz) off -= sz; }
       else if (bias >= 2) {
           u32 chain = 0;
@@ -2857,7 +2884,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * and SET_TEXTURE_OFFSET disagree this puts the real bytes under the sampler
      * without guessing a delta. */
     { static int remap = -1;
-      if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
+      PS3_KNOB(remap, ps3_env_int("TEX_REMAP", 0));
       if (remap) {
         u32 nz = 0, sz = w * h * bpp;
         for (u32 i = 0; i < sz && i < 0x20000u; i += 97) if (vm_base[off + i]) nz++;
@@ -2878,7 +2905,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;
-      if (cap < 0) { const char* e = getenv("TEX_SRCDBG"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("TEX_SRCDBG", 0));
       if (cap && n < cap) { n++;
         u32 nz = 0, tot = 0;
         for (u32 i = 0; i < w * h * bpp && i < 0x40000u; i += 61) { tot++; if (vm_base[off + i]) nz++; }
@@ -3184,7 +3211,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * says whether the duck's image is bound at all -- and if it is, the duck is
      * being drawn somewhere and the question is where, not whether. */
     { static int avgd = -1;
-      if (avgd < 0) { const char* e = getenv("TEX_AVGDBG"); avgd = e ? atoi(e) : 0; }
+      PS3_KNOB(avgd, ps3_env_int("TEX_AVGDBG", 0));
       if (avgd && !dxt && bpp == 4) {
         static u32 seen[64]; static int nseen = 0;
         int known = 0;
@@ -3227,7 +3254,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * answers "where on screen is the duck drawn" directly, which neither the
      * vertex data nor a pixel count can. Diagnostic only. */
     { static int hil = -1;
-      if (hil < 0) { const char* e = getenv("TEX_HILITE"); hil = e ? atoi(e) : 0; }
+      PS3_KNOB(hil, ps3_env_int("TEX_HILITE", 0));
       if (hil && !dxt && bpp == 4 && w == 512 && h == 512) {
         u64 sr = 0, sg = 0, sb = 0; u32 cnt = 0;
         for (u32 i2 = 0; i2 + 3 < w * h * 4u; i2 += 4 * 37) {
@@ -3255,7 +3282,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * and a legitimately black surface are indistinguishable on screen, so this
      * says WHICH geometry is missing its image -- diagnostic only. */
     { static int mark = -1;
-      if (mark < 0) { const char* e = getenv("TEX_MARKEMPTY"); mark = e ? atoi(e) : 0; }
+      PS3_KNOB(mark, ps3_env_int("TEX_MARKEMPTY", 0));
       if (mark && !dxt) {
         u32 nz = 0, sz = w * h * bpp;
         for (u32 i2 = 0; i2 < sz && i2 < 0x40000u; i2 += 61) if (vm_base[off + i2]) nz++;
@@ -3426,7 +3453,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
              * outside to geometry that never rasterised. */
-            { static int fk = -1; if (fk < 0) fk = getenv("FPK_DBG") ? 1 : 0;
+            { static int fk = -1; PS3_KNOB(fk, getenv("FPK_DBG") ? 1 : 0);
               static int n = 0;
               if (fk && n < 12 && dr->fp_addr != 0x00EC2B02u) { n++;
                   fprintf(stderr, "[FPK] tex0=0x%08X fp=0x%08X k0=(%g %g %g %g)"
@@ -3455,7 +3482,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
      * vertex program from the outside -- both give zero fragments. */
     { static int cap = -1, seen = 0;
-      if (cap < 0) { const char* e = getenv("VP_MVP"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("VP_MVP", 0));
       if (cap && seen < cap) { seen++;
         const float* c = (const float*)dst;
         int last_nz = -1;
@@ -3511,7 +3538,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                              cx = (float)a; cy = (float)b; } }
       if (z) { float ux = cx, uy = cy;
                static int lock = -1;
-               if (lock < 0) { const char* le = getenv("DBG_LOCK"); lock = le ? atoi(le) : 0; }
+               PS3_KNOB(lock, ps3_env_int("DBG_LOCK", 0));
                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
 
@@ -3531,7 +3558,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     float* c = (float*)dst;
     float c00 = c[0];
     static int s_guess = -1;
-    if (s_guess < 0) s_guess = getenv("VP_GUESSPROJ") ? 1 : 0;
+    PS3_KNOB(s_guess, getenv("VP_GUESSPROJ") ? 1 : 0);
     int garbage = s_guess && !(c00 > 0.0f && c00 < 8.0f);
     if (getenv("VP_NOFIXPROJ")) garbage = 0;
     if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
@@ -3568,12 +3595,12 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
         if (st->color_target >= 0x17) out_mrt[1] = st->surface_color_offset[2];
         if (st->color_target >= 0x1F) out_mrt[2] = st->surface_color_offset[3];
     }
-    { static int _rs = -1; if (_rs < 0) _rs = getenv("RT_SEQDBG") ? 1 : 0;
+    { static int _rs = -1; PS3_KNOB(_rs, getenv("RT_SEQDBG") ? 1 : 0);
       static u32 _last = 0; static int _n2 = 0;
       if (_rs && st->surface_color_offset[0] != _last && _n2 < 400000) {
           _last = st->surface_color_offset[0]; _n2++;
           fprintf(stderr, "[RTSEQ] #%d -> 0x%X%c", _n2, _last, 10); } }
-    { static int _ro = -1; if (_ro < 0) _ro = getenv("RT_OFFDBG") ? 1 : 0;
+    { static int _ro = -1; PS3_KNOB(_ro, getenv("RT_OFFDBG") ? 1 : 0);
       static u32 _seen[32]; static int _ns = 0;
       if (_ro) { u32 _k = st->surface_color_offset[0] ^ (st->color_target << 24)
                         ^ (st->surface_clip_w << 8) ^ st->surface_format;
@@ -3593,7 +3620,7 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
      * draw as offscreen, has_display stays 0, and render_frame() -- which is
      * what draws ALL recorded geometry -- is never called. The backbuffer shows
      * only the clear, which looks exactly like "nothing rasterizes". */
-    { static int _bs = -1; if (_bs < 0) _bs = getenv("RT_DISPLAY_BY_SIZE") ? 1 : 0;
+    { static int _bs = -1; PS3_KNOB(_bs, getenv("RT_DISPLAY_BY_SIZE") ? 1 : 0);
       if (_bs && st->color_target < 0x13 &&
           st->surface_clip_w == s_d3d.width && st->surface_clip_h == s_d3d.height)
           return 0; }
@@ -3832,7 +3859,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
      * 8-bit target costs HDR precision but makes the composite a same-format
      * copy. A stopgap for looking at the frame, not a rendering fix. */
     { static int f8 = -1;
-      if (f8 < 0) { const char* e = getenv("RT_FORCE_RGBA8"); f8 = e ? atoi(e) : 0; }
+      PS3_KNOB(f8, ps3_env_int("RT_FORCE_RGBA8", 0));
       if (f8) want_fmt = DXGI_FORMAT_R8G8B8A8_UNORM; }
     int slot = off_rt_find(off);
     if (slot >= 0) {
@@ -4012,7 +4039,7 @@ static void fp_seen_note(u32 ea, u32 len)
 static int write_color_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("RSX_WRITE_COLOR"); on = e ? atoi(e) : 1; }
+    PS3_KNOB(on, ps3_env_int("RSX_WRITE_COLOR", 1));
     return on;
 }
 
@@ -4115,7 +4142,7 @@ static void rt_writeback_store(void)
          * cannot place a surface the title keeps in main memory. */
         u32 dst = cellGcmResolveLocated(r->gdma != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER, r->off);
         if (!dst || dst == 0xFFFFFFFFu) continue;
-        { static int lg = -1; if (lg < 0) { const char* e = getenv("RSX_WRITE_COLOR_LOG"); lg = e ? atoi(e) : 0; }
+        { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
           if (lg > 0) { lg--;
             /* Did anything else write the surface since our last store? */
             static u8* shadow[MAX_OFF_RTS]; static u32 shoff[MAX_OFF_RTS], shlen[MAX_OFF_RTS];
@@ -4293,7 +4320,7 @@ static u32 draw_filter_tex(const char* e)
 static void screen_copy_capture(u32 fi)
 {
     static int en = -1;
-    if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
+    PS3_KNOB(en, ps3_env_int("SCREEN_AS_TEX", 1));
     if (!en || !s_d3d.device) return;
             if (!s_screen_copy) {
                 D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -4335,7 +4362,7 @@ static void screen_copy_capture(u32 fi)
                  * buffer so it can be written out and LOOKED AT. Claiming a
                  * capture happened is not the same as showing what is in it. */
                 { static int sd = -1;
-                  if (sd < 0) { const char* e = getenv("SCREENCOPY_DUMP"); sd = e ? atoi(e) : 0; }
+                  PS3_KNOB(sd, ps3_env_int("SCREENCOPY_DUMP", 0));
                   if (sd && s_d3d.readback_buf) {
                       D3D12_RESOURCE_BARRIER t = {0};
                       t.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4717,7 +4744,7 @@ static void render_frame(void)
      * PNG-decode-heavy titles burn hundreds of empty presents before the first
      * real draw. */
     /* RTT_DUMP_SKIP=<n>: skip the first n frames that have ops (dump late frames). */
-    { static int _sk = -1; if (_sk < 0) { const char* e = getenv("RTT_DUMP_SKIP"); _sk = e ? atoi(e) : 0; }
+    { static int _sk = -1; PS3_KNOB(_sk, ps3_env_int("RTT_DUMP_SKIP", 0));
       if (_sk > 0 && s_d3d.draw_count > 0 && getenv("RTT_DUMP")) { _sk--; goto rtt_dump_done; } }
     if (getenv("RTT_DUMP") && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(getenv("RTT_DUMP")); if (_cap < 2) _cap = 14; if (_f++ < _cap) {
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
@@ -4768,7 +4795,7 @@ rtt_dump_done:;
      * alone -- separating "the ducks never rasterize" from "later geometry is
      * painted over them". Diagnostic only. */
     { static int lim = -1;
-      if (lim < 0) { const char* e = getenv("DRAW_LIMIT"); lim = e ? atoi(e) : 0; }
+      PS3_KNOB(lim, ps3_env_int("DRAW_LIMIT", 0));
       if (lim > 0 && s_d3d.draw_count > (u32)lim) s_d3d.draw_count = (u32)lim; }
 
     /* DRAW_SKIP_TEX=<hex raw offset>: drop every op binding that texture on
@@ -4799,7 +4826,7 @@ rtt_dump_done:;
        * isolated. That makes an object that renders fine look like it renders
        * nothing. */
       static int noclr = -1;
-      if (noclr < 0) { const char* e = getenv("DRAW_KEEP_NOCLEAR"); noclr = e ? atoi(e) : 0; }
+      PS3_KNOB(noclr, ps3_env_int("DRAW_KEEP_NOCLEAR", 0));
       /* DRAW_KEEP_BLEND=0|1: further restrict DRAW_KEEP_TEX to draws with that
        * blend flag. A mesh drawn twice -- once opaque, once blended -- is two
        * different passes (body vs reflection shell) that a texture filter alone
@@ -4899,7 +4926,7 @@ rtt_dump_done:;
          * An unresolved texture renders untextured, so this names the surfaces
          * affected instead of leaving it to guesswork. */
         { static int ed = -1;
-          if (ed < 0) { const char* e = getenv("EMPTYTEX"); ed = e ? atoi(e) : 0; }
+          PS3_KNOB(ed, ps3_env_int("EMPTYTEX", 0));
           extern uint8_t* vm_base;
           if (ed && vm_base) for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
               if (!dr->tex[_u].set || !dr->tex[_u].off) continue;
@@ -4943,7 +4970,7 @@ rtt_dump_done:;
               }
           } }
         { static int sd = -1;
-          if (sd < 0) { const char* e = getenv("SCREENTEX"); sd = e ? atoi(e) : 0; }
+          PS3_KNOB(sd, ps3_env_int("SCREENTEX", 0));
           if (sd) for (int _u = 0; _u < RSX_FP_UNITS; _u++)
               if (dr->tex[_u].set && dr->tex[_u].w == s_d3d.width &&
                   dr->tex[_u].h == s_d3d.height) {
@@ -4972,7 +4999,7 @@ rtt_dump_done:;
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
                 off_rt_find(dr->tex[_u].raw) < 0) {
                 static int en = -1;
-                if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
+                PS3_KNOB(en, ps3_env_int("SCREEN_AS_TEX", 1));
                 if (en) {
                     { static int _n = 0; if (_n++ < 3)
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
@@ -5047,7 +5074,7 @@ rtt_dump_done:;
              * still recorded, lit and transformed -- it just samples nothing,
              * which renders as a solid black object. */
             { static int cap = -1, n = 0;
-              if (cap < 0) { const char* e = getenv("TEX_BINDDBG"); cap = e ? atoi(e) : 0; }
+              PS3_KNOB(cap, ps3_env_int("TEX_BINDDBG", 0));
               if (cap && n < cap && dr->tex[_u].set) { n++;
                 fprintf(stderr, "[TEXBIND] null SRV unit=%d raw=0x%X off=0x%X %ux%u fmt=0x%02X%c",
                         _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
@@ -5223,7 +5250,7 @@ rtt_dump_done:;
                                                          : s_d3d.pipeline_state_vp_color;
         if (!vpso) vpso = s_d3d.pipeline_state_vp;
         { static int cap = -1, n = 0;
-          if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+          PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
           if (cap && n < cap) { n++;
             u32 nvp = 0, nclr = 0;
             for (u32 d2 = 0; d2 < s_d3d.draw_count && d2 < MAX_DRAWS; d2++) {
@@ -5331,7 +5358,7 @@ rtt_dump_done:;
                      * path tests the wrong target. Anything not magenta
                      * afterwards was rasterised. */
                     { static int cd2 = -1;
-                      if (cd2 < 0) { const char* e = getenv("RT_CLEARDBG"); cd2 = e ? atoi(e) : 0; }
+                      PS3_KNOB(cd2, ps3_env_int("RT_CLEARDBG", 0));
                       if (cd2 >= 2 && want >= 0) {
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
                           s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
@@ -5347,7 +5374,7 @@ rtt_dump_done:;
                      * in the guest draws' own state. If it does not, nothing
                      * this backend draws reaches a render target at all. */
                     { static int tt = -1;
-                      if (tt < 0) { const char* e = getenv("VP_TESTTRI"); tt = e ? atoi(e) : 0; }
+                      PS3_KNOB(tt, ps3_env_int("VP_TESTTRI", 0));
                       if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
                           float* vtx = (float*)((char*)s_d3d.vp_vb_mapped
                               + (u64)s_d3d.vp_parity * s_vp_cap * 256u
@@ -5388,7 +5415,7 @@ rtt_dump_done:;
                      * draws are writing black; if it stays black, nothing
                      * reaches it at all. */
                     { static int cd = -1;
-                      if (cd < 0) { const char* e = getenv("RT_CLEARDBG"); cd = e ? atoi(e) : 0; }
+                      PS3_KNOB(cd, ps3_env_int("RT_CLEARDBG", 0));
                       if (cd && cur_rt >= 0) {
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
                           s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, mag, 0, NULL);
@@ -5468,7 +5495,7 @@ rtt_dump_done:;
                  * vertex past the buffer, rasterises nothing while every other
                  * check upstream still says the draw is fine. */
                 { static int dcap = -1, dn = 0;
-                  if (dcap < 0) { const char* e = getenv("DRAWARGS"); dcap = e ? atoi(e) : 0; }
+                  PS3_KNOB(dcap, ps3_env_int("DRAWARGS", 0));
                   if (dcap && dn < dcap) { dn++;
                       D3D12_CPU_DESCRIPTOR_HANDLE _rh =
                           (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
@@ -5488,7 +5515,7 @@ rtt_dump_done:;
                  * between the retarget and here drops the binding, this restores
                  * it. */
                 { static int rb = -1;
-                  if (rb < 0) { const char* e = getenv("RT_REBIND"); rb = e ? atoi(e) : 0; }
+                  PS3_KNOB(rb, ps3_env_int("RT_REBIND", 0));
                   if (rb) {
                       D3D12_CPU_DESCRIPTOR_HANDLE brh[4];
                       UINT bn = 1;
@@ -5504,7 +5531,7 @@ rtt_dump_done:;
                  * "records exist" and "draws were submitted" are different
                  * claims, and every blank-output investigation conflates them. */
                 { static int cap = -1, n = 0;
-                  if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+                  PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
                   if (cap && n < cap) { n++;
                     fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
                             d, dr->vertex_count, dpso ? "guest-fp" : "fallback",
@@ -5547,7 +5574,7 @@ rtt_dump_done:;
     /* VRAMSCAN=1: which 64 KB blocks of guest memory change between frames.
      * "nothing writes the buffer we read" is only half an answer -- this says
      * where the producer IS writing, so the two can be matched up. */
-    { static int vs = -1; if (vs < 0) vs = getenv("VRAMSCAN") ? 1 : 0;
+    { static int vs = -1; PS3_KNOB(vs, getenv("VRAMSCAN") ? 1 : 0);
       if (vs) { extern uint8_t* vm_base;
         static u32 prev[512]; static int have = 0; static int reported = 0;
         u32 base = 0xC6000000u; u32 nblk = 512;          /* 32 MB window */
@@ -5574,7 +5601,7 @@ rtt_dump_done:;
      * used to live in the clear-boundary present path, which accum bypasses, so
      * it silently produced nothing in exactly the configuration being used. */
     { static int fb = -1;
-      if (fb < 0) { const char* e = getenv("FRAME_BUDGET"); fb = e ? atoi(e) : 0; }
+      PS3_KNOB(fb, ps3_env_int("FRAME_BUDGET", 0));
       if (fb && s_req_draws) { static int n = 0; if (n++ < 40)
         fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
                         "buffer holds %u verts, %llu draws truncated%c",
@@ -5611,7 +5638,7 @@ rtt_dump_done:;
         }
     }
     { static int dt = -1;
-      if (dt < 0) { const char* e = getenv("RSX_DBG_TRACK"); dt = e ? atoi(e) : 0; }
+      PS3_KNOB(dt, ps3_env_int("RSX_DBG_TRACK", 0));
       if (dt) { static int fr = 0; fr++;
         if (s_lock_n)
             fprintf(stderr, "[RSX_DBG_TRACK] frame %d: %u duck draws, ndc=(%.3f,%.3f)%c",
@@ -6000,7 +6027,7 @@ skip_dump_consider: ;
              * the FIFO flip words decoded and how far RSX label 255 moved --
              * the fence a title like Demon's Souls paces its frames on. */
             { static int on = -1; static u32 fw0, l0;
-              if (on < 0) on = getenv("GCM_RATES") ? 1 : 0;
+              PS3_KNOB(on, getenv("GCM_RATES") ? 1 : 0);
               extern uint8_t* vm_base;
               if (on && vm_base) {
                   extern volatile u32 g_gcm_flip_words;
@@ -6055,7 +6082,7 @@ static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) 
 static int blink_dbg(void)
 {
     static int v = -1;
-    if (v < 0) v = getenv("CELLMARK_BLINKDBG") ? 1 : 0;
+    PS3_KNOB(v, getenv("CELLMARK_BLINKDBG") ? 1 : 0);
     return v;
 }
 
@@ -6218,7 +6245,7 @@ static void d3d12_clear_display(const float cc[4])
      * and each captured frame holds only a slice of the geometry -- the floor in
      * one, a wall in the next -- which makes a single model impossible to see. */
     { static int accum = -1;
-      if (accum < 0) { const char* e = getenv("RSX_ACCUM_FRAME"); accum = e ? atoi(e) : 0; }
+      PS3_KNOB(accum, ps3_env_int("RSX_ACCUM_FRAME", 0));
       if (accum) return; }
     if (s_d3d.initialized) {
         if (blink_dbg())
@@ -6397,7 +6424,7 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
 {
     static int cap = -1, seen = 0;
-    if (cap < 0) { const char* e = getenv("VTX_POS"); cap = e ? atoi(e) : 0; }
+    PS3_KNOB(cap, ps3_env_int("VTX_POS", 0));
     if (!cap || seen >= cap) return;
     seen++;
     const rsx_vertex_attrib* a = &state->vertex_attribs[0];
@@ -6797,7 +6824,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
        * s_duck_raw is filled by the texture upload, which happens AFTER the
        * first draws, so caching it once left the tracker watching offset 0. */
       { static int dtrk = -1;
-        if (dtrk < 0) { const char* e = getenv("RSX_DBG_TRACK"); dtrk = e ? atoi(e) : 0; }
+        PS3_KNOB(dtrk, ps3_env_int("RSX_DBG_TRACK", 0));
         if (dtrk && s_duck_raw) wantl = s_duck_raw; }
       /* RSX_DBG_PICK=<first>: track ONLY the draw with that starting index. The
        * mesh is one big vertex buffer sliced into 256-index chunks, so averaging
@@ -6805,7 +6832,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
        * where there is nothing in particular. A single slice is a stable target
        * and can be magnified without drifting off it. */
       static int pick = -1;
-      if (pick < 0) { const char* e = getenv("RSX_DBG_PICK"); pick = e ? atoi(e) : -2; }
+      PS3_KNOB(pick, ps3_env_int("RSX_DBG_PICK", -2));
       if (wantl && s_d3d.cur_texs[0].raw == wantl && count
           && (pick == -2 || (int)first == pick)) {
           double sx = 0, sy = 0, sz = 0;
@@ -6851,7 +6878,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
          * single silhouette; if they are arbitrary slices of one big mesh they
          * smear. Either way the answer is visible at a glance. */
         static int recen = -1;
-        if (recen < 0) { const char* e = getenv("RSX_DBG_RECENTER"); recen = e ? atoi(e) : 0; }
+        PS3_KNOB(recen, ps3_env_int("RSX_DBG_RECENTER", 0));
         static int have_c = 0; static float ox = 0, oy = 0, oz = 0;
         if (!have_c || recen) {
             double sx = 0, sy = 0, sz = 0;
@@ -6911,7 +6938,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
           /* This title's Cg programs keep their MVP at c[256..259], not c[0..3]
            * (see the vp_uses_c03 note); projecting through c0 reported zeros. */
           static int MVP = -1;
-          if (MVP < 0) { const char* e = getenv("MVP_BASE"); MVP = e ? atoi(e) : 256; }
+          PS3_KNOB(MVP, ps3_env_int("MVP_BASE", 256));
           float v[4] = { cx, cy, cz, 1.0f };
           float clip[4];
           for (int r = 0; r < 4; r++) {
@@ -6950,7 +6977,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
      * degenerate triangles -- an INDEXED mesh vanishes while non-indexed
      * geometry in the same scene renders fine. */
     { static int cap = -1, n = 0;
-      if (cap < 0) { const char* e = getenv("IDX_DBG"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("IDX_DBG", 0));
       if (cap && n < cap && count >= 3) { n++;
         extern u32 cellGcmResolveOffset(u32);
         const rsx_vertex_attrib* a0 = &state->vertex_attribs[0];
@@ -7023,7 +7050,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
-    { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
+    { static int dbg = -1; PS3_KNOB(dbg, getenv("RSX_LIVE_FEED_DBG") ? 1 : 0);
       if (dbg) { static long long n = 0;
           if (((++n) % 20000) == 0)
               printf("[backend] arrays callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
@@ -7280,7 +7307,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
-    { static int dbg = -1; if (dbg < 0) dbg = getenv("RSX_LIVE_FEED_DBG") ? 1 : 0;
+    { static int dbg = -1; PS3_KNOB(dbg, getenv("RSX_LIVE_FEED_DBG") ? 1 : 0);
       if (dbg) { static long long n = 0;
           if (((++n) % 20000) == 0)
               printf("[backend] indexed callbacks=%lld (prim=%u count=%u)\n", n, primitive, count), fflush(stdout); } }
@@ -7407,7 +7434,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * reflection is sampled as a plain 2D image -- which is what the chrome
      * faucet's black patches and banded escutcheons look like. */
     { static int cd = -1;
-      if (cd < 0) { const char* e = getenv("CUBEDBG"); cd = e ? atoi(e) : 0; }
+      PS3_KNOB(cd, ps3_env_int("CUBEDBG", 0));
       if (cd && (tex->format & 4)) {
           static u32 seen[8]; static int ns = 0; int known = 0;
           for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
@@ -7457,7 +7484,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * resolutions and how much of each is non-zero. Answers "is this draw black
      * because its texture is empty, unsupported, or resolved to the wrong pool"
      * for every texture a frame uses, not just the first few binds. */
-    { static int ts = -1; if (ts < 0) ts = getenv("TEX_STAT") ? 1 : 0;
+    { static int ts = -1; PS3_KNOB(ts, getenv("TEX_STAT") ? 1 : 0);
       if (ts) {
         static u32 seen[128]; static int ns = 0; int known = 0;
         for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
@@ -7500,7 +7527,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to
          * untouched VRAM and samples as all-zero -- geometry renders, flat. */
-        { static int _ra = -1; if (_ra < 0) _ra = getenv("TEX_RESOLVE_AUTO") ? 1 : 0;
+        { static int _ra = -1; PS3_KNOB(_ra, getenv("TEX_RESOLVE_AUTO") ? 1 : 0);
           extern u32 cellGcmResolveIO(u32);
           u32 _r = 0;
           if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
@@ -7512,7 +7539,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
            * black and the menu never appears. When the chosen resolution is
            * empty over a sample and the other one is not, take the other. */
           { static int _tp = -1;
-            if (_tp < 0) _tp = getenv("TEX_PROBE") ? 1 : 0;
+            PS3_KNOB(_tp, getenv("TEX_PROBE") ? 1 : 0);
             if (_tp && vm_base && _r) {
                 u32 alt = cellGcmResolveLocated((tex->format & 3) != 1, offset);
                 if (alt && alt != _r && alt < 0xE0000000u && _r < 0xE0000000u) {
@@ -7571,7 +7598,7 @@ static void d3d12_set_vertex_attribs(void* ud, const rsx_state* state)
      * cap: the fixed 5 were all consumed by boot-time setup, so the layouts the
      * real draws use were never printed. */
     static int log_count = 0, log_cap = -1;
-    if (log_cap < 0) { const char* e = getenv("RSX_VTXDBG"); log_cap = e ? atoi(e) : 5; }
+    PS3_KNOB(log_cap, ps3_env_int("RSX_VTXDBG", 5));
     if (log_count < log_cap) {
         printf("[D3D12] set_vertex_attribs:\n");
         for (int i = 0; i < 16; i++) {
@@ -7803,7 +7830,7 @@ void rsx_d3d12_backend_present(void)
      * running the draw pass -- the backbuffer then shows only the clear, which
      * reads as "nothing rasterizes" from every downstream check. */
     { static int cap = -1, n = 0;
-      if (cap < 0) { const char* e = getenv("VP_SUBMIT"); cap = e ? atoi(e) : 0; }
+      PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
       if (cap && n < cap && s_d3d.draw_count) { n++;
         u32 onscreen = 0, offscreen = 0, clears = 0;
         for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) {
@@ -7845,7 +7872,7 @@ void rsx_d3d12_backend_present(void)
     if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
         { extern void rsx_reset_upload_claims(void);
           static int remap = -1;
-          if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
+          PS3_KNOB(remap, ps3_env_int("TEX_REMAP", 0));
           if (remap) rsx_reset_upload_claims(); }
         s_present_this_frame = has_display;
         render_frame();

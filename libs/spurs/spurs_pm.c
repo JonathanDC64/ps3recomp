@@ -10,6 +10,7 @@
  * round-robin starting after last_scheduled_task; task N occupies bitset bit (127-N).
  */
 #include "spurs_taskset.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdint.h>
 
 /* Select the next task to run: first task that is ready and not running, scanning
@@ -135,7 +136,7 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
         uint32_t p1 = ((uint32_t)_lp[4] << 24) | ((uint32_t)_lp[5] << 16) |
                       ((uint32_t)_lp[6] <<  8) |  (uint32_t)_lp[7];
         static int s_force = -1;
-        if (s_force < 0) s_force = getenv("SPURS_LSPATTERN_FORCE") ? 1 : 0;
+        PS3_KNOB(s_force, getenv("SPURS_LSPATTERN_FORCE") ? 1 : 0);
         if (s_force || (p0 == 0 && p1 == 0)) {
             LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x0, 0xFFFFFFFFu);
             LS_BE32(STC_TEMP_TASKINFO + TI_LS_PATTERN + 0x4, 0xFFFFFFFFu);

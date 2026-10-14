@@ -83,6 +83,7 @@ void     ps3_title_options_init(void) {}
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
 #include <timeapi.h>
+#include "ps3emu/ps3_knob.h"
 
 /* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
  * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
@@ -185,6 +186,7 @@ void cached_setenv(const char* name, const char* value)
         if (!_stricmp(s_env[i].key, name)) { s_env[i].val = v; break; }
     }
     ReleaseSRWLockExclusive(&s_env_lock);
+    ps3_env_bump();   /* PS3_KNOB statics re-read on their next use */
 }
 }
 extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;

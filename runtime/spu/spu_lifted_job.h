@@ -14,6 +14,7 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
+#include "ps3emu/ps3_knob.h"
 #include "spu_interp.h"
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
@@ -57,7 +58,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
      * contexts for one dispatch" is otherwise unanswerable -- every other
      * probe sees contexts only once they reserve. */
     { static int s_cl = -1;
-      if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+      PS3_KNOB(s_cl, getenv("SPU_CTX_LOG") ? 1 : 0);
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d entry=0x%05X\n",
                           (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
     ctx.image_id = image_id;
@@ -162,7 +163,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_context ctx;
     spu_context_init(&ctx, 0);
     { static int s_cl = -1;
-      if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+      PS3_KNOB(s_cl, getenv("SPU_CTX_LOG") ? 1 : 0);
       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
                           (void*)&ctx, image_id); fflush(stderr); } }
     ctx.image_id = image_id;     /* select this image's indirect-branch table */

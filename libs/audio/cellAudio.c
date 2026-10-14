@@ -13,6 +13,7 @@
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
+#include "ps3emu/ps3_knob.h"
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include <stdio.h>
@@ -451,7 +452,7 @@ static void audio_mix_one_block(void)
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
          * writes" from "writer and reader cycle out of phase". */
-        { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
+        { static int s_pk = -1; PS3_KNOB(s_pk, getenv("AUDIO_PEAK") ? 1 : 0);
           if (s_pk) { static _Thread_local unsigned _c;
             if ((++_c % 400) == 0) {
                 char map[36]; u32 b;
@@ -567,7 +568,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
          * "is any port producing sound" is answerable (LBP Bink movie audio). */
-        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
+        { static int _ap = -1; PS3_KNOB(_ap, getenv("AUDIO_PEAK") ? 1 : 0);
           if (_ap) { static unsigned _n = 0; float pk = 0.0f;
             for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
@@ -580,7 +581,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
           if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
-        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
+        { static int on = -1; PS3_KNOB(on, getenv("AUDIO_RATE") ? 1 : 0);
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
             ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
