@@ -2600,8 +2600,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
          * each unit by name. */
         const int arr = strstr(hlsl, "rsx_tex[16]") != NULL;
         char tex[32];
+        const int sarr = strstr(hlsl, "rsx_samp[16]") != NULL;
         if (arr) snprintf(tex, sizeof tex, "rsx_tex[%d].Sample(rsx_samp[%d]", _un, _un);
-        else     snprintf(tex, sizeof tex, "rsx_tex%d.Sample(rsx_samp[%d]", _un, _un);
+        else if (sarr) snprintf(tex, sizeof tex, "rsx_tex%d.Sample(rsx_samp[%d]", _un, _un);
+        else     snprintf(tex, sizeof tex, "rsx_tex%d.Sample(rsx_samp%d", _un, _un);
         char rep[160];
         /* FP_TEX_UV=1: sample at a fixed centre UV instead of the
          * interpolated texcoord. If the texture is populated but the
@@ -5482,9 +5484,17 @@ rtt_dump_done:;
             int cur_nocol = 0;                     /* depth-only pass bound     */
             double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
+            /* DRAW_SKIP=a-b (live, diagnostic): leave out the frame's ops a..b
+             * (manifest op numbers), to bisect which op hides or breaks a
+             * later one. Mostly for rsx_replay. */
+            static unsigned skip_gen; static u32 skip_a = 1, skip_b = 0;
+            if (skip_gen != ps3_env_gen) { const char* e = getenv("DRAW_SKIP");
+                skip_gen = ps3_env_gen; skip_a = 1; skip_b = 0;
+                if (e && sscanf(e, "%u-%u", &skip_a, &skip_b) == 1) skip_b = skip_a; }
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                if (d >= skip_a && d <= skip_b && !dr->is_clear) continue;
                 /* The reduced-viewport passes (this title's reflection, drawn
                  * into a region of the same target) finish here -- snapshot
                  * before the full-screen scene overwrites them. */

@@ -3891,8 +3891,14 @@ static void rcap_finish(void)
 /* F9 in the game window (cellGcm_replay_hotkey, from the backend's window
  * procedure) captures the next frame to RSX_HOTKEY_DIR/cap_NNN.rcap (default
  * directory "rsx_hotkey", relative to the working directory), numbered from
- * 000 per run. For a person playing to grab the frame that looks wrong. */
+ * the first number not already in that directory. For a person playing to
+ * grab the frame that looks wrong. */
 static volatile LONG s_rcap_hotkey, s_rcap_hotkey_done;
+/* RSX_HOTKEY_FRAMES=n (default 1) makes F9 capture n consecutive frames, as
+ * cap_NNN_00.rcap .. cap_NNN_<n-1>.rcap, for flicker that only shows from one
+ * frame to the next. Each capture's memory is written when it ends, so a burst
+ * stalls the game for a moment between frames. */
+static long s_rcap_burst_left, s_rcap_burst_k, s_rcap_burst_id;
 
 void cellGcm_replay_hotkey(void)
 {
@@ -3911,11 +3917,34 @@ static void rcap_try_start(void)
     gen = ps3_env_gen;
     const char* e = getenv("RSX_REPLAY_CAP");
     char hk[512];
-    if (s_rcap_hotkey != s_rcap_hotkey_done) {
-        const char* dir = getenv("RSX_HOTKEY_DIR");
-        if (!dir || !*dir) dir = "rsx_hotkey";
+    const char* dir = getenv("RSX_HOTKEY_DIR");
+    if (!dir || !*dir) dir = "rsx_hotkey";
+    if (s_rcap_burst_left > 0) {   /* the rest of a burst comes first */
+        s_rcap_burst_left--;
+        snprintf(hk, sizeof hk, "%s/cap_%03ld_%02ld.rcap", dir, s_rcap_burst_id, ++s_rcap_burst_k);
+        if (s_rcap_hotkey != s_rcap_hotkey_done) ps3_env_bump();
+        e = hk;
+    } else if (s_rcap_hotkey != s_rcap_hotkey_done) {
         CreateDirectoryA(dir, NULL);
-        snprintf(hk, sizeof hk, "%s/cap_%03ld.rcap", dir, (long)s_rcap_hotkey_done);
+        const int frames = ps3_env_int("RSX_HOTKEY_FRAMES", 1);
+        /* The first number no earlier run has used, so a new run never
+         * overwrites captures still being looked at. */
+        static long next;
+        for (;; next++) {
+            char a[512], b[512];
+            snprintf(a, sizeof a, "%s/cap_%03ld.rcap", dir, next);
+            snprintf(b, sizeof b, "%s/cap_%03ld_00.rcap", dir, next);
+            if (GetFileAttributesA(a) == INVALID_FILE_ATTRIBUTES &&
+                GetFileAttributesA(b) == INVALID_FILE_ATTRIBUTES) break;
+        }
+        if (frames > 1) {
+            s_rcap_burst_id = next;
+            s_rcap_burst_k = 0;
+            s_rcap_burst_left = frames - 1;
+            snprintf(hk, sizeof hk, "%s/cap_%03ld_00.rcap", dir, next);
+        } else
+            snprintf(hk, sizeof hk, "%s/cap_%03ld.rcap", dir, next);
+        next++;
         s_rcap_hotkey_done++;
         if (s_rcap_hotkey != s_rcap_hotkey_done) ps3_env_bump();   /* pressed again meanwhile */
         e = hk;
@@ -3947,7 +3976,11 @@ static void rcap_try_start(void)
 static void rcap_cut_after(u32 mfull, u32 data)
 {
     s_rcap_cut_pending = 0;
-    if (s_rcap_on) { rcap_finish(); return; }
+    if (s_rcap_on) {
+        rcap_finish();
+        if (s_rcap_burst_left <= 0) return;
+        ps3_env_bump();   /* the next frame of the burst starts at this same cut */
+    }
     rcap_try_start();
     if (s_rcap_on) rcap_method(mfull, data);
 }
@@ -3955,7 +3988,11 @@ static void rcap_cut_after(u32 mfull, u32 data)
 static void rcap_flip_boundary(void)
 {
     if (s_rcap_cut_seen) return;
-    if (s_rcap_on) { rcap_finish(); return; }
+    if (s_rcap_on) {
+        rcap_finish();
+        if (s_rcap_burst_left <= 0) return;
+        ps3_env_bump();
+    }
     rcap_try_start();
 }
 
