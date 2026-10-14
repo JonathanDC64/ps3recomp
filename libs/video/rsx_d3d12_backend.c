@@ -7161,6 +7161,16 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * as-seen 0xA1 with the LN flag) is wired up so far; other formats fall
      * back to untextured. */
     u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
+    /* TEXFMTDBG=1 (live): one line per new unit/format/width, including the
+     * formats the VP path below does not take -- those units end up sampling
+     * nothing, so they are the ones worth seeing. */
+    if (getenv("TEXFMTDBG")) { static u32 seen[256]; static int ns=0;
+        u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
+        int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
+        if (!f && ns < 256) { seen[ns++]=k;
+            fprintf(stderr, "[TEXFMT] unit=%u fmt=0x%02X %ux%u mips=%u cube=%d off=0x%X%c",
+                    unit, (tex->format >> 8) & 0xFFu, width, height,
+                    (tex->format>>16)&0xFFFFu, (tex->format&4)?1:0, offset, 10); } }
     /* VP path: record the latest bound texture (any supported format) so draws
      * can carry it per-draw. Location bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
     extern u32 cellGcmResolveLocated(int local, u32 offset);
@@ -7218,13 +7228,6 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].filt  = tex->filter;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
-        if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;
-            u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
-            int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
-            if (!f && ns < 64) { seen[ns++]=k;
-                fprintf(stderr, "[TEXFMT] unit=%u fmt=0x%02X %ux%u mips=%u cube=%d off=0x%X%c",
-                        unit, (tex->format >> 8) & 0xFFu, width, height,
-                        (tex->format>>16)&0xFFFFu, (tex->format&4)?1:0, offset, 10); } }
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
