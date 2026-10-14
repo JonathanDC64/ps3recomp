@@ -327,6 +327,23 @@ int main(void)
         check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
     }
 
+    /* A predicated write is a select, not a blend: MOV r0, COL0 executed
+     * only where CC0 > 0 must keep r0 bit for bit in the other components.
+     * lerp(r0, v, mask) is arithmetic, so an Inf/NaN in either operand
+     * leaks into the components the condition leaves alone. (Upstream PR 278.) */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END); /* MOV r0, COL0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | (1u << 20) |          /* exec_if gt */
+                           (0u << 21) | (1u << 23) | (2u << 25) | (3u << 27));
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("pred_select", hlsl,
+              "r[0].xyzw = (_p.xyzw != 0.0) ? _v.xyzw : r[0].xyzw;");
+        check_absent("pred_no_lerp", hlsl, "lerp(");
+    }
+
     /* Source precision modifiers (SRC1 word bits 19-27) and the COL0/COL1
      * clamp. Demon's Souls's fog ramp: MUL h1.w, h1 (saturated), c. */
     {
