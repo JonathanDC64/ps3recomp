@@ -2529,10 +2529,19 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * while the guest may be between advancing current and flushing: put
      * then lands on begin, the guest's closing fence is never executed, and
      * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
-    const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+     * the ring well behind, which is the region the guest writes next.
+     *
+     * ...and only when the walker is reading THIS ring: past that consumed
+     * head, and not beyond the write position the JUMP is about to land at.
+     * "Margin past begin" alone also held when the walker was in a different
+     * buffer altogether. Demon's Souls runs a 32 KB PPU ring whose frames
+     * continue into an SPU-built pushbuffer further up the IO space; with the
+     * walker up there this wrapped the PPU ring under the title, the walker
+     * then replayed `begin`..JUMP, and label 255 stopped (logos frozen on
+     * Havok: flip-wrap at get=0x005FF6A4, then get stuck at the JUMP). */
+    const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin), io_cur = gcm_ea2io(cur);
     if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN && s_fifo_getoff <= io_cur) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         vm_write32(ctx + 8, begin);
         { static int n = 0;
