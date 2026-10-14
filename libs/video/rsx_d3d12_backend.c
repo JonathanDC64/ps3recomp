@@ -2785,6 +2785,19 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
+/* Does guest memory hold anything at [off, off+nbytes)? Sparse, about 1,000
+ * reads spread over the whole range. A surface only the GPU rendered reads as
+ * all zero here, because our backend never writes render targets back. */
+static int tex_guest_written(u32 off, u32 nbytes)
+{
+    extern uint8_t* vm_base;
+    if (!vm_base || !off) return 0;
+    const u32 step = nbytes > 4096u ? (nbytes / 1024u) | 1u : 1u;
+    for (u32 i = 0; i < nbytes; i += step)
+        if (vm_base[off + i]) return 1;
+    return 0;
+}
+
 /* The DXGI format of a decoded guest texture (rsx_texture_layout's class). The
  * upload creates the resource with it and the SRV views it with it. */
 static DXGI_FORMAT rsx_texfmt_dxgi(rsx_texfmt f)
@@ -5103,10 +5116,14 @@ rtt_dump_done:;
              * offscreen RT lives at that offset: Demon's Souls renders its
              * loading screen into a 1280x720 RT and composites it through a
              * gamma LUT, and the frame copy (last frame's backbuffer) here
-             * replaced the RT it had just drawn -- a feedback loop to flat grey. */
+             * replaced the RT it had just drawn -- a feedback loop to flat grey.
+             * And only when the guest memory there is empty, which is what a
+             * surface the GPU rendered looks like: a display-sized image the
+             * title wrote itself (a cellSail movie frame) is the texture. */
             if (dr->tex[_u].set && s_screen_copy &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
-                off_rt_find(dr->tex[_u].raw) < 0) {
+                off_rt_find(dr->tex[_u].raw) < 0 &&
+                !tex_guest_written(dr->tex[_u].off, dr->tex[_u].w * dr->tex[_u].h * 4u)) {
                 static int en = -1;
                 PS3_KNOB(en, ps3_env_int("SCREEN_AS_TEX", 1));
                 if (en) {
