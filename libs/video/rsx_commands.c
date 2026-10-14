@@ -56,6 +56,10 @@ void rsx_state_init(rsx_state* state)
     for (int _i = 0; _i < RSX_MAX_VERTEX_ATTRIBS; _i++)
         state->vertex_data4f[_i][3] = 1.0f;
 
+    /* Colour target A until the guest says otherwise (0 means "no colour
+     * target": a depth-only pass). */
+    state->color_target = 1;
+
     /* Default viewport */
     state->viewport_w = 1280;
     state->viewport_h = 720;
