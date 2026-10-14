@@ -144,6 +144,7 @@ static u64            s_audio_start_us = 0;
 
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS totals */
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -450,10 +451,65 @@ static void audio_mix_one_block(void)
         if (level <= 0.0f) level = 1.0f;
         if (level > 1.0f) level = 1.0f;
 
+        /* AUDIO_WRITEPOS=1: where the game writes relative to the index we
+         * publish. Each mix, the blocks that went from cleared to written
+         * since the last mix are counted by (block - published) mod nblock;
+         * the histogram is printed every 1000 writes. */
+        { static int wp = -1; PS3_KNOB(wp, getenv("AUDIO_WRITEPOS") ? 1 : 0);
+          if (wp) {
+              static u8 was[CELL_AUDIO_PORT_MAX][32]; static u32 hist[CELL_AUDIO_PORT_MAX][32], total[CELL_AUDIO_PORT_MAX];
+              const u32 pub = (u32)(port->read_index % nblock);
+              for (u32 b = 0; b < nblock && b < 32; b++) {
+                  const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                  int nz = 0;
+                  for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16) if (bp[s2] != 0.0f) { nz = 1; break; }
+                  if (nz && !was[p][b]) { hist[p][(b + nblock - pub) % nblock]++; total[p]++; }
+                  was[p][b] = (u8)nz;
+              }
+              if (total[p] && (total[p] % 1000) == 0) {
+                  fprintf(stderr, "[audio-writepos] port %d (%u blocks): writes land at published+", p, nblock);
+                  for (u32 k = 0; k < nblock && k < 32; k++) if (hist[p][k]) fprintf(stderr, " %u:%u", k, hist[p][k]);
+                  fprintf(stderr, "  (of %u)%c", total[p], 10);
+              }
+          } }
+
         /* Read one block at the current read_index */
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+
+        /* AUDIO_GAPS=1: a block still cleared when it is read, with sound
+         * within 40 blocks (213 ms) before and after it, is one the game did
+         * not write in time -- heard as a gap. Totals go on the AUDIO_RATE
+         * line; the first 50 runs are logged with the ring state. */
+        { static int s_gaps = -1; PS3_KNOB(s_gaps, getenv("AUDIO_GAPS") ? 1 : 0);
+          if (s_gaps) {
+              static u32 run[CELL_AUDIO_PORT_MAX]; static u8 heard[CELL_AUDIO_PORT_MAX];
+              static unsigned logged;
+              const u32 n = CELL_AUDIO_BLOCK_SAMPLES * nch;
+              const u32* w = (const u32*)src;
+              u32 k = 0;
+              while (k < n && !w[k]) k++;
+              if (k == n) run[p]++;
+              else {
+                  if (run[p] && run[p] <= 40 && heard[p]) {
+                      g_audio_gaps++; g_audio_gap_blocks += run[p];
+                      if (logged++ < 50) {
+                          char map[36]; u32 b;
+                          for (b = 0; b < nblock && b < 32; b++) {
+                              const float* bp = port->buffer + b * n;
+                              int nz = 0;
+                              for (u32 s2 = 0; s2 < n; s2 += 16) if (bp[s2] != 0.0f) { nz = 1; break; }
+                              map[b] = b == block_idx ? 'R' : (nz ? '#' : '.');
+                          }
+                          map[b] = 0;
+                          fprintf(stderr, "[audio-gap] port %d: %u block(s) not written in time; ring [%s]%c",
+                                  p, run[p], map, 10);
+                      }
+                  }
+                  run[p] = 0; heard[p] = 1;
+              }
+          } }
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -593,6 +649,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
               if (!nz) z++; }
             if (now - t0 >= 5000) {
+                static unsigned long long g0, gb0;
+                if (g_audio_gaps != g0)
+                    fprintf(stderr, "[audio-rate] gaps %llu (%llu blocks, %.1f%% of the window)%c",
+                            g_audio_gaps - g0, g_audio_gap_blocks - gb0,
+                            n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0, 10);
+                g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
                         n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
                 #if AUDIO_BACKEND_WASAPI
