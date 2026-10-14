@@ -2466,8 +2466,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     }
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
-     * instead of one run per candidate to test them by elimination. */
-    if (getenv("FP_IDCOLOR")) {
+     * instead of one run per candidate to test them by elimination.
+     * FP_IDCOLOR=h colours only half-precision-export programs: Demon's Souls
+     * draws its scene with those and its full-screen post passes with 32-bit
+     * exports, so the scene's colours survive the final composite. */
+    if (getenv("FP_IDCOLOR") && (strcmp(getenv("FP_IDCOLOR"), "h") || !exp32)) {
         /* Mix properly: every fp address in a title tends to share low
          * bits (they all end 0x01/0x81 here), so a single multiply left
          * one channel constant across all programs and made distinct
