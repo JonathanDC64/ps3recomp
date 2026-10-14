@@ -3269,12 +3269,24 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
 
-    /* Garbage-projection fallback (vkcube; see the original comment). */
+    /* Garbage-projection fallback, for vkcube only, and now opt-in.
+     *
+     * It replaced c0-c3 with a stock perspective whenever c0.x fell outside
+     * (0, 8), on the theory that c0-c3 is always a projection and a real one
+     * has a small x-scale. vkcube's broken MatrixProjPerspective (a lifter
+     * bug at the time) was the case it was written for. Nothing makes c0-c3 a
+     * projection: Demon's Souls's level shaders keep c0.x = 300 there, and the
+     * fallback rewrote their transforms on every such draw.
+     *
+     * VP_GUESSPROJ=1 brings the heuristic back (vkcube). VP_FIXPROJ=1 forces
+     * the stock projection on every draw, as before. */
     int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
                        ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;
     float* c = (float*)dst;
     float c00 = c[0];
-    int garbage = !(c00 > 0.0f && c00 < 8.0f);
+    static int s_guess = -1;
+    if (s_guess < 0) s_guess = getenv("VP_GUESSPROJ") ? 1 : 0;
+    int garbage = s_guess && !(c00 > 0.0f && c00 < 8.0f);
     if (getenv("VP_NOFIXPROJ")) garbage = 0;
     if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
         { static int _fb = 0; if (_fb++ < 6)
