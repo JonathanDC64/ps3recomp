@@ -10,6 +10,11 @@ target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include
 target_link_libraries(test_vdec_stub PRIVATE ${VDEC_TEST_LIBS})
 add_test(NAME vdec_stub COMMAND test_vdec_stub stub)
 
+# cellPamf against a synthetic header in the real on-disc layout.
+add_executable(test_cellPamf test_cellPamf.c)
+target_include_directories(test_cellPamf PRIVATE "${PROJECT_SOURCE_DIR}/include")
+add_test(NAME pamf_reader COMMAND test_cellPamf)
+
 if(NOT PS3RECOMP_FFMPEG_RUNTIME)
     return()
 endif()
