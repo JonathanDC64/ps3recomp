@@ -7419,40 +7419,49 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    if (count < 3) return 0;
-    u32 tris = count - 2;
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    s_vp_want += (u64)tris * 3;
-    if (tris * 3 > maxv) tris = maxv / 3;
+    s_vp_want += (u64)(count > 2 ? count - 2 : 0) * 3;
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
-    /* Expand to a triangle list. Two things the old loop missed:
+    /* Expand to a triangle list, one index at a time:
      *  - Strip triangles alternate winding; every odd one is emitted with its
      *    first two vertices swapped (as the non-indexed path does), or culling
      *    removes half of a culled strip.
      *  - Primitive restart (SET_RESTART_INDEX_ENABLE): an index equal to the
      *    restart index ends the strip or fan, and the next one starts after
      *    it. Without it the restart index was fetched as a vertex (past the
-     *    end of the array) and stretched triangles across the screen. */
+     *    end of the array) and stretched triangles across the screen.
+     *  - One BEGIN/END can carry several DRAW_INDEX_ARRAY ranges of at most
+     *    256 indices, and the RSX assembles them as one stream. Demon's Souls'
+     *    level meshes are strips split that way; restarting the strip at each
+     *    range lost the two triangles across every boundary (holes in the
+     *    tunnel ceiling). The strip state carries into the next contiguous
+     *    range of the same BEGIN/END, as for triangle lists. */
     const int restart = state->restart_index_enable != 0;
     const u32 ridx = state->restart_index;
-    u32 o = 0, base = 0;     /* base: index position where the current strip starts */
-    u32 cap = tris * 3;
-    for (u32 k = 0; k + 2 < count && o + 3 <= cap; k++) {
-        const u32 i2 = read_guest_index(state, first + k + 2);
-        if (restart && i2 == ridx) { base = k + 3; k += 2; continue; }
-        if (k < base) continue;
-        const u32 a = fan ? base : k;
-        const u32 ia = read_guest_index(state, first + a);
-        const u32 ib = read_guest_index(state, first + k + 1);
-        if (restart && (ia == ridx || ib == ridx)) continue;
-        const u32 t = k - base;
-        u32 v0 = ia, v1 = ib;
-        if (!fan && (t & 1)) { v0 = ib; v1 = ia; }
-        read_vp_vertex_c(state, v0, &out[o*16]); o++;
-        read_vp_vertex_c(state, v1, &out[o*16]); o++;
-        read_vp_vertex_c(state, i2, &out[o*16]); o++;
+    static struct { int valid, fan; u32 epoch, next, m, p0, p1; } carry;
+    u32 m = 0, p0 = 0, p1 = 0;   /* m: indices into the current strip; p0/p1: last two (fan: centre, last) */
+    if (carry.valid && carry.fan == fan && carry.epoch == state->begin_epoch && carry.next == first) {
+        m = carry.m; p0 = carry.p0; p1 = carry.p1;
     }
+    u32 o = 0;
+    const u32 cap = maxv - maxv % 3;
+    for (u32 k = 0; k < count; k++) {
+        const u32 ix = read_guest_index(state, first + k);
+        if (restart && ix == ridx) { m = 0; continue; }
+        if (m >= 2 && o + 3 <= cap) {
+            u32 v0 = p0, v1 = p1;
+            if (!fan && ((m - 2) & 1)) { v0 = p1; v1 = p0; }
+            read_vp_vertex_c(state, v0, &out[o*16]); o++;
+            read_vp_vertex_c(state, v1, &out[o*16]); o++;
+            read_vp_vertex_c(state, ix, &out[o*16]); o++;
+        }
+        if (fan) { if (m == 0) p0 = ix; else p1 = ix; }
+        else     { p0 = p1; p1 = ix; }
+        m++;
+    }
+    carry.valid = 1; carry.fan = fan; carry.epoch = state->begin_epoch;
+    carry.next = first + count; carry.m = m; carry.p0 = p0; carry.p1 = p1;
     { static int said = 0;
       if (restart && !said) { said = 1;
           fprintf(stderr, "[D3D12] primitive restart in use (index 0x%X)%c", ridx, 10); } }
