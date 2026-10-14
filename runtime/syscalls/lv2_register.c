@@ -1692,10 +1692,21 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
         if (!spu->spu_group_id) {
             queue = spurs_port_queue(port);
         } else {
-            AcquireSRWLockShared(&s_spu_port_lock);
-            spu_group_t* group = spu_find_group(spu->spu_group_id);
-            if (group) queue = group->user_event_ports[port];
-            ReleaseSRWLockShared(&s_spu_port_lock);
+            /* A port bound to this one thread (sys_spu_thread_connect_event)
+             * first, then the group-wide binding (connect_event_all_threads),
+             * as lv2 keeps them. MultiStream's _synth2 answers its PPU on a
+             * thread-bound port (0x3A); routing only through the group table
+             * dropped every answer, so MOMixerThread waited forever holding
+             * the MultiStream mutex and no sound ever started. */
+            spu_thread_t* t = spu_find_thread(spu->spu_id);
+            for (int i = 0; t && i < t->evt_bind_n; i++)
+                if (t->evt_bind[i].spup == port) { queue = t->evt_bind[i].queue; break; }
+            if (!queue) {
+                AcquireSRWLockShared(&s_spu_port_lock);
+                spu_group_t* group = spu_find_group(spu->spu_group_id);
+                if (group) queue = group->user_event_ports[port];
+                ReleaseSRWLockShared(&s_spu_port_lock);
+            }
         }
         result = CELL_ENOTCONN;
         if (queue) {
