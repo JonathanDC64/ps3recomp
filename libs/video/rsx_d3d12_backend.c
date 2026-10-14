@@ -161,6 +161,9 @@ typedef struct {
     u64                   rb_size;
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
+    ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
+    u32                   snap_w, snap_h, snap_dxgi;
+    D3D12_RESOURCE_STATES snap_st;
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..20 hold offscreen-RT SRVs */
@@ -4087,6 +4090,62 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
     r->st = to;
 }
 
+/* A draw that samples a surface it is also rendering to. RSX allows it, and
+ * Demon's Souls relies on it: its exposure adaptation (a 16x16 F_X32 target)
+ * reads the previous exposure from the target it overwrites, each pixel its
+ * own texel. D3D12 cannot have one resource bound as RTV and SRV at once; that
+ * read returned 0, so the exposure never moved past one adaptation step from 0
+ * and the level drew almost black. Copy the target just before the draw and
+ * return the copy for the draw to sample: the contents RSX would have read. */
+static ID3D12Resource* off_rt_snapshot(int slot)
+{
+    OffRT* r = &s_d3d.off_rt[slot];
+    if (!r->res) return NULL;
+    if (r->snap && (r->snap_w != r->w || r->snap_h != r->h || r->snap_dxgi != r->dxgi)) {
+        off_rt_defer_release(r->snap);   /* the open list may still use it */
+        r->snap = NULL;
+    }
+    if (!r->snap) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = r->w; td.Height = r->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = (DXGI_FORMAT)r->dxgi; td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                &IID_ID3D12Resource, (void**)&r->snap)))
+            return NULL;
+        r->snap_w = r->w; r->snap_h = r->h; r->snap_dxgi = r->dxgi;
+        r->snap_st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    const D3D12_RESOURCE_STATES back = r->st;
+    off_rt_transition(slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (r->snap_st != D3D12_RESOURCE_STATE_COPY_DEST) {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = r->snap;
+        b.Transition.StateBefore = r->snap_st;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    }
+    s_d3d.cmd_list->lpVtbl->CopyResource(s_d3d.cmd_list, r->snap, r->res);
+    {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = r->snap;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+        r->snap_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    off_rt_transition(slot, back);
+    return r->snap;
+}
+
 /* Set by the present entry point: 1 = this batch ends with a swapchain
  * Present, 0 = execute the recorded draws only. An OFFSCREEN-only batch (a
  * render-to-texture pass) must still run -- it is what fills the texture a
@@ -5189,9 +5248,17 @@ rtt_dump_done:;
                  * one of the currently-bound colour targets). */
                 for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
                     int rt = dr->tex_rt[_u];
-                    if (rt >= 0 && rt != cur_rt &&
-                        rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2])
+                    if (rt < 0) continue;
+                    if (rt != cur_rt &&
+                        rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2]) {
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        continue;
+                    }
+                    /* Sampling a bound colour target: read a copy (above). */
+                    ID3D12Resource* snap = off_rt_snapshot(rt);
+                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, snap,
+                              (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + d * RSX_FP_UNITS) * s_d3d.srv_inc;
