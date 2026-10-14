@@ -3562,6 +3562,31 @@ static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
     s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 3, g);
 }
 
+/* Resources dropped while a frame is being recorded, released once the GPU
+ * has finished that frame (off_rt_release_deferred, after render_frame's
+ * opening wait). Grows as needed: a frame that flips a surface between two
+ * formats draw by draw drops a resource each time. */
+static ID3D12Resource** s_rt_grave;
+static int s_rt_grave_n, s_rt_grave_cap;
+
+static void off_rt_release_deferred(void)
+{
+    for (int i = 0; i < s_rt_grave_n; i++) s_rt_grave[i]->lpVtbl->Release(s_rt_grave[i]);
+    s_rt_grave_n = 0;
+}
+
+static void off_rt_defer_release(ID3D12Resource* res)
+{
+    if (!res) return;
+    if (s_rt_grave_n == s_rt_grave_cap) {
+        int nc = s_rt_grave_cap ? s_rt_grave_cap * 2 : 64;
+        ID3D12Resource** g = (ID3D12Resource**)realloc(s_rt_grave, (size_t)nc * sizeof *g);
+        if (!g) { wait_for_gpu(); res->lpVtbl->Release(res); return; }   /* best effort */
+        s_rt_grave = g; s_rt_grave_cap = nc;
+    }
+    s_rt_grave[s_rt_grave_n++] = res;
+}
+
 static int off_rt_find(u32 off)
 {
     if (!off) return -1;
@@ -3590,14 +3615,16 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     if (slot >= 0) {
         OffRT* r = &s_d3d.off_rt[slot];
         if (r->w == w && r->h == h && r->dxgi == (u32)want_fmt) { r->used = 1; return slot; }
-        /* The frame in flight still references this resource -- releasing it here
-         * is "was deleted prior to closing the command list" (D3D12 message 921),
-         * and every draw recorded against it silently lands nowhere while the
-         * replacement reads back empty. Let the GPU finish first. Recreations are
-         * rare (a surface changing size), so the stall costs nothing. */
-        wait_for_gpu();
-        r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
-        if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
+        /* The frame being recorded may already reference this resource (its
+         * init upload, its barriers, or draws from earlier in the pre-pass), and
+         * releasing it before that list runs is "deleted prior to closing the
+         * command list" (D3D12 message 921). wait_for_gpu() only drains lists
+         * already submitted, not the open one, so the release is deferred to
+         * after the GPU finishes this frame. Demon's Souls declares its
+         * luminance targets as A8R8G8B8 and then as F_X32 at the same offsets;
+         * releasing at once removed the device about one run in two. */
+        off_rt_defer_release(r->res); r->res = NULL;     /* dims/format changed */
+        off_rt_defer_release(r->up);  r->up = NULL;
     } else {
         for (int i = 0; i < MAX_OFF_RTS; i++)
             if (!s_d3d.off_rt[i].res) { slot = i; break; }
@@ -3605,13 +3632,9 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             for (int i = 0; i < MAX_OFF_RTS; i++)
                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
             if (slot < 0) return -1;
-            wait_for_gpu();   /* same hazard as above: the frame may still use it */
-            s_d3d.off_rt[slot].res->lpVtbl->Release(s_d3d.off_rt[slot].res);
-            s_d3d.off_rt[slot].res = NULL;
-            if (s_d3d.off_rt[slot].up) {
-                s_d3d.off_rt[slot].up->lpVtbl->Release(s_d3d.off_rt[slot].up);
-                s_d3d.off_rt[slot].up = NULL;
-            }
+            /* same hazard as above: the open list may still use it */
+            off_rt_defer_release(s_d3d.off_rt[slot].res); s_d3d.off_rt[slot].res = NULL;
+            off_rt_defer_release(s_d3d.off_rt[slot].up);  s_d3d.off_rt[slot].up = NULL;
         }
     }
     OffRT* r = &s_d3d.off_rt[slot];
@@ -4062,6 +4085,7 @@ static void render_frame(void)
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
     wait_for_gpu();
+    off_rt_release_deferred();   /* RT resources the previous frame dropped */
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
