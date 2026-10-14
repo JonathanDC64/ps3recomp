@@ -1654,16 +1654,6 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             if (k < 4 || (k & (k - 1)) == 0)
                 fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X, drop #%u)\n",
                         code & 63, spu->image_id, value, k + 1); }
-        /* As lv2 does for a port with no queue (RPCS3 SPUThread.cpp): the
-         * data word is consumed, and send_event answers ENOTCONN in the
-         * inbound mailbox. Left alone, the word stayed in the outbound
-         * mailbox for the next event to pick up as its data, and the SPU
-         * read whatever its inbound mailbox held as the result. */
-        if (code < 128) {
-            if (spu->ch_out_mbox.count) (void)spu_channel_read(&spu->ch_out_mbox);
-            if (code < 64) spu_channel_write(&spu->ch_in_mbox, CELL_ENOTCONN);
-            return 1;
-        }
         return 0;
     }
     /* Task-exit handlers signal an LV2 flag, not an SPU user-event queue.
