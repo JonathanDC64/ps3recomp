@@ -153,6 +153,7 @@ typedef struct {
     /* Depth surface (SET_SURFACE_ZETA_OFFSET, raw) and its SET_SURFACE_FORMAT
      * depth field [7:5] (1 = Z16, 2 = Z24S8) at record time. */
     u32   zeta, zfmt;
+    u32   ctgt;         /* SET_SURFACE_COLOR_TARGET at record time (0 = none) */
     u32   depth;        /* packed guest depth state (rsx_depth_key, PSO key) */
 } D3D12DrawRecord;
 
@@ -1641,16 +1642,20 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         for (u32 d = 0; d < ndraws && d < MAX_DRAWS; d++) {
             const D3D12DrawRecord* r = &s_d3d.draws[d];
             if (r->is_clear)
-                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f)\n",
+                fprintf(mf, "op%03u CLEAR rt=0x%08X mrt=0x%X/0x%X/0x%X cc=(%.3f,%.3f,%.3f,%.3f) "
+                            "mask=0x%X z=%.3f ct=0x%X zeta=0x%08X\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
-                        r->cc[0], r->cc[1], r->cc[2], r->cc[3]);
+                        r->cc[0], r->cc[1], r->cc[2], r->cc[3],
+                        r->clr_flags, r->clr_z, r->ctgt, r->zeta);
             else {
                 fprintf(mf, "op%03u DRAW  rt=0x%08X mrt=0x%X/0x%X/0x%X vp=%u,%u,%ux%u fp=0x%08X vs=%d "
-                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X\n",
+                            "n=%u cmask=%X blend=%d bk=0x%X t0=0x%08X t1=0x%08X t2=0x%08X t3=0x%08X "
+                            "ct=0x%X z=0x%08X zf=%u depth=0x%X cull=%u\n",
                         d, r->rt_off, r->rt_mrt[0], r->rt_mrt[1], r->rt_mrt[2],
                         r->vp_x, r->vp_y, r->vp_w, r->vp_h,
                         r->fp_addr, r->vs_idx, r->vertex_count, r->cmask, r->blend, r->blend_key,
-                        r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw);
+                        r->tex[0].raw, r->tex[1].raw, r->tex[2].raw, r->tex[3].raw,
+                        r->ctgt, r->zeta, r->zfmt, r->depth, r->cull);
                 for (int u = 0; u < RSX_FP_UNITS; u++)
                     if (r->tex[u].set)
                         fprintf(mf, "      t%d off=0x%08X fmt=0x%02X (%s%s) %ux%u remap=0x%04X\n", u,
@@ -4055,6 +4060,7 @@ static void rt_pitch_record(D3D12DrawRecord* dr)
         dr->rt_dma[i]   = st->surface_color_dma[i];
     }
     dr->zeta = st->surface_zeta_offset;
+    dr->ctgt = st->color_target;
     dr->zfmt = (st->surface_format >> 5) & 7u;
 }
 
