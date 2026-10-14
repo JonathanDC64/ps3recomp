@@ -6418,10 +6418,33 @@ static void d3d12_clear_display(const float cc[4])
              * in one present. Gauged against the running MAX frame size (not
              * the last, which a leaked tiny batch would poison), so it
              * self-scales per title with no fixed threshold. */
+            /* A max that is stale: no present for RSX_STALE_FLIPS flips
+             * (default 4; 0 = never) means the scene got lighter, not that
+             * these are intermediates -- a full frame arrives at least every
+             * other flip where the rule above is needed (the Demon's Souls
+             * level). Start over from this batch. Without it the whole-run
+             * max made every frame of a light scene "small": movie frames of
+             * 5-10 draws after 1,700-draw loading or level frames were merged
+             * two to a present (15 fps) or hardly presented at all (1 fps). */
             if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4) {
-                s_pc_clear_small++;
-                return;   /* intermediate: keep accumulating, flip stays pending */
+                static int stale = -1;
+                PS3_KNOB(stale, ps3_env_int("RSX_STALE_FLIPS", 4));
+                if (stale <= 0 || fc - s_last_present_flip < (unsigned)stale) {
+                    s_pc_clear_small++;
+                    return;   /* intermediate: keep accumulating, flip stays pending */
+                }
+                s_frame_draws_max = s_d3d.draw_count;
             }
+            /* The other face of a stale max: every present merges two or more
+             * flips and is still light (under half the max) -- a 5-draw movie
+             * frame is "small" against a max of 30, two of them are not, so
+             * the movie ran at 15 fps. Three such presents in a row halve the
+             * max. A full level frame is never under half, so the level is
+             * untouched. */
+            { static int light_merges;
+              if (fc - s_last_present_flip >= 2 && s_d3d.draw_count * 2 < s_frame_draws_max) {
+                  if (++light_merges >= 3) { s_frame_draws_max /= 2; light_merges = 0; }
+              } else light_merges = 0; }
             s_last_present_flip = fc;
         }
     }
