@@ -6352,6 +6352,7 @@ static void d3d12_clear_display(const float cc[4])
                    s_d3d.draw_count);
         render_frame();
         s_clear_presents++;
+        { extern void cellGcm_rcap_cut(void); cellGcm_rcap_cut(); }   /* frame capture boundary */
     }
     s_dbg_clears_since_present++;
     s_d3d.draw_count   = 0;

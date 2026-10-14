@@ -104,10 +104,13 @@ static volatile int s_flip_pending = 0;
  * derive it from the observed per-frame volume if a title outgrows it. */
 #define GCM_FLIP_WRAP_BYTES 0x40000u
 
+static void rcap_flip_boundary(void);
+
 int cellGcm_take_flip_pending(void)
 {
     int v = s_flip_pending;
     s_flip_pending = 0;
+    if (v) rcap_flip_boundary();
     return v;
 }
 
@@ -1225,6 +1228,7 @@ int cellGcm_take_flip_pending_synced(void)
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
     if (get != put) return 0;   /* frame not fully drained yet */
     s_flip_pending = 0;
+    rcap_flip_boundary();
     return 1;
 }
 
@@ -1602,6 +1606,15 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* The RSX register state the walker decodes into (file scope so a frame
+ * capture can snapshot it and a replay can restore it; see RSX_REPLAY_CAP). */
+static rsx_state s_state;
+static int  s_inited = 0;
+static void rcap_method(u32 mfull, u32 data);
+static void rcap_cut_after(u32 mfull, u32 data);
+static int  s_rcap_on = 0;
+static volatile int s_rcap_cut_pending = 0;
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
@@ -1615,8 +1628,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
               _n = 0; _t0 = now;
           }
       } }
-    static rsx_state s_state;
-    static int  s_inited = 0;
     extern u32 g_rsx_last_reference;
 
     /* A statically-linked libgcm (PS3 firmware modules -- ps1_netemu) never calls
@@ -1910,6 +1921,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                if (s_rcap_on) rcap_method((subch << 13) | m, vm_read32(dea));
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2028,6 +2040,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     { const u32 md = vm_read32(dea);
                       const int hr = rsx_process_method(&s_state, m, md);
+                      if (s_rcap_cut_pending) rcap_cut_after((subch << 13) | m, md);
                       gcm_census_method(m, md, hr == 0); }
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -3777,4 +3790,217 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
     s_fifo_getoff  = get;
     s_fifo_calloff = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Frame capture for offline replay
+ *
+ * RSX_REPLAY_CAP=<file> (live: the debug console's setenv arms it) records
+ * the next whole frame -- from one presented flip to the next -- into <file>:
+ * the RSX register state and the GCM tables at the frame's start, every
+ * method the FIFO walker dispatches in it, and at its end the guest memory a
+ * frame can read (RSX local memory and every IO-mapped main-memory range,
+ * committed non-zero 4 KB pages only). libs/video/tests/rsx_replay_main.c
+ * plays it back through the same dispatch and the same D3D12 backend, so a
+ * renderer change can be checked in seconds instead of a boot to the level.
+ * Each new value of the knob captures once. Captures are made of the title's
+ * own data: keep them out of any repository.
+ *
+ * File: "PS3RCAP1", then sections {char tag[4]; u32 size; bytes}; "MSEG"
+ * sections hold {u32 ea; bytes}, "METH" (mfull, data) u32 pairs, where mfull
+ * is (subchannel << 13) | method. Same-build only: the state sections are
+ * raw structs.
+ * -----------------------------------------------------------------------*/
+static FILE* s_rcap_f;
+static u32*  s_rcap_m;
+static u32   s_rcap_n, s_rcap_cap;
+
+static void rcap_method(u32 mfull, u32 data)
+{
+    if (s_rcap_n + 2 > s_rcap_cap) {
+        u32 nc = s_rcap_cap ? s_rcap_cap * 2 : 1u << 20;
+        u32* nm = (u32*)realloc(s_rcap_m, (size_t)nc * 4);
+        if (!nm) { s_rcap_on = 0; return; }
+        s_rcap_m = nm; s_rcap_cap = nc;
+    }
+    s_rcap_m[s_rcap_n++] = mfull;
+    s_rcap_m[s_rcap_n++] = data;
+}
+
+static void rcap_sec(const char* tag, const void* p, u32 n)
+{
+    fwrite(tag, 1, 4, s_rcap_f); fwrite(&n, 4, 1, s_rcap_f);
+    if (n) fwrite(p, 1, n, s_rcap_f);
+}
+
+static void rcap_seg(u32 ea, u32 n)
+{
+    const u32 sz = n + 4;
+    fwrite("MSEG", 1, 4, s_rcap_f); fwrite(&sz, 4, 1, s_rcap_f);
+    fwrite(&ea, 4, 1, s_rcap_f); fwrite(vm_base + ea, 1, n, s_rcap_f);
+}
+
+/* Runs of committed pages that are not all zero, as MSEG sections. */
+static u64 rcap_region(u32 ea, u32 size)
+{
+    u64 written = 0;
+    u32 run = 0, run_n = 0;
+    for (u64 a = ea & ~0xFFFull; a < (u64)ea + size && a < 0x100000000ull; a += 0x1000) {
+        int keep = 0;
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(vm_base + a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT)
+#endif
+        {   const u64* q = (const u64*)(vm_base + a);
+            for (int k = 0; k < 512 && !keep; k++) keep = q[k] != 0; }
+        if (keep && run_n && run + run_n * 0x1000u == (u32)a && run_n < 4096) { run_n++; continue; }
+        if (run_n) { rcap_seg(run, run_n * 0x1000u); written += run_n * 0x1000u; run_n = 0; }
+        if (keep) { run = (u32)a; run_n = 1; }
+    }
+    if (run_n) { rcap_seg(run, run_n * 0x1000u); written += run_n * 0x1000u; }
+    return written;
+}
+
+/* Frame boundaries. A backend that presents each frame at the clear that
+ * starts the next one (d3d12: "frame-boundary presents") reports it through
+ * cellGcm_rcap_cut, and the walker calls rcap_cut_after once that clear has
+ * been dispatched: the capture then runs from that clear to the next one, so
+ * a replay presents exactly one of the backend's frames. Until a backend
+ * reports a cut, the presented flip is the boundary instead. */
+static int s_rcap_cut_seen = 0;
+
+void cellGcm_rcap_cut(void) { s_rcap_cut_pending = 1; s_rcap_cut_seen = 1; }
+
+static void rcap_finish(void)
+{
+    s_rcap_on = 0;
+    u64 mem = 0;
+    if (vm_base) {
+        mem += rcap_region(s_config.localAddress, s_config.localSize);
+        for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)
+            if (s_io_mappings[i].active && s_io_mappings[i].size)
+                mem += rcap_region(s_io_mappings[i].ea, s_io_mappings[i].size);
+    }
+    rcap_sec("METH", s_rcap_m, s_rcap_n * 4);
+    rcap_sec("END ", NULL, 0);
+    fclose(s_rcap_f); s_rcap_f = NULL;
+    printf("[RCAP] wrote the capture: %u methods, %llu MB of guest memory%c", s_rcap_n / 2,
+           (unsigned long long)(mem >> 20), 10);
+}
+
+/* Start a capture if RSX_REPLAY_CAP names a file not captured yet. */
+static void rcap_try_start(void)
+{
+    static char armed[512] = "";
+    static unsigned gen;
+    if (gen == ps3_env_gen) return;
+    gen = ps3_env_gen;
+    const char* e = getenv("RSX_REPLAY_CAP");
+    if (!e || !*e || !strcmp(e, armed)) return;
+    snprintf(armed, sizeof armed, "%s", e);
+    s_rcap_f = fopen(e, "wb");
+    if (!s_rcap_f) { printf("[RCAP] cannot write %s%c", e, 10); return; }
+    fwrite("PS3RCAP1", 1, 8, s_rcap_f);
+    rcap_sec("RSXS", &s_state, (u32)sizeof s_state);
+    rcap_sec("CONF", &s_config, sizeof s_config);
+    rcap_sec("EATB", s_ea_address_table, sizeof s_ea_address_table);
+    rcap_sec("IOTB", s_io_address_table, sizeof s_io_address_table);
+    rcap_sec("LOCP", s_local_offset_page, sizeof s_local_offset_page);
+    rcap_sec("IOMP", s_io_mappings, sizeof s_io_mappings);
+    rcap_sec("DISP", s_display_buffers, sizeof s_display_buffers);
+    rcap_sec("DSET", s_display_buffer_set, sizeof s_display_buffer_set);
+    rcap_sec("DCUR", &s_current_display_buffer_id, 4);
+    rcap_sec("UPLD", s_uploads, sizeof s_uploads);
+    rcap_sec("UPLN", &s_upload_n, 4);
+    s_rcap_n = 0;
+    s_rcap_on = 1;
+    printf("[RCAP] capturing the next frame to %s%c", e, 10);
+}
+
+/* The clear that cut the frame has been dispatched: it ends a capture (as its
+ * last method, so the replay presents there) and begins the next one (as its
+ * first method, replayed on the state it left). */
+static void rcap_cut_after(u32 mfull, u32 data)
+{
+    s_rcap_cut_pending = 0;
+    if (s_rcap_on) { rcap_finish(); return; }
+    rcap_try_start();
+    if (s_rcap_on) rcap_method(mfull, data);
+}
+
+static void rcap_flip_boundary(void)
+{
+    if (s_rcap_cut_seen) return;
+    if (s_rcap_on) { rcap_finish(); return; }
+    rcap_try_start();
+}
+
+/* Replay side. Load a capture: restore the tables and the RSX state, copy the
+ * memory into vm_base (the caller maps it), and hand back the method pairs.
+ * Returns the number of pairs, or -1. */
+static rsx_state s_rcap_state0;
+
+static void rcap_put(const char* want, const char* tag, void* dst, u32 dsz, const u8* b, u32 sz)
+{
+    if (memcmp(tag, want, 4)) return;
+    if (sz == dsz) memcpy(dst, b, sz);
+    else printf("[RCAP] %.4s is %u bytes, this build has %u: captured by another build?%c", want, sz, dsz, 10);
+}
+
+int cellGcm_replay_load(const char* file, u32** methods)
+{
+    FILE* f = fopen(file, "rb");
+    if (!f) return -1;
+    char magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PS3RCAP1", 8)) { fclose(f); return -1; }
+    int n = -1;
+    for (;;) {
+        char tag[4]; u32 sz;
+        if (fread(tag, 1, 4, f) != 4 || fread(&sz, 4, 1, f) != 1) break;
+        if (!memcmp(tag, "END ", 4)) break;
+        u8* b = (u8*)malloc(sz ? sz : 1);
+        if (!b || fread(b, 1, sz, f) != sz) { free(b); break; }
+        rcap_put("RSXS", tag, &s_state, sizeof s_state, b, sz);
+        rcap_put("CONF", tag, &s_config, sizeof s_config, b, sz);
+        rcap_put("EATB", tag, s_ea_address_table, sizeof s_ea_address_table, b, sz);
+        rcap_put("IOTB", tag, s_io_address_table, sizeof s_io_address_table, b, sz);
+        rcap_put("LOCP", tag, s_local_offset_page, sizeof s_local_offset_page, b, sz);
+        rcap_put("IOMP", tag, s_io_mappings, sizeof s_io_mappings, b, sz);
+        rcap_put("DISP", tag, s_display_buffers, sizeof s_display_buffers, b, sz);
+        rcap_put("DSET", tag, s_display_buffer_set, sizeof s_display_buffer_set, b, sz);
+        rcap_put("DCUR", tag, &s_current_display_buffer_id, 4, b, sz);
+        rcap_put("UPLD", tag, s_uploads, sizeof s_uploads, b, sz);
+        rcap_put("UPLN", tag, &s_upload_n, 4, b, sz);
+        if (!memcmp(tag, "MSEG", 4) && sz > 4) {
+            u32 ea; memcpy(&ea, b, 4);
+            memcpy(vm_base + ea, b + 4, sz - 4);
+        }
+        if (!memcmp(tag, "METH", 4)) { *methods = (u32*)b; n = (int)(sz / 8); b = NULL; }
+        free(b);
+    }
+    fclose(f);
+    s_rcap_state0 = s_state;
+    s_inited = 1;
+    s_gcm_initialized = 1;
+    return n;
+}
+
+/* Back to the frame's starting RSX state, to play the frame again. */
+void cellGcm_replay_reset(void)
+{
+    s_state = s_rcap_state0;
+    rsx_reset_upload_claims();
+}
+
+/* One recorded method, dispatched as the walker does. A user command or a
+ * flip has no guest to talk to here and is dropped; the replayer presents. */
+void cellGcm_replay_method(u32 mfull, u32 data)
+{
+    const u32 subch = (mfull >> 13) & 7u, m = mfull & 0x1FFFu;
+    if (mfull == 0xEB00u || mfull == 0xEB04u || mfull == 0xE920u || mfull == 0xE924u) return;
+    if (subch == 7 && m == 0x0B00u) return;
+    static int s1_2d = -1;
+    PS3_KNOB(s1_2d, ps3_env_int("GCM_SUBCH1_2D", 0));
+    if (subch == 0 || (subch == 1 && !s1_2d)) rsx_process_method(&s_state, m, data);
+    else gcm_2d_method(subch, m, data);
 }

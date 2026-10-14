@@ -441,6 +441,26 @@ if(UNIX)
 endif()
 
 # ---------------------------------------------------------------------------
+# Frame replayer (Windows / D3D12)
+# ---------------------------------------------------------------------------
+# Plays back one frame a game run captured with RSX_REPLAY_CAP=<file> through
+# the same method dispatch and D3D12 backend, with no game linked in: see
+# libs/video/tests/rsx_replay_main.c. Built on demand (not part of "all"):
+#   cmake --build build --target rsx_replay
+if(WIN32)
+    add_executable(rsx_replay EXCLUDE_FROM_ALL
+        libs/video/tests/rsx_replay_main.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(rsx_replay PRIVATE ps3recomp_runtime dxguid)
+    target_include_directories(rsx_replay PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
+# ---------------------------------------------------------------------------
 # PPU boot smoke title
 # ---------------------------------------------------------------------------
 # The one target that LINKS AND RUNS the PPU boot scaffold. runtime/ppu/ is the
