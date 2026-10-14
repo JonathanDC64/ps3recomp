@@ -66,7 +66,7 @@ void rsx_state_init(rsx_state* state)
     state->scissor_h = 4096;
 
     /* Default depth */
-    state->depth_func = 1; /* LESS */
+    state->depth_func = 0x0201; /* LESS (GL enum, as the register holds it) */
     state->depth_mask = 1;
 
     /* Default cull */

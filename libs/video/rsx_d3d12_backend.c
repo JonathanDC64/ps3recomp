@@ -146,6 +146,13 @@ typedef struct {
      * legacy replay pass skips them. */
     int   is_clear;
     float cc[4];
+    u32   clr_flags;    /* CLEAR_SURFACE mask: bit0 Z, bit1 S, bits 4-7 RGBA */
+    float clr_z;        /* depth clear value, 0..1 */
+    u32   clr_s;        /* stencil clear value */
+    /* Depth surface (SET_SURFACE_ZETA_OFFSET, raw) and its SET_SURFACE_FORMAT
+     * depth field [7:5] (1 = Z16, 2 = Z24S8) at record time. */
+    u32   zeta, zfmt;
+    u32   depth;        /* packed guest depth state (rsx_depth_key, PSO key) */
 } D3D12DrawRecord;
 
 /* Offscreen render target (render-to-texture). Persistent across frames --
@@ -233,6 +240,7 @@ typedef struct {
                              * stale compile forever. */
     u32 cmask;              /* colour write mask (PSO key) */
     u32 cull;               /* packed face culling (PSO key) */
+    u32 depth;              /* packed depth test/func/write (PSO key) */
     u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
@@ -2046,6 +2054,15 @@ static u32 rsx_cull_key(const rsx_state* st)
     return k;
 }
 
+/* Pack the guest's depth state for the PSO key: bit0 test enabled, bit1
+ * writes on, bits 2-4 the compare function (GL enum 0x0200 NEVER .. 0x0207
+ * ALWAYS, in the same order as D3D12_COMPARISON_FUNC minus one). */
+static u32 rsx_depth_key(const rsx_state* st)
+{
+    if (!st || !st->depth_test_enable) return 0;
+    return 1u | (st->depth_mask ? 2u : 0u) | ((st->depth_func & 7u) << 2);
+}
+
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
@@ -2243,7 +2260,7 @@ static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
 static void fp_seen_note(u32 ea, u32 len);
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 cube_mask)
+                                          u32 depth, u32 cube_mask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2293,7 +2310,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
-            s_d3d.vp_fp[i].cull == cull &&
+            s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].depth == depth &&
             s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -2302,7 +2319,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.fp_addr = fp_addr; key.vs_idx = vs_idx; key.vs_hash = vs_hash;
     key.gen = s_d3d.vp_gen; key.blend = blend; key.nrt = nrt;
     key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
-    key.cmask = cmask; key.cull = cull; key.cube_mask = cube_mask;
+    key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
     key.pso = NULL;
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -2609,9 +2626,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    /* Guest depth state (rsx_depth_key). With the test off RSX neither tests
+     * nor writes depth, which is D3D's DepthEnable FALSE as well. */
+    pd.DepthStencilState.DepthEnable = (depth & 1u) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = (depth & 2u) ? D3D12_DEPTH_WRITE_MASK_ALL
+                                                       : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)(((depth >> 2) & 7u) + 1u);
     pd.DepthStencilState.StencilEnable = FALSE;
     /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
      * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
@@ -3707,6 +3727,97 @@ static int off_rt_find(u32 off)
     return -1;
 }
 
+/* Depth surfaces, one per guest zeta offset. RSX keeps depth in memory like
+ * any other surface: a pass that switches to another target (a shadow
+ * cascade, a luminance step) and comes back finds its depth where it left it,
+ * and only the guest's own CLEAR_SURFACE Z/S bits reset it. A single shared
+ * buffer cleared on every switch lost the scene's depth halfway through
+ * Demon's Souls's frame, so later scene draws covered the player.
+ * Created typeless (R24G8) so a later pass can sample one as a texture. */
+typedef struct {
+    ID3D12Resource* res;
+    u32 off, w, h;
+    int used;
+} ZetaRT;
+#define MAX_ZETA 8
+static ZetaRT s_zeta[MAX_ZETA];
+static ID3D12DescriptorHeap* s_zeta_dsv_heap;
+
+static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(int slot)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_zeta_dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_zeta_dsv_heap, &h);
+    h.ptr += (u64)slot * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    return h;
+}
+
+static int zeta_find(u32 off)
+{
+    for (int i = 0; i < MAX_ZETA; i++)
+        if (s_zeta[i].res && s_zeta[i].off == off) return i;
+    return -1;
+}
+
+/* Ensure a depth surface for this zeta offset at least w x h. A larger clip
+ * recreates it (content lost once); a smaller one reuses it, since a pass may
+ * render a sub-rectangle of the same surface. New surfaces start cleared. */
+static int zeta_get(u32 off, u32 w, u32 h)
+{
+    if (!w) w = s_d3d.width;
+    if (!h) h = s_d3d.height;
+    if (!s_zeta_dsv_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.NumDescriptors = MAX_ZETA;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(
+                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_zeta_dsv_heap)))
+            return -1;
+    }
+    int slot = zeta_find(off);
+    if (slot >= 0) {
+        ZetaRT* z = &s_zeta[slot];
+        if (z->w >= w && z->h >= h) { z->used = 1; return slot; }
+        if (z->w > w) w = z->w;
+        if (z->h > h) h = z->h;
+        off_rt_defer_release(z->res); z->res = NULL;
+    } else {
+        for (int i = 0; i < MAX_ZETA; i++)
+            if (!s_zeta[i].res) { slot = i; break; }
+        if (slot < 0) {
+            for (int i = 0; i < MAX_ZETA; i++)
+                if (!s_zeta[i].used) { slot = i; break; }
+            if (slot < 0) return -1;
+            off_rt_defer_release(s_zeta[slot].res); s_zeta[slot].res = NULL;
+        }
+    }
+    ZetaRT* z = &s_zeta[slot];
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R24G8_TYPELESS; td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {0};
+    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    cv.DepthStencil.Depth = 1.0f;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+            &IID_ID3D12Resource, (void**)&z->res)))
+        return -1;
+    z->off = off; z->w = w; z->h = h; z->used = 1;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
+    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, z->res, &dd, zeta_dsv(slot));
+    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zeta_dsv(slot),
+        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    printf("[ZETA] depth surface 0x%08X %ux%u (slot %d)\n", off, w, h, slot);
+    return slot;
+}
+
 /* Ensure an RT resource exists for this surface; (re)creates the RTV at
  * rt_rtv_heap[i] and the SRV at srv_heap[RT_SRV_BASE+i]. */
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -3916,6 +4027,8 @@ static void rt_pitch_record(D3D12DrawRecord* dr)
         dr->rt_pitch[i] = st->surface_color_pitch[i];
         dr->rt_dma[i]   = st->surface_color_dma[i];
     }
+    dr->zeta = st->surface_zeta_offset;
+    dr->zfmt = (st->surface_format >> 5) & 7u;
 }
 
 static u32 rt_guest_bpp(u32 dxgi)
@@ -4742,8 +4855,11 @@ rtt_dump_done:;
      * every non-display surface targeted this frame (so draws binding it as a
      * texture can resolve to it below, whatever the op order). */
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
+    for (int _i = 0; _i < MAX_ZETA; _i++) s_zeta[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
+        if (dr->is_vp && dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u)))
+            zeta_get(dr->zeta, dr->rt_w, dr->rt_h);
         u32 _offs[4] = { dr->rt_off, dr->rt_mrt[0], dr->rt_mrt[1], dr->rt_mrt[2] };
         for (int _m = 0; _m < 4; _m++) {
             if (!dr->is_vp || !_offs[_m]) continue;
@@ -4945,7 +5061,8 @@ rtt_dump_done:;
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr));
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                       dr_cube_mask(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -5140,6 +5257,7 @@ rtt_dump_done:;
             float vp_last_w = 0, vp_last_h = 0;    /* for DRAWARGS */
             float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
+            int cur_z = -1;                        /* zeta: -1 = shared buffer  */
             double _rec0 = perf_on() ? perf_now() : 0.0;
             int seen_small_vp = 0, captured = 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
@@ -5172,8 +5290,15 @@ rtt_dump_done:;
                 int wantm[3];
                 for (int _m = 0; _m < 3; _m++)
                     wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
+                /* Depth follows the op's zeta when it has one; ops without a
+                 * depth surface (or not using depth) keep the shared buffer. */
+                int wz = dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u))
+                       ? zeta_find(dr->zeta) : -1;
+                if (wz < 0 && cur_z >= 0 && !(dr->depth & 1u) && !(dr->clr_flags & 3u))
+                    wz = cur_z;   /* depth unused: don't rebind just to drop it */
                 if (want != cur_rt || wantm[0] != cur_m[0] ||
-                    wantm[1] != cur_m[1] || wantm[2] != cur_m[2]) {
+                    wantm[1] != cur_m[1] || wantm[2] != cur_m[2] || wz != cur_z) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE dsv_op = wz >= 0 ? zeta_dsv(wz) : dsv_handle;
                     D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
                     UINT nrt = 1;
                     rh[0] = rtv_handle;
@@ -5190,11 +5315,15 @@ rtt_dump_done:;
                     }
                     D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
                     vp_last_w = vp.Width; vp_last_h = vp.Height;
-                    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, nrt, rh, FALSE, &dsv_handle);
+                    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, nrt, rh, FALSE, &dsv_op);
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
                     s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
-                    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
-                        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                    /* The shared buffer stands in for "no guest depth surface",
+                     * so it starts each target fresh; a zeta keeps its content. */
+                    if (wz < 0)
+                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
+                            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                    cur_z = wz;
                     /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
                      * at the moment they bind it. The guest's own clears may go
                      * to a different surface entirely (they do here: clears to
@@ -5240,6 +5369,14 @@ rtt_dump_done:;
                     cur_rt = want;
                     for (int _m = 0; _m < 3; _m++) cur_m[_m] = wantm[_m];
                 }
+                if (dr->is_clear && (dr->clr_flags & 3u) && cur_z >= 0) {
+                    D3D12_CLEAR_FLAGS zf = (D3D12_CLEAR_FLAGS)(
+                        ((dr->clr_flags & 1u) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
+                        ((dr->clr_flags & 2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
+                    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zeta_dsv(cur_z),
+                        zf, dr->clr_z, (UINT8)dr->clr_s, 0, NULL);
+                }
+                if (dr->is_clear && !(dr->clr_flags & 0xF0u)) continue;   /* depth/stencil only */
                 if (dr->is_clear) {
                     D3D12_CPU_DESCRIPTOR_HANDLE rh =
                         (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
@@ -5271,7 +5408,7 @@ rtt_dump_done:;
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask, dr->cull,
+                                                dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                                 dr_cube_mask(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
@@ -5956,12 +6093,20 @@ static void d3d12_present(void* ud, u32 buffer_id)
     }
 }
 
+static void d3d12_clear_display(const float cc[4]);
+
+/* Guest depth clear value in 0..1 for the current zeta format: Z24S8 keeps
+ * depth in the top 24 bits, Z16 in the low 16 (rsx_commands assumes Z24S8). */
+static float clear_depth_value(const rsx_state* st, float z24)
+{
+    if (st && ((st->surface_format >> 5) & 7u) == 1u)
+        return (float)(st->zstencil_clear_value & 0xFFFFu) / 65535.0f;
+    return z24;
+}
+
 static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
     (void)ud;
-    (void)flags;
-    (void)depth;
-    (void)stencil;
 
     /* Convert RSX ARGB u32 to float[4] RGBA */
     float cc[4];
@@ -5993,11 +6138,30 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
             dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
             rt_pitch_record(dr);
             memcpy(dr->cc, cc, sizeof(cc));
+            dr->clr_flags = flags;
+            dr->clr_z = clear_depth_value(s_d3d.current_rsx_state, depth);
+            dr->clr_s = stencil;
         }
         return;
     }
 
-    memcpy(s_d3d.clear_color, cc, sizeof(cc));
+    d3d12_clear_display(cc);
+    /* The display path above may close the frame; a Z/S clear belongs to
+     * whatever frame follows it, so it is recorded after. */
+    if ((flags & 3u) && s_d3d.draw_count < MAX_DRAWS) {
+        D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
+        memset(dr, 0, sizeof(*dr));
+        dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
+        rt_pitch_record(dr);
+        dr->clr_flags = flags & 3u;
+        dr->clr_z = clear_depth_value(s_d3d.current_rsx_state, depth);
+        dr->clr_s = stencil;
+    }
+}
+
+static void d3d12_clear_display(const float cc[4])
+{
+    memcpy(s_d3d.clear_color, cc, 4 * sizeof(float));
 
     /* A DISPLAY clear marks the start of a new visible frame. If a completed
      * frame is still accumulated (the drain gulped across a frame boundary --
@@ -6901,6 +7065,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+                dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
@@ -7026,6 +7191,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+            dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
@@ -7173,6 +7339,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
