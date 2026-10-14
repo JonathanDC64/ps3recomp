@@ -522,10 +522,15 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     for (;;) {
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
-         * fence still paid the whole tick. Waiting on it keeps the same 4 ms
-         * ceiling when nothing kicks, and drains on demand when something
-         * does. */
-        cellGcm_fifo_kick_wait(4);
+         * fence still paid the whole tick. Waiting on it drains on demand
+         * when something kicks. FIFO_KICK_MS (live) is the ceiling when
+         * nothing does: a title that writes `put` directly never kicks, and
+         * each wait is latency on its frame's critical path (the real RSX
+         * fetches continuously). 4 -> 1 took Demon's Souls from ~13.7 to
+         * ~15.8 presents/s for ~15% of a core on this thread. */
+        { static int kms = -1;
+          PS3_KNOB(kms, ps3_env_int("FIFO_KICK_MS", 1));
+          cellGcm_fifo_kick_wait(kms >= 1 ? (unsigned)kms : 1u); }
         ULONGLONG now = GetTickCount64();
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
