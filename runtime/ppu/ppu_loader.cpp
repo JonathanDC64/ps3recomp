@@ -31,6 +31,7 @@
 #  include "../platform/win32_compat.h"   /* _Interlocked*, YieldProcessor, Sleep */
 #endif
 
+#include "ppu_waits.h"   /* console waits table */
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
@@ -3103,6 +3104,40 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
+/* Console `waits`: time spent inside each lv2 syscall and HLE call, per guest
+ * thread, call and first argument (usually the object waited on). Off unless
+ * the console arms it; when armed every call takes two QPC reads and a lock.
+ * A guest frame's time is either guest code or one of these calls, so the
+ * table says what a slow frame waits on. HLE handlers that make syscalls are
+ * counted at both levels. */
+extern "C" volatile int g_waits_armed = 0;
+extern "C" ppu_waits_ent g_waits[PPU_WAITS_N] = {};
+extern "C" volatile uint32_t g_waits_dropped = 0;
+static SRWLOCK s_waits_lock = SRWLOCK_INIT;
+
+extern "C" uint64_t ppu_waits_now(void)
+{
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+}
+
+extern "C" void ppu_waits_add(uint32_t tid, int hle, uint32_t key, uint32_t obj,
+                              const char* name, uint64_t ticks)
+{
+    uint32_t h = (tid * 0x9E3779B1u) ^ (key * 0x85EBCA6Bu) ^ (obj * 0xC2B2AE35u) ^ (uint32_t)hle;
+    AcquireSRWLockExclusive(&s_waits_lock);
+    uint32_t i = 0;
+    for (; i < 64; i++) {
+        ppu_waits_ent* e = &g_waits[(h + i) & (PPU_WAITS_N - 1)];
+        if (!e->n) { e->tid = tid; e->hle = hle; e->key = key; e->obj = obj; e->name = name; }
+        else if (e->tid != tid || e->hle != hle || e->key != key || e->obj != obj) continue;
+        e->n++; e->ticks += ticks;
+        break;
+    }
+    if (i == 64) g_waits_dropped++;   /* the neighbourhood is full */
+    ReleaseSRWLockExclusive(&s_waits_lock);
+}
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
@@ -3124,10 +3159,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * through ps3_hle_call) and a stale CTR, so without this a wedged thread is
      * just "somewhere in ntdll". Cleared on every exit path by the guard. */
     struct _ScGuard {
-        ppu_context* c;
+        ppu_context* c; uint32_t num, obj; uint64_t t0;
         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
-    } _sg{ ctx };
+                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+                      if (t0) ppu_waits_add(t, 0, num, obj, nullptr, ppu_waits_now() - t0); }
+    } _sg{ ctx, (uint32_t)num, (uint32_t)ctx->gpr[3], g_waits_armed ? ppu_waits_now() : 0 };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall

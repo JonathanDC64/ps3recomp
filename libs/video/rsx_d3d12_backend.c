@@ -397,6 +397,9 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* GCM_RATES: why a frame boundary did or did not present (per-second deltas) */
+static u32 s_clear_presents;   /* defined with the clear path */
+static u32 s_pc_flip_render, s_pc_flip_nodisp, s_pc_clear_nodisp, s_pc_clear_sameflip, s_pc_clear_small;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
 /* VP vertex buffer capacity, in vertices per frame-parity half. Starts at
  * MAX_VERTICES and grows when a frame asks for more (vp_vb_grow): a Demon's
@@ -6173,17 +6176,30 @@ skip_dump_consider: ;
             /* GCM_RATES=1: the same once-a-second sample on stderr, beside
              * the FIFO flip words decoded and how far RSX label 255 moved --
              * the fence a title like Demon's Souls paces its frames on. */
-            { static int on = -1; static u32 fw0, l0;
+            { static int on = -1; static u32 fw0, l0, fr0;
               PS3_KNOB(on, getenv("GCM_RATES") ? 1 : 0);
               extern uint8_t* vm_base;
               if (on && vm_base) {
                   extern volatile u32 g_gcm_flip_words;
+                  extern unsigned cellGcm_flip_request_count(void);
                   const u8* lp = vm_base + 0x20000FF0u;
                   u32 fw = g_gcm_flip_words, l = ((u32)lp[0] << 24) | ((u32)lp[1] << 16) | ((u32)lp[2] << 8) | lp[3];
-                  fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s label255=%08X (+%u) draws=%u%c",
+                  u32 fr = cellGcm_flip_request_count();
+                  /* flips: all flip requests, in the FIFO or not (Demon's
+                   * Souls flips twice per frame it renders). */
+                  /* boundaries: at a flip (render / no display draws), at a
+                   * display clear (render / no display draws / no flip since
+                   * the last present / batch too small) */
+                  static u32 c0, f1, f2, k1, k2, k3;
+                  fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s flips=%u/s label255=%08X (+%u) draws=%u"
+                          " | flip:render=%u nodisp=%u clear:render=%u nodisp=%u sameflip=%u small=%u%c",
                           (unsigned long long)tnow, s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                          fw - fw0, l, l - l0, s_dbg_last_draws, 10);
-                  fw0 = fw; l0 = l;
+                          fw - fw0, fr - fr0, l, l - l0, s_dbg_last_draws,
+                          s_pc_flip_render - f1, s_pc_flip_nodisp - f2, s_clear_presents - c0,
+                          s_pc_clear_nodisp - k1, s_pc_clear_sameflip - k2, s_pc_clear_small - k3, 10);
+                  fw0 = fw; l0 = l; fr0 = fr;
+                  f1 = s_pc_flip_render; f2 = s_pc_flip_nodisp; c0 = s_clear_presents;
+                  k1 = s_pc_clear_nodisp; k2 = s_pc_clear_sameflip; k3 = s_pc_clear_small;
               } }
             s_tframes = 0;
             s_tt0 = tnow;
@@ -6257,6 +6273,7 @@ static void d3d12_present(void* ud, u32 buffer_id)
 
     if (s_d3d.initialized && flip_has_display)
         render_frame();
+    if (flip_has_display) s_pc_flip_render++; else s_pc_flip_nodisp++;
 
     /* FPS tracking */
     ULONGLONG now = GetTickCount64();
@@ -6350,8 +6367,10 @@ static void d3d12_clear_display(const float cc[4])
             have_display_draws = 1;
             break;
         }
-    if (!have_display_draws)
+    if (!have_display_draws) {
+        s_pc_clear_nodisp++;
         return;   /* keep accumulating the in-progress frame */
+    }
 
     /* A title that DOUBLE-BUFFERS the display (DeferredShading clears both
      * 0x0 and 0x440000 per frame, plus a HUD pass) issues several display
@@ -6369,8 +6388,10 @@ static void d3d12_clear_display(const float cc[4])
         static unsigned s_last_present_flip = 0;
         unsigned fc = cellGcm_flip_request_count();
         if (fc != 0) {
-            if (fc == s_last_present_flip)
+            if (fc == s_last_present_flip) {
+                s_pc_clear_sameflip++;
                 return;   /* no flip since last present -> not a real boundary */
+            }
             /* A double-buffered title issues several display clears per flip
              * (DeferredShading: clear back-buffer, HUD pass, ...). They can
              * arrive in either order, so a small batch here may be an
@@ -6380,8 +6401,10 @@ static void d3d12_clear_display(const float cc[4])
              * in one present. Gauged against the running MAX frame size (not
              * the last, which a leaked tiny batch would poison), so it
              * self-scales per title with no fixed threshold. */
-            if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4)
+            if (s_frame_draws_max > 16 && s_d3d.draw_count < s_frame_draws_max / 4) {
+                s_pc_clear_small++;
                 return;   /* intermediate: keep accumulating, flip stays pending */
+            }
             s_last_present_flip = fc;
         }
     }

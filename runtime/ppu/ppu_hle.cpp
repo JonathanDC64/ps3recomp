@@ -19,6 +19,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+#include "ppu_waits.h"     /* console waits */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
@@ -338,11 +339,16 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp; uint32_t nid, obj; uint64_t t0;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
+                      /* console `waits`: the name is still in the slot here */
+                      if (t0) ppu_waits_add(t, 1, nid, obj,
+                                            t < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[t] : nullptr,
+                                            ppu_waits_now() - t0);
                       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], nid, (uint32_t)ctx->gpr[3],
+           g_waits_armed ? ppu_waits_now() : 0 };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -781,9 +787,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
             g_ctx[i].fn(ctx);
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-            return;
+            return;   /* the guard clears the in-flight slot (after `waits` reads it) */
         }
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;

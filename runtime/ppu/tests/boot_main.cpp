@@ -433,6 +433,7 @@ static void present_guest_frame(void)
  * answers "where does thread X spend its wall time" without a debugger. */
 #include "../../syscalls/sys_ppu_thread.h"
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
+#include "../ppu_waits.h"                     /* console waits */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
     struct Site { uint32_t tid, cia; uint32_t hits; };
@@ -1121,6 +1122,114 @@ static void dbg_prof(DWORD tid, unsigned sec)
     }
 }
 
+/* waits [s]: what guest threads spend their time inside, over s seconds.
+ * Every lv2 syscall and HLE call is timed per (thread, call, r3); r3 is
+ * usually the object waited on. A call already running when the window opens
+ * is not seen, so a thread parked the whole time shows nothing: ctx/gstacks
+ * answer that one. HLE handlers that make syscalls count at both levels. */
+static const char* sc_name(uint32_t n)
+{
+    /* Numbers from lv2_syscall_table.h, so the labels cannot drift. */
+    switch (n) {
+    case SYS_EVENT_FLAG_WAIT:     return "event_flag_wait";
+    case SYS_SEMAPHORE_WAIT:      return "semaphore_wait";
+    case SYS_SEMAPHORE_TRYWAIT:   return "semaphore_trywait";
+    case SYS_SEMAPHORE_POST:      return "semaphore_post";
+    case SYS_LWMUTEX_LOCK:        return "lwmutex_lock";
+    case SYS_LWMUTEX_UNLOCK:      return "lwmutex_unlock";
+    case SYS_MUTEX_LOCK:          return "mutex_lock";
+    case SYS_MUTEX_UNLOCK:        return "mutex_unlock";
+    case SYS_COND_WAIT:           return "cond_wait";
+    case SYS_COND_SIGNAL:         return "cond_signal";
+    case SYS_COND_SIGNAL_ALL:     return "cond_signal_all";
+    case SYS_LWCOND_WAIT:         return "lwcond_queue_wait";
+    case SYS_EVENT_QUEUE_RECEIVE: return "event_queue_receive";
+    case SYS_EVENT_PORT_SEND:     return "event_port_send";
+    case SYS_TIMER_USLEEP:        return "timer_usleep";
+    case SYS_TIMER_SLEEP:         return "timer_sleep";
+    case SYS_PPU_THREAD_YIELD:    return "ppu_thread_yield";
+    case SYS_PPU_THREAD_JOIN:     return "ppu_thread_join";
+    case SYS_RWLOCK_RLOCK:        return "rwlock_rlock";
+    case SYS_RWLOCK_WLOCK:        return "rwlock_wlock";
+    case SYS_FS_OPEN:             return "fs_open";
+    case SYS_FS_READ:             return "fs_read";
+    case SYS_FS_LSEEK:            return "fs_lseek";
+    default: return "";
+    }
+}
+
+static void dbg_waits(unsigned sec, unsigned rows)
+{
+    memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
+    g_waits_dropped = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t a = ppu_waits_now();
+    g_waits_armed = 1;
+    Sleep(sec * 1000u);
+    g_waits_armed = 0;
+    const double win_ms = (double)(ppu_waits_now() - a) * 1000.0 / (double)f.QuadPart;
+    Sleep(100);   /* calls in flight at the close land */
+    const double tms = 1000.0 / (double)f.QuadPart;
+    static ppu_waits_ent e[PPU_WAITS_N];
+    memcpy(e, g_waits, sizeof e);
+    unsigned used = 0;
+    for (unsigned i = 0; i < PPU_WAITS_N; i++) used += e[i].n != 0;
+    dbg_printf("  %u distinct (thread, call, r3)%c", used, 10);
+
+    dbg_printf("  waits over %.0f ms (%% = share of the window), %u calls dropped (table full)%c",
+               win_ms, (unsigned)g_waits_dropped, 10);
+    /* per thread: time inside syscalls and inside HLE calls */
+    for (uint32_t tid = 0; tid < 256; tid++) {
+        double sc = 0, hl = 0; unsigned n = 0;
+        for (unsigned i = 0; i < PPU_WAITS_N; i++)
+            if (e[i].n && e[i].tid == tid) { (e[i].hle ? hl : sc) += e[i].ticks * tms; n += e[i].n; }
+        if (!n) continue;
+        const char* tn = tid >= 1 && tid <= PPU_THREAD_MAX ? g_ppu_threads[tid - 1].name : "?";
+        dbg_printf("  tid %-3u %-28s syscalls %5.1f%%  hle %5.1f%%  %u calls%c", tid, tn,
+                   100.0 * sc / win_ms, 100.0 * hl / win_ms, n, 10);
+    }
+    /* by (thread, call), r3 folded: HLE calls often take a different pointer each time */
+    { static ppu_waits_ent g[4096]; unsigned ng = 0;
+      for (unsigned i = 0; i < PPU_WAITS_N; i++) {
+          if (!e[i].n) continue;
+          unsigned k = 0;
+          while (k < ng && (g[k].tid != e[i].tid || g[k].hle != e[i].hle || g[k].key != e[i].key)) k++;
+          if (k == ng) { if (ng == 4096) continue; g[ng] = e[i]; g[ng].n = 0; g[ng].ticks = 0; g[ng].obj = 0; ng++; }
+          g[k].n += e[i].n; g[k].ticks += e[i].ticks; g[k].obj++;
+      }
+      dbg_printf("  --- by thread and call (r3 folded; objs = distinct r3) ---%c", 10);
+      for (unsigned rank = 0; rank < rows; rank++) {
+          uint64_t best = 0; int bi = -1;
+          for (unsigned i = 0; i < ng; i++) if (g[i].n && g[i].ticks > best) { best = g[i].ticks; bi = (int)i; }
+          if (bi < 0) break;
+          const ppu_waits_ent* w = &g[bi];
+          const char* tn = w->tid >= 1 && w->tid <= PPU_THREAD_MAX ? g_ppu_threads[w->tid - 1].name : "?";
+          char what[64];
+          if (w->hle) snprintf(what, sizeof what, "%s", w->name ? w->name : "?");
+          else snprintf(what, sizeof what, "sc%u %s", w->key, sc_name(w->key));
+          const double ms = w->ticks * tms;
+          dbg_printf("  %5.1f%% %8.1fms n=%-6u avg=%7.0fus  tid %-3u %-22.22s %-26.26s objs=%u%c",
+                     100.0 * ms / win_ms, ms, w->n, 1000.0 * ms / w->n, w->tid, tn, what, w->obj, 10);
+          g[bi].n = 0;
+      } }
+    dbg_printf("  --- top calls ---%c", 10);
+    for (unsigned rank = 0; rank < rows + rows / 2; rank++) {
+        uint64_t best = 0; int bi = -1;
+        for (unsigned i = 0; i < PPU_WAITS_N; i++)
+            if (e[i].n && e[i].ticks > best) { best = e[i].ticks; bi = (int)i; }
+        if (bi < 0) break;
+        const ppu_waits_ent* w = &e[bi];
+        const char* tn = w->tid >= 1 && w->tid <= PPU_THREAD_MAX ? g_ppu_threads[w->tid - 1].name : "?";
+        char what[64];
+        if (w->hle) snprintf(what, sizeof what, "%s", w->name ? w->name : "?");
+        else snprintf(what, sizeof what, "sc%u %s", w->key, sc_name(w->key));
+        const double ms = w->ticks * tms;
+        dbg_printf("  %5.1f%% %8.1fms n=%-6u avg=%7.0fus  tid %-3u %-22.22s %-26.26s r3=0x%08X%c",
+                   100.0 * ms / win_ms, ms, w->n, 1000.0 * ms / w->n, w->tid, tn, what, w->obj, 10);
+        e[bi].n = 0;
+    }
+}
+
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -1158,6 +1267,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  gstacks [n]      guest shadow stack of every thread, n frames%c", 10);
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
+            dbg_printf("  waits [s] [rows] time per guest thread inside each syscall/HLE call (+r3) over s seconds%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
@@ -1283,6 +1393,9 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if (!strcmp(verb, "cpu")) {
             sscanf(cmd, "%*s %u", &a);
             dbg_cpu(a ? a : 5);
+        } else if (!strcmp(verb, "waits")) {
+            sscanf(cmd, "%*s %u %u", &a, &b);
+            dbg_waits(a ? a : 3, b ? b : 40);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "ctx") && sscanf(cmd, "%*s %u", &a) == 1) {
