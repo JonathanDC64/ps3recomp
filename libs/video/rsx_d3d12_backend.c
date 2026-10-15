@@ -8370,6 +8370,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex_slot = -1;
                 dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
                 dr->is_clear = 0;
+                /* Records are reused frame to frame without a reset: a slot that
+                 * held a depth clear kept its Z/S flags, and a soft-particle draw in
+                 * it lost its read-only depth view (FP_WATCH: "reads 0"). */
+                dr->clr_flags = 0;
                 dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
                 dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
                 if (getenv("BLENDDBG")) { static u32 seen[32]; static int ns=0;
@@ -8403,6 +8407,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
             s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
             s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
+            s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
             s_d3d.draws[s_d3d.draw_count].rt_off         = 0;
             s_d3d.draw_count++;
         }
@@ -8496,6 +8501,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex_slot = -1;
             dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
             dr->is_clear = 0;
+            dr->clr_flags = 0;
             dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
             dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
             dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
@@ -8542,6 +8548,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         s_d3d.draws[s_d3d.draw_count].textured       = 0;
         s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
         s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
+        s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
         s_d3d.draws[s_d3d.draw_count].rt_off         = 0;
         s_d3d.draw_count++;
     }
@@ -8643,6 +8650,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->tex_slot = -1;
         dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
         dr->is_clear = 0;
+        dr->clr_flags = 0;
         dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
         dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
         dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
