@@ -204,6 +204,30 @@ static void spu_count_run(int image_id)
     g_spu_image_runs[(unsigned)image_id < 64 ? image_id : 0]++;
 }
 
+/* SPU history: a ring of the last 64K task dispatches, starts, returns, thread
+ * ends, signals, WAIT_SIGNAL parks and SPU->PPU user events. Always on -- one
+ * store per event -- and read by the debug console's `spuhist [image] [n]`,
+ * which answers "which run of this task never finished, or never told the PPU"
+ * after a hang, without a log that perturbs the timing that caused it. */
+spu_hist_ent g_spu_hist[SPU_HIST_N];
+volatile long g_spu_hist_n;
+void spu_hist(char op, int image, uint32_t a, uint32_t b, uint32_t c)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const long i = __sync_add_and_fetch(&g_spu_hist_n, 1) - 1;
+    spu_hist_ent* e = &g_spu_hist[(unsigned long)i & (SPU_HIST_N - 1)];
+    e->t_ms = (uint32_t)ps3_ms_now(); e->op = (uint8_t)op; e->image = (uint8_t)image;
+    e->a = a; e->b = b; e->c = c; e->htid = (uint32_t)GetCurrentThreadId();
+}
+
+uint32_t spu_hist_line(void)
+{
+    static int s_init; static uint32_t s_ea;
+    if (!s_init) { const char* e = getenv("SPU_HIST_LINE");
+                   s_ea = e ? (uint32_t)strtoul(e, 0, 16) : 0; s_init = 1; }
+    return s_ea;
+}
+
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
 {
@@ -411,6 +435,8 @@ static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
 /* Per-thread taskset/task handoff for spu_workload_dispatch_async (see there). */
 static SPU_WL_TLS uint32_t t_dispatch_ts, t_dispatch_id;
 static SPU_WL_TLS int t_dispatch_valid;
+/* The image this task thread runs, for spu_hist entries made below it. */
+static SPU_WL_TLS int t_hist_image;
 void spu_workload_set_dispatch_task(uint32_t taskset_ea, uint32_t taskid)
 {
     t_dispatch_ts = taskset_ea; t_dispatch_id = taskid; t_dispatch_valid = 1;
@@ -620,7 +646,9 @@ static void spu_async_run(spu_async_job* j)
      * missed: the task would adopt the new generation, park in WAIT_SIGNAL and
      * hold up cellSpursJoinTaskset forever. Such a job never runs. */
     t_job_gen = j->gen;
+    t_hist_image = j->image_id;
     if (spu_taskset_job_stale()) {
+        spu_hist('N', j->image_id, j->taskset_ea, j->taskid, (uint32_t)j->gen);
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) not started: "
                 "taskset was shut down after it was queued\n", j->taskid, j->taskset_ea);
         spu_taskset_job_end(j->taskset_ea, j->taskid);
@@ -628,6 +656,7 @@ static void spu_async_run(spu_async_job* j)
         return;
     }
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+    spu_hist('S', j->image_id, j->taskset_ea, j->taskid, j->args_ea);
     TS_TRACE(j->taskset_ea, "task %u running image=%d\n", j->taskid, j->image_id);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -925,6 +954,7 @@ static void spu_async_run(spu_async_job* j)
             spu_serial_acquire();       /* one SPU task runs at a time (LBP_SPU_SERIAL) */
             int32_t rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
+            spu_hist('R', j->image_id, j->taskset_ea, j->taskid, (uint32_t)rc);
             /* YDKJ_CRI_RESUME: a real SPURS task is PERSISTENT -- on yield (num=0)
              * the kernel re-enters it when work is signaled. Our HLE runs it once,
              * so it polls the (concurrently PPU-updated) eaContext, finds no work,
@@ -1095,6 +1125,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
     }
     spu_taskset_job_end(j->taskset_ea, j->taskid);
+    spu_hist('X', j->image_id, j->taskset_ea, j->taskid, 0);
     free(j);
 }
 
@@ -1316,6 +1347,7 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
+    spu_hist('G', t_hist_image, taskset_ea, taskId, 0);
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
     spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
@@ -1392,6 +1424,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return 0;
     TS_TRACE(taskset_ea, "task %u WAIT_SIGNAL\n", taskId);
+    spu_hist('W', t_hist_image, taskset_ea, taskId, 0);
     /* ran= is the wall time this task spent OUT of the wait (decode/mix work
      * per round) -- decisive for "is the Bink decode CPU-bound". TLS: each
      * task runs on its own host thread. */
@@ -1523,6 +1556,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
         return -1;              /* caller halts the task */
     }
     spu_serial_acquire();       /* resume: re-take the serial lock */
+    spu_hist('w', t_hist_image, taskset_ea, taskId, (uint32_t)secs);
     { extern unsigned long long ps3_ms_now(void);
       s_wait_exit_ms = ps3_ms_now(); }   /* stamp for the next entry's ran= */
     return 0;
@@ -1658,6 +1692,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
       if (t_dispatch_valid) { j->taskset_ea = t_dispatch_ts; j->taskid = t_dispatch_id;
                               t_dispatch_valid = 0; } }
     j->gen = spu_taskset_gen_peek(j->taskset_ea);
+    spu_hist('D', image_id, j->taskset_ea, j->taskid, args_ea);
     /* Capture the SPURS task r3 NOW (PPU thread, synchronous) from the game's
      * descriptor at eaContext+0x10 = {0x40-marker handle, workload EAs}; the
      * async SPU thread reading it later would race the PPU stack. word1 is

@@ -17,6 +17,7 @@
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_workload.h"  /* spu_hist / spu_hist_line */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
@@ -1006,6 +1007,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+        /* SPU_HIST_LINE=<hex ea>: every PUTLLC on that word's line goes into
+         * the SPU history ring (console `spuhist`), L committed, F failed, with
+         * the caller's lr and the word before and after. A lost atomic update
+         * then reads as an L whose old value is not the previous commit's new
+         * one, and the htid names the task that made it. */
+        { const uint32_t hl = spu_hist_line();
+          if (hl && (ea & ~127u) == (hl & ~127u)) {
+              uint32_t o, n;
+              memcpy(&o, ctx->resv_line + (hl & 127u), 4);
+              memcpy(&n, mem + (hl & 127u), 4);
+              spu_hist(ctx->atomic_stat ? 'F' : 'L', ctx->image_id,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                       __builtin_bswap32(o), __builtin_bswap32(n));
+          } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);

@@ -143,6 +143,21 @@ void spu_pending_flush(void);
 /* Number of currently registered lifted SPU binaries (diagnostics/tests). */
 unsigned spu_workload_count(void);
 
+/* SPU history ring (spu_workload.c): see spu_hist(). op: D dispatched, N not
+ * started (taskset shut down), S started, R lifted entry returned, X task
+ * thread done, G task signalled, W/w WAIT_SIGNAL enter/resume, P user event
+ * a SPURS task sent to a PPU queue; L/F/l the watched line, see
+ * spu_hist_line(). */
+#define SPU_HIST_N 65536
+typedef struct { uint32_t t_ms; uint32_t a, b, c; uint32_t htid; uint8_t op; uint8_t image; } spu_hist_ent;
+extern spu_hist_ent g_spu_hist[SPU_HIST_N];
+extern volatile long g_spu_hist_n;
+void spu_hist(char op, int image, uint32_t a, uint32_t b, uint32_t c);
+/* SPU_HIST_LINE=<hex ea>: the guest word whose 128-byte line also goes into the
+ * ring -- SPU PUTLLC commits (L) and failures (F), PPU stwcx. commits (l), with
+ * the word before and after. 0 when unset. */
+uint32_t spu_hist_line(void);
+
 #ifdef __cplusplus
 }
 #endif

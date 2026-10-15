@@ -433,6 +433,7 @@ static void present_guest_frame(void)
  * answers "where does thread X spend its wall time" without a debugger. */
 #include "../../syscalls/sys_ppu_thread.h"
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
+#include "../../spu/spu_workload.h"          /* SPU history ring (console spuhist) */
 #include "../ppu_waits.h"                     /* console waits */
 extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
 extern "C" void (*volatile g_spu_trace_mark)(const char*, uint32_t, uint32_t);   /* spu_channels.c */
@@ -1373,6 +1374,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
             dbg_printf("  ctx <tid>        a guest thread's live registers (lr = where it is parked)%c", 10);
             dbg_printf("  synchist <id> [n] cond/mutex history for an id (create, wait, signal, destroy)%c", 10);
+            dbg_printf("  spuhist [img] [n] SPU task history (dispatch, start, end, signal, user events)%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
@@ -1544,6 +1546,24 @@ static DWORD WINAPI debug_console(LPVOID param)
                 const sync_hist_ent* e = &g_sync_hist[hits[nh] & (SYNC_HIST_N - 1)];
                 dbg_printf("  t=%u %c id=0x%X tid=%u lr=0x%08X x=0x%X r=0x%08X%c", e->t_ms, e->op,
                            e->id, e->tid, e->lr, e->extra, (unsigned)e->res, 10);
+            }
+        } else if (!strcmp(verb, "spuhist")) {
+            /* spuhist [image] [n]: the last n (default 60) SPU history events,
+             * oldest first, for one lifted image (0 = all). Ops: D dispatched,
+             * N not started, S started, R entry returned (c=rc), X thread done,
+             * G signalled, W/w WAIT_SIGNAL enter/resume, P user event (a=port |
+             * data0<<8, b=queue | bit31 if the queue refused it, c=data1). */
+            unsigned img = 0, want = 60;
+            sscanf(cmd, "%*s %u %u", &img, &want);
+            const long n = g_spu_hist_n;
+            const long lo = n > SPU_HIST_N ? n - SPU_HIST_N : 0;
+            static long hits[4096]; unsigned nh = 0;
+            for (long i = n - 1; i >= lo && nh < want && nh < 4096; i--)
+                if (!img || g_spu_hist[i & (SPU_HIST_N - 1)].image == img) hits[nh++] = i;
+            while (nh--) {
+                const spu_hist_ent* e = &g_spu_hist[hits[nh] & (SPU_HIST_N - 1)];
+                dbg_printf("  t=%u %c img=%u a=0x%08X b=0x%08X c=0x%08X htid=%u%c", e->t_ms, e->op,
+                           e->image, e->a, e->b, e->c, e->htid, 10);
             }
         } else if (!strcmp(verb, "spu")) {
             /* SPU program runs per lifted image id since start (dispatch HITs). */
