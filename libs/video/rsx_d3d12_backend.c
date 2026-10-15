@@ -457,6 +457,8 @@ static u32 s_dbg_last_draws = 0;
  * not: those draws are dropped, and a frame cut short presents without its
  * end (Demon's Souls copies its finished image to the display last). */
 static int draw_room(void);
+/* Finish the vertex fetch threads' queued work (defined with them). */
+static void vpj_sync(void);
 /* F10: dump the next RSX_HOTKEY_SHOTS (default 12) presents, every one, to
  * RSX_HOTKEY_DIR as shot_<burst>_<n>_d<draws>.bmp. For a flicker someone
  * playing can see but a replay cannot show (a replay has no flips, so it
@@ -6276,6 +6278,7 @@ static void frame_log(long long q0, long long q1)
 
 static void render_frame(void)
 {
+    vpj_sync();   /* the batch's vertices, before anything reads vp_vb */
     double _rf0 = perf_on() ? perf_now() : 0.0;
     { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); s_rf_entry_qpc = _q.QuadPart; }
     RSX_MARK("render_frame", s_dbg_last_draws, 0);
@@ -7471,6 +7474,7 @@ rtt_dump_done:;
         s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
     }
     s_dbg_last_draws = s_d3d.draw_count;
+    vpj_sync();           /* nothing may still write the half being reset */
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
@@ -8549,6 +8553,142 @@ static void read_vp_vertex_c(const rsx_state* state, u32 vi, VPSlot* out16)
     memcpy(out16, s_vc_v[h], VP_VERT_STRIDE);
 }
 
+/* VP_FETCH_THREADS=<n> (read once; default a quarter of the logical CPUs, at
+ * most 4; 0 = off): convert the vertices of indexed strip uploads on worker
+ * threads. The FIFO thread only walks the indices, numbers the draw's
+ * vertices and queues them (vpj_queue); the workers fetch and convert them
+ * straight into vp_vb. In a Demon's Souls level frame the conversion was
+ * about a third of the FIFO thread, and HighGraphics waits on that thread's
+ * labels before each flip.
+ *
+ * A queued vertex is read from guest memory later than the FIFO reached the
+ * draw, so everything the title can observe of the RSX's progress waits for
+ * the queue first (vpj_sync, g_rsx_sync_hook): labels, semaphores, reports,
+ * the reference, the 2D engine's writes, `get`, and the frame's render. */
+typedef struct {
+    rsx_fetch_plan plan;     /* copied: the FIFO moves on before it is used */
+    const u32* vis;          /* guest vertex indices, n of them */
+    u32 n;
+    VPSlot* out;             /* n vertices of VP_VERT_STRIDE */
+} VPJob;
+#define VPJ_JOBS 4096u
+#define VPJ_VIS  (1u << 20)
+static VPJob* s_vpj;
+static u32* s_vpj_vis;
+static u32 s_vpj_vis_n;
+static volatile LONG s_vpj_pub, s_vpj_next, s_vpj_done, s_vpj_sleepers;
+static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
+
+static void vpj_run(LONG j)
+{
+    const VPJob* J = &s_vpj[j];
+    float tmp[16][4];
+    memcpy(tmp, J->plan.konst, sizeof tmp);
+    for (u32 i = 0; i < J->n; i++) {
+        rsx_fetch_vertex_arrays(&J->plan, J->vis[i], tmp);
+        memcpy(&J->out[i * 16], tmp, sizeof tmp);
+    }
+}
+static LONG vpj_claim(void)
+{
+    for (;;) {
+        const LONG n = s_vpj_next;
+        if (n >= s_vpj_pub) return -1;
+        if (InterlockedCompareExchange(&s_vpj_next, n + 1, n) == n) return n;
+    }
+}
+static DWORD WINAPI vpj_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        LONG j = vpj_claim();
+        if (j >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); continue; }
+        for (int k = 0; k < 2000 && s_vpj_next >= s_vpj_pub; k++) YieldProcessor();
+        if (s_vpj_next < s_vpj_pub) continue;
+        AcquireSRWLockExclusive(&s_vpj_lk);
+        InterlockedIncrement(&s_vpj_sleepers);   /* before the check: see vpj_queue */
+        while (s_vpj_next >= s_vpj_pub)
+            SleepConditionVariableSRW(&s_vpj_cv, &s_vpj_lk, INFINITE, 0);
+        InterlockedDecrement(&s_vpj_sleepers);
+        ReleaseSRWLockExclusive(&s_vpj_lk);
+    }
+}
+/* Wait for every queued vertex, converting what no worker has taken yet. */
+static void vpj_sync(void)
+{
+    if (!s_vpj_pub) return;
+    LONG j;
+    while ((j = vpj_claim()) >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); }
+    while (s_vpj_done < s_vpj_pub) YieldProcessor();
+    InterlockedExchange(&s_vpj_pub, 0);   /* first: a stale claim then sees nothing */
+    InterlockedExchange(&s_vpj_next, 0);
+    InterlockedExchange(&s_vpj_done, 0);
+    s_vpj_vis_n = 0;
+}
+static void vpj_sync_hook(void) { vpj_sync(); }
+static int vpj_threads(void)
+{
+    static int n = -1;
+    if (n >= 0) return n;
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int def = (int)si.dwNumberOfProcessors / 4;
+    if (def > 4) def = 4;
+    if (def < 1) def = 1;
+    n = ps3_env_int("VP_FETCH_THREADS", def);
+    if (n > 16) n = 16;
+    if (n > 0) {
+        s_vpj = (VPJob*)malloc(sizeof(VPJob) * VPJ_JOBS);
+        s_vpj_vis = (u32*)malloc(sizeof(u32) * VPJ_VIS);
+        if (!s_vpj || !s_vpj_vis) { n = 0; return n; }
+        for (int i = 0; i < n; i++) {
+            HANDLE h = CreateThread(NULL, 0, vpj_worker, NULL, 0, NULL);
+            if (h) CloseHandle(h);
+        }
+        extern void (*g_rsx_sync_hook)(void);
+        g_rsx_sync_hook = vpj_sync_hook;
+        fprintf(stderr, "[VPJ] %d vertex fetch threads%c", n, 10);
+    }
+    return n;
+}
+/* Can this draw's vertices go to the workers? Every array type must be one
+ * rsx_fetch_vertex_arrays converts itself (its fallback reads the live
+ * state), and no debug knob may want to see the vertices as they upload. */
+static int vpj_usable(void)
+{
+    if (vpj_threads() <= 0 || s_lv_open) return 0;
+    static int dbg = -1;
+    PS3_KNOB(dbg, (getenv("RSX_DBG_VTX") || ps3_env_int("VTX_POS", 0)) ? 1 : 0);
+    if (dbg) return 0;
+    for (u32 k = 0; k < s_vp_plan.n_on; k++) {
+        const u32 t = s_vp_plan.on[k].type;
+        if (t < 1 || t > 7 || t == 6) return 0;
+    }
+    return 1;
+}
+/* Room for a draw of up to `nv` vertices, syncing to make it. */
+static int vpj_room(u32 nv)
+{
+    if (nv > VPJ_VIS) return 0;
+    if (s_vpj_pub >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
+    return 1;
+}
+static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
+{
+    VPJob* J = &s_vpj[s_vpj_pub];
+    memcpy(&J->plan, &s_vp_plan, sizeof J->plan);
+    J->vis = vis; J->n = n; J->out = out;
+    s_vpj_vis_n += n;
+    InterlockedIncrement(&s_vpj_pub);
+    /* A worker counts itself a sleeper before it checks for work, so either
+     * it sees this job or this sees it. */
+    if (s_vpj_sleepers) {
+        AcquireSRWLockExclusive(&s_vpj_lk);
+        WakeAllConditionVariable(&s_vpj_cv);
+        ReleaseSRWLockExclusive(&s_vpj_lk);
+    }
+}
+
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
  * vertex array that resolves to the wrong memory reads as garbage/denormals, and
  * that is indistinguishable from "the shader is wrong" without seeing the input. */
@@ -9226,6 +9366,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         const u32 icap = iroom - iroom % 3;
         u32 ni = 0, nmiss = 0;
         u32 tri[3];
+        const int par = vpj_usable() && vpj_room(count);
+        u32* vis = par ? s_vpj_vis + s_vpj_vis_n : NULL;
         for (u32 k = 0; k < count; k++) {
             const u32 ix = read_guest_index(state, first + k);
             if (restart && ix == ridx) { m = 0; continue; }
@@ -9237,7 +9379,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
                     const u32 vi = tri[t];
                     const u32 h = (vi ^ (vi >> 8)) & (VP_VC_N - 1);
                     if (s_vx_tag[h] != s_vc_gen || s_vx_key[h] != vi) {
-                        read_vp_vertex(state, vi, &out[o*16]);
+                        if (par) vis[o] = vi;
+                        else     read_vp_vertex(state, vi, &out[o*16]);
                         s_vx_key[h] = vi; s_vx_tag[h] = s_vc_gen; s_vx_out[h] = o++;
                         nmiss++;
                     }
@@ -9252,7 +9395,8 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         carry.next = first + count; carry.m = m; carry.p0 = p0; carry.p1 = p1;
         s_vp_want += nmiss;
         s_vp_iwant += need;
-        dbg_vtx_dump(state, out, first, o);
+        if (par && o) { vpj_queue(vis, o, out); s_vs_fetch += o; s_vs_attr += (u64)o * s_vp_plan.n_on; }
+        if (!par) dbg_vtx_dump(state, out, first, o);
         s_up_icount = ni; s_up_ifirst = s_d3d.vp_ib_offset;
         s_d3d.vp_ib_offset += ni;
         s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
