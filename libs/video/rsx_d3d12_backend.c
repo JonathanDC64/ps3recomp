@@ -3028,7 +3028,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
               PS3_KNOB(verify, ps3_env_int("TEX_VERIFY", 0));
               if (verify && cs == c->csum) {
                   u32 fs = tex_csum_full(vm_base + c->off, nb);
-                  if (c->fsum && fs != c->fsum) {
+                  if (!c->fsum) c->fsum = fs;   /* uploaded before TEX_VERIFY went on */
+                  if (fs != c->fsum) {
                       static int n = 0;
                       if (n++ < 40) fprintf(stderr, "[TEX] stale: 0x%X %ux%u fmt 0x%02X (%u bytes) "
                                             "changed, sparse checksum did not (frame %llu)%c",
