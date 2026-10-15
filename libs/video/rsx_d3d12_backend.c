@@ -583,8 +583,16 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             extern void cellGcm_replay_hotkey(void);
             cellGcm_replay_hotkey();
         }
-        if (wp == VK_F10 && !(lp & (1 << 30))) s_hotshot_arm = 1;   /* see s_hotshot_left */
         return 0;
+    case WM_SYSKEYDOWN:
+        /* F10 is the menu key: Windows sends it as WM_SYSKEYDOWN, never
+         * WM_KEYDOWN. Handled here, it also stops the window entering menu
+         * mode. */
+        if (wp == VK_F10) {
+            if (!(lp & (1 << 30))) s_hotshot_arm = 1;   /* see s_hotshot_left */
+            return 0;
+        }
+        break;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
