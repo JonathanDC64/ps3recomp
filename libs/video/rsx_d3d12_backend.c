@@ -196,11 +196,16 @@ typedef struct {
                               * visible sampler heap at 2048 samplers). When all
                               * are taken, the least recently used one the GPU
                               * has finished with is rewritten (vp_sampler_table). */
-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
+/* Each texture slot's own SRV, after the windows. It used to sit at heap
+ * index 1+slot, inside the windows from slot 31 on: once a session had
+ * cached that many textures, each new upload rewrote a descriptor of one of
+ * the frame's first 63 draws. */
+#define VP_TEX_SRV_BASE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
+#define SRV_HEAP_SIZE (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
- * memory). SRV lives at heap index 1+slot. */
+ * memory). SRV lives at heap index VP_TEX_SRV_BASE+slot. */
 typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
@@ -2797,8 +2802,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
  * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
- * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
- * command list is open, before the draw passes. */
+ * Returns the slot index (SRV at heap VP_TEX_SRV_BASE+slot) or -1. Must run
+ * while the command list is open, before the draw passes. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
  * The crossbar decode itself is RSX semantics and lives in
  * rsx_texture_layout.c; all that is left here is packing the four selectors
@@ -3544,7 +3549,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
-    /* SRV at heap slot 1+slot */
+    /* SRV at heap slot VP_TEX_SRV_BASE+slot */
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = dxfmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -3556,7 +3561,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     sv.Texture2D.MipLevels = 1;
     D3D12_CPU_DESCRIPTOR_HANDLE sh;
     s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-    sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
+    sh.ptr += (u64)(VP_TEX_SRV_BASE + slot) * s_d3d.srv_inc;
     if (cube) {
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         sv.TextureCube.MipLevels = 1;
@@ -5581,8 +5586,9 @@ rtt_dump_done:;
     }
 
     /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
-     * texture it had bound at submit time into a slot (SRV heap 1+slot; plasma
-     * animates so contents re-upload every frame) and pre-build its FP PSO.
+     * texture it had bound at submit time into a slot (SRV heap
+     * VP_TEX_SRV_BASE+slot; plasma animates so contents re-upload every
+     * frame) and pre-build its FP PSO.
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
     late_check();
