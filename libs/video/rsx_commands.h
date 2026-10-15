@@ -364,6 +364,9 @@ typedef struct rsx_state {
     u32 vertex_constants_lo;
     u32 vertex_constants_hi;
     int vertex_constants_dirty;
+    /* Bumped on every constant write: a backend that kept a copy of the bank
+     * can tell it is still current. */
+    u32 vertex_constants_gen;
 
     /* Captured RSX vertex program microcode (NV40 ISA), filled by
      * NV4097_SET_TRANSFORM_PROGRAM. Words are host-endian (as delivered by the
