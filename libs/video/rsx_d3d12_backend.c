@@ -5001,6 +5001,19 @@ static u32 rsx_swz_index(u32 x, u32 y, u32 lw, u32 lh)
     return o;
 }
 
+/* n words from a readback row to guest memory. kind 0: RGBA8 to A,R,G,B
+ * (a rotate), 1: FP16 (swap each half's bytes), 2: 32-bit lanes (bswap). */
+static void wb_conv_row(u8* d, const u8* s, u32 n, int kind)
+{
+    /* One loop per kind, so each vectorises. */
+    #define WB_LOOP(EXPR) for (u32 i = 0; i < n; i++) { \
+        u32 v; memcpy(&v, s + (u64)i * 4, 4); v = (EXPR); memcpy(d + (u64)i * 4, &v, 4); }
+    if (kind == 0)      WB_LOOP((v << 8) | (v >> 24))
+    else if (kind == 1) WB_LOOP(((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu))
+    else                WB_LOOP(_byteswap_ulong(v))
+    #undef WB_LOOP
+}
+
 /* Store the copies in guest memory (after the GPU finished the frame). */
 static u8* s_wc_shadow; static u32 s_wc_len;   /* RSX_WRITE_COLOR_LOG */
 static void rt_writeback_store(void)
@@ -5047,23 +5060,33 @@ static void rt_writeback_store(void)
           } }
         void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * r->h};
         if (FAILED(r->rb->lpVtbl->Map(r->rb, 0, &rr, &mp)) || !mp) continue;
-        for (u32 y = 0; y < r->h; y++) {
-            const u8* srow = (const u8*)mp + (u64)y * pitch;
-            for (u32 x = 0; x < r->w; x++) {
-                u64 at = swz ? (u64)rsx_swz_index(x, y, lw, lh) * bpp
-                             : (u64)y * gp + (u64)x * bpp;
-                u8* d = vm_base + dst + at;
-                const u8* s = srow + (u64)x * bpp;
-                if (r->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                    d[0] = s[3]; d[1] = s[0]; d[2] = s[1]; d[3] = s[2];  /* A,R,G,B */
-                } else if (r->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-                    for (int c = 0; c < 4; c++) { d[c*2] = s[c*2+1]; d[c*2+1] = s[c*2]; }
-                } else {                                                /* 32-bit lanes */
-                    for (u32 c = 0; c < bpp / 4; c++) {
-                        d[c*4+0] = s[c*4+3]; d[c*4+1] = s[c*4+2];
-                        d[c*4+2] = s[c*4+1]; d[c*4+3] = s[c*4+0];
-                    }
-                }
+        /* A word at a time: every format here is whole 32-bit words per
+         * texel, converted the same way. RGBA8 R,G,B,A -> A,R,G,B is a rotate,
+         * FP16 swaps the bytes of each half, 32-bit lanes swap all four.
+         * Byte by byte, this was 3.5-6 ms of each Demon's Souls frame (about
+         * 25 MB: a 1280x720 target several times per frame, and others). */
+        const int kind = r->dxgi == DXGI_FORMAT_R8G8B8A8_UNORM ? 0 :
+                         r->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
+        const u32 wpt = bpp / 4;                     /* words per texel */
+        if (!swz) {
+            for (u32 y = 0; y < r->h; y++)
+                wb_conv_row(vm_base + dst + (u64)y * gp, (const u8*)mp + (u64)y * pitch,
+                            r->w * wpt, kind);
+        } else {
+            /* rsx_swz_index(x, y) is the x bits' part OR the y bits' part. */
+            static u32* xpart; static u32 xpart_n;
+            if (xpart_n < r->w) {
+                u32* nx = (u32*)realloc(xpart, (size_t)r->w * sizeof *nx);
+                if (!nx) { D3D12_RANGE nw0 = {0, 0}; r->rb->lpVtbl->Unmap(r->rb, 0, &nw0); continue; }
+                xpart = nx; xpart_n = r->w;
+            }
+            for (u32 x = 0; x < r->w; x++) xpart[x] = rsx_swz_index(x, 0, lw, lh);
+            for (u32 y = 0; y < r->h; y++) {
+                const u32 ypart = rsx_swz_index(0, y, lw, lh);
+                const u8* srow = (const u8*)mp + (u64)y * pitch;
+                for (u32 x = 0; x < r->w; x++)
+                    wb_conv_row(vm_base + dst + (u64)(xpart[x] | ypart) * bpp,
+                                srow + (u64)x * bpp, wpt, kind);
             }
         }
         D3D12_RANGE nw = {0, 0};
