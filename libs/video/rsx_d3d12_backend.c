@@ -5229,6 +5229,104 @@ static void drawprint_batch(void)
     snprintf(path, sizeof path, "%s_%02d_d%u.txt", s_dp_prefix, s_dp_n++, s_d3d.draw_count);
     drawprint_write(path, "");
 }
+/* FP_WATCH (live, diagnostic): catch a flicker without timing a capture.
+ *   FP_WATCH=<hex>[,<hex>...]  log each change in how many draws a full batch
+ *                              makes with these fragment programs, and each
+ *                              of their draws that samples the depth surface
+ *                              it is bound to as writable (it reads nothing);
+ *   FP_WATCH=all               log any program a full batch drew, the next one
+ *                              did not, and the one after drew again.
+ * A full batch has at least FP_WATCH_MIN draws (default 100), which leaves out
+ * the skip batches that only copy the last frame to the display. At most
+ * FP_WATCH_MAX lines (default 400). Lines start [fpwatch]. */
+typedef struct { u32 fp, n; } FpCount;
+#define FPW_MAX 1024
+static int fpw_cmp(const void* a, const void* b)
+{
+    u32 x = *(const u32*)a, y = *(const u32*)b;
+    return x < y ? -1 : x > y;
+}
+static u32 s_fpw_list[16]; static int s_fpw_list_n, s_fpw_all, s_fpw_lines;
+static u32 s_fpw_unread[16]; static int s_fpw_unread_n;
+static void fpwatch_parse(void)
+{
+    static unsigned gen; if (gen == ps3_env_gen) return; gen = ps3_env_gen;
+    const char* e = getenv("FP_WATCH");
+    s_fpw_list_n = 0; s_fpw_all = e && !strcmp(e, "all");
+    if (e && !s_fpw_all)
+        for (const char* p = e; *p && s_fpw_list_n < 16; ) {
+            char* q; u32 v = (u32)strtoul(p, &q, 16);
+            if (q == p) break;
+            s_fpw_list[s_fpw_list_n++] = v;
+            p = *q == ',' ? q + 1 : q;
+        }
+}
+static int fpwatch_listed(u32 fp)
+{
+    for (int i = 0; i < s_fpw_list_n; i++) if (s_fpw_list[i] == fp) return 1;
+    return 0;
+}
+/* A watched draw sampling its own writable depth surface (bound as NULL). */
+static void fpwatch_unreadable(u32 fp)
+{
+    if (!s_fpw_list_n || !fpwatch_listed(fp)) return;
+    for (int i = 0; i < s_fpw_unread_n; i++) if (s_fpw_unread[i] == fp) return;
+    if (s_fpw_unread_n < 16) s_fpw_unread[s_fpw_unread_n++] = fp;
+}
+static u32 fpwatch_count(const FpCount* c, int n, u32 fp)
+{
+    for (int i = 0; i < n; i++) if (c[i].fp == fp) return c[i].n;
+    return 0;
+}
+static void fpwatch_batch(void)
+{
+    fpwatch_parse();
+    if (!s_fpw_all && !s_fpw_list_n) { s_fpw_unread_n = 0; return; }
+    static FpCount hist[3][FPW_MAX]; static int hn[3]; static u32 hframe[3];
+    static u32* fps;
+    const int maxl = ps3_env_int("FP_WATCH_MAX", 400);
+    const u32 full = (u32)ps3_env_int("FP_WATCH_MIN", 100);
+    if (!fps) fps = (u32*)malloc(MAX_DRAWS * sizeof *fps);
+    u32 n = 0;
+    for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS && fps; d++)
+        if (s_d3d.draws[d].is_vp && !s_d3d.draws[d].is_clear) fps[n++] = s_d3d.draws[d].fp_addr;
+    for (int i = 0; i < s_fpw_unread_n && s_fpw_lines < maxl; i++, s_fpw_lines++)
+        printf("[fpwatch] frame %u fp %X samples its own writable depth surface (reads 0)\n",
+               (unsigned)s_d3d.frame_count, s_fpw_unread[i]);
+    s_fpw_unread_n = 0;
+    if (n < full) return;
+    /* Shift the history and run-length the sorted program addresses. */
+    memmove(&hist[0], &hist[1], 2 * sizeof hist[0]);
+    hn[0] = hn[1]; hn[1] = hn[2]; hframe[0] = hframe[1]; hframe[1] = hframe[2];
+    qsort(fps, n, sizeof *fps, fpw_cmp);
+    int k = 0;
+    for (u32 i = 0; i < n && k < FPW_MAX; ) {
+        u32 j = i; while (j < n && fps[j] == fps[i]) j++;
+        hist[2][k].fp = fps[i]; hist[2][k].n = j - i; k++; i = j;
+    }
+    hn[2] = k; hframe[2] = (u32)s_d3d.frame_count;
+    if (s_fpw_list_n) {
+        for (int i = 0; i < s_fpw_list_n && s_fpw_lines < maxl; i++) {
+            u32 was = fpwatch_count(hist[1], hn[1], s_fpw_list[i]);
+            u32 now = fpwatch_count(hist[2], hn[2], s_fpw_list[i]);
+            if (was != now) {
+                s_fpw_lines++;
+                printf("[fpwatch] frame %u fp %X draws %u -> %u (batch %u draws)\n",
+                       hframe[2], s_fpw_list[i], was, now, n);
+            }
+        }
+        return;
+    }
+    for (int i = 0; i < hn[2] && s_fpw_lines < maxl; i++) {
+        u32 fp = hist[2][i].fp;
+        u32 a = fpwatch_count(hist[0], hn[0], fp);
+        if (a && !fpwatch_count(hist[1], hn[1], fp)) {
+            s_fpw_lines++;
+            printf("[fpwatch] frame %u fp %X missing: %u draws at frame %u, 0 at %u, %u at %u\n",
+                   hframe[2], fp, a, hframe[0], hframe[1], hist[2][i].n, hframe[2]);
+        }
+    }
+}
 static void drawprint_write(const char* path, const char* hdr)
 {
     FILE* f = fopen(path, "w");
@@ -6256,10 +6354,12 @@ rtt_dump_done:;
                     if (tz >= 0) {
                         if (tz == cur_z && cur_zro)   /* bound read-only: readable */
                             ;
-                        else if (tz == cur_z)   /* bound as this draw's depth: unreadable */
+                        else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
                             srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, NULL,
                                       DXGI_FORMAT_R8G8B8A8_UNORM,
                                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                            fpwatch_unreadable(dr->fp_addr);
+                        }
                         else
                             zeta_transition(tz, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                         continue;
@@ -6352,6 +6452,7 @@ rtt_dump_done:;
                             dr->cull, dr->blend, 10); } }
             }
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
+            fpwatch_batch();
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
                 s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
