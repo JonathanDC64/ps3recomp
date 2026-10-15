@@ -206,6 +206,7 @@ typedef struct {
     ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
+    u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
                          * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
@@ -2853,6 +2854,17 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
+/* FNV-1a over every word, for TEX_VERIFY. */
+static u32 tex_csum_full(const u8* base, u32 nbytes)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i + 3 < nbytes; i += 4) {
+        u32 w32; memcpy(&w32, base + i, sizeof w32);
+        h ^= w32; h *= 16777619u;
+    }
+    return h;
+}
+
 /* Does guest memory hold anything at [off, off+nbytes)? Sparse, about 1,000
  * reads spread over the whole range. A surface only the GPU rendered reads as
  * all zero here, because our backend never writes render targets back. */
@@ -3001,15 +3013,30 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         VPTexSlot* c = &s_d3d.vp_tex[i];
         {
             if (c->used) return i;                /* already bound this frame */
-            { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
-              if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
-                                 nocache = e ? atoi(e) : 0; }
+            { static int nocache = -1;            /* TEX_NOCACHE=1 (live): always re-upload */
+              PS3_KNOB(nocache, ps3_env_int("TEX_NOCACHE", 0));
               if (nocache) { slot = i; break; } }
             /* Held from an earlier frame: re-upload only if the guest bytes
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
+            /* TEX_VERIFY=1 (live): hash every byte of each cache hit as well,
+             * and re-upload one the sparse checksum called unchanged. Slow; it
+             * tells whether a held texture is ever stale. */
+            { static int verify = -1;
+              PS3_KNOB(verify, ps3_env_int("TEX_VERIFY", 0));
+              if (verify && cs == c->csum) {
+                  u32 fs = tex_csum_full(vm_base + c->off, nb);
+                  if (c->fsum && fs != c->fsum) {
+                      static int n = 0;
+                      if (n++ < 40) fprintf(stderr, "[TEX] stale: 0x%X %ux%u fmt 0x%02X (%u bytes) "
+                                            "changed, sparse checksum did not (frame %llu)%c",
+                                            c->off, w, h, fmt, nb,
+                                            (unsigned long long)s_d3d.frame_count, 10);
+                      slot = i; break;
+                  }
+              } }
             if (cs == c->csum) { c->used = 1; return i; }
             slot = i; break;                      /* stale: fall through and redo */
         }
@@ -3535,7 +3562,8 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1;
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
-      t->csum = TEX_CSUM(vm_base + off, nb); }
+      t->csum = TEX_CSUM(vm_base + off, nb);
+      t->fsum = ps3_env_int("TEX_VERIFY", 0) ? tex_csum_full(vm_base + off, nb) : 0; }
     #undef TEX_CSUM
     return slot;
 }
@@ -3554,8 +3582,113 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
 /* Snapshot the VP constant bank + viewport epilogue for one draw into its
  * vp_cb slot. Runs at record time so every draw keeps the constants that
  * were live when the guest issued it. */
+/* RSX_LATE_CHECK=1 (live): hash each draw's textures and fragment program
+ * when the draw is recorded, and again when the batch renders, and report
+ * what changed in between. Textures and program code are read from guest
+ * memory only at render time, which is later than the RSX would read them:
+ * if the title has reused that memory by then, the draw shows the new bytes.
+ * A replay has one consistent snapshot, so this kind of error shows live only. */
+static int off_rt_find(u32 off);
+static u32 (*s_late_tex)[RSX_FP_UNITS];
+static u32* s_late_fp;
+static int late_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_LATE_CHECK", 0));
+    return on;
+}
+/* One hash per texture per frame and pass (record, render): a frame binds
+ * the same few hundred textures thousands of times. */
+#define LATE_MEMO 8192
+static struct { u32 off, w, h, fmt; u64 gen; u32 sum; } s_late_memo[LATE_MEMO];
+static u64 s_late_gen = 1;
+static u32 late_tex_hash(const D3D12DrawRecord* dr, int u);
+static u32 late_tex_sum(const D3D12DrawRecord* dr, int u)
+{
+    if (!dr->tex[u].set || !dr->tex[u].off || !dr->tex[u].w || !dr->tex[u].h) return 0;
+    const u32 off = dr->tex[u].off, w = dr->tex[u].w, h = dr->tex[u].h, fmt = dr->tex[u].fmt;
+    u32 b = (off * 0x9E3779B1u ^ (w << 16 | h) ^ fmt * 0x85EBCA77u) & (LATE_MEMO - 1);
+    for (int n = 0; n < 16; n++, b = (b + 1) & (LATE_MEMO - 1)) {
+        if (s_late_memo[b].gen == s_late_gen) {
+            if (s_late_memo[b].off == off && s_late_memo[b].w == w &&
+                s_late_memo[b].h == h && s_late_memo[b].fmt == fmt) return s_late_memo[b].sum;
+            continue;
+        }
+        s_late_memo[b].off = off; s_late_memo[b].w = w; s_late_memo[b].h = h;
+        s_late_memo[b].fmt = fmt; s_late_memo[b].gen = s_late_gen;
+        return s_late_memo[b].sum = late_tex_hash(dr, u);
+    }
+    return late_tex_hash(dr, u);
+}
+static u32 late_tex_hash(const D3D12DrawRecord* dr, int u)
+{
+    extern uint8_t* vm_base;
+    rsx_tex_layout tl;
+    rsx_texture_layout(dr->tex[u].fmt, dr->tex[u].w, dr->tex[u].h, &tl);
+    u32 nb = tl.compressed ? tl.row_bytes * tl.rows
+                           : dr->tex[u].w * dr->tex[u].h * tl.bytes_per_texel;
+    return nb ? tex_csum(vm_base + dr->tex[u].off, nb) | 1u : 0;
+}
+static u32 late_fp_sum(const D3D12DrawRecord* dr)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int, u32);
+    if (!dr->fp_addr) return 0;
+    u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1, dr->fp_addr & ~0x3u);
+    if (foff == 0xFFFFFFFFu) return 0;
+    return rsx_fp_code_hash(vm_base + foff, RSX_FP_MAX_BYTES) | 1u;
+}
+static void late_note(u32 slot, const D3D12DrawRecord* dr)
+{
+    if (!late_on() || !dr || slot >= MAX_DRAWS) return;
+    if (!s_late_tex) {
+        s_late_tex = calloc(MAX_DRAWS, sizeof *s_late_tex);
+        s_late_fp  = calloc(MAX_DRAWS, sizeof *s_late_fp);
+        if (!s_late_tex || !s_late_fp) return;
+    }
+    for (int u = 0; u < RSX_FP_UNITS; u++) s_late_tex[slot][u] = late_tex_sum(dr, u);
+    s_late_fp[slot] = late_fp_sum(dr);
+}
+static void late_check(void)
+{
+    if (!late_on() || !s_late_tex) return;
+    s_late_gen++;   /* render-time hashes */
+    static int said = 0;
+    u32 ntex = 0, nfp = 0;
+    for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        if (!dr->is_vp || dr->is_clear || dr->cb_slot >= MAX_DRAWS) continue;
+        const u32 k = dr->cb_slot;
+        for (int u = 0; u < RSX_FP_UNITS; u++) {
+            if (!s_late_tex[k][u] || off_rt_find(dr->tex[u].raw) >= 0) continue;
+            if (late_tex_sum(dr, u) == s_late_tex[k][u]) continue;
+            ntex++;
+            if (said < 60) { said++;
+                fprintf(stderr, "[LATE] frame %llu draw %u fp 0x%X t%d 0x%X %ux%u fmt 0x%02X "
+                        "changed after the draw%c", (unsigned long long)s_d3d.frame_count, d,
+                        dr->fp_addr, u, dr->tex[u].raw, dr->tex[u].w, dr->tex[u].h,
+                        dr->tex[u].fmt, 10); }
+        }
+        if (s_late_fp[k] && late_fp_sum(dr) != s_late_fp[k]) {
+            nfp++;
+            if (said < 60) { said++;
+                fprintf(stderr, "[LATE] frame %llu draw %u fp 0x%X: program code changed "
+                        "after the draw%c", (unsigned long long)s_d3d.frame_count, d,
+                        dr->fp_addr, 10); }
+        }
+    }
+    if (ntex || nfp) {
+        static int n = 0;
+        if (n++ < 200) fprintf(stderr, "[LATE] frame %llu: %u texture binds, %u programs "
+                               "changed between draw and render%c",
+                               (unsigned long long)s_d3d.frame_count, ntex, nfp, 10);
+    }
+    s_late_gen++;   /* the next batch's record-time hashes */
+}
+
 static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
+    late_note(slot, dr);
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
     /* FP texcoord scale (b1): 1/size for UNnormalized textures (fmt bit
@@ -5287,6 +5420,7 @@ rtt_dump_done:;
      * animates so contents re-upload every frame) and pre-build its FP PSO.
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
+    late_check();
     double _pre0 = perf_on() ? perf_now() : 0.0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
