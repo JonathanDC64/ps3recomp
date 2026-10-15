@@ -456,6 +456,21 @@ uint32_t g_ydkj_real_taskset_ea = 0;
 uint32_t g_ydkj_real_taskid = 0;
 void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
 void ydkj_wake_all_event_flags(void)                   { }
+
+/* The fork's SPURS completion hooks (libs/spurs/cellSpurs.c, spurs_task.c),
+ * the lv2 event-queue receive (sys_event.c) and the guard-page re-arm
+ * (ppu_loader.cpp). With no exit-code address set and no bound queue (an SPU
+ * receive gets CELL_EINVAL), none of them is on the path this test drives. */
+uint32_t g_spurs_exitcode_ea = 0;
+int  spu_spurs_task_write_exit_code(spu_context* c, uint32_t ea) { (void)c; (void)ea; return 0; }
+void spurs_notify_task_completion(void)                { }
+void spurs_ef_notify_taskset_round(uint32_t ea)        { (void)ea; }
+int  sys_event_queue_receive_host(uint32_t q, sys_event_t* ev, unsigned ms)
+{
+    (void)q; (void)ev; (void)ms; return -1;
+}
+void ppu_guard_page_rearm(uint32_t ea, int noaccess)   { (void)ea; (void)noaccess; }
+uint32_t spu_thread_bound_queue(uint32_t tid, uint32_t n) { (void)tid; (void)n; return 0; }
 void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
 {
     (void)c; (void)a; (void)b; (void)d;
