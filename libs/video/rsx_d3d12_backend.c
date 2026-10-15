@@ -8135,7 +8135,6 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    s_vp_want += (u64)(count > 2 ? count - 2 : 0) * 3;
     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
         + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     /* Expand to a triangle list, one index at a time:
@@ -8159,11 +8158,12 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     if (carry.valid && carry.fan == fan && carry.epoch == state->begin_epoch && carry.next == first) {
         m = carry.m; p0 = carry.p0; p1 = carry.p1;
     }
-    u32 o = 0;
+    u32 o = 0, need = 0;   /* need: vertices the strip expands to, room or not */
     const u32 cap = maxv - maxv % 3;
     for (u32 k = 0; k < count; k++) {
         const u32 ix = read_guest_index(state, first + k);
         if (restart && ix == ridx) { m = 0; continue; }
+        if (m >= 2) need += 3;
         if (m >= 2 && o + 3 <= cap) {
             u32 v0 = p0, v1 = p1;
             if (!fan && ((m - 2) & 1)) { v0 = p1; v1 = p0; }
@@ -8177,6 +8177,10 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     }
     carry.valid = 1; carry.fan = fan; carry.epoch = state->begin_epoch;
     carry.next = first + count; carry.m = m; carry.p0 = p0; carry.p1 = p1;
+    /* What the buffer grows to: (count-2)*3 counted the strip as unbroken,
+     * twice the vertices a Demon's Souls frame emits once restarts split its
+     * level strips, and grew the buffer to the 2M-vertex cap for nothing. */
+    s_vp_want += need;
     { static int said = 0;
       if (restart && !said) { said = 1;
           fprintf(stderr, "[D3D12] primitive restart in use (index 0x%X)%c", ridx, 10); } }
