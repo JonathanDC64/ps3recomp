@@ -345,12 +345,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
                       /* console `waits`: the name is still in the slot here */
-                      if (t0) ppu_waits_add(t, 1, nid, obj,
-                                            t < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[t] : nullptr,
-                                            ppu_waits_now() - t0);
+                      if (t0) { const uint64_t t1 = ppu_waits_now();
+                                const char* nm = t < PS3_HLE_INFLIGHT_MAX ? g_hle_inflight[t] : nullptr;
+                                if (g_waits_armed) ppu_waits_add(t, 1, nid, obj, nm, t1 - t0);
+                                if (g_trace_armed) ppu_trace_add(t, 1, nid, obj, nm, t0, t1); }
                       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
     } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], nid, (uint32_t)ctx->gpr[3],
-           g_waits_armed ? ppu_waits_now() : 0 };
+           (g_waits_armed | g_trace_armed) ? ppu_waits_now() : 0 };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */

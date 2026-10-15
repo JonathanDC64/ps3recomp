@@ -82,6 +82,13 @@ static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 static volatile u32 s_flip_request_count = 0;
 /* FIFO flip words decoded so far (GCM_RATES compares it with presents). */
 volatile u32 g_gcm_flip_words = 0;
+/* QueryPerformanceCounter value when the last flip word was decoded
+ * (FRAME_LOG: how long a frame waits between the game's flip and our
+ * present). Windows only; 0 elsewhere. */
+volatile long long g_gcm_flip_word_qpc = 0;
+void (*volatile g_rsx_trace_mark)(const char* name, u32 a, u32 b) = 0;
+#define RSX_MARK(n, a, b) do { void (*_m)(const char*, u32, u32) = g_rsx_trace_mark; \
+                               if (_m) _m((n), (a), (b)); } while (0)
 
 u32 cellGcm_flip_request_count(void)
 {
@@ -1600,8 +1607,10 @@ void cellGcm_ref_on_poll(void)
         dry = (s_ref_qhead == s_ref_qtail);
     }
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
-    if (dry && s_gcm_kick_ev)
+    if (dry && s_gcm_kick_ev) {
         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+        RSX_MARK("kick", 0, 0);
+    }
 }
 
 void cellGcm_rsx_process_fifo(void)
@@ -1796,6 +1805,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
             { static unsigned long long flips = 0; static int dbg = -1;
               PS3_KNOB(dbg, getenv("GCM_FLIPCOUNT") ? 1 : 0);
               ++flips; g_gcm_flip_words++;
+#ifdef _WIN32
+              { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_gcm_flip_word_qpc = q.QuadPart; }
+              RSX_MARK("flipword", g_gcm_flip_words, 0);
+#endif
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
@@ -1908,8 +1921,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
-                    else if (m == 0x6Cu) vm_write32(la, v);
+                    else if (m == 0x6Cu) { vm_write32(la, v); RSX_MARK("sem_release", s_sema_offset, v); }
                     else if (m == 0x68u && vm_read32(la) != v) {
+            RSX_MARK("sem_acquire_miss", s_sema_offset, v);
             /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
              * the hardware does. Off by default: a title whose label nothing
              * ever writes would wedge the drain permanently, and RELEASE on
