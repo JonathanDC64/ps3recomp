@@ -8,6 +8,7 @@
 #include "spu_workload.h"
 #include "ps3emu/ps3_knob.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+#include "../../libs/spurs/spurs_taskset.h"   /* taskset bitset layout + atomic set/clear */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
 #include <stdlib.h>
@@ -550,7 +551,7 @@ static void ts_start_task_locked(uint32_t taskset_ea, uint8_t* ts, uint8_t* run,
     if (!elf) return;
     size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
     if (!sz) return;
-    ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
+    spurs_bitset_clear(taskset_ea + CSTS_PENDING_READY, t);   /* pending -> started */
     run[t / 8] |= m;
     if (ps3_log_verbose()) fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X (%s)\n",
                                    t, taskset_ea, elf, why);
@@ -571,9 +572,11 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     uint8_t* run = ts_running(taskset_ea);
     if (done_task < 128) {
         uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
-        ts[0x10 + done_task / 8] &= (uint8_t)~m;
-        ts[0x20 + done_task / 8] &= (uint8_t)~m;
-        ts[0x30 + done_task / 8] &= (uint8_t)~m;
+        /* Atomic against the SPU (spurs_bitset_clear): the same byte holds
+         * tasks 0-7, and an SPU may be enabling one of them right now. */
+        spurs_bitset_clear(taskset_ea + CSTS_READY, done_task);
+        spurs_bitset_clear(taskset_ea + CSTS_PENDING_READY, done_task);
+        spurs_bitset_clear(taskset_ea + CSTS_ENABLED, done_task);
         if (run) run[done_task / 8] &= (uint8_t)~m;
     }
     for (uint32_t t = 0; t < 128 && run; t++) {
@@ -1221,7 +1224,6 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  *     the guest bit is set under the same lock the waiter checks it).
  * The bitset is guest state (SPU-visible); the host lock/condvar exist only
  * to block and wake the task's host thread. */
-#include "../../libs/spurs/spurs_taskset.h"
 
 #ifdef _WIN32
 static SRWLOCK            s_sig_lock = SRWLOCK_INIT;

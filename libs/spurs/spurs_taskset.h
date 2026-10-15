@@ -75,18 +75,23 @@ static inline uint32_t spurs_taskset_taskinfo_ea(uint32_t taskset_ea, uint32_t t
 { return taskset_ea + CSTS_TASKINFO + taskId * TI_SIZE; }
 
 /* set/clear/test a task bit in a 128-bit bitset (bit 0 = MSB of word 0, per RPCS3
- * atomic_tasks_bitset::get_bit). bitset_ea = taskset_ea + CSTS_READY etc. */
+ * atomic_tasks_bitset::get_bit). bitset_ea = taskset_ea + CSTS_READY etc.
+ *
+ * set/clear are atomic against the SPU: its taskset code updates these same
+ * lines with GETLLAR/PUTLLC, and a plain read-then-write here could erase a
+ * bit it committed in between (spu_coh_rmw32). */
+uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr);   /* spu_coherency.c */
 static inline void spurs_bitset_set(uint32_t bitset_ea, uint32_t taskId)
 {
     uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
     uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) | mask);
+    spu_coh_rmw32(word_ea, mask, 0);
 }
 static inline void spurs_bitset_clear(uint32_t bitset_ea, uint32_t taskId)
 {
     uint32_t word_ea = bitset_ea + (taskId / 32) * 4;
     uint32_t mask = (1u << 31) >> (taskId % 32);
-    vm_write32(word_ea, vm_read32(word_ea) & ~mask);
+    spu_coh_rmw32(word_ea, 0, mask);
 }
 static inline int spurs_bitset_test(uint32_t bitset_ea, uint32_t taskId)
 {

@@ -23,6 +23,9 @@
  * SPU goes back to sleep holding a reservation it has already lost. Both sides
  * are atomic, and the test races them to show no raise is lost.
  *
+ * Then the runtime as a writer: spu_coh_rmw32, which updates the SPURS task
+ * bitsets an SPU also commits to, raced against PUTLLCs on the same word.
+ *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
  *
@@ -412,6 +415,75 @@ static void test_ack_keeps_a_concurrent_raise(void)
 }
 
 /* ===========================================================================
+ * A host read-modify-write against an SPU's PUTLLC (spu_coh_rmw32)
+ *
+ * SPURS keeps its task bitsets in one line: the runtime clears an exited
+ * task's bits while SPU code sets another task's bits with GETLLAR/PUTLLC, and
+ * tasks 0-7 share a byte. As a plain read then write, a commit landing in
+ * between was erased -- Demon's Souls' Havok step then waited forever for a
+ * task whose enabled bit was gone. Here an SPU toggles bit 1 with PUTLLC while
+ * the host sets and clears bit 0; at the end bit 1 must match the number of
+ * toggles that committed, and bit 0 the host's last write.
+ * ===========================================================================*/
+#define RMW_ROUNDS 200000
+#define RMW_SPU_BIT  0x40000000u   /* task 1 */
+#define RMW_HOST_BIT 0x80000000u   /* task 0 */
+
+static volatile int g_rmw_stop;
+static volatile long g_rmw_toggles;
+
+static uint32_t be32_at(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void* rmw_spu_thread(void* arg)
+{
+    (void)arg;
+    while (!g_rmw_stop) {
+        spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
+        uint8_t* w = &g_b.ls[LSA_B];
+        const uint32_t v = be32_at(w) ^ RMW_SPU_BIT;
+        w[0] = (uint8_t)(v >> 24); w[1] = (uint8_t)(v >> 16);
+        w[2] = (uint8_t)(v >> 8);  w[3] = (uint8_t)v;
+        spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
+        if (g_b.atomic_stat == 0) g_rmw_toggles++;
+    }
+    return NULL;
+}
+
+static void test_host_rmw_keeps_an_spu_commit(void)
+{
+    reset_pair();
+    g_rmw_stop = 0;
+    g_rmw_toggles = 0;
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, rmw_spu_thread, NULL) != 0) {
+        TEST("the PUTLLC thread starts");
+        CHECK(0);
+        return;
+    }
+    while (!g_rmw_toggles) YieldProcessor();
+    for (int i = 0; i < RMW_ROUNDS; i++)
+        spu_coh_rmw32(LINE_A, (i & 1) ? 0 : RMW_HOST_BIT, (i & 1) ? RMW_HOST_BIT : 0);
+    spu_coh_rmw32(LINE_A, RMW_HOST_BIT, 0);
+    g_rmw_stop = 1;
+    pthread_join(t, NULL);
+
+    const uint32_t w = be32_at(g_guest_mem + LINE_A);
+    TEST("PUTLLCs committed while the host was writing");
+    CHECK(g_rmw_toggles > 0);
+    TEST("no SPU commit was erased by a host read-modify-write");
+    CHECK_EQ_U32(w & RMW_SPU_BIT, (g_rmw_toggles & 1) ? RMW_SPU_BIT : 0);
+    TEST("no host write was erased by an SPU commit");
+    CHECK_EQ_U32(w & RMW_HOST_BIT, RMW_HOST_BIT);
+    TEST("the read-modify-write returns the old value");
+    CHECK_EQ_U32(spu_coh_rmw32(LINE_A, 0, RMW_HOST_BIT) & RMW_HOST_BIT, RMW_HOST_BIT);
+    CHECK_EQ_U32(be32_at(g_guest_mem + LINE_A) & RMW_HOST_BIT, 0);
+}
+
+/* ===========================================================================
  * main
  * ===========================================================================*/
 int main(void)
@@ -423,6 +495,7 @@ int main(void)
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_host_rmw_keeps_an_spu_commit();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

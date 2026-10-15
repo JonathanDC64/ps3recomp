@@ -226,6 +226,32 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* A read-modify-write the runtime makes on guest memory an SPU updates
+ * atomically -- the SPURS taskset bitsets, where tasks 0-7 share one byte of
+ * each. Done as vm_read then vm_write, an SPU PUTLLC can commit between the
+ * two and be overwritten: Demon's Souls' Havok task enables the next task
+ * (task 4) on that line while our runtime clears the bits of a task that just
+ * exited, and the cleared-back enabled bit means task 4 never starts, its
+ * semaphore post never comes, and the physics step waits forever.
+ *
+ * Under the lock-line lock the RMW is one transaction against every PUTLLC,
+ * and the notify fails any reservation taken before it, as a store from
+ * another processor does on hardware. */
+uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr)
+{
+    extern uint8_t* vm_base;
+    uint32_t* p = (uint32_t*)(vm_base + (ea & ~3u));
+    spu_lockline_lock();
+    uint32_t raw = __atomic_load_n(p, __ATOMIC_SEQ_CST), nraw;
+    do {
+        nraw = __builtin_bswap32((__builtin_bswap32(raw) | set) & ~clr);
+    } while (nraw != raw &&
+             !__atomic_compare_exchange_n(p, &raw, nraw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    if (nraw != raw) spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+    return __builtin_bswap32(raw);
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
