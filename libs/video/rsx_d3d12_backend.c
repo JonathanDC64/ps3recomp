@@ -221,11 +221,13 @@ static HRESULT d3d_create_committed(ID3D12Device* dev, const D3D12_HEAP_PROPERTI
  * memory). SRV lives at heap index VP_TEX_SRV_BASE+slot. */
 typedef struct {
     ID3D12Resource* res;
-    ID3D12Resource* up;
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
-    u32 up_bytes;       /* size of up, which holds the decoded bytes last uploaded */
+    u32 face_bytes;     /* guest bytes from one cube face to the next */
+    ID3D12Heap* blk_heap; /* res is placed here (tex_pool), at blk_off; NULL = committed */
+    u64 blk_off;
+    int blk_class;
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
                          * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
@@ -3247,6 +3249,200 @@ static int vp_tex_free_slot(void)
     return -1;
 }
 
+/* Texture staging: one upload buffer, persistently mapped, that every
+ * texture upload of a frame decodes into, from the start again each frame
+ * (render_frame waits for the GPU before the pre-pass uploads anything).
+ *
+ * Each texture slot used to own an upload buffer of its own. Creating it
+ * was half of a texture's first upload: a camera turn in Demon's Souls'
+ * Tutorial that brought 67 new textures into view spent 30 ms creating
+ * resources and 6 ms decoding, and the frame missed the game's 36.3 ms
+ * limit. The buffers also stayed allocated for as long as their slots.
+ *
+ * A frame that needs more than the buffer holds puts the rest into one-off
+ * buffers (released the next frame), and the next frame starts with the
+ * buffer grown to what that frame used, up to TEX_STAGE_MAX_MB (default
+ * 512). TEX_STAGE_MB sets the starting size (default 32). */
+static void off_rt_defer_release(ID3D12Resource* res);
+static ID3D12Resource* s_ts_buf;
+static u8*             s_ts_map;
+static u64             s_ts_cap, s_ts_off;
+static ID3D12Resource* tex_stage_create(u64 bytes, u8** map)
+{
+    D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes;
+    bd.Height = 1; bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource* r = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
+    if (FAILED(d3d_create_committed(s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                    &IID_ID3D12Resource, (void**)&r)))
+        return NULL;
+    if (FAILED(r->lpVtbl->Map(r, 0, &nr, &mp)) || !mp) { r->lpVtbl->Release(r); return NULL; }
+    *map = (u8*)mp;
+    return r;
+}
+/* Space for `bytes` of decoded texture, 512-byte aligned (a placed
+ * footprint's offset must be). NULL if no buffer could be had. */
+static u8* tex_stage_alloc(u64 bytes, ID3D12Resource** res, u64* at)
+{
+    const u64 a = (s_ts_off + 511u) & ~511ull;
+    s_ts_off = a + bytes;               /* counted either way: next frame's size */
+    if (s_ts_map && a + bytes <= s_ts_cap) { *res = s_ts_buf; *at = a; return s_ts_map + a; }
+    u8* mp = NULL;
+    ID3D12Resource* r = tex_stage_create(bytes, &mp);
+    if (!r) return NULL;
+    off_rt_defer_release(r);            /* read by this frame's copy; gone next frame */
+    *res = r; *at = 0;
+    return mp;
+}
+/* Start of a frame's uploads; the GPU is idle. */
+static void tex_stage_frame(void)
+{
+    const u64 used = s_ts_off;
+    s_ts_off = 0;
+    static u64 limit = 0;
+    if (!limit) limit = (u64)ps3_env_int("TEX_STAGE_MAX_MB", 512) << 20;
+    u64 cap = s_ts_cap ? s_ts_cap : (u64)ps3_env_int("TEX_STAGE_MB", 32) << 20;
+    while (cap < used + used / 4 && cap < limit) cap *= 2;
+    if (cap > limit) cap = limit;
+    if (s_ts_buf && cap <= s_ts_cap) return;
+    u8* mp = NULL;
+    ID3D12Resource* r = tex_stage_create(cap, &mp);
+    if (!r) {
+        static int warned = 0;
+        if (!warned++) fprintf(stderr, "[TEXSTAGE] no %llu MB staging buffer; staying at %llu MB%c",
+                               (unsigned long long)(cap >> 20), (unsigned long long)(s_ts_cap >> 20), 10);
+        limit = s_ts_cap ? s_ts_cap : 1;
+        return;
+    }
+    if (s_ts_buf) {
+        fprintf(stderr, "[TEXSTAGE] a frame staged %llu MB of textures: buffer grown to %llu MB%c",
+                (unsigned long long)(used >> 20), (unsigned long long)(cap >> 20), 10);
+        off_rt_defer_release(s_ts_buf);
+    }
+    s_ts_buf = r; s_ts_map = mp; s_ts_cap = cap;
+}
+
+/* Texture memory: placed resources in 64 MB heaps, in power-of-two blocks
+ * from 64 KB to 64 MB with a free list per size, so a slot's texture
+ * memory is reused when the slot takes another texture. A committed
+ * resource per texture cost ~0.24 ms to create; 67 new textures on one
+ * Tutorial camera turn were 16 ms of a 38 ms frame. A texture over 64 MB
+ * (or TEX_PLACED=0) is still committed. Heaps are never released. */
+#define TEX_POOL_CHUNK   (64ull << 20)
+#define TEX_POOL_MIN     (64ull << 10)
+#define TEX_POOL_CLASSES 11                  /* 64 KB << 0..10 = 64 MB */
+typedef struct { ID3D12Heap* heap; u64 off; } TexBlock;
+static TexBlock*   s_tp_free[TEX_POOL_CLASSES];
+static int         s_tp_free_n[TEX_POOL_CLASSES], s_tp_free_cap[TEX_POOL_CLASSES];
+static ID3D12Heap* s_tp_chunk;
+static u64         s_tp_chunk_off;
+static void tex_pool_put(int k, ID3D12Heap* heap, u64 off)
+{
+    if (s_tp_free_n[k] == s_tp_free_cap[k]) {
+        const int nc = s_tp_free_cap[k] ? s_tp_free_cap[k] * 2 : 64;
+        TexBlock* nb = (TexBlock*)realloc(s_tp_free[k], (size_t)nc * sizeof *nb);
+        if (!nb) return;                     /* the block is lost, not reused */
+        s_tp_free[k] = nb; s_tp_free_cap[k] = nc;
+    }
+    s_tp_free[k][s_tp_free_n[k]].heap = heap;
+    s_tp_free[k][s_tp_free_n[k]++].off = off;
+}
+/* A block of class k: a freed one, or carved from the current heap. *reused
+ * says the memory held another texture before. */
+static int tex_pool_get(int k, ID3D12Heap** heap, u64* off, int* reused)
+{
+    if (s_tp_free_n[k]) {
+        const TexBlock b = s_tp_free[k][--s_tp_free_n[k]];
+        *heap = b.heap; *off = b.off; *reused = 1;
+        return 1;
+    }
+    const u64 sz = TEX_POOL_MIN << k;
+    if (!s_tp_chunk || s_tp_chunk_off + sz > TEX_POOL_CHUNK) {
+        D3D12_HEAP_DESC hd = {0};
+        hd.SizeInBytes = TEX_POOL_CHUNK;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;   /* any heap tier */
+        ID3D12Heap* nh = NULL;
+        if (FAILED(s_d3d.device->lpVtbl->CreateHeap(s_d3d.device, &hd, &IID_ID3D12Heap,
+                                                    (void**)&nh)))
+            return 0;
+        /* The old heap's tail goes to the free lists. Blocks are carved in
+         * any order, so align each piece to its own size. */
+        if (s_tp_chunk) {
+            u64 o = s_tp_chunk_off;
+            while (o + TEX_POOL_MIN <= TEX_POOL_CHUNK) {
+                int c = 0;
+                while (c + 1 < TEX_POOL_CLASSES && !(o & ((TEX_POOL_MIN << (c + 1)) - 1)) &&
+                       o + (TEX_POOL_MIN << (c + 1)) <= TEX_POOL_CHUNK) c++;
+                tex_pool_put(c, s_tp_chunk, o);
+                o += TEX_POOL_MIN << c;
+            }
+        }
+        s_tp_chunk = nh; s_tp_chunk_off = 0;
+    }
+    /* Align to the block's own size (a 64 KB block may have left the
+     * offset off a larger block's boundary); the gap goes to the lists. */
+    while (s_tp_chunk_off & (sz - 1)) {
+        int c = 0;
+        while (TEX_POOL_MIN << (c + 1) <= sz &&
+               !(s_tp_chunk_off & ((TEX_POOL_MIN << (c + 1)) - 1))) c++;
+        tex_pool_put(c, s_tp_chunk, s_tp_chunk_off);
+        s_tp_chunk_off += TEX_POOL_MIN << c;
+    }
+    if (s_tp_chunk_off + sz > TEX_POOL_CHUNK) return tex_pool_get(k, heap, off, reused);
+    *heap = s_tp_chunk; *off = s_tp_chunk_off; *reused = 0;
+    s_tp_chunk_off += sz;
+    return 1;
+}
+/* The slot's texture resource, in COPY_DEST. */
+static HRESULT tex_res_create(VPTexSlot* t, const D3D12_RESOURCE_DESC* td)
+{
+    static int placed = -1;
+    PS3_KNOB(placed, ps3_env_int("TEX_PLACED", 1));
+    t->blk_heap = NULL; t->blk_class = -1;
+    if (placed) {
+        D3D12_RESOURCE_ALLOCATION_INFO ai;
+        s_d3d.device->lpVtbl->GetResourceAllocationInfo(s_d3d.device, &ai, 0, 1, td);
+        int k = 0;
+        while (k < TEX_POOL_CLASSES && (TEX_POOL_MIN << k) < ai.SizeInBytes) k++;
+        ID3D12Heap* heap; u64 off; int reused;
+        if (ai.SizeInBytes != UINT64_MAX && ai.Alignment <= TEX_POOL_MIN &&
+            k < TEX_POOL_CLASSES && tex_pool_get(k, &heap, &off, &reused)) {
+            s_res_gen++;
+            if (SUCCEEDED(s_d3d.device->lpVtbl->CreatePlacedResource(
+                    s_d3d.device, heap, off, td, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                    &IID_ID3D12Resource, (void**)&t->res))) {
+                t->blk_heap = heap; t->blk_off = off; t->blk_class = k;
+                if (reused) {   /* the memory held another texture */
+                    D3D12_RESOURCE_BARRIER b = {0};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
+                    b.Aliasing.pResourceAfter = t->res;
+                    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+                }
+                return S_OK;
+            }
+            tex_pool_put(k, heap, off);
+        }
+    }
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    return d3d_create_committed(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, td,
+                                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                &IID_ID3D12Resource, (void**)&t->res);
+}
+/* Release the slot's texture; a placed one's block goes back to its list.
+ * The GPU is idle (render_frame waits before the pre-pass), and a slot
+ * that is replaced was not used this frame. */
+static void tex_res_release(VPTexSlot* t)
+{
+    if (!t->res) return;
+    t->res->lpVtbl->Release(t->res); t->res = NULL;
+    if (t->blk_heap) tex_pool_put(t->blk_class, t->blk_heap, t->blk_off);
+    t->blk_heap = NULL; t->blk_class = -1;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
@@ -3443,12 +3639,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)) {
-        t->res->lpVtbl->Release(t->res); t->res = NULL;
-        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
-    }
+    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
+        tex_res_release(t);
     if (!t->res) {
-        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESOURCE_DESC td = {0};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         td.Width = w; td.Height = h;
@@ -3456,29 +3649,19 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         td.MipLevels = 1;
         td.Format = dxfmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        if (FAILED(d3d_create_committed(
-                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
-                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                &IID_ID3D12Resource, (void**)&t->res)))
+        if (FAILED(tex_res_create(t, &td)))
             return -1;
-        D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bd = {0};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
-        bd.Height = 1; bd.DepthOrArraySize = 1;
-        bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(d3d_create_committed(
-                s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
-                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&t->up))) {
-            t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
-        }
-        t->up_bytes = (u32)bd.Width;
         fresh = 1;
     }
 
-    void* mapped = NULL; D3D12_RANGE nr = {0,0};
-    if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
+    ID3D12Resource* up = NULL; u64 up_at = 0;
+    void* mapped = tex_stage_alloc((u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1), &up, &up_at);
+    if (!mapped) {
+        /* A fresh resource has never been through the copy below, so it
+         * would be left in COPY_DEST: drop it and try again next frame. */
+        if (fresh) tex_res_release(t);
+        return -1;
+    }
     { static int _tp=0; if (getenv("RTT_DUMP") && _tp++ < 6) {
         const u8* sp = vm_base + off;
         fprintf(stderr, "[TEXUP] off=0x%X fmt=0x%X row0:", off, fmt);
@@ -3789,7 +3972,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
       } }
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
-    t->up->lpVtbl->Unmap(t->up, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
         D3D12_RESOURCE_BARRIER b = {0};
@@ -3802,7 +3984,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = t->up;  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.pResource = up;     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Footprint.Format   = dxfmt;
     src.PlacedFootprint.Footprint.Width    = w;
     src.PlacedFootprint.Footprint.Height   = h;
@@ -3810,7 +3992,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     src.PlacedFootprint.Footprint.RowPitch = pitch;
     for (u32 _f = 0; _f < _nfaces; _f++) {
         dst.SubresourceIndex        = _f;      /* cube face = array slice */
-        src.PlacedFootprint.Offset  = (u64)_f * pitch * _face_rows;
+        src.PlacedFootprint.Offset  = up_at + (u64)_f * pitch * _face_rows;
         s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
     }
     {
@@ -3846,7 +4028,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     if (t->key != key_off || t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)
         s_vp_tex_index_dirty = 1;
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
-    t->cube = cube; t->used = 1;
+    t->cube = cube; t->used = 1; t->face_bytes = _face_bytes;
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
       t->csum = TEX_CSUM(vm_base + off, nb);
       t->fsum = ps3_env_int("TEX_VERIFY", 0) ? tex_csum_full(vm_base + off, nb) : 0; }
@@ -5642,6 +5824,27 @@ static void fpwatch_batch(void)
         }
     }
 }
+/* A texture slot's guest image decoded into a scratch buffer, hashed. */
+static u32 vp_tex_decoded_hash(const VPTexSlot* t)
+{
+    extern uint8_t* vm_base;
+    if (!t->res || !vm_base) return 0;
+    rsx_tex_layout tl;
+    rsx_texture_layout(t->fmt, t->w, t->h, &tl);
+    const u32 pitch = (tl.dst_row_bytes + 255) & ~255u;
+    const u32 rows  = tl.compressed ? tl.rows : t->h;
+    const u32 nf    = t->cube ? 6u : 1u;
+    const size_t n  = (size_t)pitch * rows * nf;
+    u8* buf = (u8*)calloc(1, n);        /* zeroed: the row padding is hashed too */
+    if (!buf) return 0;
+    for (u32 f = 0; f < nf; f++)
+        rsx_texture_decode(buf + (size_t)f * pitch * rows, pitch,
+                           vm_base + t->off + f * t->face_bytes, t->w, t->h, &tl,
+                           rsx_texture_argb_is_rgba());
+    const u32 h = dp_hash(buf, n);
+    free(buf);
+    return h;
+}
 static void drawprint_write(const char* path, const char* hdr)
 {
     FILE* f = fopen(path, "w");
@@ -5681,20 +5884,14 @@ static void drawprint_write(const char* path, const char* hdr)
             if (dr->tex_z[u] >= 0)  { fprintf(f, " t%d=Z%X", u, s_zeta[dr->tex_z[u]].off); continue; }
             int ts = vp_tex_find(dr->tex[u].off, dr->tex[u].w, dr->tex[u].h, dr->tex[u].fmt,
                                  dr->tex[u].cube && (dr_cube_mask(dr) & (1u << u)));
-            /* /<hash>: the decoded bytes last uploaded to the slot, which
-             * are what the GPU samples; the checksum is of guest memory at
-             * that upload. Slow to read (upload heap), like vb. */
+            /* /<hash>: the slot's texture decoded as an upload decodes it,
+             * from guest memory now; the checksum is of guest memory at the
+             * last upload, so the two together say whether the GPU's copy is
+             * current. */
             if (ts >= 0) {
                 const VPTexSlot* t = &s_d3d.vp_tex[ts];
                 if (uh_file[ts] != uh_gen) {   /* once per slot per file */
-                    void* um = NULL; D3D12_RANGE ur = {0, t->up_bytes};
-                    uh[ts] = 0; uh_file[ts] = uh_gen;
-                    if (t->up && t->up_bytes &&
-                        SUCCEEDED(t->up->lpVtbl->Map(t->up, 0, &ur, &um)) && um) {
-                        uh[ts] = dp_hash(um, t->up_bytes);
-                        D3D12_RANGE nw = {0, 0};
-                        t->up->lpVtbl->Unmap(t->up, 0, &nw);
-                    }
+                    uh[ts] = vp_tex_decoded_hash(t); uh_file[ts] = uh_gen;
                 }
                 fprintf(f, " t%d=T%X:%08X/%08X", u, dr->tex[u].raw, t->csum, uh[ts]);
             }
@@ -6012,6 +6209,7 @@ static void render_frame(void)
       s_fl_wait_ms  = (double)(_w1.QuadPart - _w0.QuadPart) * 1000.0 / (double)_f.QuadPart;
       s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
     off_rt_release_deferred();   /* RT resources the previous frame dropped */
+    tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);
 
     /* Compile the real vertex program once its microcode is captured, and keep
