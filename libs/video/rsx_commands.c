@@ -52,8 +52,14 @@ rsx_backend* rsx_get_backend(void)
  * State initialization
  * -----------------------------------------------------------------------*/
 
+/* Bumped whenever any rsx_state's vertex-program store changes (and when a
+ * state is reset): a backend may remember what it derived from the store
+ * while this stays the same. */
+u32 g_rsx_vp_ucode_ver = 1;
+
 void rsx_state_init(rsx_state* state)
 {
+    g_rsx_vp_ucode_ver++;
     memset(state, 0, sizeof(rsx_state));
     /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
      * struct would leave w at 0. */
@@ -641,6 +647,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             state->vp_ucode_write = w + 4;
             if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
             state->vp_dirty = 1;
+            g_rsx_vp_ucode_ver++;
         }
         return 0;
     }

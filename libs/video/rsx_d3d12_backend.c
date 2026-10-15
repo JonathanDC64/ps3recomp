@@ -2116,6 +2116,19 @@ static int vp_get_vs(const rsx_state* st)
     { static int off = -1; PS3_KNOB(off, getenv("VP_START_OFF") ? 1 : 0);
       if (!off) vstart = st->transform_program_start * 16u; }
     if (vstart >= st->vp_ucode_bytes) vstart = 0;
+    /* Sizing and hashing the program, then scanning the cache, ran for every
+     * draw. While the store has not been written since, a program start
+     * resolves to the slot it resolved to before (if that slot still holds
+     * the same program). RSX_VP_MEMO=0 looks it up every time. */
+    extern u32 g_rsx_vp_ucode_ver;
+    typedef struct { const rsx_state* st; u32 ver, vstart, hash; int idx; } VsMemo;
+    static VsMemo memo[64];
+    static int memo_en = -1;
+    PS3_KNOB(memo_en, ps3_env_int("RSX_VP_MEMO", 1));
+    VsMemo* m = &memo[(vstart >> 4) & 63];
+    if (memo_en && m->st == st && m->ver == g_rsx_vp_ucode_ver && m->vstart == vstart &&
+        m->idx >= 0 && m->idx < s_d3d.vp_vs_n && s_d3d.vp_vs[m->idx].hash == m->hash)
+        return s_d3d.vp_vs[m->idx].vs ? m->idx : -1;
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = st->vp_ucode_bytes - vstart;
     /* Key the program by its own instructions, up to its end bit. The store
@@ -2125,7 +2138,11 @@ static int vp_get_vs(const rsx_state* st)
       if (instrs) vlen = instrs * 16u; }
     u32 hash = vp_hash_ucode(vuc, vlen);
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
-        if (s_d3d.vp_vs[i].hash == hash) return s_d3d.vp_vs[i].vs ? i : -1;
+        if (s_d3d.vp_vs[i].hash == hash) {
+            m->st = st; m->ver = g_rsx_vp_ucode_ver; m->vstart = vstart;
+            m->hash = hash; m->idx = i;
+            return s_d3d.vp_vs[i].vs ? i : -1;
+        }
 
     static char hlsl[262144];
     const double vs_t0 = perf_on() ? perf_now() : 0.0;
@@ -3984,7 +4001,9 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
          * has no fixed alpha test; guest FPs discard on it dynamically
          * (wave's colour wheel is a disc via alpha test -- without it the
          * palette drew as an opaque square). */
-        if (dr && !getenv("NO_ALPHATEST")) {
+        static int noat = -1;   /* knobs: this runs for every draw */
+        PS3_KNOB(noat, getenv("NO_ALPHATEST") ? 1 : 0);
+        if (dr && !noat) {
             { static int _at = 0;
               if (((dr->alpha_ctl >> 16) & 1u) && _at++ < 4)
                   printf("[ALPHATEST] enable func=%u ref=%u\n",
@@ -4144,8 +4163,11 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     static int s_guess = -1;
     PS3_KNOB(s_guess, getenv("VP_GUESSPROJ") ? 1 : 0);
     int garbage = s_guess && !(c00 > 0.0f && c00 < 8.0f);
-    if (getenv("VP_NOFIXPROJ")) garbage = 0;
-    if ((garbage && uses_c03) || getenv("VP_FIXPROJ")) {
+    static int nofix = -1, fix = -1;
+    PS3_KNOB(nofix, getenv("VP_NOFIXPROJ") ? 1 : 0);
+    PS3_KNOB(fix, getenv("VP_FIXPROJ") ? 1 : 0);
+    if (nofix) garbage = 0;
+    if ((garbage && uses_c03) || fix) {
         { static int _fb = 0; if (_fb++ < 6)
             printf("[VPFB] fallback proj on draw slot %u (c00=%g vs_idx=%d)\n",
                    slot, c00, vs_idx); }
