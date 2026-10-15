@@ -1312,7 +1312,12 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = (u64)MAX_VERTICES * 256 * 2;  /* generic VP vertex: 16 float4 slots,
+        /* VP_VB_VERTS=<n>: start the buffer at n vertices rather than
+         * MAX_VERTICES, for a title known to need more (it grows on demand,
+         * but the growth costs a frame; see vp_vb_grow). */
+        { u64 v = (u64)ps3_env_int("VP_VB_VERTS", 0);
+          if (v > MAX_VERTICES && v <= (64ull << 20)) s_vp_cap = (u32)v; }
+        bd.Width = (u64)s_vp_cap * 256 * 2;  /* generic VP vertex: 16 float4 slots,
                                           * DOUBLE-buffered by frame parity so a
                                           * new frame's upload never overwrites
                                           * vertices the in-flight GPU frame is
@@ -1323,7 +1328,7 @@ static int init_d3d12(u32 width, u32 height)
          * anywhere. Report the size too: this buffer is
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
-                (unsigned long long)(bd.Width >> 20), (unsigned)MAX_VERTICES, 10);
+                (unsigned long long)(bd.Width >> 20), (unsigned)s_vp_cap, 10);
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
@@ -4624,6 +4629,20 @@ static int write_color_on(void)
     return on;
 }
 
+/* RSX_WRITE_COLOR_DEFER (default 1): store the frame's write-back copies at the
+ * start of the next frame, after the GPU wait that frame makes anyway, instead
+ * of waiting for the GPU between submit and Present. That wait held up both the
+ * Present and the FIFO drain on this thread for most of the GPU's frame time.
+ * Guest reads of render targets (Demon's Souls's exposure) see the values one
+ * frame later. 0 restores the store before Present. */
+static int write_color_defer(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_WRITE_COLOR_DEFER", 1));
+    return on;
+}
+static int s_wb_pending;   /* copies recorded, store not yet done */
+
 static void rt_pitch_record(D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -5185,12 +5204,16 @@ static void guest_fb_present(u32 fi)
  * ones fit. The old buffer may still be read by the frame in flight, so it is
  * released with the deferred RT resources. VP_VB_MAX_VERTS caps the growth
  * (default 2M vertices = 1 GB of upload heap at 256 bytes x 2 parities). */
+/* Growing creates and maps a new upload buffer of hundreds of MB on the render
+ * thread: 100-400 ms for Demon's Souls's level, one frame, whose overflowing
+ * draws are dropped as well. A title that needs more starts bigger
+ * (VP_VB_VERTS). */
 static void vp_vb_grow(u64 want)
 {
     static u64 limit = 0;
     if (!limit) { const char* e = getenv("VP_VB_MAX_VERTS");
                   limit = e ? strtoull(e, NULL, 0) : (2ull << 20);
-                  if (limit < MAX_VERTICES) limit = MAX_VERTICES; }
+                  if (limit < s_vp_cap) limit = s_vp_cap; }
     u64 cap = s_vp_cap;
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
@@ -5595,6 +5618,8 @@ static void render_frame(void)
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
     wait_for_gpu();
+    /* Before the pre-pass below resets `used` and reassigns slots. */
+    if (s_wb_pending) { s_wb_pending = 0; rt_writeback_store(); }
     off_rt_release_deferred();   /* RT resources the previous frame dropped */
 
     /* Compile the real vertex program once its microcode is captured, and keep
@@ -6983,14 +7008,16 @@ skip_dump_consider: ;
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
 
     dred_report("frame submit");
-    if (write_color_on()) {
+    if (write_color_on() && write_color_defer()) {
+        s_wb_pending = 1;
+    } else if (write_color_on()) {
         double _g = perf_on() ? perf_now() : 0.0;
         wait_for_gpu();
         dred_report("write-back wait");
         if (perf_on()) s_perf_gpu += perf_now() - _g;
         rt_writeback_store();
     }
-    if (s_zq_n && !write_color_on()) wait_for_gpu();
+    if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
     zq_finish();
 
     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
