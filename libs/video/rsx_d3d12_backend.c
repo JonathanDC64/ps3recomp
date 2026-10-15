@@ -468,6 +468,10 @@ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
  * composite -- so the exposure never updated and the level stayed dark. */
 static u32 s_vp_cap = MAX_VERTICES;
 static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
+/* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
+ * vertices fetched from guest memory, vertices written to the upload heap,
+ * uploads by primitive, and the mean enabled-attribute count per fetch. */
+static u64 s_vs_fetch, s_vs_attr, s_vs_up[4];
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like
@@ -7390,6 +7394,19 @@ rtt_dump_done:;
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
+      PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
+      emit += s_vp_want;
+      if (vst > 0 && ++fr >= (u32)vst) {
+          fprintf(stderr, "[VSTAT] per frame: fetched %llu emitted %llu (%.1f MB) attrs/fetch %.2f"
+                  " | uploads quad %llu tri %llu strip %llu fan %llu%c",
+                  (unsigned long long)(s_vs_fetch / fr), (unsigned long long)(emit / fr),
+                  (double)emit / fr * 256.0 / 1048576.0,
+                  s_vs_fetch ? (double)s_vs_attr / s_vs_fetch : 0.0,
+                  (unsigned long long)(s_vs_up[0] / fr), (unsigned long long)(s_vs_up[1] / fr),
+                  (unsigned long long)(s_vs_up[2] / fr), (unsigned long long)(s_vs_up[3] / fr), 10);
+          fr = 0; emit = 0; s_vs_fetch = s_vs_attr = 0; memset(s_vs_up, 0, sizeof s_vs_up);
+      } }
     if (s_vp_want > s_vp_cap) vp_vb_grow(s_vp_want);
     s_vp_want = 0;
 
@@ -8411,6 +8428,7 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
         /* Built on the stack, then one copy: out16 is usually the upload
          * heap, which is write-combined. */
         float tmp[16][4];
+        s_vs_fetch++; s_vs_attr += s_vp_plan.n_on;
         rsx_fetch_vertex(&s_vp_plan, vi, tmp);
         memcpy(out16, tmp, sizeof tmp);
     } else {
@@ -9414,6 +9432,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * list. Other primitives are skipped rather than drawn wrong. */
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
+    s_vs_up[primitive == RSX_PRIMITIVE_QUADS ? 0 : primitive == RSX_PRIMITIVE_TRIANGLES ? 1
+            : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
     if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
     else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
