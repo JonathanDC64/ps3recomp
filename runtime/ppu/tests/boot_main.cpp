@@ -1616,7 +1616,9 @@ int main(int argc, char** argv)
           SetPriorityClass(GetCurrentProcess(), cls);
       }
       const char* af = getenv("PS3_AFFINITY");
-      if (af && *af) {
+      /* "all" is no limit. Parsed as hex it was 0xA (strtoull stops at the
+       * 'l'): two logical CPUs, and every sleep in the title overran. */
+      if (af && *af && _stricmp(af, "all")) {
           DWORD_PTR want = (DWORD_PTR)strtoull(af, 0, 16), proc = 0, sys = 0;
           if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && (want & sys))
               SetProcessAffinityMask(GetCurrentProcess(), want & sys);
