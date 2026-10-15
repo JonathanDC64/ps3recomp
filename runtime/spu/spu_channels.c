@@ -154,6 +154,7 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+void (*volatile g_spu_trace_mark)(const char* name, uint32_t a, uint32_t b) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -1055,6 +1056,40 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* SPU_RATE=<image id>: every 2 s, what that image's host thread did --
+ * drain steps (lifted block transfers), slow-path channel writes (MFC
+ * commands, atomics, events), DMAs, GETLLARs, idle naps -- and how much of
+ * the window it spent napping. steps per busy ms is the speed of the SPU
+ * runtime on that image's code, independent of how much work the scene
+ * gave it: the number to compare between builds. Ticks from spu_wrch,
+ * the clock is read once per 1024 calls. */
+static SPU_THREAD_LOCAL unsigned long long t_nap_ticks;   /* QPC ticks in spu_llar_idle_wait */
+static void spu_rate_tick(spu_context* ctx)
+{
+    static int s_img = -2;
+    PS3_KNOB(s_img, ps3_env_int("SPU_RATE", -1));
+    if (s_img < 0 || ctx->image_id != s_img) return;
+    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0;
+    static SPU_THREAD_LOCAL long nap0;
+    extern volatile long g_spu_llar_naps;
+    if ((++wr & 1023u) != 0) return;
+    LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+    const unsigned long long now = (unsigned long long)q.QuadPart;
+    if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
+               ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; return; }
+    if (now - t0 < 2ull * (unsigned long long)f.QuadPart) return;
+    const double s = (double)(now - t0) / (double)f.QuadPart;
+    const double nap_s = (double)(t_nap_ticks - nt0) / (double)f.QuadPart;
+    const double steps = (double)(uint32_t)(ctx->steps - (uint32_t)st0);
+    fprintf(stderr, "[spu-rate] img=%d per s: steps=%.0f wrch_full=%.0f dma=%.0f getllar=%.0f"
+                    " naps=%.0f napping=%.0f%% | %.0f steps per busy ms%c",
+            s_img, steps / s, (wr - wr0) / s, (t_spu_xfers - x0) / s,
+            (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
+            s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
+    t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
+    ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
+}
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
@@ -1068,6 +1103,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
+    spu_rate_tick(ctx);
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
@@ -1236,6 +1272,11 @@ volatile long g_spu_llar_naps;   /* SPU_LLAR_HIST */
 static void spu_llar_idle_wait(spu_context* ctx)
 {
     g_spu_llar_naps++;
+    LARGE_INTEGER nap_t0; QueryPerformanceCounter(&nap_t0);
+    /* Console trace: the nap as two marks, so a trace shows whether an SPU
+     * slept while a PPU thread waited on it. */
+    void (*mark)(const char*, uint32_t, uint32_t) = g_spu_trace_mark;
+    if (mark) mark("spu_nap", (uint32_t)ctx->image_id, ctx->resv_ea);
     yz_lockstep_block_begin(ctx);
     AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     if (ctx->resv_valid && vm_base &&
@@ -1244,6 +1285,9 @@ static void spu_llar_idle_wait(spu_context* ctx)
                                   (SRWLOCK*)&ctx->ch_wait_lock, 2, 0);
     ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     yz_lockstep_block_end(ctx);
+    if (mark) mark("spu_wake", (uint32_t)ctx->image_id, ctx->resv_ea);
+    LARGE_INTEGER nap_t1; QueryPerformanceCounter(&nap_t1);
+    t_nap_ticks += (unsigned long long)(nap_t1.QuadPart - nap_t0.QuadPart);   /* SPU_RATE */
 }
 
 /* Block the calling SPU host thread until `channel` is readable. */

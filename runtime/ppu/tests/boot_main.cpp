@@ -435,6 +435,7 @@ static void present_guest_frame(void)
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
 #include "../ppu_waits.h"                     /* console waits */
 extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
+extern "C" void (*volatile g_spu_trace_mark)(const char*, uint32_t, uint32_t);   /* spu_channels.c */
 extern "C" volatile long g_rsx_prof_toggle;   /* F11 profile sessions (profile_thread) */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
@@ -1434,8 +1435,10 @@ static DWORD WINAPI debug_console(LPVOID param)
             sscanf(cmd, "%*s %u %259s", &a, tp);
             if (!tp[0]) snprintf(tp, sizeof tp, "%s.trace", path);
             g_rsx_trace_mark = ppu_trace_mark;
+            g_spu_trace_mark = ppu_trace_mark;
             const int n = ppu_trace_run(a ? a : 2, tp);
             g_rsx_trace_mark = nullptr;
+            g_spu_trace_mark = nullptr;
             dbg_printf("  %d records -> %s%c", n, tp, 10);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);

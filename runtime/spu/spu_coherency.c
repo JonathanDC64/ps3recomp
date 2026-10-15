@@ -39,15 +39,34 @@ static volatile long g_lockline = 0;
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
  * -- FMOD's mixer task among them, 25-40 ms at a time. */
+/* SPU_LOCKLINE_STATS=1: per host thread, every 2^20 acquisitions, how long
+ * they took to accumulate and how many found the lock held -- which threads
+ * share this lock, and how hard. */
+static void spu_lockline_stats(int contended)
+{
+    static __declspec(thread) unsigned long n, c;
+    static __declspec(thread) unsigned long long t0;
+    n++; c += contended;
+    if (n & ((1u << 20) - 1)) return;
+    const unsigned long long now = GetTickCount64();
+    if (t0) fprintf(stderr, "[lockline] host tid %lu: 1M in %llu ms, %lu contended%c",
+                    GetCurrentThreadId(), now - t0, c, 10);
+    t0 = now; c = 0;
+}
 void spu_lockline_lock(void)
 {
+    static int s_st = -1;
+    PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
     unsigned spins = 0;
+    int contended = 0;
     while (_InterlockedExchange(&g_lockline, 1)) {
+        contended = 1;
         do {
             _mm_pause();
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
         } while (g_lockline);
     }
+    if (s_st) spu_lockline_stats(contended);
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else
