@@ -212,6 +212,7 @@ typedef struct {
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
+    u32 up_bytes;       /* size of up, which holds the decoded bytes last uploaded */
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
     u32 key;            /* the ORIGINAL bound offset -- the cache lookup key.
                          * off is the RESOLVED source after TEX_OFF_BIAS/TEX_REMAP
@@ -3201,6 +3202,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 &IID_ID3D12Resource, (void**)&t->up))) {
             t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
         }
+        t->up_bytes = (u32)bd.Width;
         fresh = 1;
     }
 
@@ -5232,6 +5234,8 @@ static void drawprint_write(const char* path, const char* hdr)
     FILE* f = fopen(path, "w");
     if (!f) return;
     fputs(hdr, f);
+    static u32 uh[VP_TEX_SLOTS], uh_file[VP_TEX_SLOTS], uh_gen;
+    uh_gen++;
     const u32 par = (u32)s_d3d.vp_parity;
     for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
         const D3D12DrawRecord* dr = &s_d3d.draws[d];
@@ -5264,7 +5268,23 @@ static void drawprint_write(const char* path, const char* hdr)
             if (dr->tex_z[u] >= 0)  { fprintf(f, " t%d=Z%X", u, s_zeta[dr->tex_z[u]].off); continue; }
             int ts = vp_tex_find(dr->tex[u].off, dr->tex[u].w, dr->tex[u].h, dr->tex[u].fmt,
                                  dr->tex[u].cube && (dr_cube_mask(dr) & (1u << u)));
-            if (ts >= 0) fprintf(f, " t%d=T%X:%08X", u, dr->tex[u].raw, s_d3d.vp_tex[ts].csum);
+            /* /<hash>: the decoded bytes last uploaded to the slot, which
+             * are what the GPU samples; the checksum is of guest memory at
+             * that upload. Slow to read (upload heap), like vb. */
+            if (ts >= 0) {
+                const VPTexSlot* t = &s_d3d.vp_tex[ts];
+                if (uh_file[ts] != uh_gen) {   /* once per slot per file */
+                    void* um = NULL; D3D12_RANGE ur = {0, t->up_bytes};
+                    uh[ts] = 0; uh_file[ts] = uh_gen;
+                    if (t->up && t->up_bytes &&
+                        SUCCEEDED(t->up->lpVtbl->Map(t->up, 0, &ur, &um)) && um) {
+                        uh[ts] = dp_hash(um, t->up_bytes);
+                        D3D12_RANGE nw = {0, 0};
+                        t->up->lpVtbl->Unmap(t->up, 0, &nw);
+                    }
+                }
+                fprintf(f, " t%d=T%X:%08X/%08X", u, dr->tex[u].raw, t->csum, uh[ts]);
+            }
             else fprintf(f, " t%d=-%X", u, dr->tex[u].raw);
         }
         /* RSX_DRAWPRINT_K=1: the inline FP constants and texture scales too. */
