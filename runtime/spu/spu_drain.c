@@ -58,7 +58,51 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+/* The per-step check runs on every trampoline hop -- ~12 million a second
+ * in Demon's Souls' HighGraphics ring consumer -- so the common case is kept
+ * to what every step needs: the recent-pc ring, the stack-reset entries and
+ * the job-end test. The trace and drain knobs below it go through one cached
+ * flag (re-read when the console changes the environment), and only a set
+ * knob or an armed PM flow trace takes the full path. */
+extern unsigned g_spu_stack_reset_n;   /* spu_channels.c */
+extern volatile int g_yz_lockstep_on;  /* spu_lockstep.c; < 0 = not resolved yet */
+static int      s_step_diag, s_step_no_ls0;
+static unsigned s_step_diag_gen = ~0u;
+static void spu_step_diag_load(void)
+{
+    s_step_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
+    s_step_diag = (getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") ||
+                   getenv("SPU_JOBDRAIN")) ? 1 : 0;
+    s_step_diag_gen = ps3_env_gen;
+}
+static void spu_task_launch_check_full(spu_context* ctx, void* fn);
+static inline void spu_step_check(spu_context* ctx, void* fn)
+{
+    if (s_step_diag_gen != ps3_env_gen) spu_step_diag_load();
+    if (s_step_diag || g_pm_flow_ctx) { spu_task_launch_check_full(ctx, fn); return; }
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    t_recent[t_recent_n++ & 31] = pc;
+    if (g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode) {
+        extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+        spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+    }
+    /* As in the full path: a job branching back to LS 0 has finished. */
+    if (!s_step_no_ls0 && ctx->steps++ && pc == 0 &&
+        !ctx->policy_mode && ctx->image_id > 0) {
+        static int _n = 0;
+        if (_n++ < 8)
+            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete%c",
+                    ctx->image_id, 10);
+        spu_halt(ctx);
+    }
+}
+
 void spu_task_launch_check(spu_context* ctx, void* fn)
+{
+    spu_step_check(ctx, fn);
+}
+
+static void spu_task_launch_check_full(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -417,8 +461,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);
+            spu_step_check(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

@@ -597,7 +597,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (!s_last) s_last = now;
         if (now - s_last >= (time_t)s_ah) {
             s_last = now;
-            char buf[4096]; int p = snprintf(buf, sizeof buf, "[atomhist] last %ds:\n", s_ah);
+            /* Static (under s_lock): a 4 KB local here gave every caller of
+             * the atomic path -- spu_wrch_full -- a __chkstk-probed frame. */
+            static char buf[4096]; int p = snprintf(buf, sizeof buf, "[atomhist] last %ds:\n", s_ah);
             for (int r = 0; r < 8; r++) {
                 int best = -1;
                 for (k = 0; k < AH_N; k++) if (s_t[k].n && (best < 0 || s_t[k].n > s_t[best].n)) best = k;
@@ -690,7 +692,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
               static int s_af = -1;
               if (s_af < 0) { const char* f = getenv("SPU_ATOM_FULL"); s_af = f ? (atoi(f) > 1 ? 2 : 1) : 0; }
-              char buf[1024]; int p = 0;
+              static SPU_THREAD_LOCAL char buf[1024]; int p = 0;   /* off the stack, as [atomhist] */
               /* lr (gpr[0]) as well as pc: these atomics sit in generic helpers,
                * so pc names the HELPER and only lr names the real caller. */
               p += snprintf(buf + p, sizeof buf - p,
@@ -1061,7 +1063,7 @@ static int channel_is_mfc(uint32_t ch)
  * commands, atomics, events), DMAs, GETLLARs, idle naps -- and how much of
  * the window it spent napping. steps per busy ms is the speed of the SPU
  * runtime on that image's code, independent of how much work the scene
- * gave it: the number to compare between builds. Ticks from spu_wrch,
+ * gave it: the number to compare between builds. Ticks from spu_wrch_full,
  * the clock is read once per 1024 calls. */
 static SPU_THREAD_LOCAL unsigned long long t_nap_ticks;   /* QPC ticks in spu_llar_idle_wait */
 static void spu_rate_tick(spu_context* ctx)
@@ -1090,7 +1092,54 @@ static void spu_rate_tick(spu_context* ctx)
     ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
 }
 
+#if defined(_MSC_VER)
+#define SPU_NOINLINE __declspec(noinline)
+#else
+#define SPU_NOINLINE __attribute__((noinline))
+#endif
+
+/* Channel diagnostics that must see every access: SPU_CHHIST (both
+ * directions), SPU_POLLTRACE. While neither is set, spu_wrch and
+ * spu_rdch answer the plain MFC parameter channels themselves. */
+static int s_ch_diag;
+static unsigned s_ch_diag_gen = ~0u;
+static SPU_NOINLINE int spu_ch_diag_load(void)
+{
+    s_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE")) ? 1 : 0;
+    s_ch_diag_gen = ps3_env_gen;
+    return s_ch_diag;
+}
+static inline int spu_ch_diag(void)
+{
+    return s_ch_diag_gen == ps3_env_gen ? s_ch_diag : spu_ch_diag_load();
+}
+
+static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+
+/* The hot path. Demon's Souls' HighGraphics ring consumer (img 2) issues ~31
+ * channel writes per 16-byte ring entry, ~20 million a second, and almost all
+ * of them only latch a DMA parameter (LSA, EA, size, tag) for the MFC_Cmd that
+ * follows. spu_wrch_full carries the diagnostics inline, which gave it a
+ * 4.5 KB frame -- a __chkstk probe, six saved XMM registers and the /GS
+ * cookie on every one of those writes. Latch them here and leave the rest. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    const uint32_t v = value._u32[0];
+    if (!spu_ch_diag()) {
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;         return;
+        case MFC_EAH:       ctx->mfc_eah = v;         return;
+        case MFC_EAL:       ctx->mfc_eal = v;         return;
+        case MFC_Size:      ctx->mfc_size = v;        return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+        default: break;
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+
+static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1329,7 +1378,23 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+
+/* The MFC status reads that follow each DMA and atomic (see spu_wrch). */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (!spu_ch_diag()) {
+        switch (channel) {
+        case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+        case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+        case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+        default: break;
+        }
+    }
+    return spu_rdch_full(ctx, channel);
+}
+
+static SPU_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -1850,11 +1915,13 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_n;   /* = s_stack_reset_count, for the drain's per-step check */
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_n = s_stack_reset_count;
     }
 }
 
