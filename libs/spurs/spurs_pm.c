@@ -11,6 +11,7 @@
  */
 #include "spurs_taskset.h"
 #include "ps3emu/ps3_knob.h"
+#include <stdlib.h>   /* getenv */
 #include <stdint.h>
 
 /* Select the next task to run: first task that is ready and not running, scanning

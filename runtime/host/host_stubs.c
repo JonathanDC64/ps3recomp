@@ -124,3 +124,20 @@ uint32_t g_spu_image_span = 0;
 void ppu_dump_bctrl_ring(uint32_t a, const char* tag) { (void)a; (void)tag; }
 uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }
 
+
+/* ppu_loader.cpp - re-protects a guard page after a guest touched it (the
+ * SPU DMA path re-arms one it hit). A host with no game set none. */
+void ppu_guard_page_rearm(uint32_t guest_ea, int noaccess) { (void)guest_ea; (void)noaccess; }
+
+/* ppu_hle.cpp - EXIT_ON=<tag> ends a test run at a named event. A host with
+ * no game has no run to end. */
+void ps3_exit_on(const char* tag) { (void)tag; }
+
+/* ppu_loader.cpp - calls a guest function through its OPD. With no lifted
+ * game there is no guest code to call; sceNp's one-shot manager callback is
+ * the only caller and nothing registers one here. */
+uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    (void)opd; (void)a0; (void)a1; (void)a2; (void)a3;
+    return 0;
+}
