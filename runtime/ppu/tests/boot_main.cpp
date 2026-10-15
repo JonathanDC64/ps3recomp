@@ -434,6 +434,7 @@ static void present_guest_frame(void)
 #include "../../syscalls/sys_ppu_thread.h"
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
 #include "../ppu_waits.h"                     /* console waits */
+extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
     struct Site { uint32_t tid, cia; uint32_t hits; };
@@ -1285,6 +1286,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
             dbg_printf("  waits [s] [rows] time per guest thread inside each syscall/HLE call (+r3) over s seconds%c", 10);
+            dbg_printf("  trace [s] [file] every syscall/HLE call and render mark as a timeline (default <console>.trace)%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
@@ -1413,6 +1415,14 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if (!strcmp(verb, "waits")) {
             sscanf(cmd, "%*s %u %u", &a, &b);
             dbg_waits(a ? a : 3, b ? b : 40);
+        } else if (!strcmp(verb, "trace")) {
+            char tp[MAX_PATH] = {0};
+            sscanf(cmd, "%*s %u %259s", &a, tp);
+            if (!tp[0]) snprintf(tp, sizeof tp, "%s.trace", path);
+            g_rsx_trace_mark = ppu_trace_mark;
+            const int n = ppu_trace_run(a ? a : 2, tp);
+            g_rsx_trace_mark = nullptr;
+            dbg_printf("  %d records -> %s%c", n, tp, 10);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "ctx") && sscanf(cmd, "%*s %u", &a) == 1) {
@@ -1616,7 +1626,9 @@ int main(int argc, char** argv)
           SetPriorityClass(GetCurrentProcess(), cls);
       }
       const char* af = getenv("PS3_AFFINITY");
-      if (af && *af) {
+      /* "all" is no limit. Parsed as hex it was 0xA (strtoull stops at the
+       * 'l'): two logical CPUs, and every sleep in the title overran. */
+      if (af && *af && _stricmp(af, "all")) {
           DWORD_PTR want = (DWORD_PTR)strtoull(af, 0, 16), proc = 0, sys = 0;
           if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && (want & sys))
               SetProcessAffinityMask(GetCurrentProcess(), want & sys);

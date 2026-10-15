@@ -3138,6 +3138,64 @@ extern "C" void ppu_waits_add(uint32_t tid, int hle, uint32_t key, uint32_t obj,
     ReleaseSRWLockExclusive(&s_waits_lock);
 }
 
+/* Console `trace`: every lv2 syscall and HLE call, and every mark, as one
+ * record with its start and end, for a few seconds; then written out as text
+ * ("t0_us dur_us tid kind key r3 name", time from the start of the window).
+ * Posts (semaphore post, cond signal, port send) are syscalls too, so the file
+ * shows who woke whom. Records are claimed with one interlocked add.
+ * ponytail: fixed capacity; records past it are counted, not kept. */
+struct ppu_trace_rec { uint64_t t0, t1; uint32_t tid, key, obj; int32_t hle; const char* name; };
+#define PPU_TRACE_CAP (4u << 20)
+extern "C" volatile int g_trace_armed = 0;
+static ppu_trace_rec* s_trace;
+static volatile LONG s_trace_n;
+
+extern "C" void ppu_trace_add(uint32_t tid, int hle, uint32_t key, uint32_t obj,
+                              const char* name, uint64_t t0, uint64_t t1)
+{
+    if (!s_trace) return;
+    const LONG i = InterlockedIncrement(&s_trace_n) - 1;
+    if ((uint32_t)i >= PPU_TRACE_CAP) return;
+    ppu_trace_rec* r = &s_trace[i];
+    r->t0 = t0; r->t1 = t1; r->tid = tid; r->key = key; r->obj = obj; r->hle = hle; r->name = name;
+}
+
+/* A point event from a host thread (tid 0): kind 2, key = a, r3 = b. */
+extern "C" void ppu_trace_mark(const char* name, uint32_t a, uint32_t b)
+{
+    if (!g_trace_armed) return;
+    const uint64_t t = ppu_waits_now();
+    ppu_trace_add(0, 2, a, b, name, t, t);
+}
+
+extern "C" int ppu_trace_run(unsigned sec, const char* path)
+{
+    if (!s_trace) s_trace = (ppu_trace_rec*)malloc(sizeof(ppu_trace_rec) * PPU_TRACE_CAP);
+    if (!s_trace) return -1;
+    s_trace_n = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t a = ppu_waits_now();
+    g_trace_armed = 1;
+    Sleep(sec * 1000u);
+    g_trace_armed = 0;
+    Sleep(200);   /* calls in flight at the close land */
+    FILE* o = fopen(path, "w");
+    if (!o) return -1;
+    const uint32_t n = (uint32_t)s_trace_n < PPU_TRACE_CAP ? (uint32_t)s_trace_n : PPU_TRACE_CAP;
+    const double us = 1e6 / (double)f.QuadPart;
+    fprintf(o, "# t0_us dur_us tid kind(0 sc,1 hle,2 mark) key r3 name; %u records, %d lost\n",
+            n, (int)((uint32_t)s_trace_n - n));
+    for (uint32_t i = 0; i < n; i++) {
+        const ppu_trace_rec* r = &s_trace[i];
+        if (r->t0 < a) continue;   /* began before the window */
+        fprintf(o, "%.1f %.1f %u %d %X %X %s\n", (double)(r->t0 - a) * us,
+                (double)(r->t1 - r->t0) * us, r->tid, r->hle, r->key, r->obj,
+                r->name && *r->name ? r->name : "-");
+    }
+    fclose(o);
+    return (int)n;
+}
+
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
@@ -3162,8 +3220,11 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         ppu_context* c; uint32_t num, obj; uint64_t t0;
         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
                       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
-                      if (t0) ppu_waits_add(t, 0, num, obj, nullptr, ppu_waits_now() - t0); }
-    } _sg{ ctx, (uint32_t)num, (uint32_t)ctx->gpr[3], g_waits_armed ? ppu_waits_now() : 0 };
+                      if (t0) { const uint64_t t1 = ppu_waits_now();
+                                if (g_waits_armed) ppu_waits_add(t, 0, num, obj, nullptr, t1 - t0);
+                                if (g_trace_armed) ppu_trace_add(t, 0, num, obj, nullptr, t0, t1); } }
+    } _sg{ ctx, (uint32_t)num, (uint32_t)ctx->gpr[3],
+           (g_waits_armed | g_trace_armed) ? ppu_waits_now() : 0 };
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall

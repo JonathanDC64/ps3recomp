@@ -24,6 +24,14 @@ extern volatile uint32_t g_waits_dropped;   /* calls a full table lost */
 uint64_t ppu_waits_now(void);
 void ppu_waits_add(uint32_t tid, int hle, uint32_t key, uint32_t obj,
                    const char* name, uint64_t ticks);
+
+/* Console `trace`: the same calls as a timeline (start, end, thread, call, r3)
+ * plus marks from host threads (ppu_trace_mark). See ppu_trace_run. */
+extern volatile int g_trace_armed;
+void ppu_trace_add(uint32_t tid, int hle, uint32_t key, uint32_t obj,
+                   const char* name, uint64_t t0, uint64_t t1);
+void ppu_trace_mark(const char* name, uint32_t a, uint32_t b);
+int ppu_trace_run(unsigned sec, const char* path);
 #ifdef __cplusplus
 }
 #endif

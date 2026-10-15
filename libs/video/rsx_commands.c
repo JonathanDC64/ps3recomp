@@ -21,6 +21,10 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+/* Console `trace` marks (boot_main sets this while a trace runs). */
+extern void (*volatile g_rsx_trace_mark)(const char* name, u32 a, u32 b);
+#define RSX_MARK(n, a, b) do { void (*_m)(const char*, u32, u32) = g_rsx_trace_mark; \
+                               if (_m) _m((n), (a), (b)); } while (0)
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -385,6 +389,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        RSX_MARK("backend_label", s_sem_off, val);
         { static u32 seen[64]; static int ns = 0; int k;   /* first write per label */
           for (k = 0; k < ns && seen[k] != s_sem_off; k++) {}
           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
@@ -400,6 +405,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       if (method == 0x1D74) {
         extern void vm_write32(uint32_t a, uint32_t v);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), data);
+        RSX_MARK("texture_label", s_sem_off, data);
         return 0;
       } }
     if ((method >= 0x200 && method <= 0x23C) ||

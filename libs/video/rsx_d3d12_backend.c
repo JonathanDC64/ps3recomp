@@ -1312,7 +1312,12 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
-        bd.Width = (u64)MAX_VERTICES * 256 * 2;  /* generic VP vertex: 16 float4 slots,
+        /* VP_VB_VERTS=<n>: start the buffer at n vertices rather than
+         * MAX_VERTICES, for a title known to need more (it grows on demand,
+         * but the growth costs a frame; see vp_vb_grow). */
+        { u64 v = (u64)ps3_env_int("VP_VB_VERTS", 0);
+          if (v > MAX_VERTICES && v <= (64ull << 20)) s_vp_cap = (u32)v; }
+        bd.Width = (u64)s_vp_cap * 256 * 2;  /* generic VP vertex: 16 float4 slots,
                                           * DOUBLE-buffered by frame parity so a
                                           * new frame's upload never overwrites
                                           * vertices the in-flight GPU frame is
@@ -1323,7 +1328,7 @@ static int init_d3d12(u32 width, u32 height)
          * anywhere. Report the size too: this buffer is
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
-                (unsigned long long)(bd.Width >> 20), (unsigned)MAX_VERTICES, 10);
+                (unsigned long long)(bd.Width >> 20), (unsigned)s_vp_cap, 10);
         if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
@@ -4624,6 +4629,21 @@ static int write_color_on(void)
     return on;
 }
 
+/* RSX_WRITE_COLOR_DEFER (default 1): store the frame's write-back copies at the
+ * start of the next frame, after the GPU wait that frame makes anyway, instead
+ * of waiting for the GPU between submit and Present. That wait held up both the
+ * Present and the FIFO drain on this thread for most of the GPU's frame time.
+ * Guest reads of render targets (Demon's Souls's exposure) see the values one
+ * frame later. 0 restores the store before Present. */
+static int write_color_defer(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_WRITE_COLOR_DEFER", 1));
+    return on;
+}
+static int s_wb_pending;   /* copies recorded, store not yet done */
+static double s_fl_wait_ms, s_fl_store_ms;   /* FRAME_LOG: frame-start wait, store */
+
 static void rt_pitch_record(D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
@@ -5185,12 +5205,16 @@ static void guest_fb_present(u32 fi)
  * ones fit. The old buffer may still be read by the frame in flight, so it is
  * released with the deferred RT resources. VP_VB_MAX_VERTS caps the growth
  * (default 2M vertices = 1 GB of upload heap at 256 bytes x 2 parities). */
+/* Growing creates and maps a new upload buffer of hundreds of MB on the render
+ * thread: 100-400 ms for Demon's Souls's level, one frame, whose overflowing
+ * draws are dropped as well. A title that needs more starts bigger
+ * (VP_VB_VERTS). */
 static void vp_vb_grow(u64 want)
 {
     static u64 limit = 0;
     if (!limit) { const char* e = getenv("VP_VB_MAX_VERTS");
                   limit = e ? strtoull(e, NULL, 0) : (2ull << 20);
-                  if (limit < MAX_VERTICES) limit = MAX_VERTICES; }
+                  if (limit < s_vp_cap) limit = s_vp_cap; }
     u64 cap = s_vp_cap;
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
@@ -5576,9 +5600,108 @@ static void drawprint_write(const char* path, const char* hdr)
     fclose(f);
 }
 
+/* FRAME_LOG=<file>: one line per present, to see how evenly frames reach the
+ * screen (the title-bar FPS can read 30 while frames are held for uneven
+ * numbers of refreshes). Times in ms:
+ *   t      Present call, from the first logged one
+ *   dt     since the previous present
+ *   rf     render_frame entry -> Present (recording the batch's GPU work)
+ *   pres   inside Present
+ *   flat   game's flip word decoded -> Present
+ *   flips  flip words since the previous present, draws in the batch
+ * then DXGI's statistics for the last frame that reached the screen:
+ *   pc / prc / src  PresentCount, PresentRefreshCount, SyncRefreshCount
+ * (consecutive pc and prc give how many refreshes each frame was shown). */
+/* Console `trace` marks (boot_main sets this while a trace runs). */
+extern void (*volatile g_rsx_trace_mark)(const char* name, u32 a, u32 b);
+#define RSX_MARK(n, a, b) do { void (*_m)(const char*, u32, u32) = g_rsx_trace_mark; \
+                               if (_m) _m((n), (a), (b)); } while (0)
+static long long s_rf_entry_qpc = 0;
+/* RF_SLOW_MS=<ms> (live): print where a render_frame longer than that spent
+ * its time, phase by phase (checkpoints RF_CP below). */
+#define RF_CPS 10
+static long long s_rf_cp[RF_CPS];
+/* With PERF=1, the draw pre-pass split: texture uploads, SRVs, pipeline
+ * lookups and creation, shader compiles (ms) and counts. */
+static double s_rf_pp[6], s_rf_pp0[6]; static int s_rf_ppn[3], s_rf_ppn0[3];
+static void rf_pp_snap(double* d, int* n)
+{
+    d[0] = s_perf_tex; d[1] = s_perf_srv; d[2] = s_perf_pso; d[3] = s_perf_cpso;
+    d[4] = s_perf_fxc; d[5] = s_perf_pmiss;
+    n[0] = s_perf_ntex; n[1] = s_perf_cpso_n; n[2] = s_perf_fxc_n;
+}
+#define RF_CP(i) do { LARGE_INTEGER _c; QueryPerformanceCounter(&_c); s_rf_cp[i] = _c.QuadPart; } while (0)
+static void rf_slow_report(void)
+{
+    static int lim = -1;
+    PS3_KNOB(lim, ps3_env_int("RF_SLOW_MS", 0));
+    if (lim <= 0 || !s_rf_cp[0]) return;
+    static long long fq = 0;
+    if (!fq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
+    const double ms = 1000.0 / (double)fq;
+    long long last = s_rf_cp[0];
+    for (int i = 1; i < RF_CPS; i++) if (s_rf_cp[i] > last) last = s_rf_cp[i];
+    if ((last - s_rf_cp[0]) * ms < (double)lim) return;
+    static const char* nm[RF_CPS] = { "", "gpu-wait+store", "setup", "rt-prepass",
+        "draw-prepass", "legacy-pass", "vp-pass", "post", "submit+zq", "present" };
+    fprintf(stderr, "[RF-SLOW] %.1f ms, %u draws:", (last - s_rf_cp[0]) * ms, s_dbg_last_draws);
+    long long prev = s_rf_cp[0];
+    for (int i = 1; i < RF_CPS; i++) {
+        if (!s_rf_cp[i]) continue;
+        fprintf(stderr, " %s %.1f", nm[i], (s_rf_cp[i] - prev) * ms);
+        prev = s_rf_cp[i];
+    }
+    if (perf_on())
+        fprintf(stderr, " | pre-pass: tex %.1f (%d) srv %.1f pso %.1f create-pso %.1f (%d) fxc %.1f (%d) miss %.1f",
+                (s_rf_pp[0] - s_rf_pp0[0]) * 1000, s_rf_ppn[0] - s_rf_ppn0[0],
+                (s_rf_pp[1] - s_rf_pp0[1]) * 1000, (s_rf_pp[2] - s_rf_pp0[2]) * 1000,
+                (s_rf_pp[3] - s_rf_pp0[3]) * 1000, s_rf_ppn[1] - s_rf_ppn0[1],
+                (s_rf_pp[4] - s_rf_pp0[4]) * 1000, s_rf_ppn[2] - s_rf_ppn0[2],
+                (s_rf_pp[5] - s_rf_pp0[5]) * 1000);
+    fprintf(stderr, "%c", 10);
+}
+static void frame_log(long long q0, long long q1)
+{
+    static FILE* f = NULL; static int st = -1;
+    static long long first = 0, prev = 0, freq = 0; static u32 fw_prev = 0;
+    static char path[MAX_PATH];
+    if (st < 0) {
+        const char* e = getenv("FRAME_LOG");
+        st = (e && *e) ? 1 : 0;
+        if (st) {
+            snprintf(path, sizeof path, "%s", e);
+            f = fopen(path, "w");
+            if (!f) st = 0;
+            else fprintf(f, "t dt rf pres flat flips draws pc prc src wait store\n");
+            LARGE_INTEGER fr; QueryPerformanceFrequency(&fr); freq = fr.QuadPart;
+        }
+    }
+    if (!st) return;
+    extern volatile u32 g_gcm_flip_words;
+    extern volatile long long g_gcm_flip_word_qpc;
+    if (!first) first = q0;
+    const double ms = 1000.0 / (double)freq;
+    DXGI_FRAME_STATISTICS fs; memset(&fs, 0, sizeof fs);
+    if (FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)))
+        memset(&fs, 0, sizeof fs);
+    const u32 fw = g_gcm_flip_words;
+    const long long fq = g_gcm_flip_word_qpc;
+    fprintf(f, "%.2f %.2f %.2f %.2f %.2f %u %u %u %u %u %.2f %.2f\n",
+            (q0 - first) * ms, prev ? (q0 - prev) * ms : 0.0,
+            s_rf_entry_qpc ? (q0 - s_rf_entry_qpc) * ms : 0.0, (q1 - q0) * ms,
+            fq ? (q0 - fq) * ms : -1.0, fw - fw_prev, s_dbg_last_draws,
+            fs.PresentCount, fs.PresentRefreshCount, fs.SyncRefreshCount,
+            s_fl_wait_ms, s_fl_store_ms);
+    prev = q0; fw_prev = fw;
+    { static int n = 0; if (++n % 64 == 0) fflush(f); }
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
+    { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); s_rf_entry_qpc = _q.QuadPart; }
+    RSX_MARK("render_frame", s_dbg_last_draws, 0);
+    memset(s_rf_cp, 0, sizeof s_rf_cp); RF_CP(0);
     u32 fi = s_d3d.frame_index;
     /* RSX_FRAME_SLEEP=<ms> (live, diagnostic): stall each batch this long.
      * Frames over ~36 ms put Demon's Souls's pacer into its 15 fps mode, with
@@ -5594,8 +5717,17 @@ static void render_frame(void)
      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
-    wait_for_gpu();
+    { LARGE_INTEGER _w0, _w1, _w2, _f;
+      QueryPerformanceCounter(&_w0);
+      wait_for_gpu();
+      QueryPerformanceCounter(&_w1);
+      /* Before the pre-pass below resets `used` and reassigns slots. */
+      if (s_wb_pending) { s_wb_pending = 0; rt_writeback_store(); }
+      QueryPerformanceCounter(&_w2); QueryPerformanceFrequency(&_f);
+      s_fl_wait_ms  = (double)(_w1.QuadPart - _w0.QuadPart) * 1000.0 / (double)_f.QuadPart;
+      s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
     off_rt_release_deferred();   /* RT resources the previous frame dropped */
+    RF_CP(1);
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
@@ -5857,6 +5989,7 @@ rtt_dump_done:;
         s_d3d.draw_count = keep;
       } }
 
+    RF_CP(2);
     /* Render-to-texture pre-pass: make sure an offscreen RT resource exists for
      * every non-display surface targeted this frame (so draws binding it as a
      * texture can resolve to it below, whatever the op order). */
@@ -5883,6 +6016,7 @@ rtt_dump_done:;
      * frame) and pre-build its FP PSO.
      * A texture whose offset matches an offscreen RT samples the RT directly
      * (tex_slot 1000+idx) -- no guest-memory upload. */
+    RF_CP(3); rf_pp_snap(s_rf_pp0, s_rf_ppn0);
     late_check();
     double _pre0 = perf_on() ? perf_now() : 0.0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
@@ -6116,6 +6250,7 @@ rtt_dump_done:;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
     drawprint_batch();
+    RF_CP(4); rf_pp_snap(s_rf_pp, s_rf_ppn);
 
     /* Transition render target to RENDER_TARGET state */
     D3D12_RESOURCE_BARRIER barrier = {0};
@@ -6261,6 +6396,7 @@ rtt_dump_done:;
         }
     }
 
+    RF_CP(5);
     /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
      * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
     if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
@@ -6640,6 +6776,7 @@ rtt_dump_done:;
         }
     }
 
+    RF_CP(6);
     if (perf_on()) s_perf_rf += perf_now() - _rf0;
     /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
      * with a min/max so a buffer of constants is distinguishable from real data. */
@@ -6972,6 +7109,7 @@ skip_dump_consider: ;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
     }
 
+    RF_CP(7);
     rt_writeback_record();
     if (s_zq_n)
         s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_zq_heap,
@@ -6983,14 +7121,16 @@ skip_dump_consider: ;
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
 
     dred_report("frame submit");
-    if (write_color_on()) {
+    if (write_color_on() && write_color_defer()) {
+        s_wb_pending = 1;
+    } else if (write_color_on()) {
         double _g = perf_on() ? perf_now() : 0.0;
         wait_for_gpu();
         dred_report("write-back wait");
         if (perf_on()) s_perf_gpu += perf_now() - _g;
         rt_writeback_store();
     }
-    if (s_zq_n && !write_color_on()) wait_for_gpu();
+    if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
     zq_finish();
 
     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
@@ -7150,9 +7290,16 @@ skip_dump_consider: ;
         }
       } }
 
+    RF_CP(8);
     /* Present */
-    if (s_present_this_frame)
-        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+    { LARGE_INTEGER _pq0, _pq1;
+      QueryPerformanceCounter(&_pq0);
+      if (s_present_this_frame)
+          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+      QueryPerformanceCounter(&_pq1);
+      if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
+      RSX_MARK("present", s_present_this_frame, 0); }
+    RF_CP(9); rf_slow_report();
 
     move_to_next_frame();
 
