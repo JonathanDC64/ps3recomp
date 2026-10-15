@@ -192,10 +192,10 @@ typedef struct {
  * (t0-t15) so multi-unit fragment programs see all their textures. */
 #define DRAW_SRV_BASE 32
 #define VP_SAMP_TABLES (2048 / RSX_FP_UNITS)
-                             /* distinct per-draw sampler tables, kept for the whole
-                              * run: written once, never rewritten, so no frame in
-                              * flight can see a table change (D3D12 caps a
-                              * shader-visible sampler heap at 2048 samplers) */
+                             /* per-draw sampler tables (D3D12 caps a shader-
+                              * visible sampler heap at 2048 samplers). When all
+                              * are taken, the least recently used one the GPU
+                              * has finished with is rewritten (vp_sampler_table). */
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
@@ -3968,11 +3968,19 @@ static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap_to_d3d(u32 m)
 }
 
 /* The sampler table (s0-s15) for one draw, from each unit's guest sampler
- * state. Tables are deduplicated for the whole run; returns the table index. Unset
- * units keep the old static defaults (s0 point/clamp, the rest linear/wrap). */
+ * state; returns the table index. Unset units keep the old static defaults
+ * (s0 point/clamp, the rest linear/wrap).
+ *
+ * Tables are shared by every draw with the same 16 sampler states. A session
+ * meets more combinations than fit: Demon's Souls filled all 128 between the
+ * tutorial and the Nexus, and every later combination used table 0's
+ * addressing and filtering -- the colour-grading LUT wrapped instead of
+ * clamping, and bright pixels came out blue, magenta and grey. A full heap now
+ * gives up the table used longest ago, once the GPU is done with it. */
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
+    static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
     u32 k[RSX_FP_UNITS * 2];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
         k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
@@ -3980,16 +3988,39 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
                                             : (u ? 0x02060000u : 0x01010000u);
         if (dr_unit_shadow(dr, u)) k[u * 2 + 1] |= 0x80000000u;   /* comparison */
     }
+    const u64 now = s_d3d.frame_count;
+    /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
+     * below without a two-hour session. */
+    static u32 cap = 0;
+    if (!cap) { int c = ps3_env_int("RSX_SAMP_TABLES", VP_SAMP_TABLES);
+                cap = (u32)(c < 2 ? 2 : c > VP_SAMP_TABLES ? VP_SAMP_TABLES : c); }
     for (u32 i = 0; i < s_d3d.samp_n; i++)
-        if (!memcmp(keys[i], k, sizeof k)) return i;
-    if (s_d3d.samp_n >= VP_SAMP_TABLES) {
-        static int said = 0;
-        if (!said) { said = 1;
-            fprintf(stderr, "[D3D12] sampler tables full (%d); later combinations "
-                            "reuse table 0%c", VP_SAMP_TABLES, 10); }
-        return 0;
+        if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; return i; }
+    u32 t;
+    if (s_d3d.samp_n < cap) {
+        t = s_d3d.samp_n++;
+    } else {
+        /* The frame being recorded may use any table it has bound, so only a
+         * table it has not touched can be rewritten. One last used FRAME_COUNT
+         * frames ago or more is done (move_to_next_frame waited for it);
+         * a more recent one needs the queue drained first. */
+        t = cap;
+        for (u32 i = 0; i < cap; i++)
+            if (last[i] != now && (t == cap || last[i] < last[t])) t = i;
+        if (t == cap) {
+            static int said = 0;
+            if (!said) { said = 1;
+                fprintf(stderr, "[D3D12] one frame uses more than %u sampler "
+                                "combinations; the rest share table 0%c", cap, 10); }
+            return 0;
+        }
+        if (last[t] + FRAME_COUNT > now) wait_for_gpu();
+        { static int n = 0;
+          if (n++ < 5) fprintf(stderr, "[D3D12] sampler tables full (%u): reusing table %u, "
+                               "last used in frame %llu%c", cap, t,
+                               (unsigned long long)last[t], 10); }
     }
-    const u32 t = s_d3d.samp_n++;
+    last[t] = now;
     memcpy(keys[t], k, sizeof k);
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
