@@ -479,8 +479,11 @@ void func_00010000(ppu_context* ctx)
     smoke_check((int32_t)ctx->gpr[3] == 0, "_cellGcmInitBody returned an error");
     gcm_ctx = vm_read32(SMOKE_SC_GCMCTX);
     smoke_check(gcm_ctx != 0, "_cellGcmInitBody left the context pointer null");
-    smoke_check(vm_read32(gcm_ctx + 0) == SMOKE_IO_ADDR,
-                "the GCM context does not begin at the IO address");
+    /* libgcm reserves the first 4 KB of the IO region: the default command
+     * buffer begins at IO offset 0x1000, and put/get start there. */
+    smoke_check(vm_read32(gcm_ctx + 0) == SMOKE_IO_ADDR + 0x1000u,
+                "the GCM context does not begin 4 KB into the IO region");
+    g_fifo_len = 0x1000u;   /* the stream is written from the context's begin */
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
     /* A guest thread. The entry is an OPD address, which the runtime's thread
