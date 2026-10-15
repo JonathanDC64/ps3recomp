@@ -3939,6 +3939,11 @@ static volatile LONG s_rcap_hotkey, s_rcap_hotkey_done;
  * frame to the next. Each capture's memory is written when it ends, so a burst
  * stalls the game for a moment between frames. */
 static long s_rcap_burst_left, s_rcap_burst_k, s_rcap_burst_id;
+/* Each F9 capture also asks the backend to save the presents that follow it
+ * (RSX_HOTKEY_LIVE, d3d12): what the screen showed, beside the capture whose
+ * replay can only rebuild one frame. Bumped with the capture's base name. */
+volatile long g_rcap_live_arm;
+char g_rcap_live_name[32];
 
 void cellGcm_replay_hotkey(void)
 {
@@ -3984,6 +3989,8 @@ static void rcap_try_start(void)
             snprintf(hk, sizeof hk, "%s/cap_%03ld_00.rcap", dir, next);
         } else
             snprintf(hk, sizeof hk, "%s/cap_%03ld.rcap", dir, next);
+        snprintf(g_rcap_live_name, sizeof g_rcap_live_name, "cap_%03ld", next);
+        InterlockedIncrement(&g_rcap_live_arm);
         next++;
         s_rcap_hotkey_done++;
         if (s_rcap_hotkey != s_rcap_hotkey_done) ps3_env_bump();   /* pressed again meanwhile */

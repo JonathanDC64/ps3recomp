@@ -433,6 +433,7 @@ static int draw_room(void);
  * file per present, with the batch's draw count in the name. */
 static volatile int s_hotshot_left, s_hotshot_arm;
 static int s_hotshot_burst = -1, s_hotshot_n;
+static char s_hotshot_name[40];   /* F9's live presents: "cap_NNN", else "" */
 /* GCM_RATES: why a frame boundary did or did not present (per-second deltas) */
 static u32 s_clear_presents;   /* defined with the clear path */
 static u32 s_pc_flip_render, s_pc_flip_nodisp, s_pc_clear_nodisp, s_pc_clear_sameflip, s_pc_clear_small;
@@ -1503,6 +1504,10 @@ static void dump_backbuffer_bmp(void)
     if (s_hotshot_left > 0 && !s_dump_name) {
         const char* hd = getenv("RSX_HOTKEY_DIR");
         if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
+        if (s_hotshot_name[0])
+            snprintf(path, sizeof(path), "%s/%s_live_%02d_d%u.bmp", hd, s_hotshot_name,
+                     s_hotshot_n++, s_dbg_last_draws);
+        else
         snprintf(path, sizeof(path), "%s%sshot_%03d_%02d_d%u.bmp", hd ? hd : "", hd ? "/" : "",
                  s_hotshot_burst, s_hotshot_n++, s_dbg_last_draws);
         s_hotshot_left--;
@@ -6264,8 +6269,25 @@ skip_dump_consider: ;
      * the console -- the frames around a flicker, once the game is showing it.
      * CELLMARK_DUMP is read at init, and its skip count cannot know when a
      * hand-driven run reaches the spot. Each dump line gives the batch's draws. */
+    /* An F9 capture started: save the presents that follow it as
+     * cap_NNN_live_XX_d<draws>.bmp, RSX_HOTKEY_LIVE of them (default 4, 0 =
+     * off). A replay rebuilds one batch from guest memory with no targets
+     * from earlier frames and no flips; these show what was on screen. */
+    { extern volatile long g_rcap_live_arm; extern char g_rcap_live_name[32];
+      static long seen;
+      if (g_rcap_live_arm != seen) {
+          seen = g_rcap_live_arm;
+          const int n = ps3_env_int("RSX_HOTKEY_LIVE", 4);
+          if (n > 0 && s_hotshot_left <= 0) {
+              snprintf(s_hotshot_name, sizeof s_hotshot_name, "%s", g_rcap_live_name);
+              s_hotshot_n = 0;
+              s_hotshot_left = n;
+              s_d3d.dump_frames_left = n; s_d3d.dump_skip_left = 0;
+          }
+      } }
     if (s_hotshot_arm) {   /* F10, armed from the window procedure */
         s_hotshot_arm = 0;
+        s_hotshot_name[0] = 0;
         const int n = ps3_env_int("RSX_HOTKEY_SHOTS", 12);
         const char* hd = getenv("RSX_HOTKEY_DIR");
         if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
