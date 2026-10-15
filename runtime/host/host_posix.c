@@ -1251,7 +1251,10 @@ int main(int argc, char** argv)
     printf("[host] gcm context data @ 0x%08X\n", cdata);
     cellGcmSetDisplayBuffer(0, 0, 1280 * 4, 1280, 720);
 
-    guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
+    /* The stream starts where the context begins: libgcm reserves the first
+     * 4 KB of the IO region, so that is IO offset 0x1000, not 0. */
+    g_fifo_len = guest_r32(cdata) - IO_ADDR;
+    guest_w32(CTRL_ADDR + 4, g_fifo_len);   /* get: start of ring */
     if (io_alias) {
         const u32 out = host_alloc(4, 4);
         cellGcmAddressToOffset(0xC0000000u + TEX_OFFSET, (u32*)(uintptr_t)out);

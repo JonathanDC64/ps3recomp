@@ -33,6 +33,8 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>   /* exit-on: CreateThread, TerminateProcess */
+#else
+#  include "../platform/win32_compat.h"   /* the same, on POSIX */
 #endif
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 

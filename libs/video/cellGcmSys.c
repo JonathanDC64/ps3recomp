@@ -3911,9 +3911,11 @@ static int s_rcap_cut_seen = 0;
 
 void cellGcm_rcap_cut(void) { s_rcap_cut_pending = 1; s_rcap_cut_seen = 1; }
 
+void (*g_rcap_mark_hook)(int end) = NULL;
 static void rcap_finish(void)
 {
     s_rcap_on = 0;
+    if (g_rcap_mark_hook) g_rcap_mark_hook(1);
     u64 mem = 0;
     if (vm_base) {
         mem += rcap_region(s_config.localAddress, s_config.localSize);
@@ -3944,6 +3946,9 @@ static long s_rcap_burst_left, s_rcap_burst_k, s_rcap_burst_id;
  * replay can only rebuild one frame. Bumped with the capture's base name. */
 volatile long g_rcap_live_arm;
 char g_rcap_live_name[32];
+/* The capture's path without ".rcap"; g_rcap_mark_hook (above) tells the
+ * backend where in its batches a capture starts and ends. */
+char g_rcap_fin_name[512];
 
 void cellGcm_replay_hotkey(void)
 {
@@ -3998,6 +4003,9 @@ static void rcap_try_start(void)
     }
     if (!e || !*e || !strcmp(e, armed)) return;
     snprintf(armed, sizeof armed, "%s", e);
+    { size_t n = strlen(e);
+      snprintf(g_rcap_fin_name, sizeof g_rcap_fin_name, "%.*s",
+               (int)(n > 5 && !strcmp(e + n - 5, ".rcap") ? n - 5 : n), e); }
     s_rcap_f = fopen(e, "wb");
     if (!s_rcap_f) { printf("[RCAP] cannot write %s%c", e, 10); return; }
     fwrite("PS3RCAP1", 1, 8, s_rcap_f);
@@ -4014,6 +4022,7 @@ static void rcap_try_start(void)
     rcap_sec("UPLN", &s_upload_n, 4);
     s_rcap_n = 0;
     s_rcap_on = 1;
+    if (g_rcap_mark_hook) g_rcap_mark_hook(0);
     printf("[RCAP] capturing the next frame to %s%c", e, 10);
 }
 

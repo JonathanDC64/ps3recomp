@@ -3650,8 +3650,10 @@ static void late_note(u32 slot, const D3D12DrawRecord* dr)
     for (int u = 0; u < RSX_FP_UNITS; u++) s_late_tex[slot][u] = late_tex_sum(dr, u);
     s_late_fp[slot] = late_fp_sum(dr);
 }
+static void late_vtx_check(void);
 static void late_check(void)
 {
+    late_vtx_check();
     if (!late_on() || !s_late_tex) return;
     s_late_gen++;   /* render-time hashes */
     static int said = 0;
@@ -3687,6 +3689,9 @@ static void late_check(void)
     s_late_gen++;   /* the next batch's record-time hashes */
 }
 
+/* Inline constants each record's program has (drawprint hashes only those:
+ * the rest of the slot holds whatever an earlier frame left there). */
+static u8 s_fpk_n[MAX_DRAWS];
 static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
     late_note(slot, dr);
@@ -3736,7 +3741,8 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_BYTES, &ts[FPCB_K * 4], FPCB_KMAX);
+                s_fpk_n[slot] = (u8)rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_BYTES,
+                                                          &ts[FPCB_K * 4], FPCB_KMAX);
             /* FPK_FP=<hex fp_addr>: that program's constants, each time they
              * change (capped). Shows whether the title's per-material patches
              * reach the draw, for one surface at a time. */
@@ -5146,6 +5152,126 @@ static void zq_finish(void)
     s_zq_on_start = s_zq_on;
 }
 
+/* Per-draw fingerprints (live and replay): one line per record with the
+ * inputs the batch actually renders from -- the emitted vertices, the VP and
+ * FP constant slots, the pipeline keys, the vertex program's ucode hash, and
+ * per texture unit what it resolved to (T = uploaded texture, with the
+ * checksum of the bytes uploaded; R = offscreen target; Z = depth surface;
+ * - = nothing). A live frame and the replay of its F9 capture should print
+ * the same lines; the first that differs names the state a replay cannot
+ * see. F9 writes them next to the live presents as cap_NNN_draws_XX_d<n>.txt;
+ * RSX_DRAWPRINT=<prefix> (live, replay) writes the next RSX_DRAWPRINT_N
+ * batches (default 4) as <prefix>_XX_d<n>.txt. */
+static char s_dp_prefix[480];
+static int s_dp_left, s_dp_n;
+static u32 dp_hash(const void* p, size_t n)
+{
+    const u8* b = (const u8*)p;
+    u32 h = 2166136261u;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+static void drawprint_write(const char* path, const char* hdr);
+static u32 s_batch_seq, s_cap_mark_seq[2], s_cap_mark_at[2];
+static volatile int s_cap_mark_ok[2];
+static void cap_mark(int end)
+{
+    s_cap_mark_seq[end] = s_batch_seq;
+    s_cap_mark_at[end] = s_d3d.draw_count;
+    s_cap_mark_ok[end] = 1;
+}
+static void drawprint_batch(void)
+{
+    { static u64 gen = (u64)-1;
+      if (gen != ps3_env_gen) { gen = ps3_env_gen;
+          const char* e = getenv("RSX_DRAWPRINT");
+          static char last[480];
+          if (e && *e && strcmp(e, last)) {
+              snprintf(last, sizeof last, "%s", e);
+              snprintf(s_dp_prefix, sizeof s_dp_prefix, "%s", e);
+              s_dp_left = ps3_env_int("RSX_DRAWPRINT_N", 4); s_dp_n = 0;
+          } } }
+    char path[512];
+    /* A capture's start and end, as (batch, record) marks: the batches that
+     * hold them are written as <capture>_cap<k>_d<draws>.txt with "# capture
+     * starts/ends at record N" lines, so the live records line up one for
+     * one with the replay's. */
+    { extern char g_rcap_fin_name[512];
+      int in0 = s_cap_mark_ok[0] && s_cap_mark_seq[0] == s_batch_seq;
+      int in1 = s_cap_mark_ok[1] && s_cap_mark_seq[1] == s_batch_seq;
+      if (in0 || in1) {
+          snprintf(path, sizeof path, "%s_cap%d_d%u.txt", g_rcap_fin_name, in0 ? 0 : 1,
+                   s_d3d.draw_count);
+          char hdr[96]; hdr[0] = 0;
+          if (in0) snprintf(hdr, sizeof hdr, "# capture starts at record %u%c", s_cap_mark_at[0], 10);
+          if (in1) snprintf(hdr + strlen(hdr), sizeof hdr - strlen(hdr),
+                            "# capture ends at record %u%c", s_cap_mark_at[1], 10);
+          drawprint_write(path, hdr);
+          if (in1) s_cap_mark_ok[0] = s_cap_mark_ok[1] = 0;
+      } }
+    s_batch_seq++;
+    if (s_dp_left <= 0 || !s_dp_prefix[0]) return;
+    s_dp_left--;
+    snprintf(path, sizeof path, "%s_%02d_d%u.txt", s_dp_prefix, s_dp_n++, s_d3d.draw_count);
+    drawprint_write(path, "");
+}
+static void drawprint_write(const char* path, const char* hdr)
+{
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fputs(hdr, f);
+    const u32 par = (u32)s_d3d.vp_parity;
+    for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        if (dr->is_clear) {
+            fprintf(f, "d%u CLEAR rt=%X flags=%X z=%X\n", d, dr->rt_off, dr->clr_flags, dr->zeta);
+            continue;
+        }
+        if (!dr->is_vp) { fprintf(f, "d%u legacy n=%u\n", d, dr->vertex_count); continue; }
+        u32 vsh = (dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[dr->vs_idx].hash : 0;
+        /* Every 4th vertex: the upload heap is write-combined, slow to read. */
+        u32 vb = 0;
+        if (s_d3d.vp_vb_mapped) {
+            const u8* v0 = (const u8*)s_d3d.vp_vb_mapped
+                + (u64)par * s_vp_cap * 256u /* VP_VERT_STRIDE */ + dr->vb_byte_offset;
+            vb = 2166136261u;
+            for (u32 k = 0; k < dr->vertex_count; k += 4)
+                vb = (vb ^ dp_hash(v0 + (u64)k * 256u, 256u)) * 16777619u;
+        }
+        u32 cb = (s_d3d.vp_cb_mapped && dr->cb_slot < MAX_DRAWS) ? dp_hash((const char*)s_d3d.vp_cb_mapped
+                     + ((u64)par * MAX_DRAWS + dr->cb_slot) * VP_CB_STRIDE, VP_CB_STRIDE) : 0;
+        u32 fcb = (s_d3d.vp_fpcb_mapped && dr->cb_slot < MAX_DRAWS) ? dp_hash((const char*)s_d3d.vp_fpcb_mapped
+                     + ((u64)par * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE,
+                     (size_t)(FPCB_K + s_fpk_n[dr->cb_slot]) * 16u) : 0;
+        fprintf(f, "d%u fp=%X vs=%08X n=%u bk=%X dep=%X cull=%X cm=%X rt=%X z=%X d2c=%X vb=%08X cb=%08X fcb=%08X",
+                d, dr->fp_addr, vsh, dr->vertex_count, dr->blend_key, dr->depth, dr->cull,
+                dr->cmask, dr->rt_off, dr->zeta, dr->d2c_mask, vb, cb, fcb);
+        for (int u = 0; u < RSX_FP_UNITS; u++) {
+            if (!dr->tex[u].set) continue;
+            if (dr->tex_rt[u] >= 0) { fprintf(f, " t%d=R%X", u, s_d3d.off_rt[dr->tex_rt[u]].off); continue; }
+            if (dr->tex_z[u] >= 0)  { fprintf(f, " t%d=Z%X", u, s_zeta[dr->tex_z[u]].off); continue; }
+            int ts = vp_tex_find(dr->tex[u].off, dr->tex[u].w, dr->tex[u].h, dr->tex[u].fmt,
+                                 dr->tex[u].cube && (dr_cube_mask(dr) & (1u << u)));
+            if (ts >= 0) fprintf(f, " t%d=T%X:%08X", u, dr->tex[u].raw, s_d3d.vp_tex[ts].csum);
+            else fprintf(f, " t%d=-%X", u, dr->tex[u].raw);
+        }
+        /* RSX_DRAWPRINT_K=1: the inline FP constants and texture scales too. */
+        { static int pk = -1; PS3_KNOB(pk, ps3_env_int("RSX_DRAWPRINT_K", 0));
+          if (pk && s_d3d.vp_fpcb_mapped && dr->cb_slot < MAX_DRAWS) {
+              const float* c = (const float*)((const char*)s_d3d.vp_fpcb_mapped
+                  + ((u64)par * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+              fprintf(f, " at=(%g,%g,%g)", c[FPCB_ALPHA*4], c[FPCB_ALPHA*4+1], c[FPCB_ALPHA*4+2]);
+              for (int u = 0; u < 16; u++)
+                  if (c[u*4] != 1.0f || c[u*4+1] != 1.0f) fprintf(f, " ts%d=(%g,%g)", u, c[u*4], c[u*4+1]);
+              for (int k = 0; k < s_fpk_n[dr->cb_slot]; k++)
+                  fprintf(f, " k%d=(%g,%g,%g,%g)", k, c[(FPCB_K+k)*4], c[(FPCB_K+k)*4+1],
+                          c[(FPCB_K+k)*4+2], c[(FPCB_K+k)*4+3]);
+          } }
+        fputc('\n', f);
+    }
+    fclose(f);
+}
+
 static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
@@ -5682,6 +5808,7 @@ rtt_dump_done:;
                                        dr_cube_mask(dr), dr->d2c_mask);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
+    drawprint_batch();
 
     /* Transition render target to RENDER_TARGET state */
     D3D12_RESOURCE_BARRIER barrier = {0};
@@ -6449,6 +6576,10 @@ skip_dump_consider: ;
               s_hotshot_n = 0;
               s_hotshot_left = n;
               s_d3d.dump_frames_left = n; s_d3d.dump_skip_left = 0;
+              const char* hd = getenv("RSX_HOTKEY_DIR");
+              if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
+              snprintf(s_dp_prefix, sizeof s_dp_prefix, "%s/%s_draws", hd, g_rcap_live_name);
+              s_dp_left = n; s_dp_n = 0;
           }
       } }
     if (s_hotshot_arm) {   /* F10, armed from the window procedure */
@@ -7206,8 +7337,99 @@ static int s_vp_fast = 1;
 static u32 s_vc_key[VP_VC_N], s_vc_tag[VP_VC_N], s_vc_gen;
 static VPSlot s_vc_v[VP_VC_N][16];
 
+/* RSX_LATE_CHECK, vertices: these are read when the draw is recorded, so the
+ * question is the other way round from textures -- did the title write a
+ * vertex array after issuing the draw that reads it? Each VP upload notes the
+ * guest bytes of every enabled array over the vertex range it fetched, and
+ * late_check hashes them again when the batch renders. A replay reads its
+ * snapshot from the end of the frame, so a late write shows live only. */
+#define LATE_VTX_MAX 16384
+typedef struct { const u8* p; u32 len, sum, fp, draw, slot, off; } LateVtx;
+static LateVtx* s_late_vtx;
+static u32 s_late_vtx_n, s_lv_lo, s_lv_hi, s_lv_draw, s_lv_klo, s_lv_khi, s_lv_idma, s_lv_ioff;
+static int s_lv_open;
+static rsx_fetch_plan s_lv_plan;
+static u32 lv_elem_bytes(u32 type, u32 n)
+{
+    switch (type) { case 4: case 7: return n; case 1: case 3: case 5: return 2 * n;
+                    default: return 4 * n; }
+}
+static void lv_close(void)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int, u32);
+    if (!s_lv_open) return;
+    s_lv_open = 0;
+    if (s_lv_lo > s_lv_hi || !vm_base) return;
+    for (u32 k = 0; k < s_lv_plan.n_on && s_late_vtx_n < LATE_VTX_MAX; k++) {
+        const rsx_fetch_slot* sl = &s_lv_plan.on[k];
+        u32 lo = s_lv_lo, hi = s_lv_hi;
+        if (sl->freq) { if (sl->modulo) { lo = 0; hi = sl->freq - 1; }
+                        else { lo /= sl->freq; hi /= sl->freq; } }
+        const u32 off = sl->off + lo * sl->stride;
+        u64 len = (u64)(hi - lo) * sl->stride + lv_elem_bytes(sl->type, sl->n);
+        if (len > (16u << 20)) len = 16u << 20;
+        const u32 ga = sl->main ? cellGcmResolveLocated(0, off) : sl->local_addr + off;
+        if (ga == 0xFFFFFFFFu) continue;
+        LateVtx* e = &s_late_vtx[s_late_vtx_n++];
+        e->p = vm_base + ga; e->len = (u32)len; e->off = sl->off;
+        e->sum = tex_csum_full(e->p, e->len);
+        e->fp = s_lv_plan.st ? s_lv_plan.st->shader_program : 0;
+        e->draw = s_lv_draw; e->slot = sl->idx;
+    }
+    /* The index range, too. */
+    if (s_lv_klo <= s_lv_khi && s_late_vtx_n < LATE_VTX_MAX) {
+        const u32 isz = ((s_lv_idma >> 4) & 0xF) == 1 ? 2 : 4;
+        const u32 base = cellGcmResolveLocated((s_lv_idma & 0xF) == 0, s_lv_ioff);
+        if (base != 0xFFFFFFFFu) {
+            LateVtx* e = &s_late_vtx[s_late_vtx_n++];
+            e->p = vm_base + base + (u64)s_lv_klo * isz;
+            e->len = (s_lv_khi - s_lv_klo + 1) * isz; e->off = s_lv_ioff;
+            e->sum = tex_csum_full(e->p, e->len);
+            e->fp = s_lv_plan.st ? s_lv_plan.st->shader_program : 0;
+            e->draw = s_lv_draw; e->slot = 16;
+        }
+    }
+}
+static void lv_open(const rsx_state* state)
+{
+    lv_close();
+    if (!late_on()) return;
+    if (!s_late_vtx && !(s_late_vtx = calloc(LATE_VTX_MAX, sizeof *s_late_vtx))) return;
+    rsx_fetch_plan_init(state, &s_lv_plan);
+    s_lv_lo = 0xFFFFFFFFu; s_lv_hi = 0; s_lv_open = 1;
+    s_lv_draw = s_d3d.draw_count;
+    s_lv_klo = 0xFFFFFFFFu; s_lv_khi = 0;
+    s_lv_idma = state->index_array_dma; s_lv_ioff = state->index_array_offset;
+}
+static void late_vtx_check(void)
+{
+    lv_close();
+    if (!s_late_vtx || !s_late_vtx_n) return;
+    static int said = 0;
+    u32 nchg = 0;
+    for (u32 i = 0; i < s_late_vtx_n; i++) {
+        const LateVtx* e = &s_late_vtx[i];
+        if (tex_csum_full(e->p, e->len) == e->sum) continue;
+        nchg++;
+        if (said < 60) { said++;
+            fprintf(stderr, "[LATE] frame %llu draw %u fp 0x%X %s%u array 0x%X (%u bytes) "
+                    "written after the draw read it%c", (unsigned long long)s_d3d.frame_count,
+                    e->draw, e->fp, e->slot == 16 ? "index" : "a", e->slot == 16 ? 0 : e->slot,
+                    e->off, e->len, 10); }
+    }
+    if (nchg) {
+        static int n = 0;
+        if (n++ < 200) fprintf(stderr, "[LATE] frame %llu: %u of %u vertex reads changed "
+                               "between draw and render%c", (unsigned long long)s_d3d.frame_count,
+                               nchg, s_late_vtx_n, 10);
+    }
+    s_late_vtx_n = 0;
+}
+
 static void vp_plan_begin(const rsx_state* state)
 {
+    lv_open(state);
     static int fast = -1;
     PS3_KNOB(fast, ps3_env_int("VP_FETCH_FAST", 1));
     s_vp_fast = fast != 0;
@@ -7217,6 +7439,7 @@ static void vp_plan_begin(const rsx_state* state)
 
 static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
 {
+    if (s_lv_open) { if (vi < s_lv_lo) s_lv_lo = vi; if (vi > s_lv_hi) s_lv_hi = vi; }
     if (s_vp_fast && s_vp_plan.st == state) {
         /* Built on the stack, then one copy: out16 is usually the upload
          * heap, which is write-combined. */
@@ -7563,6 +7786,7 @@ static u32 read_guest_index(const rsx_state* st, u32 k)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
+    if (s_lv_open) { if (k < s_lv_klo) s_lv_klo = k; if (k > s_lv_khi) s_lv_khi = k; }
     int local = ((st->index_array_dma & 0xF) == 0);
     u32 base = cellGcmResolveLocated(local, st->index_array_offset);
     const u8* p = vm_base + base;
@@ -8561,6 +8785,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     { extern void (*g_gcm_fifo_flip_hook)(void); g_gcm_fifo_flip_hook = d3d12_fifo_flip; }
     if (ps3_env_int("RSX_ZPASS", 1)) g_rsx_report_hook = zq_hook;
+    { extern void (*g_rcap_mark_hook)(int end); g_rcap_mark_hook = cap_mark; }
     memset(&s_d3d, 0, sizeof(s_d3d));
     s_d3d.width = width;
     s_d3d.height = height;

@@ -1,4 +1,5 @@
 #pragma once
+#include <stdlib.h>
 /* Live diagnostic knobs.
  *
  * Most runtime knobs are environment variables read once into a static, so a
@@ -16,9 +17,22 @@
 extern "C" {
 #endif
 
-extern volatile unsigned ps3_env_gen;   /* starts at 1; setenv increments it */
+/* Defined here, once per program (weak / selectany), so a test that compiles
+ * a few library sources on its own links without runtime/diag/ps3_knob.c. */
+#if defined(_MSC_VER)
+#define PS3_KNOB_SHARED __declspec(selectany)
+#else
+#define PS3_KNOB_SHARED __attribute__((weak))
+#endif
+PS3_KNOB_SHARED volatile unsigned ps3_env_gen = 1;   /* setenv increments it */
 void ps3_env_bump(void);
-int  ps3_env_int(const char* name, int def);   /* atoi(getenv(name)), def if unset */
+
+/* atoi(getenv(name)), def if unset */
+static inline int ps3_env_int(const char* name, int def)
+{
+    const char* e = getenv(name);
+    return e ? atoi(e) : def;
+}
 
 #ifdef __cplusplus
 }

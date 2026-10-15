@@ -55,3 +55,11 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  * never read back. */
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
+
+/* Wait/wake diagnostics the sync syscalls report into: thread_diag.c,
+ * ps3_ms_now (ppu_hle.cpp) and the stall hook sys_timer.c defines are not in
+ * this suite; the reports are print-only. */
+void thrdiag_wait(const char* type, uint32_t obj) { (void)type; (void)obj; }
+void thrdiag_wake(void) {}
+unsigned long long ps3_ms_now(void) { return 0; }
+void (*g_shadow_stack_dump_hook)(void) = 0;

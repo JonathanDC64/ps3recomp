@@ -35,10 +35,6 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * runtime/host/host_stubs.c does not cover. No guest code runs here. */
 const uint64_t function_table[2] = { 0, 0 };   /* backtrace symbolisation: empty */
 const uint64_t function_table_count = 0;
-void ppu_guard_page_rearm(uint32_t ea, int abs) { (void)ea; (void)abs; }
-uint64_t ppu_guest_call(uint32_t opd, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
-{ (void)opd; (void)a; (void)b; (void)c; (void)d; return 0; }
-void ps3_exit_on(const char* tag) { (void)tag; }
 
 /* Commit guest pages on first touch, as the game's runtime does: the backend
  * may read past what the capture held (it held only non-zero pages), and
