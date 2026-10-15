@@ -203,6 +203,19 @@ typedef struct {
 #define VP_TEX_SRV_BASE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
 #define SRV_HEAP_SIZE (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
 
+/* Bumped on every resource creation. A cached descriptor (srv_write_ex) names
+ * its resource by pointer, and a released resource's address can come back
+ * for a new one: the stamp tells the two apart. */
+static u32 s_res_gen = 1;
+static HRESULT d3d_create_committed(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* hp,
+                                    D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
+                                    D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
+                                    REFIID riid, void** out)
+{
+    s_res_gen++;
+    return dev->lpVtbl->CreateCommittedResource(dev, hp, hf, rd, st, cv, riid, out);
+}
+
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
  * memory). SRV lives at heap index VP_TEX_SRV_BASE+slot. */
@@ -511,7 +524,7 @@ static void subvp_capture(u32 fi)
             td.DepthOrArraySize = 1; td.MipLevels = 1;
             td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
             td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            if (FAILED(d3d_create_committed(
                     s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
                     &IID_ID3D12Resource, (void**)&s_subvp[i].res)))
@@ -867,7 +880,7 @@ static int init_d3d12(u32 width, u32 height)
         depth_clear.DepthStencil.Depth           = 1.0f;
         depth_clear.DepthStencil.Stencil         = 0;
 
-        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        hr = d3d_create_committed(
             s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
             &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
             &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
@@ -1197,6 +1210,7 @@ static int init_d3d12(u32 width, u32 height)
                     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &nv, hh);
                     hh.ptr += s_d3d.srv_inc;
                 }
+                s_res_gen++;   /* a new heap: forget srv_write_ex's memo */
             }
         }
 
@@ -1227,7 +1241,7 @@ static int init_d3d12(u32 width, u32 height)
         buf_desc.SampleDesc.Count = 1;
         buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        hr = d3d_create_committed(
             s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
             &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
             &IID_ID3D12Resource, (void**)&s_d3d.vertex_buffer);
@@ -1336,7 +1350,7 @@ static int init_d3d12(u32 width, u32 height)
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
                 (unsigned long long)(bd.Width >> 20), (unsigned)s_vp_cap, 10);
-        if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
             s_d3d.vp_vb->lpVtbl->Map(s_d3d.vp_vb, 0, &nr, &s_d3d.vp_vb_mapped);
@@ -1349,13 +1363,13 @@ static int init_d3d12(u32 width, u32 height)
          * zeros -- indistinguishable from a broken vertex program. Say so. */
         fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
                 (unsigned long long)(bd.Width >> 20), MAX_DRAWS, 10);
-        if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
             s_d3d.vp_cb->lpVtbl->Map(s_d3d.vp_cb, 0, &nr, &s_d3d.vp_cb_mapped);
 
         bd.Width = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;  /* per-draw FP slots (b1), x2 parity */
-        if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
                 D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.vp_fpcb)))
             s_d3d.vp_fpcb->lpVtbl->Map(s_d3d.vp_fpcb, 0, &nr, &s_d3d.vp_fpcb_mapped);
@@ -1647,7 +1661,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
     rd.Width = (u64)pitch * h; rd.Height = 1; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+    if (FAILED(d3d_create_committed(
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&rb)) || !rb)
@@ -3371,7 +3385,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         td.MipLevels = 1;
         td.Format = dxfmt; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        if (FAILED(d3d_create_committed(
                 s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
@@ -3382,7 +3396,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         bd.Width = (u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1);
         bd.Height = 1; bd.DepthOrArraySize = 1;
         bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        if (FAILED(d3d_create_committed(
                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&t->up))) {
@@ -4404,7 +4418,7 @@ static int zeta_get(u32 off, u32 w, u32 h)
     D3D12_CLEAR_VALUE cv = {0};
     cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     cv.DepthStencil.Depth = 1.0f;
-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+    if (FAILED(d3d_create_committed(
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
             D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
             &IID_ID3D12Resource, (void**)&z->res)))
@@ -4489,7 +4503,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_CLEAR_VALUE cv = {0};
     cv.Format = td.Format;
-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+    if (FAILED(d3d_create_committed(
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
             D3D12_RESOURCE_STATE_COPY_DEST, &cv,
             &IID_ID3D12Resource, (void**)&r->res)))
@@ -4519,7 +4533,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             bd.Width = (u64)pitch * h; bd.Height = 1; bd.DepthOrArraySize = 1;
             bd.MipLevels = 1; bd.SampleDesc.Count = 1;
             bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            if (SUCCEEDED(d3d_create_committed(
                     s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
                     D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                     &IID_ID3D12Resource, (void**)&r->up))) {
@@ -4690,7 +4704,7 @@ static void rt_writeback_record(void)
             rd.Width = need; rd.Height = 1; rd.DepthOrArraySize = 1;
             rd.MipLevels = 1; rd.SampleDesc.Count = 1;
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            if (FAILED(d3d_create_committed(
                     s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                     D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                     &IID_ID3D12Resource, (void**)&r->rb)) || !r->rb) {
@@ -4848,9 +4862,28 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
 
 /* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
  * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
+/* What each per-draw window descriptor last held. A draw at the same index
+ * usually binds the same textures as it did the frame before, and at 5-6k
+ * draws a frame (Demon's Souls's Boletarian Palace) re-creating all 16 views
+ * of every window was ~11 ms of the render thread's frame. An unchanged view
+ * is left as it is. The heap is only written after the GPU has finished the
+ * previous frame (render_frame waits first), so skipping a write is safe. */
+typedef struct { ID3D12Resource* res; u32 fmt, mapping, gen; } SrvMemo;
+static SrvMemo s_srv_memo[MAX_DRAWS * RSX_FP_UNITS];
+
 static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
                          UINT mapping, int cube)
 {
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_SRV_MEMO", 1));
+    SrvMemo* m = NULL;
+    if (en && heap_slot >= DRAW_SRV_BASE && heap_slot < VP_TEX_SRV_BASE) {
+        m = &s_srv_memo[heap_slot - DRAW_SRV_BASE];
+        const u32 g = (s_res_gen << 1) | (cube ? 1u : 0u);
+        if (m->gen == g && m->res == res && m->fmt == (u32)fmt && m->mapping == mapping)
+            return;
+        m->res = res; m->fmt = (u32)fmt; m->mapping = mapping; m->gen = g;
+    }
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = fmt;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -4909,7 +4942,7 @@ static ID3D12Resource* off_rt_snapshot(int slot)
         td.Width = r->w; td.Height = r->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
         td.Format = (DXGI_FORMAT)r->dxgi; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        if (FAILED(d3d_create_committed(
                 s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&r->snap)))
@@ -4977,7 +5010,7 @@ static void screen_copy_capture(u32 fi)
                 td.DepthOrArraySize = 1; td.MipLevels = 1;
                 td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
                 td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-                if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                if (FAILED(d3d_create_committed(
                         s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
                         &IID_ID3D12Resource, (void**)&s_screen_copy)))
@@ -5155,7 +5188,7 @@ static void guest_fb_present(u32 fi)
         bd.DepthOrArraySize = 1; bd.MipLevels = 1;
         bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+        if (FAILED(d3d_create_committed(
                 s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&up)))
@@ -5239,7 +5272,7 @@ static void vp_vb_grow(u64 want)
     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     bd.Width = cap * 256 * 2;          /* VP_VERT_STRIDE, two parity halves */
     ID3D12Resource* nb = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
             D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
             &IID_ID3D12Resource, (void**)&nb)) ||
         FAILED(nb->lpVtbl->Map(nb, 0, &nr, &mp)) || !mp) {
@@ -5326,7 +5359,7 @@ static int zq_ready(void)
     rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
     rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp,
+    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
             D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&s_zq_rb))) {
         s_zq_heap->lpVtbl->Release(s_zq_heap); s_zq_heap = NULL; s_zq_rb = NULL; return 0;
@@ -5930,7 +5963,7 @@ static void render_frame(void)
         rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        s_d3d.device->lpVtbl->CreateCommittedResource(
+        d3d_create_committed(
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&s_d3d.readback_buf);
@@ -5962,7 +5995,7 @@ static void render_frame(void)
         td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
         td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
         td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        HRESULT thr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        HRESULT thr = d3d_create_committed(
             s_d3d.device, &hp_def, D3D12_HEAP_FLAG_NONE, &td,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&s_d3d.tex_resource);
@@ -5973,7 +6006,7 @@ static void render_frame(void)
         ud.Width = (u64)pitch * h; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
         ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         if (SUCCEEDED(thr))
-            thr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            thr = d3d_create_committed(
                 s_d3d.device, &hp_up, D3D12_HEAP_FLAG_NONE, &ud,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
                 &IID_ID3D12Resource, (void**)&s_d3d.tex_upload);
@@ -7139,7 +7172,7 @@ rtt_dump_done:;
                 rd.Width = (u64)pitch * r->h; rd.Height = 1; rd.DepthOrArraySize = 1;
                 rd.MipLevels = 1; rd.SampleDesc.Count = 1;
                 rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                s_d3d.device->lpVtbl->CreateCommittedResource(
+                d3d_create_committed(
                     s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
                     D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                     &IID_ID3D12Resource, (void**)&s_rtsave_buf);
