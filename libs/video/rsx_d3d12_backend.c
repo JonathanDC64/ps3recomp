@@ -404,6 +404,13 @@ typedef struct {
 static D3D12State s_d3d;
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* F10: dump the next RSX_HOTKEY_SHOTS (default 12) presents, every one, to
+ * RSX_HOTKEY_DIR as shot_<burst>_<n>_d<draws>.bmp. For a flicker someone
+ * playing can see but a replay cannot show (a replay has no flips, so it
+ * cuts frames at display clears instead): what was actually presented, one
+ * file per present, with the batch's draw count in the name. */
+static volatile int s_hotshot_left, s_hotshot_arm;
+static int s_hotshot_burst = -1, s_hotshot_n;
 /* GCM_RATES: why a frame boundary did or did not present (per-second deltas) */
 static u32 s_clear_presents;   /* defined with the clear path */
 static u32 s_pc_flip_render, s_pc_flip_nodisp, s_pc_clear_nodisp, s_pc_clear_sameflip, s_pc_clear_small;
@@ -576,6 +583,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             extern void cellGcm_replay_hotkey(void);
             cellGcm_replay_hotkey();
         }
+        if (wp == VK_F10 && !(lp & (1 << 30))) s_hotshot_arm = 1;   /* see s_hotshot_left */
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
@@ -1444,8 +1452,8 @@ static void dump_backbuffer_bmp(void)
      * enough to tell a logo or a menu change from a re-presented frame, and a
      * long static screen then costs one file instead of hundreds. */
     { static int chg = -1; static unsigned long long last = 0;
-      PS3_KNOB(chg, getenv("CELLMARK_DUMP_CHANGED") ? 1 : 0);
-      if (chg) {
+      PS3_KNOB(chg, ps3_env_int("CELLMARK_DUMP_CHANGED", 0));
+      if (chg && s_hotshot_left <= 0) {   /* an F10 burst keeps every present */
           unsigned long long hsh = 1469598103934665603ull;
           for (u32 y = 0; y < s_d3d.height; y += 8) {
               const u32* row = (const u32*)((unsigned char*)mapped + (u64)y * s_d3d.readback_pitch);
@@ -1462,6 +1470,12 @@ static void dump_backbuffer_bmp(void)
     static int idx = 0;
     char path[512];
     const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
+    if (s_hotshot_left > 0 && !s_dump_name) {
+        const char* hd = getenv("RSX_HOTKEY_DIR");
+        snprintf(path, sizeof(path), "%s%sshot_%03d_%02d_d%u.bmp", hd ? hd : "", hd ? "/" : "",
+                 s_hotshot_burst, s_hotshot_n++, s_dbg_last_draws);
+        s_hotshot_left--;
+    } else
     snprintf(path, sizeof(path), "%s%s%s_%03d.bmp",
              dir ? dir : "", dir ? "/" : "", s_dump_name ? s_dump_name : "frame", idx++);
     FILE* f = fopen(path, "wb");
@@ -1494,7 +1508,8 @@ static void dump_backbuffer_bmp(void)
             free(row);
         }
         fclose(f);
-        printf("[D3D12] dumped %s (%ux%u)\n", path, s_d3d.width, s_d3d.height);
+        printf("[D3D12] dumped %s (%ux%u, %u draws)\n", path, s_d3d.width, s_d3d.height,
+               s_dbg_last_draws);
     }
     D3D12_RANGE wr = {0, 0};
     s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
@@ -4036,7 +4051,21 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         if (slot < 0) {   /* evict an entry not used this frame */
             for (int i = 0; i < MAX_OFF_RTS; i++)
                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
-            if (slot < 0) return -1;
+            if (slot < 0) {
+                /* Every target is in use this frame: the draws into this one
+                 * are dropped, and whatever samples it reads nothing. */
+                static u64 said = ~0ull;
+                if (said != s_d3d.frame_count) { said = s_d3d.frame_count;
+                    static int n = 0;
+                    if (n++ < 20) fprintf(stderr, "[RT] all %d offscreen targets in use this "
+                                          "frame: 0x%X (%ux%u) not created%c",
+                                          MAX_OFF_RTS, off, w, h, 10); }
+                return -1;
+            }
+            { static int n = 0;   /* a target a later frame reads loses its content */
+              if (n++ < 20) fprintf(stderr, "[RT] evicted 0x%X (%ux%u) for 0x%X (%ux%u)%c",
+                                    s_d3d.off_rt[slot].off, s_d3d.off_rt[slot].w,
+                                    s_d3d.off_rt[slot].h, off, w, h, 10); }
             /* same hazard as above: the open list may still use it */
             off_rt_defer_release(s_d3d.off_rt[slot].res); s_d3d.off_rt[slot].res = NULL;
             off_rt_defer_release(s_d3d.off_rt[slot].up);  s_d3d.off_rt[slot].up = NULL;
@@ -4880,6 +4909,13 @@ static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
+    /* RSX_FRAME_SLEEP=<ms> (live, diagnostic): stall each batch this long.
+     * Frames over ~36 ms put Demon's Souls's pacer into its 15 fps mode, with
+     * a skip frame between rendered ones (see docs/28, Frame rate); this
+     * reproduces that mode on a machine fast enough not to enter it. */
+    { static int fs = -1;
+      PS3_KNOB(fs, ps3_env_int("RSX_FRAME_SLEEP", 0));
+      if (fs > 0) Sleep((DWORD)fs); }
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
      * vp_cb constants, per-frame texture staging): the previous frame's draws
@@ -6152,6 +6188,34 @@ rtt_dump_done:;
       if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
 skip_dump_consider: ;
+    /* CELLMARK_DUMP_NOW=<n> (live): dump the next n presents, every one, from
+     * the console -- the frames around a flicker, once the game is showing it.
+     * CELLMARK_DUMP is read at init, and its skip count cannot know when a
+     * hand-driven run reaches the spot. Each dump line gives the batch's draws. */
+    if (s_hotshot_arm) {   /* F10, armed from the window procedure */
+        s_hotshot_arm = 0;
+        const int n = ps3_env_int("RSX_HOTKEY_SHOTS", 12);
+        const char* hd = getenv("RSX_HOTKEY_DIR");
+        char probe[512];
+        do {   /* the first burst number not already on disk */
+            s_hotshot_burst++;
+            snprintf(probe, sizeof probe, "%s%sshot_%03d_00_d*.bmp", hd ? hd : "", hd ? "/" : "",
+                     s_hotshot_burst);
+            WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(probe, &fd);
+            if (fh == INVALID_HANDLE_VALUE) break;
+            FindClose(fh);
+        } while (s_hotshot_burst < 999);
+        s_hotshot_n = 0;
+        s_hotshot_left = n > 0 ? n : 12;
+        s_d3d.dump_frames_left = s_hotshot_left; s_d3d.dump_skip_left = 0;
+        printf("[F10] dumping the next %d presents as shot_%03d_*%c", s_hotshot_left,
+               s_hotshot_burst, 10);
+    }
+    { static unsigned gen; static int last;
+      if (gen != ps3_env_gen) { gen = ps3_env_gen;
+          const int v = ps3_env_int("CELLMARK_DUMP_NOW", 0);
+          if (v != last) { last = v;
+              if (v > 0) { s_d3d.dump_frames_left = v; s_d3d.dump_skip_left = 0; } } } }
     guest_fb_present(fi);
     composite_present(fi);
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
