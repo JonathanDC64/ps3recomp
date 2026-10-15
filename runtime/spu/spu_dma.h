@@ -194,10 +194,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
       if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
           if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
       if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
-          static int _n = 0;
-          if (_n++ < 64)
-              fprintf(stderr, "[dma-range] pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                      (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size);
+          /* SPU_DMA_RANGE_MAX=<n>: how many to log (default 64, 0 = all). Each
+           * line carries the time and the first word moved, so a PUT of a
+           * result or a ring pointer can be followed over a run. */
+          /* SPU_DMA_RANGE_IMG=<id>: only that lifted image's transfers. */
+          static int _n = 0; static long s_max = -1, s_img = -2;
+          if (s_max < 0) { const char* m = getenv("SPU_DMA_RANGE_MAX"); s_max = m ? atol(m) : 64; }
+          if (s_img == -2) { const char* m = getenv("SPU_DMA_RANGE_IMG"); s_img = m ? atol(m) : -1; }
+          if ((s_img < 0 || spu->image_id == s_img) && (!s_max || _n++ < s_max)) {
+              extern unsigned long long ps3_ms_now(void);
+              const uint8_t* w = &spu->ls[lsa & SPU_LS_MASK];
+              fprintf(stderr, "[dma-range] t=%llu img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u w0=%02X%02X%02X%02X\n",
+                      ps3_ms_now(), spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa,
+                      (uint32_t)ea, size, w[0], w[1], w[2], w[3]);
+          }
           /* ...and every 5 s, the bytes PUT into / GOT from the range. */
           { static volatile long long s_put, s_get; static unsigned long long s_t0;
             extern unsigned long long ps3_ms_now(void);

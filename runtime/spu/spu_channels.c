@@ -782,6 +782,39 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
+        /* SPU_LLAR_HIST=<image id>: every 2 s, that image's top GETLLAR lines
+         * and how many idle naps it took -- what a slow SPU is polling, which
+         * the DMA logs cannot show (GETLLAR is not a transfer). Unlocked
+         * counters: a diagnostic, the top entries survive a lost increment. */
+        { static int s_hi = -2;
+          if (s_hi == -2) { const char* e = getenv("SPU_LLAR_HIST"); s_hi = e ? atoi(e) : -1; }
+          if (s_hi >= 0 && ctx->image_id == s_hi) {
+              enum { LH_N = 64 };
+              static uint32_t lh_ea[LH_N], lh_n[LH_N], lh_pc[LH_N]; static int lh_used;
+              static unsigned long long lh_t0;
+              extern unsigned long long ps3_ms_now(void);
+              extern volatile long g_spu_llar_naps;
+              int i = 0;
+              for (; i < lh_used; i++) if (lh_ea[i] == ea) break;
+              if (i == lh_used && lh_used < LH_N) { lh_ea[i] = ea; lh_n[i] = 0; lh_used++; }
+              if (i < LH_N) { lh_n[i]++; lh_pc[i] = (uint32_t)ctx->pc & SPU_LS_MASK; }
+              unsigned long long now = ps3_ms_now();
+              if (!lh_t0) lh_t0 = now;
+              if (now - lh_t0 >= 2000) {
+                  fprintf(stderr, "[llar-hist] t=%llu img=%d naps=%ld:", now, s_hi, g_spu_llar_naps);
+                  for (int k = 0; k < 6; k++) {
+                      int b = -1;
+                      for (int j = 0; j < lh_used; j++)
+                          if (lh_n[j] && (b < 0 || lh_n[j] > lh_n[b])) b = j;
+                      if (b < 0) break;
+                      fprintf(stderr, " %08X x%u(pc %05X)", lh_ea[b], lh_n[b], lh_pc[b]);
+                      lh_n[b] = 0;
+                  }
+                  fprintf(stderr, "\n");
+                  for (int j = 0; j < lh_used; j++) lh_n[j] = 0;
+                  g_spu_llar_naps = 0; lh_t0 = now;
+              }
+          } }
         spu_lockline_unlock();
         /* Idle-poll back-off. A GETLLAR loop that keeps reading the same,
          * unchanged line is an SPU waiting for another processor to write it;
@@ -1187,8 +1220,10 @@ void spu_ch_wake(spu_context* ctx)
  * which clears resv_valid and wakes this cv -- instead of spinning GETLLAR.
  * The notifier does not take ch_wait_lock, so a write landing between the
  * check and the sleep can miss the wake; the 2 ms timeout bounds that. */
+volatile long g_spu_llar_naps;   /* SPU_LLAR_HIST */
 static void spu_llar_idle_wait(spu_context* ctx)
 {
+    g_spu_llar_naps++;
     yz_lockstep_block_begin(ctx);
     AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     if (ctx->resv_valid && vm_base &&
