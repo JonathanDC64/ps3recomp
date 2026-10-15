@@ -771,6 +771,8 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
+extern "C" uint32_t spu_hist_line(void);
+extern "C" void spu_hist(char op, int image, uint32_t a, uint32_t b, uint32_t c);
 
 /* ---------------------------------------------------------------------------
  * lwarx/stwcx. cross-thread reservation invalidation.
@@ -992,6 +994,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
+    /* SPU_HIST_LINE: a PPU commit on the watched line, into the SPU history
+     * ring beside the SPU's own (spu_workload.h), so one ordered record shows
+     * both halves of a PPU/SPU atomic counter. */
+    if (ok) { const uint32_t hl = spu_hist_line();
+        if (hl && ((uint32_t)ea & ~127u) == (hl & ~127u))
+            spu_hist('l', 0, self ? (uint32_t)self->lr : 0u, expected, val); }
     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
      * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
      * spins on) is written exclusively through here and looked untouched. */
@@ -1544,6 +1552,16 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
 static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
+/* SPU_HIST_LINE: a plain PPU store to the watched line (s: lr, ea, the word
+ * there afterwards). Only reached on SPU-reserved lines. */
+static inline void ppu_hist_plain_store(uint32_t a, unsigned n)
+{
+    const uint32_t hl = spu_hist_line();
+    if (!hl || (a & ~127u) != (hl & ~127u)) return;
+    uint32_t w; memcpy(&w, vm_base + (hl & ~3u), 4);
+    spu_hist('s', (int)n, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u, a, __builtin_bswap32(w));
+}
+
 /* Every guest store commits through this: on a line no SPU has reserved (all of
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
@@ -1553,6 +1571,7 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
             spu_lockline_unlock();                                            \
+            ppu_hist_plain_store((uint32_t)(a), (n));                         \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
         }                                                                     \
@@ -3793,6 +3812,13 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* Per-host-thread callback stack. Every thread's first callback used to take
+ * 0xCFFE0000, so two threads delivering callbacks at once shared one stack. A
+ * host thread that delivers callbacks concurrently with the guest (the vblank
+ * clock) sets its own first. */
+static PPU_THREAD_LOCAL uint32_t t_cb_sp_override = 0;
+extern "C" void ppu_guest_call_set_stack(uint32_t sp) { t_cb_sp_override = sp; }
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3820,7 +3846,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = t_cb_sp_override ? t_cb_sp_override : 0xCFFE0000u;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3865,7 +3891,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = t_cb_sp_override ? t_cb_sp_override : 0xCFFE0000u;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

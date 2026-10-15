@@ -433,8 +433,10 @@ static void present_guest_frame(void)
  * answers "where does thread X spend its wall time" without a debugger. */
 #include "../../syscalls/sys_ppu_thread.h"
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
+#include "../../spu/spu_workload.h"          /* SPU history ring (console spuhist) */
 #include "../ppu_waits.h"                     /* console waits */
 extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
+extern "C" void (*volatile g_spu_trace_mark)(const char*, uint32_t, uint32_t);   /* spu_channels.c */
 extern "C" volatile long g_rsx_prof_toggle;   /* F11 profile sessions (profile_thread) */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
@@ -480,6 +482,75 @@ static DWORD WINAPI guest_prof_thread(LPVOID)
 }
 
 extern "C" const char* cellGame_get_title(void);   /* PARAM.SFO TITLE, for the caption */
+
+/* GCM_VBLANK_THREAD (default 1): vblanks come from a thread of their own,
+ * which also runs the game's vblank and flip handlers, the way libgcm's
+ * interrupt thread does on hardware.
+ *
+ * The ticks used to be marked by the render loop below, between drains and
+ * presents, and the handlers ran at the next HLE call of whichever guest
+ * thread made one. Both added delay: a 15 ms render_frame held the tick, and
+ * delivery waited for a guest thread to call into the runtime. Demon's Souls
+ * flips from HighGraphics after its vblank handler posts a semaphore; the
+ * posts came 7-25 ms apart instead of every 16.7, each late one pushed a frame
+ * past the game's 36.3 ms limit, and its pacer fell back to 15 fps (the
+ * Boletarian Palace render/skip alternation, the Tutorial micro-stutter).
+ *
+ * The handlers run on a guest stack of their own, with a host-thread identity
+ * (ppu_guest_call). The HLE-boundary pump stays as a fallback for a tick this
+ * thread could not deliver (another thread was mid-pump). */
+extern "C" uint32_t sys_ppu_thread_alloc_host_stack(uint32_t size);
+extern "C" void ppu_guest_call_set_stack(uint32_t sp);
+extern "C" void ppu_gcm_pump(void);
+static int vblank_thread_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = ps3_env_int("GCM_VBLANK_THREAD", 1) ? 1 : 0;
+    return on;
+}
+
+static DWORD WINAPI vblank_clock(LPVOID)
+{
+    if (uint32_t sp = sys_ppu_thread_alloc_host_stack(0x10000u)) ppu_guest_call_set_stack(sp);
+    else fprintf(stderr, "[vblank] no guest stack for the clock thread; sharing the callback stack%c", 10);
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); a plain timer
+     * rounds to the scheduler tick. */
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#endif
+    LARGE_INTEGER qpf, qpc;
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&qpc);
+    const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
+    const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
+    long long next_tick = qpc.QuadPart + tick_qpc;
+    for (;;) {
+        QueryPerformanceCounter(&qpc);
+        long long wait_qpc = next_tick - qpc.QuadPart;
+        if (wait_qpc > 0) {
+            const long long us = wait_qpc * 1000000 / qpf.QuadPart;
+#ifdef _WIN32
+            if (timer) {
+                LARGE_INTEGER due; due.QuadPart = -(us * 10);
+                SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(timer, INFINITE);
+            } else Sleep((DWORD)(us / 1000));
+#else
+            usleep((useconds_t)us);
+#endif
+            continue;   /* re-check: a timer can wake a little early */
+        }
+        /* Far behind (the machine stalled): resync rather than burst. */
+        if (-wait_qpc > tick_qpc * 8) next_tick = qpc.QuadPart;
+        next_tick += tick_qpc;
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+        ppu_gcm_pump();
+    }
+    return 0;
+}
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
@@ -547,7 +618,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         ULONGLONG now = GetTickCount64();
         QueryPerformanceCounter(&qpc);
         int fired = 0;
-        while (qpc.QuadPart - next_tick >= 0 && fired < 240) {
+        while (!vblank_thread_on() && qpc.QuadPart - next_tick >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining further: the flip fires
@@ -1303,6 +1374,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
             dbg_printf("  ctx <tid>        a guest thread's live registers (lr = where it is parked)%c", 10);
             dbg_printf("  synchist <id> [n] cond/mutex history for an id (create, wait, signal, destroy)%c", 10);
+            dbg_printf("  spuhist [img] [n] SPU task history (dispatch, start, end, signal, user events)%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
@@ -1434,8 +1506,10 @@ static DWORD WINAPI debug_console(LPVOID param)
             sscanf(cmd, "%*s %u %259s", &a, tp);
             if (!tp[0]) snprintf(tp, sizeof tp, "%s.trace", path);
             g_rsx_trace_mark = ppu_trace_mark;
+            g_spu_trace_mark = ppu_trace_mark;
             const int n = ppu_trace_run(a ? a : 2, tp);
             g_rsx_trace_mark = nullptr;
+            g_spu_trace_mark = nullptr;
             dbg_printf("  %d records -> %s%c", n, tp, 10);
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
@@ -1472,6 +1546,24 @@ static DWORD WINAPI debug_console(LPVOID param)
                 const sync_hist_ent* e = &g_sync_hist[hits[nh] & (SYNC_HIST_N - 1)];
                 dbg_printf("  t=%u %c id=0x%X tid=%u lr=0x%08X x=0x%X r=0x%08X%c", e->t_ms, e->op,
                            e->id, e->tid, e->lr, e->extra, (unsigned)e->res, 10);
+            }
+        } else if (!strcmp(verb, "spuhist")) {
+            /* spuhist [image] [n]: the last n (default 60) SPU history events,
+             * oldest first, for one lifted image (0 = all). Ops: D dispatched,
+             * N not started, S started, R entry returned (c=rc), X thread done,
+             * G signalled, W/w WAIT_SIGNAL enter/resume, P user event (a=port |
+             * data0<<8, b=queue | bit31 if the queue refused it, c=data1). */
+            unsigned img = 0, want = 60;
+            sscanf(cmd, "%*s %u %u", &img, &want);
+            const long n = g_spu_hist_n;
+            const long lo = n > SPU_HIST_N ? n - SPU_HIST_N : 0;
+            static long hits[4096]; unsigned nh = 0;
+            for (long i = n - 1; i >= lo && nh < want && nh < 4096; i--)
+                if (!img || g_spu_hist[i & (SPU_HIST_N - 1)].image == img) hits[nh++] = i;
+            while (nh--) {
+                const spu_hist_ent* e = &g_spu_hist[hits[nh] & (SPU_HIST_N - 1)];
+                dbg_printf("  t=%u %c img=%u a=0x%08X b=0x%08X c=0x%08X htid=%u%c", e->t_ms, e->op,
+                           e->image, e->a, e->b, e->c, e->htid, 10);
             }
         } else if (!strcmp(verb, "spu")) {
             /* SPU program runs per lifted image id since start (dispatch HITs). */
@@ -1932,6 +2024,7 @@ int main(int argc, char** argv)
      * frame clock now runs everywhere. Without it a POSIX host never ticks
      * vblank or drains the FIFO, and the guest waits on fences forever. */
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
+    if (vblank_thread_on()) CreateThread(NULL, 1u * 1024 * 1024, vblank_clock, NULL, 0, NULL);
     if (getenv("PS3_GUEST_PROF"))
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #ifdef _WIN32

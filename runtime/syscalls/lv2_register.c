@@ -1714,6 +1714,13 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+            /* SPURS tasks only: a raw SPU thread group (MultiStream's synth)
+             * sends thousands a second and would flush the ring. */
+            if (!spu->spu_group_id) {
+                extern void spu_hist(char, int, uint32_t, uint32_t, uint32_t);
+                spu_hist('P', spu->image_id, port | (value & 0xFFFFFFu) << 8,
+                         queue | (rc ? 0x80000000u : 0u), data);
+            }
             if (rc == 0 && !spu->spu_group_id) {
                 extern void spurs_note_spu_event(uint32_t queue);
                 spurs_note_spu_event(queue);

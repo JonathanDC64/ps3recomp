@@ -20,12 +20,11 @@
  * The last test is the event acknowledge. An SPU acknowledging the events it
  * has read is a read-modify-write of the same word every one of those raises
  * writes, so an edge landing between the read and the write is dropped and the
- * SPU goes back to sleep holding a reservation it has already lost. The
- * interleaving is built with the lock-line lock rather than raced for: the main
- * thread takes the lock, a second thread starts the acknowledge and is held at
- * that lock, that the acknowledge has NOT completed while the lock is held is
- * asserted, the raise then happens under the lock, and only afterwards is the
- * acknowledge let through.
+ * SPU goes back to sleep holding a reservation it has already lost. Both sides
+ * are atomic, and the test races them to show no raise is lost.
+ *
+ * Then the runtime as a writer: spu_coh_rmw32, which updates the SPURS task
+ * bitsets an SPU also commits to, raced against PUTLLCs on the same word.
  *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
@@ -350,69 +349,138 @@ static void test_wide_put_finds_the_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ * The acknowledge does not take the lock-line lock: it and every raise are
+ * atomic read-modify-writes of event_status, so neither can overwrite the
+ * other. Raced for, then, rather than built: one thread acknowledges the tag
+ * event as fast as it can while the main thread raises SPU_EVENT_LR on the
+ * same context, the way a peer's commit does, and checks after each raise
+ * that the edge is still there. A bare read-modify-write in either loses
+ * some of them within a few thousand rounds on any multi-core host.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
+#define ACK_ROUNDS     200000
 
-static volatile int g_ack_entered;
-static volatile int g_ack_done;
+static volatile int g_ack_stop;
+static volatile long g_ack_count;
 
 static void* ack_thread(void* arg)
 {
     (void)arg;
-    g_ack_entered = 1;
-    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
-    g_ack_done = 1;
+    while (!g_ack_stop) {
+        __atomic_fetch_or(&g_a.event_status, ACK_TAG_EVENT, __ATOMIC_SEQ_CST);
+        wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+        g_ack_count++;
+    }
     return NULL;
 }
 
 static void test_ack_keeps_a_concurrent_raise(void)
 {
     reset_pair();
-    g_ack_entered = 0;
-    g_ack_done = 0;
+    g_ack_stop = 0;
+    g_ack_count = 0;
 
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
-    g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
-
-    spu_lockline_lock();
+    g_a.event_status = 0;
 
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
-        spu_lockline_unlock();
         TEST("the acknowledging thread starts");
         CHECK(0);
         return;
     }
+    while (!g_ack_count) YieldProcessor();
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
-
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
-
-    /* The raise a peer's commit would make, under the lock that peer holds. */
-    spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
-    spu_lockline_unlock();
+    int lost = 0;
+    for (int i = 0; i < ACK_ROUNDS; i++) {
+        /* A fresh reservation each round, so the notify below raises again. */
+        spu_lockline_lock();
+        g_a.resv_ea = LINE_A; g_a.resv_valid = 1;
+        spu_coh_notify_write(LINE_A);        /* the raise a peer's commit makes */
+        spu_lockline_unlock();
+        if (!(__atomic_load_n(&g_a.event_status, __ATOMIC_SEQ_CST) & SPU_EVENT_LR)) lost++;
+        __atomic_fetch_and(&g_a.event_status, ~SPU_EVENT_LR, __ATOMIC_SEQ_CST);
+    }
+    g_ack_stop = 1;
     pthread_join(t, NULL);
 
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
+    TEST("acknowledges racing the raises ran");
+    CHECK(g_ack_count > 0);
+    TEST("no raise was lost to an acknowledge of another event");
+    CHECK_EQ_U32((uint32_t)lost, 0);
+    TEST("the acknowledge still clears what it asked for");
+    g_a.event_status = ACK_TAG_EVENT | SPU_EVENT_LR;
+    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
+}
+
+/* ===========================================================================
+ * A host read-modify-write against an SPU's PUTLLC (spu_coh_rmw32)
+ *
+ * SPURS keeps its task bitsets in one line: the runtime clears an exited
+ * task's bits while SPU code sets another task's bits with GETLLAR/PUTLLC, and
+ * tasks 0-7 share a byte. As a plain read then write, a commit landing in
+ * between was erased -- Demon's Souls' Havok step then waited forever for a
+ * task whose enabled bit was gone. Here an SPU toggles bit 1 with PUTLLC while
+ * the host sets and clears bit 0; at the end bit 1 must match the number of
+ * toggles that committed, and bit 0 the host's last write.
+ * ===========================================================================*/
+#define RMW_ROUNDS 200000
+#define RMW_SPU_BIT  0x40000000u   /* task 1 */
+#define RMW_HOST_BIT 0x80000000u   /* task 0 */
+
+static volatile int g_rmw_stop;
+static volatile long g_rmw_toggles;
+
+static uint32_t be32_at(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static void* rmw_spu_thread(void* arg)
+{
+    (void)arg;
+    while (!g_rmw_stop) {
+        spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
+        uint8_t* w = &g_b.ls[LSA_B];
+        const uint32_t v = be32_at(w) ^ RMW_SPU_BIT;
+        w[0] = (uint8_t)(v >> 24); w[1] = (uint8_t)(v >> 16);
+        w[2] = (uint8_t)(v >> 8);  w[3] = (uint8_t)v;
+        spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
+        if (g_b.atomic_stat == 0) g_rmw_toggles++;
+    }
+    return NULL;
+}
+
+static void test_host_rmw_keeps_an_spu_commit(void)
+{
+    reset_pair();
+    g_rmw_stop = 0;
+    g_rmw_toggles = 0;
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, rmw_spu_thread, NULL) != 0) {
+        TEST("the PUTLLC thread starts");
+        CHECK(0);
+        return;
+    }
+    while (!g_rmw_toggles) YieldProcessor();
+    for (int i = 0; i < RMW_ROUNDS; i++)
+        spu_coh_rmw32(LINE_A, (i & 1) ? 0 : RMW_HOST_BIT, (i & 1) ? RMW_HOST_BIT : 0);
+    spu_coh_rmw32(LINE_A, RMW_HOST_BIT, 0);
+    g_rmw_stop = 1;
+    pthread_join(t, NULL);
+
+    const uint32_t w = be32_at(g_guest_mem + LINE_A);
+    TEST("PUTLLCs committed while the host was writing");
+    CHECK(g_rmw_toggles > 0);
+    TEST("no SPU commit was erased by a host read-modify-write");
+    CHECK_EQ_U32(w & RMW_SPU_BIT, (g_rmw_toggles & 1) ? RMW_SPU_BIT : 0);
+    TEST("no host write was erased by an SPU commit");
+    CHECK_EQ_U32(w & RMW_HOST_BIT, RMW_HOST_BIT);
+    TEST("the read-modify-write returns the old value");
+    CHECK_EQ_U32(spu_coh_rmw32(LINE_A, 0, RMW_HOST_BIT) & RMW_HOST_BIT, RMW_HOST_BIT);
+    CHECK_EQ_U32(be32_at(g_guest_mem + LINE_A) & RMW_HOST_BIT, 0);
 }
 
 /* ===========================================================================
@@ -427,6 +495,7 @@ int main(void)
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_host_rmw_keeps_an_spu_commit();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

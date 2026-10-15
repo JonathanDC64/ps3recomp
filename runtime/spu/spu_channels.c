@@ -17,6 +17,7 @@
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_workload.h"  /* spu_hist / spu_hist_line */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include <stdint.h>
 #include <stdio.h>
@@ -154,6 +155,7 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+void (*volatile g_spu_trace_mark)(const char* name, uint32_t a, uint32_t b) = 0;
 
 void spu_halt(spu_context* ctx)
 {
@@ -596,7 +598,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (!s_last) s_last = now;
         if (now - s_last >= (time_t)s_ah) {
             s_last = now;
-            char buf[4096]; int p = snprintf(buf, sizeof buf, "[atomhist] last %ds:\n", s_ah);
+            /* Static (under s_lock): a 4 KB local here gave every caller of
+             * the atomic path -- spu_wrch_full -- a __chkstk-probed frame. */
+            static char buf[4096]; int p = snprintf(buf, sizeof buf, "[atomhist] last %ds:\n", s_ah);
             for (int r = 0; r < 8; r++) {
                 int best = -1;
                 for (k = 0; k < AH_N; k++) if (s_t[k].n && (best < 0 || s_t[k].n > s_t[best].n)) best = k;
@@ -689,7 +693,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
               static int s_af = -1;
               if (s_af < 0) { const char* f = getenv("SPU_ATOM_FULL"); s_af = f ? (atoi(f) > 1 ? 2 : 1) : 0; }
-              char buf[1024]; int p = 0;
+              static SPU_THREAD_LOCAL char buf[1024]; int p = 0;   /* off the stack, as [atomhist] */
               /* lr (gpr[0]) as well as pc: these atomics sit in generic helpers,
                * so pc names the HELPER and only lr names the real caller. */
               p += snprintf(buf + p, sizeof buf - p,
@@ -1003,6 +1007,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "[atom-ea] PUTLLC %s lr=0x%05X ea=0x%08X\n",
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+        /* SPU_HIST_LINE=<hex ea>: every PUTLLC on that word's line goes into
+         * the SPU history ring (console `spuhist`), L committed, F failed, with
+         * the caller's lr and the word before and after. A lost atomic update
+         * then reads as an L whose old value is not the previous commit's new
+         * one, and the htid names the task that made it. */
+        { const uint32_t hl = spu_hist_line();
+          if (hl && (ea & ~127u) == (hl & ~127u)) {
+              uint32_t o, n;
+              memcpy(&o, ctx->resv_line + (hl & 127u), 4);
+              memcpy(&n, mem + (hl & 127u), 4);
+              spu_hist(ctx->atomic_stat ? 'F' : 'L', ctx->image_id,
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                       __builtin_bswap32(o), __builtin_bswap32(n));
+          } }
         ctx->resv_valid = 0;                           /* reservation consumed */
         spu_lockline_unlock();
         if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);
@@ -1055,7 +1073,88 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* SPU_RATE=<image id>: every 2 s, what that image's host thread did --
+ * drain steps (lifted block transfers), slow-path channel writes (MFC
+ * commands, atomics, events), DMAs, GETLLARs, idle naps -- and how much of
+ * the window it spent napping. steps per busy ms is the speed of the SPU
+ * runtime on that image's code, independent of how much work the scene
+ * gave it: the number to compare between builds. Ticks from spu_wrch_full,
+ * the clock is read once per 1024 calls. */
+static SPU_THREAD_LOCAL unsigned long long t_nap_ticks;   /* QPC ticks in spu_llar_idle_wait */
+static void spu_rate_tick(spu_context* ctx)
+{
+    static int s_img = -2;
+    PS3_KNOB(s_img, ps3_env_int("SPU_RATE", -1));
+    if (s_img < 0 || ctx->image_id != s_img) return;
+    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0;
+    static SPU_THREAD_LOCAL long nap0;
+    extern volatile long g_spu_llar_naps;
+    if ((++wr & 1023u) != 0) return;
+    LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+    const unsigned long long now = (unsigned long long)q.QuadPart;
+    if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
+               ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; return; }
+    if (now - t0 < 2ull * (unsigned long long)f.QuadPart) return;
+    const double s = (double)(now - t0) / (double)f.QuadPart;
+    const double nap_s = (double)(t_nap_ticks - nt0) / (double)f.QuadPart;
+    const double steps = (double)(uint32_t)(ctx->steps - (uint32_t)st0);
+    fprintf(stderr, "[spu-rate] img=%d per s: steps=%.0f wrch_full=%.0f dma=%.0f getllar=%.0f"
+                    " naps=%.0f napping=%.0f%% | %.0f steps per busy ms%c",
+            s_img, steps / s, (wr - wr0) / s, (t_spu_xfers - x0) / s,
+            (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
+            s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
+    t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
+    ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
+}
+
+#if defined(_MSC_VER)
+#define SPU_NOINLINE __declspec(noinline)
+#else
+#define SPU_NOINLINE __attribute__((noinline))
+#endif
+
+/* Channel diagnostics that must see every access: SPU_CHHIST (both
+ * directions), SPU_POLLTRACE. While neither is set, spu_wrch and
+ * spu_rdch answer the plain MFC parameter channels themselves. */
+static int s_ch_diag;
+static unsigned s_ch_diag_gen = ~0u;
+static SPU_NOINLINE int spu_ch_diag_load(void)
+{
+    s_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE")) ? 1 : 0;
+    s_ch_diag_gen = ps3_env_gen;
+    return s_ch_diag;
+}
+static inline int spu_ch_diag(void)
+{
+    return s_ch_diag_gen == ps3_env_gen ? s_ch_diag : spu_ch_diag_load();
+}
+
+static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
+
+/* The hot path. Demon's Souls' HighGraphics ring consumer (img 2) issues ~31
+ * channel writes per 16-byte ring entry, ~20 million a second, and almost all
+ * of them only latch a DMA parameter (LSA, EA, size, tag) for the MFC_Cmd that
+ * follows. spu_wrch_full carries the diagnostics inline, which gave it a
+ * 4.5 KB frame -- a __chkstk probe, six saved XMM registers and the /GS
+ * cookie on every one of those writes. Latch them here and leave the rest. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    const uint32_t v = value._u32[0];
+    if (!spu_ch_diag()) {
+        switch (channel) {
+        case MFC_LSA:       ctx->mfc_lsa = v;         return;
+        case MFC_EAH:       ctx->mfc_eah = v;         return;
+        case MFC_EAL:       ctx->mfc_eal = v;         return;
+        case MFC_Size:      ctx->mfc_size = v;        return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+        default: break;
+        }
+    }
+    spu_wrch_full(ctx, channel, value);
+}
+
+static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
@@ -1068,6 +1167,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
+    spu_rate_tick(ctx);
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
@@ -1084,7 +1184,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * long-missing producer for event_status (previously only ever cleared
          * via WrEventAck -> RdEventStat waits could never complete). */
         if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
-            ctx->event_status |= 0x1u;
+            __atomic_fetch_or(&ctx->event_status, 0x1u, __ATOMIC_SEQ_CST);
             spu_ch_wake(ctx);
         }
         return;
@@ -1132,17 +1232,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
-        /* Under the lock-line lock, because every producer of the LR bit sets
-         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
-         * PUTLLUC or plain PUT. A bare read-modify-write here can read
-         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
-         * write the stale value back. The edge is then gone, and an SPU that
-         * has just acknowledged the events it read goes back to sleep believing
-         * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
-        ctx->event_status &= ~v;
-        spu_lockline_unlock();
+        /* Atomic, as every other change to event_status is. A bare
+         * read-modify-write here can read event_status, have a concurrent
+         * |= SPU_EVENT_LR from a lock-line notifier (the PPU coherent store, a
+         * peer SPU's PUTLLC, PUTLLUC or plain PUT) land in between, and write
+         * the stale value back. The edge is then gone, and an SPU that has just
+         * acknowledged the events it read goes back to sleep believing it still
+         * holds a reservation it has already lost, which is the parked SPURS
+         * kernel this whole mechanism exists to wake.
+         *
+         * This used to take the lock-line lock instead, with the notifiers'
+         * plain |= under it. Demon's Souls' HighGraphics ring consumer acks
+         * ~2 million times a second, every one a round trip on the lock's
+         * cache line against the PPU thread feeding it. */
+        __atomic_fetch_and(&ctx->event_status, ~v, __ATOMIC_SEQ_CST);
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
@@ -1202,7 +1305,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
     if (!vm_base || ctx->resv_ea == 0) return;
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
-        ctx->event_status |= 0x400u;
+        __atomic_fetch_or(&ctx->event_status, 0x400u, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -1236,6 +1339,11 @@ volatile long g_spu_llar_naps;   /* SPU_LLAR_HIST */
 static void spu_llar_idle_wait(spu_context* ctx)
 {
     g_spu_llar_naps++;
+    LARGE_INTEGER nap_t0; QueryPerformanceCounter(&nap_t0);
+    /* Console trace: the nap as two marks, so a trace shows whether an SPU
+     * slept while a PPU thread waited on it. */
+    void (*mark)(const char*, uint32_t, uint32_t) = g_spu_trace_mark;
+    if (mark) mark("spu_nap", (uint32_t)ctx->image_id, ctx->resv_ea);
     yz_lockstep_block_begin(ctx);
     AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     if (ctx->resv_valid && vm_base &&
@@ -1244,6 +1352,9 @@ static void spu_llar_idle_wait(spu_context* ctx)
                                   (SRWLOCK*)&ctx->ch_wait_lock, 2, 0);
     ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
     yz_lockstep_block_end(ctx);
+    if (mark) mark("spu_wake", (uint32_t)ctx->image_id, ctx->resv_ea);
+    LARGE_INTEGER nap_t1; QueryPerformanceCounter(&nap_t1);
+    t_nap_ticks += (unsigned long long)(nap_t1.QuadPart - nap_t0.QuadPart);   /* SPU_RATE */
 }
 
 /* Block the calling SPU host thread until `channel` is readable. */
@@ -1285,7 +1396,23 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+static SPU_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
+
+/* The MFC status reads that follow each DMA and atomic (see spu_wrch). */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (!spu_ch_diag()) {
+        switch (channel) {
+        case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+        case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+        case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+        default: break;
+        }
+    }
+    return spu_rdch_full(ctx, channel);
+}
+
+static SPU_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel)
 {
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
@@ -1806,11 +1933,13 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+unsigned g_spu_stack_reset_n;   /* = s_stack_reset_count, for the drain's per-step check */
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_n = s_stack_reset_count;
     }
 }
 

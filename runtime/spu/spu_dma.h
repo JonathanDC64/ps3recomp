@@ -206,6 +206,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           static int _n = 0; static long s_max = -1, s_img = -2;
           if (s_max < 0) { const char* m = getenv("SPU_DMA_RANGE_MAX"); s_max = m ? atol(m) : 64; }
           if (s_img == -2) { const char* m = getenv("SPU_DMA_RANGE_IMG"); s_img = m ? atol(m) : -1; }
+          /* With a console trace running, every such transfer is also a
+           * mark (key = EA, r3 = first word): who answered when. */
+          { void (*mark)(const char*, uint32_t, uint32_t) = g_spu_trace_mark;
+            if (mark && (s_img < 0 || spu->image_id == s_img)) {
+                const uint8_t* w = &spu->ls[lsa & SPU_LS_MASK];
+                mark((cmd & 0xF0) == 0x20 ? "spu_put" : "spu_get", (uint32_t)ea,
+                     (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3]);
+            } }
           if ((s_img < 0 || spu->image_id == s_img) && (!s_max || _n++ < s_max)) {
               extern unsigned long long ps3_ms_now(void);
               const uint8_t* w = &spu->ls[lsa & SPU_LS_MASK];
@@ -873,7 +881,7 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_cmd[t]       = base_cmd;
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
-            spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            __atomic_fetch_or(&spu->event_status, 0x2u, __ATOMIC_SEQ_CST);   /* SPU_EVENT_SN stall-and-notify */
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS

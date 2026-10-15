@@ -79,6 +79,17 @@ static void table_unlock(void)
 #endif
 }
 
+/* A guest stack for a host thread that runs guest callbacks (the vblank
+ * clock in boot_main). Taken from the same region as thread stacks, under the
+ * table lock thread creation holds. Returns the stack TOP (0 on failure). */
+uint32_t sys_ppu_thread_alloc_host_stack(uint32_t size)
+{
+    table_lock();
+    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, size);
+    table_unlock();
+    return base ? base + size - 0x100u : 0;
+}
+
 /* Find a free slot. Returns index or -1. Must be called under lock. */
 static int find_free_slot(void)
 {

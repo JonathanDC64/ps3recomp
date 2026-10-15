@@ -70,6 +70,12 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
 
+/* Host-side read-modify-write of one big-endian guest word -- (v | set) & ~clr
+ * -- that cannot lose an SPU's lock-line commit, nor have its own lost to one.
+ * Returns the old value. For runtime code that keeps SPURS bitsets in guest
+ * memory the SPU also updates with GETLLAR/PUTLLC. */
+uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr);
+
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;

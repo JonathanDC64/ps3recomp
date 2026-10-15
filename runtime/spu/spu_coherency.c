@@ -14,6 +14,13 @@
 #include "ps3emu/ps3_knob.h"
 #include "spu_coherency.h"
 
+/* A variable alone on a 64-byte cache line. */
+#if defined(_MSC_VER)
+#define SPU_COH_LINE(T) __declspec(align(64)) struct { T v; char pad_[64 - sizeof(T)]; }
+#else
+#define SPU_COH_LINE(T) struct __attribute__((aligned(64))) { T v; char pad_[64 - sizeof(T)]; }
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 
@@ -34,20 +41,43 @@ extern "C" {
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
+/* On a cache line of its own: SPU atomics and PPU stores into reserved
+ * lines take this lock millions of times a second, and anything sharing its
+ * line (s_coh_armed, which every guest store reads) would bounce with it. */
+static SPU_COH_LINE(volatile long) g_lockline_line;
+#define g_lockline g_lockline_line.v
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
  * -- FMOD's mixer task among them, 25-40 ms at a time. */
+/* SPU_LOCKLINE_STATS=1: per host thread, every 2^20 acquisitions, how long
+ * they took to accumulate and how many found the lock held -- which threads
+ * share this lock, and how hard. */
+static void spu_lockline_stats(int contended)
+{
+    static __declspec(thread) unsigned long n, c;
+    static __declspec(thread) unsigned long long t0;
+    n++; c += contended;
+    if (n & ((1u << 20) - 1)) return;
+    const unsigned long long now = GetTickCount64();
+    if (t0) fprintf(stderr, "[lockline] host tid %lu: 1M in %llu ms, %lu contended%c",
+                    GetCurrentThreadId(), now - t0, c, 10);
+    t0 = now; c = 0;
+}
 void spu_lockline_lock(void)
 {
+    static int s_st = -1;
+    PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
     unsigned spins = 0;
+    int contended = 0;
     while (_InterlockedExchange(&g_lockline, 1)) {
+        contended = 1;
         do {
             _mm_pause();
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
         } while (g_lockline);
     }
+    if (s_st) spu_lockline_stats(contended);
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else
@@ -80,7 +110,8 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+static SPU_COH_LINE(int) s_coh_armed_line;   /* own line, as g_lockline */
+#define s_coh_armed s_coh_armed_line.v
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
@@ -91,9 +122,16 @@ unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
+    /* Store only on a change. Every guest store on every PPU thread reads
+     * s_coh_armed and its line's bitmap byte (spu_coh_is_reserved), and an SPU
+     * polling one line re-reserves it on each GETLLAR -- Demon's Souls'
+     * HighGraphics ring consumer ~1.8 million times a second. An unconditional
+     * store dirties those cache lines every time and takes them away from
+     * every core that reads them. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    if (!(s_coh_bitmap[line >> 3] & bit)) s_coh_bitmap[line >> 3] |= bit;
+    if (!s_coh_armed) s_coh_armed = 1;
 
     if (!ctx) return;
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
@@ -180,12 +218,38 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
         }
     }
+}
+
+/* A read-modify-write the runtime makes on guest memory an SPU updates
+ * atomically -- the SPURS taskset bitsets, where tasks 0-7 share one byte of
+ * each. Done as vm_read then vm_write, an SPU PUTLLC can commit between the
+ * two and be overwritten: Demon's Souls' Havok task enables the next task
+ * (task 4) on that line while our runtime clears the bits of a task that just
+ * exited, and the cleared-back enabled bit means task 4 never starts, its
+ * semaphore post never comes, and the physics step waits forever.
+ *
+ * Under the lock-line lock the RMW is one transaction against every PUTLLC,
+ * and the notify fails any reservation taken before it, as a store from
+ * another processor does on hardware. */
+uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr)
+{
+    extern uint8_t* vm_base;
+    uint32_t* p = (uint32_t*)(vm_base + (ea & ~3u));
+    spu_lockline_lock();
+    uint32_t raw = __atomic_load_n(p, __ATOMIC_SEQ_CST), nraw;
+    do {
+        nraw = __builtin_bswap32((__builtin_bswap32(raw) | set) & ~clr);
+    } while (nraw != raw &&
+             !__atomic_compare_exchange_n(p, &raw, nraw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    if (nraw != raw) spu_coh_notify_write(ea);
+    spu_lockline_unlock();
+    return __builtin_bswap32(raw);
 }
 
 void spu_coh_notify_write(uint32_t ea)
@@ -195,7 +259,7 @@ void spu_coh_notify_write(uint32_t ea)
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who

@@ -232,7 +232,10 @@ typedef struct spu_context {
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask */
+    /* Event status / mask. event_status is set by other threads (lock-line
+     * notifiers) while its SPU acknowledges bits, so every change to it is an
+     * atomic or/and (__atomic_fetch_or / __atomic_fetch_and), never a plain
+     * read-modify-write. */
     uint32_t event_status;
     uint32_t event_mask;
 
@@ -790,6 +793,9 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 void spu_img_restore(spu_context* ctx, int32_t saved_img);
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
+/* Console trace marks from SPU host threads (an idle nap, a watched DMA);
+ * NULL unless a trace is running. Set by the host alongside the GCM marks. */
+extern void (*volatile g_spu_trace_mark)(const char* name, uint32_t a, uint32_t b);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
  * call frame, so an SPU loop the lifter lowered as a CALL rather than a
  * transfer recurses until the host stack dies -- surfacing as a bare
