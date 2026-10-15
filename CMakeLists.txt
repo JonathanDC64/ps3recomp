@@ -460,6 +460,19 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
     set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+
+    # Fills the backend's shader disk cache from a title's Cg binaries
+    # (.vpo/.fpo) before it runs: libs/video/tests/rsx_shader_precompile_main.c.
+    add_executable(rsx_shader_precompile EXCLUDE_FROM_ALL
+        libs/video/tests/rsx_shader_precompile_main.c
+        runtime/host/host_stubs.c
+    )
+    target_link_libraries(rsx_shader_precompile PRIVATE ps3recomp_runtime dxguid)
+    target_include_directories(rsx_shader_precompile PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(rsx_shader_precompile PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 # ---------------------------------------------------------------------------

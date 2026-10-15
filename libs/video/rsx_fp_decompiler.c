@@ -138,6 +138,32 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes)
     return 0;
 }
 
+/* Texture units the program samples (TEX, TXP, TXD, TXB, TXL, TEXBEM,
+ * TXPBEM), as a bit mask. */
+u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    u32 off = 0, mask = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        off += 16;
+        const u32 op = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        if (op == 0x17 || op == 0x18 || op == 0x19 || op == 0x2F || op == 0x31 ||
+            op == 0x33 || op == 0x34)
+            mask |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+        if (((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+            ((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST ||
+            ((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) {
+            if (off + 16 <= max_bytes) off += 16;
+        }
+        if (w0 & FP_END) break;
+    }
+    return mask;
+}
+
 static int fp_instruction_has_constant(u32 w1, u32 w2, u32 w3)
 {
     return
