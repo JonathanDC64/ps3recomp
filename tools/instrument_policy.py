@@ -1,5 +1,6 @@
-import re
-p = r'D:/recomp/ps3games/simpsons/src/spu/spurs_policy.c'
+# instrument_policy.py <spurs_policy.c>: add a [pt] trace to each lifted policy function.
+import re, sys
+p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
 if 'int g_pt' not in s:
     s = s.replace('#include "spurs_policy.h"', '#include "spurs_policy.h"\n#include <stdio.h>\nint g_pt;', 1)

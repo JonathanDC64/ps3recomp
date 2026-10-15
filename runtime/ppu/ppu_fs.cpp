@@ -112,10 +112,12 @@ static void host_path(char* out, size_t cap, const char* guest)
      * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
      * /dev_flash/sys/external/flashMP3.pic and, on a miss, prints "mp3 failed to
      * load MP3 codec (are you using the correct flash?)" and then crashes.
-     * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
+     * Serve it from a real dev_flash tree instead: $PS3_DEV_FLASH (e.g. RPCS3's
+     * dev_flash), else ./dev_flash. Firmware is the user's own; nothing is
+     * looked up on a fixed path. */
     if (strncmp(guest, "/dev_flash/", 11) == 0) {
         const char* fw = getenv("PS3_DEV_FLASH");
-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
+        if (!fw || !*fw) fw = "dev_flash";
         snprintf(out, cap, "%s/%s", fw, guest + 11);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;

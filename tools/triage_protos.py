@@ -6,7 +6,7 @@ unencrypted, usually-unstripped kind that carries symbols + DWARF (see unfself.p
 retail-encrypted SELF we can do nothing with. For the debug ones, count STT_FUNC symbols and
 flag DWARF, so you know which titles are worth mining (nid_harvest / dwarf_abi / objdump_audit).
 
-    python triage_protos.py W:/Roms/PS3_Protos
+    python triage_protos.py <dir>
     python triage_protos.py <dir> --descend   # also crack open nested disc images (SLOW)
 
 Container handling (cheapest path that yields the EBOOT):

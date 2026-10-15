@@ -65,8 +65,11 @@ static void (*reg_lookup(uint32_t addr))(void*) {
 }
 
 int main(int argc, char** argv) {
-    const char* img_path = argc > 1 ? argv[1]
-                                    : "D:/recomp/ps3games/flow/prx/libsre.linked.bin";
+    if (argc < 2) {
+        fprintf(stderr, "usage: test_prx_loader <libsre.linked.bin>\n");
+        return 2;
+    }
+    const char* img_path = argv[1];
     const uint32_t BASE = 0x30000000;
 
     /* Reserve guest address space (like the real runtime) and commit just the
