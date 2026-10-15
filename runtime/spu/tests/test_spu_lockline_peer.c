@@ -20,12 +20,8 @@
  * The last test is the event acknowledge. An SPU acknowledging the events it
  * has read is a read-modify-write of the same word every one of those raises
  * writes, so an edge landing between the read and the write is dropped and the
- * SPU goes back to sleep holding a reservation it has already lost. The
- * interleaving is built with the lock-line lock rather than raced for: the main
- * thread takes the lock, a second thread starts the acknowledge and is held at
- * that lock, that the acknowledge has NOT completed while the lock is held is
- * asserted, the raise then happens under the lock, and only afterwards is the
- * acknowledge let through.
+ * SPU goes back to sleep holding a reservation it has already lost. Both sides
+ * are atomic, and the test races them to show no raise is lost.
  *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
@@ -350,69 +346,69 @@ static void test_wide_put_finds_the_reserved_line(void)
 /* ===========================================================================
  * The event acknowledge against a concurrent raise
  *
- * Built with the lock rather than raced for. The main thread holds the
- * lock-line lock, so the acknowledge cannot get past it, and that it has not
- * completed is asserted -- which is what makes the interleaving a fact of the
- * run rather than a hope. The raise then happens under the same lock, and the
- * acknowledge is let through afterwards: exactly the order that loses the edge
- * when the acknowledge is a bare read-modify-write.
- *
- * The two waits below decide nothing. An acknowledge that has not started yet
- * lands after the raise and keeps it just the same; what the assertion rules
- * out is the acknowledge COMPLETING while the lock is held, which is the only
- * way the raise can be read, overwritten and lost.
+ * The acknowledge does not take the lock-line lock: it and every raise are
+ * atomic read-modify-writes of event_status, so neither can overwrite the
+ * other. Raced for, then, rather than built: one thread acknowledges the tag
+ * event as fast as it can while the main thread raises SPU_EVENT_LR on the
+ * same context, the way a peer's commit does, and checks after each raise
+ * that the edge is still there. A bare read-modify-write in either loses
+ * some of them within a few thousand rounds on any multi-core host.
  * ===========================================================================*/
 #define ACK_TAG_EVENT  0x1u    /* MFC tag-status update: what the ack asks for */
+#define ACK_ROUNDS     200000
 
-static volatile int g_ack_entered;
-static volatile int g_ack_done;
+static volatile int g_ack_stop;
+static volatile long g_ack_count;
 
 static void* ack_thread(void* arg)
 {
     (void)arg;
-    g_ack_entered = 1;
-    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
-    g_ack_done = 1;
+    while (!g_ack_stop) {
+        __atomic_fetch_or(&g_a.event_status, ACK_TAG_EVENT, __ATOMIC_SEQ_CST);
+        wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+        g_ack_count++;
+    }
     return NULL;
 }
 
 static void test_ack_keeps_a_concurrent_raise(void)
 {
     reset_pair();
-    g_ack_entered = 0;
-    g_ack_done = 0;
+    g_ack_stop = 0;
+    g_ack_count = 0;
 
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
-    g_a.event_status = ACK_TAG_EVENT;      /* the event the SPU is acking */
-
-    spu_lockline_lock();
+    g_a.event_status = 0;
 
     pthread_t t;
     if (pthread_create(&t, NULL, ack_thread, NULL) != 0) {
-        spu_lockline_unlock();
         TEST("the acknowledging thread starts");
         CHECK(0);
         return;
     }
+    while (!g_ack_count) YieldProcessor();
 
-    while (!g_ack_entered) YieldProcessor();
-    Sleep(2);                              /* time to arrive at the lock */
-
-    TEST("the acknowledge cannot complete while the lock-line lock is held");
-    CHECK(g_ack_done == 0);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
-
-    /* The raise a peer's commit would make, under the lock that peer holds. */
-    spu_coh_notify_write(LINE_A);
-    CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT | SPU_EVENT_LR);
-
-    spu_lockline_unlock();
+    int lost = 0;
+    for (int i = 0; i < ACK_ROUNDS; i++) {
+        /* A fresh reservation each round, so the notify below raises again. */
+        spu_lockline_lock();
+        g_a.resv_ea = LINE_A; g_a.resv_valid = 1;
+        spu_coh_notify_write(LINE_A);        /* the raise a peer's commit makes */
+        spu_lockline_unlock();
+        if (!(__atomic_load_n(&g_a.event_status, __ATOMIC_SEQ_CST) & SPU_EVENT_LR)) lost++;
+        __atomic_fetch_and(&g_a.event_status, ~SPU_EVENT_LR, __ATOMIC_SEQ_CST);
+    }
+    g_ack_stop = 1;
     pthread_join(t, NULL);
 
-    TEST("the acknowledge clears what it asked for and keeps the raise");
-    CHECK(g_ack_done == 1);
+    TEST("acknowledges racing the raises ran");
+    CHECK(g_ack_count > 0);
+    TEST("no raise was lost to an acknowledge of another event");
+    CHECK_EQ_U32((uint32_t)lost, 0);
+    TEST("the acknowledge still clears what it asked for");
+    g_a.event_status = ACK_TAG_EVENT | SPU_EVENT_LR;
+    wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
     CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
-    CHECK(g_a.resv_valid == 0);
 }
 
 /* ===========================================================================

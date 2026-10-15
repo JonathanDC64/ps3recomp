@@ -1169,7 +1169,7 @@ static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 
          * long-missing producer for event_status (previously only ever cleared
          * via WrEventAck -> RdEventStat waits could never complete). */
         if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
-            ctx->event_status |= 0x1u;
+            __atomic_fetch_or(&ctx->event_status, 0x1u, __ATOMIC_SEQ_CST);
             spu_ch_wake(ctx);
         }
         return;
@@ -1217,17 +1217,20 @@ static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
     case SPU_WrEventAck:
-        /* Under the lock-line lock, because every producer of the LR bit sets
-         * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
-         * PUTLLUC or plain PUT. A bare read-modify-write here can read
-         * event_status, have a concurrent |= SPU_EVENT_LR land in between, and
-         * write the stale value back. The edge is then gone, and an SPU that
-         * has just acknowledged the events it read goes back to sleep believing
-         * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
-        ctx->event_status &= ~v;
-        spu_lockline_unlock();
+        /* Atomic, as every other change to event_status is. A bare
+         * read-modify-write here can read event_status, have a concurrent
+         * |= SPU_EVENT_LR from a lock-line notifier (the PPU coherent store, a
+         * peer SPU's PUTLLC, PUTLLUC or plain PUT) land in between, and write
+         * the stale value back. The edge is then gone, and an SPU that has just
+         * acknowledged the events it read goes back to sleep believing it still
+         * holds a reservation it has already lost, which is the parked SPURS
+         * kernel this whole mechanism exists to wake.
+         *
+         * This used to take the lock-line lock instead, with the notifiers'
+         * plain |= under it. Demon's Souls' HighGraphics ring consumer acks
+         * ~2 million times a second, every one a round trip on the lock's
+         * cache line against the PPU thread feeding it. */
+        __atomic_fetch_and(&ctx->event_status, ~v, __ATOMIC_SEQ_CST);
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
@@ -1287,7 +1290,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
     if (!vm_base || ctx->resv_ea == 0) return;
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
-        ctx->event_status |= 0x400u;
+        __atomic_fetch_or(&ctx->event_status, 0x400u, __ATOMIC_SEQ_CST);
     }
 }
 

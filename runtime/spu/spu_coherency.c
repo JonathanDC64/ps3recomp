@@ -14,6 +14,13 @@
 #include "ps3emu/ps3_knob.h"
 #include "spu_coherency.h"
 
+/* A variable alone on a 64-byte cache line. */
+#if defined(_MSC_VER)
+#define SPU_COH_LINE(T) __declspec(align(64)) struct { T v; char pad_[64 - sizeof(T)]; }
+#else
+#define SPU_COH_LINE(T) struct __attribute__((aligned(64))) { T v; char pad_[64 - sizeof(T)]; }
+#endif
+
 #include <stdint.h>
 #include <stdio.h>
 
@@ -34,7 +41,11 @@ extern "C" {
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
+/* On a cache line of its own: SPU atomics and PPU stores into reserved
+ * lines take this lock millions of times a second, and anything sharing its
+ * line (s_coh_armed, which every guest store reads) would bounce with it. */
+static SPU_COH_LINE(volatile long) g_lockline_line;
+#define g_lockline g_lockline_line.v
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
@@ -99,7 +110,8 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
+static SPU_COH_LINE(int) s_coh_armed_line;   /* own line, as g_lockline */
+#define s_coh_armed s_coh_armed_line.v
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
@@ -110,9 +122,16 @@ unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
+    /* Store only on a change. Every guest store on every PPU thread reads
+     * s_coh_armed and its line's bitmap byte (spu_coh_is_reserved), and an SPU
+     * polling one line re-reserves it on each GETLLAR -- Demon's Souls'
+     * HighGraphics ring consumer ~1.8 million times a second. An unconditional
+     * store dirties those cache lines every time and takes them away from
+     * every core that reads them. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    if (!(s_coh_bitmap[line >> 3] & bit)) s_coh_bitmap[line >> 3] |= bit;
+    if (!s_coh_armed) s_coh_armed = 1;
 
     if (!ctx) return;
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
@@ -199,7 +218,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
         spu_context* c = s_coh_ctxs[i];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
             c->resv_valid = 0;
             g_spu_lr_raise++;
             spu_ch_wake(c);
@@ -214,7 +233,7 @@ void spu_coh_notify_write(uint32_t ea)
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-            c->event_status |= SPU_EVENT_LR;
+            __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
             c->resv_valid = 0;          /* reservation lost, PUTLLC must fail */
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who

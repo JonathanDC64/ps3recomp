@@ -232,7 +232,10 @@ typedef struct spu_context {
     /* SRR0 - Save/Restore Register (exception return address) */
     uint32_t srr0;
 
-    /* Event status / mask */
+    /* Event status / mask. event_status is set by other threads (lock-line
+     * notifiers) while its SPU acknowledges bits, so every change to it is an
+     * atomic or/and (__atomic_fetch_or / __atomic_fetch_and), never a plain
+     * read-modify-write. */
     uint32_t event_status;
     uint32_t event_mask;
 
