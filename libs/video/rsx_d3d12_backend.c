@@ -181,6 +181,10 @@ typedef struct {
     ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
     u32                   snap_w, snap_h, snap_dxgi;
     D3D12_RESOURCE_STATES snap_st;
+    /* Guest bytes after our last write-back (tex_csum over [gaddr, +glen)).
+     * If they differ later, the title put something else there. */
+    u32                   gaddr, glen, gsum;
+    int                   gsum_ok, gsum_new;
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..20 hold offscreen-RT SRVs */
@@ -4117,6 +4121,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
     r->used = 1;
+    r->gsum_ok = 0;
 
     /* Populate the new RT from guest memory: titles CPU-initialise their
      * render-target buffers (wave fills the height fields with texels of
@@ -4400,6 +4405,44 @@ static void rt_writeback_store(void)
         D3D12_RANGE nw = {0, 0};
         r->rb->lpVtbl->Unmap(r->rb, 0, &nw);
         if (s_wc_shadow) { memcpy(s_wc_shadow, vm_base + dst, s_wc_len); s_wc_shadow = NULL; }
+        r->gaddr = dst;
+        r->glen = swz ? ((1u << lw) << lh) * bpp : gp * r->h;
+        r->gsum_new = 1;
+    }
+    /* Checksums after every store, so targets that share memory do not
+     * count each other's write-back as a foreign write. */
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        OffRT* r = &s_d3d.off_rt[i];
+        if (!r->gsum_new) continue;
+        r->gsum_new = 0;
+        r->gsum = tex_csum(vm_base + r->gaddr, r->glen);
+        r->gsum_ok = 1;
+    }
+}
+
+/* Drop offscreen targets whose guest memory the title rewrote after our last
+ * write-back: it streamed a texture or copied an image there. A texture bound
+ * at that offset then reads the guest bytes, and a later draw into it starts
+ * a new target from them. Sampling the old target instead is a live-only
+ * error -- a replay starts with no targets and reads the guest bytes. */
+static void off_rt_drop_rewritten(void)
+{
+    extern uint8_t* vm_base;
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_RT_REWRITTEN", 1));
+    if (!en || !vm_base) return;
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        OffRT* r = &s_d3d.off_rt[i];
+        if (!r->res || !r->gsum_ok) continue;
+        if (tex_csum(vm_base + r->gaddr, r->glen) == r->gsum) continue;
+        { static int n = 0;
+          if (n++ < 40) fprintf(stderr, "[RT] 0x%X (%ux%u) rewritten by the title: "
+                                "dropped (frame %llu)%c", r->off, r->w, r->h,
+                                (unsigned long long)s_d3d.frame_count, 10); }
+        off_rt_defer_release(r->res);  r->res = NULL;
+        off_rt_defer_release(r->up);   r->up = NULL;
+        off_rt_defer_release(r->snap); r->snap = NULL;
+        r->gsum_ok = 0;
     }
 }
 
@@ -5219,6 +5262,7 @@ rtt_dump_done:;
      * texture can resolve to it below, whatever the op order). */
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
     for (int _i = 0; _i < MAX_ZETA; _i++) s_zeta[_i].used = 0;
+    off_rt_drop_rewritten();
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (dr->is_vp && dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u)))
