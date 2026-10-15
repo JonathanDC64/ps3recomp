@@ -60,11 +60,15 @@
  * register outside the root signature's range, so its pipeline failed to
  * build (E_INVALIDARG) and those surfaces never drew. */
 #define RSX_FP_UNITS      16
-#define MAX_DRAWS         2048  /* per-frame draw records. Sized from the
-                                 * measured worst case (~1841, FRAME_BUDGET);
-                                 * the per-draw constant buffer is
-                                 * VP_CB_STRIDE * MAX_DRAWS * 2 bytes, so 16384
-                                 * asked for a 264 MB upload allocation. */
+#define MAX_DRAWS         8192  /* per-frame draw records. The per-draw
+                                 * constant buffer is VP_CB_STRIDE * MAX_DRAWS
+                                 * * 2 bytes (138 MB here; 16384 asked for 264
+                                 * MB). 2048, sized from the spawn area's
+                                 * ~1841, was too few for a dark room in the
+                                 * first level: every draw past it was dropped,
+                                 * the display copy at the end of the frame
+                                 * with them, and the frame presented black.
+                                 * draw_room() reports running out. */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
  * (514 vec4 = 8224 B) rounded up to D3D12's 256-byte CBV alignment.
  * Constants are snapshotted at RECORD time -- wave's passes each set their
@@ -402,8 +406,21 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+static int draw_room(void)
+{
+    if (s_d3d.draw_count < MAX_DRAWS) return 1;
+    static u64 said = ~0ull; static int n = 0;
+    if (said != s_d3d.frame_count && n < 20) { said = s_d3d.frame_count; n++;
+        fprintf(stderr, "[D3D12] frame has more than %d draws: the rest are dropped%c",
+                MAX_DRAWS, 10); }
+    return 0;
+}
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
+/* Room for one more draw record this frame? Says so once per frame when
+ * not: those draws are dropped, and a frame cut short presents without its
+ * end (Demon's Souls copies its finished image to the display last). */
+static int draw_room(void);
 /* F10: dump the next RSX_HOTKEY_SHOTS (default 12) presents, every one, to
  * RSX_HOTKEY_DIR as shot_<burst>_<n>_d<draws>.bmp. For a flicker someone
  * playing can see but a replay cannot show (a replay has no flips, so it
@@ -6627,7 +6644,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
      * chain (demosaic clears each effect pass's surface) -- record it, don't
      * touch the frame boundary. */
     if (rt != 0) {
-        if (s_d3d.draw_count < MAX_DRAWS) {
+        if (draw_room()) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
             memset(dr, 0, sizeof(*dr));
             dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
@@ -6646,7 +6663,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     d3d12_clear_display(cc);
     /* The display path above may close the frame; a Z/S clear belongs to
      * whatever frame follows it, so it is recorded after. */
-    if ((flags & 3u) && s_d3d.draw_count < MAX_DRAWS) {
+    if ((flags & 3u) && draw_room()) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count++];
         memset(dr, 0, sizeof(*dr));
         dr->is_vp = 1; dr->is_clear = 1; dr->tex_slot = -1;
@@ -7714,7 +7731,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
-            if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+            if (emitted && draw_room()) {
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec;
                 dr->vertex_count   = emitted;
@@ -7784,7 +7801,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         u32 record_offset = s_d3d.vb_offset;
         u32 emitted = upload_quads_from_rsx(first, count);
         if (emitted == 0) return;
-        if (s_d3d.draw_count < MAX_DRAWS) {
+        if (draw_room()) {
             s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
             s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
             s_d3d.draws[s_d3d.draw_count].topology       = RSX_TOPOLOGY_TRIANGLES;
@@ -7840,7 +7857,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 return;
             }
         }
-        if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+        if (emitted && draw_room()) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec;
             dr->vertex_count   = emitted;
@@ -7923,7 +7940,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     u32 actual_count  = upload_vertices_from_rsx(first, count);
     if (actual_count == 0) return;
 
-    if (s_d3d.draw_count < MAX_DRAWS) {
+    if (draw_room()) {
         s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
         s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
         s_d3d.draws[s_d3d.draw_count].topology       = topo;
@@ -7988,7 +8005,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             return;
         }
     }
-    if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+    if (emitted && draw_room()) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->vertex_count   = emitted;
