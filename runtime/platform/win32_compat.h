@@ -744,6 +744,9 @@ static inline DWORD GetCurrentThreadId(void)
 static inline DWORD  GetCurrentProcessId(void) { return (DWORD)getpid(); }
 static inline HANDLE GetCurrentProcess(void)   { return (HANDLE)(intptr_t)-1; }   /* pseudo-handle */
 static inline HANDLE GetCurrentThread(void)    { return (HANDLE)(intptr_t)-2; }   /* pseudo-handle */
+/* Only the current process can be ended here (the exit-on hooks' use): _exit
+ * skips atexit handlers and destructors, as TerminateProcess does. */
+static inline BOOL TerminateProcess(HANDLE h, UINT code) { (void)h; fflush(NULL); _exit((int)code); }
 
 /* ---------------------------------------------------------------------------
  * Waitable handles: events, semaphores, threads, waitable timers

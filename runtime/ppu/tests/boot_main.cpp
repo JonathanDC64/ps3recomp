@@ -75,6 +75,7 @@ void     ps3_title_options_init(void) {}
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include "ps3emu/ps3_knob.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -83,7 +84,6 @@ void     ps3_title_options_init(void) {}
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
 #include <timeapi.h>
-#include "ps3emu/ps3_knob.h"
 
 /* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
  * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
@@ -637,6 +637,8 @@ extern "C" const char* g_last_hle_name;
  * SuspendThread/GetThreadContext; POSIX has no equivalent that does not
  * amount to writing a debugger. The vblank ticker above, which is what the
  * frame loop actually depends on, is deliberately outside this. */
+extern "C" void (*g_ds_register_shadow_hook)(unsigned long long);
+extern "C" void ps3_exit_now(const char* tag);   /* ppu_hle.cpp */
 #ifdef _WIN32
 #include <tlhelp32.h>
 /* When the boot wedges, snapshot every other thread's instruction pointer as a
@@ -650,10 +652,8 @@ extern "C" const char* g_last_hle_name;
 /* Defined with the debug console below; writes to stderr and, when the
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
-extern "C" void (*g_ds_register_shadow_hook)(unsigned long long);
 extern "C" void ds_print_all_shadows(void (*)(const char*, ...), unsigned) __attribute__((weak));
 extern "C" void ppu_guard_page_rearm(uint32_t guest_ea, int noaccess);   /* ppu_loader.cpp */
-extern "C" void ps3_exit_now(const char* tag);
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
  * and writing then deadlocks the watchdog -- and with it every thread that
