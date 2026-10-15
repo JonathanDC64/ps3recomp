@@ -435,6 +435,7 @@ static void present_guest_frame(void)
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
 #include "../ppu_waits.h"                     /* console waits */
 extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
+extern "C" volatile long g_rsx_prof_toggle;   /* F11 profile sessions (profile_thread) */
 static DWORD WINAPI guest_prof_thread(LPVOID)
 {
     struct Site { uint32_t tid, cia; uint32_t hits; };
@@ -818,6 +819,7 @@ static void dump_threads(const char* label, HMODULE self)
  * with, which is the useful half of that.
  */
 static FILE* s_dbg_out = NULL;
+static FILE* s_dbg_redirect = NULL;   /* set: dbg_printf writes only here */
 
 static void dbg_printf(const char* fmt, ...)
 {
@@ -830,6 +832,7 @@ static void dbg_printf(const char* fmt, ...)
         va_end(ap);
         return;
     }
+    if (s_dbg_redirect) { vfprintf(s_dbg_redirect, fmt, ap); va_end(ap); return; }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -1176,6 +1179,7 @@ static const char* sc_name(uint32_t n)
     }
 }
 
+static void dbg_waits_report(double win_ms, unsigned rows);
 static void dbg_waits(unsigned sec, unsigned rows)
 {
     memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
@@ -1187,6 +1191,12 @@ static void dbg_waits(unsigned sec, unsigned rows)
     g_waits_armed = 0;
     const double win_ms = (double)(ppu_waits_now() - a) * 1000.0 / (double)f.QuadPart;
     Sleep(100);   /* calls in flight at the close land */
+    dbg_waits_report(win_ms, rows);
+}
+
+static void dbg_waits_report(double win_ms, unsigned rows)
+{
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     const double tms = 1000.0 / (double)f.QuadPart;
     static ppu_waits_ent e[PPU_WAITS_N];
     memcpy(e, g_waits, sizeof e);
@@ -1286,6 +1296,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
             dbg_printf("  waits [s] [rows] time per guest thread inside each syscall/HLE call (+r3) over s seconds%c", 10);
+            dbg_printf("  profile          start/stop a profile session, like F11 in the game window%c", 10);
             dbg_printf("  trace [s] [file] every syscall/HLE call and render mark as a timeline (default <console>.trace)%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
@@ -1415,6 +1426,9 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if (!strcmp(verb, "waits")) {
             sscanf(cmd, "%*s %u %u", &a, &b);
             dbg_waits(a ? a : 3, b ? b : 40);
+        } else if (!strcmp(verb, "profile")) {
+            InterlockedIncrement(&g_rsx_prof_toggle);
+            dbg_printf("  profile toggled (same as F11)%c", 10);
         } else if (!strcmp(verb, "trace")) {
             char tp[MAX_PATH] = {0};
             sscanf(cmd, "%*s %u %259s", &a, tp);
@@ -1509,6 +1523,188 @@ static DWORD WINAPI debug_console(LPVOID param)
 
         /* End marker: a driver script waits for this rather than sleeping. */
         if (s_dbg_out) { fprintf(s_dbg_out, "[dbg] done%c", 10); fclose(s_dbg_out); s_dbg_out = NULL; }
+    }
+    return 0;
+}
+
+/* Profile sessions: F11 in the game window (or the console's `profile`)
+ * starts one, the next press stops it. Files go to PROF_DIR (default
+ * RSX_HOTKEY_DIR, else the current directory) as prof_NNN_*:
+ *   _frames.txt   one line per present: interval, render_frame and its
+ *                 phases, draws, texture uploads, pipelines, shader compiles
+ *   _summary.txt  fps, 1% low, intervals over the game's 36.3 ms limit, skip
+ *                 frames, and the worst presents with where their time went
+ *   _threads.txt  CPU per thread every second and over the session, and the
+ *                 console `waits` report (what each guest thread waited on)
+ * The window caption says when a session is recording. */
+extern "C" volatile long g_rsx_prof_toggle;
+extern "C" void rsx_prof_begin(const char* prefix);
+extern "C" int  rsx_prof_end(char* digest, size_t cap);
+extern "C" void rsx_prof_title(const char* note);
+
+struct ProfThr { DWORD tid; ULONGLONG t; };
+static int prof_threads(ProfThr* a, int max)
+{
+    int n = 0;
+    const DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (Thread32First(snap, &te)) do {
+        if (te.th32OwnerProcessID != pid || n >= max) continue;
+        HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(h, &c, &e, &k, &u)) {
+            a[n].tid = te.th32ThreadID;
+            a[n].t = ((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) +
+                     ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime);
+            n++;
+        }
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    return n;
+}
+
+/* A guest thread's name, else the host thread's start function (cached). */
+static void prof_thread_name_uncached(DWORD tid, char* out, size_t cap);
+static void prof_thread_name(DWORD tid, char* out, size_t cap)
+{
+    for (int g = 0; g < PPU_THREAD_MAX; g++)   /* named after it was first seen, too */
+        if (g_ppu_threads[g].state != PPU_THREAD_STATE_FREE && g_ppu_threads[g].host_tid == tid) {
+            snprintf(out, cap, "ppu %d %.24s", g + 1, g_ppu_threads[g].name); return; }
+    /* Resolving a start function reads the link map: once per thread. */
+    static struct { DWORD tid; char nm[64]; } c[512]; static int nc = 0;
+    for (int i = 0; i < nc; i++)
+        if (c[i].tid == tid) { snprintf(out, cap, "%s", c[i].nm); return; }
+    prof_thread_name_uncached(tid, out, cap);
+    if (nc < 512) { c[nc].tid = tid; snprintf(c[nc].nm, sizeof c[nc].nm, "%s", out); nc++; }
+}
+static void prof_thread_name_uncached(DWORD tid, char* out, size_t cap)
+{
+    snprintf(out, cap, "host %lu", (unsigned long)tid);
+    typedef LONG (WINAPI *NtQIT)(HANDLE, int, PVOID, ULONG, PULONG);
+    static NtQIT qit = (NtQIT)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h || !qit) { if (h) CloseHandle(h); return; }
+    PVOID sa = NULL; qit(h, 9 /* ThreadQuerySetWin32StartAddress */, &sa, sizeof sa, NULL);
+    CloseHandle(h);
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+    if ((uintptr_t)sa - exe < 0x40000000u) {
+        uint64_t rv = (uint64_t)((uintptr_t)sa - exe); char nm[1][48];
+        map_names(&rv, 1, nm);
+        snprintf(out, cap, "%.40s", nm[0]);
+    } else {
+        HMODULE m = NULL; char mod[MAX_PATH] = "";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sa, &m) && m)
+            GetModuleFileNameA(m, mod, sizeof mod);
+        const char* b = strrchr(mod, '\\'); b = b ? b + 1 : mod;
+        snprintf(out, cap, "(%s thread)", *b ? b : "dll");
+    }
+}
+
+/* CPU of each thread between two snapshots, busiest first, as "name cpu%". */
+static double prof_cpu_lines(FILE* f, const ProfThr* a, int na, const ProfThr* b, int nb,
+                             double wall_ms, int rows, int one_line)
+{
+    struct D { DWORD tid; double ms; } d[512]; int nd = 0;
+    double tot = 0;
+    for (int i = 0; i < nb && nd < 512; i++) {
+        ULONGLONG t0 = 0;
+        for (int j = 0; j < na; j++) if (a[j].tid == b[i].tid) { t0 = a[j].t; break; }
+        const double ms = (double)(b[i].t - t0) / 10000.0;
+        if (ms <= 0) continue;
+        d[nd].tid = b[i].tid; d[nd].ms = ms; nd++; tot += ms;
+    }
+    for (int i = 1; i < nd; i++) for (int j = i; j > 0 && d[j].ms > d[j - 1].ms; j--)
+        { D t = d[j]; d[j] = d[j - 1]; d[j - 1] = t; }
+    if (one_line) fprintf(f, "cores %5.2f |", tot / wall_ms);
+    for (int i = 0; i < nd && i < rows; i++) {
+        if (d[i].ms < wall_ms * 0.01) break;
+        char nm[64]; prof_thread_name(d[i].tid, nm, sizeof nm);
+        if (one_line) fprintf(f, " %s %.0f%%", nm, 100.0 * d[i].ms / wall_ms);
+        else fprintf(f, "  %6.1f%%  %s%c", 100.0 * d[i].ms / wall_ms, nm, 10);
+    }
+    if (one_line) fprintf(f, "%c", 10);
+    return tot / wall_ms;
+}
+
+static DWORD WINAPI profile_thread(LPVOID)
+{
+    enum { MAXT = 512 };
+    static ProfThr first[MAXT], prev[MAXT], cur[MAXT];
+    int nfirst = 0, nprev = 0;
+    long seen = g_rsx_prof_toggle;
+    int on = 0, num = 0;
+    char prefix[MAX_PATH] = "";
+    FILE* tf = NULL;
+    ULONGLONG t0 = 0, tlast = 0;
+    uint64_t w0 = 0;
+    for (;;) {
+        Sleep(100);
+        const long tg = g_rsx_prof_toggle;
+        if (tg != seen) {
+            seen = tg;
+            if (!on) {
+                const char* dir = getenv("PROF_DIR");
+                if (!dir || !*dir) dir = getenv("RSX_HOTKEY_DIR");
+                if (!dir || !*dir) dir = ".";
+                CreateDirectoryA(dir, NULL);
+                for (num = 1; num < 1000; num++) {
+                    char probe[MAX_PATH + 32];
+                    snprintf(probe, sizeof probe, "%s/prof_%03d_summary.txt", dir, num);
+                    if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) break;
+                }
+                snprintf(prefix, sizeof prefix, "%s/prof_%03d", dir, num);
+                char tp[MAX_PATH + 32]; snprintf(tp, sizeof tp, "%s_threads.txt", prefix);
+                tf = fopen(tp, "w");
+                if (tf) fprintf(tf, "CPU per thread each second (%% of one core)%c", 10);
+                memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
+                g_waits_dropped = 0;
+                w0 = ppu_waits_now();
+                g_waits_armed = 1;
+                nfirst = nprev = prof_threads(first, MAXT);
+                memcpy(prev, first, sizeof(ProfThr) * nfirst);
+                t0 = tlast = GetTickCount64();
+                rsx_prof_begin(prefix);
+                char note[64]; snprintf(note, sizeof note, "  [profiling #%d - F11 stops]", num);
+                rsx_prof_title(note);
+                fprintf(stderr, "[prof] #%d started -> %s_*%c", num, prefix, 10);
+                on = 1;
+            } else {
+                g_waits_armed = 0;
+                LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+                const double win_ms = (double)(ppu_waits_now() - w0) * 1000.0 / (double)f.QuadPart;
+                char digest[256] = "";
+                const int n = rsx_prof_end(digest, sizeof digest);
+                if (tf) {
+                    const int nc = prof_threads(cur, MAXT);
+                    const double wall = (double)(GetTickCount64() - t0);
+                    fprintf(tf, "%cover the session (%.1f s):%c", 10, wall / 1000.0, 10);
+                    const double cores = prof_cpu_lines(tf, first, nfirst, cur, nc, wall, 24, 0);
+                    fprintf(tf, "  %.2f cores busy on average%c%c", cores, 10, 10);
+                    fprintf(tf, "what each guest thread waited on (console `waits`):%c", 10);
+                    s_dbg_redirect = tf;
+                    dbg_waits_report(win_ms, 40);
+                    s_dbg_redirect = NULL;
+                    fclose(tf); tf = NULL;
+                }
+                rsx_prof_title("");
+                fprintf(stderr, "[prof] #%d stopped: %d presents; %s -> %s_*%c", num, n, digest, prefix, 10);
+                on = 0;
+            }
+        }
+        if (on && tf && GetTickCount64() - tlast >= 1000) {
+            const ULONGLONG now = GetTickCount64();
+            const int nc = prof_threads(cur, MAXT);
+            fprintf(tf, "t=%5.1f ", (now - t0) / 1000.0);
+            prof_cpu_lines(tf, prev, nprev, cur, nc, (double)(now - tlast), 6, 1);
+            memcpy(prev, cur, sizeof(ProfThr) * nc); nprev = nc;
+            tlast = now;
+            fflush(tf);
+        }
     }
     return 0;
 }
@@ -1740,6 +1936,7 @@ int main(int argc, char** argv)
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #ifdef _WIN32
     CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
+    CreateThread(NULL, 0, profile_thread, NULL, 0, NULL);   /* F11 profile sessions */
     /* PS3_DEBUG=<file>: ask a running title what it is doing. */
     { static char dbgpath[1024];
       const char* dp = getenv("PS3_DEBUG");

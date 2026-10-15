@@ -572,12 +572,17 @@ static double perf_now(void)
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
-static int perf_on(void)
+static volatile long s_prof_on;   /* a profile session is recording (rsx_prof_begin) */
+volatile long g_rsx_prof_toggle;   /* bumped per F11 press; boot_main starts/stops */
+static int perf_print(void)
 {
     static int v = -1;
     PS3_KNOB(v, ps3_env_int("PERF", 0));
     return v;
 }
+/* PERF=1 prints the [PERF] lines; a profile session turns the counters on
+ * without them. */
+static int perf_on(void) { return perf_print() || s_prof_on; }
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -613,6 +618,8 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             extern void cellGcm_replay_hotkey(void);
             cellGcm_replay_hotkey();
         }
+        if (wp == VK_F11 && !(lp & (1 << 30)))    /* profile start/stop */
+            InterlockedIncrement(&g_rsx_prof_toggle);
         return 0;
     case WM_SYSKEYDOWN:
         /* F10 is the menu key: Windows sends it as WM_SYSKEYDOWN, never
@@ -5660,6 +5667,174 @@ static void rf_slow_report(void)
                 (s_rf_pp[5] - s_rf_pp0[5]) * 1000);
     fprintf(stderr, "%c", 10);
 }
+
+/* Profile sessions (F11, or the console's `profile`): boot_main's profile
+ * thread calls rsx_prof_begin/rsx_prof_end; in between, every present is
+ * recorded here, and the end writes <prefix>_frames.txt (one line per
+ * present) and <prefix>_summary.txt (frame-time statistics and the worst
+ * frames with where their time went). */
+typedef struct ProfRec {
+    double t, dt, rf, flat, wait, store;
+    float ph[RF_CPS];                         /* render_frame phases, ms */
+    float tex, srv, pso, cpso, fxc, miss;     /* draw pre-pass split, ms */
+    int ntex, ncpso, nfxc;
+    u32 draws;
+} ProfRec;
+#define PROF_MAX (1 << 17)                    /* ~70 min at 30 presents/s */
+static ProfRec* s_prof; static volatile long s_prof_n;
+static long long s_prof_t0, s_prof_prev;
+static char s_prof_prefix[MAX_PATH];
+
+static void prof_record(long long q0)
+{
+    if (!s_prof_on || !s_prof) return;
+    static long long fq = 0;
+    if (!fq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
+    const double ms = 1000.0 / (double)fq;
+    const long i = s_prof_n;
+    if (i >= PROF_MAX) return;
+    ProfRec* r = &s_prof[i];
+    extern volatile long long g_gcm_flip_word_qpc;
+    if (!s_prof_t0) s_prof_t0 = q0;
+    r->t = (q0 - s_prof_t0) * ms;
+    r->dt = s_prof_prev ? (q0 - s_prof_prev) * ms : 0.0;
+    r->rf = s_rf_cp[0] ? (q0 - s_rf_cp[0]) * ms : 0.0;
+    r->flat = g_gcm_flip_word_qpc ? (q0 - g_gcm_flip_word_qpc) * ms : -1.0;
+    r->wait = s_fl_wait_ms; r->store = s_fl_store_ms;
+    long long prev = s_rf_cp[0];
+    for (int k = 0; k < RF_CPS; k++) {
+        r->ph[k] = (k && s_rf_cp[k]) ? (float)((s_rf_cp[k] - prev) * ms) : 0.f;
+        if (k && s_rf_cp[k]) prev = s_rf_cp[k];
+    }
+    r->tex = (float)((s_rf_pp[0] - s_rf_pp0[0]) * 1000); r->srv = (float)((s_rf_pp[1] - s_rf_pp0[1]) * 1000);
+    r->pso = (float)((s_rf_pp[2] - s_rf_pp0[2]) * 1000); r->cpso = (float)((s_rf_pp[3] - s_rf_pp0[3]) * 1000);
+    r->fxc = (float)((s_rf_pp[4] - s_rf_pp0[4]) * 1000); r->miss = (float)((s_rf_pp[5] - s_rf_pp0[5]) * 1000);
+    r->ntex = s_rf_ppn[0] - s_rf_ppn0[0]; r->ncpso = s_rf_ppn[1] - s_rf_ppn0[1]; r->nfxc = s_rf_ppn[2] - s_rf_ppn0[2];
+    r->draws = s_dbg_last_draws;
+    s_prof_prev = q0;
+    s_prof_n = i + 1;
+}
+
+void rsx_prof_begin(const char* prefix)
+{
+    if (!s_prof) s_prof = (ProfRec*)malloc(sizeof(ProfRec) * PROF_MAX);
+    if (!s_prof) return;
+    snprintf(s_prof_prefix, sizeof s_prof_prefix, "%s", prefix);
+    s_prof_n = 0; s_prof_t0 = 0; s_prof_prev = 0;
+    InterlockedExchange(&s_prof_on, 1);
+}
+
+static int prof_cmp_dbl(const void* a, const void* b)
+{
+    const double x = *(const double*)a, y = *(const double*)b;
+    return x < y ? -1 : x > y;
+}
+
+/* Returns the number of presents recorded; fills a one-line digest. */
+int rsx_prof_end(char* digest, size_t cap)
+{
+    InterlockedExchange(&s_prof_on, 0);
+    Sleep(150);                       /* the frame being recorded finishes */
+    const long n = s_prof_n;
+    if (digest && cap) digest[0] = 0;
+    if (!s_prof || n < 3) return (int)n;
+    static const char* ph[RF_CPS] = { "", "wait+store", "setup", "rt-prepass",
+        "draw-prepass", "legacy", "vp-pass", "post", "submit", "present" };
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%s_frames.txt", s_prof_prefix);
+    FILE* f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "# t_ms dt rf flip->present wait store draws |");
+        for (int k = 1; k < RF_CPS; k++) fprintf(f, " %s", ph[k]);
+        fprintf(f, " | tex ntex srv pso create-pso ncreate fxc nfxc miss%c", 10);
+        for (long i = 0; i < n; i++) {
+            const ProfRec* r = &s_prof[i];
+            fprintf(f, "%.1f %.2f %.2f %.2f %.2f %.2f %u |", r->t, r->dt, r->rf, r->flat,
+                    r->wait, r->store, r->draws);
+            for (int k = 1; k < RF_CPS; k++) fprintf(f, " %.2f", r->ph[k]);
+            fprintf(f, " | %.2f %d %.2f %.2f %.2f %d %.2f %d %.2f%c", r->tex, r->ntex, r->srv,
+                    r->pso, r->cpso, r->ncpso, r->fxc, r->nfxc, r->miss, 10);
+        }
+        fclose(f);
+    }
+    /* statistics over intervals (skip the first: no previous present) */
+    double* dt = (double*)malloc(sizeof(double) * n);
+    double* rf = (double*)malloc(sizeof(double) * n);
+    if (!dt || !rf) { free(dt); free(rf); return (int)n; }
+    long m = 0, skips = 0, over36 = 0, over50 = 0, over100 = 0;
+    double sum = 0, phsum[RF_CPS] = {0};
+    for (long i = 1; i < n; i++) {
+        const ProfRec* r = &s_prof[i];
+        dt[m] = r->dt; rf[m] = r->rf; sum += r->dt; m++;
+        if (r->draws < 50) skips++;
+        if (r->dt > 36.3) over36++;
+        if (r->dt > 50) over50++;
+        if (r->dt > 100) over100++;
+        for (int k = 1; k < RF_CPS; k++) phsum[k] += r->ph[k];
+    }
+    qsort(dt, (size_t)m, sizeof *dt, prof_cmp_dbl);
+    qsort(rf, (size_t)m, sizeof *rf, prof_cmp_dbl);
+    const double secs = s_prof[n - 1].t / 1000.0;
+    const double fps = sum > 0 ? 1000.0 * m / sum : 0;
+    /* 1% low: the frame rate of the slowest 1% of presents (mean interval) */
+    long k1 = m / 100; if (k1 < 1) k1 = 1;
+    double low = 0; for (long i = m - k1; i < m; i++) low += dt[i]; low /= k1;
+    snprintf(path, sizeof path, "%s_summary.txt", s_prof_prefix);
+    f = fopen(path, "w");
+    if (f) {
+        fprintf(f, "%.1f s, %ld presents: %.1f fps average, 1%% low %.1f fps%c", secs, n, fps,
+                low > 0 ? 1000.0 / low : 0, 10);
+        fprintf(f, "present interval ms: median %.1f  p90 %.1f  p99 %.1f  max %.1f%c",
+                dt[m / 2], dt[m * 9 / 10], dt[m * 99 / 100], dt[m - 1], 10);
+        fprintf(f, "  over 36.3 ms (the game's limit for 30 fps): %ld   over 50: %ld   over 100: %ld%c",
+                over36, over50, over100, 10);
+        fprintf(f, "skip frames (under 50 draws, the game's 15 fps mode): %ld (%.1f%%)%c",
+                skips, m ? 100.0 * skips / m : 0, 10);
+        fprintf(f, "render_frame (frame start -> Present) ms: median %.1f  p90 %.1f  max %.1f%c",
+                rf[m / 2], rf[m * 9 / 10], rf[m - 1], 10);
+        fprintf(f, "  mean per phase:");
+        for (int k = 1; k < RF_CPS; k++) fprintf(f, " %s %.2f", ph[k], m ? phsum[k] / m : 0);
+        fprintf(f, "%c%c", 10, 10);
+        fprintf(f, "An interval much longer than its render_frame means the game itself was%c"
+                   "late with the frame (CPU, SPU or waits: see _threads.txt); a long%c"
+                   "render_frame is this renderer.%c%c", 10, 10, 10, 10);
+        fprintf(f, "worst presents (t = seconds into the session):%c", 10);
+        char* used = (char*)calloc((size_t)n, 1);
+        for (int w = 0; w < 15 && used; w++) {
+            long bi = -1;
+            for (long i = 1; i < n; i++)
+                if (!used[i] && (bi < 0 || s_prof[i].dt > s_prof[bi].dt)) bi = i;
+            if (bi < 0) break;
+            used[bi] = 1;
+            const ProfRec* r = &s_prof[bi];
+            fprintf(f, "  t=%7.2f  interval %6.1f  render_frame %6.1f  draws %5u  flip->present %5.1f |",
+                    r->t / 1000.0, r->dt, r->rf, r->draws, r->flat);
+            for (int k = 1; k < RF_CPS; k++) if (r->ph[k] >= 1.0f) fprintf(f, " %s %.1f", ph[k], r->ph[k]);
+            if (r->tex >= 1.0f) fprintf(f, " | tex uploads %.1f (%d)", r->tex, r->ntex);
+            if (r->ncpso) fprintf(f, " | %d pipelines created %.1f", r->ncpso, r->cpso);
+            if (r->nfxc) fprintf(f, " | %d shaders compiled %.1f", r->nfxc, r->fxc);
+            fprintf(f, "%c", 10);
+        }
+        free(used);
+        fclose(f);
+    }
+    if (digest && cap)
+        snprintf(digest, cap, "%.1f s, %.1f fps, 1%% low %.1f, %ld over 36.3 ms, %ld over 100 ms, %.1f%% skip frames",
+                 secs, fps, low > 0 ? 1000.0 / low : 0, over36, over100, m ? 100.0 * skips / m : 0);
+    free(dt); free(rf);
+    return (int)n;
+}
+
+/* Window caption note while a session records ("" clears it). */
+void rsx_prof_title(const char* note)
+{
+    static char base[256];
+    if (!s_d3d.hwnd) return;
+    if (!base[0]) GetWindowTextA(s_d3d.hwnd, base, sizeof base);
+    char t[320];
+    snprintf(t, sizeof t, "%s%s", base, note);
+    SetWindowTextA(s_d3d.hwnd, t);
+}
 static void frame_log(long long q0, long long q1)
 {
     static FILE* f = NULL; static int st = -1;
@@ -6839,7 +7014,7 @@ rtt_dump_done:;
         s_t_prev = now;
         if (++s_n % 20 == 0) {
             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
-            fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
+            if (perf_print()) fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
                             " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
                             " [vs compile %.2fs, %d] [fxc %.2fs %d, disk %d | create pso %.2fs %d | misses %.2fs]%c",
@@ -7300,6 +7475,7 @@ skip_dump_consider: ;
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       RSX_MARK("present", s_present_this_frame, 0); }
     RF_CP(9); rf_slow_report();
+    if (s_present_this_frame) prof_record(s_rf_cp[9]);
 
     move_to_next_frame();
 
