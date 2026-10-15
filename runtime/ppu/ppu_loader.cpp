@@ -3793,6 +3793,13 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* Per-host-thread callback stack. Every thread's first callback used to take
+ * 0xCFFE0000, so two threads delivering callbacks at once shared one stack. A
+ * host thread that delivers callbacks concurrently with the guest (the vblank
+ * clock) sets its own first. */
+static PPU_THREAD_LOCAL uint32_t t_cb_sp_override = 0;
+extern "C" void ppu_guest_call_set_stack(uint32_t sp) { t_cb_sp_override = sp; }
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3820,7 +3827,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = t_cb_sp_override ? t_cb_sp_override : 0xCFFE0000u;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -3865,7 +3872,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!s_cb_sp) s_cb_sp = t_cb_sp_override ? t_cb_sp_override : 0xCFFE0000u;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

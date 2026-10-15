@@ -482,6 +482,75 @@ static DWORD WINAPI guest_prof_thread(LPVOID)
 
 extern "C" const char* cellGame_get_title(void);   /* PARAM.SFO TITLE, for the caption */
 
+/* GCM_VBLANK_THREAD (default 1): vblanks come from a thread of their own,
+ * which also runs the game's vblank and flip handlers, the way libgcm's
+ * interrupt thread does on hardware.
+ *
+ * The ticks used to be marked by the render loop below, between drains and
+ * presents, and the handlers ran at the next HLE call of whichever guest
+ * thread made one. Both added delay: a 15 ms render_frame held the tick, and
+ * delivery waited for a guest thread to call into the runtime. Demon's Souls
+ * flips from HighGraphics after its vblank handler posts a semaphore; the
+ * posts came 7-25 ms apart instead of every 16.7, each late one pushed a frame
+ * past the game's 36.3 ms limit, and its pacer fell back to 15 fps (the
+ * Boletarian Palace render/skip alternation, the Tutorial micro-stutter).
+ *
+ * The handlers run on a guest stack of their own, with a host-thread identity
+ * (ppu_guest_call). The HLE-boundary pump stays as a fallback for a tick this
+ * thread could not deliver (another thread was mid-pump). */
+extern "C" uint32_t sys_ppu_thread_alloc_host_stack(uint32_t size);
+extern "C" void ppu_guest_call_set_stack(uint32_t sp);
+extern "C" void ppu_gcm_pump(void);
+static int vblank_thread_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = ps3_env_int("GCM_VBLANK_THREAD", 1) ? 1 : 0;
+    return on;
+}
+
+static DWORD WINAPI vblank_clock(LPVOID)
+{
+    if (uint32_t sp = sys_ppu_thread_alloc_host_stack(0x10000u)) ppu_guest_call_set_stack(sp);
+    else fprintf(stderr, "[vblank] no guest stack for the clock thread; sharing the callback stack%c", 10);
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); a plain timer
+     * rounds to the scheduler tick. */
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+#endif
+    LARGE_INTEGER qpf, qpc;
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&qpc);
+    const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
+    const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
+    long long next_tick = qpc.QuadPart + tick_qpc;
+    for (;;) {
+        QueryPerformanceCounter(&qpc);
+        long long wait_qpc = next_tick - qpc.QuadPart;
+        if (wait_qpc > 0) {
+            const long long us = wait_qpc * 1000000 / qpf.QuadPart;
+#ifdef _WIN32
+            if (timer) {
+                LARGE_INTEGER due; due.QuadPart = -(us * 10);
+                SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+                WaitForSingleObject(timer, INFINITE);
+            } else Sleep((DWORD)(us / 1000));
+#else
+            usleep((useconds_t)us);
+#endif
+            continue;   /* re-check: a timer can wake a little early */
+        }
+        /* Far behind (the machine stalled): resync rather than burst. */
+        if (-wait_qpc > tick_qpc * 8) next_tick = qpc.QuadPart;
+        next_tick += tick_qpc;
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+        ppu_gcm_pump();
+    }
+    return 0;
+}
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
     /* Window caption: $PS3_TITLE wins, else the TITLE field PARAM.SFO already
@@ -548,7 +617,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         ULONGLONG now = GetTickCount64();
         QueryPerformanceCounter(&qpc);
         int fired = 0;
-        while (qpc.QuadPart - next_tick >= 0 && fired < 240) {
+        while (!vblank_thread_on() && qpc.QuadPart - next_tick >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
             /* Present a pending flip BEFORE draining further: the flip fires
@@ -1935,6 +2004,7 @@ int main(int argc, char** argv)
      * frame clock now runs everywhere. Without it a POSIX host never ticks
      * vblank or drains the FIFO, and the guest waits on fences forever. */
     CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
+    if (vblank_thread_on()) CreateThread(NULL, 1u * 1024 * 1024, vblank_clock, NULL, 0, NULL);
     if (getenv("PS3_GUEST_PROF"))
         CreateThread(NULL, 0, guest_prof_thread, NULL, 0, NULL);
 #ifdef _WIN32
