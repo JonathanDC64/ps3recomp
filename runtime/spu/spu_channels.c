@@ -826,13 +826,25 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * (spu_coh_notify_write -> spu_ch_wake; 2 ms timeout as the safety
          * net for a missed wake): a waiter wakes on the write, at worst 2 ms
          * late, and a busy consumer (whose line keeps
-         * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it. */
+         * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it.
+         *
+         * "Unchanged" must also mean "nothing else happened in between". The
+         * same consumer re-reads the write pointer once per ring entry while
+         * it works through a backlog, and when the producer is itself blocked
+         * waiting on a reply from this consumer, that pointer does not move:
+         * every entry then cost a 2 ms nap, and a full 1 MB ring took ~9 s to
+         * drain (the multi-second freezes in Boletarian Palace, HighGraphics
+         * waiting on command 0x23's result). Any DMA since the previous
+         * GETLLAR means the SPU is working, not polling: start the count over. */
         { static int s_nap = -1;
           PS3_KNOB(s_nap, ps3_env_int("SPU_LLAR_NAP", 1));
           static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
+          static SPU_THREAD_LOCAL unsigned long n_xfers;
           static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
           if (s_nap) {
-              if (ea == n_ea && !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE)) {
+              const int worked = t_spu_xfers != n_xfers;
+              n_xfers = t_spu_xfers;
+              if (ea == n_ea && !worked && !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE)) {
                   if (++n_same > 20000u) spu_llar_idle_wait(ctx);
               } else {
                   n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);

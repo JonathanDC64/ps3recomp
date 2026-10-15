@@ -166,11 +166,16 @@ static inline int mfc_is_fence(uint32_t cmd)
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
  */
+/* Transfers this host thread's SPU has issued: the GETLLAR idle back-off
+ * (spu_channels.c) tells an SPU that is working between polls from one that
+ * only polls. */
+static SPU_THREAD_LOCAL unsigned long t_spu_xfers;
 static volatile uint32_t s_arm_pending;   /* SPU_PUT_MAGIC_ARM: guard EA to arm */
 static volatile int s_arm_abs;           /* ...as an absolute, write-only guard */
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    t_spu_xfers++;
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
