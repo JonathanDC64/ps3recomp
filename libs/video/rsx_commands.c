@@ -343,8 +343,17 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+/* Occlusion-query methods, for a backend that counts samples:
+ * NV4097_CLEAR_REPORT_VALUE (0x17C8), NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE
+ * (0x17CC) and NV4097_GET_REPORT (0x1800). They arrive here in stream order
+ * with the draws, which is what places each query. NULL: no backend counts,
+ * and the FIFO walker answers ZPASS reports with "visible". */
+void (*g_rsx_report_hook)(u32 method, u32 data) = NULL;
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    if ((method == 0x17C8 || method == 0x17CC || method == 0x1800) && g_rsx_report_hook)
+        g_rsx_report_hook(method, data);
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
      * the first real draw -- exactly the ones worth seeing -- were never traced. */

@@ -2053,13 +2053,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * later fence in the same batch overwrite it. */
                     if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
                     /* NV4097_GET_REPORT: (type << 24) | offset into the report
-                     * area. Sample counts are not measured, so a ZPASS query
-                     * reports "visible" -- the conservative answer; reading 0
-                     * tells the title every queried object is occluded. */
+                     * area. A backend that counts samples (g_rsx_report_hook)
+                     * stores ZPASS results itself once the GPU has them.
+                     * Without one a ZPASS query reports "visible" -- the
+                     * conservative answer; reading 0 tells the title every
+                     * queried object is occluded. */
                     if (m == 0x1800) {
+                        extern void (*g_rsx_report_hook)(u32, u32);
                         const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
                         { static int rn = 0; if (rn++ < 6) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT) {
+                        if (idx < CELL_GCM_MAX_REPORT_COUNT &&
+                            !((v >> 24) == 1u && g_rsx_report_hook)) {
                             s_report_data[idx].timestamp = get_timestamp_ns();
                             s_report_data[idx].value = (v >> 24) == 1u ? 0xFFFFu : 0u;
                         }
@@ -3158,6 +3162,15 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
         return NULL;
     }
     return &s_report_data[index];
+}
+
+/* A ZPASS result from the backend's occlusion query, stored where
+ * cellGcmGetReport reads it. */
+void cellGcm_report_store(u32 index, u32 value)
+{
+    if (index >= CELL_GCM_MAX_REPORT_COUNT) return;
+    s_report_data[index].value = value;
+    s_report_data[index].timestamp = get_timestamp_ns();
 }
 
 /* NID: 0x97FC4B73 */
