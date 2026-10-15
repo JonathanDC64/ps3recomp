@@ -60,14 +60,15 @@
  * register outside the root signature's range, so its pipeline failed to
  * build (E_INVALIDARG) and those surfaces never drew. */
 #define RSX_FP_UNITS      16
-#define MAX_DRAWS         8192  /* per-frame draw records. The per-draw
+#define MAX_DRAWS         16384 /* per-frame draw records. The per-draw
                                  * constant buffer is VP_CB_STRIDE * MAX_DRAWS
-                                 * * 2 bytes (138 MB here; 16384 asked for 264
-                                 * MB). 2048, sized from the spawn area's
-                                 * ~1841, was too few for a dark room in the
-                                 * first level: every draw past it was dropped,
-                                 * the display copy at the end of the frame
-                                 * with them, and the frame presented black.
+                                 * * 2 bytes (264 MB of upload heap). 2048,
+                                 * sized from the spawn area's ~1841, was too
+                                 * few for a dark room in the first level:
+                                 * every draw past it was dropped, the display
+                                 * copy at the end of the frame with them, and
+                                 * the frame presented black. Boletarian
+                                 * Palace reaches 7529, too close to 8192.
                                  * draw_room() reports running out. */
 /* Per-draw VP constant-buffer slot: vp_c[512] + posscale + posoffset
  * (514 vec4 = 8224 B) rounded up to D3D12's 256-byte CBV alignment.
