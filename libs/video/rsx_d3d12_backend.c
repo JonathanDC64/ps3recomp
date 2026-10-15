@@ -1945,6 +1945,107 @@ static void compile_vp(void)
  * gcm/cube's plasma FP `c = tex2D(t0, uv).x; out = (c, 0, c, 1)`. */
 #include "rsx_fp_decompiler.h"
 
+/* Compiled guest shaders on disk, so a program FXC has seen once never costs a
+ * frame again. FXC takes ~100 ms for one of this title's large vertex
+ * programs; a new area used to stall on dozens of them (PERF=1 "vs compile").
+ * Keyed by the HLSL text itself plus the target profile, so any decompiler
+ * change or diagnostic patch (VP_BYPASS, FP_SUB, ...) simply misses: there is
+ * nothing to invalidate. One file per program:
+ *   <dir>/<profile>_<fnv64 of profile+hlsl>.dxbc
+ * <dir> is PS3_SHADER_CACHE, default "shader_cache" next to the executable;
+ * PS3_SHADER_CACHE=0 turns the cache off. */
+static double s_perf_fxc = 0.0;            /* time inside D3DCompile proper */
+static int    s_perf_fxc_n = 0, s_perf_sc_hits = 0;
+static double s_perf_cpso = 0.0;           /* CreateGraphicsPipelineState, guest-FP PSOs */
+static int    s_perf_cpso_n = 0;
+static double s_perf_pmiss = 0.0;          /* whole vp_get_fp_pso calls that missed */
+static const char* shader_cache_dir(void)
+{
+    static char dir[MAX_PATH]; static int init = 0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("PS3_SHADER_CACHE");
+        if (e && !strcmp(e, "0")) dir[0] = 0;
+        else if (e && *e) snprintf(dir, sizeof dir, "%s", e);
+        else {
+            char exe[MAX_PATH];
+            DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
+            char* slash = (n && n < sizeof exe) ? strrchr(exe, '\\') : NULL;
+            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s\\shader_cache", exe); }
+            else snprintf(dir, sizeof dir, "shader_cache");
+        }
+        if (dir[0]) CreateDirectoryA(dir, NULL);
+    }
+    return dir;
+}
+static u64 shader_key(const char* src, size_t n, const char* profile)
+{
+    u64 h = 14695981039346656037ull;
+    for (const char* p = profile; *p; p++) { h ^= (u8)*p; h *= 1099511628211ull; }
+    h ^= 0xFF; h *= 1099511628211ull;
+    for (size_t i = 0; i < n; i++) { h ^= (u8)src[i]; h *= 1099511628211ull; }
+    return h;
+}
+/* A cached file is used only if it is a whole DXBC container: the header's
+ * total-size field (offset 24) must match the file length. */
+static ID3DBlob* shader_cache_load(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    ID3DBlob* b = NULL;
+    if (n > 32 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &b))) {
+        u8* p = (u8*)b->lpVtbl->GetBufferPointer(b);
+        if (fread(p, 1, (size_t)n, f) != (size_t)n || memcmp(p, "DXBC", 4) ||
+            ((u32)p[24] | ((u32)p[25] << 8) | ((u32)p[26] << 16) | ((u32)p[27] << 24)) != (u32)n) {
+            b->lpVtbl->Release(b); b = NULL;
+        }
+    }
+    fclose(f);
+    return b;
+}
+/* Written to a temporary name and renamed, so a crash or a second process
+ * never leaves a half-written program under the real name. */
+static void shader_cache_store(const char* path, ID3DBlob* b)
+{
+    char tmp[MAX_PATH + 32];
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return;
+    const size_t n = b->lpVtbl->GetBufferSize(b);
+    const int ok = fwrite(b->lpVtbl->GetBufferPointer(b), 1, n, f) == n;
+    if (fclose(f) || !ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        DeleteFileA(tmp);
+}
+static HRESULT shader_compile_cached(const char* src, size_t n, const char* name,
+                                     const char* profile, ID3DBlob** out, ID3DBlob** err)
+{
+    char path[MAX_PATH + 64]; path[0] = 0;
+    const char* dir = shader_cache_dir();
+    if (dir[0]) {
+        snprintf(path, sizeof path, "%s\\%s_%016llx.dxbc", dir, profile,
+                 (unsigned long long)shader_key(src, n, profile));
+        if ((*out = shader_cache_load(path)) != NULL) { if (perf_on()) s_perf_sc_hits++; return S_OK; }
+    }
+    const double t0 = perf_on() ? perf_now() : 0.0;
+    HRESULT hr = D3DCompile(src, n, name, NULL, NULL, "main", profile, 0, 0, out, err);
+    if (perf_on()) { s_perf_fxc += perf_now() - t0; s_perf_fxc_n++; }
+    if (SUCCEEDED(hr) && *out && path[0]) {
+        shader_cache_store(path, *out);
+        /* PS3_SHADER_CACHE_HLSL=1: keep the source beside each program, to
+         * see why a precompiled entry and a draw's lookup differ. */
+        static int keep = -1;
+        PS3_KNOB(keep, ps3_env_int("PS3_SHADER_CACHE_HLSL", 0));
+        if (keep) {
+            char hp[MAX_PATH + 72];
+            snprintf(hp, sizeof hp, "%s.hlsl", path);
+            FILE* f = fopen(hp, "wb");
+            if (f) { fwrite(src, 1, n, f); fclose(f); }
+        }
+    }
+    return hr;
+}
+
 /* Hash + compile the CURRENT rsx_state vertex program into the VS cache;
  * returns the cache slot (or -1). Called at draw-record time so each draw
  * carries the VP that was loaded when it was submitted. */
@@ -2057,8 +2158,7 @@ static int vp_get_vs(const rsx_state* st)
         }
     }
     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
-                            "main", "vs_5_0", 0, 0, &vb, &e);
+    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb, &e);
     if (e) e->lpVtbl->Release(e);
     if (perf_on()) s_perf_vs += perf_now() - vs_t0;
     if (FAILED(hr) || !vb) {
@@ -2395,6 +2495,95 @@ static void vp_pso_knobs_check(void)
     sig = h;
 }
 
+/* The HLSL the draw path compiles for a fragment program: decompiled with its
+ * inline constants read from b1 (baked in when there are more than b1 holds),
+ * then given the b1 layout. The offline precompiler builds the same text, so
+ * its disk-cache entries are the ones a draw looks up. ucode must be readable
+ * for RSX_FP_MAX_BYTES. Returns the instruction count, <= 0 on failure;
+ * fp_addr is only for the log. */
+/* Fragment-program variants this title has compiled, by code hash, in
+ * <shader cache>/fp_variants.txt ("hash exp32 cube d2c" per line, hex). The
+ * texture kinds a program is bound with (cube, shadow, depth-as-colour) are
+ * draw state that a Cg binary does not record, so the precompiler reads this
+ * list to rebuild every variant a run has needed: a cache emptied by a
+ * decompiler or driver update is refilled whole before the next boot. */
+typedef struct { u32 hash, exp32, cube, d2c; } FPVariant;
+static FPVariant* s_fpv = NULL;
+static int s_fpv_n = 0, s_fpv_cap = 0, s_fpv_loaded = 0;
+static int fpv_find(u32 hash, u32 exp32, u32 cube, u32 d2c)
+{
+    for (int i = 0; i < s_fpv_n; i++)
+        if (s_fpv[i].hash == hash && s_fpv[i].exp32 == exp32 && s_fpv[i].cube == cube &&
+            s_fpv[i].d2c == d2c) return 1;
+    return 0;
+}
+static void fpv_add(u32 hash, u32 exp32, u32 cube, u32 d2c)
+{
+    if (s_fpv_n == s_fpv_cap) {
+        const int cap = s_fpv_cap ? s_fpv_cap * 2 : 256;
+        FPVariant* g = (FPVariant*)realloc(s_fpv, sizeof(FPVariant) * (size_t)cap);
+        if (!g) return;
+        s_fpv = g; s_fpv_cap = cap;
+    }
+    s_fpv[s_fpv_n].hash = hash; s_fpv[s_fpv_n].exp32 = exp32;
+    s_fpv[s_fpv_n].cube = cube; s_fpv[s_fpv_n].d2c = d2c; s_fpv_n++;
+}
+static void fpv_load(void)
+{
+    if (s_fpv_loaded) return;
+    s_fpv_loaded = 1;
+    if (!shader_cache_dir()[0]) return;
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%s\\fp_variants.txt", shader_cache_dir());
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    unsigned h, e, c, d;
+    while (fscanf(f, "%x %x %x %x", &h, &e, &c, &d) == 4)
+        if (!fpv_find(h, e, c, d)) fpv_add(h, e, c, d);
+    fclose(f);
+}
+static void fpv_note(const u8* ucode, u32 exp32, u32 cube, u32 d2c)
+{
+    fpv_load();
+    const u32 hash = rsx_fp_code_hash(ucode, RSX_FP_MAX_BYTES);
+    if (!shader_cache_dir()[0] || fpv_find(hash, exp32, cube, d2c)) return;
+    fpv_add(hash, exp32, cube, d2c);
+    char path[MAX_PATH + 32];
+    snprintf(path, sizeof path, "%s\\fp_variants.txt", shader_cache_dir());
+    FILE* f = fopen(path, "a");
+    if (f) { fprintf(f, "%08x %x %x %x\n", hash, exp32, cube, d2c); fclose(f); }
+}
+
+static int fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask,
+                         char* hlsl, size_t cap, u32 fp_addr, int note)
+{
+    /* Only the units the program samples: the masks come from whatever the
+     * draw has bound, and a cube or depth texture left on an unused unit
+     * would otherwise change the text (and the cache entry) for nothing. */
+    { const u32 used = rsx_fp_texture_units(ucode, RSX_FP_MAX_BYTES);
+      cube_mask &= used | (used << 16); d2c_mask &= used; }
+    if (note) fpv_note(ucode, exp32 ? 1u : 0u, cube_mask, d2c_mask);
+    u32 kcount = 0;
+    int n = rsx_fp_decompile_buffered_ex2(ucode, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
+                                          d2c_mask, hlsl, (u32)cap, &kcount);
+    int buffered = n > 0 && kcount <= FPCB_KMAX;
+    if (n > 0 && !buffered) {
+        /* More constants than b1 holds: bake them, as before. */
+        static int said = 0;
+        if (said++ < 4)
+            fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
+                            "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
+        n = rsx_fp_decompile_ex2(ucode, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
+                                 d2c_mask, hlsl, (u32)cap);
+    }
+    if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return n; }
+    if (!fp_bind_b1(hlsl, cap, cube_mask, buffered)) {
+        static int _e=0; if(_e++<16) printf("[FP] b1 binding failed (fp=0x%08X)\n", fp_addr);
+        return 0;
+    }
+    return n;
+}
+
 static void fp_seen_note(u32 ea, u32 len);
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
@@ -2521,24 +2710,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * run while the title re-patched them per material (Demon's Souls's level
      * surfaces drew black or saturated). The cube mask goes to the decompiler
      * so cube units are declared and sampled as cubes. */
-    u32 kcount = 0;
-    int n = rsx_fp_decompile_buffered_ex2(vm_base + off, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
-                                          d2c_mask, hlsl, sizeof(hlsl), &kcount);
-    int buffered = n > 0 && kcount <= FPCB_KMAX;
-    if (n > 0 && !buffered) {
-        /* More constants than b1 holds: bake them, as before. */
-        static int said = 0;
-        if (said++ < 4)
-            fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
-                            "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
-        n = rsx_fp_decompile_ex2(vm_base + off, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
-                                 d2c_mask, hlsl, sizeof(hlsl));
-    }
-    if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return vp_fp_insert(&key); }
-    if (!fp_bind_b1(hlsl, sizeof hlsl, cube_mask, buffered)) {
-        static int _e=0; if(_e++<16) printf("[FP] b1 binding failed (fp=0x%08X)\n", fp_addr);
-        return vp_fp_insert(&key);
-    }
+    int n = fp_build_hlsl(vm_base + off, exp32, cube_mask, d2c_mask, hlsl, sizeof hlsl, fp_addr, 1);
+    if (n <= 0) return vp_fp_insert(&key);
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2696,8 +2869,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
           }
       } }
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
-                            "main", "ps_5_0", 0, 0, &pb, &e);
+    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
     if (FAILED(hr) || !pb) {
         static int _e2=0; if (_e2++<16)
             printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
@@ -2788,8 +2960,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.SampleDesc.Count = 1;
 
     ID3D12PipelineState* pso = NULL;
+    const double cp_t0 = perf_on() ? perf_now() : 0.0;
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    if (perf_on()) { s_perf_cpso += perf_now() - cp_t0; s_perf_cpso_n++; }
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
         static int _e3=0; if (_e3++<16) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
@@ -5833,13 +6007,15 @@ rtt_dump_done:;
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
+        const int _pm0 = s_perf_pso_miss;
         if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                        dr_cube_mask(dr), dr->d2c_mask);
-        if (perf_on()) s_perf_pso += perf_now() - _ps0;
+        if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
+                         if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
     drawprint_batch();
 
@@ -6428,7 +6604,7 @@ rtt_dump_done:;
             fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
                             " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
-                            " [vs compile %.2fs, %d]%c",
+                            " [vs compile %.2fs, %d] [fxc %.2fs %d, disk %d | create pso %.2fs %d | misses %.2fs]%c",
                     20.0 / fr,
                     s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
                     s_perf_vtx, 100.0 * s_perf_vtx / fr,
@@ -6439,11 +6615,14 @@ rtt_dump_done:;
                     s_perf_pso, 100.0 * s_perf_pso / fr,
                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
                     fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr,
-                    s_perf_vs, s_perf_vs_compiles, 10);
+                    s_perf_vs, s_perf_vs_compiles,
+                    s_perf_fxc, s_perf_fxc_n, s_perf_sc_hits, s_perf_cpso, s_perf_cpso_n, s_perf_pmiss, 10);
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
             s_perf_vs_compiles = 0; s_perf_vs = 0.0;
+            s_perf_fxc = 0.0; s_perf_fxc_n = 0; s_perf_sc_hits = 0;
+            s_perf_cpso = 0.0; s_perf_cpso_n = 0; s_perf_pmiss = 0.0;
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }
     }
