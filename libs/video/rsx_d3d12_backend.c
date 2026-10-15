@@ -2847,8 +2847,15 @@ static u32 tex_csum(const u8* base, u32 nbytes)
 {
     u32 h = 2166136261u;
     u32 step = nbytes > 4096u ? nbytes / 1024u : 4u;
-    for (u32 i = 0; i + 3 < nbytes; i += step) {
-        u32 w32; memcpy(&w32, base + i, sizeof w32);
+    /* The word read moves through each step (k*28 mod step): texture sizes
+     * are powers of two, so a fixed stride always landed on the same bytes
+     * of every compressed block -- a 128x128 DXT5 read only its alpha
+     * endpoints, a DXT1 only its colour endpoints, never the indices. */
+    u32 k = 0;
+    for (u32 i = 0; i + 3 < nbytes; i += step, k++) {
+        u32 at = step > 4u ? i + ((k * 28u) % step & ~3u) : i;
+        if (at + 3 >= nbytes) at = i;
+        u32 w32; memcpy(&w32, base + at, sizeof w32);
         h ^= w32; h *= 16777619u;
     }
     return h;
