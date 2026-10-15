@@ -288,6 +288,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
+    int next;               /* vp_fp_find: next entry in this fp_addr's bucket */
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
  * distinct (fp, vs, blend, rt, cmask, ucode-hash) combinations than that in a
@@ -2353,6 +2354,14 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m | sh;
 }
 
+/* The guest-FP PSO cache is looked up for every draw, and holds thousands of
+ * keys once a level has been played: a scan of the whole array per draw was a
+ * measurable part of the render thread's frame at 6k draws. Bucketed by
+ * fp_addr. */
+#define VP_FP_BUCKETS 4096
+static int s_vp_fp_head[VP_FP_BUCKETS];
+static u32 vp_fp_bucket(u32 fp_addr) { return ((fp_addr >> 4) * 2654435761u) >> 20; }
+
 /* Append a finished (or failed: pso NULL) key to the guest-FP PSO cache. */
 static ID3D12PipelineState* vp_fp_insert(const VPFPEntry* e)
 {
@@ -2362,8 +2371,31 @@ static ID3D12PipelineState* vp_fp_insert(const VPFPEntry* e)
         if (!grown) return e->pso;              /* uncached, still usable */
         s_d3d.vp_fp = grown; s_d3d.vp_fp_cap = cap;
     }
-    s_d3d.vp_fp[s_d3d.vp_fp_n++] = *e;
+    const int idx = s_d3d.vp_fp_n++;
+    s_d3d.vp_fp[idx] = *e;
+    VPFPEntry* n = &s_d3d.vp_fp[idx];
+    int* head = &s_vp_fp_head[vp_fp_bucket(e->fp_addr)];
+    n->next = *head - 1;     /* heads are stored +1 so 0 means empty */
+    *head = idx + 1;
     return e->pso;
+}
+
+/* The entry with exactly this key, or NULL. Entries are only appended, so a
+ * bucket's chain stays valid as the array grows. */
+static VPFPEntry* vp_fp_find(const VPFPEntry* k)
+{
+    for (int i = s_vp_fp_head[vp_fp_bucket(k->fp_addr)] - 1; i >= 0; i = s_d3d.vp_fp[i].next) {
+        VPFPEntry* q = &s_d3d.vp_fp[i];
+        if (q->fp_addr == k->fp_addr && q->vs_idx == k->vs_idx &&
+            q->vs_hash == k->vs_hash && q->gen == k->gen &&
+            q->blend == k->blend && q->nrt == k->nrt &&
+            q->rtfmt == k->rtfmt && q->exp32 == k->exp32 &&
+            q->ucode_hash == k->ucode_hash && q->cmask == k->cmask &&
+            q->cull == k->cull && q->depth == k->depth &&
+            q->cube_mask == k->cube_mask && q->d2c_mask == k->d2c_mask)
+            return q;
+    }
+    return NULL;
 }
 
 /* The debug rewrites below (FP_ONE, FP_SHOW, FP_IDCOLOR, FP_TEX, FP_KILL) edit
@@ -2611,6 +2643,38 @@ static int fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask
 }
 
 static void fp_seen_note(u32 ea, u32 len);
+
+/* rsx_fp_code_hash of the program at guest offset `off`, and its size. The
+ * PSO lookup needs it for every draw, and hashing (a byte-serial FNV) plus
+ * sizing the program was ~12% of the render thread at Boletarian Palace's
+ * 6k draws. A program is re-hashed only when its bytes differ from the copy
+ * kept with the last hash: equal bytes up to the old size mean the same END
+ * instruction, so the same size and the same hash. RSX_FP_HASH_MEMO=0 hashes
+ * every time. */
+typedef struct { u32 off, size, hash; u8* bytes; } FpHashMemo;
+static FpHashMemo s_fph[1024];
+static u32 fp_hash_at(u32 off, u32* size_out)
+{
+    extern uint8_t* vm_base;
+    const u8* up = vm_base + off;
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_FP_HASH_MEMO", 1));
+    FpHashMemo* m = &s_fph[((off >> 4) * 2654435761u) >> 22];
+    if (en && m->bytes && m->off == off && !memcmp(m->bytes, up, m->size)) {
+        *size_out = m->size;
+        return m->hash;
+    }
+    u32 usz = rsx_fp_program_size(up, RSX_FP_MAX_BYTES);
+    if (usz == 0) usz = 64;
+    const u32 h = rsx_fp_code_hash(up, RSX_FP_MAX_BYTES);
+    fp_seen_note(off, usz);
+    if (en) {
+        u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
+        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h; }
+    }
+    *size_out = usz;
+    return h;
+}
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 depth, u32 cube_mask, u32 d2c_mask)
@@ -2643,31 +2707,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * so hashing them made the pipeline key move every draw. */
     u32 uhash;
     {
-        u32 usz = rsx_fp_program_size(vm_base + off, RSX_FP_MAX_BYTES);
-        if (usz == 0) usz = 64;
-        fp_seen_note(off, usz);
+        static int cb = -1;
+        PS3_KNOB(cb, ps3_env_int("FP_CONSTBUF", 1));
+        u32 usz;
+        uhash = fp_hash_at(off, &usz);
         s_perf_pso_hashbytes += (int)usz;
-        if (getenv("FP_CONSTBUF") && getenv("FP_CONSTBUF")[0] == '0') {
+        if (!cb) {
             uhash = 2166136261u;
             const u8* up = vm_base + off;
             for (u32 i = 0; i < usz; i++) { uhash ^= up[i]; uhash *= 16777619u; }
-        } else {
-            uhash = rsx_fp_code_hash(vm_base + off, RSX_FP_MAX_BYTES);
         }
     }
 
     s_perf_pso_calls++;
-    for (int i = 0; i < s_d3d.vp_fp_n; i++)
-        if (s_d3d.vp_fp[i].fp_addr != fp_addr) continue;   /* cheap reject first */
-        else if (s_d3d.vp_fp[i].vs_idx == vs_idx &&
-            s_d3d.vp_fp[i].vs_hash == vs_hash && s_d3d.vp_fp[i].gen == s_d3d.vp_gen &&
-            s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
-            s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
-            s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
-            s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].depth == depth &&
-            s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].d2c_mask == d2c_mask)
-            return s_d3d.vp_fp[i].pso;
-    s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     VPFPEntry key;
     memset(&key, 0, sizeof key);
     key.fp_addr = fp_addr; key.vs_idx = vs_idx; key.vs_hash = vs_hash;
@@ -2676,6 +2728,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
     key.d2c_mask = d2c_mask;
     key.pso = NULL;
+    { const VPFPEntry* hit = vp_fp_find(&key); if (hit) return hit->pso; }
+    s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
      * misses on ucode_hash" is. */
@@ -3851,7 +3905,8 @@ static u32 late_fp_sum(const D3D12DrawRecord* dr)
     if (!dr->fp_addr) return 0;
     u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1, dr->fp_addr & ~0x3u);
     if (foff == 0xFFFFFFFFu) return 0;
-    return rsx_fp_code_hash(vm_base + foff, RSX_FP_MAX_BYTES) | 1u;
+    u32 usz;
+    return fp_hash_at(foff, &usz) | 1u;
 }
 static void late_note(u32 slot, const D3D12DrawRecord* dr)
 {
@@ -8156,7 +8211,9 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n)
 
 static void vp_attrs_dbg(const rsx_state* state)
 {
-    if (!getenv("VP_ATTRS")) return;
+    static int en = -1;   /* once: this runs for every draw */
+    PS3_KNOB(en, getenv("VP_ATTRS") ? 1 : 0);
+    if (!en) return;
     /* VP_ATTRS_FP=<hex shader_program>: dump only the draws that use one
      * fragment program. Without it the first six draws are whatever the frame
      * happens to start with, which is never the mesh being investigated. */
@@ -9468,6 +9525,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     if (ps3_env_int("RSX_ZPASS", 1)) g_rsx_report_hook = zq_hook;
     { extern void (*g_rcap_mark_hook)(int end); g_rcap_mark_hook = cap_mark; }
     memset(&s_d3d, 0, sizeof(s_d3d));
+    memset(s_vp_fp_head, 0, sizeof s_vp_fp_head);   /* the PSO cache is empty again */
     s_d3d.width = width;
     s_d3d.height = height;
     s_d3d.clear_color[0] = 0.0f;
