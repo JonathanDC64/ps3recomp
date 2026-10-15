@@ -1472,6 +1472,7 @@ static void dump_backbuffer_bmp(void)
     const char* dir = getenv("CELLMARK_DUMP_DIR");   /* default: current dir */
     if (s_hotshot_left > 0 && !s_dump_name) {
         const char* hd = getenv("RSX_HOTKEY_DIR");
+        if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
         snprintf(path, sizeof(path), "%s%sshot_%03d_%02d_d%u.bmp", hd ? hd : "", hd ? "/" : "",
                  s_hotshot_burst, s_hotshot_n++, s_dbg_last_draws);
         s_hotshot_left--;
@@ -1479,6 +1480,7 @@ static void dump_backbuffer_bmp(void)
     snprintf(path, sizeof(path), "%s%s%s_%03d.bmp",
              dir ? dir : "", dir ? "/" : "", s_dump_name ? s_dump_name : "frame", idx++);
     FILE* f = fopen(path, "wb");
+    if (!f) printf("[D3D12] cannot write %s%c", path, 10);
     if (f) {
         u32 w = s_d3d.width, h = s_d3d.height;
         u32 padded = (w * 3 + 3) & ~3u;
@@ -6196,6 +6198,8 @@ skip_dump_consider: ;
         s_hotshot_arm = 0;
         const int n = ps3_env_int("RSX_HOTKEY_SHOTS", 12);
         const char* hd = getenv("RSX_HOTKEY_DIR");
+        if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
+        CreateDirectoryA(hd, NULL);
         char probe[512];
         do {   /* the first burst number not already on disk */
             s_hotshot_burst++;
