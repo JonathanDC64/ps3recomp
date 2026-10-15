@@ -1,5 +1,6 @@
+# instrument_kernel.py <spurs_kernel.c>: add a [kt] trace to each lifted kernel function.
 import re, sys
-p = r'D:/recomp/ps3games/simpsons/src/spu/spurs_kernel.c'
+p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
 
 def repl(m):

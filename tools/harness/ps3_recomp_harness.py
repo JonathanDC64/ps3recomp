@@ -35,8 +35,8 @@ aggregates them into REPORT.md.
 
 Usage:
   python ps3_recomp_harness.py catalog --archive-root <dir> [--probe 10]
-  python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games --max-tier 4
-  python ps3_recomp_harness.py analyze --elf-root D:\\recomp\\ps3games\\scout --max-tier 5
+  python ps3_recomp_harness.py analyze --elf-root <dir> --max-tier 4
+  python ps3_recomp_harness.py analyze --elf-root <dir>/scout --max-tier 5
   python ps3_recomp_harness.py report
 """
 
