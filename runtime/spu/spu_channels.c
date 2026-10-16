@@ -1142,7 +1142,8 @@ static int s_ch_diag;
 static unsigned s_ch_diag_gen = ~0u;
 static SPU_NOINLINE int spu_ch_diag_load(void)
 {
-    s_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE")) ? 1 : 0;
+    s_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
+                 getenv("SPU_TAGPROBE")) ? 1 : 0;
     s_ch_diag_gen = ps3_env_gen;
     return s_ch_diag;
 }
@@ -1158,7 +1159,11 @@ static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 
  * of them only latch a DMA parameter (LSA, EA, size, tag) for the MFC_Cmd that
  * follows. spu_wrch_full carries the diagnostics inline, which gave it a
  * 4.5 KB frame -- a __chkstk probe, six saved XMM registers and the /GS
- * cookie on every one of those writes. Latch them here and leave the rest. */
+ * cookie on every one of those writes. Latch them here and leave the rest.
+ *
+ * The other frequent ones are answered here too, exactly as spu_wrch_full
+ * would: a plain GET/PUT command (mfc_submit; atomics and lists still go the
+ * long way), the tag-status update, the event mask and acknowledge. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     const uint32_t v = value._u32[0];
@@ -1170,6 +1175,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         case MFC_Size:      ctx->mfc_size = v;        return;
         case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
         case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
+        case MFC_Cmd:
+            if (mfc_is_plain_xfer(v)) { mfc_submit(mfc_for(ctx), ctx, v); return; }
+            break;
+        case MFC_WrTagUpdate:
+            ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
+            if (v != 0 && (ctx->event_mask & 0x1u)) {   /* as spu_wrch_full */
+                __atomic_fetch_or(&ctx->event_status, 0x1u, __ATOMIC_SEQ_CST);
+                spu_ch_wake(ctx);
+            }
+            return;
+        case SPU_WrEventMask: ctx->event_mask = v;    return;
+        case SPU_WrEventAck:
+            __atomic_fetch_and(&ctx->event_status, ~v, __ATOMIC_SEQ_CST);
+            return;
         default: break;
         }
     }

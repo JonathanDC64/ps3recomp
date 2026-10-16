@@ -980,12 +980,158 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
     return 0;
 }
 
+/* The repeat limit of mfc_submit (see there). One counter for every transfer,
+ * the lean path's included: fed only what the lean path leaves to the full
+ * one, a harmless DMA that comes round now and then reads as 256 in a row
+ * (Demon's Souls' image 2 was halted that way, at its EA-0 transfer). */
+static inline void mfc_repeat_check(spu_context* spu, uint32_t ea32, uint32_t lsa)
+{
+    static uint32_t s_last_ea, s_last_lsa, s_rep;
+    static uint32_t s_limit = 0;
+    if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+                    s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
+    if (ea32 == s_last_ea && lsa == s_last_lsa) {
+        if (++s_rep >= s_limit) {
+            s_rep = 0;   /* re-arm: the chain may run this job again */
+            extern void spu_halt(spu_context*);
+            fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+                    "transfers to ea=0x%08X -- halting the SPU%c",
+                    spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit, ea32, 10);
+            fflush(stderr);
+            spu_halt(spu);
+        }
+    } else { s_last_ea = ea32; s_last_lsa = lsa; s_rep = 0; }
+}
+
+/* ---------------------------------------------------------------------------
+ * The common DMA, without the diagnostics.
+ *
+ * mfc_submit and mfc_do_transfer carry dozens of env-armed probes, each a
+ * static test on every transfer and one (the poison scan) a pass over every
+ * PUT's data. Demon's Souls' HighGraphics ring consumer (image 2) moves ~3
+ * million DMAs a second, and the probes were most of what a transfer cost.
+ *
+ * While none of the variables in mfc_diag_load is set, a plain GET or PUT
+ * that passes the MFC's rules comes here and does what the full path does to
+ * memory and to the SPU: the copy, the overlay bookkeeping of a GET, the
+ * lock-line coherence and the pushbuffer hook of a PUT, the repeat limit and
+ * the tag. Everything else -- lists, barriers, a malformed or uncommitted
+ * transfer, the null page, a policy-module SPU, the images with their own
+ * hooks (22, 23) -- takes the full path, which reports it as before.
+ * -----------------------------------------------------------------------*/
+static int s_mfc_diag = 1;
+static unsigned s_mfc_diag_gen = ~0u;
+static int mfc_diag_load(void)
+{
+    static const char* const names[] = {
+        "LBP_SKIP_NULL_DMA", "SPU_CMDDUMP", "SPU_CMDHIST", "SPU_DMACHK", "SPU_DMATRACE",
+        "SPU_DMATRACE_ALL", "SPU_DMATRACE_RAW", "SPU_DMA_LAX", "SPU_DMA_RANGE",
+        "SPU_DMA_REPEAT_LIMIT", "SPU_DMA_SKIP_DUMP", "SPU_DMA_WATCH", "SPU_DSP_IMAGE_EA",
+        "SPU_DUMP_GET", "SPU_GETHIST", "SPU_GET_LOG", "SPU_H2LSRC", "SPU_MFC_TRACE",
+        "SPU_OVL_DIAG", "SPU_PUTEA", "SPU_PUTHIST", "SPU_PUT_MAGIC", "SPU_PUT_MAGIC_ARM",
+        "SPU_PUT_WATCH", "SPU_QLOG", "SPU_ROWCOV", "SPU_SMC_WATCH", "SPU_STACKEA_WATCH",
+        "SPU_TAGPROBE", "SPU_VRAMPC", "SPU_WATCHEA", "SPU_WATCHLSA", "YDKJ_CRI_CHAIN",
+        "YDKJ_DMA_IMG", "SPU_LOCKGUARD", "SPU_LS_WATCH", "SPU_POISON_DMA", "SPU_MFC_FULL",
+    };
+    const unsigned gen = ps3_env_gen;
+    int d = 0;
+#ifdef SPU_DMA_LOG
+    d = 1;
+#endif
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (getenv(names[i])) d = 1;
+    s_mfc_diag = d;
+    s_mfc_diag_gen = gen;
+    return d;
+}
+static inline int mfc_diag(void)
+{
+    return s_mfc_diag_gen == ps3_env_gen ? s_mfc_diag : mfc_diag_load();
+}
+static inline int mfc_is_plain_xfer(uint32_t cmd)
+{
+    return cmd == 0x40 || cmd == 0x41 || cmd == 0x42 ||   /* GET, GETB, GETF */
+           cmd == 0x20 || cmd == 0x21 || cmd == 0x22;     /* PUT, PUTB, PUTF */
+}
+/* 1 = done, with the result in *rc; 0 = take the full path. */
+static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd, int* rc)
+{
+    extern uint32_t g_barrier_sync_watch;
+    if (!mfc_is_plain_xfer(cmd) || spu->policy_mode || g_barrier_sync_watch || mfc_diag())
+        return 0;
+    const uint32_t lsa_raw = spu->mfc_lsa;
+    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    const uint32_t ea32 = (uint32_t)ea;
+    const uint32_t size = spu->mfc_size;
+    const uint32_t tag = spu->mfc_tag & 0x1F;
+    const uint32_t lsa = lsa_raw & SPU_LS_MASK;
+    if (size == 0 || size > MFC_MAX_DMA_SIZE || (size >= 16 && (size & 15)) ||
+        ((lsa_raw ^ ea32) & 15) != 0 || ea32 < 0x10000u ||
+        (uint64_t)lsa + size > (uint64_t)SPU_LS_SIZE ||
+        spu->image_id == 22 || spu->image_id == 23 ||
+        !mfc_ea_range_committed(ea, size))
+        return 0;
+    mfc_repeat_check(spu, ea32, lsa_raw);
+    mfc->tag_completed &= ~(1u << tag);
+    t_spu_xfers++;
+    uint8_t* ls_ptr = &spu->ls[lsa];
+    uint8_t* ea_ptr = vm_base + ea32;
+    if (cmd & 0x40) {
+        memcpy(ls_ptr, ea_ptr, size);
+        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+          spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
+    } else {
+        /* The PUT coherence of mfc_do_transfer: see the comment there. */
+        extern int  spu_coh_is_reserved(uint32_t);
+        extern void spu_coh_notify_write_except(uint32_t, const void*);
+        extern void spu_lockline_lock(void);
+        extern void spu_lockline_unlock(void);
+        const uint32_t a0 = ea32 & ~127u;
+        const uint32_t a1 = (ea32 + size - 1u) & ~127u;
+        int span_reserved = 0;
+        for (uint32_t a = a0; ; a += 128u) {
+            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (a == a1) break;
+        }
+        if (span_reserved) {
+            spu_lockline_lock();
+            memcpy(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (a == a1) break;
+            }
+            spu_lockline_unlock();
+        } else {
+            memcpy(ea_ptr, ls_ptr, size);
+            for (uint32_t a = a0; ; a += 128u) {
+                if (spu_coh_is_reserved(a)) {
+                    spu_lockline_lock();
+                    spu_coh_notify_write_except(a, spu);
+                    spu_lockline_unlock();
+                }
+                if (a == a1) break;
+            }
+        }
+        { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+          if (g_spu_put_hook) g_spu_put_hook(ea32, size); }
+    }
+    if (spu->image_id == 2 && lsa_raw == 0xC00 && cmd == 0x40) {
+        extern volatile unsigned g_wws_batch_gets;
+        g_wws_batch_gets++;
+    }
+    if (!(spu->list_stall_mask & (1u << tag)))
+        mfc->tag_completed |= (1u << tag);
+    *rc = 0;
+    return 1;
+}
+
 /*
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    { int rc; if (mfc_fast_xfer(mfc, spu, cmd, &rc)) return rc; }
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
@@ -1297,22 +1443,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * pages on demand the counter never advanced and a spinning job simply hung
      * the chain walker instead. Count repeats whether or not the transfer
      * succeeds, and halt at a known pc rather than hanging silently. */
-    { static uint32_t s_last_ea, s_last_lsa, s_rep;
-      static uint32_t s_limit = 0;
-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
-      if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit) {
-              s_rep = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
-              fflush(stderr);
-              spu_halt(spu);
-          }
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; } }
+    mfc_repeat_check(spu, (uint32_t)ea, lsa);
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
