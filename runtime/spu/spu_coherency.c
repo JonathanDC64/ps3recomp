@@ -3,11 +3,11 @@
  *
  * See spu_coherency.h for what this is for. The state here is deliberately
  * plain: a bit per 128-byte line, a small table of the SPU contexts that have
- * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
- * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
- * so the read-modify-write on a shared bitmap byte is serialized. Only
- * spu_coh_is_reserved reads without the lock, which is the entire point: it is
- * on every PPU store.
+ * ever reserved one, and the lock-line spinlocks (one stripe per line). A
+ * writer holds only its own line's stripe, so the bitmap and the table are
+ * updated atomically; dropping a context takes every stripe, which excludes
+ * every walker. spu_coh_is_reserved reads without a lock, which is the
+ * entire point: it is on every PPU store.
  */
 
 #include <stdlib.h>
@@ -41,18 +41,35 @@ extern "C" {
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
-/* On a cache line of its own: SPU atomics and PPU stores into reserved
- * lines take this lock millions of times a second, and anything sharing its
- * line (s_coh_armed, which every guest store reads) would bounce with it. */
-static SPU_COH_LINE(volatile long) g_lockline_line;
-#define g_lockline g_lockline_line.v
+/* Striped by line: one spinlock per (line % 64), each on a cache line of its
+ * own. What the lock serializes is per line -- a GETLLAR's snapshot, a
+ * PUTLLC's compare and commit, a PPU or DMA store into a reserved line and its
+ * notify -- so two lines never need to exclude each other. One global lock
+ * made every SPU atomic wait on every other: in Demon's Souls the
+ * HighGraphics ring (its producer's per-command store and the img-2
+ * consumer's GETLLAR/PUTLLC, ~4 million a second) spent about half its lock
+ * waits behind SPURS kernels polling their own lines. Striped, both ring
+ * threads spend ~2% of their time on the lock instead of ~20%. The Palace
+ * frame rate did not move (those waits were not on the frame's critical
+ * path), but the spinning was most of a core, and a burst of SPU atomics
+ * elsewhere (Havok tasks) no longer queues behind the ring.
+ *
+ * A transfer that spans lines takes each line's stripe in ascending stripe
+ * order, and spu_lockline_lock() takes them all in the same order, so no two
+ * holders can deadlock. SPU_LL_STRIPES=1 (read once at the first lock) puts
+ * every line on one stripe: the old global lock, for an A/B. */
+#define SPU_LL_NSTRIPE 64
+static SPU_COH_LINE(volatile long) g_ll[SPU_LL_NSTRIPE];
 /* SPU_LOCKLINE_STATS: the host thread holding the lock (its own line, so the
- * stats do not add traffic to the lock's). */
+ * stats do not add traffic to the lock's). One for all stripes: a hint. */
 static SPU_COH_LINE(volatile unsigned long) g_lockline_holder_line;
-/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
- * pause, and yield after a long wait. The bare exchange loop let GH3's four
- * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
+static unsigned spu_ll_mask(void)
+{
+    /* Same value from every thread, so a race on the first read is benign. */
+    static volatile int s_mask = -1;
+    if (s_mask < 0) s_mask = getenv("SPU_LL_STRIPES") ? 0 : SPU_LL_NSTRIPE - 1;
+    return (unsigned)s_mask;
+}
 /* SPU_LOCKLINE_STATS=1: per host thread, every 2^20 acquisitions, how long
  * they took to accumulate and how many found the lock held -- which threads
  * share this lock, and how hard. */
@@ -95,21 +112,26 @@ static void spu_lockline_stats(int contended, unsigned long holder, unsigned lon
     t0 = now; c = 0; tw = 0;
     memset(h_tid, 0, sizeof h_tid); memset(h_n, 0, sizeof h_n); memset(h_w, 0, sizeof h_w);
 }
-void spu_lockline_lock(void)
+/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
+ * pause, and yield after a long wait. The bare exchange loop let GH3's four
+ * idle job-policy pollers saturate the line and delay every other SPU atomic
+ * -- FMOD's mixer task among them, 25-40 ms at a time. */
+static void spu_ll_acquire(unsigned i)
 {
     static int s_st = -1;
     PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
+    volatile long* l = &g_ll[i].v;
     unsigned spins = 0;
     int contended = 0;
     unsigned long holder = 0;
     LARGE_INTEGER w0 = {0};
-    while (_InterlockedExchange(&g_lockline, 1)) {
+    while (_InterlockedExchange(l, 1)) {
         if (!contended && s_st) { holder = g_lockline_holder_line.v; QueryPerformanceCounter(&w0); }
         contended = 1;
         do {
             _mm_pause();
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
-        } while (g_lockline);
+        } while (*l);
     }
     if (s_st) {
         unsigned long long wait = 0;
@@ -119,12 +141,44 @@ void spu_lockline_lock(void)
         spu_lockline_stats(contended, holder, wait);
     }
 }
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+/* The stripes [ea, ea+len) touches, as a bit set. */
+static unsigned long long spu_ll_set(uint32_t ea, uint32_t len)
+{
+    const unsigned m = spu_ll_mask();
+    const unsigned long long l0 = ea >> 7;
+    const unsigned long long l1 = ((unsigned long long)ea + (len ? len : 1) - 1) >> 7;
+    if (l1 - l0 >= m) return m == SPU_LL_NSTRIPE - 1 ? ~0ull : 1ull;
+    unsigned long long s = 0;
+    for (unsigned long long l = l0; l <= l1; l++) s |= 1ull << (l & m);
+    return s;
+}
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len)
+{
+    unsigned long long s = spu_ll_set(ea, len);
+    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; spu_ll_acquire((unsigned)i); }
+}
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len)
+{
+    unsigned long long s = spu_ll_set(ea, len);
+    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; _InterlockedExchange(&g_ll[i].v, 0); }
+}
+void spu_lockline_lock(void)
+{
+    const unsigned m = spu_ll_mask();
+    for (unsigned i = 0; i <= m; i++) spu_ll_acquire(i);
+}
+void spu_lockline_unlock(void)
+{
+    const unsigned m = spu_ll_mask();
+    for (unsigned i = 0; i <= m; i++) _InterlockedExchange(&g_ll[i].v, 0);
+}
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len)   { (void)ea; (void)len; spu_lockline_lock(); }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; spu_lockline_unlock(); }
 #endif
 
 /* ===========================================================================
@@ -170,13 +224,24 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * every core that reads them. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     const unsigned char bit = (unsigned char)(1u << (line & 7));
-    if (!(s_coh_bitmap[line >> 3] & bit)) s_coh_bitmap[line >> 3] |= bit;
+    /* Atomic: the caller holds only its own line's stripe, and eight lines
+     * share a bitmap byte. A lost bit would leave a reserved line that PPU
+     * stores do not see. */
+    if (!(s_coh_bitmap[line >> 3] & bit))
+        __atomic_fetch_or(&s_coh_bitmap[line >> 3], bit, __ATOMIC_SEQ_CST);
     if (!s_coh_armed) s_coh_armed = 1;
 
     if (!ctx) return;
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
-        if (s_coh_ctxs[i] == ctx) return;
-        if (s_coh_ctxs[i] == NULL) { s_coh_ctxs[i] = ctx; return; }
+        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
+        if (c == ctx) return;
+        if (c == NULL) {
+            /* Claim the slot: another stripe's holder may be claiming it too. */
+            spu_context* expect = NULL;
+            if (__atomic_compare_exchange_n(&s_coh_ctxs[i], &expect, ctx, 0,
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return;
+            if (expect == ctx) return;
+        }
     }
     /* More live SPU contexts than the registry holds. The ones already in it
      * still get their events; this one would silently never wake, so say so. */
@@ -205,7 +270,14 @@ void spu_coh_unregister(spu_context* ctx)
      * notifier that loaded this pointer just before the NULL store would
      * otherwise go on dereferencing it after the job returned and its stack
      * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
-     * spu_coh_notify_write, reading a freed thread stack. */
+     * spu_coh_notify_write, reading a freed thread stack.
+     *
+     * A context only ever enters the table from its own thread's GETLLAR,
+     * and this runs on that thread, so a context not in it now cannot be
+     * added under us: most jobs never reserve a line and skip the 64 locks. */
+    int in = 0;
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++) if (s_coh_ctxs[i] == ctx) in = 1;
+    if (!in) return;
     spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
         if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
@@ -281,14 +353,14 @@ uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr)
 {
     extern uint8_t* vm_base;
     uint32_t* p = (uint32_t*)(vm_base + (ea & ~3u));
-    spu_lockline_lock();
+    spu_lockline_lock_ea(ea & ~3u, 4);
     uint32_t raw = __atomic_load_n(p, __ATOMIC_SEQ_CST), nraw;
     do {
         nraw = __builtin_bswap32((__builtin_bswap32(raw) | set) & ~clr);
     } while (nraw != raw &&
              !__atomic_compare_exchange_n(p, &raw, nraw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
     if (nraw != raw) spu_coh_notify_write(ea);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(ea & ~3u, 4);
     return __builtin_bswap32(raw);
 }
 

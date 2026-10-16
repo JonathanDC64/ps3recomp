@@ -770,6 +770,8 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
+extern "C" void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
+extern "C" void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 extern "C" uint32_t spu_hist_line(void);
 extern "C" void spu_hist(char op, int image, uint32_t a, uint32_t b, uint32_t c);
@@ -992,12 +994,12 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    if (coh) spu_lockline_lock_ea((uint32_t)ea, 4);
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea((uint32_t)ea, 4);
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
@@ -1070,11 +1072,11 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    if (coh) spu_lockline_lock_ea((uint32_t)ea, 8);
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea((uint32_t)ea, 8);
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
@@ -1629,10 +1631,10 @@ static inline void ppu_hist_plain_store(uint32_t a, unsigned n)
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         if (spu_coh_is_reserved((uint32_t)(a))) {                             \
-            spu_lockline_lock();                                              \
+            spu_lockline_lock_ea((uint32_t)(a), (uint32_t)(n));               \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
-            spu_lockline_unlock();                                            \
+            spu_lockline_unlock_ea((uint32_t)(a), (uint32_t)(n));             \
             ppu_hist_plain_store((uint32_t)(a), (n));                         \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \

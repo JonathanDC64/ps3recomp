@@ -754,8 +754,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             extern int  spu_coh_is_reserved(uint32_t);
             extern void spu_coh_notify_write(uint32_t);
             extern void spu_coh_notify_write_except(uint32_t, const void*);
-            extern void spu_lockline_lock(void);
-            extern void spu_lockline_unlock(void);
+            extern void spu_lockline_lock_ea(uint32_t, uint32_t);
+            extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
             extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
             spu_lockguard_check(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size, "PUT");
             uint32_t a0 = (uint32_t)ea & ~127u;
@@ -766,20 +766,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (a == a1) break;
             }
             if (span_reserved) {
-                spu_lockline_lock();
+                spu_lockline_lock_ea(a0, a1 - a0 + 128u);
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_ea(a0, a1 - a0 + 128u);
             } else {
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
+                        spu_lockline_lock_ea(a, 128u);
                         spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                        spu_lockline_unlock_ea(a, 128u);
                     }
                     if (a == a1) break;
                 }
@@ -1084,8 +1084,8 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
         /* The PUT coherence of mfc_do_transfer: see the comment there. */
         extern int  spu_coh_is_reserved(uint32_t);
         extern void spu_coh_notify_write_except(uint32_t, const void*);
-        extern void spu_lockline_lock(void);
-        extern void spu_lockline_unlock(void);
+        extern void spu_lockline_lock_ea(uint32_t, uint32_t);
+        extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
         const uint32_t a0 = ea32 & ~127u;
         const uint32_t a1 = (ea32 + size - 1u) & ~127u;
         int span_reserved = 0;
@@ -1094,20 +1094,20 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
             if (a == a1) break;
         }
         if (span_reserved) {
-            spu_lockline_lock();
+            spu_lockline_lock_ea(a0, a1 - a0 + 128u);
             memcpy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                 if (a == a1) break;
             }
-            spu_lockline_unlock();
+            spu_lockline_unlock_ea(a0, a1 - a0 + 128u);
         } else {
             memcpy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
                 if (spu_coh_is_reserved(a)) {
-                    spu_lockline_lock();
+                    spu_lockline_lock_ea(a, 128u);
                     spu_coh_notify_write_except(a, spu);
-                    spu_lockline_unlock();
+                    spu_lockline_unlock_ea(a, 128u);
                 }
                 if (a == a1) break;
             }

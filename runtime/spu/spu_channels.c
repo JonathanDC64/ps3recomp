@@ -765,7 +765,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               const long long end = q0.QuadPart + (long long)((unsigned long long)s_sns * (unsigned long long)f.QuadPart / 1000000000ull);
               do { _mm_pause(); QueryPerformanceCounter(&q); } while (q.QuadPart < end);
           } }
-        spu_lockline_lock();
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
          * unannounced. Nothing else about this transaction changes. */
@@ -851,7 +851,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   g_spu_llar_naps = 0; lh_t0 = now;
               }
           } }
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         /* Idle-poll back-off. A GETLLAR loop that keeps reading the same,
          * unchanged line is an SPU waiting for another processor to write it;
          * on hardware it would sleep on the lock-line-lost event. Here it ran
@@ -969,12 +969,12 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { static int s_same = -1;
           PS3_KNOB(s_same, ps3_env_int("SPU_PUTLLC_SAME", 1));
           if (s_same) {
-              spu_lockline_lock();
+              spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
               if (ctx->resv_valid && ctx->resv_ea == ea &&
                   memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) == 0 &&
                   memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
                   ctx->resv_valid = 0; ctx->atomic_stat = 0;
-                  spu_lockline_unlock();
+                  spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
                   t_llu_same++;
                   /* The runtime's own commit hooks still run: they stand in
                    * for the SPURS kernel, and a task left pending by an
@@ -984,10 +984,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
                   return 1;
               }
-              spu_lockline_unlock();
+              spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
           } }
         if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
-        spu_lockline_lock();
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
@@ -1092,7 +1092,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                        __builtin_bswap32(o), __builtin_bswap32(n));
           } }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
@@ -1103,7 +1103,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
         if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
-        spu_lockline_lock();
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
@@ -1115,7 +1115,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         if (g_ppu_resv_line_leave) g_ppu_resv_line_leave(ea);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
