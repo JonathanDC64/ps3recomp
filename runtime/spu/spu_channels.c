@@ -557,6 +557,7 @@ static int spu_rate_img(void)
 /* QPC ticks the SPU_RATE image spent re-reading a lock line that had not
  * changed, with no DMA in between: polling, as opposed to working. */
 static SPU_THREAD_LOCAL unsigned long long t_poll_ticks, t_llar_last;
+static SPU_THREAD_LOCAL unsigned long long t_llu_n, t_llu_same;   /* SPU_RATE: PUTLLCs, of them no-op writes */
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
@@ -934,6 +935,37 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
+        t_llu_n++;
+        /* A PUTLLC that succeeds and writes back the bytes the line already
+         * holds stores nothing, so it is answered under the lock-line lock
+         * alone: no PPU reservation slot or break, no notify, no copy. Memory
+         * is unchanged, so no other processor can tell it apart from a store:
+         * a reservation it leaves in place would have read the same line
+         * after the store. Demon's Souls' HighGraphics ring consumer (img 2)
+         * re-commits the unchanged ring header ~1.3 million times a second
+         * (~89% of its PUTLLCs), and each real store took the line away from
+         * the HighGraphics thread that writes it: +4.6% frame rate in the
+         * Palace. SPU_PUTLLC_SAME=0 (live) stores every time, as before. */
+        { static int s_same = -1;
+          PS3_KNOB(s_same, ps3_env_int("SPU_PUTLLC_SAME", 1));
+          if (s_same) {
+              spu_lockline_lock();
+              if (ctx->resv_valid && ctx->resv_ea == ea &&
+                  memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) == 0 &&
+                  memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+                  ctx->resv_valid = 0; ctx->atomic_stat = 0;
+                  spu_lockline_unlock();
+                  t_llu_same++;
+                  /* The runtime's own commit hooks still run: they stand in
+                   * for the SPURS kernel, and a task left pending by an
+                   * earlier commit is started on the next one, changed or
+                   * not (without them the game froze within seconds). */
+                  spu_taskset_line_committed(ea & ~127u);
+                  if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+                  return 1;
+              }
+              spu_lockline_unlock();
+          } }
         if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
         spu_lockline_lock();
         if (ctx->resv_valid && ctx->resv_ea == ea &&
@@ -1103,7 +1135,7 @@ static void spu_rate_tick(spu_context* ctx)
 {
     const int s_img = spu_rate_img();
     if (s_img < 0 || ctx->image_id != s_img) return;
-    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0, pt0;
+    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0, pt0, lu0, ls0;
     static SPU_THREAD_LOCAL long nap0;
     extern volatile long g_spu_llar_naps;
     if ((++wr & 1023u) != 0) return;
@@ -1111,7 +1143,7 @@ static void spu_rate_tick(spu_context* ctx)
     const unsigned long long now = (unsigned long long)q.QuadPart;
     if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
                ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
-               pt0 = t_poll_ticks; return; }
+               pt0 = t_poll_ticks; lu0 = t_llu_n; ls0 = t_llu_same; return; }
     if (now - t0 < 2ull * (unsigned long long)f.QuadPart) return;
     const double s = (double)(now - t0) / (double)f.QuadPart;
     const double nap_s = (double)(t_nap_ticks - nt0) / (double)f.QuadPart;
@@ -1120,13 +1152,14 @@ static void spu_rate_tick(spu_context* ctx)
     if (poll_s < 0) poll_s = 0;
     const double steps = (double)(uint32_t)(ctx->steps - (uint32_t)st0);
     fprintf(stderr, "[spu-rate] img=%d per s: steps=%.0f wrch_full=%.0f dma=%.0f getllar=%.0f"
-                    " naps=%.0f napping=%.0f%% polling=%.0f%% | %.0f steps per busy ms%c",
+                    " naps=%.0f napping=%.0f%% polling=%.0f%% putllc=%.0f (same %.0f) | %.0f steps per busy ms%c",
             s_img, steps / s, (wr - wr0) / s, (t_spu_xfers - x0) / s,
             (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
-            100.0 * poll_s / s,
+            100.0 * poll_s / s, (t_llu_n - lu0) / s, (t_llu_same - ls0) / s,
             s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
     t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
     ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; pt0 = t_poll_ticks;
+    lu0 = t_llu_n; ls0 = t_llu_same;
 }
 
 #if defined(_MSC_VER)
