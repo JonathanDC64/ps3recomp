@@ -24,6 +24,11 @@
 static int knob_vtx_dump(void)   { static int v = -1; PS3_KNOB(v, getenv("VTX_DUMP") ? 1 : 0); return v; }
 static int dbg_movie_bind(void) { static int v = -1; PS3_KNOB(v, getenv("MOVIE_BIND") ? 1 : 0); return v; }
 static int dbg_texfmt(void)     { static int v = -1; PS3_KNOB(v, getenv("TEXFMTDBG") ? 1 : 0); return v; }
+/* RSX_PRESENT=0: render every frame but never Present it. Behind the lock
+ * screen DWM holds each back buffer 250-500 ms without reporting occlusion,
+ * so an unattended test run measures DWM instead of the game; this makes it
+ * measure the game. Live (console setenv). */
+static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_PRESENT", 1)); return v; }
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -7912,8 +7917,8 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
-      if (s_present_this_frame)
-          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+      if (s_present_this_frame && knob_present())   /* skipped for an offscreen-only batch */
+          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       RSX_MARK("present", s_present_this_frame, 0); }
