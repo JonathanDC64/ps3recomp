@@ -1621,7 +1621,16 @@ static VM_HOOK_BODY void ppu_rwatch_check(uint32_t a, int width, void* ra)
     if (s_lo < 0) return;
     if (a < (uint32_t)s_lo || a >= (uint32_t)s_lo + s_len) return;
     static unsigned long rn;
-    if (++rn <= 24 || (rn % 4096) == 0) {
+    /* Every reader, not just the early ones: "who else uses this" is the
+     * question before changing a shared value, and a hot reader fills the
+     * first 24 hits by itself. Each new guest function prints once. */
+    bool new_fn = false;
+    { static uint32_t seen[64]; static int nseen;
+      const uint32_t fn = ppu_prof_resolve_host(ra);
+      int i = 0;
+      while (i < nseen && seen[i] != fn) i++;
+      if (i == nseen && nseen < 64) { seen[nseen++] = fn; new_fn = true; } }
+    if (++rn <= 24 || (rn % 4096) == 0 || new_fn) {
         /* ...and the VALUE. PPU_WWATCH has always printed what was written;
          * the read side printed only the address, so answering "what did it
          * actually get" meant a second run with a write watch, or a guess --
