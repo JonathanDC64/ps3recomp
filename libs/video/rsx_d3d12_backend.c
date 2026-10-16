@@ -425,6 +425,9 @@ typedef struct {
      * extended. */
     u32                   merge_first_end;
     int                   merge_prev_draw;
+    /* Indexed strip/fan merging (see d3d12_draw_indexed): the primitive of
+     * the last draw when it was one, else 0. merge_first_end is its end. */
+    int                   merge_strip;
     ID3D12DescriptorHeap* rt_rtv_heap;          /* MAX_OFF_RTS RTVs (CPU only)   */
 
     /* Frame-parity double buffering for the per-draw upload streams (vp_vb
@@ -8461,6 +8464,11 @@ static VPSlot s_vc_v[VP_VC_N][16];
 /* For indexed uploads: where this draw's vertices went in vp_vb, keyed like
  * the vertex cache (and in the same generation). */
 static u32 s_vx_key[VP_VC_N], s_vx_tag[VP_VC_N], s_vx_out[VP_VC_N];
+/* Vertices the draw being extended already has (d3d12_draw_indexed), 0 for
+ * a new draw: the indices a merged range writes count from there, and the
+ * vertex cache carries over, so the vertices two ranges share are written
+ * once. */
+static u32 s_strip_base;
 
 /* RSX_LATE_CHECK, vertices: these are read when the draw is recorded, so the
  * question is the other way round from textures -- did the title write a
@@ -8562,6 +8570,7 @@ static void vp_plan_begin(const rsx_state* state)
         rsx_fetch_plan_init(state, &s_vp_plan);
         memcpy(s_vp_tmp, s_vp_plan.konst, sizeof s_vp_tmp);
     }
+    if (s_strip_base) return;   /* continuing the last draw: its vertices stay */
     if (++s_vc_gen == 0) { memset(s_vc_tag, 0, sizeof s_vc_tag);
                            memset(s_vx_tag, 0, sizeof s_vx_tag); s_vc_gen = 1; }
 }
@@ -9487,7 +9496,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
                     if (s_vx_tag[h] != s_vc_gen || s_vx_key[h] != vi) {
                         if (par) vis[o] = vi;
                         else     read_vp_vertex(state, vi, &out[o*16]);
-                        s_vx_key[h] = vi; s_vx_tag[h] = s_vc_gen; s_vx_out[h] = o++;
+                        s_vx_key[h] = vi; s_vx_tag[h] = s_vc_gen; s_vx_out[h] = s_strip_base + o++;
                         nmiss++;
                     }
                     ib[ni++] = s_vx_out[h];
@@ -9769,11 +9778,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
             s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
+            s_d3d.merge_strip      = 0;
             s_d3d.merge_first_end  = first + count;
         }
         return;
     }
     s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
+    s_d3d.merge_strip = 0;
 
     u32 topo = (u32)rsx_primitive_topology(primitive);
     if (topo == RSX_TOPOLOGY_UNSUPPORTED) {
@@ -9832,6 +9843,27 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
     s_up_icount = 0;
+    /* A strip split over several DRAW_INDEX_ARRAY ranges of one BEGIN/END
+     * (Demon's Souls' level meshes, 256 indices each) was a draw per range,
+     * each paying the whole per-draw cost here and in render_frame. A range
+     * that continues the last draw's strip, with its vertices and indices
+     * right after that draw's, extends it instead. RSX_STRIP_MERGE=0 draws
+     * each range on its own. */
+    D3D12DrawRecord* mpv = NULL;
+    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
+        s_d3d.merge_strip == (int)primitive && s_d3d.merge_first_end == first &&
+        s_d3d.draw_count > 0 && s_d3d.current_rsx_state && !late_on()) {
+        static int en = -1;
+        PS3_KNOB(en, ps3_env_int("RSX_STRIP_MERGE", 1));
+        D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+        if (en && pv->is_vp && pv->index_count && pv->vertex_count &&
+            pv->begin_epoch == s_d3d.current_rsx_state->begin_epoch &&
+            pv->fp_addr == s_d3d.current_rsx_state->shader_program &&
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset &&
+            pv->ib_first + pv->index_count == s_d3d.vp_ib_offset)
+            mpv = pv;
+    }
+    s_strip_base = mpv ? mpv->vertex_count : 0;
     s_vs_up[primitive == RSX_PRIMITIVE_QUADS ? 0 : primitive == RSX_PRIMITIVE_TRIANGLES ? 1
             : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
     if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
@@ -9843,6 +9875,17 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         if (_skip++ < 3)
             printf("[D3D12] draw_indexed: skipping prim=%u (not wired)\n", primitive);
         return;
+    }
+    s_strip_base = 0;
+    if (mpv) {
+        s_d3d.merge_first_end = first + count;
+        if (!emitted) return;   /* nothing drawn; the strip's carry still moved on */
+        if (s_up_icount) {
+            mpv->vertex_count += emitted;
+            mpv->index_count  += s_up_icount;
+            return;
+        }
+        /* The unindexed fallback ran (no index room): a draw of its own. */
     }
     /* Same BEGIN/END batch concatenation as the non-indexed path: this title's
      * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
@@ -9924,6 +9967,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
         s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
+        s_d3d.merge_strip = (s_up_icount && (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ||
+                             primitive == RSX_PRIMITIVE_TRIANGLE_FAN)) ? (int)primitive : 0;
         s_d3d.merge_first_end = first + count;
     }
 }
