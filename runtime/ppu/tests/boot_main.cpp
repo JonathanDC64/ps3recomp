@@ -510,6 +510,21 @@ static int vblank_thread_on(void)
     return on;
 }
 
+/* ps3_vblank_set_mhz: change the vblank rate while the title runs
+ * (millihertz; 0 goes back to VBLANK_MHZ). A title option can run the clock
+ * fast for an unlocked frame rate and slow it again for a scene the game
+ * paces by vblanks. The clock picks the new rate up at its next tick. */
+#include <atomic>
+static std::atomic<int> s_vblank_live_mhz{0};
+extern "C" void ps3_vblank_set_mhz(int mhz) { s_vblank_live_mhz.store(mhz, std::memory_order_relaxed); }
+static int vblank_rate_mhz(void)
+{
+    const int live = s_vblank_live_mhz.load(std::memory_order_relaxed);
+    if (live > 1000) return live;
+    static const int env = ps3_env_int("VBLANK_MHZ", 59940);
+    return env > 1000 ? env : 59940;
+}
+
 static DWORD WINAPI vblank_clock(LPVOID)
 {
     if (uint32_t sp = sys_ppu_thread_alloc_host_stack(0x10000u)) ppu_guest_call_set_stack(sp);
@@ -524,13 +539,20 @@ static DWORD WINAPI vblank_clock(LPVOID)
     LARGE_INTEGER qpf, qpc;
     QueryPerformanceFrequency(&qpf);
     QueryPerformanceCounter(&qpc);
-    const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
-    const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
+    int vblank_mhz = vblank_rate_mhz();
+    long long tick_qpc = qpf.QuadPart * 1000 / vblank_mhz;
     long long next_tick = qpc.QuadPart + tick_qpc;
-    fprintf(stderr, "[vblank] clock thread at %.3f Hz%c",
-            (vblank_mhz > 1000 ? vblank_mhz : 59940) / 1000.0, 10);
+    fprintf(stderr, "[vblank] clock thread at %.3f Hz%c", vblank_mhz / 1000.0, 10);
     for (;;) {
         QueryPerformanceCounter(&qpc);
+        const int m = vblank_rate_mhz();
+        if (m != vblank_mhz) {
+            /* The next tick is one new period after the last one. */
+            next_tick += qpf.QuadPart * 1000 / m - tick_qpc;
+            vblank_mhz = m;
+            tick_qpc = qpf.QuadPart * 1000 / m;
+            fprintf(stderr, "[vblank] clock now at %.3f Hz%c", m / 1000.0, 10);
+        }
         long long wait_qpc = next_tick - qpc.QuadPart;
         if (wait_qpc > 0) {
             const long long us = wait_qpc * 1000000 / qpf.QuadPart;
@@ -603,10 +625,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     LARGE_INTEGER qpf, qpc;
     QueryPerformanceFrequency(&qpf);
     QueryPerformanceCounter(&qpc);
-    const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
-    const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
+    long long tick_qpc = qpf.QuadPart * 1000 / vblank_rate_mhz();
     long long next_tick = qpc.QuadPart;
     for (;;) {
+        tick_qpc = qpf.QuadPart * 1000 / vblank_rate_mhz();   /* ps3_vblank_set_mhz */
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
          * fence still paid the whole tick. Waiting on it drains on demand
