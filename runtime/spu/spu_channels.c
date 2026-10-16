@@ -559,6 +559,15 @@ static int spu_rate_img(void)
 static SPU_THREAD_LOCAL unsigned long long t_poll_ticks, t_llar_last;
 static SPU_THREAD_LOCAL unsigned long long t_llu_n, t_llu_same;   /* SPU_RATE: PUTLLCs, of them no-op writes */
 
+/* SPU_SLOW_GETLLAR=<image>:<ns> -> image, and the delay in *ns; -1 if unset. */
+static int spu_slow_parse(unsigned* ns)
+{
+    const char* e = getenv("SPU_SLOW_GETLLAR");
+    unsigned img = 0;
+    if (!e || sscanf(e, "%u:%u", &img, ns) != 2) return -1;
+    return (int)img;
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -745,6 +754,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
+        /* SPU_SLOW_GETLLAR=<image>:<ns> (live): spin that long before each
+         * GETLLAR of that image. A causal test: if the frame rate falls in
+         * step with the time added, the image is on the frame's critical
+         * path; if not, speeding it up will not help either. */
+        { static int s_si = -1; static unsigned s_sns;
+          PS3_KNOB(s_si, spu_slow_parse(&s_sns));
+          if (s_si >= 0 && ctx->image_id == s_si) {
+              LARGE_INTEGER q0, q, f; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&f);
+              const long long end = q0.QuadPart + (long long)((unsigned long long)s_sns * (unsigned long long)f.QuadPart / 1000000000ull);
+              do { _mm_pause(); QueryPerformanceCounter(&q); } while (q.QuadPart < end);
+          } }
         spu_lockline_lock();
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing

@@ -46,6 +46,9 @@ extern "C" {
  * line (s_coh_armed, which every guest store reads) would bounce with it. */
 static SPU_COH_LINE(volatile long) g_lockline_line;
 #define g_lockline g_lockline_line.v
+/* SPU_LOCKLINE_STATS: the host thread holding the lock (its own line, so the
+ * stats do not add traffic to the lock's). */
+static SPU_COH_LINE(volatile unsigned long) g_lockline_holder_line;
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
@@ -53,16 +56,44 @@ static SPU_COH_LINE(volatile long) g_lockline_line;
 /* SPU_LOCKLINE_STATS=1: per host thread, every 2^20 acquisitions, how long
  * they took to accumulate and how many found the lock held -- which threads
  * share this lock, and how hard. */
-static void spu_lockline_stats(int contended)
+static void spu_lockline_stats(int contended, unsigned long holder, unsigned long long wait)
 {
     static __declspec(thread) unsigned long n, c;
-    static __declspec(thread) unsigned long long t0;
+    static __declspec(thread) unsigned long long t0, tw;
+    /* ...and, of the contended ones, whose turn it was and how long the
+     * wait took, so a lock held too long names its holder. */
+    enum { HN = 32 };
+    static __declspec(thread) unsigned long h_tid[HN], h_n[HN];
+    static __declspec(thread) unsigned long long h_w[HN];
     n++; c += contended;
+    if (contended) {
+        tw += wait;
+        int k = 0;
+        while (k < HN && h_tid[k] && h_tid[k] != holder) k++;
+        if (k == HN) k = HN - 1;             /* the last slot collects the rest */
+        if (!h_tid[k]) h_tid[k] = holder;
+        h_n[k]++; h_w[k] += wait;
+    }
     if (n & ((1u << 20) - 1)) return;
     const unsigned long long now = GetTickCount64();
-    if (t0) fprintf(stderr, "[lockline] host tid %lu: 1M in %llu ms, %lu contended%c",
-                    GetCurrentThreadId(), now - t0, c, 10);
-    t0 = now; c = 0;
+    if (t0) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        char buf[768];
+        int p = snprintf(buf, sizeof buf, "[lockline] host tid %lu: 1M in %llu ms, %lu contended,"
+                         " %.1f ms waiting; behind:", GetCurrentThreadId(), now - t0, c,
+                         1000.0 * (double)tw / (double)f.QuadPart);
+        for (int r = 0; r < 6; r++) {           /* the six longest waits */
+            int b = -1;
+            for (int k = 0; k < HN; k++) if (h_n[k] && (b < 0 || h_w[k] > h_w[b])) b = k;
+            if (b < 0) break;
+            p += snprintf(buf + p, sizeof buf - p, " %lu x%lu %.1fms", h_tid[b], h_n[b],
+                          1000.0 * (double)h_w[b] / (double)f.QuadPart);
+            h_n[b] = 0;
+        }
+        fprintf(stderr, "%s%c", buf, 10);
+    }
+    t0 = now; c = 0; tw = 0;
+    memset(h_tid, 0, sizeof h_tid); memset(h_n, 0, sizeof h_n); memset(h_w, 0, sizeof h_w);
 }
 void spu_lockline_lock(void)
 {
@@ -70,14 +101,23 @@ void spu_lockline_lock(void)
     PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
     unsigned spins = 0;
     int contended = 0;
+    unsigned long holder = 0;
+    LARGE_INTEGER w0 = {0};
     while (_InterlockedExchange(&g_lockline, 1)) {
+        if (!contended && s_st) { holder = g_lockline_holder_line.v; QueryPerformanceCounter(&w0); }
         contended = 1;
         do {
             _mm_pause();
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
         } while (g_lockline);
     }
-    if (s_st) spu_lockline_stats(contended);
+    if (s_st) {
+        unsigned long long wait = 0;
+        if (contended) { LARGE_INTEGER w1; QueryPerformanceCounter(&w1);
+                         wait = (unsigned long long)(w1.QuadPart - w0.QuadPart); }
+        g_lockline_holder_line.v = GetCurrentThreadId();
+        spu_lockline_stats(contended, holder, wait);
+    }
 }
 void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
 #else

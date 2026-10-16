@@ -1574,10 +1574,50 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
 static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
+/* PPU_COH_HIST=1: every 2 s, the lines whose plain PPU stores took the
+ * lock-line lock, busiest first, with the guest thread and lr of the last
+ * store. The reserved bitmap is sticky, so this is also how to see stores
+ * that pay the lock for a line no SPU has reserved in a long time.
+ * Unlocked counters: a diagnostic. */
+extern "C" unsigned long long ps3_ms_now(void);
+static VM_HOOK_BODY void ppu_coh_hist(uint32_t a)
+{
+    enum { CH_N = 64 };
+    static uint32_t ch_line[CH_N], ch_n[CH_N], ch_lr[CH_N], ch_tid[CH_N];
+    static int ch_used;
+    static unsigned long long ch_t0;
+    const uint32_t line = a & ~127u;
+    int i = 0;
+    for (; i < ch_used; i++) if (ch_line[i] == line) break;
+    if (i == ch_used && ch_used < CH_N) { ch_line[i] = line; ch_n[i] = 0; ch_used++; }
+    if (i < CH_N) {
+        ch_n[i]++;
+        ch_lr[i] = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+        ch_tid[i] = g_active_ctx ? (uint32_t)g_active_ctx->thread_id : 0u;
+    }
+    const unsigned long long now = ps3_ms_now();
+    if (!ch_t0) ch_t0 = now;
+    if (now - ch_t0 < 2000) return;
+    char buf[1024]; int p = snprintf(buf, sizeof buf, "[coh-hist] last %llu ms:", now - ch_t0);
+    for (int k = 0; k < 8; k++) {
+        int b = -1;
+        for (int j = 0; j < ch_used; j++) if (ch_n[j] && (b < 0 || ch_n[j] > ch_n[b])) b = j;
+        if (b < 0) break;
+        p += snprintf(buf + p, sizeof buf - p, " %08X x%u(tid %u lr %08X)",
+                      ch_line[b], ch_n[b], ch_tid[b], ch_lr[b]);
+        ch_n[b] = 0;
+    }
+    for (int j = 0; j < ch_used; j++) ch_n[j] = 0;
+    ch_t0 = now;
+    fprintf(stderr, "%s%c", buf, 10);
+}
 /* SPU_HIST_LINE: a plain PPU store to the watched line (s: lr, ea, the word
  * there afterwards). Only reached on SPU-reserved lines. */
 static inline void ppu_hist_plain_store(uint32_t a, unsigned n)
 {
+    static int s_ch = -1;
+    PS3_KNOB(s_ch, getenv("PPU_COH_HIST") ? 1 : 0);
+    if (s_ch) ppu_coh_hist(a);
     const uint32_t hl = spu_hist_line();
     if (!hl || (a & ~127u) != (hl & ~127u)) return;
     uint32_t w; memcpy(&w, vm_base + (hl & ~3u), 4);
