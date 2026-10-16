@@ -498,6 +498,9 @@ class SPULifter:
                 f"underscore; using {prefix + chr(95)!r}"+chr(10))
             prefix += "_"
         self.prefix = prefix
+        # --native-hook: function entry address -> host function run first;
+        # see emit_source.
+        self.native_hooks: dict = {}
         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
@@ -1037,7 +1040,12 @@ class SPULifter:
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         for f in self.functions:
+            hook = self.native_hooks.get(f.start_addr)
+            if hook:
+                lines.append(f"int {hook}(spu_context* ctx);   /* --native-hook */")
             lines.append(f"void {f.name}(spu_context* ctx) {{")
+            if hook:
+                lines.append(f"    if ({hook}(ctx)) {{ SPU_RET(ctx); }}")
             for b in f.body_lines:
                 lines.append(b if b.endswith(":") else f"    {b}")
             lines.append("}")
@@ -1133,6 +1141,15 @@ def main() -> None:
                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
+    p.add_argument("--native-hook", action="append", default=[], metavar="ADDR=SYMBOL",
+                   help="Run host function `int SYMBOL(spu_context*)` at the entry "
+                        "of the function at ADDR. When it returns nonzero it has "
+                        "done the function's work (result in r3, r1 and the "
+                        "callee-saved registers untouched) and the lifted code "
+                        "returns at once; 0 runs the lifted function. For library "
+                        "code that lifted is far slower than its host equivalent, "
+                        "such as zlib inflate (runtime/spu/spu_inflate_hook.c). "
+                        "Repeatable.")
     args = p.parse_args()
 
     if args.auto_functions:
@@ -1245,6 +1262,15 @@ def main() -> None:
         print(f"  {len(lifter.link_return)} non-r0 link-register return site(s) "
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
+    for h in args.native_hook:
+        addr, _, sym = h.partition("=")
+        if not sym.isidentifier():
+            p.error(f"--native-hook {h!r}: expected ADDR=SYMBOL")
+        lifter.native_hooks[int(addr, 0)] = sym
+    missing = set(lifter.native_hooks) - {s for s, e in bounds}
+    if missing:
+        p.error("--native-hook: no function starts at " +
+                ", ".join(f"0x{a:X}" for a in sorted(missing)))
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
     for s, e in bounds:
         lifter.lift_function(insns, s, e)

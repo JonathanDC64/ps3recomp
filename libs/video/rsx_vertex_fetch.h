@@ -86,6 +86,10 @@ typedef struct rsx_fetch_plan {
 } rsx_fetch_plan;
 void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* pl);
 void rsx_fetch_vertex(const rsx_fetch_plan* pl, u32 vi, float out[16][4]);
+/* Only the components the enabled arrays supply; the rest of `out` is left
+ * as it is. For a caller that keeps one vertex filled from pl->konst and
+ * reuses it across the draw. */
+void rsx_fetch_vertex_arrays(const rsx_fetch_plan* pl, u32 vi, float out[16][4]);
 
 #ifdef __cplusplus
 }

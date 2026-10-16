@@ -1253,18 +1253,34 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined 
 static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
 
+/* The lines holding a parked task's signalled bitset, counted in a 256-way
+ * filter on the line address, so a PPU store-conditional (every guest lock
+ * takes one) tests one word before it looks at the parked list. */
+volatile long g_spu_parked_lines[256];
+static unsigned parked_line_slot(uint32_t taskset_ea)
+{
+    return ((taskset_ea + CSTS_SIGNALLED) >> 7) & 255u;
+}
+
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) { s_parked_obj[i] = wait_obj; s_parked[i] = key; return; }
+        if (s_parked[i] == 0) {
+            __sync_add_and_fetch(&g_spu_parked_lines[parked_line_slot(taskset_ea)], 1);
+            s_parked_obj[i] = wait_obj; s_parked[i] = key; return;
+        }
 }
 
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) { s_parked[i] = 0; return; }
+        if (s_parked[i] == key) {
+            s_parked[i] = 0;
+            __sync_sub_and_fetch(&g_spu_parked_lines[parked_line_slot(taskset_ea)], 1);
+            return;
+        }
 }
 
 /* Event bits owed to a task, keyed by the OBJECT it waits on (flag - 0x80).
@@ -1403,6 +1419,39 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 void spu_taskset_line_committed(uint32_t line)
 {
     spu_taskset_line_written(line);
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        const uint64_t k = s_parked[i];
+        if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_sig_lock);
+        WakeAllConditionVariable(&s_sig_cv);
+        ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+        pthread_mutex_lock(&s_sig_lock);
+        pthread_cond_broadcast(&s_sig_cv);
+        pthread_mutex_unlock(&s_sig_lock);
+#endif
+        return;
+    }
+}
+
+/* A PPU store-conditional committed at `ea` (ppu_stwcx32/ppu_stdcx64), on a
+ * line the filter says may hold a parked task's signalled bitset.
+ *
+ * The PPU signals a task the same way an SPU does when the code doing it is
+ * the real libsre rather than our cellSpursSendSignal: an lwarx/stwcx. loop
+ * on the bitset. Demon's Souls's resource decompressor pushes each block to
+ * its SPU task with libsre's cellSpursQueuePush (run as lifted code), which
+ * signals the task that way. Nothing woke the parked task, so it saw its bit
+ * only when some other signal broadcast the condition variable: the audio
+ * mixer's, about every 10 ms. Every block of a level load waited for that.
+ * SPU_PPU_SIGNAL_WAKE=0 (live) turns the wake off, for A/B. */
+void spu_taskset_ppu_committed(uint32_t ea)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_PPU_SIGNAL_WAKE", 1));
+    if (!on) return;
+    const uint32_t line = ea & ~127u;
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;

@@ -53,6 +53,8 @@ int  spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId);
 void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_obj);
 void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId);
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
+void spu_taskset_ppu_committed(uint32_t ea);
+extern volatile long g_spu_parked_lines[256];
 
 /* ---------------------------------------------------------------------------
  * Harness
@@ -254,6 +256,50 @@ static void test_other_taskset_stays_parked(void)
     pthread_join(th, NULL);
 }
 
+/* What libsre's own cellSpursSendSignal does on the PPU: an lwarx/stwcx. on
+ * the bitset word. ppu_stwcx32 commits it straight into guest memory and then
+ * calls spu_taskset_ppu_committed when the filter has the line; this does the
+ * same two steps. */
+static void ppu_signal(uint32_t taskset, uint32_t task)
+{
+    const uint32_t ea = taskset + SIGNALLED + (task / 32u) * 4u;
+    const uint8_t m = (uint8_t)(0x80u >> (task % 8u));
+    __atomic_fetch_or(&g_guest_mem[taskset + SIGNALLED + task / 8u], m, __ATOMIC_SEQ_CST);
+    if (g_spu_parked_lines[(ea >> 7) & 255u]) spu_taskset_ppu_committed(ea);
+}
+
+static void test_ppu_signal_wakes(void)
+{
+    TEST("a PPU store-conditional setting the waiter's bit wakes it");
+    clear_guest();
+    waiter w; pthread_t th;
+    park(&w, &th, TASKSET_A, WAITER);
+    CHECK(g_spu_parked_lines[((TASKSET_A + SIGNALLED) >> 7) & 255u] == 1);
+    const uint64_t t = now_ms();
+    ppu_signal(TASKSET_A, WAITER);
+    const uint64_t took = wait_return(&w, t, WAKE_MS);
+    CHECK(took != ~(uint64_t)0);
+    if (took == ~(uint64_t)0) wait_return(&w, t, 2000);
+    pthread_join(th, NULL);
+    CHECK(!signalled(TASKSET_A, WAITER));
+    /* Unparked: the filter is clear again. */
+    CHECK(g_spu_parked_lines[((TASKSET_A + SIGNALLED) >> 7) & 255u] == 0);
+}
+
+static void test_ppu_other_taskset_stays_parked(void)
+{
+    TEST("a PPU signal to another taskset leaves the waiter parked");
+    clear_guest();
+    waiter w; pthread_t th;
+    park(&w, &th, TASKSET_A, WAITER);
+    const uint64_t t = now_ms();
+    ppu_signal(TASKSET_B, WAITER);
+    CHECK(wait_return(&w, t, STAY_MS) == ~(uint64_t)0);
+    spu_taskset_signal_task(TASKSET_A, WAITER);
+    CHECK(wait_return(&w, t, 2000) != ~(uint64_t)0);
+    pthread_join(th, NULL);
+}
+
 int main(void)
 {
     printf("SPURS task wake on an SPU-side signal\n");
@@ -262,6 +308,8 @@ int main(void)
     test_putlluc_signal_wakes();
     test_other_task_stays_parked();
     test_other_taskset_stays_parked();
+    test_ppu_signal_wakes();
+    test_ppu_other_taskset_stays_parked();
     printf("SPURS task wake on an SPU-side signal: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

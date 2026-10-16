@@ -360,8 +360,15 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * and the FIFO walker answers ZPASS reports with "visible". */
 void (*g_rsx_report_hook)(u32 method, u32 data) = NULL;
 
+/* Called before the RSX does anything the title can observe (a label, a
+ * report, a semaphore, `get`): a backend with work still queued from earlier
+ * methods finishes it first (the D3D12 backend's vertex fetch threads). */
+void (*g_rsx_sync_hook)(void) = NULL;
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    if ((method == 0x1D70 || method == 0x1D74 || method == 0x1800) && g_rsx_sync_hook)
+        g_rsx_sync_hook();
     if ((method == 0x17C8 || method == 0x17CC || method == 0x1800) && g_rsx_report_hook)
         g_rsx_report_hook(method, data);
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -721,6 +728,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
             state->vertex_constants[slot][lane] = f;
+            state->vertex_constants_gen++;
             { static int _sq=0, _e=-1; PS3_KNOB(_e, getenv("SEQ_DBG") ? 1 : 0); if (_e && slot==256 && lane==0 && _sq++ < 500)
                 fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
             if (!state->vertex_constants_dirty) {

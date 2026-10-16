@@ -152,6 +152,11 @@ void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* pl)
 void rsx_fetch_vertex(const rsx_fetch_plan* pl, u32 vi, float out[16][4])
 {
     memcpy(out, pl->konst, sizeof pl->konst);
+    rsx_fetch_vertex_arrays(pl, vi, out);
+}
+
+void rsx_fetch_vertex_arrays(const rsx_fetch_plan* pl, u32 vi, float out[16][4])
+{
     for (u32 k = 0; k < pl->n_on; k++) {
         const rsx_fetch_slot* s = &pl->on[k];
         u32 ei = vi;

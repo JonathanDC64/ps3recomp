@@ -117,6 +117,10 @@ static void rcap_flip_boundary(void);
  * it: called on the drain thread when the walker reaches a flip in the
  * command stream, after everything queued before it. */
 void (*g_gcm_fifo_flip_hook)(void) = NULL;
+/* rsx_commands.c: finish a backend's queued work before the title can see
+ * the RSX move on. */
+extern void (*g_rsx_sync_hook)(void);
+#define GCM_RSX_SYNC() do { if (g_rsx_sync_hook) g_rsx_sync_hook(); } while (0)
 
 int cellGcm_take_flip_pending(void)
 {
@@ -1812,6 +1816,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
+            GCM_RSX_SYNC();
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -1911,6 +1916,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * while it waits. Semaphore offsets index the same label window
              * cellGcmGetLabelAddress hands out. */
             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
+                GCM_RSX_SYNC();
                 int sem_blocked = 0;
                 for (u32 i = 0; i < count; i++) {
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
@@ -1955,6 +1961,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
+                    GCM_RSX_SYNC();
                     rsx_raise_user_cmd(vm_read32(dea));
                     continue;
                 }
@@ -2054,8 +2061,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                    GCM_RSX_SYNC();
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    GCM_RSX_SYNC();
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     { const u32 md = vm_read32(dea);
@@ -2065,7 +2074,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
-                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                    if (m == 0x50) { GCM_RSX_SYNC();
+                                     gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff); }
                     /* NV4097_GET_REPORT: (type << 24) | offset into the report
                      * area. A backend that counts samples (g_rsx_report_hook)
                      * stores ZPASS results itself once the GPU has them.
@@ -2083,7 +2093,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         }
                     }
                 } else
-                    gcm_2d_method(subch, m, vm_read32(dea));
+                    { GCM_RSX_SYNC(); gcm_2d_method(subch, m, vm_read32(dea)); }
                 }
             }
             s_fifo_getoff += 4 + count * 4;
@@ -2316,6 +2326,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
     }
 
+    GCM_RSX_SYNC();   /* before `get` and the reference are published */
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
