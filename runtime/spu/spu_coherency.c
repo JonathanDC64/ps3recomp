@@ -222,15 +222,17 @@ int spu_lockline_read_ok(uint32_t ea, long seq)     { (void)ea; (void)seq; retur
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+/* Exported (ppu_loader.cpp tests it inline on every guest store). */
+unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
+#define s_coh_bitmap g_spu_coh_bitmap
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
-static SPU_COH_LINE(int) s_coh_armed_line;   /* own line, as g_lockline */
-#define s_coh_armed s_coh_armed_line.v
+SPU_COH_LINE(int) g_spu_coh_armed_line;   /* own line, as g_lockline; exported as above */
+#define s_coh_armed g_spu_coh_armed_line.v
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */

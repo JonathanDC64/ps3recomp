@@ -768,6 +768,18 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * work was posted. spu_coh_is_reserved reads a global that stays zero until an
  * SPU reserves its first line, so an ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
+/* spu_coh_is_reserved, inline: it was a call on every guest store (~3% of
+ * Demon's Souls' HighGraphics thread). Same two loads, from the bitmap and
+ * the armed flag spu_coherency.c exports; the flag has a cache line of its
+ * own there, so the declaration only has to name its first member. */
+extern "C" unsigned char g_spu_coh_bitmap[];
+extern "C" struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
+static inline int spu_coh_reserved_fast(uint32_t addr)
+{
+    if (!*(volatile int*)&g_spu_coh_armed_line.v) return 0;
+    const uint32_t line = addr >> 7;
+    return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+}
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
@@ -983,7 +995,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
      * notify: the same serialization the coherent stores use, so a PPU commit
      * cannot land inside an SPU PUTLLC's compare/commit window (nor the
      * reverse), and the reserving SPU gets its lost-reservation event. */
-    int coh = spu_coh_is_reserved((uint32_t)ea);
+    int coh = spu_coh_reserved_fast((uint32_t)ea);
     /* SPU_PUTLLC_WHY=1: count PPU commits that land on a line an SPU has
      * reserved. If an SPU's PUTLLC never succeeds for "no reservation", the
      * PPU hammering the same 128-byte line is one of only two agents that can
@@ -1071,7 +1083,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     volatile LONG* L = resv_slot(ea);   /* ea and ea+4 share a line, so a slot */
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
-    int coh = spu_coh_is_reserved((uint32_t)ea);
+    int coh = spu_coh_reserved_fast((uint32_t)ea);
     if (coh) spu_lockline_lock_ea((uint32_t)ea, 8);
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
@@ -1413,6 +1425,7 @@ static inline int vm_oob(uint32_t a, uint32_t n)
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
+extern "C" unsigned g_vm_inl_wr_lim;       /* ps3_knob.c; see vm_inl_wr_eval */
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
@@ -1424,6 +1437,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     { static int sweep = -1;
       if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
       if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
+                   g_vm_inl_wr_lim = 0;   /* the sweep must see every store */
                    g_null_sweep_tid = g_active_ctx
                                     ? (unsigned)g_active_ctx->thread_id : 0u; } }
     { static long n = 0;
@@ -1630,7 +1644,7 @@ static inline void ppu_hist_plain_store(uint32_t a, unsigned n)
  * them, until SPU code runs) it is the plain memcpy it replaced. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        if (spu_coh_reserved_fast((uint32_t)(a))) {                           \
             spu_lockline_lock_ea((uint32_t)(a), (uint32_t)(n));               \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
@@ -1937,6 +1951,14 @@ static VM_HOOK_BODY uint64_t vm_read64_full(uint64_t a, void* ra) { if (vm_oob((
  * VM_READ_FULL=1 forces the full accessors for every load. */
 static unsigned g_rd_gen;
 static int g_rd_full = 1;
+/* The inline fast paths in the lifted code (ppu_recomp.h): an access at ea
+ * is a plain load or store when ea - 0x10000 < the limit -- below the raw-SPU
+ * window, above the null page -- and is not the one special read below, and,
+ * for a store, its line is not SPU-reserved. Everything else, and everything
+ * while a limit is 0, comes here. The calls recompute them (vm_rd_full_eval,
+ * vm_inl_wr_eval); ps3_env_bump and a null-pointer sweep drop them. */
+extern "C" unsigned g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
+#define VM_INL_LIM (0xE0000000u /* SPU_RAW_BASE */ - 0x10000u - 8u)   /* an 8-byte access stays below it */
 static VM_HOOK_BODY int vm_rd_full_eval(void)
 {
     static const char* const names[] = {
@@ -1954,6 +1976,8 @@ static VM_HOOK_BODY int vm_rd_full_eval(void)
     }
     g_rd_full = full;
     g_rd_gen = gen;
+    g_vm_inl_rd_hole = VM_HLE_INJECT_BASE + 0x2008u;
+    g_vm_inl_rd_lim = (!full && ppu_vm_size == 0) ? VM_INL_LIM : 0;
     return full;
 }
 static VM_HOOK_INLINE int vm_rd_fast(uint32_t ea, uint32_t n)
@@ -2163,6 +2187,16 @@ extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* r
 {
     barrier_watch_hit(ea, val, width, ra);
 }
+/* The store limit: 0 while anything the stores below do besides storing is
+ * live (a store watch, the PT detector, the Bink sync watch, a null sweep). */
+static VM_HOOK_BODY void vm_inl_wr_eval(void)
+{
+    static unsigned s_gen; static int s_env;
+    if (s_gen != ps3_env_gen) { s_env = getenv("PT") || getenv("SPU_ATOM_EA"); s_gen = ps3_env_gen; }
+    g_vm_inl_wr_lim = (!s_env && ppu_vm_size == 0 && !g_wval_armed && !g_wwatch_armed &&
+                       !g_barrier_sync_watch && !g_null_sweep_hi) ? VM_INL_LIM : 0;
+}
+#define VM_INL_WR_EVAL() do { if (!g_vm_inl_wr_lim) vm_inl_wr_eval(); } while (0)
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
@@ -2172,9 +2206,9 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         if(nw==(uint32_t)g_pt_val && cur!=(uint32_t)g_pt_val) pt_record(wa);
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
-    VM_WRITE_COH(a, &v, 1); }
+    VM_WRITE_COH(a, &v, 1); VM_INL_WR_EVAL(); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
-    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
+    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); VM_INL_WR_EVAL(); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -2186,7 +2220,8 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
+      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); }
+    VM_INL_WR_EVAL(); }
 void vm_write64(uint64_t a, uint64_t v) {
     /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
      * blind to exactly the code that matters most for it: every bignum and
@@ -2196,7 +2231,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
-    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); VM_INL_WR_EVAL(); }
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------
