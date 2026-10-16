@@ -26,6 +26,10 @@ extern "C" {
 #endif
 PS3_KNOB_SHARED volatile unsigned ps3_env_gen = 1;   /* setenv increments it */
 void ps3_env_bump(void);
+/* Set a variable for the getenv cache as well as the process (boot_main's
+ * cached_setenv, which the console's setenv uses). _putenv_s alone is not
+ * seen by a name the cache has already looked up. */
+void ps3_setenv(const char* name, const char* value);
 
 /* atoi(getenv(name)), def if unset */
 static inline int ps3_env_int(const char* name, int def)

@@ -190,6 +190,7 @@ void cached_setenv(const char* name, const char* value)
 }
 }
 extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
+extern "C" void ps3_setenv(const char* name, const char* value) { cached_setenv(name, value); }
 
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
@@ -526,6 +527,8 @@ static DWORD WINAPI vblank_clock(LPVOID)
     const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
     const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
     long long next_tick = qpc.QuadPart + tick_qpc;
+    fprintf(stderr, "[vblank] clock thread at %.3f Hz%c",
+            (vblank_mhz > 1000 ? vblank_mhz : 59940) / 1000.0, 10);
     for (;;) {
         QueryPerformanceCounter(&qpc);
         long long wait_qpc = next_tick - qpc.QuadPart;
@@ -2106,3 +2109,12 @@ int main(int argc, char** argv)
      * produce. */
     return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
 }
+
+#ifndef _WIN32
+/* No getenv cache off Windows: the plain setenv, and the knobs re-read. */
+extern "C" void ps3_setenv(const char* name, const char* value)
+{
+    setenv(name, value, 1);
+    ps3_env_bump();
+}
+#endif
