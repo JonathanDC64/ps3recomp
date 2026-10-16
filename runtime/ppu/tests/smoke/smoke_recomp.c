@@ -287,12 +287,12 @@ void func_00010600(ppu_context* ctx) { ps3_hle_call(NID_cellGcmGetFlipStatus, ct
 void func_00010700(ppu_context* ctx) { ps3_hle_call(NID_sys_process_exit, ctx); return; }
 
 /* The vblank handler the guest registers, which is what a title's frame
- * pacing hangs off. The harness's clock marks a beat pending from its own
- * thread; the runtime delivers it here, on the guest thread, at the next HLE
- * boundary, so this runs nested inside one of the status polls in the frame
- * loop, in a scratch context whose r3 is the vblank count. It records what it
- * saw and returns; a handler that called back into the runtime would be
- * testing something else. */
+ * pacing hangs off. The harness's vblank clock thread ticks and delivers it
+ * itself, as the PS3's interrupt thread does (GCM_VBLANK_THREAD); a status
+ * poll in the frame loop is an HLE boundary that delivers a beat still
+ * pending, so either thread can run it. It runs in a scratch context whose
+ * r3 is the vblank count, records what it saw and returns; a handler that
+ * called back into the runtime would be testing something else. */
 void func_00010800(ppu_context* ctx)
 {
     g_vblank_last_count = (uint32_t)ctx->gpr[3];
@@ -363,17 +363,15 @@ static void smoke_verify(void)
         ok = 0;
     }
 
-    /* The vblank handler: delivered on the guest thread, with the count. */
+    /* The vblank handler: delivered, with the count. Which thread ran it is
+     * printed, not checked: the clock thread and the guest's HLE boundaries
+     * both deliver a pending beat, whichever gets there first. */
     {
         unsigned calls = atomic_load(&g_vblank_calls);
         printf("[smoke] vblank handler: %u call(s), last count %u, host thread %lu\n",
                calls, g_vblank_last_count, g_vblank_host_tid);
         if (!calls) {
             printf("[smoke] FAIL: the guest's vblank handler never ran\n");
-            ok = 0;
-        } else if (g_vblank_host_tid != g_main_host_tid) {
-            printf("[smoke] FAIL: the vblank handler ran on host thread %lu, not the guest's %lu\n",
-                   g_vblank_host_tid, g_main_host_tid);
             ok = 0;
         } else if (!g_vblank_last_count) {
             printf("[smoke] FAIL: the vblank handler was handed count 0\n");
@@ -549,15 +547,23 @@ void func_00010000(ppu_context* ctx)
         func_00010500(ctx); DRAIN_TRAMPOLINE(ctx);
         smoke_check((int32_t)ctx->gpr[3] == 0, "cellGcmSetFlipCommand returned an error");
 
-        /* The flip completes on the harness's vblank beat, delivered on this
-         * thread at the next HLE boundary -- which is the status poll itself.
-         * Bounded so a stalled clock fails the run instead of hanging it. */
+        /* The flip completes on the harness's vblank beat. Bounded so a
+         * stalled clock fails the run instead of hanging it. */
         for (waited = 0; waited < 2000; waited++) {
             func_00010600(ctx); DRAIN_TRAMPOLINE(ctx);
             if ((uint32_t)ctx->gpr[3] == SMOKE_FLIP_DONE) break;
             smoke_usleep(ctx, 1000);
         }
         if (waited >= 2000) smoke_fail("a flip never completed");
+        /* The backend presents a completed flip a step later, on its own
+         * thread, and presents the latest one: a guest that flips again in
+         * that gap gets two flips shown as one present, which a loaded
+         * runner showed. A title does not care; the verdict counts presents,
+         * so wait for this one, bounded like the rest. */
+        for (waited = 0; waited < 2000; waited++) {
+            if (ppu_boot_frames_presented() >= (unsigned)frame + 1u) break;
+            smoke_usleep(ctx, 1000);
+        }
         smoke_mark(ctx, SMOKE_STEP_FRAME_1 + frame);
     }
 
@@ -575,9 +581,8 @@ void func_00010000(ppu_context* ctx)
     }
 
     /* The vblank handler ran. Three frames of polling is normally beats
-     * enough, and the poll is itself the boundary that delivers a pending
-     * one, so keep polling, bounded, until it has. The verdict checks what
-     * the handler recorded: that it ran on this thread with a count in r3. */
+     * enough, so keep polling, bounded, until it has. The verdict checks
+     * what the handler recorded: a count in r3. */
     {
         int waited;
         for (waited = 0; waited < 2000; waited++) {
