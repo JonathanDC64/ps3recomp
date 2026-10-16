@@ -48,6 +48,12 @@ void spu_lockline_unlock(void);
  * ascending order, as spu_lockline_lock does, so neither can deadlock). */
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
+/* Read one line without the lock: begin returns 0 when the stripe is held
+ * (take the lock instead), and _ok after the copy says whether no writer took
+ * the stripe since begin -- if not, the copy may be torn: redo it locked. Only
+ * for a line already marked reserved (every store to one takes the stripe). */
+int spu_lockline_read_begin(uint32_t ea, long* seq);
+int spu_lockline_read_ok(uint32_t ea, long seq);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.

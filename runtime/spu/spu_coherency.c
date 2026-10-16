@@ -112,7 +112,14 @@ static void spu_lockline_stats(int contended, unsigned long holder, unsigned lon
     t0 = now; c = 0; tw = 0;
     memset(h_tid, 0, sizeof h_tid); memset(h_n, 0, sizeof h_n); memset(h_w, 0, sizeof h_w);
 }
-/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
+/* Each stripe is a sequence lock: odd while held, and every release moves it
+ * on by two. A writer takes it as before (test-and-test-and-set below); a
+ * GETLLAR on a line already reserved can instead read the line without
+ * taking it (spu_lockline_read_begin/_ok), so the polling SPU stops writing
+ * the lock's cache line on every read -- the HighGraphics ring consumer's
+ * GETLLAR and its producer's store fought over that line once per entry.
+ *
+ * Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
  * -- FMOD's mixer task among them, 25-40 ms at a time. */
@@ -125,13 +132,16 @@ static void spu_ll_acquire(unsigned i)
     int contended = 0;
     unsigned long holder = 0;
     LARGE_INTEGER w0 = {0};
-    while (_InterlockedExchange(l, 1)) {
+    /* lock bts: one read-for-ownership of the line, as the exchange was. A
+     * plain read then a compare-exchange costs two transfers of a line the
+     * other side has just written (shared, then the upgrade). */
+    while (_interlockedbittestandset(l, 0)) {
         if (!contended && s_st) { holder = g_lockline_holder_line.v; QueryPerformanceCounter(&w0); }
         contended = 1;
         do {
             _mm_pause();
             if (++spins >= 4096) { spins = 0; SwitchToThread(); }
-        } while (*l);
+        } while (*l & 1);
     }
     if (s_st) {
         unsigned long long wait = 0;
@@ -160,7 +170,20 @@ void spu_lockline_lock_ea(uint32_t ea, uint32_t len)
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len)
 {
     unsigned long long s = spu_ll_set(ea, len);
-    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; _InterlockedExchange(&g_ll[i].v, 0); }
+    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; _InterlockedIncrement(&g_ll[i].v); }
+}
+int spu_lockline_read_begin(uint32_t ea, long* seq)
+{
+    const long v = __atomic_load_n(&g_ll[(ea >> 7) & spu_ll_mask()].v, __ATOMIC_ACQUIRE);
+    *seq = v;
+    return !(v & 1);
+}
+int spu_lockline_read_ok(uint32_t ea, long seq)
+{
+    /* StoreLoad: the caller's reservation stores must be visible before this
+     * read, so a writer that takes the stripe after it finds and drops them. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return __atomic_load_n(&g_ll[(ea >> 7) & spu_ll_mask()].v, __ATOMIC_ACQUIRE) == seq;
 }
 void spu_lockline_lock(void)
 {
@@ -170,7 +193,7 @@ void spu_lockline_lock(void)
 void spu_lockline_unlock(void)
 {
     const unsigned m = spu_ll_mask();
-    for (unsigned i = 0; i <= m; i++) _InterlockedExchange(&g_ll[i].v, 0);
+    for (unsigned i = 0; i <= m; i++) _InterlockedIncrement(&g_ll[i].v);
 }
 #else
 #include <stdatomic.h>
@@ -179,6 +202,8 @@ void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_loc
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len)   { (void)ea; (void)len; spu_lockline_lock(); }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; spu_lockline_unlock(); }
+int spu_lockline_read_begin(uint32_t ea, long* seq) { (void)ea; *seq = 0; return 0; }   /* always lock */
+int spu_lockline_read_ok(uint32_t ea, long seq)     { (void)ea; (void)seq; return 0; }
 #endif
 
 /* ===========================================================================

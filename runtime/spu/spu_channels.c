@@ -568,6 +568,97 @@ static int spu_slow_parse(unsigned* ns)
     return (int)img;
 }
 
+/* GETLLAR's read of the line into `ls` and the reservation snapshot. Returns 1
+ * when it was done without the lock; 0 when it holds the line's stripe, which
+ * the caller releases. */
+static inline int spu_getllar_read(spu_context* ctx, uint32_t ea, uint8_t* ls, const uint8_t* mem)
+{
+    /* A line already marked reserved is read without the lock when no
+     * writer holds or takes its stripe meanwhile (every store into a
+     * marked line takes it): the copy and the reservation are then from
+     * one instant, as below, and the poller no longer writes the lock's
+     * cache line. A writer in between -- or a stripe already held --
+     * redoes it under the lock. SPU_GETLLAR_SEQ=0 (live): always lock. */
+    int ll_fast = 0;
+    { static int s_sq = -1; long seq;
+      PS3_KNOB(s_sq, ps3_env_int("SPU_GETLLAR_SEQ", 1));
+      if (s_sq && spu_coh_is_reserved(ea) && spu_lockline_read_begin(ea & ~127u, &seq)) {
+          spu_coh_reserve(ctx, ea);   /* lock-free; registers ctx for the notify */
+          memcpy(ls, mem, MFC_ATOMIC_LINE);
+          memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);
+          ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+          ll_fast = spu_lockline_read_ok(ea & ~127u, seq);
+      } }
+    if (!ll_fast) {
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+        /* Tell the PPU store paths this line is live, so a store into it goes
+         * through the lock and raises SPU_EVENT_LR here instead of landing
+         * unannounced. Nothing else about this transaction changes. */
+        spu_coh_reserve(ctx, ea);
+
+        /* ONE read of guest memory, then the snapshot from that copy.
+         *
+         * This used to memcpy from `mem` twice -- once to the local store, once
+         * to resv_line -- and a PPU store landing BETWEEN the two reads gave the
+         * SPU a stale line and a fresh snapshot. That is a permanent deadlock,
+         * and it is the one this port spent a session chasing: the SPU compares
+         * its (stale) copy, finds produced == consumed, and sleeps on
+         * MFC_LLR_LOST_EVENT; spu_resv_lost_poll then compares memory against a
+         * snapshot that ALREADY has the new value, finds no difference, and
+         * never raises the event. Measured at a freeze: mirror 0x9E, snapshot
+         * 0x9F, memory 0x9F, and the SPU polling rchcnt 1.6 billion times.
+         *
+         * Hardware cannot produce that state: GETLLAR is a single atomic
+         * 128-byte read, so the reserved data and the reservation come from the
+         * same instant. Copying the snapshot from `ls` restores that property,
+         * and a store that lands after the read now leaves BOTH stale -- which
+         * is what makes the lost-reservation event fire. */
+        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
+         * single atomic 128-byte read, so the reserved data and the reservation
+         * come from the same instant. Reading guest memory twice lets a PPU store
+         * land between them, leaving the SPU a STALE line and a FRESH snapshot --
+         * and then both halves of the wait fail: the SPU compares its stale copy,
+         * sees produced == consumed and sleeps on MFC_LLR_LOST_EVENT, while the
+         * reservation poll compares memory against a snapshot that already holds
+         * the new value, finds no difference, and never raises the event. Nobody
+         * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
+         * stale, which is exactly what makes the lost-reservation event fire. */
+        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
+        /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
+         * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
+         * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
+        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+    }
+    return ll_fast;
+}
+
+/* GETLLAR idle-poll back-off (see the note at its call in spu_mfc_atomic). */
+static inline void spu_llar_nap_check(spu_context* ctx, uint32_t ea)
+{
+    { static int s_nap = -1;
+      PS3_KNOB(s_nap, ps3_env_int("SPU_LLAR_NAP", 1));
+      static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
+      static SPU_THREAD_LOCAL unsigned long n_xfers;
+      static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
+      if (s_nap) {
+          const int worked = t_spu_xfers != n_xfers;
+          n_xfers = t_spu_xfers;
+          const int same = ea == n_ea && !worked &&
+                           !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
+          if (spu_rate_img() == ctx->image_id) {
+              LARGE_INTEGER q; QueryPerformanceCounter(&q);
+              if (same) t_poll_ticks += (unsigned long long)q.QuadPart - t_llar_last;
+              t_llar_last = (unsigned long long)q.QuadPart;
+          }
+          if (same) {
+              if (++n_same > 20000u) spu_llar_idle_wait(ctx);
+          } else {
+              n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
+          }
+      } }
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -765,45 +856,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               const long long end = q0.QuadPart + (long long)((unsigned long long)s_sns * (unsigned long long)f.QuadPart / 1000000000ull);
               do { _mm_pause(); QueryPerformanceCounter(&q); } while (q.QuadPart < end);
           } }
-        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
-        /* Tell the PPU store paths this line is live, so a store into it goes
-         * through the lock and raises SPU_EVENT_LR here instead of landing
-         * unannounced. Nothing else about this transaction changes. */
-        spu_coh_reserve(ctx, ea);
-
-        /* ONE read of guest memory, then the snapshot from that copy.
-         *
-         * This used to memcpy from `mem` twice -- once to the local store, once
-         * to resv_line -- and a PPU store landing BETWEEN the two reads gave the
-         * SPU a stale line and a fresh snapshot. That is a permanent deadlock,
-         * and it is the one this port spent a session chasing: the SPU compares
-         * its (stale) copy, finds produced == consumed, and sleeps on
-         * MFC_LLR_LOST_EVENT; spu_resv_lost_poll then compares memory against a
-         * snapshot that ALREADY has the new value, finds no difference, and
-         * never raises the event. Measured at a freeze: mirror 0x9E, snapshot
-         * 0x9F, memory 0x9F, and the SPU polling rchcnt 1.6 billion times.
-         *
-         * Hardware cannot produce that state: GETLLAR is a single atomic
-         * 128-byte read, so the reserved data and the reservation come from the
-         * same instant. Copying the snapshot from `ls` restores that property,
-         * and a store that lands after the read now leaves BOTH stale -- which
-         * is what makes the lost-reservation event fire. */
-        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
-        /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
-         * single atomic 128-byte read, so the reserved data and the reservation
-         * come from the same instant. Reading guest memory twice lets a PPU store
-         * land between them, leaving the SPU a STALE line and a FRESH snapshot --
-         * and then both halves of the wait fail: the SPU compares its stale copy,
-         * sees produced == consumed and sleeps on MFC_LLR_LOST_EVENT, while the
-         * reservation poll compares memory against a snapshot that already holds
-         * the new value, finds no difference, and never raises the event. Nobody
-         * wakes anybody. Snapshotting from `ls` makes a later store leave BOTH
-         * stale, which is exactly what makes the lost-reservation event fire. */
-        memcpy(ctx->resv_line, ls, MFC_ATOMIC_LINE);   /* snapshot for compare */
-        /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
-         * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
-         * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+        const int ll_fast = spu_getllar_read(ctx, ea, ls, mem);
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -851,7 +904,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   g_spu_llar_naps = 0; lh_t0 = now;
               }
           } }
-        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+        if (!ll_fast) spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         /* Idle-poll back-off. A GETLLAR loop that keeps reading the same,
          * unchanged line is an SPU waiting for another processor to write it;
          * on hardware it would sleep on the lock-line-lost event. Here it ran
@@ -872,27 +925,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * drain (the multi-second freezes in Boletarian Palace, HighGraphics
          * waiting on command 0x23's result). Any DMA since the previous
          * GETLLAR means the SPU is working, not polling: start the count over. */
-        { static int s_nap = -1;
-          PS3_KNOB(s_nap, ps3_env_int("SPU_LLAR_NAP", 1));
-          static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
-          static SPU_THREAD_LOCAL unsigned long n_xfers;
-          static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
-          if (s_nap) {
-              const int worked = t_spu_xfers != n_xfers;
-              n_xfers = t_spu_xfers;
-              const int same = ea == n_ea && !worked &&
-                               !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
-              if (spu_rate_img() == ctx->image_id) {
-                  LARGE_INTEGER q; QueryPerformanceCounter(&q);
-                  if (same) t_poll_ticks += (unsigned long long)q.QuadPart - t_llar_last;
-                  t_llar_last = (unsigned long long)q.QuadPart;
-              }
-              if (same) {
-                  if (++n_same > 20000u) spu_llar_idle_wait(ctx);
-              } else {
-                  n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
-              }
-          } }
+        spu_llar_nap_check(ctx, ea);
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -968,13 +1001,34 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * Palace. SPU_PUTLLC_SAME=0 (live) stores every time, as before. */
         { static int s_same = -1;
           PS3_KNOB(s_same, ps3_env_int("SPU_PUTLLC_SAME", 1));
-          if (s_same) {
+          /* The same check without the lock (as the GETLLAR read): drop the
+           * reservation first, so a writer that takes the stripe from here on
+           * finds none to break, then succeed if no writer took it since the
+           * check began. One did: put the reservation back and decide under
+           * the lock -- a store that changed the line fails it there, and one
+           * that did not (another line on the stripe, or the same bytes)
+           * leaves a line no reader can tell from a committed one.
+           * SPU_PUTLLC_SEQ=0 (live): always lock. */
+          static int s_psq = -1; long seq; int same = 0;
+          PS3_KNOB(s_psq, ps3_env_int("SPU_PUTLLC_SEQ", 1));
+          if (s_same && s_psq && spu_lockline_read_begin(ea & ~127u, &seq) &&
+              ctx->resv_valid && ctx->resv_ea == ea &&
+              memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) == 0 &&
+              memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+              ctx->resv_valid = 0;
+              if (spu_lockline_read_ok(ea & ~127u, seq)) { ctx->atomic_stat = 0; same = 1; }
+              else ctx->resv_valid = 1;
+          }
+          if (s_same && !same) {
               spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
               if (ctx->resv_valid && ctx->resv_ea == ea &&
                   memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) == 0 &&
                   memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
-                  ctx->resv_valid = 0; ctx->atomic_stat = 0;
-                  spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+                  ctx->resv_valid = 0; ctx->atomic_stat = 0; same = 1;
+              }
+              spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+          }
+          if (same) {
                   t_llu_same++;
                   /* The runtime's own commit hooks still run: they stand in
                    * for the SPURS kernel, and a task left pending by an
@@ -983,8 +1037,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   spu_taskset_line_committed(ea & ~127u);
                   if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
                   return 1;
-              }
-              spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
           } }
         if (g_ppu_resv_line_enter) g_ppu_resv_line_enter(ea);
         spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
@@ -1207,6 +1259,80 @@ static inline int spu_ch_diag(void)
 
 static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);
 
+/* Atomic-path diagnostics (knobs read inside spu_mfc_atomic). While none is
+ * set, spu_wrch answers the two frequent atomics itself (spu_atomic_lean). */
+static int g_spu_atom_diag;
+static unsigned g_spu_atom_diag_gen = ~0u;
+static SPU_NOINLINE int spu_atom_diag_load(void)
+{
+    static const char* const names[] = {
+        "SPU_POLLTRACE", "SPU_ATOMHIST", "SPU_ATOMTRACE", "SPU_ATOM_EA", "YDKJ_CRI_CHAIN",
+        "SPU_SLOW_GETLLAR", "SPU_LLAR_HIST", "SPU_LLARWATCH", "SPU_RATE", "SPU_CHHIST",
+        "SPU_ATOM_LEAN_OFF",
+    };
+    int d = 0;
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++) if (getenv(names[i])) d = 1;
+    g_spu_atom_diag = d;
+    g_spu_atom_diag_gen = ps3_env_gen;
+    return d;
+}
+
+/* GETLLAR, and a PUTLLC that writes back the bytes the line holds, without
+ * spu_wrch_full: the HighGraphics ring consumer issues ~5 million of them a
+ * second, and spu_wrch_full's frame (the diagnostics inlined into it) cost a
+ * stack probe, six saved XMM registers and the security cookie on each, plus
+ * a dozen knob checks. The same transactions as spu_mfc_atomic, minus its
+ * diagnostics; anything else -- a PUTLLC that stores, an uncommitted line, a
+ * knob set (SPU_ATOM_LEAN_OFF=1 forces it) -- returns 0 for the long way. */
+static int spu_atomic_lean(spu_context* ctx, uint32_t cmd)
+{
+    if ((g_spu_atom_diag_gen == ps3_env_gen ? g_spu_atom_diag : spu_atom_diag_load()) ||
+        g_yz_lockstep_on)
+        return 0;
+    extern uint32_t g_barrier_sync_watch;
+    if (g_barrier_sync_watch) return 0;
+    const uint32_t ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) return 0;
+    uint8_t* ls = &ctx->ls[ctx->mfc_lsa & SPU_LS_MASK];
+    uint8_t* mem = vm_base + ea;
+    if (cmd == MFC_GETLLAR_CMD) {
+        if (!spu_getllar_read(ctx, ea, ls, mem))
+            spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+        ctx->dbg_getllar++;
+        spu_llar_nap_check(ctx, ea);
+        return 1;
+    }
+    /* PUTLLC: the no-op check of spu_mfc_atomic, seqlock first. */
+    static int s_same = -1, s_psq = -1;
+    PS3_KNOB(s_same, ps3_env_int("SPU_PUTLLC_SAME", 1));
+    PS3_KNOB(s_psq, ps3_env_int("SPU_PUTLLC_SEQ", 1));
+    if (!s_same || !ctx->resv_valid || ctx->resv_ea != ea ||
+        memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) != 0)
+        return 0;
+    long seq; int same = 0;
+    if (s_psq && spu_lockline_read_begin(ea & ~127u, &seq) &&
+        memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+        ctx->resv_valid = 0;
+        if (spu_lockline_read_ok(ea & ~127u, seq)) same = 1;
+        else ctx->resv_valid = 1;
+    }
+    if (!same) {
+        spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+        if (ctx->resv_valid && ctx->resv_ea == ea &&
+            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+            ctx->resv_valid = 0; same = 1;
+        }
+        spu_lockline_unlock_ea(ea & ~127u, MFC_ATOMIC_LINE);
+        if (!same) return 0;
+    }
+    ctx->atomic_stat = 0;
+    g_spu_putllc_count++;
+    t_llu_n++; t_llu_same++;
+    spu_taskset_line_committed(ea & ~127u);
+    if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+    return 1;
+}
+
 /* The hot path. Demon's Souls' HighGraphics ring consumer (img 2) issues ~31
  * channel writes per 16-byte ring entry, ~20 million a second, and almost all
  * of them only latch a DMA parameter (LSA, EA, size, tag) for the MFC_Cmd that
@@ -1230,6 +1356,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
         case MFC_Cmd:
             if (mfc_is_plain_xfer(v)) { mfc_submit(mfc_for(ctx), ctx, v); return; }
+            if ((v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD) && spu_atomic_lean(ctx, v)) return;
             break;
         case MFC_WrTagUpdate:
             ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
