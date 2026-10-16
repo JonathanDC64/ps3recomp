@@ -569,6 +569,11 @@ static void pad_trace(int which, u32 port)
     }
 }
 
+/* Buttons title code holds down on port 0 (CELL_PAD_CTRL_* packed as in
+ * PAD_SCRIPT), asked on every poll. Demon's Souls' DES_AUTO_CONTINUE presses
+ * through its boot menus with it. NULL by default. */
+unsigned (*g_pad_title_hook)(void) = NULL;
+
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     pad_trace(0, port_no);
@@ -725,6 +730,12 @@ skip_inject: ;
               }
           }
       } }
+
+    if (g_pad_title_hook && port_no == 0) {
+        const unsigned m = g_pad_title_hook();
+        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(m & 0xFF);
+        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((m >> 8) & 0xFF);
+    }
 
     /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
      * button mask (same encoding as PAD_SCRIPT), press it for a fixed number
