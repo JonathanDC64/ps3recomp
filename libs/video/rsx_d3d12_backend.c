@@ -8587,7 +8587,21 @@ typedef struct {
 static VPJob* s_vpj;
 static u32* s_vpj_vis;
 static u32 s_vpj_vis_n;
-static volatile LONG s_vpj_pub, s_vpj_next, s_vpj_done, s_vpj_sleepers;
+/* The shared counters, each on its own cache line: the workers claim from
+ * `next` and count into `done` while the FIFO thread publishes into `pub`,
+ * and on one line every publish waited for the workers' writes. */
+typedef struct { volatile LONG v; char pad[60]; } VPJCounter;
+static __declspec(align(64)) VPJCounter s_vpj_ctr[4];
+#define s_vpj_pub      (s_vpj_ctr[0].v)   /* jobs the workers may take */
+#define s_vpj_next     (s_vpj_ctr[1].v)
+#define s_vpj_done     (s_vpj_ctr[2].v)
+#define s_vpj_sleepers (s_vpj_ctr[3].v)
+/* FIFO thread only: jobs queued (published or not), and the vertices queued
+ * since the last publish. Jobs are published in batches of VPJ_BATCH
+ * vertices (read once, default 1024): one publish per draw was a locked
+ * increment of a line the workers spin on, ~6% of the FIFO thread. */
+static LONG s_vpj_q;
+static u32 s_vpj_qv;
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -8618,16 +8632,32 @@ static DWORD WINAPI vpj_worker(LPVOID arg)
         for (int k = 0; k < 2000 && s_vpj_next >= s_vpj_pub; k++) YieldProcessor();
         if (s_vpj_next < s_vpj_pub) continue;
         AcquireSRWLockExclusive(&s_vpj_lk);
-        InterlockedIncrement(&s_vpj_sleepers);   /* before the check: see vpj_queue */
+        InterlockedIncrement(&s_vpj_sleepers);   /* before the check: see vpj_publish */
         while (s_vpj_next >= s_vpj_pub)
             SleepConditionVariableSRW(&s_vpj_cv, &s_vpj_lk, INFINITE, 0);
         InterlockedDecrement(&s_vpj_sleepers);
         ReleaseSRWLockExclusive(&s_vpj_lk);
     }
 }
+/* Let the workers take everything queued so far. The exchange is also the
+ * full barrier the sleeper check needs (see vpj_worker). */
+static void vpj_publish(void)
+{
+    s_vpj_qv = 0;
+    if (s_vpj_q == s_vpj_pub) return;
+    InterlockedExchange(&s_vpj_pub, s_vpj_q);
+    /* A worker counts itself a sleeper before it checks for work, so either
+     * it sees these jobs or this sees it. */
+    if (s_vpj_sleepers) {
+        AcquireSRWLockExclusive(&s_vpj_lk);
+        WakeAllConditionVariable(&s_vpj_cv);
+        ReleaseSRWLockExclusive(&s_vpj_lk);
+    }
+}
 /* Wait for every queued vertex, converting what no worker has taken yet. */
 static void vpj_sync(void)
 {
+    vpj_publish();
     if (!s_vpj_pub) return;
     LONG j;
     while ((j = vpj_claim()) >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); }
@@ -8635,6 +8665,7 @@ static void vpj_sync(void)
     InterlockedExchange(&s_vpj_pub, 0);   /* first: a stale claim then sees nothing */
     InterlockedExchange(&s_vpj_next, 0);
     InterlockedExchange(&s_vpj_done, 0);
+    s_vpj_q = 0;
     s_vpj_vis_n = 0;
 }
 static void vpj_sync_hook(void) { vpj_sync(); }
@@ -8681,23 +8712,20 @@ static int vpj_usable(void)
 static int vpj_room(u32 nv)
 {
     if (nv > VPJ_VIS) return 0;
-    if (s_vpj_pub >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
+    if (s_vpj_q >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
     return 1;
 }
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
-    VPJob* J = &s_vpj[s_vpj_pub];
+    VPJob* J = &s_vpj[s_vpj_q];
     memcpy(&J->plan, &s_vp_plan, sizeof J->plan);
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
-    InterlockedIncrement(&s_vpj_pub);
-    /* A worker counts itself a sleeper before it checks for work, so either
-     * it sees this job or this sees it. */
-    if (s_vpj_sleepers) {
-        AcquireSRWLockExclusive(&s_vpj_lk);
-        WakeAllConditionVariable(&s_vpj_cv);
-        ReleaseSRWLockExclusive(&s_vpj_lk);
-    }
+    s_vpj_q++;
+    static int batch = -1;
+    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
+    s_vpj_qv += n;
+    if (s_vpj_qv >= (u32)batch) vpj_publish();
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
