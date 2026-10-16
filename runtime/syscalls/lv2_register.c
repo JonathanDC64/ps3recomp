@@ -722,6 +722,10 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
+    /* Out of the lock-line reserver set on this thread, the only one that can
+     * add it: group_destroy frees sctx, and a registered context left behind
+     * is a dangling pointer every later notify walks. */
+    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(t->sctx); }
     t->exit_status = r.exit_status;
     if (r.group_exit) {
         spu_group_t* g = spu_find_group(t->group_id);
@@ -1325,6 +1329,7 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
                     t->local_store = NULL;
                 }
                 if (t->sctx) {
+                    { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(t->sctx); }
                     free(t->sctx);
                     t->sctx = NULL;
                 }

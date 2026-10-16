@@ -257,9 +257,17 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     if (!s_coh_armed) s_coh_armed = 1;
 
     if (!ctx) return;
+    /* Look for ctx in the whole table before claiming a slot. Only ctx's own
+     * thread adds or removes it, so this pass is exact; but other slots empty
+     * under us (the GETLLAR fast path reserves without the stripe lock, so it
+     * runs during other threads' unregisters), and stopping at the first empty
+     * slot registered a context a second time below its own entry. Unregister
+     * cleared one; the other dangled once the context's stack was gone, and
+     * spu_coh_notify_write faulted on it. */
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
-        if (c == ctx) return;
         if (c == NULL) {
             /* Claim the slot: another stripe's holder may be claiming it too. */
             spu_context* expect = NULL;
@@ -305,7 +313,7 @@ void spu_coh_unregister(spu_context* ctx)
     if (!in) return;
     spu_lockline_lock();
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (s_coh_ctxs[i] == ctx) { s_coh_ctxs[i] = NULL; break; }
+        if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = NULL;
     spu_lockline_unlock();
 }
 
