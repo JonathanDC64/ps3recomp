@@ -824,6 +824,21 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+
+/* The end of a lifted call bracket (brsl/bisl): drain, host_depth--, then
+ * spu_img_restore. Most callees return straight to the link address with
+ * nothing queued on the trampoline, and spu_drain_call then only clears
+ * drain_ret_pc, so that case stays inline here. The depth guard sits on the
+ * drain path, which any lifted-call recursion goes through. */
+static inline void spu_call_done(spu_context* ctx, uint32_t return_pc, int32_t saved_img)
+{
+    if (g_spu_trampoline_fn || ((ctx->pc ^ return_pc) & SPU_LS_MASK))
+        spu_drain_call(ctx, return_pc);
+    else
+        ctx->drain_ret_pc = 0;
+    ctx->host_depth--;
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
+}
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
