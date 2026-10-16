@@ -957,6 +957,13 @@ static inline int resv_off() { static int v = -1; PS3_KNOB(v, getenv("PPU_RESV_O
  * can give. Report the commit through the same path as an ordinary store. */
 extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra);
 extern "C" uint32_t g_ww_lo, g_ww_hi;
+/* A parked SPU task's signalled bitset may live on the committed line
+ * (spu_workload.c): wake the parked tasks so they re-check their bits. */
+extern "C" volatile long g_spu_parked_lines[256];
+extern "C" void spu_taskset_ppu_committed(uint32_t ea);
+#define PPU_SIGNAL_CHECK(ok, ea)                                                \
+    do { if ((ok) && g_spu_parked_lines[((uint32_t)(ea) >> 7) & 255u])         \
+             spu_taskset_ppu_committed((uint32_t)(ea)); } while (0)
 
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
@@ -994,6 +1001,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
+    PPU_SIGNAL_CHECK(ok, ea);
     /* SPU_HIST_LINE: a PPU commit on the watched line, into the SPU history
      * ring beside the SPU's own (spu_workload.h), so one ordered record shows
      * both halves of a PPU/SPU atomic counter. */
@@ -1070,6 +1078,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
+    PPU_SIGNAL_CHECK(ok, ea);
     if (ok && g_ww_lo && (uint32_t)ea + 4u >= g_ww_lo && (uint32_t)ea < g_ww_hi) {
         /* Report as two words: the watch window is word-granular, and a
          * doubleword CAS on a counter pair is exactly the case worth seeing. */
