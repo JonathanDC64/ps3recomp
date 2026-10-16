@@ -1507,10 +1507,18 @@ static inline int vm_null_store(uint32_t a, uint32_t v, int width, void* ra)
 /* Shared read-frequency histogram (PPU_HOTMAP): finds busy-loop polled
  * addresses across all read widths even when the loop touches several addresses
  * per iteration (so the consecutive HOTREAD detectors reset). */
-static void vm_hotmap(uint32_t ea, int width)
+/* The disarmed debug hooks on every guest access must stay a flag test in the
+ * accessor: left to itself clang inlines the body into the wrapper and calls
+ * the wrapper, which is the cost the wrapper exists to avoid. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define VM_HOOK_BODY   __declspec(noinline)
+#define VM_HOOK_INLINE __forceinline
+#else
+#define VM_HOOK_BODY   __attribute__((noinline))
+#define VM_HOOK_INLINE inline __attribute__((always_inline))
+#endif
+static VM_HOOK_BODY void vm_hotmap_count(uint32_t ea, int width)
 {
-    static int en = -1; PS3_KNOB(en, getenv("PPU_HOTMAP") ? 1 : 0);
-    if (!en) return;
     enum { NB = 4096 };
     static uint32_t addr[NB]; static uint32_t cnt[NB]; static unsigned long long tot = 0;
     uint32_t h = (ea >> 2) & (NB - 1);
@@ -1524,6 +1532,11 @@ static void vm_hotmap(uint32_t ea, int width)
                 addr[b1], cnt[b1], addr[b2], cnt[b2], width);
         for (uint32_t i = 0; i < NB; i++) cnt[i] = 0;
     }
+}
+static VM_HOOK_INLINE void vm_hotmap(uint32_t ea, int width)
+{
+    static int en = -1; PS3_KNOB(en, getenv("PPU_HOTMAP") ? 1 : 0);
+    if (en) vm_hotmap_count(ea, width);
 }
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined below) */
 /* Tracks the most recent vm_read32 {addr,value} on this thread, so PPU_WVAL can
@@ -1587,8 +1600,14 @@ static inline void ppu_hist_plain_store(uint32_t a, unsigned n)
     } while (0)
 
 extern "C" {
-/* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
-static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
+/* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8.
+ *
+ * The accessors test g_rwatch_armed inline and call the body only while it is
+ * set: it starts at 1 so the first read parses the variable, which clears it
+ * when nothing is watched. Every guest load used to pay a call here, ~3% of
+ * the render-producing thread in a heavy view. */
+static int g_rwatch_armed = 1;
+static VM_HOOK_BODY void ppu_rwatch_check(uint32_t a, int width, void* ra)
 {
     static int64_t s_lo = -2; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
@@ -1597,6 +1616,7 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
         if (e) { const char* c = strchr(e, ',');
                  if (c) s_len = (uint32_t)strtoul(c + 1, 0, 0); }
         if (!s_len) s_len = 0x10;
+        g_rwatch_armed = s_lo >= 0;
     }
     if (s_lo < 0) return;
     if (a < (uint32_t)s_lo || a >= (uint32_t)s_lo + s_len) return;
@@ -1620,6 +1640,10 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
      * makes ambiguous, and it names the reading function but never who called
      * it -- which is the question whenever a field reads as garbage. */
     if (rn == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "rw");
+}
+static VM_HOOK_INLINE void ppu_rwatch_hit(uint32_t a, int width, void* ra)
+{
+    if (g_rwatch_armed) ppu_rwatch_check(a, width, ra);
 }
 /* Report a guest read through a NULL-ish pointer.
  *
@@ -1881,7 +1905,12 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
-static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+/* The store watches below are read once, so the accessors skip the call
+ * entirely once both are known to be off: 1 until the first store parses
+ * PPU_WVAL and PPU_WWATCH. The call on every guest store was ~6% of the
+ * render-producing thread in a heavy view. */
+static int g_wval_armed = 1, g_wwatch_armed = 1;
+static VM_HOOK_BODY void barrier_watch_check(uint32_t a, uint32_t v, int width, void* ra)
 {
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
@@ -1902,7 +1931,8 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                                  const char* lo = getenv("PPU_WVAL_LO");
                                  const char* hi = getenv("PPU_WVAL_HI");
                                  s_wvlo = lo ? (uint32_t)strtoul(lo, 0, 0) : 0;
-                                 s_wvhi = hi ? (uint32_t)strtoul(hi, 0, 0) : 0xFFFFFFFFu; }
+                                 s_wvhi = hi ? (uint32_t)strtoul(hi, 0, 0) : 0xFFFFFFFFu;
+                                 g_wval_armed = s_wv != 0; }
       /* PPU_WVAL_GATE=<file>: only while <file> exists (checked on matches). */
       static const char* s_wvg = (const char*)-1;
       if (s_wvg == (const char*)-1) s_wvg = getenv("PPU_WVAL_GATE");
@@ -1931,7 +1961,8 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
                                   * reports "nothing writes this" for an address that is
                                   * written constantly. A 0x prefix still works. */
                                  s_ww = e ? (uint32_t)strtoul(e,0,16) : 0;
-                                 ww_arm_inline_window(s_ww); }
+                                 ww_arm_inline_window(s_ww);
+                                 g_wwatch_armed = s_ww != 0; }
       /* PPU_WWATCH_LEN=<bytes>: widen the watched span. 0x20 is fine for a single
        * field but useless for "who fills this struct" -- the SPURS instance is
        * 0x1000+ and a 32-byte window reported "nothing writes it" twice while
@@ -2000,6 +2031,11 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
             fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
+}
+static VM_HOOK_INLINE void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (g_wval_armed | g_wwatch_armed || g_barrier_sync_watch)
+        barrier_watch_check(a, v, width, ra);
 }
 
 /* See the note on the forward declaration above ppu_stwcx32. */
