@@ -542,7 +542,18 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+/* The LS accessors are forced inline. A --regions body is one C function for
+ * a whole stretch of SPU code, and in the biggest ones clang stopped inlining
+ * them: Demon's Souls' image 2 hot region made 128 real calls to
+ * spu_ls_read128 (the quadword returned through the stack) and 51 to
+ * spu_ls_write128. The probes they guard stay out of line and cold. */
+#if defined(_MSC_VER)
+#  define SPU_LS_INLINE static __forceinline
+#else
+#  define SPU_LS_INLINE static inline __attribute__((always_inline))
+#endif
+
+SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
     if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
@@ -621,7 +632,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
