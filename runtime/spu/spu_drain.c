@@ -68,11 +68,18 @@ extern unsigned g_spu_stack_reset_n;   /* spu_channels.c */
 extern volatile int g_yz_lockstep_on;  /* spu_lockstep.c; < 0 = not resolved yet */
 static int      s_step_diag, s_step_no_ls0;
 static unsigned s_step_diag_gen = ~0u;
+/* Whether a region goto (SPU_RGOTO) must take the trampoline instead: set
+ * while anything below needs to see every hop. 1 until the first step has
+ * read the knobs. SPU_TAILRET and SPU_PCHIST are SPU_DRAIN's per-hop work. */
+volatile int g_spu_goto_slow = 1;
 static void spu_step_diag_load(void)
 {
     s_step_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
     s_step_diag = (getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") ||
                    getenv("SPU_JOBDRAIN")) ? 1 : 0;
+    g_spu_goto_slow = s_step_diag || g_spu_stack_reset_n ||
+                      getenv("SPU_GOTO_OFF") || getenv("SPU_TAILRET") ||
+                      getenv("SPU_PCHIST");
     s_step_diag_gen = ps3_env_gen;
 }
 static void spu_task_launch_check_full(spu_context* ctx, void* fn);

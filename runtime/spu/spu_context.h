@@ -892,6 +892,29 @@ static inline void spu_pchist_tick(const spu_context* ctx)
         }                                                      \
     } while (0)
 
+/* A direct branch inside one region body (spu_lifter --regions): a goto,
+ * unless the drain loop has per-step work for this hop -- an interrupt to
+ * take, the lockstep scheduler, a stack-reset entry, step diagnostics or a
+ * PM flow trace -- in which case the hop goes through the trampoline exactly
+ * as an unregioned lift would. g_spu_goto_slow folds the knob-driven cases
+ * (spu_drain.c); SPU_GOTO_OFF=1 sets it, which turns every region branch back
+ * into a trampoline hop for an A/B in the same build. event_status is
+ * written by other threads, hence the atomic load: a loop with no calls in
+ * it would otherwise be free to read it once. */
+extern volatile int   g_spu_goto_slow;
+extern volatile int   g_yz_lockstep_on;
+extern void* volatile g_pm_flow_ctx;
+#define SPU_RGOTO(ctx, tgt, fn, label) do {                                 \
+        (ctx)->steps++;                                                     \
+        if (g_spu_goto_slow || g_yz_lockstep_on || g_pm_flow_ctx ||         \
+            ((ctx)->int_enable &&                                           \
+             (__atomic_load_n(&(ctx)->event_status, __ATOMIC_RELAXED) &     \
+              (ctx)->event_mask))) {                                        \
+            (ctx)->pc = (tgt); g_spu_trampoline_fn = (fn); return;          \
+        }                                                                   \
+        goto label;                                                         \
+    } while (0)
+
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful

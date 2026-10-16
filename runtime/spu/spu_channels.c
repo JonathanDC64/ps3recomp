@@ -1940,6 +1940,9 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
         g_spu_stack_reset_n = s_stack_reset_count;
+        /* Region gotos skip the per-step check that honours this entry. */
+        extern volatile int g_spu_goto_slow;
+        g_spu_goto_slow = 1;
     }
 }
 
