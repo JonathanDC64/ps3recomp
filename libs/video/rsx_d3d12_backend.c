@@ -9030,6 +9030,31 @@ static u32 read_guest_index(const rsx_state* st, u32 k)
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
 }
 
+/* read_guest_index for a loop over one draw's indices: the array's base is
+ * resolved once, not per index (cellGcmResolveLocated is out of line, in
+ * cellGcmSys.c, and the strip walk reads millions of indices a second). The
+ * caller notes the range for the live-vertex window itself. */
+typedef struct { const u8* p; int w16; } GuestIdx;
+static GuestIdx guest_index_open(const rsx_state* st)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    GuestIdx g;
+    g.p = vm_base + cellGcmResolveLocated((st->index_array_dma & 0xF) == 0,
+                                          st->index_array_offset);
+    g.w16 = ((st->index_array_dma >> 4) & 0xF) == 1;
+    return g;
+}
+static inline u32 guest_index_at(const GuestIdx* g, u32 k)
+{
+    if (g->w16) {
+        const u8* p = g->p + (u64)k * 2;
+        return ((u32)p[0] << 8) | p[1];
+    }
+    const u8* p = g->p + (u64)k * 4;
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
 /* Indexed variants of the VP-path uploads. */
 static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
 {
@@ -9362,6 +9387,11 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         m = carry.m; p0 = carry.p0; p1 = carry.p1;
     }
     u32 o = 0, need = 0;   /* need: vertices the strip expands to, room or not */
+    const GuestIdx gi = guest_index_open(state);
+    if (s_lv_open && count) {
+        if (first < s_lv_klo) s_lv_klo = first;
+        if (first + count - 1 > s_lv_khi) s_lv_khi = first + count - 1;
+    }
     /* VP_INDEXED (live, default 1): write each of the draw's vertices once and
      * the triangle list as u32 indices into them. A Demon's Souls level strip
      * expands to ~2.5 list vertices per guest vertex, and at 256 bytes each
@@ -9380,7 +9410,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         const int par = vpj_usable() && vpj_room(count);
         u32* vis = par ? s_vpj_vis + s_vpj_vis_n : NULL;
         for (u32 k = 0; k < count; k++) {
-            const u32 ix = read_guest_index(state, first + k);
+            const u32 ix = guest_index_at(&gi, first + k);
             if (restart && ix == ridx) { m = 0; continue; }
             if (m >= 2) need += 3;
             if (m >= 2 && ni + 3 <= icap && o + 3 <= maxv) {
@@ -9415,7 +9445,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     }
     const u32 cap = maxv - maxv % 3;
     for (u32 k = 0; k < count; k++) {
-        const u32 ix = read_guest_index(state, first + k);
+        const u32 ix = guest_index_at(&gi, first + k);
         if (restart && ix == ridx) { m = 0; continue; }
         if (m >= 2) need += 3;
         if (m >= 2 && o + 3 <= cap) {
