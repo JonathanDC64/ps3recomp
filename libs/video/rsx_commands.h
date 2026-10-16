@@ -406,6 +406,14 @@ void rsx_state_init(rsx_state* state);
  * Returns 0 on success, -1 if method is unrecognized. */
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
 
+/* A run of incrementing method words (src: count big-endian guest words, the
+ * first for `method`) handled in bulk where it is a vertex-program or
+ * vertex-constant upload -- three quarters of the words in a Demon's Souls
+ * level frame. Returns how many leading words it took (0 when the run is
+ * not one of those, or a debug knob wants to see each word); the caller
+ * sends the rest through rsx_process_method. */
+u32 rsx_process_method_run(rsx_state* state, u32 method, const u8* src, u32 count);
+
 /* Process a command buffer segment.
  * buf:  pointer to command buffer data (host memory)
  * size: size in bytes

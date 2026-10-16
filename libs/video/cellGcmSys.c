@@ -1947,7 +1947,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
-            for (u32 i = 0; i < count; i++) {
+            /* Vertex-program and vertex-constant uploads, three quarters of the
+             * words in a Demon's Souls level frame, go to the 3D state in bulk
+             * (rsx_process_method_run) instead of one word at a time through
+             * the per-word diagnostics below and rsx_process_method's chain.
+             * Only while nothing below wants to see each word, and only over
+             * words contiguous in guest memory; the rest of the run, if any,
+             * continues below. */
+            u32 i0 = 0;
+            if (subch == 0 && type == 0 && count && !s_rcap_on && !s_rcap_cut_pending &&
+                ((method >= 0x0B80u && method < 0x0C00u) ||
+                 (method >= 0x1EFCu && method < 0x1F80u))) {
+                extern u8* vm_base;
+                static int lean = -1;
+                PS3_KNOB(lean, (!getenv("GCM_VAL_WATCH") && !getenv("RSX_CENSUS") &&
+                                !rsx_live_draw_enabled() && !rsx_draw_engine_enabled()) ? 1 : 0);
+                const u32 dea0 = gcm_io2ea(s_fifo_getoff + 4);
+                if (lean && dea0 && gcm_io2ea(s_fifo_getoff + count * 4) == dea0 + (count - 1) * 4)
+                    i0 = rsx_process_method_run(&s_state, method, vm_base + dea0, count);
+            }
+            for (u32 i = i0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
