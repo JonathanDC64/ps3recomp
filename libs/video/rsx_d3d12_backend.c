@@ -2702,7 +2702,7 @@ static void fp_seen_note(u32 ea, u32 len);
  * kept with the last hash: equal bytes up to the old size mean the same END
  * instruction, so the same size and the same hash. RSX_FP_HASH_MEMO=0 hashes
  * every time. */
-typedef struct { u32 off, size, hash; u8* bytes; } FpHashMemo;
+typedef struct { u32 off, size, hash, units; u8* bytes; } FpHashMemo;
 static FpHashMemo s_fph[1024];
 static u32 fp_hash_at(u32 off, u32* size_out)
 {
@@ -2721,10 +2721,26 @@ static u32 fp_hash_at(u32 off, u32* size_out)
     fp_seen_note(off, usz);
     if (en) {
         u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
-        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h; }
+        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h;
+                 m->units = rsx_fp_texture_units(up, RSX_FP_MAX_BYTES); }
     }
     *size_out = usz;
     return h;
+}
+/* The texture units the program at guest offset `off` samples, from
+ * fp_hash_at's memo: render_frame binds only those. Every draw looked up all
+ * sixteen units' textures (and render targets, and depth surfaces), ~14 a
+ * draw at the Palace where its programs sample two or three, and that was
+ * most of the frame's SRV time. */
+static u32 fp_units_at(u32 off)
+{
+    extern uint8_t* vm_base;
+    u32 usz;
+    (void)fp_hash_at(off, &usz);
+    const FpHashMemo* m = &s_fph[((off >> 4) * 2654435761u) >> 22];
+    if (m->bytes && m->off == off && !memcmp(m->bytes, vm_base + off, m->size))
+        return m->units;
+    return rsx_fp_texture_units(vm_base + off, RSX_FP_MAX_BYTES);
 }
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
@@ -6737,10 +6753,26 @@ rtt_dump_done:;
         /* Once per draw: it walks all sixteen units, and the unit loop below
          * and the PSO lookup after it each wanted it. */
         const u32 _cmask = dr_cube_mask(dr);
+        /* The units the program samples; the others get a null SRV.
+         * RSX_SRV_USED=0 binds all sixteen. */
+        u32 _used = 0xFFFFFFFFu;
+        { static int en = -1;
+          PS3_KNOB(en, ps3_env_int("RSX_SRV_USED", 1));
+          if (en && dr->is_vp && dr->fp_addr) {
+              extern u32 cellGcmResolveLocated(int, u32);
+              const u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
+                                                     dr->fp_addr & ~0x3u);
+              if (foff != 0xFFFFFFFFu) _used = fp_units_at(foff);
+          } }
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * RSX_FP_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
+            if (!(_used & (1u << _u))) {
+                srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                continue;
+            }
             /* An A8R8G8B8 / D8R8G8B8 unit over a depth surface reads the depth
              * buffer's bytes as colour (RPCS3 RSXThread.cpp "redirected"
              * textures; Demon's Souls's light shafts and depth of field read
