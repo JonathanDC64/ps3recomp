@@ -8019,8 +8019,14 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
+      /* RSX_VSYNC (live, default 1): 0 presents without waiting for the
+       * display's refresh. The flip-model window does not tear; the
+       * compositor shows the newest frame. The title's own vblank stays the
+       * frame limit, so a game set above the display's rate is not held to it. */
+      static int vsync = -1;
+      PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
-          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
+          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, vsync ? 1 : 0, 0);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       RSX_MARK("present", s_present_this_frame, 0); }
@@ -9500,6 +9506,14 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    /* VP_SLOW_DRAW_NS=<ns> (live): spin that long per strip upload. A causal
+     * test for whether the FIFO thread's draw cost sets the frame rate. */
+    { static int slow = -1; PS3_KNOB(slow, ps3_env_int("VP_SLOW_DRAW_NS", 0));
+      if (slow > 0) { static long long fq; LARGE_INTEGER t0, t;
+          if (!fq) { QueryPerformanceFrequency(&t); fq = t.QuadPart; }
+          QueryPerformanceCounter(&t0);
+          do { YieldProcessor(); QueryPerformanceCounter(&t); }
+          while ((t.QuadPart - t0.QuadPart) * 1000000000LL / fq < slow); } }
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
