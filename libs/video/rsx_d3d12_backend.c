@@ -42,6 +42,7 @@ static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RS
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <wtsapi32.h>         /* session lock notifications (s_session_locked) */
 
 /* D3D12 headers */
 #include <d3d12.h>
@@ -57,6 +58,7 @@ static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RS
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -647,9 +649,37 @@ static u32    s_lock_n  = 0;
  * Win32 window
  * -----------------------------------------------------------------------*/
 
+/* The Windows session is locked. Behind the lock screen DWM holds each back
+ * buffer for 250-500 ms while Present still returns S_OK (not
+ * DXGI_STATUS_OCCLUDED), and the frame rate fell to 4 fps waiting for them.
+ * Frames are rendered but not presented while this is set. Written by the
+ * window thread (WM_WTSSESSION_CHANGE, and once at window creation), read
+ * at the flip. */
+static volatile LONG s_session_locked;
+
+static void session_lock_init(HWND hwnd)
+{
+    WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+    /* A run started behind the lock screen gets no LOCK message. */
+    WTSINFOEXW* info = NULL;
+    DWORD n = 0;
+    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                                    WTSSessionInfoEx, (LPWSTR*)&info, &n) && info) {
+        if (info->Level == 1)
+            s_session_locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+        WTSFreeMemory(info);
+    }
+    if (s_session_locked)
+        fprintf(stderr, "[D3D12] session locked: rendering without presenting until unlock%c", 10);
+}
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK)   InterlockedExchange(&s_session_locked, 1);
+        if (wp == WTS_SESSION_UNLOCK) InterlockedExchange(&s_session_locked, 0);
+        return 0;
     case WM_CLOSE:
         s_d3d.window_closed = 1;
         DestroyWindow(hwnd);
@@ -7989,7 +8019,7 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
-      if (s_present_this_frame && knob_present())   /* skipped for an offscreen-only batch */
+      if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
           s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
@@ -10299,6 +10329,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         printf("[D3D12] ERROR: Window creation failed\n");
         return -1;
     }
+    session_lock_init(s_d3d.hwnd);
 
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
