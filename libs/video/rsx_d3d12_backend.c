@@ -4189,6 +4189,41 @@ static void late_check(void)
 /* Inline constants each record's program has (drawprint hashes only those:
  * the rest of the slot holds whatever an earlier frame left there). */
 static u8 s_fpk_n[MAX_DRAWS];
+/* rsx_fp_extract_consts of the program at guest offset `off`, memoised as
+ * fp_hash_at memoises the hash: the walk ran for every draw, ~2.6% of the
+ * render thread at the Palace, and a program whose bytes (constants
+ * included, up to its END) equal the copy kept with the last walk has the
+ * same constants. A re-patched constant is a byte that differs, so a fresh
+ * walk. RSX_FPK_MEMO=0 walks every time. */
+typedef struct { u32 off, size; int n; u8* bytes; float k[FPCB_KMAX * 4]; } FpkMemo;
+static FpkMemo s_fpkm[1024];
+static int fpk_extract_at(u32 off, float* out)
+{
+    extern uint8_t* vm_base;
+    const u8* up = vm_base + off;
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_FPK_MEMO", 1));
+    if (!en) return rsx_fp_extract_consts(up, RSX_FP_MAX_BYTES, out, FPCB_KMAX);
+    FpkMemo* m = &s_fpkm[((off >> 4) * 2654435761u) >> 22];
+    if (m->bytes && m->off == off && !memcmp(m->bytes, up, m->size)) {
+        memcpy(out, m->k, sizeof(float) * 4 * (size_t)m->n);
+        return m->n;
+    }
+    /* Into a cached buffer first: `out` is the upload heap, write-combined,
+     * and reading it back for the memo would be the slow part. */
+    float k[FPCB_KMAX * 4];
+    const int n = rsx_fp_extract_consts(up, RSX_FP_MAX_BYTES, k, FPCB_KMAX);
+    memcpy(out, k, sizeof(float) * 4 * (size_t)n);
+    const u32 usz = rsx_fp_program_size(up, RSX_FP_MAX_BYTES);
+    if (usz) {   /* no END: nothing bounds what the walk read */
+        u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
+        if (b) {
+            memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->n = n;
+            memcpy(m->k, k, sizeof(float) * 4 * (size_t)n);
+        }
+    }
+    return n;
+}
 /* The last vp_cb slot written this frame, and what it was written from. */
 static u32 s_vcb_last = ~0u, s_vcb_gen;
 static const rsx_state* s_vcb_st;
@@ -4246,8 +4281,7 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                s_fpk_n[slot] = (u8)rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_BYTES,
-                                                          &ts[FPCB_K * 4], FPCB_KMAX);
+                s_fpk_n[slot] = (u8)fpk_extract_at(foff, &ts[FPCB_K * 4]);
             /* FPK_FP=<hex fp_addr>: that program's constants, each time they
              * change (capped). Shows whether the title's per-material patches
              * reach the draw, for one surface at a time. */
@@ -6697,6 +6731,9 @@ rtt_dump_done:;
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         dr->d2c_mask = 0;
+        /* Once per draw: it walks all sixteen units, and the unit loop below
+         * and the PSO lookup after it each wanted it. */
+        const u32 _cmask = dr_cube_mask(dr);
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * RSX_FP_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -6791,7 +6828,7 @@ rtt_dump_done:;
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
                 if (dr->tex[_u].off && vp_tex_fmt_ok(_bf)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
-                    int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                    int _cube = dr->tex[_u].cube && (_cmask & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
                                                 _cube, dr->tex[_u].mips);
@@ -6838,7 +6875,7 @@ rtt_dump_done:;
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       dr_cube_mask(dr), dr->d2c_mask);
+                                       _cmask, dr->d2c_mask);
         if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
