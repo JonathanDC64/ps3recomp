@@ -1445,6 +1445,10 @@ void spu_taskset_line_committed(uint32_t line)
  * signals the task that way. Nothing woke the parked task, so it saw its bit
  * only when some other signal broadcast the condition variable: the audio
  * mixer's, about every 10 ms. Every block of a level load waited for that.
+ *
+ * Wake only when a parked task's own bit is set. Other words share the line,
+ * and the PPU takes store-conditionals on them all the time while a level is
+ * running, each of which woke every parked task for nothing.
  * SPU_PPU_SIGNAL_WAKE=0 (live) turns the wake off, for A/B. */
 void spu_taskset_ppu_committed(uint32_t ea)
 {
@@ -1455,6 +1459,8 @@ void spu_taskset_ppu_committed(uint32_t ea)
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+        if (!spurs_bitset_test((uint32_t)(k >> 32) + CSTS_SIGNALLED, (uint32_t)k - 1u))
+            continue;
 #ifdef _WIN32
         AcquireSRWLockExclusive(&s_sig_lock);
         WakeAllConditionVariable(&s_sig_cv);
