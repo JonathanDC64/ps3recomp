@@ -277,21 +277,23 @@ extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
  * at boot in 1 run of ~4). Raw accesses inside: vm_write16 would take the
  * same (non-recursive) lock. The end notifies reserving SPUs, under the lock
  * as spu_coh_notify_write expects. */
-extern void spu_lockline_lock(void);
-extern void spu_lockline_unlock(void);
+extern void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
+extern void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
 extern int  spu_coh_is_reserved(uint32_t);
 extern void spu_coh_notify_write(uint32_t);
 static inline u16 ef_r16(uint32_t a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
 static inline void ef_w16(uint32_t a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+/* The event flag's line lock: ef_line_begin(ea) ... ef_line_end(ea). */
+static inline void ef_line_begin(uint32_t ea) { spu_lockline_lock_ea(ea & ~127u, 128); }
 static inline void ef_line_end(uint32_t ea)
 {
     if (spu_coh_is_reserved(ea & ~127u)) spu_coh_notify_write(ea & ~127u);
-    spu_lockline_unlock();
+    spu_lockline_unlock_ea(ea & ~127u, 128);
 }
 
 static void spurs_ef_set_locked(uint32_t ea, u16 bits)
 {
-    spu_lockline_lock();
+    ef_line_begin(ea);
     u16 events        = ef_r16(ea + EF_EVENTS);
     u16 used          = (u16)(ef_r16(ea + EF_SPU_USED_SLOTS) &
                               ~ef_r16(ea + EF_SPU_PENDING_RECV));
@@ -2264,7 +2266,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
         /* Clear from the CURRENT word: bits an SPU set since `current` was
          * read must survive. */
-        spu_lockline_lock();
+        ef_line_begin(ea);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -2309,7 +2311,7 @@ s32 cellSpursEventFlagTryWait(CellSpursEventFlag* eventFlag, u16* bits,
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
-        spu_lockline_lock();
+        ef_line_begin(ea);
         ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~received));
         ef_line_end(ea);
     }
@@ -2329,7 +2331,7 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     ef_lock(sync);
-    spu_lockline_lock();
+    ef_line_begin(ea);
     ef_w16(ea + EF_EVENTS, (u16)(ef_r16(ea + EF_EVENTS) & ~bits));
     ef_line_end(ea);
     ef_unlock(sync);

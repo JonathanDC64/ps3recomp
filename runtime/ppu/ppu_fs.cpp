@@ -292,6 +292,12 @@ static void cellFsOpen(ppu_context* ctx)
  * no EDAT decryption needed. (A title supplying a still-encrypted NPD .sdat
  * would need the SDATA block cipher; not required here.) The license `arg`
  * (gpr[6]) and its size (gpr[7]) are ignored. */
+/* Set by title code that follows the title's progress by what it loads:
+ * called with the guest path of every data file cellFsSdataOpen opens.
+ * Demon's Souls' DES_AUTO_CONTINUE stops pressing buttons once the level's
+ * script archive opens. */
+extern "C" { void (*g_fs_open_hook)(const char* guest_path) = nullptr; }
+
 static void cellFsSdataOpen(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
@@ -315,6 +321,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         fprintf(stderr, "[fs] SdataOpen FAIL '%s' -> '%s'\n", gpath, hpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
+    if (g_fs_open_hook) g_fs_open_hook(gpath);
     FILE* f = fdopen(hfd, "rb");
     if (!f) { close(hfd); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     /* If the file IS still NPD-encrypted, we can't serve it plaintext here --

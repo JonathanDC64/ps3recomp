@@ -1638,7 +1638,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      static int on = -1; PS3_KNOB(on, getenv("GCM_RATE") ? 1 : 0);
+      if (on) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1677,7 +1678,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int ctxdbg = -1; PS3_KNOB(ctxdbg, getenv("GCM_CTXDBG") ? 1 : 0);
+    if (ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -1694,7 +1696,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
 
     u32 start_off = s_fifo_getoff;
     const u32 start_tr = s_tr_i;      /* words decoded this pass (stuck test) */
-    if (getenv("GCM_DRAINDBG")) {
+    static int draindbg = -1; PS3_KNOB(draindbg, ps3_env_int("GCM_DRAINDBG", 0));
+    if (draindbg) {
         static int n = 0;
         if (n++ % 60 == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1707,7 +1710,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * two very different causes -- we missed the command, or it was never
      * submitted -- and only a direct scan of the ring separates them. */
     { static int scanned = 0;
-      if (!scanned && getenv("GCM_SCANREF") && put >= 0x19F0) { scanned = 1;
+      if (!scanned && put >= 0x19F0 && getenv("GCM_SCANREF")) { scanned = 1;
         unsigned found = 0;
         for (u32 io = 0; io + 8 <= put; io += 4) {
             u32 ea = gcm_io2ea(io); if (!ea) continue;
@@ -1924,7 +1927,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
-                    { static int sn = 0; if (getenv("GCM_RECDBG") && sn++ < 12)
+                    { static int sn = 0, rd = -1; PS3_KNOB(rd, getenv("GCM_RECDBG") ? 1 : 0);
+                      if (rd && sn++ < 12)
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     if (m == 0x64u)      s_sema_offset = v;
                     else if (m == 0x6Cu) { vm_write32(la, v); RSX_MARK("sem_release", s_sema_offset, v); }
@@ -1943,7 +1947,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
-            for (u32 i = 0; i < count; i++) {
+            /* Vertex-program and vertex-constant uploads, three quarters of the
+             * words in a Demon's Souls level frame, go to the 3D state in bulk
+             * (rsx_process_method_run) instead of one word at a time through
+             * the per-word diagnostics below and rsx_process_method's chain.
+             * Only while nothing below wants to see each word, and only over
+             * words contiguous in guest memory; the rest of the run, if any,
+             * continues below. */
+            u32 i0 = 0;
+            if (subch == 0 && type == 0 && count && !s_rcap_on && !s_rcap_cut_pending &&
+                ((method >= 0x0B80u && method < 0x0C00u) ||
+                 (method >= 0x1EFCu && method < 0x1F80u))) {
+                extern u8* vm_base;
+                static int lean = -1;
+                PS3_KNOB(lean, (!getenv("GCM_VAL_WATCH") && !getenv("RSX_CENSUS") &&
+                                !rsx_live_draw_enabled() && !rsx_draw_engine_enabled()) ? 1 : 0);
+                const u32 dea0 = gcm_io2ea(s_fifo_getoff + 4);
+                if (lean && dea0 && gcm_io2ea(s_fifo_getoff + count * 4) == dea0 + (count - 1) * 4)
+                    i0 = rsx_process_method_run(&s_state, method, vm_base + dea0, count);
+            }
+            for (u32 i = i0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
@@ -2202,10 +2225,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (draindbg) {
         static int n2 = 0;
         /* GCM_DRAINDBG=2: every pass that did work or stopped early. */
-        const int all = atoi(getenv("GCM_DRAINDBG")) >= 2 &&
+        const int all = draindbg >= 2 &&
                         (s_fifo_getoff != start_off || strcmp(why, "caught-up") != 0);
         if (all || n2++ % 60 == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
@@ -2535,8 +2558,14 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
+/* Set by title code that paces itself on the title's frames: called on the
+ * guest thread that requested the flip, once per flip request, before it is
+ * queued. Demon's Souls' frame-time option measures its frames here. */
+void (*g_gcm_flip_request_hook)(void) = NULL;
+
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    if (g_gcm_flip_request_hook) g_gcm_flip_request_hook();
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on

@@ -122,6 +122,46 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 
+/* The DMA-parameter channels only latch a value for the MFC_Cmd after them,
+ * and they are most of a DMA-heavy image's channel writes (~20 million a
+ * second in Demon's Souls' HighGraphics ring consumer). Written in place,
+ * without the call, which also made every SPU register live in a host
+ * register go back to ctx around it. Through spu_wrch while a channel
+ * diagnostic (SPU_CHHIST, SPU_POLLTRACE, SPU_TAGPROBE) is on, or before it
+ * was read. */
+extern int g_spu_ch_diag;
+extern unsigned g_spu_ch_diag_gen;
+static inline void spu_wrch_latch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(g_spu_ch_diag_gen != ps3_env_gen || g_spu_ch_diag, 0)) {
+        spu_wrch(ctx, channel, value);
+        return;
+    }
+    const uint32_t v = value._u32[0];
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;        break;
+    case MFC_EAH:       ctx->mfc_eah = v;        break;
+    case MFC_EAL:       ctx->mfc_eal = v;        break;
+    case MFC_Size:      ctx->mfc_size = v;       break;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F; break;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;   break;
+    default:            spu_wrch(ctx, channel, value); break;
+    }
+}
+/* The status reads spu_rdch answers from a field, in place for the same
+ * reason. */
+static inline u128 spu_rdch_latch(spu_context* ctx, uint32_t channel)
+{
+    if (__builtin_expect(g_spu_ch_diag_gen != ps3_env_gen || g_spu_ch_diag, 0))
+        return spu_rdch(ctx, channel);
+    switch (channel) {
+    case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+    case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+    case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+    default:               return spu_rdch(ctx, channel);
+    }
+}
+
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
 void spu_trace_pc(spu_context* ctx, uint32_t pc);
@@ -183,6 +223,13 @@ def _imm(token: str) -> str:
     return "0"
 
 
+# Channels whose write only latches a DMA parameter (spu_wrch_latch).
+_LATCH_CHANNELS = {"MFC_LSA", "MFC_EAH", "MFC_EAL", "MFC_Size", "MFC_TagID",
+                   "MFC_WrTagMask", "16", "17", "18", "19", "20", "22"}
+# Status reads answered from a field (spu_rdch_latch).
+_LATCH_RD_CHANNELS = {"MFC_RdTagStat", "MFC_RdAtomicStat", "MFC_RdTagMask",
+                      "24", "27", "12"}
+
 def _chan(token: str) -> str:
     """Channel operand -> a C expression (macro name or numeric id)."""
     token = token.strip()
@@ -204,6 +251,16 @@ class LiftedFunction:
     end_addr: int = 0
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
+    # --regions: the entry addresses (one exported function each) and the
+    # instruction addresses lifted into this body; None for a plain function.
+    entries: list = None
+    lifted: set = None
+
+    def holds(self, tgt: int) -> bool:
+        """Whether a branch to `tgt` can be a goto inside this body."""
+        if self.lifted is not None:
+            return tgt in self.lifted
+        return self.start_addr <= tgt < self.end_addr
 
 
 # Mnemonics whose last operand is a branch target address (0x...).
@@ -573,6 +630,79 @@ class SPULifter:
         self.functions.append(func)
         return func
 
+    def lift_region(self, insns: list[SPUInstruction], rbounds: list) -> LiftedFunction:
+        """--regions: lift several consecutive functions as ONE C body.
+
+        find_spu_functions seeds a function at every branch target, so a plain
+        lift is one C function per basic block and every branch -- each turn
+        of a loop -- is a trampoline hop through the drain loop, with all guest
+        state spilled to ctx. Demon's Souls' HighGraphics ring consumer makes
+        ~20 million such hops a second. Here each function still gets its
+        exported entry (a wrapper that enters the body at its label), so
+        calls, indirect dispatch and the function table are unchanged, but a
+        direct branch between functions of the same region is a goto."""
+        rs, re_ = rbounds[0][0], rbounds[-1][1]
+        func = LiftedFunction(name=f"{self.prefix}spu_region_{rs:08X}",
+                              start_addr=rs, end_addr=re_)
+        func.entries = [s for s, _ in rbounds]
+        by_addr = getattr(self, "_by_addr", None)
+        if by_addr is None:
+            by_addr = self._by_addr = {i.addr: i for i in insns}
+        func.lifted = {a for s, e in rbounds for a in range(s, e, 4) if a in by_addr}
+        labels = set(func.entries)
+        for a in func.lifted:
+            tgt = self._branch_target(by_addr[a])
+            if tgt is not None and tgt in func.lifted:
+                labels.add(tgt)
+
+        for k, (s, e) in enumerate(rbounds):
+            nxt = rbounds[k + 1][0] if k + 1 < len(rbounds) else None
+            body = [by_addr[a] for a in range(s, e, 4) if a in by_addr]
+            hook = self.native_hooks.get(s)
+            # The `br .`-style no-op self-loop idiom, as lift_function does.
+            if body and all(i.mnemonic in ("nop", "lnop", "br", "bra") for i in body):
+                ltgt = self._branch_target(body[-1])
+                if body[-1].mnemonic in ("br", "bra") and ltgt is not None and s <= ltgt < e:
+                    func.body_lines += [f"loc_{s:08X}:",
+                                        "    /* infinite no-op self-loop (SPU halt idiom) -> abort */",
+                                        "    spu_halt(ctx); return;"]
+                    continue
+            last_insn = None
+            for insn in body:
+                if insn.addr in labels:
+                    func.body_lines.append(f"loc_{insn.addr:08X}:")
+                if insn.addr == s and hook:
+                    func.body_lines.append(f"    if ({hook}(ctx)) {{ SPU_RET(ctx); }}")
+                c = self._translate(insn, func)
+                if c:
+                    if self.trace:
+                        func.body_lines.append(f"    spu_trace_pc(ctx, 0x{insn.addr:X});")
+                    func.body_lines.append(f"    {c}")
+                    if self.trace and insn.mnemonic not in _NO_RT_WRITE:
+                        func.body_lines.append(f"    spu_trace_rt(ctx, {insn.raw & 0x7F});")
+                last_insn = insn
+            if last_insn is None:
+                if s not in labels:
+                    func.body_lines.append(f"loc_{s:08X}:")
+                func.body_lines.append("    return;")
+                continue
+            if _flow_break(last_insn):
+                continue
+            # Falls through: into the next function of the region when it starts
+            # here, otherwise as lift_function does (tail to the function that
+            # starts at the end, or the plain host return of falling off it).
+            if nxt == e:
+                continue
+            if e in getattr(self, "func_starts", set()):
+                func.body_lines.append(
+                    f"    {{ ctx->pc = 0x{e:X}; "
+                    f"g_spu_trampoline_fn = {self.prefix}spu_func_{e:08X}; return; }}")
+            else:
+                func.body_lines.append("    return;")
+
+        self.functions.append(func)
+        return func
+
     @staticmethod
     def _branch_target(insn: SPUInstruction):
         """The literal target of a direct branch, or None if it has none.
@@ -840,14 +970,18 @@ class SPULifter:
 
         # ---- channel ops ----
         if mn == "rdch":
-            return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
+            ch = _chan(ops[1])
+            fn = "spu_rdch_latch" if ch in _LATCH_RD_CHANNELS else "spu_rdch"
+            return f"{g(rt())} = {fn}(ctx, {ch});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            ch = _chan(ops[0])
+            fn = "spu_wrch_latch" if ch in _LATCH_CHANNELS else "spu_wrch"
+            return f"{fn}(ctx, {ch}, {g(_reg(ops[1]))});"
 
         # ---- branches ----
         if mn in ("br", "bra"):
@@ -901,8 +1035,8 @@ class SPULifter:
             if tgt is None:
                 return (f'/* TODO spu: {mn} {insn.operands} */ '
                         f'spu_unsupported(0x{insn.addr:X}, "{mn}");')
-            if func.start_addr <= tgt < func.end_addr:
-                return f"if ({cond}) goto loc_{tgt:08X};"
+            if func.holds(tgt):
+                return f"if ({cond}) {self._goto(tgt, func)}"
             self.branch_targets.add(tgt)
             # Cross-function conditional branch = conditional tail: hand the
             # target to the trampoline and unwind (enclosing SPU_DRAIN re-enters).
@@ -1008,11 +1142,20 @@ class SPULifter:
         }
         return table.get(mn, f"{word} != 0")
 
+    def _goto(self, tgt: int, func: LiftedFunction) -> str:
+        """A branch that stays inside this body. In a region, a branch to one of
+        its entries goes through SPU_RGOTO, which falls back to the trampoline
+        whenever the drain loop has per-step work to do (spu_context.h)."""
+        if func.entries is not None and tgt in func.entries:
+            return (f"SPU_RGOTO(ctx, 0x{tgt:X}u, {self.prefix}spu_func_{tgt:08X}, "
+                    f"loc_{tgt:08X});")
+        return f"goto loc_{tgt:08X};"
+
     def _uncond_branch(self, tgt, func: LiftedFunction) -> str:
         if tgt is None:
             return "/* TODO spu: unresolved branch */;"
-        if func.start_addr <= tgt < func.end_addr:
-            return f"goto loc_{tgt:08X};"
+        if func.holds(tgt):
+            return self._goto(tgt, func)
         self.branch_targets.add(tgt)
         # Cross-function unconditional tail: hand the target to the trampoline
         # and unwind so the enclosing SPU_DRAIN re-enters (no host-stack growth).
@@ -1023,8 +1166,9 @@ class SPULifter:
     def emit_header(self) -> str:
         lines = [HEADER_PREAMBLE, ""]
         for f in self.functions:
-            lines.append(f"void {f.name}(spu_context* ctx);")
-        defined = {f.start_addr for f in self.functions}
+            for a in (f.entries if f.entries is not None else [f.start_addr]):
+                lines.append(f"void {self.prefix}spu_func_{a:08X}(spu_context* ctx);")
+        defined = self._defined()
         for t in sorted(self.call_targets | self.branch_targets):
             if t not in defined:
                 lines.append(f"void {self.prefix}spu_func_{t:08X}(spu_context* ctx); /* external */")
@@ -1037,9 +1181,36 @@ class SPULifter:
         lines.append("")
         return "\n".join(lines)
 
+    def _defined(self) -> set:
+        return {a for f in self.functions
+                for a in (f.entries if f.entries is not None else [f.start_addr])}
+
+    def _emit_region(self, f: LiftedFunction, lines: list) -> None:
+        for a in f.entries:
+            hook = self.native_hooks.get(a)
+            if hook:
+                lines.append(f"int {hook}(spu_context* ctx);   /* --native-hook */")
+        lines.append(f"static void {f.name}(spu_context* ctx, uint32_t entry) {{")
+        if len(f.entries) > 1:
+            lines.append("    switch (entry) {")
+            for a in f.entries[1:]:
+                lines.append(f"    case 0x{a:X}u: goto loc_{a:08X};")
+            lines.append("    default: break;")
+            lines.append("    }")
+        for b in f.body_lines:
+            lines.append(b if b.endswith(":") else f"    {b}")
+        lines.append("}")
+        for a in f.entries:
+            lines.append(f"void {self.prefix}spu_func_{a:08X}(spu_context* ctx) "
+                         f"{{ {f.name}(ctx, 0x{a:X}u); }}")
+        lines.append("")
+
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
         for f in self.functions:
+            if f.entries is not None:
+                self._emit_region(f, lines)
+                continue
             hook = self.native_hooks.get(f.start_addr)
             if hook:
                 lines.append(f"int {hook}(spu_context* ctx);   /* --native-hook */")
@@ -1057,7 +1228,7 @@ class SPULifter:
         # at runtime we route through spu_indirect_branch which either lands
         # on a registered mid-function entry (if one was emitted) or halts
         # cleanly with a "PC X not registered" diagnostic.
-        defined = {f.start_addr for f in self.functions}
+        defined = self._defined()
         externs = sorted((self.call_targets | self.branch_targets) - defined)
         if externs:
             lines.append("/* Indirect-dispatch stubs for cross-function targets the")
@@ -1073,8 +1244,9 @@ class SPULifter:
         lines.append("/* Function table */")
         lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
         lines.append("static const spu_func_entry spu_function_table[] = {")
-        for f in self.functions:
-            lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
+        for a in sorted(defined):
+            n = f"{self.prefix}spu_func_{a:08X}"
+            lines.append(f'    {{ 0x{a:08X}u, {n}, "{n}" }},')
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append("")
@@ -1141,6 +1313,14 @@ def main() -> None:
                         "dispatch table at 0x1BD8, `br` into a fallthrough chain, "
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
+    p.add_argument("--regions", action="store_true",
+                   help="Lift the functions between two call targets as one C "
+                        "body, so a direct branch inside it is a goto instead "
+                        "of a trampoline hop (see SPULifter.lift_region). Every "
+                        "function keeps its exported entry. Off by default.")
+    p.add_argument("--region-max", type=int, default=2048,
+                   help="--regions: most instructions in one body (compile "
+                        "time and frame size). Default 2048.")
     p.add_argument("--native-hook", action="append", default=[], metavar="ADDR=SYMBOL",
                    help="Run host function `int SYMBOL(spu_context*)` at the entry "
                         "of the function at ADDR. When it returns nonzero it has "
@@ -1272,8 +1452,33 @@ def main() -> None:
         p.error("--native-hook: no function starts at " +
                 ", ".join(f"0x{a:X}" for a in sorted(missing)))
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
-    for s, e in bounds:
-        lifter.lift_function(insns, s, e)
+    if args.regions:
+        # A region ends where a call target starts (the start of a real guest
+        # function), at LS 0 (a branch there ends a SPURS job, which only the
+        # drain loop's step check sees) and at --region-max instructions.
+        # Any split is correct; this one keeps loops inside one body.
+        cuts = {0}
+        for ins in insns:
+            if ins.mnemonic in ("brsl", "brasl"):
+                t = SPULifter._branch_target(ins)
+                if t is not None:
+                    cuts.add(t)
+        regions, cur, n = [], [], 0
+        for s, e in sorted(bounds):
+            k = max(0, (e - s) // 4)
+            if cur and (s in cuts or n + k > args.region_max or s < cur[-1][1]):
+                regions.append(cur)
+                cur, n = [], 0
+            cur.append((s, e))
+            n += k
+        if cur:
+            regions.append(cur)
+        for r in regions:
+            lifter.lift_region(insns, r)
+        print(f"  --regions: {len(bounds)} function(s) in {len(regions)} body(ies)")
+    else:
+        for s, e in bounds:
+            lifter.lift_function(insns, s, e)
 
     os.makedirs(args.output, exist_ok=True)
     hp = os.path.join(args.output, args.header_name)

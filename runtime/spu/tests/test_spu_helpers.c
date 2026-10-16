@@ -419,6 +419,57 @@ static void test_float_fused(void) {
 }
 
 /* ===========================================================================
+ * Quadword byte shifts/rotates and the cbd/chd/cwd/cdd controls against the
+ * byte loops they replaced (pshufb / blend forms under __SSE4_1__): every
+ * shift count, both signs, junk in the unused bits of the count.
+ * ===========================================================================*/
+static u128 ref_qb_shl(u128 a, int sh) { u128 r = spu_zero(); if (sh >= 16) return r;
+    for (int i = 0; i < 16; i++) { int s = i + sh; if (s < 16) r._u8[SPU_W(i)] = a._u8[SPU_W(s)]; } return r; }
+static u128 ref_qb_rot(u128 a, int sh) { u128 r;
+    for (int i = 0; i < 16; i++) r._u8[SPU_W(i)] = a._u8[SPU_W((i + sh) & 0x0F)]; return r; }
+static u128 ref_qb_shr(u128 a, int sh) { u128 r = spu_zero(); if (sh >= 16) return r;
+    for (int i = 0; i < 16; i++) { int s = i - sh; if (s >= 0) r._u8[SPU_W(i)] = a._u8[SPU_W(s)]; } return r; }
+static u128 ref_ctl(int pos, int size) {
+    u128 r; for (int t = 0; t < 16; t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
+    int p = (pos & 0xF) & ~(size - 1);
+    /* a's preferred slot: SPU byte 3, bytes 2-3, word 0-3, dword 0-7 */
+    for (int k = 0; k < size; k++) r._u8[SPU_W(p + k)] = (uint8_t)((size == 8 ? 0 : 4 - size) + k);
+    return r;
+}
+static void test_quadword_byte_shifts(void) {
+    int bad[13] = {0};
+    uint32_t seed = 12345u;
+    for (int it = 0; it < 64; it++) {
+        u128 a;
+        for (int k = 0; k < 16; k++) { seed = seed * 1103515245u + 12345u; a._u8[k] = (uint8_t)(seed >> 16); }
+        for (int v = -300; v < 300; v++) {
+            seed = seed * 1103515245u + 12345u;
+            const uint32_t w = (uint32_t)v + (seed & 0xFFFF0000u);
+            u128 b = spu_zero(); b._u32[0] = w;
+            bad[0] += !u128_eq(spu_shlqby(a, b),    ref_qb_shl(a, w & 0x1F));
+            bad[1] += !u128_eq(spu_rotqby(a, b),    ref_qb_rot(a, w & 0x0F));
+            bad[2] += !u128_eq(spu_shlqbybi(a, b),  ref_qb_shl(a, (w >> 3) & 0x1F));
+            bad[3] += !u128_eq(spu_rotqbybi(a, b),  ref_qb_rot(a, (w >> 3) & 0x0F));
+            bad[4] += !u128_eq(spu_rotqmby(a, b),   ref_qb_shr(a, (0 - (int)w) & 0x1F));
+            bad[5] += !u128_eq(spu_rotqmbybi(a, b), ref_qb_shr(a, (0 - ((int)w >> 3)) & 0x1F));
+            bad[6] += !u128_eq(spu_shlqbyi(a, v),   ref_qb_shl(a, v & 0x1F));
+            bad[7] += !u128_eq(spu_rotqbyi(a, v),   ref_qb_rot(a, v & 0x0F));
+            bad[8] += !u128_eq(spu_rotqmbyi(a, v),  ref_qb_shr(a, (0 - v) & 0x1F));
+            bad[9]  += !u128_eq(spu_cbd_pos(v), ref_ctl(v, 1));
+            bad[10] += !u128_eq(spu_chd_pos(v), ref_ctl(v, 2));
+            bad[11] += !u128_eq(spu_cwd_pos(v), ref_ctl(v, 4));
+            bad[12] += !u128_eq(spu_cdd_pos(v), ref_ctl(v, 8));
+        }
+    }
+    static const char* nm[13] = { "shlqby", "rotqby", "shlqbybi", "rotqbybi", "rotqmby",
+        "rotqmbybi", "shlqbyi", "rotqbyi", "rotqmbyi", "cbd", "chd", "cwd", "cdd" };
+    for (int i = 0; i < 13; i++) {
+        if (bad[i]) { g_fail++; fprintf(stderr, "FAIL: %s vs byte loop: %d mismatches\n", nm[i], bad[i]); }
+        else g_pass++;
+    }
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
 int main(void) {
@@ -433,6 +484,7 @@ int main(void) {
     test_fsmbi();
     test_sign_extend();
     test_float_fused();
+    test_quadword_byte_shifts();
 
     printf("\nSPU helper tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

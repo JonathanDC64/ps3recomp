@@ -365,6 +365,68 @@ void (*g_rsx_report_hook)(u32 method, u32 data) = NULL;
  * methods finishes it first (the D3D12 backend's vertex fetch threads). */
 void (*g_rsx_sync_hook)(void) = NULL;
 
+/* See rsx_commands.h. The per-word handlers these replace are the
+ * NV4097_SET_TRANSFORM_PROGRAM, _CONSTANT_LOAD and _CONSTANT cases of
+ * rsx_process_method; the stores, counters and dirty range are the same. */
+u32 rsx_process_method_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{
+    /* The per-word debug output of those cases, and the method trace. */
+    static int dbg = -1;
+    PS3_KNOB(dbg, (getenv("RSX_TRACE") || getenv("LOAD_DBG") || getenv("TCONST_DBG") ||
+                   getenv("SEQ_DBG")) ? 1 : 0);
+    if (dbg) return 0;
+#define RUN_WORD(i) (((u32)src[(i)*4] << 24) | ((u32)src[(i)*4+1] << 16) | \
+                     ((u32)src[(i)*4+2] << 8) | (u32)src[(i)*4+3])
+    u32 i = 0;
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        u32 w = state->vp_ucode_write, n = 0;
+        for (; i < count && method + i * 4 < NV4097_SET_TRANSFORM_PROGRAM + 32 * 4; i++) {
+            if (w + 4 > sizeof(state->vp_ucode)) continue;   /* dropped, as per word */
+            const u32 data = RUN_WORD(i);
+            memcpy(&state->vp_ucode[w], &data, 4);           /* little-endian, as per word */
+            w += 4; n++;
+        }
+        if (n) {
+            state->vp_ucode_write = w;
+            if (w > state->vp_ucode_bytes) state->vp_ucode_bytes = w;
+            state->vp_dirty = 1;
+            g_rsx_vp_ucode_ver += n;
+        }
+        return i;
+    }
+    /* Word i is method + 4*i: a LOAD block's first word is the slot, the rest
+     * land in the 32-dword constant window that follows it. */
+    if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+        if (!count) return 0;
+        state->transform_constant_load = RUN_WORD(0);
+        i = 1;
+    }
+    const u32 load = state->transform_constant_load;
+    for (; i < count; i++) {
+        const u32 m = method + i * 4;
+        if (m < NV4097_SET_TRANSFORM_CONSTANT ||
+            m >= NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4)
+            break;
+        const u32 reg_offset = (m - NV4097_SET_TRANSFORM_CONSTANT) / 4;
+        const u32 slot = load + (reg_offset >> 2);
+        if (slot >= RSX_MAX_VERTEX_CONSTANTS) continue;
+        const u32 data = RUN_WORD(i);
+        memcpy(&state->vertex_constants[slot][reg_offset & 3], &data, 4);
+        state->vertex_constants_gen++;
+        if (!state->vertex_constants_dirty) {
+            state->vertex_constants_lo = slot;
+            state->vertex_constants_hi = slot;
+            state->vertex_constants_dirty = 1;
+        } else {
+            if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
+            if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
+        }
+    }
+#undef RUN_WORD
+    return i;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     if ((method == 0x1D70 || method == 0x1D74 || method == 0x1800) && g_rsx_sync_hook)

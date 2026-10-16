@@ -190,6 +190,7 @@ void cached_setenv(const char* name, const char* value)
 }
 }
 extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
+extern "C" void ps3_setenv(const char* name, const char* value) { cached_setenv(name, value); }
 
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
@@ -526,6 +527,8 @@ static DWORD WINAPI vblank_clock(LPVOID)
     const int vblank_mhz = ps3_env_int("VBLANK_MHZ", 59940);
     const long long tick_qpc = qpf.QuadPart * 1000 / (vblank_mhz > 1000 ? vblank_mhz : 59940);
     long long next_tick = qpc.QuadPart + tick_qpc;
+    fprintf(stderr, "[vblank] clock thread at %.3f Hz%c",
+            (vblank_mhz > 1000 ? vblank_mhz : 59940) / 1000.0, 10);
     for (;;) {
         QueryPerformanceCounter(&qpc);
         long long wait_qpc = next_tick - qpc.QuadPart;
@@ -988,10 +991,13 @@ static void dbg_knobs(const char* prefix)
  * functions exclusive (leaf) and inclusive (anywhere on the stack), keyed by
  * function start. exe entries print as rva=; resolve against the link map.
  * Only lock-free work happens while the thread is suspended.
+ * "profrip" adds a fourth table, the leaf by instruction address, for a hot
+ * function too big to read whole (a lifted SPU region is thousands of lines):
+ * disassemble the exe at those rvas to see which guest instructions they are.
  * ponytail: fixed 4096-slot tables; a thread touching more functions drops the rest. */
 #define PROF_SLOTS 4096
-static uint64_t s_prof_key[3][PROF_SLOTS];
-static uint32_t s_prof_ct[3][PROF_SLOTS];
+static uint64_t s_prof_key[4][PROF_SLOTS];
+static uint32_t s_prof_ct[4][PROF_SLOTS];
 static void prof_hit(int tab, uint64_t key)
 {
     for (uint32_t i = (uint32_t)((key >> 4) * 2654435761u) % PROF_SLOTS, n = 0; n < PROF_SLOTS;
@@ -1157,7 +1163,7 @@ static void dbg_cpu(unsigned sec)
     }
 }
 
-static void dbg_prof(DWORD tid, unsigned sec)
+static void dbg_prof(DWORD tid, unsigned sec, int by_rip)
 {
     /* Suspending ourselves never resumes: the console would hang for good. */
     if (tid == GetCurrentThreadId()) { dbg_printf("  tid %lu is the console%c", (unsigned long)tid, 10); return; }
@@ -1177,7 +1183,7 @@ static void dbg_prof(DWORD tid, unsigned sec)
                 DWORD64 base = 0;
                 PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
                 uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
-                if (d == 0) prof_hit(0, key);
+                if (d == 0) { prof_hit(0, key); if (by_rip) prof_hit(3, c.Rip); }
                 /* first exe frame of a sample whose leaf is in a DLL: who called out */
                 if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
                 int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
@@ -1192,8 +1198,9 @@ static void dbg_prof(DWORD tid, unsigned sec)
     }
     CloseHandle(h);
     dbg_printf("  prof tid %lu: %u samples over %us%c", (unsigned long)tid, samples, sec, 10);
-    for (int tab = 0; tab < 3; tab++) {
-        static const char* tn[3] = { "exclusive", "inclusive", "exe caller of DLL leaf" };
+    for (int tab = 0; tab < (by_rip ? 4 : 3); tab++) {
+        static const char* tn[4] = { "exclusive", "inclusive", "exe caller of DLL leaf",
+                                     "exclusive by address" };
         dbg_printf("  --- %s ---%c", tn[tab], 10);
         for (int rank = 0; rank < 40; rank++) {
             uint32_t best = 0; int bi = -1;
@@ -1365,6 +1372,8 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
             dbg_printf("  gstacks [n]      guest shadow stack of every thread, n frames%c", 10);
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
+            dbg_printf("  profrip <tid> [s] the same, plus the hottest instruction addresses%c", 10);
+            dbg_printf("  affin <tid> <hexmask> pin a host thread to those logical CPUs (0 = the process mask)%c", 10);
             dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
             dbg_printf("  waits [s] [rows] time per guest thread inside each syscall/HLE call (+r3) over s seconds%c", 10);
             dbg_printf("  profile          start/stop a profile session, like F11 in the game window%c", 10);
@@ -1511,8 +1520,23 @@ static DWORD WINAPI debug_console(LPVOID param)
             g_rsx_trace_mark = nullptr;
             g_spu_trace_mark = nullptr;
             dbg_printf("  %d records -> %s%c", n, tp, 10);
-        } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
-            dbg_prof((DWORD)a, b ? b : 5);
+        } else if ((!strcmp(verb, "prof") || !strcmp(verb, "profrip")) &&
+                   sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
+            dbg_prof((DWORD)a, b ? b : 5, !strcmp(verb, "profrip"));
+        } else if (!strcmp(verb, "affin") && sscanf(cmd, "%*s %u %x", &a, &b) == 2) {
+            /* affin <host tid> <mask>: where a thread runs, for placement
+             * experiments (a producer and its consumer on one core's two SMT
+             * threads share its L1). 0 puts it back on the process mask. */
+            DWORD_PTR pm = 0, sm = 0;
+            GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm);
+            HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, (DWORD)a);
+            if (!h) dbg_printf("  no thread %u%c", a, 10);
+            else {
+                const DWORD_PTR prev = SetThreadAffinityMask(h, b ? (DWORD_PTR)b : pm);
+                dbg_printf("  tid %u: mask 0x%llX (was 0x%llX)%c", a,
+                           (unsigned long long)(b ? (DWORD_PTR)b : pm), (unsigned long long)prev, 10);
+                CloseHandle(h);
+            }
         } else if (!strcmp(verb, "ctx") && sscanf(cmd, "%*s %u", &a) == 1) {
             /* ctx <tid>: that guest thread's live registers. Read unlocked from
              * the thread's own context, so a running thread gives a torn view;
@@ -2085,3 +2109,12 @@ int main(int argc, char** argv)
      * produce. */
     return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
 }
+
+#ifndef _WIN32
+/* No getenv cache off Windows: the plain setenv, and the knobs re-read. */
+extern "C" void ps3_setenv(const char* name, const char* value)
+{
+    setenv(name, value, 1);
+    ps3_env_bump();
+}
+#endif

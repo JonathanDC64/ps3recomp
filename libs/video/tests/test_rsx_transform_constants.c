@@ -16,11 +16,13 @@
 #include <stdio.h>
 #include <string.h>
 
-/* rsx_commands.c reaches the guest VM (semaphore labels) and the boot
- * milestone log; nothing here uses either, so stubs are enough to link. */
+/* rsx_commands.c reaches the guest VM (semaphore labels), the boot
+ * milestone log and the trace-mark hook; nothing here uses them, so stubs
+ * are enough to link. */
 uint32_t ppu_hle_inject_base;
 void vm_write32(uint32_t addr, uint32_t value) { (void)addr; (void)value; }
 void ps3_ms(const char* key) { (void)key; }
+void (*volatile g_rsx_trace_mark)(const char* name, uint32_t a, uint32_t b) = 0;
 
 static int g_fail;
 

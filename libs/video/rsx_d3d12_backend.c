@@ -18,6 +18,17 @@
 
 #include <time.h>
 #include "ps3emu/ps3_knob.h"
+
+/* Debug gates on the per-draw and per-texture-bind paths. A getenv on each
+ * call was ~3% of the FIFO thread in a heavy view (~200k lookups a second). */
+static int knob_vtx_dump(void)   { static int v = -1; PS3_KNOB(v, getenv("VTX_DUMP") ? 1 : 0); return v; }
+static int dbg_movie_bind(void) { static int v = -1; PS3_KNOB(v, getenv("MOVIE_BIND") ? 1 : 0); return v; }
+static int dbg_texfmt(void)     { static int v = -1; PS3_KNOB(v, getenv("TEXFMTDBG") ? 1 : 0); return v; }
+/* RSX_PRESENT=0: render every frame but never Present it. Behind the lock
+ * screen DWM holds each back buffer 250-500 ms without reporting occlusion,
+ * so an unattended test run measures DWM instead of the game; this makes it
+ * measure the game. Live (console setenv). */
+static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_PRESENT", 1)); return v; }
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -31,6 +42,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <wtsapi32.h>         /* session lock notifications (s_session_locked) */
 
 /* D3D12 headers */
 #include <d3d12.h>
@@ -46,6 +58,7 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -414,6 +427,9 @@ typedef struct {
      * extended. */
     u32                   merge_first_end;
     int                   merge_prev_draw;
+    /* Indexed strip/fan merging (see d3d12_draw_indexed): the primitive of
+     * the last draw when it was one, else 0. merge_first_end is its end. */
+    int                   merge_strip;
     ID3D12DescriptorHeap* rt_rtv_heap;          /* MAX_OFF_RTS RTVs (CPU only)   */
 
     /* Frame-parity double buffering for the per-draw upload streams (vp_vb
@@ -633,9 +649,37 @@ static u32    s_lock_n  = 0;
  * Win32 window
  * -----------------------------------------------------------------------*/
 
+/* The Windows session is locked. Behind the lock screen DWM holds each back
+ * buffer for 250-500 ms while Present still returns S_OK (not
+ * DXGI_STATUS_OCCLUDED), and the frame rate fell to 4 fps waiting for them.
+ * Frames are rendered but not presented while this is set. Written by the
+ * window thread (WM_WTSSESSION_CHANGE, and once at window creation), read
+ * at the flip. */
+static volatile LONG s_session_locked;
+
+static void session_lock_init(HWND hwnd)
+{
+    WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+    /* A run started behind the lock screen gets no LOCK message. */
+    WTSINFOEXW* info = NULL;
+    DWORD n = 0;
+    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+                                    WTSSessionInfoEx, (LPWSTR*)&info, &n) && info) {
+        if (info->Level == 1)
+            s_session_locked = info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+        WTSFreeMemory(info);
+    }
+    if (s_session_locked)
+        fprintf(stderr, "[D3D12] session locked: rendering without presenting until unlock%c", 10);
+}
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK)   InterlockedExchange(&s_session_locked, 1);
+        if (wp == WTS_SESSION_UNLOCK) InterlockedExchange(&s_session_locked, 0);
+        return 0;
     case WM_CLOSE:
         s_d3d.window_closed = 1;
         DestroyWindow(hwnd);
@@ -2688,7 +2732,7 @@ static void fp_seen_note(u32 ea, u32 len);
  * kept with the last hash: equal bytes up to the old size mean the same END
  * instruction, so the same size and the same hash. RSX_FP_HASH_MEMO=0 hashes
  * every time. */
-typedef struct { u32 off, size, hash; u8* bytes; } FpHashMemo;
+typedef struct { u32 off, size, hash, units; u8* bytes; } FpHashMemo;
 static FpHashMemo s_fph[1024];
 static u32 fp_hash_at(u32 off, u32* size_out)
 {
@@ -2707,10 +2751,26 @@ static u32 fp_hash_at(u32 off, u32* size_out)
     fp_seen_note(off, usz);
     if (en) {
         u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
-        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h; }
+        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h;
+                 m->units = rsx_fp_texture_units(up, RSX_FP_MAX_BYTES); }
     }
     *size_out = usz;
     return h;
+}
+/* The texture units the program at guest offset `off` samples, from
+ * fp_hash_at's memo: render_frame binds only those. Every draw looked up all
+ * sixteen units' textures (and render targets, and depth surfaces), ~14 a
+ * draw at the Palace where its programs sample two or three, and that was
+ * most of the frame's SRV time. */
+static u32 fp_units_at(u32 off)
+{
+    extern uint8_t* vm_base;
+    u32 usz;
+    (void)fp_hash_at(off, &usz);
+    const FpHashMemo* m = &s_fph[((off >> 4) * 2654435761u) >> 22];
+    if (m->bytes && m->off == off && !memcmp(m->bytes, vm_base + off, m->size))
+        return m->units;
+    return rsx_fp_texture_units(vm_base + off, RSX_FP_MAX_BYTES);
 }
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
@@ -4178,6 +4238,41 @@ static void late_check(void)
 /* Inline constants each record's program has (drawprint hashes only those:
  * the rest of the slot holds whatever an earlier frame left there). */
 static u8 s_fpk_n[MAX_DRAWS];
+/* rsx_fp_extract_consts of the program at guest offset `off`, memoised as
+ * fp_hash_at memoises the hash: the walk ran for every draw, ~2.6% of the
+ * render thread at the Palace, and a program whose bytes (constants
+ * included, up to its END) equal the copy kept with the last walk has the
+ * same constants. A re-patched constant is a byte that differs, so a fresh
+ * walk. RSX_FPK_MEMO=0 walks every time. */
+typedef struct { u32 off, size; int n; u8* bytes; float k[FPCB_KMAX * 4]; } FpkMemo;
+static FpkMemo s_fpkm[1024];
+static int fpk_extract_at(u32 off, float* out)
+{
+    extern uint8_t* vm_base;
+    const u8* up = vm_base + off;
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_FPK_MEMO", 1));
+    if (!en) return rsx_fp_extract_consts(up, RSX_FP_MAX_BYTES, out, FPCB_KMAX);
+    FpkMemo* m = &s_fpkm[((off >> 4) * 2654435761u) >> 22];
+    if (m->bytes && m->off == off && !memcmp(m->bytes, up, m->size)) {
+        memcpy(out, m->k, sizeof(float) * 4 * (size_t)m->n);
+        return m->n;
+    }
+    /* Into a cached buffer first: `out` is the upload heap, write-combined,
+     * and reading it back for the memo would be the slow part. */
+    float k[FPCB_KMAX * 4];
+    const int n = rsx_fp_extract_consts(up, RSX_FP_MAX_BYTES, k, FPCB_KMAX);
+    memcpy(out, k, sizeof(float) * 4 * (size_t)n);
+    const u32 usz = rsx_fp_program_size(up, RSX_FP_MAX_BYTES);
+    if (usz) {   /* no END: nothing bounds what the walk read */
+        u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
+        if (b) {
+            memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->n = n;
+            memcpy(m->k, k, sizeof(float) * 4 * (size_t)n);
+        }
+    }
+    return n;
+}
 /* The last vp_cb slot written this frame, and what it was written from. */
 static u32 s_vcb_last = ~0u, s_vcb_gen;
 static const rsx_state* s_vcb_st;
@@ -4235,8 +4330,7 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
             if (vm_base && foff != 0xFFFFFFFFu)
-                s_fpk_n[slot] = (u8)rsx_fp_extract_consts(vm_base + foff, RSX_FP_MAX_BYTES,
-                                                          &ts[FPCB_K * 4], FPCB_KMAX);
+                s_fpk_n[slot] = (u8)fpk_extract_at(foff, &ts[FPCB_K * 4]);
             /* FPK_FP=<hex fp_addr>: that program's constants, each time they
              * change (capped). Shows whether the title's per-material patches
              * reach the draw, for one surface at a time. */
@@ -6686,10 +6780,29 @@ rtt_dump_done:;
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         dr->d2c_mask = 0;
+        /* Once per draw: it walks all sixteen units, and the unit loop below
+         * and the PSO lookup after it each wanted it. */
+        const u32 _cmask = dr_cube_mask(dr);
+        /* The units the program samples; the others get a null SRV.
+         * RSX_SRV_USED=0 binds all sixteen. */
+        u32 _used = 0xFFFFFFFFu;
+        { static int en = -1;
+          PS3_KNOB(en, ps3_env_int("RSX_SRV_USED", 1));
+          if (en && dr->is_vp && dr->fp_addr) {
+              extern u32 cellGcmResolveLocated(int, u32);
+              const u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
+                                                     dr->fp_addr & ~0x3u);
+              if (foff != 0xFFFFFFFFu) _used = fp_units_at(foff);
+          } }
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * RSX_FP_UNITS + (u32)_u;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
+            if (!(_used & (1u << _u))) {
+                srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                continue;
+            }
             /* An A8R8G8B8 / D8R8G8B8 unit over a depth surface reads the depth
              * buffer's bytes as colour (RPCS3 RSXThread.cpp "redirected"
              * textures; Demon's Souls's light shafts and depth of field read
@@ -6780,7 +6893,7 @@ rtt_dump_done:;
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
                 if (dr->tex[_u].off && vp_tex_fmt_ok(_bf)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
-                    int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
+                    int _cube = dr->tex[_u].cube && (_cmask & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
                                                 dr->tex[_u].h, dr->tex[_u].fmt,
                                                 _cube, dr->tex[_u].mips);
@@ -6827,7 +6940,7 @@ rtt_dump_done:;
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       dr_cube_mask(dr), dr->d2c_mask);
+                                       _cmask, dr->d2c_mask);
         if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
@@ -7906,8 +8019,14 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
-      if (s_present_this_frame)
-          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+      /* RSX_VSYNC (live, default 1): 0 presents without waiting for the
+       * display's refresh. The flip-model window does not tear; the
+       * compositor shows the newest frame. The title's own vblank stays the
+       * frame limit, so a game set above the display's rate is not held to it. */
+      static int vsync = -1;
+      PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
+      if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
+          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, vsync ? 1 : 0, 0);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       RSX_MARK("present", s_present_this_frame, 0); }
@@ -8413,6 +8532,11 @@ static VPSlot s_vc_v[VP_VC_N][16];
 /* For indexed uploads: where this draw's vertices went in vp_vb, keyed like
  * the vertex cache (and in the same generation). */
 static u32 s_vx_key[VP_VC_N], s_vx_tag[VP_VC_N], s_vx_out[VP_VC_N];
+/* Vertices the draw being extended already has (d3d12_draw_indexed), 0 for
+ * a new draw: the indices a merged range writes count from there, and the
+ * vertex cache carries over, so the vertices two ranges share are written
+ * once. */
+static u32 s_strip_base;
 
 /* RSX_LATE_CHECK, vertices: these are read when the draw is recorded, so the
  * question is the other way round from textures -- did the title write a
@@ -8514,6 +8638,7 @@ static void vp_plan_begin(const rsx_state* state)
         rsx_fetch_plan_init(state, &s_vp_plan);
         memcpy(s_vp_tmp, s_vp_plan.konst, sizeof s_vp_tmp);
     }
+    if (s_strip_base) return;   /* continuing the last draw: its vertices stay */
     if (++s_vc_gen == 0) { memset(s_vc_tag, 0, sizeof s_vc_tag);
                            memset(s_vx_tag, 0, sizeof s_vx_tag); s_vc_gen = 1; }
 }
@@ -8553,13 +8678,21 @@ static void read_vp_vertex_c(const rsx_state* state, u32 vi, VPSlot* out16)
     memcpy(out16, s_vc_v[h], VP_VERT_STRIDE);
 }
 
-/* VP_FETCH_THREADS=<n> (read once; default a quarter of the logical CPUs, at
- * most 4; 0 = off): convert the vertices of indexed strip uploads on worker
- * threads. The FIFO thread only walks the indices, numbers the draw's
- * vertices and queues them (vpj_queue); the workers fetch and convert them
- * straight into vp_vb. In a Demon's Souls level frame the conversion was
- * about a third of the FIFO thread, and HighGraphics waits on that thread's
- * labels before each flip.
+/* VP_FETCH_THREADS=<n> (read once; default 1; 0 = off): convert the vertices
+ * of indexed strip uploads on worker threads. The FIFO thread only walks the
+ * indices, numbers the draw's vertices and queues them (vpj_queue); the
+ * workers fetch and convert them straight into vp_vb. In a Demon's Souls level
+ * frame the conversion was about a third of the FIFO thread, and HighGraphics
+ * waits on that thread's labels before each flip.
+ *
+ * One worker, whatever the machine: the conversion only has to overlap the
+ * FIFO walk, and one keeps up. More cost the frame instead -- Palace, 60 fps
+ * mode with VBLANK_MHZ=120000: 1 worker 63-64 fps, 2 about 61, 4 (the old
+ * default of a quarter of the logical CPUs) 57-59, with each of the four at
+ * ~55% of a core, half of it in the kernel going to sleep and waking. Waking
+ * one worker per publish instead of all of them did not change that. The
+ * threads the frame waits on (HighGraphics, the image-2 SPU thread, the FIFO
+ * walker) run slower beside them. 0 workers: ~46 fps at a 60 cap.
  *
  * A queued vertex is read from guest memory later than the FIFO reached the
  * draw, so everything the title can observe of the RSX's progress waits for
@@ -8576,7 +8709,21 @@ typedef struct {
 static VPJob* s_vpj;
 static u32* s_vpj_vis;
 static u32 s_vpj_vis_n;
-static volatile LONG s_vpj_pub, s_vpj_next, s_vpj_done, s_vpj_sleepers;
+/* The shared counters, each on its own cache line: the workers claim from
+ * `next` and count into `done` while the FIFO thread publishes into `pub`,
+ * and on one line every publish waited for the workers' writes. */
+typedef struct { volatile LONG v; char pad[60]; } VPJCounter;
+static __declspec(align(64)) VPJCounter s_vpj_ctr[4];
+#define s_vpj_pub      (s_vpj_ctr[0].v)   /* jobs the workers may take */
+#define s_vpj_next     (s_vpj_ctr[1].v)
+#define s_vpj_done     (s_vpj_ctr[2].v)
+#define s_vpj_sleepers (s_vpj_ctr[3].v)
+/* FIFO thread only: jobs queued (published or not), and the vertices queued
+ * since the last publish. Jobs are published in batches of VPJ_BATCH
+ * vertices (read once, default 1024): one publish per draw was a locked
+ * increment of a line the workers spin on, ~6% of the FIFO thread. */
+static LONG s_vpj_q;
+static u32 s_vpj_qv;
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -8607,16 +8754,32 @@ static DWORD WINAPI vpj_worker(LPVOID arg)
         for (int k = 0; k < 2000 && s_vpj_next >= s_vpj_pub; k++) YieldProcessor();
         if (s_vpj_next < s_vpj_pub) continue;
         AcquireSRWLockExclusive(&s_vpj_lk);
-        InterlockedIncrement(&s_vpj_sleepers);   /* before the check: see vpj_queue */
+        InterlockedIncrement(&s_vpj_sleepers);   /* before the check: see vpj_publish */
         while (s_vpj_next >= s_vpj_pub)
             SleepConditionVariableSRW(&s_vpj_cv, &s_vpj_lk, INFINITE, 0);
         InterlockedDecrement(&s_vpj_sleepers);
         ReleaseSRWLockExclusive(&s_vpj_lk);
     }
 }
+/* Let the workers take everything queued so far. The exchange is also the
+ * full barrier the sleeper check needs (see vpj_worker). */
+static void vpj_publish(void)
+{
+    s_vpj_qv = 0;
+    if (s_vpj_q == s_vpj_pub) return;
+    InterlockedExchange(&s_vpj_pub, s_vpj_q);
+    /* A worker counts itself a sleeper before it checks for work, so either
+     * it sees these jobs or this sees it. */
+    if (s_vpj_sleepers) {
+        AcquireSRWLockExclusive(&s_vpj_lk);
+        WakeAllConditionVariable(&s_vpj_cv);
+        ReleaseSRWLockExclusive(&s_vpj_lk);
+    }
+}
 /* Wait for every queued vertex, converting what no worker has taken yet. */
 static void vpj_sync(void)
 {
+    vpj_publish();
     if (!s_vpj_pub) return;
     LONG j;
     while ((j = vpj_claim()) >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); }
@@ -8624,6 +8787,7 @@ static void vpj_sync(void)
     InterlockedExchange(&s_vpj_pub, 0);   /* first: a stale claim then sees nothing */
     InterlockedExchange(&s_vpj_next, 0);
     InterlockedExchange(&s_vpj_done, 0);
+    s_vpj_q = 0;
     s_vpj_vis_n = 0;
 }
 static void vpj_sync_hook(void) { vpj_sync(); }
@@ -8631,11 +8795,7 @@ static int vpj_threads(void)
 {
     static int n = -1;
     if (n >= 0) return n;
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    int def = (int)si.dwNumberOfProcessors / 4;
-    if (def > 4) def = 4;
-    if (def < 1) def = 1;
-    n = ps3_env_int("VP_FETCH_THREADS", def);
+    n = ps3_env_int("VP_FETCH_THREADS", 1);
     if (n > 16) n = 16;
     if (n > 0) {
         s_vpj = (VPJob*)malloc(sizeof(VPJob) * VPJ_JOBS);
@@ -8670,23 +8830,20 @@ static int vpj_usable(void)
 static int vpj_room(u32 nv)
 {
     if (nv > VPJ_VIS) return 0;
-    if (s_vpj_pub >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
+    if (s_vpj_q >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
     return 1;
 }
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
-    VPJob* J = &s_vpj[s_vpj_pub];
+    VPJob* J = &s_vpj[s_vpj_q];
     memcpy(&J->plan, &s_vp_plan, sizeof J->plan);
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
-    InterlockedIncrement(&s_vpj_pub);
-    /* A worker counts itself a sleeper before it checks for work, so either
-     * it sees this job or this sees it. */
-    if (s_vpj_sleepers) {
-        AcquireSRWLockExclusive(&s_vpj_lk);
-        WakeAllConditionVariable(&s_vpj_cv);
-        ReleaseSRWLockExclusive(&s_vpj_lk);
-    }
+    s_vpj_q++;
+    static int batch = -1;
+    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
+    s_vpj_qv += n;
+    if (s_vpj_qv >= (u32)batch) vpj_publish();
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
@@ -8907,7 +9064,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
         /* quad -> two triangles (perimeter winding) */
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 4) {
+        if (knob_vtx_dump()) { static int _n=0; if (_n++ < 4) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) { for (u32 k = 0; k < 4; k++)
                 fprintf(f, "q%02d v%u a0=(%.3f,%.3f,%.3f,%.3f) a8=(%.3f,%.3f)\n", _n, k,
@@ -8950,7 +9107,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
           fprintf(stderr, "[IDXDBG] tris first=%u count=%u a0off=0x%X stride=%u%c",
                   first, count, state->vertex_attribs[0].offset,
                   state->vertex_attribs[0].stride, 10); } }
-    if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
+    if (knob_vtx_dump() && state->surface_color_offset[0] == 0xCC0000) {
         static int _n=0; if (_n++ < 1) {
         FILE* f = fopen("vtx_dump.txt", "w");
         if (f) { fprintf(f, "G-buffer draw surf0=0x%X count=%u first=%u\n",
@@ -9019,6 +9176,31 @@ static u32 read_guest_index(const rsx_state* st, u32 k)
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
 }
 
+/* read_guest_index for a loop over one draw's indices: the array's base is
+ * resolved once, not per index (cellGcmResolveLocated is out of line, in
+ * cellGcmSys.c, and the strip walk reads millions of indices a second). The
+ * caller notes the range for the live-vertex window itself. */
+typedef struct { const u8* p; int w16; } GuestIdx;
+static GuestIdx guest_index_open(const rsx_state* st)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    GuestIdx g;
+    g.p = vm_base + cellGcmResolveLocated((st->index_array_dma & 0xF) == 0,
+                                          st->index_array_offset);
+    g.w16 = ((st->index_array_dma >> 4) & 0xF) == 1;
+    return g;
+}
+static inline u32 guest_index_at(const GuestIdx* g, u32 k)
+{
+    if (g->w16) {
+        const u8* p = g->p + (u64)k * 2;
+        return ((u32)p[0] << 8) | p[1];
+    }
+    const u8* p = g->p + (u64)k * 4;
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
 /* Indexed variants of the VP-path uploads. */
 static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
 {
@@ -9040,7 +9222,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
             read_vp_vertex_c(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 6) {
+        if (knob_vtx_dump()) { static int _n=0; if (_n++ < 6) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) {
                 const float* vs_ = state->viewport_scale;
@@ -9324,6 +9506,14 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
+    /* VP_SLOW_DRAW_NS=<ns> (live): spin that long per strip upload. A causal
+     * test for whether the FIFO thread's draw cost sets the frame rate. */
+    { static int slow = -1; PS3_KNOB(slow, ps3_env_int("VP_SLOW_DRAW_NS", 0));
+      if (slow > 0) { static long long fq; LARGE_INTEGER t0, t;
+          if (!fq) { QueryPerformanceFrequency(&t); fq = t.QuadPart; }
+          QueryPerformanceCounter(&t0);
+          do { YieldProcessor(); QueryPerformanceCounter(&t); }
+          while ((t.QuadPart - t0.QuadPart) * 1000000000LL / fq < slow); } }
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
@@ -9351,6 +9541,11 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         m = carry.m; p0 = carry.p0; p1 = carry.p1;
     }
     u32 o = 0, need = 0;   /* need: vertices the strip expands to, room or not */
+    const GuestIdx gi = guest_index_open(state);
+    if (s_lv_open && count) {
+        if (first < s_lv_klo) s_lv_klo = first;
+        if (first + count - 1 > s_lv_khi) s_lv_khi = first + count - 1;
+    }
     /* VP_INDEXED (live, default 1): write each of the draw's vertices once and
      * the triangle list as u32 indices into them. A Demon's Souls level strip
      * expands to ~2.5 list vertices per guest vertex, and at 256 bytes each
@@ -9369,7 +9564,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
         const int par = vpj_usable() && vpj_room(count);
         u32* vis = par ? s_vpj_vis + s_vpj_vis_n : NULL;
         for (u32 k = 0; k < count; k++) {
-            const u32 ix = read_guest_index(state, first + k);
+            const u32 ix = guest_index_at(&gi, first + k);
             if (restart && ix == ridx) { m = 0; continue; }
             if (m >= 2) need += 3;
             if (m >= 2 && ni + 3 <= icap && o + 3 <= maxv) {
@@ -9381,7 +9576,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
                     if (s_vx_tag[h] != s_vc_gen || s_vx_key[h] != vi) {
                         if (par) vis[o] = vi;
                         else     read_vp_vertex(state, vi, &out[o*16]);
-                        s_vx_key[h] = vi; s_vx_tag[h] = s_vc_gen; s_vx_out[h] = o++;
+                        s_vx_key[h] = vi; s_vx_tag[h] = s_vc_gen; s_vx_out[h] = s_strip_base + o++;
                         nmiss++;
                     }
                     ib[ni++] = s_vx_out[h];
@@ -9404,7 +9599,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     }
     const u32 cap = maxv - maxv % 3;
     for (u32 k = 0; k < count; k++) {
-        const u32 ix = read_guest_index(state, first + k);
+        const u32 ix = guest_index_at(&gi, first + k);
         if (restart && ix == ridx) { m = 0; continue; }
         if (m >= 2) need += 3;
         if (m >= 2 && o + 3 <= cap) {
@@ -9663,11 +9858,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draw_count++;
             /* Anchor for merging the next DRAW_ARRAYS batch of this stream. */
             s_d3d.merge_prev_draw  = (primitive == RSX_PRIMITIVE_TRIANGLES);
+            s_d3d.merge_strip      = 0;
             s_d3d.merge_first_end  = first + count;
         }
         return;
     }
     s_d3d.merge_prev_draw = 0;   /* any other primitive breaks the stream */
+    s_d3d.merge_strip = 0;
 
     u32 topo = (u32)rsx_primitive_topology(primitive);
     if (topo == RSX_TOPOLOGY_UNSUPPORTED) {
@@ -9726,6 +9923,27 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
     s_up_icount = 0;
+    /* A strip split over several DRAW_INDEX_ARRAY ranges of one BEGIN/END
+     * (Demon's Souls' level meshes, 256 indices each) was a draw per range,
+     * each paying the whole per-draw cost here and in render_frame. A range
+     * that continues the last draw's strip, with its vertices and indices
+     * right after that draw's, extends it instead. RSX_STRIP_MERGE=0 draws
+     * each range on its own. */
+    D3D12DrawRecord* mpv = NULL;
+    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
+        s_d3d.merge_strip == (int)primitive && s_d3d.merge_first_end == first &&
+        s_d3d.draw_count > 0 && s_d3d.current_rsx_state && !late_on()) {
+        static int en = -1;
+        PS3_KNOB(en, ps3_env_int("RSX_STRIP_MERGE", 1));
+        D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+        if (en && pv->is_vp && pv->index_count && pv->vertex_count &&
+            pv->begin_epoch == s_d3d.current_rsx_state->begin_epoch &&
+            pv->fp_addr == s_d3d.current_rsx_state->shader_program &&
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset &&
+            pv->ib_first + pv->index_count == s_d3d.vp_ib_offset)
+            mpv = pv;
+    }
+    s_strip_base = mpv ? mpv->vertex_count : 0;
     s_vs_up[primitive == RSX_PRIMITIVE_QUADS ? 0 : primitive == RSX_PRIMITIVE_TRIANGLES ? 1
             : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
     if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
@@ -9737,6 +9955,17 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         if (_skip++ < 3)
             printf("[D3D12] draw_indexed: skipping prim=%u (not wired)\n", primitive);
         return;
+    }
+    s_strip_base = 0;
+    if (mpv) {
+        s_d3d.merge_first_end = first + count;
+        if (!emitted) return;   /* nothing drawn; the strip's carry still moved on */
+        if (s_up_icount) {
+            mpv->vertex_count += emitted;
+            mpv->index_count  += s_up_icount;
+            return;
+        }
+        /* The unindexed fallback ran (no index room): a draw of its own. */
     }
     /* Same BEGIN/END batch concatenation as the non-indexed path: this title's
      * fluid arrives as ~3000 DRAW_INDEX_ARRAY batches of 256, and 256 is not a
@@ -9818,6 +10047,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         s_d3d.draw_count++;
         /* Anchor for merging the next batch of this indexed stream. */
         s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
+        s_d3d.merge_strip = (s_up_icount && (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ||
+                             primitive == RSX_PRIMITIVE_TRIANGLE_FAN)) ? (int)primitive : 0;
         s_d3d.merge_first_end = first + count;
     }
 }
@@ -9858,7 +10089,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * resolved EA + a content probe -- used to diagnose the Bink frame-buffer
      * ring mismatch (the draw binds a cleared buffer 0x4D80 before the one the
      * decoder actually fills). */
-    if (getenv("MOVIE_BIND") &&
+    if (dbg_movie_bind() &&
         ((width == 640 && height == 360) || (width == 320 && height == 180))) {
         extern u32 cellGcmResolveLocated(int local, u32 offset);
         static int _mv = 0; if (_mv++ < 24) {
@@ -9916,7 +10147,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     /* TEXFMTDBG=1 (live): one line per new unit/format/width, including the
      * formats the VP path below does not take -- those units end up sampling
      * nothing, so they are the ones worth seeing. */
-    if (getenv("TEXFMTDBG")) { static u32 seen[256]; static int ns=0;
+    if (dbg_texfmt()) { static u32 seen[256]; static int ns=0;
         u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
         int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
         if (!f && ns < 256) { seen[ns++]=k;
@@ -10116,6 +10347,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         printf("[D3D12] ERROR: Window creation failed\n");
         return -1;
     }
+    session_lock_init(s_d3d.hwnd);
 
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
