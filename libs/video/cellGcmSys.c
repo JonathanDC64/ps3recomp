@@ -2539,8 +2539,14 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
+/* Set by title code that paces itself on the title's frames: called on the
+ * guest thread that requested the flip, once per flip request, before it is
+ * queued. Demon's Souls' frame-time option measures its frames here. */
+void (*g_gcm_flip_request_hook)(void) = NULL;
+
 static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 {
+    if (g_gcm_flip_request_hook) g_gcm_flip_request_hook();
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
      * fast?" -- the question that matters when a title stops appearing on
