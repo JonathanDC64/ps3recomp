@@ -547,6 +547,17 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* SPU_RATE=<image id> (see spu_rate_tick). */
+static int spu_rate_img(void)
+{
+    static int s_img = -2;
+    PS3_KNOB(s_img, ps3_env_int("SPU_RATE", -1));
+    return s_img;
+}
+/* QPC ticks the SPU_RATE image spent re-reading a lock line that had not
+ * changed, with no DMA in between: polling, as opposed to working. */
+static SPU_THREAD_LOCAL unsigned long long t_poll_ticks, t_llar_last;
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -848,7 +859,14 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (s_nap) {
               const int worked = t_spu_xfers != n_xfers;
               n_xfers = t_spu_xfers;
-              if (ea == n_ea && !worked && !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE)) {
+              const int same = ea == n_ea && !worked &&
+                               !memcmp(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
+              if (spu_rate_img() == ctx->image_id) {
+                  LARGE_INTEGER q; QueryPerformanceCounter(&q);
+                  if (same) t_poll_ticks += (unsigned long long)q.QuadPart - t_llar_last;
+                  t_llar_last = (unsigned long long)q.QuadPart;
+              }
+              if (same) {
                   if (++n_same > 20000u) spu_llar_idle_wait(ctx);
               } else {
                   n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
@@ -1083,28 +1101,32 @@ static int channel_is_mfc(uint32_t ch)
 static SPU_THREAD_LOCAL unsigned long long t_nap_ticks;   /* QPC ticks in spu_llar_idle_wait */
 static void spu_rate_tick(spu_context* ctx)
 {
-    static int s_img = -2;
-    PS3_KNOB(s_img, ps3_env_int("SPU_RATE", -1));
+    const int s_img = spu_rate_img();
     if (s_img < 0 || ctx->image_id != s_img) return;
-    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0;
+    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0, pt0;
     static SPU_THREAD_LOCAL long nap0;
     extern volatile long g_spu_llar_naps;
     if ((++wr & 1023u) != 0) return;
     LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
     const unsigned long long now = (unsigned long long)q.QuadPart;
     if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
-               ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; return; }
+               ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
+               pt0 = t_poll_ticks; return; }
     if (now - t0 < 2ull * (unsigned long long)f.QuadPart) return;
     const double s = (double)(now - t0) / (double)f.QuadPart;
     const double nap_s = (double)(t_nap_ticks - nt0) / (double)f.QuadPart;
+    /* A poll interval that spans a nap counts the nap too: take it out. */
+    double poll_s = (double)(t_poll_ticks - pt0) / (double)f.QuadPart - nap_s;
+    if (poll_s < 0) poll_s = 0;
     const double steps = (double)(uint32_t)(ctx->steps - (uint32_t)st0);
     fprintf(stderr, "[spu-rate] img=%d per s: steps=%.0f wrch_full=%.0f dma=%.0f getllar=%.0f"
-                    " naps=%.0f napping=%.0f%% | %.0f steps per busy ms%c",
+                    " naps=%.0f napping=%.0f%% polling=%.0f%% | %.0f steps per busy ms%c",
             s_img, steps / s, (wr - wr0) / s, (t_spu_xfers - x0) / s,
             (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
+            100.0 * poll_s / s,
             s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
     t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
-    ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
+    ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; pt0 = t_poll_ticks;
 }
 
 #if defined(_MSC_VER)
