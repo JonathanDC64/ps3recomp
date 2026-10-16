@@ -1191,18 +1191,18 @@ static void spu_rate_tick(spu_context* ctx)
 /* Channel diagnostics that must see every access: SPU_CHHIST (both
  * directions), SPU_POLLTRACE. While neither is set, spu_wrch and
  * spu_rdch answer the plain MFC parameter channels themselves. */
-static int s_ch_diag;
-static unsigned s_ch_diag_gen = ~0u;
+int g_spu_ch_diag;               /* spu_wrch_latch (spu_context.h) reads both */
+unsigned g_spu_ch_diag_gen = ~0u;
 static SPU_NOINLINE int spu_ch_diag_load(void)
 {
-    s_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
-                 getenv("SPU_TAGPROBE")) ? 1 : 0;
-    s_ch_diag_gen = ps3_env_gen;
-    return s_ch_diag;
+    g_spu_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
+                     getenv("SPU_TAGPROBE")) ? 1 : 0;
+    g_spu_ch_diag_gen = ps3_env_gen;
+    return g_spu_ch_diag;
 }
 static inline int spu_ch_diag(void)
 {
-    return s_ch_diag_gen == ps3_env_gen ? s_ch_diag : spu_ch_diag_load();
+    return g_spu_ch_diag_gen == ps3_env_gen ? g_spu_ch_diag : spu_ch_diag_load();
 }
 
 static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value);

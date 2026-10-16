@@ -122,6 +122,46 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 
+/* The DMA-parameter channels only latch a value for the MFC_Cmd after them,
+ * and they are most of a DMA-heavy image's channel writes (~20 million a
+ * second in Demon's Souls' HighGraphics ring consumer). Written in place,
+ * without the call, which also made every SPU register live in a host
+ * register go back to ctx around it. Through spu_wrch while a channel
+ * diagnostic (SPU_CHHIST, SPU_POLLTRACE, SPU_TAGPROBE) is on, or before it
+ * was read. */
+extern int g_spu_ch_diag;
+extern unsigned g_spu_ch_diag_gen;
+static inline void spu_wrch_latch(spu_context* ctx, uint32_t channel, u128 value)
+{
+    if (__builtin_expect(g_spu_ch_diag_gen != ps3_env_gen || g_spu_ch_diag, 0)) {
+        spu_wrch(ctx, channel, value);
+        return;
+    }
+    const uint32_t v = value._u32[0];
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;        break;
+    case MFC_EAH:       ctx->mfc_eah = v;        break;
+    case MFC_EAL:       ctx->mfc_eal = v;        break;
+    case MFC_Size:      ctx->mfc_size = v;       break;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F; break;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;   break;
+    default:            spu_wrch(ctx, channel, value); break;
+    }
+}
+/* The status reads spu_rdch answers from a field, in place for the same
+ * reason. */
+static inline u128 spu_rdch_latch(spu_context* ctx, uint32_t channel)
+{
+    if (__builtin_expect(g_spu_ch_diag_gen != ps3_env_gen || g_spu_ch_diag, 0))
+        return spu_rdch(ctx, channel);
+    switch (channel) {
+    case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+    case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+    case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+    default:               return spu_rdch(ctx, channel);
+    }
+}
+
 /* Execution trace (only emitted when the lifter was invoked with --trace). */
 void spu_trace_init(const char* path);
 void spu_trace_pc(spu_context* ctx, uint32_t pc);
@@ -182,6 +222,13 @@ def _imm(token: str) -> str:
         return m.group(1)
     return "0"
 
+
+# Channels whose write only latches a DMA parameter (spu_wrch_latch).
+_LATCH_CHANNELS = {"MFC_LSA", "MFC_EAH", "MFC_EAL", "MFC_Size", "MFC_TagID",
+                   "MFC_WrTagMask", "16", "17", "18", "19", "20", "22"}
+# Status reads answered from a field (spu_rdch_latch).
+_LATCH_RD_CHANNELS = {"MFC_RdTagStat", "MFC_RdAtomicStat", "MFC_RdTagMask",
+                      "24", "27", "12"}
 
 def _chan(token: str) -> str:
     """Channel operand -> a C expression (macro name or numeric id)."""
@@ -923,14 +970,18 @@ class SPULifter:
 
         # ---- channel ops ----
         if mn == "rdch":
-            return f"{g(rt())} = spu_rdch(ctx, {_chan(ops[1])});"
+            ch = _chan(ops[1])
+            fn = "spu_rdch_latch" if ch in _LATCH_RD_CHANNELS else "spu_rdch"
+            return f"{g(rt())} = {fn}(ctx, {ch});"
         if mn == "rchcnt":
             # CBEA: the count lands in the PREFERRED word, remaining slots ZERO
             # (splatting it is the spu_link bug class; RPCS3 = v128::from32r).
             return f"{g(rt())} = spu_pref_u32(spu_rchcnt(ctx, {_chan(ops[1])}));"
         if mn == "wrch":
             # operands: channel, $rt
-            return f"spu_wrch(ctx, {_chan(ops[0])}, {g(_reg(ops[1]))});"
+            ch = _chan(ops[0])
+            fn = "spu_wrch_latch" if ch in _LATCH_CHANNELS else "spu_wrch"
+            return f"{fn}(ctx, {ch}, {g(_reg(ops[1]))});"
 
         # ---- branches ----
         if mn in ("br", "bra"):
