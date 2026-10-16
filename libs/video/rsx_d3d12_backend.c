@@ -8672,13 +8672,21 @@ static void read_vp_vertex_c(const rsx_state* state, u32 vi, VPSlot* out16)
     memcpy(out16, s_vc_v[h], VP_VERT_STRIDE);
 }
 
-/* VP_FETCH_THREADS=<n> (read once; default a quarter of the logical CPUs, at
- * most 4; 0 = off): convert the vertices of indexed strip uploads on worker
- * threads. The FIFO thread only walks the indices, numbers the draw's
- * vertices and queues them (vpj_queue); the workers fetch and convert them
- * straight into vp_vb. In a Demon's Souls level frame the conversion was
- * about a third of the FIFO thread, and HighGraphics waits on that thread's
- * labels before each flip.
+/* VP_FETCH_THREADS=<n> (read once; default 1; 0 = off): convert the vertices
+ * of indexed strip uploads on worker threads. The FIFO thread only walks the
+ * indices, numbers the draw's vertices and queues them (vpj_queue); the
+ * workers fetch and convert them straight into vp_vb. In a Demon's Souls level
+ * frame the conversion was about a third of the FIFO thread, and HighGraphics
+ * waits on that thread's labels before each flip.
+ *
+ * One worker, whatever the machine: the conversion only has to overlap the
+ * FIFO walk, and one keeps up. More cost the frame instead -- Palace, 60 fps
+ * mode with VBLANK_MHZ=120000: 1 worker 63-64 fps, 2 about 61, 4 (the old
+ * default of a quarter of the logical CPUs) 57-59, with each of the four at
+ * ~55% of a core, half of it in the kernel going to sleep and waking. Waking
+ * one worker per publish instead of all of them did not change that. The
+ * threads the frame waits on (HighGraphics, the image-2 SPU thread, the FIFO
+ * walker) run slower beside them. 0 workers: ~46 fps at a 60 cap.
  *
  * A queued vertex is read from guest memory later than the FIFO reached the
  * draw, so everything the title can observe of the RSX's progress waits for
@@ -8781,11 +8789,7 @@ static int vpj_threads(void)
 {
     static int n = -1;
     if (n >= 0) return n;
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    int def = (int)si.dwNumberOfProcessors / 4;
-    if (def > 4) def = 4;
-    if (def < 1) def = 1;
-    n = ps3_env_int("VP_FETCH_THREADS", def);
+    n = ps3_env_int("VP_FETCH_THREADS", 1);
     if (n > 16) n = 16;
     if (n > 0) {
         s_vpj = (VPJob*)malloc(sizeof(VPJob) * VPJ_JOBS);
