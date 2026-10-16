@@ -854,7 +854,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           if (s_si >= 0 && ctx->image_id == s_si) {
               LARGE_INTEGER q0, q, f; QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&f);
               const long long end = q0.QuadPart + (long long)((unsigned long long)s_sns * (unsigned long long)f.QuadPart / 1000000000ull);
-              do { _mm_pause(); QueryPerformanceCounter(&q); } while (q.QuadPart < end);
+              do { YieldProcessor(); QueryPerformanceCounter(&q); } while (q.QuadPart < end);
           } }
         const int ll_fast = spu_getllar_read(ctx, ea, ls, mem);
         ctx->dbg_getllar++;
