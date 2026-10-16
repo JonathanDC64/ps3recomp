@@ -317,6 +317,14 @@ jobs:
                 -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
           /tmp/test_spu_coherency
 
+      # The host inflate that replaces an SPU title's lifted zlib: its output
+      # has to be zlib's byte for byte, and a bad stream has to fail cleanly.
+      - name: Run the raw inflate tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -I include -I runtime/spu \
+                -o /tmp/test_spu_inflate runtime/spu/tests/test_spu_inflate.c
+          /tmp/test_spu_inflate
+
       # The other writer: an SPU. Five SPURS kernels share one management line,
       # so a commit that does not break its peers' reservations lets two of them
       # win the same compare-and-swap, and the queue is quietly wrong afterwards.
