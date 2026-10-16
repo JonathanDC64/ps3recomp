@@ -18,6 +18,12 @@
 
 #include <time.h>
 #include "ps3emu/ps3_knob.h"
+
+/* Debug gates on the per-draw and per-texture-bind paths. A getenv on each
+ * call was ~3% of the FIFO thread in a heavy view (~200k lookups a second). */
+static int knob_vtx_dump(void)   { static int v = -1; PS3_KNOB(v, getenv("VTX_DUMP") ? 1 : 0); return v; }
+static int dbg_movie_bind(void) { static int v = -1; PS3_KNOB(v, getenv("MOVIE_BIND") ? 1 : 0); return v; }
+static int dbg_texfmt(void)     { static int v = -1; PS3_KNOB(v, getenv("TEXFMTDBG") ? 1 : 0); return v; }
 #include "rsx_d3d12_backend.h"
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
@@ -8907,7 +8913,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
         /* quad -> two triangles (perimeter winding) */
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 4) {
+        if (knob_vtx_dump()) { static int _n=0; if (_n++ < 4) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) { for (u32 k = 0; k < 4; k++)
                 fprintf(f, "q%02d v%u a0=(%.3f,%.3f,%.3f,%.3f) a8=(%.3f,%.3f)\n", _n, k,
@@ -8950,7 +8956,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
           fprintf(stderr, "[IDXDBG] tris first=%u count=%u a0off=0x%X stride=%u%c",
                   first, count, state->vertex_attribs[0].offset,
                   state->vertex_attribs[0].stride, 10); } }
-    if (getenv("VTX_DUMP") && state->surface_color_offset[0] == 0xCC0000) {
+    if (knob_vtx_dump() && state->surface_color_offset[0] == 0xCC0000) {
         static int _n=0; if (_n++ < 1) {
         FILE* f = fopen("vtx_dump.txt", "w");
         if (f) { fprintf(f, "G-buffer draw surf0=0x%X count=%u first=%u\n",
@@ -9040,7 +9046,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
             read_vp_vertex_c(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
-        if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 6) {
+        if (knob_vtx_dump()) { static int _n=0; if (_n++ < 6) {
             FILE* f = fopen("vtx_dump.txt", _n==1 ? "w" : "a");
             if (f) {
                 const float* vs_ = state->viewport_scale;
@@ -9858,7 +9864,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
      * resolved EA + a content probe -- used to diagnose the Bink frame-buffer
      * ring mismatch (the draw binds a cleared buffer 0x4D80 before the one the
      * decoder actually fills). */
-    if (getenv("MOVIE_BIND") &&
+    if (dbg_movie_bind() &&
         ((width == 640 && height == 360) || (width == 320 && height == 180))) {
         extern u32 cellGcmResolveLocated(int local, u32 offset);
         static int _mv = 0; if (_mv++ < 24) {
@@ -9916,7 +9922,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     /* TEXFMTDBG=1 (live): one line per new unit/format/width, including the
      * formats the VP path below does not take -- those units end up sampling
      * nothing, so they are the ones worth seeing. */
-    if (getenv("TEXFMTDBG")) { static u32 seen[256]; static int ns=0;
+    if (dbg_texfmt()) { static u32 seen[256]; static int ns=0;
         u32 k = (unit<<24) | (((tex->format>>8) & 0xFFu)<<16) | (width & 0xFFFFu);
         int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
         if (!f && ns < 256) { seen[ns++]=k;
