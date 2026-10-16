@@ -574,6 +574,11 @@ static void pad_trace(int which, u32 port)
  * through its boot menus with it. NULL by default. */
 unsigned (*g_pad_title_hook)(void) = NULL;
 
+/* Port 0 as the guest last saw it, for a frame log in the title's port code:
+ * the reads, how many came back empty (len = 0), and the last packet's buttons
+ * ((DIGITAL2 << 8) | DIGITAL1) and left stick ((lx << 8) | ly). */
+volatile unsigned g_pad0_reads, g_pad0_empty_reads, g_pad0_buttons, g_pad0_lstick;
+
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     pad_trace(0, port_no);
@@ -920,6 +925,16 @@ emit:
         if (!always && port_no < PAD_MAX_HOST_PORTS && data->len) {
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;
+        }
+    }
+    if (port_no == 0) {
+        g_pad0_reads++;
+        if (!data->len) g_pad0_empty_reads++;
+        else {
+            g_pad0_buttons = (unsigned)(data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] & 0xFF) << 8 |
+                             (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF);
+            g_pad0_lstick  = (unsigned)(data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X] & 0xFF) << 8 |
+                             (data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y] & 0xFF);
         }
     }
     {
