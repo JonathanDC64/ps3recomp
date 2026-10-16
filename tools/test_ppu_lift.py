@@ -796,7 +796,26 @@ def check_barrier_lowering():
             print(f"FAIL barrier preamble: header preamble is missing {want!r}")
             fails += 1
 
-    n = len(BARRIERS) + len(wanted)
+    # A load-reserve publishes its reservation, then fences, then loads. The
+    # code that breaks a reservation stores the line and then reads every
+    # reservation, so with the load first (or no StoreLoad fence between) both
+    # sides can miss each other on x86 and a stwcx. succeeds against a line
+    # another agent already changed: a lost SPURS queue wakeup in Demon's Souls.
+    reserves = [(31 << 26) | (3 << 21) | (0 << 16) | (4 << 11) | (xo << 1)
+                for xo in (20, 84)]   # lwarx r3,0,r4 / ldarx r3,0,r4
+    for word in reserves:
+        insn = ppu_disasm.decode(word, 0x30000)
+        code = lifter._translate(insn, dummy)
+        marks = [code.find(s) for s in ("ctx->reserve_addr =", "PPU_FENCE(seq_cst)",
+                                        "vm_read")]
+        if -1 in marks or marks != sorted(marks):
+            print(f"FAIL reservation order {insn.mnemonic}: lifted to {code!r}, want "
+                  f"the reserve_addr store, then PPU_FENCE(seq_cst), then the load")
+            fails += 1
+            continue
+        print(f"[barriers] ok {insn.mnemonic}: reservation published before the load")
+
+    n = len(BARRIERS) + len(wanted) + len(reserves)
     print(f"[barriers] {n - fails} checks passed, {fails} FAILED")
     return fails == 0
 

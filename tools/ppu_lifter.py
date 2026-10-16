@@ -2166,12 +2166,25 @@ class PPULifter:
         # (lwarx rD,0,rB; ...; stwcx. rS,0,rB) reuses r0 as scratch between the
         # lwarx and stwcx; emitting ctx->gpr[0] makes the two EAs diverge so the
         # reservation never matches and the loop spins forever.
+        #
+        # The reservation is published BEFORE the load, with a full fence between
+        # them. Another agent's commit (a PPU stwcx, an SPU PUTLLC) breaks a
+        # reservation by storing its line and then reading every reserve_addr;
+        # this side stores reserve_addr and then reads the line. That is a
+        # store-then-load handshake on both sides, and without StoreLoad ordering
+        # here x86 lets each side miss the other's store: the commit sees no
+        # reservation to break, this thread reads the line from before the
+        # commit, and its stwcx succeeds against a stale view. Demon's Souls
+        # lost an SPURS queue wakeup that way (libsre's queue pop: lwarx the pop
+        # count, read the push count, stwcx "waiting" while an SPU push landed).
+        # Real hardware takes the reservation and the load as one operation, so
+        # the guest's own barriers cannot be relied on to cover this.
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; PPU_FENCE(seq_cst); "
+                    f"ctx->gpr[{rd}] = vm_read32(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2190,8 +2203,8 @@ class PPULifter:
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
             return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+                    f"ctx->reserve_addr = (uint32_t)ea; PPU_FENCE(seq_cst); "   # see lwarx
+                    f"ctx->gpr[{rd}] = vm_read64(ea); ctx->reserve_value = ctx->gpr[{rd}]; }}")
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
