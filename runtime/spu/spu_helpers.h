@@ -257,8 +257,48 @@ static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i
 static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
 static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
 static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+#if defined(__SSE4_1__)
+/* Whole-quadword byte shifts and rotates as one pshufb. Host byte j holds SPU
+ * byte j^3 (SPU_W), so result host byte j takes source host byte
+ * (((j^3) + sh) ^ 3) for a left shift/rotate and (((j^3) - sh) ^ 3) for a
+ * right shift; an index with its top bit set makes pshufb write 0. As byte
+ * loops these were ~70 instructions through the stack each, and rotqby (the
+ * second half of every unaligned scalar load) is one of the commonest SPU
+ * ops. tests/test_spu_helpers.c checks them against the loops. */
+static inline __m128i spu_qb_jx3(void) { return _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12); }
+static inline u128 spu_qb_shuf(u128 a, __m128i idx)
+{
+    __m128i A; memcpy(&A, &a, 16);
+    const __m128i r = _mm_shuffle_epi8(A, idx);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+/* sh 0..15 */
+static inline u128 spu_qb_rot(u128 a, int sh)
+{
+    const __m128i t = _mm_and_si128(_mm_add_epi8(spu_qb_jx3(), _mm_set1_epi8((char)sh)), _mm_set1_epi8(0x0F));
+    return spu_qb_shuf(a, _mm_xor_si128(t, _mm_set1_epi8(3)));
+}
+/* sh 0..31, 16 and up give 0 */
+static inline u128 spu_qb_shl(u128 a, int sh)
+{
+    const __m128i t = _mm_add_epi8(spu_qb_jx3(), _mm_set1_epi8((char)sh));
+    const __m128i over = _mm_and_si128(_mm_cmpgt_epi8(t, _mm_set1_epi8(15)), _mm_set1_epi8((char)0x80));
+    return spu_qb_shuf(a, _mm_or_si128(_mm_xor_si128(t, _mm_set1_epi8(3)), over));
+}
+/* sh 0..31, 16 and up give 0: a negative index keeps its top bit through ^3 */
+static inline u128 spu_qb_shr(u128 a, int sh)
+{
+    const __m128i t = _mm_sub_epi8(spu_qb_jx3(), _mm_set1_epi8((char)sh));
+    return spu_qb_shuf(a, _mm_xor_si128(t, _mm_set1_epi8(3)));
+}
+#endif
+#if defined(__SSE4_1__)
+static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_qb_shl(a, sh & 0x1F); }
+static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_qb_rot(a, sh & 0x0F); }
+#else
 static inline u128 spu_shlqbyi(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 static inline u128 spu_rotqbyi(u128 a, int sh) { u128 r; sh&=0x0F; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+#endif
 /* Bit-level quadword shifts/rotates operate on the WHOLE 128-bit big-endian
  * value. Our _u64[0]/_u64[1] are word-SCRAMBLED (host-LE: _u64[0] = word0 |
  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
@@ -362,10 +402,17 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#if defined(__SSE4_1__)
+static inline u128 spu_shlqby(u128 a, u128 b)  { return spu_qb_shl(a, b._u32[0] & 0x1F); }
+static inline u128 spu_rotqby(u128 a, u128 b)  { return spu_qb_rot(a, b._u32[0] & 0x0F); }
+static inline u128 spu_shlqbybi(u128 a, u128 b){ return spu_qb_shl(a, (b._u32[0] >> 3) & 0x1F); }
+static inline u128 spu_rotqbybi(u128 a, u128 b){ return spu_qb_rot(a, (b._u32[0] >> 3) & 0x0F); }
+#else
 static inline u128 spu_shlqby(u128 a, u128 b){ int sh=b._u32[0]&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 static inline u128 spu_rotqby(u128 a, u128 b){ int sh=b._u32[0]&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
 static inline u128 spu_shlqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i+sh; if(s<16) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 static inline u128 spu_rotqbybi(u128 a, u128 b){ int sh=(b._u32[0]>>3)&0x0F; u128 r; for(int i=0;i<16;i++) r._u8[SPU_W(i)]=a._u8[SPU_W((i+sh)&0x0F)]; return r; }
+#endif
 
 /* ---- Phase 2: rotmahi ---- */
 static inline u128 spu_rotmahi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._s16[i]=(sh>15)?(a._s16[i]>>15):(a._s16[i]>>sh); return r; }
@@ -559,6 +606,36 @@ static inline u128 spu_fsmbi(int32_t imm) {
  * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
  * the right host index. Verified to compose correctly with the fixed shufb for
  * both cbd-generated and immediate/LS-constant controls. */
+#if defined(__SSE4_1__)
+/* The same controls without the narrow store into a just-built vector (which
+ * stalls store forwarding on the read back). In host layout the inserted part
+ * is one whole lane: cwd's word is _u32[p/4] = 0x00010203, cdd's dword is
+ * _u64[p/8] = 0x0405060700010203, chd's halfword is _u16[(p>>1)^1] = 0x0203 and
+ * cbd's byte is host byte p^3 = 0x03. Each is a compare against the lane index
+ * and a blend into the base pattern (host byte j = 0x10 + (j^3)). */
+static inline __m128i spu_c_base(void) { return _mm_setr_epi8(0x13,0x12,0x11,0x10, 0x17,0x16,0x15,0x14, 0x1B,0x1A,0x19,0x18, 0x1F,0x1E,0x1D,0x1C); }
+static inline u128 spu_c_blend(__m128i ins, __m128i sel)
+{
+    const __m128i r = _mm_blendv_epi8(spu_c_base(), ins, sel);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+static inline u128 spu_cbd_pos(int pos) {
+    const __m128i sel = _mm_cmpeq_epi8(_mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15), _mm_set1_epi8((char)((pos & 0xF) ^ 3)));
+    return spu_c_blend(_mm_set1_epi8(0x03), sel);
+}
+static inline u128 spu_chd_pos(int pos) {
+    const __m128i sel = _mm_cmpeq_epi16(_mm_setr_epi16(0,1,2,3,4,5,6,7), _mm_set1_epi16((short)(((pos & 0xF) >> 1) ^ 1)));
+    return spu_c_blend(_mm_set1_epi16(0x0203), sel);
+}
+static inline u128 spu_cwd_pos(int pos) {
+    const __m128i sel = _mm_cmpeq_epi32(_mm_setr_epi32(0,1,2,3), _mm_set1_epi32((pos & 0xF) >> 2));
+    return spu_c_blend(_mm_set1_epi32(0x00010203), sel);
+}
+static inline u128 spu_cdd_pos(int pos) {
+    const __m128i sel = _mm_cmpeq_epi64(_mm_set_epi64x(1, 0), _mm_set1_epi64x((pos & 0xF) >> 3));
+    return spu_c_blend(_mm_set1_epi64x(0x0405060700010203LL), sel);
+}
+#else
 static inline u128 spu_cbd_pos(int pos) {
     u128 r; for(int t=0;t<16;t++) r._u8[SPU_W(t)] = (uint8_t)(0x10 + t);
     r._u8[SPU_W(pos & 0xF)] = 0x03;                 /* a's preferred byte = SPU byte 3 */
@@ -583,6 +660,7 @@ static inline u128 spu_cdd_pos(int pos) {
     for(int k=0;k<8;k++) r._u8[SPU_W(p+k)] = (uint8_t)k;   /* a SPU bytes 0..7 (preferred dword) */
     return r;
 }
+#endif
 static inline u128 spu_cbd(u128 a, int i7){ return spu_cbd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_chd(u128 a, int i7){ return spu_chd_pos((int)a._u32[0]+i7); }
 static inline u128 spu_cwd(u128 a, int i7){ return spu_cwd_pos((int)a._u32[0]+i7); }
@@ -602,13 +680,22 @@ static inline u128 spu_rotqmbi(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; 
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#if defined(__SSE4_1__)
+static inline u128 spu_rotqmby(u128 a, u128 b)   { return spu_qb_shr(a, (0-(int)b._u32[0])&0x1F); }
+static inline u128 spu_rotqmbybi(u128 a, u128 b) { return spu_qb_shr(a, (0-((int)b._u32[0]>>3))&0x1F); }
+#else
 static inline u128 spu_rotqmby(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
 static inline u128 spu_rotqmbybi(u128 a, u128 b) { int sh=(0-((int)b._u32[0]>>3))&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+#endif
 static inline u128 spu_rotqmbii(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) return a;
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
+#if defined(__SSE4_1__)
+static inline u128 spu_rotqmbyi(u128 a, int i7)  { return spu_qb_shr(a, (0-i7)&0x1F); }
+#else
 static inline u128 spu_rotqmbyi(u128 a, int i7)  { int sh=(0-i7)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+#endif
 
 /* ---- Phase 3: halfword/byte immediate logic ---- */
 static inline u128 spu_andhi(u128 a, int32_t imm) { u128 r; uint16_t v=(uint16_t)imm; for(int i=0;i<8;i++) r._u16[i]=a._u16[i]&v; return r; }
