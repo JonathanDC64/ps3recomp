@@ -542,7 +542,18 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
+/* The LS accessors are forced inline. A --regions body is one C function for
+ * a whole stretch of SPU code, and in the biggest ones clang stopped inlining
+ * them: Demon's Souls' image 2 hot region made 128 real calls to
+ * spu_ls_read128 (the quadword returned through the stack) and 51 to
+ * spu_ls_write128. The probes they guard stay out of line and cold. */
+#if defined(_MSC_VER)
+#  define SPU_LS_INLINE static __forceinline
+#else
+#  define SPU_LS_INLINE static inline __attribute__((always_inline))
+#endif
+
+SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
     if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
@@ -621,7 +632,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
+SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
@@ -813,6 +824,21 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* Drain a translated call up to its explicit architectural return PC. */
 void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+
+/* The end of a lifted call bracket (brsl/bisl): drain, host_depth--, then
+ * spu_img_restore. Most callees return straight to the link address with
+ * nothing queued on the trampoline, and spu_drain_call then only clears
+ * drain_ret_pc, so that case stays inline here. The depth guard sits on the
+ * drain path, which any lifted-call recursion goes through. */
+static inline void spu_call_done(spu_context* ctx, uint32_t return_pc, int32_t saved_img)
+{
+    if (g_spu_trampoline_fn || ((ctx->pc ^ return_pc) & SPU_LS_MASK))
+        spu_drain_call(ctx, return_pc);
+    else
+        ctx->drain_ret_pc = 0;
+    ctx->host_depth--;
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
+}
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
