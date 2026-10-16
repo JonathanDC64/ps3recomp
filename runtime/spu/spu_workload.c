@@ -409,10 +409,17 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
 #define TS_TRACK 32
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
 static volatile LONG s_ts_lock;
+/* The lines s_ts_run holds, as a 256-way filter on the line address (set,
+ * never cleared, like the entries): spu_taskset_line_written runs for every
+ * committed SPU lock-line and looks in s_ts_run only on a hit. */
+static volatile uint8_t s_ts_lines[256];
 static uint8_t* ts_running(uint32_t taskset_ea)
 {
     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
-    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
+    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) {
+        s_ts_lines[(taskset_ea >> 7) & 255u] = 1;   /* before the entry: see above */
+        s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running;
+    }
     return NULL;
 }
 static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
@@ -624,6 +631,7 @@ void spu_taskset_created(uint32_t taskset_ea)
 static void spu_taskset_line_written(uint32_t line_ea)
 {
     extern uint8_t* vm_base;
+    if (!s_ts_lines[(line_ea >> 7) & 255u]) return;
     int known = 0;
     for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == line_ea) { known = 1; break; }
     if (!known || !vm_base) return;
@@ -1518,6 +1526,9 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 void spu_taskset_line_committed(uint32_t line)
 {
     spu_taskset_line_written(line);
+    /* Every committed SPU lock-line comes here; the parked list matters only
+     * for a line g_spu_parked_lines counts. */
+    if (!g_spu_parked_lines[(line >> 7) & 255u]) return;
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
