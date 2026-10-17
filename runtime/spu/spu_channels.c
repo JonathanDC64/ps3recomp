@@ -538,6 +538,9 @@ extern uint8_t* vm_base;
 /* Total PUTLLC attempts (all SPUs). The PM flow trace (spurs_policy.c) reads
  * the delta across one policy run to find the run that performed a claim. */
 volatile unsigned g_spu_putllc_count = 0;
+/* No-op PUTLLCs failed because the line changed while the reservation was still
+ * held (a raw store into guest memory; see spu_atomic_lean). */
+volatile unsigned long long g_spu_putllc_stale = 0;
 /* PUTLLCs that hit the WATCHED sync line (g_barrier_sync_watch) -- isolates the
  * work-run on the stalled job queue from the dozen idle jobmanager instances. */
 volatile unsigned g_spu_putllc_sync_hit = 0;
@@ -1315,21 +1318,31 @@ static int spu_atomic_lean(spu_context* ctx, uint32_t cmd)
     if (!s_same || !ctx->resv_valid || ctx->resv_ea != ea ||
         memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) != 0)
         return 0;
-    /* Decide from the reservation alone. Every store into a reserved line
-     * (lifted PPU stores, vm_write*, stwcx./stdcx., SPU DMA PUTs and PUTLLCs)
-     * clears resv_valid under the line's stripe (spu_coh_notify_write), so a
-     * reservation still held means no store has finished since the GETLLAR;
-     * one in flight is ordered after this PUTLLC, which writes nothing. The
-     * exchange races only that clear. The comparison below reads the writer's
-     * stripe word and the line itself, which in Demon's Souls the HighGraphics
-     * ring producer has usually just written: 60.35 -> 64.32 fps. A raw
-     * memcpy into guest memory does not clear reservations (see
-     * spu_resv_lost_poll); SPU_PUTLLC_RESV=0 (live) compares the bytes as
-     * before. */
+    /* Decide from the reservation, then the bytes. Stores through vm_write*,
+     * stwcx./stdcx., SPU DMA PUTs and PUTLLCs clear resv_valid under the
+     * line's stripe (spu_coh_notify_write), and the exchange catches those.
+     * The lifted PPU's vector and cache-line stores (stvx, stvewx, stvlx,
+     * stvrx, dcbz) are a raw memcpy into guest memory and clear nothing, so
+     * the line is compared with the snapshot as well: one landed since the
+     * GETLLAR fails the PUTLLC, as it did before; one still in flight is
+     * ordered after this PUTLLC, which writes nothing. Deciding from the
+     * reservation alone let such a store through: the consumer took the
+     * line as unchanged and never saw the entry, and in Demon's Souls the
+     * HighGraphics ring's producer then waited on its reply forever (a
+     * frozen picture with the music playing on). The stripe word and its
+     * fences, which the long way below reads, stay skipped.
+     * SPU_PUTLLC_RESV=0 (live) takes the long way. */
     { static int s_resv = -1;
       PS3_KNOB(s_resv, ps3_env_int("SPU_PUTLLC_RESV", 1));
       if (s_resv) {
           if (!__atomic_exchange_n(&ctx->resv_valid, 0, __ATOMIC_SEQ_CST)) return 0;
+          if (memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) != 0) {
+              const unsigned long long n = ++g_spu_putllc_stale;
+              if (n <= 8 || (n & (n - 1)) == 0)
+                  fprintf(stderr, "[putllc] line 0x%08X img=%d changed under a held reservation "
+                          "(a store that clears none); PUTLLC fails (%llu so far)%c", ea, ctx->image_id, n, 10);
+              return 0;
+          }
           ctx->atomic_stat = 0;
           g_spu_putllc_count++;
           t_llu_n++; t_llu_same++;
