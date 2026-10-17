@@ -1309,6 +1309,28 @@ static int spu_atomic_lean(spu_context* ctx, uint32_t cmd)
     if (!s_same || !ctx->resv_valid || ctx->resv_ea != ea ||
         memcmp(ls, ctx->resv_line, MFC_ATOMIC_LINE) != 0)
         return 0;
+    /* Decide from the reservation alone. Every store into a reserved line
+     * (lifted PPU stores, vm_write*, stwcx./stdcx., SPU DMA PUTs and PUTLLCs)
+     * clears resv_valid under the line's stripe (spu_coh_notify_write), so a
+     * reservation still held means no store has finished since the GETLLAR;
+     * one in flight is ordered after this PUTLLC, which writes nothing. The
+     * exchange races only that clear. The comparison below reads the writer's
+     * stripe word and the line itself, which in Demon's Souls the HighGraphics
+     * ring producer has usually just written: 60.35 -> 64.32 fps. A raw
+     * memcpy into guest memory does not clear reservations (see
+     * spu_resv_lost_poll); SPU_PUTLLC_RESV=0 (live) compares the bytes as
+     * before. */
+    { static int s_resv = -1;
+      PS3_KNOB(s_resv, ps3_env_int("SPU_PUTLLC_RESV", 1));
+      if (s_resv) {
+          if (!__atomic_exchange_n(&ctx->resv_valid, 0, __ATOMIC_SEQ_CST)) return 0;
+          ctx->atomic_stat = 0;
+          g_spu_putllc_count++;
+          t_llu_n++; t_llu_same++;
+          spu_taskset_line_committed(ea & ~127u);
+          if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+          return 1;
+      } }
     long seq; int same = 0;
     if (s_psq && spu_lockline_read_begin(ea & ~127u, &seq) &&
         memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
