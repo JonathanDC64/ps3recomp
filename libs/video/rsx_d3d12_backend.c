@@ -11785,10 +11785,11 @@ int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_s
                           int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+    extern int rsx_vp_decompile_fetch(const uint8_t*, u32, char*, u32);
     extern u32 rsx_vp_program_size_instrs(const u8*, u32);
     extern void rsx_vp_set_branch_base(u32);
     if (!ucode || !out || cap < 2) return 0;
-    if (fragment) {
+    if (fragment == 1) {
         /* The decompiler may read up to RSX_FP_MAX_BYTES, as it does from
          * guest memory; give it a zero tail. */
         u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
@@ -11799,7 +11800,7 @@ int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_s
         return n;
     }
     /* The binary holds big-endian words; rsx_state keeps the words
-     * SET_TRANSFORM_PROGRAM delivered, little-endian. Then as vp_get_vs:
+     * SET_TRANSFORM_PROGRAM delivered, little-endian. Then as vp_get_vs_mode:
      * trimmed to the END instruction, branch targets made relative to the
      * slot the program is loaded at. */
     u32 vlen = ucode_len & ~3u;
@@ -11811,7 +11812,8 @@ int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_s
     { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
       if (instrs) vlen = instrs * 16u; }
     rsx_vp_set_branch_base(vp_start_slot);
-    const int n = rsx_vp_decompile(w, vlen, out, cap);
+    const int n = fragment == 2 ? rsx_vp_decompile_fetch(w, vlen, out, cap)
+                                : rsx_vp_decompile(w, vlen, out, cap);
     rsx_vp_set_branch_base(0);
     free(w);
     return n;

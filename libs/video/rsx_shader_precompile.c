@@ -139,7 +139,7 @@ static void queue(const char* name, int fragment, const uint8_t* uc, uint32_t us
         s_jobs = j2;
         s_jobcap = cap;
     }
-    s_jobs[s_njobs].fragment = fragment;
+    s_jobs[s_njobs].fragment = fragment == 1;
     s_jobs[s_njobs].hlsl = hlsl;
     s_jobs[s_njobs].name = name;
     s_njobs++;
@@ -162,7 +162,11 @@ static void add_program(const Program* p)
     }
     const uint8_t* uc = b + uoff;
     if (!fragment) {   /* CgBinaryVertexProgram.instructionSlot: where it is loaded */
+        /* Both forms: most draws fetch their own vertices (the GPU fetch
+         * path), and a vertex shader compiled at draw time stalls the RSX
+         * thread, and the game waiting on it, for as long as FXC takes. */
         queue(p->name, 0, uc, usz, be32(b + prog + 4), 0, 0, 0);
+        queue(p->name, 2, uc, usz, be32(b + prog + 4), 0, 0, 0);
         return;
     }
     const uint32_t exp32 = b[prog + 19] ? 0 : 1;   /* CgBinaryFragmentProgram.outputFromH0 */

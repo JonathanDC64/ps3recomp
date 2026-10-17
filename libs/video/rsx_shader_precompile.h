@@ -10,6 +10,9 @@
  * program the title modifies before binding, or binds with other state than
  * assumed here, simply misses and is compiled at draw time as before.
  *
+ * A vertex program is built twice: as it is, and in fetch form (reading its
+ * vertex arrays itself), which the draws the GPU fetch path records use.
+ *
  * A fragment program's text also depends on what kind of texture each unit
  * it samples is bound to (cube, shadow = depth compare, d2c = depth read as
  * colour), which is draw state, not part of the binary. Each program is
