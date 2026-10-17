@@ -758,6 +758,14 @@ static HWND create_window(u32 width, u32 height, const char* title)
  * D3D12 initialization
  * -----------------------------------------------------------------------*/
 
+static void pso_lib_open(void);   /* pipeline library, defined with the shader cache */
+static u64 s_vp_root_hash;        /* vp_root_sig's serialized bytes, part of every pipeline's name */
+static u64 fnv_bytes(u64 h, const void* p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) { h ^= ((const u8*)p)[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
@@ -848,6 +856,8 @@ static int init_d3d12(u32 width, u32 height)
         }
         printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
     }
+
+    pso_lib_open();
 
     /* Create command queue */
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
@@ -1431,6 +1441,8 @@ static int init_d3d12(u32 width, u32 height)
             s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
                 sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
                 &IID_ID3D12RootSignature, (void**)&s_d3d.vp_root_sig);
+            s_vp_root_hash = fnv_bytes(14695981039346656037ull, sig->lpVtbl->GetBufferPointer(sig),
+                                       sig->lpVtbl->GetBufferSize(sig));
             sig->lpVtbl->Release(sig);
         } else if (err) { printf("[D3D12] VP root sig: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); }
 
@@ -2193,6 +2205,385 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
             FILE* f = fopen(hp, "wb");
             if (f) { fwrite(src, 1, n, f); fclose(f); }
         }
+    }
+    return hr;
+}
+
+/* Driver pipelines on disk. The .dxbc cache above saves FXC, but every new
+ * PSO still has the driver compile DXBC to GPU code: 0.1 ms when the driver's
+ * own cache has it, 7-20 ms when it does not, and a new area asks for a dozen
+ * in one frame (PERF=1 "pipelines created"). The driver's cache belongs to the
+ * executable, so a rebuilt exe starts cold. Ours, in the shader cache dir:
+ *
+ *   pso_library.bin  an ID3D12PipelineLibrary: the compiled pipelines, named by
+ *                    a hash of the whole description. Only good for the driver
+ *                    and GPU that wrote it; another one fails to load.
+ *   pso_library.n    how many manifest records the saved library holds.
+ *   pso_manifest.bin every pipeline ever created, as a description that can
+ *                    be rebuilt without the guest (fixed-size records).
+ *   pso_blobs/       the shader bytecode those records name, by content hash.
+ *
+ * At startup, worker threads build every manifest record the library does not
+ * hold yet (all of them after a driver update), before the title asks for
+ * them; a draw then only loads its pipeline from the library. A pipeline no
+ * session has met yet is still compiled on first use, once.
+ * PS3_PSO_LIBRARY=0 turns all of it off; PS3_PSO_PREBUILD=0 keeps the library
+ * but skips the startup build. */
+static ID3D12PipelineLibrary* s_pso_lib;
+static void*         s_pso_lib_blob;        /* the library reads from this while it lives */
+static SRWLOCK       s_pso_lib_lock = SRWLOCK_INIT;   /* Load/Store; the manifest */
+static volatile LONG s_pso_lib_new;         /* pipelines stored since the last save */
+static volatile LONG s_pso_lib_saving;
+static u32           s_pso_lib_quiet;       /* presents since the last store */
+static u32           s_pso_lib_hits, s_pso_lib_live;   /* draws: loaded / compiled */
+
+#define PSO_REC_MAGIC 0x314F5350u           /* "PSO1" */
+typedef struct {
+    u32 magic, size;
+    u64 name, vs_hash, ps_hash;
+    u32 vs_len, ps_len, nel, pad;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;   /* pointers zeroed */
+    struct { char sem[16]; D3D12_INPUT_ELEMENT_DESC e; } el[16];
+} pso_rec;
+static pso_rec*      s_pso_man;             /* records read at startup */
+static u32           s_pso_man_n;           /* records in the file (read + appended) */
+static u32           s_pso_man_read;
+static u64*          s_pso_names;           /* open-addressed set of record names */
+static u32           s_pso_names_cap, s_pso_names_n;
+static u32           s_pso_lib_have;        /* records the loaded library holds */
+static volatile LONG s_pso_pre_next, s_pso_pre_live, s_pso_pre_built, s_pso_pre_abort;
+static int           s_pso_pre_started;
+static double        s_pso_pre_t0;
+
+static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC c;
+    memcpy(&c, pd, sizeof c);
+    c.pRootSignature = NULL;
+    c.VS.pShaderBytecode = c.PS.pShaderBytecode = c.DS.pShaderBytecode = NULL;
+    c.HS.pShaderBytecode = c.GS.pShaderBytecode = NULL;
+    c.StreamOutput.pSODeclaration = NULL; c.StreamOutput.pBufferStrides = NULL;
+    c.InputLayout.pInputElementDescs = NULL; c.CachedPSO.pCachedBlob = NULL;
+    /* The root signature by its serialized bytes: every caller passes
+     * vp_root_sig. Callers zero the whole description first, so padding hashes
+     * the same every run. */
+    u64 h = fnv_bytes(14695981039346656037ull, &s_vp_root_hash, sizeof s_vp_root_hash);
+    h = fnv_bytes(h, &c, sizeof c);
+    const D3D12_SHADER_BYTECODE* sh[5] = { &pd->VS, &pd->PS, &pd->DS, &pd->HS, &pd->GS };
+    for (int i = 0; i < 5; i++)
+        if (sh[i]->pShaderBytecode) h = fnv_bytes(h, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
+    for (UINT i = 0; i < pd->InputLayout.NumElements; i++) {
+        D3D12_INPUT_ELEMENT_DESC e = pd->InputLayout.pInputElementDescs[i];
+        h = fnv_bytes(h, e.SemanticName, strlen(e.SemanticName));
+        e.SemanticName = NULL;
+        h = fnv_bytes(h, &e, sizeof e);
+    }
+    return h;
+}
+static void pso_path(char* out, size_t n, const char* leaf)
+{
+    snprintf(out, n, "%s\\%s", shader_cache_dir(), leaf);
+}
+/* Through a temporary name and a rename, so a crash or a second process never
+ * leaves a half-written file under the real name. */
+static int pso_write_file(const char* path, const void* p, size_t n)
+{
+    char tmp[MAX_PATH + 64];
+    snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)GetCurrentProcessId(),
+             (unsigned long)GetCurrentThreadId());
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return 0;
+    int ok = fwrite(p, 1, n, f) == n;
+    if (fclose(f)) ok = 0;
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileA(tmp); return 0; }
+    return 1;
+}
+static void* pso_read_file(const char* path, long* n)
+{
+    *n = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    void* p = sz > 0 ? malloc((size_t)sz) : NULL;
+    if (p && fread(p, 1, (size_t)sz, f) != (size_t)sz) { free(p); p = NULL; }
+    fclose(f);
+    if (p) *n = sz;
+    return p;
+}
+static int pso_names_has(u64 k)
+{
+    if (!s_pso_names_cap) return 0;
+    for (u32 i = (u32)k & (s_pso_names_cap - 1); s_pso_names[i]; i = (i + 1) & (s_pso_names_cap - 1))
+        if (s_pso_names[i] == k) return 1;
+    return 0;
+}
+static void pso_names_add(u64 k)
+{
+    if (!k || pso_names_has(k)) return;
+    if ((s_pso_names_n + 1) * 2 > s_pso_names_cap) {
+        const u32 cap = s_pso_names_cap ? s_pso_names_cap * 2 : 4096;
+        u64* old = s_pso_names; const u32 ocap = s_pso_names_cap;
+        u64* nw = (u64*)calloc(cap, sizeof(u64));
+        if (!nw) return;
+        s_pso_names = nw; s_pso_names_cap = cap;
+        for (u32 i = 0; i < ocap; i++)
+            if (old[i])
+                for (u32 j = (u32)old[i] & (cap - 1);; j = (j + 1) & (cap - 1))
+                    if (!nw[j]) { nw[j] = old[i]; break; }
+        free(old);
+    }
+    for (u32 i = (u32)k & (s_pso_names_cap - 1);; i = (i + 1) & (s_pso_names_cap - 1))
+        if (!s_pso_names[i]) { s_pso_names[i] = k; s_pso_names_n++; return; }
+}
+static void pso_lib_open(void)
+{
+    if (!ps3_env_int("PS3_PSO_LIBRARY", 1) || !shader_cache_dir()[0]) return;
+    ID3D12Device1* d1 = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device1, (void**)&d1)))
+        return;
+    char path[MAX_PATH + 32];
+    pso_path(path, sizeof path, "pso_library.bin");
+    long n = 0;
+    s_pso_lib_blob = pso_read_file(path, &n);
+    HRESULT hr = E_FAIL;
+    if (s_pso_lib_blob) {
+        hr = d1->lpVtbl->CreatePipelineLibrary(d1, s_pso_lib_blob, (SIZE_T)n,
+                 &IID_ID3D12PipelineLibrary, (void**)&s_pso_lib);
+        if (FAILED(hr)) {
+            printf("[D3D12] pipeline library: '%s' is from another driver or GPU (0x%08lX); rebuilding it\n",
+                   path, hr);
+            free(s_pso_lib_blob); s_pso_lib_blob = NULL;
+        }
+    }
+    if (!s_pso_lib && FAILED(d1->lpVtbl->CreatePipelineLibrary(d1, NULL, 0,
+                                 &IID_ID3D12PipelineLibrary, (void**)&s_pso_lib)))
+        s_pso_lib = NULL;
+    d1->lpVtbl->Release(d1);
+    if (!s_pso_lib) return;
+
+    /* The manifest: whole records only; a torn tail is cut off. */
+    char mp[MAX_PATH + 32];
+    pso_path(mp, sizeof mp, "pso_manifest.bin");
+    long mn = 0;
+    pso_rec* m = (pso_rec*)pso_read_file(mp, &mn);
+    u32 cnt = 0;
+    if (m) {
+        const u32 whole = (u32)(mn / (long)sizeof(pso_rec));
+        while (cnt < whole && m[cnt].magic == PSO_REC_MAGIC && m[cnt].size == sizeof(pso_rec)) cnt++;
+        if ((long)cnt * (long)sizeof(pso_rec) != mn) {
+            printf("[D3D12] pipeline manifest: keeping the first %u whole records\n", cnt);
+            pso_write_file(mp, m, (size_t)cnt * sizeof(pso_rec));
+        }
+        for (u32 i = 0; i < cnt; i++) pso_names_add(m[i].name);
+    }
+    s_pso_man = m; s_pso_man_n = s_pso_man_read = cnt;
+    if (SUCCEEDED(hr)) {
+        char np[MAX_PATH + 32];
+        pso_path(np, sizeof np, "pso_library.n");
+        FILE* f = fopen(np, "rb");
+        unsigned have = 0;
+        if (f) { if (fscanf(f, "%u", &have) != 1) have = 0; fclose(f); }
+        s_pso_lib_have = have < cnt ? have : cnt;
+    }
+    printf("[D3D12] pipeline library: %s (%ld KB), %u known pipelines, %u to build\n",
+           SUCCEEDED(hr) ? "loaded" : "new", n >> 10, cnt, cnt - s_pso_lib_have);
+}
+/* Serialize can fail when a pipeline is stored between sizing and writing;
+ * the next attempt sizes again. pso_library.n follows the library, so after a
+ * crash between the two it only undercounts, and the next startup rebuilds a
+ * few pipelines the library already had. */
+static void pso_lib_save(void)
+{
+    for (int tries = 0; tries < 3; tries++) {
+        const LONG pending = s_pso_lib_new;
+        AcquireSRWLockExclusive(&s_pso_lib_lock);
+        const u32 recs = s_pso_man_n;
+        ReleaseSRWLockExclusive(&s_pso_lib_lock);
+        const SIZE_T n = s_pso_lib->lpVtbl->GetSerializedSize(s_pso_lib);
+        void* buf = malloc(n ? n : 1);
+        if (buf && SUCCEEDED(s_pso_lib->lpVtbl->Serialize(s_pso_lib, buf, n))) {
+            char path[MAX_PATH + 32];
+            pso_path(path, sizeof path, "pso_library.bin");
+            const int ok = pso_write_file(path, buf, n);
+            free(buf);
+            if (ok) {
+                char np[MAX_PATH + 32], txt[16];
+                pso_path(np, sizeof np, "pso_library.n");
+                pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
+                InterlockedExchangeAdd(&s_pso_lib_new, -pending);
+                printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
+                       (unsigned long)(n >> 10), recs, s_pso_lib_hits, s_pso_lib_live);
+            }
+            return;
+        }
+        free(buf);
+    }
+}
+static DWORD WINAPI pso_lib_save_thread(LPVOID unused)
+{
+    (void)unused;
+    pso_lib_save();
+    InterlockedExchange(&s_pso_lib_saving, 0);
+    return 0;
+}
+/* Keep a pipeline's description and shaders so a later startup can build it. */
+static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+{
+    if (pd->DS.pShaderBytecode || pd->HS.pShaderBytecode || pd->GS.pShaderBytecode ||
+        !pd->VS.pShaderBytecode || !pd->PS.pShaderBytecode || pd->InputLayout.NumElements > 16 ||
+        pd->StreamOutput.NumEntries)
+        return;
+    pso_rec r;
+    memset(&r, 0, sizeof r);
+    r.magic = PSO_REC_MAGIC; r.size = sizeof r; r.name = name;
+    memcpy(&r.desc, pd, sizeof r.desc);
+    r.desc.pRootSignature = NULL;
+    r.desc.VS.pShaderBytecode = r.desc.PS.pShaderBytecode = NULL;
+    r.desc.InputLayout.pInputElementDescs = NULL;
+    r.desc.CachedPSO.pCachedBlob = NULL; r.desc.CachedPSO.CachedBlobSizeInBytes = 0;
+    r.nel = pd->InputLayout.NumElements;
+    for (u32 i = 0; i < r.nel; i++) {
+        r.el[i].e = pd->InputLayout.pInputElementDescs[i];
+        snprintf(r.el[i].sem, sizeof r.el[i].sem, "%s", r.el[i].e.SemanticName);
+        r.el[i].e.SemanticName = NULL;
+    }
+    const D3D12_SHADER_BYTECODE* sh[2] = { &pd->VS, &pd->PS };
+    u64* hs[2] = { &r.vs_hash, &r.ps_hash };
+    u32* ls[2] = { &r.vs_len, &r.ps_len };
+    char dir[MAX_PATH + 32];
+    pso_path(dir, sizeof dir, "pso_blobs");
+    CreateDirectoryA(dir, NULL);
+    for (int i = 0; i < 2; i++) {
+        *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
+        *ls[i] = (u32)sh[i]->BytecodeLength;
+        char bp[MAX_PATH + 64];
+        snprintf(bp, sizeof bp, "%s\\%016llx.dxbc", dir, (unsigned long long)*hs[i]);
+        if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES &&
+            !pso_write_file(bp, sh[i]->pShaderBytecode, sh[i]->BytecodeLength))
+            return;
+    }
+    char mp[MAX_PATH + 32];
+    pso_path(mp, sizeof mp, "pso_manifest.bin");
+    AcquireSRWLockExclusive(&s_pso_lib_lock);
+    if (!pso_names_has(name)) {
+        FILE* f = fopen(mp, "ab");
+        if (f) {
+            if (fwrite(&r, sizeof r, 1, f) == 1) { pso_names_add(name); s_pso_man_n++; }
+            fclose(f);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_pso_lib_lock);
+}
+/* One startup build: the record's shaders from pso_blobs, its description
+ * back together, and its name checked against the rebuilt description. */
+static int pso_prebuild_one(const pso_rec* r)
+{
+    char dir[MAX_PATH + 32];
+    pso_path(dir, sizeof dir, "pso_blobs");
+    void* blob[2] = { NULL, NULL }; long len[2] = { 0, 0 };
+    const u64 hs[2] = { r->vs_hash, r->ps_hash };
+    const u32 ls[2] = { r->vs_len, r->ps_len };
+    int ok = 0;
+    for (int i = 0; i < 2; i++) {
+        char bp[MAX_PATH + 64];
+        snprintf(bp, sizeof bp, "%s\\%016llx.dxbc", dir, (unsigned long long)hs[i]);
+        blob[i] = pso_read_file(bp, &len[i]);
+        if (!blob[i] || (u32)len[i] != ls[i] ||
+            fnv_bytes(14695981039346656037ull, blob[i], (size_t)len[i]) != hs[i])
+            goto out;
+    }
+    D3D12_INPUT_ELEMENT_DESC il[16];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    memcpy(&pd, &r->desc, sizeof pd);
+    pd.pRootSignature = s_d3d.vp_root_sig;
+    pd.VS.pShaderBytecode = blob[0]; pd.VS.BytecodeLength = (SIZE_T)len[0];
+    pd.PS.pShaderBytecode = blob[1]; pd.PS.BytecodeLength = (SIZE_T)len[1];
+    for (u32 i = 0; i < r->nel && i < 16; i++) { il[i] = r->el[i].e; il[i].SemanticName = r->el[i].sem; }
+    pd.InputLayout.pInputElementDescs = r->nel ? il : NULL;
+    if (pso_desc_key(&pd) != r->name) goto out;   /* another build's layout, or a stale root signature */
+    ID3D12PipelineState* pso = NULL;
+    if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+            s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
+        WCHAR name[20];
+        _snwprintf(name, 20, L"%016llx", (unsigned long long)r->name);
+        AcquireSRWLockExclusive(&s_pso_lib_lock);
+        if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso)))
+            InterlockedIncrement(&s_pso_lib_new);
+        ReleaseSRWLockExclusive(&s_pso_lib_lock);
+        pso->lpVtbl->Release(pso);
+        ok = 1;
+    }
+out:
+    free(blob[0]); free(blob[1]);
+    return ok;
+}
+static DWORD WINAPI pso_prebuild_thread(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) {
+        const u32 i = s_pso_lib_have + (u32)(InterlockedIncrement(&s_pso_pre_next) - 1);
+        if (i >= s_pso_man_read || s_pso_pre_abort) break;
+        if (pso_prebuild_one(&s_pso_man[i])) InterlockedIncrement(&s_pso_pre_built);
+    }
+    if (InterlockedDecrement(&s_pso_pre_live) == 0)
+        printf("[D3D12] pipeline prebuild: %ld of %u built in %.0f ms\n", s_pso_pre_built,
+               s_pso_man_read - s_pso_lib_have, 1000.0 * (perf_now() - s_pso_pre_t0));
+    return 0;
+}
+/* Once per present, on the render thread. Starts the startup build once the
+ * root signature exists, and saves in the background once that build is done
+ * and a burst of new pipelines has settled (120 presents with none, or 256
+ * pending). */
+static void pso_lib_tick(void)
+{
+    if (!s_pso_lib) return;
+    if (!s_pso_pre_started && s_d3d.vp_root_sig) {
+        s_pso_pre_started = 1;
+        if (s_pso_man_read > s_pso_lib_have && ps3_env_int("PS3_PSO_PREBUILD", 1)) {
+            SYSTEM_INFO si; GetSystemInfo(&si);
+            int nt = (int)si.dwNumberOfProcessors / 4;
+            if (nt < 1) nt = 1; if (nt > 4) nt = 4;
+            s_pso_pre_t0 = perf_now();
+            s_pso_pre_live = nt;
+            for (int t = 0; t < nt; t++) {
+                HANDLE h = CreateThread(NULL, 0, pso_prebuild_thread, NULL, 0, NULL);
+                if (h) CloseHandle(h); else InterlockedDecrement(&s_pso_pre_live);
+            }
+        }
+    }
+    if (!s_pso_lib_new || s_pso_lib_saving || s_pso_pre_live) return;
+    if (++s_pso_lib_quiet < 120 && s_pso_lib_new < 256) return;
+    if (InterlockedCompareExchange(&s_pso_lib_saving, 1, 0) == 0) {
+        HANDLE t = CreateThread(NULL, 0, pso_lib_save_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t); else InterlockedExchange(&s_pso_lib_saving, 0);
+    }
+}
+static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+                                 ID3D12PipelineState** out)
+{
+    *out = NULL;
+    if (!s_pso_lib)
+        return s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+            s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
+    const u64 key = pso_desc_key(pd);
+    WCHAR name[20];
+    _snwprintf(name, 20, L"%016llx", (unsigned long long)key);
+    AcquireSRWLockExclusive(&s_pso_lib_lock);
+    HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
+                     &IID_ID3D12PipelineState, (void**)out);
+    ReleaseSRWLockExclusive(&s_pso_lib_lock);
+    if (SUCCEEDED(hr)) { s_pso_lib_hits++; return S_OK; }
+    *out = NULL;
+    s_pso_lib_live++;
+    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
+    if (SUCCEEDED(hr)) {
+        AcquireSRWLockExclusive(&s_pso_lib_lock);
+        const HRESULT st = s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, *out);
+        ReleaseSRWLockExclusive(&s_pso_lib_lock);
+        if (SUCCEEDED(st)) { InterlockedIncrement(&s_pso_lib_new); s_pso_lib_quiet = 0; }
+        pso_manifest_add(key, pd);
     }
     return hr;
 }
@@ -3134,7 +3525,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
         il[_i].InstanceDataStepRate = 0;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;   /* zeroed whole: pso_desc_key hashes its bytes */
+    memset(&pd, 0, sizeof pd);
     pd.pRootSignature = s_d3d.vp_root_sig;
     pd.VS.pShaderBytecode = vsb->lpVtbl->GetBufferPointer(vsb);
     pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
@@ -3212,8 +3604,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     ID3D12PipelineState* pso = NULL;
     const double cp_t0 = perf_on() ? perf_now() : 0.0;
-    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-        s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+    hr = pso_create_cached(&pd, &pso);
     if (perf_on()) { s_perf_cpso += perf_now() - cp_t0; s_perf_cpso_n++; }
     pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
@@ -8129,6 +8520,7 @@ skip_dump_consider: ;
                                             tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
+      if (s_present_this_frame) pso_lib_tick();
       RSX_MARK("present", s_present_this_frame, 0); }
     RF_CP(9); rf_slow_report();
     if (s_present_this_frame) prof_record(s_rf_cp[9]);
@@ -10877,6 +11269,11 @@ void rsx_d3d12_backend_shutdown(void)
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
+    if (s_pso_lib) {
+        InterlockedExchange(&s_pso_pre_abort, 1);
+        while (s_pso_lib_saving || s_pso_pre_live) Sleep(1);
+        if (s_pso_lib_new) pso_lib_save();
+    }
 
     /* Release D3D12 resources */
     if (s_d3d.vertex_buffer) {
