@@ -71,6 +71,11 @@ int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
 
+/* Fetch variant: VSInput is SV_VertexID alone, and the shader reads and
+ * converts the guest's vertex arrays from a raw buffer at t20 using per-draw
+ * attribute records (cbuffer b2: their offset). See the preamble it emits. */
+int rsx_vp_decompile_fetch(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
+
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);

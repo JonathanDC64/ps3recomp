@@ -279,6 +279,11 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
         ucode, max_bytes, vtex_mask, 0, 0xFFFFu, out, out_size);
 }
 
+int rsx_vp_decompile_fetch(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
+{
+    return rsx_vp_decompile_impl(ucode, max_bytes, 0u, 2, 0xFFFFu, out, out_size);
+}
+
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size)
@@ -561,7 +566,52 @@ static int rsx_vp_decompile_impl(
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
-    if (!compact_inputs) {
+    if (compact_inputs == 2) {
+        /* Fetch mode: the shader reads the guest's vertex arrays itself.
+         * vf_raw holds the draw's guest vertex bytes as the guest stored them
+         * (big-endian), copied once per draw; vf_desc is the byte offset of
+         * the draw's 16 attribute records in it, 32 bytes each:
+         *   uint4 (x: offset of vertex 0's element, y: stride,
+         *          z: type | size << 4 | divider << 8 (1 = divide, 2 = modulo),
+         *          w: frequency), then float4 the constant register value.
+         * Type 0 is no array: the attribute is the constant. An array fills
+         * its first `size` components and keeps the constant's others, as
+         * rsx_fetch_vertex_arrays does on the CPU. S1 (type 1) is (2x + 1) / 65535,
+         * the RSX's signed-normalized rule (rsx_snorm16). */
+        emit(&o,
+            "struct VSInput { uint vid:SV_VertexID; };\n"
+            "ByteAddressBuffer vf_raw : register(t20);\n"
+            "cbuffer VFDraw : register(b2) { uint vf_desc; };\n"
+            "uint vf_b8(uint a) { return (vf_raw.Load(a & ~3u) >> ((a & 3u) * 8u)) & 0xFFu; }\n"
+            "uint vf_be16(uint a) { return (vf_b8(a) << 8) | vf_b8(a + 1u); }\n"
+            "uint vf_be32(uint a) {\n"
+            "    uint w = ((a & 3u) == 0u) ? vf_raw.Load(a)\n"
+            "           : (vf_b8(a) | (vf_b8(a + 1u) << 8) | (vf_b8(a + 2u) << 16) | (vf_b8(a + 3u) << 24));\n"
+            "    return (w >> 24) | ((w >> 8) & 0xFF00u) | ((w << 8) & 0xFF0000u) | (w << 24);\n"
+            "}\n"
+            "float4 vf_fetch(uint k, uint vid) {\n"
+            "    uint4 d = vf_raw.Load4(vf_desc + k * 32u);\n"
+            "    float4 r = asfloat(vf_raw.Load4(vf_desc + k * 32u + 16u));\n"
+            "    uint type = d.z & 15u;\n"
+            "    if (type == 0u) return r;\n"
+            "    uint n = (d.z >> 4) & 7u, dv = (d.z >> 8) & 3u;\n"
+            "    uint ei = dv == 1u ? vid / d.w : dv == 2u ? vid % d.w : vid;\n"
+            "    uint a = d.x + ei * d.y;\n"
+            "    [unroll] for (uint c = 0u; c < 4u; c++) {\n"
+            "        if (c < n) {\n"
+            "            float f;\n"
+            "            if (type == 2u) f = asfloat(vf_be32(a + c * 4u));\n"
+            "            else if (type == 3u) f = f16tof32(vf_be16(a + c * 2u));\n"
+            "            else if (type == 4u) f = (float)vf_b8(a + c) / 255.0;\n"
+            "            else if (type == 1u) f = ((float)((int)(vf_be16(a + c * 2u) << 16) >> 16) * 2.0 + 1.0) / 65535.0;\n"
+            "            else if (type == 5u) f = (float)((int)(vf_be16(a + c * 2u) << 16) >> 16);\n"
+            "            else f = (float)vf_b8(a + c);\n"
+            "            r[c] = f;\n"
+            "        }\n"
+            "    }\n"
+            "    return r;\n"
+            "}\n");
+    } else if (!compact_inputs) {
         emit(&o,
             /* All 16 RSX vertex attributes arrive as float4 (the harness
              * fetches and converts them on the CPU). */
@@ -623,7 +673,11 @@ static int rsx_vp_decompile_impl(
     }
 
     emit(&o, "VSOutput main(VSInput input) {\n");
-    if (!compact_inputs) {
+    if (compact_inputs == 2) {
+        emit(&o,
+            "    float4 v[16];\n"
+            "    [unroll] for (uint _k = 0u; _k < 16u; _k++) v[_k] = vf_fetch(_k, input.vid);\n");
+    } else if (!compact_inputs) {
         emit(&o,
             "    float4 v[16];\n"
             "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
