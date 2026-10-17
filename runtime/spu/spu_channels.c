@@ -453,9 +453,15 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    /* Every channel access asks, a few million times a second on Demon's
+     * Souls' image 2, and almost always from the SPU's own thread: remember
+     * the last slot this thread found. It still has to be ctx's -- a released
+     * context can come back in another slot -- and a slot has one owner. */
+    static SPU_TLS int t_slot = -1;
+    { const int s = t_slot;
+      if (s >= 0 && s_mfc_slots[s].ctx == ctx) return &s_mfc_slots[s].mfc; }
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx)
-            return &s_mfc_slots[i].mfc;
+        if (s_mfc_slots[i].ctx == ctx) { t_slot = i; return &s_mfc_slots[i].mfc; }
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */

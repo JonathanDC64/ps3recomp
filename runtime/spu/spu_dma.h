@@ -36,8 +36,31 @@ extern uint8_t* vm_base;
  * as a failed DMA, NOT crash the host emulator with an access violation.
  * Queries the page state and demand-commits on first touch; the whole
  * [ea, ea+size) range must be committed and accessible.
- * Returns 1 if the range is safe to memcpy. */
+ * Returns 1 if the range is safe to memcpy.
+ *
+ * mfc_ea_range_committed is the two bit tests, inline; a page not yet in the
+ * bitmap goes to the out-of-line half. As one function the system calls kept
+ * it from being inlined into the DMA fast path, which calls it on every
+ * transfer. */
+#ifdef _MSC_VER
+#define MFC_NOINLINE __declspec(noinline)
+#else
+#define MFC_NOINLINE __attribute__((noinline))
+#endif
+static MFC_NOINLINE int mfc_ea_range_commit_slow(uint64_t ea, uint32_t size);
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
+{
+    extern uint8_t g_vm_page_bitmap[65536 / 8];
+    const uint32_t e = (uint32_t)ea;
+    if (size && (uint64_t)e + (uint64_t)size <= 0x100000000ull && vm_base) {
+        const uint32_t p0 = e >> 16, p1 = (e + size - 1) >> 16;
+        if (((g_vm_page_bitmap[p0 >> 3] >> (p0 & 7)) & 1) &&
+            ((g_vm_page_bitmap[p1 >> 3] >> (p1 & 7)) & 1))
+            return 1;
+    }
+    return mfc_ea_range_commit_slow(ea, size);
+}
+static MFC_NOINLINE int mfc_ea_range_commit_slow(uint64_t ea, uint32_t size)
 {
     /* The VM reserves the full 32-bit guest space but only commits specific
      * regions (main mem, stack, RSX). A DMA to an uncommitted page must
@@ -986,7 +1009,14 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  * (Demon's Souls' image 2 was halted that way, at its EA-0 transfer). */
 static inline void mfc_repeat_check(spu_context* spu, uint32_t ea32, uint32_t lsa)
 {
-    static uint32_t s_last_ea, s_last_lsa, s_rep;
+    /* Per thread: these were shared by every SPU thread, so each DMA wrote a
+     * line the other SPUs' DMAs wrote too, and a run of identical transfers
+     * was counted across SPUs that had nothing to do with one another. */
+#ifdef _WIN32
+    static __declspec(thread) uint32_t s_last_ea, s_last_lsa, s_rep;
+#else
+    static __thread uint32_t s_last_ea, s_last_lsa, s_rep;
+#endif
     static uint32_t s_limit = 0;
     if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
                     s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
