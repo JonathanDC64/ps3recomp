@@ -9806,6 +9806,9 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
  * Palace, same run: 108.9 -> 112.7 fps. Checked against the list walk, as
  * triangles with degenerates dropped, over 26 million ranges (Tutorial and
  * Palace) with no difference. VF_NATIVE_STRIP=0 goes back to the list. */
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
 #define VF_CUT 0xFFFFFFFFu
 static __forceinline u32 vf_ix(const u8* src, const int w16, u32 k)
 {
@@ -9828,8 +9831,47 @@ static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 cou
      * thread, so the loop keeps r, and the tail comes from the guest's bytes. */
     u32* b = ib + n;
     u32 r = 0;   /* where the strip after the range's last restart begins (0: none) */
+    u32 k = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+    /* 16-bit indices eight at a time, the same outputs as the loop below:
+     * byte swap, restart lanes to the cut value, unsigned min/max over the
+     * other lanes (SSE2 has only the signed ones, hence the 0x8000 bias),
+     * and the last restart from the compare mask. The scalar loop was ~10%
+     * of the FIFO thread, a cmov chain per index. */
+    static int sse = -1;
+    PS3_KNOB(sse, ps3_env_int("VF_STRIP_SSE", 1));
+    if (w16 && count >= 8 && sse) {
+        const __m128i bias = _mm_set1_epi16((short)0x8000);
+        const __m128i rv = _mm_set1_epi16((short)ridx);
+        const int rs = restart && ridx <= 0xFFFFu;
+        __m128i vlo = _mm_set1_epi16(0x7FFF), vhi = _mm_set1_epi16((short)0x8000);
+        __m128i real = _mm_setzero_si128();
+        for (; k + 8 <= count; k += 8) {
+            __m128i v = _mm_loadu_si128((const __m128i*)(src + (u64)k * 2));
+            v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
+            const __m128i c = rs ? _mm_cmpeq_epi16(v, rv) : _mm_setzero_si128();
+            const __m128i o = _mm_or_si128(v, c);   /* restart lanes 0xFFFF */
+            _mm_storeu_si128((__m128i*)(b + k), _mm_unpacklo_epi16(o, c));
+            _mm_storeu_si128((__m128i*)(b + k + 4), _mm_unpackhi_epi16(o, c));
+            vlo = _mm_min_epi16(vlo, _mm_xor_si128(o, bias));
+            vhi = _mm_max_epi16(vhi, _mm_xor_si128(_mm_andnot_si128(c, v), bias));
+            real = _mm_or_si128(real, _mm_xor_si128(c, _mm_set1_epi32(-1)));
+            const int mk = _mm_movemask_epi8(c);
+            if (mk) { unsigned long top; _BitScanReverse(&top, (unsigned long)mk);
+                      r = k + (u32)(top >> 1) + 1; }
+        }
+        if (_mm_movemask_epi8(real)) {
+            u16 l8[8], h8[8];
+            _mm_storeu_si128((__m128i*)l8, _mm_xor_si128(vlo, bias));
+            _mm_storeu_si128((__m128i*)h8, _mm_xor_si128(vhi, bias));
+            for (int j = 0; j < 8; j++) {
+                lo = l8[j] < lo ? l8[j] : lo; hi = h8[j] > hi ? h8[j] : hi;
+            }
+        }
+    }
+#endif
 #define VF_IX(k) vf_ix(src, w16, k)
-    for (u32 k = 0; k < count; k++) {
+    for (; k < count; k++) {
         const u32 ix = VF_IX(k);
         const int c = restart && ix == ridx;
         b[k] = c ? VF_CUT : ix;
