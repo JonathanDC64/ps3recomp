@@ -183,7 +183,8 @@ typedef struct {
     u32   depth;        /* packed guest depth state (rsx_depth_key, PSO key) */
     /* GPU vertex fetch (VP_GPU_FETCH): the VS reads the guest's vertex arrays
      * from vf_buf, and the indices are the guest's own. fdesc is the byte
-     * offset of the draw's attribute records in vf_buf's half. */
+     * offset of the draw's attribute records in vf_buf's half. fetch is 1
+     * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
     u32   fetch, fdesc;
 } D3D12DrawRecord;
 
@@ -2001,6 +2002,8 @@ static void compile_vp(void)
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    /* Strip draws (vf_strip_native) cut at 0xFFFFFFFF; list draws never hold it. */
+    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     /* Depth test ON (LESS_EQUAL, matching the guest's rsxtiny_DepthTestFunc 515 /
@@ -3148,6 +3151,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    /* Strip draws (vf_strip_native) cut at 0xFFFFFFFF; list draws never hold it. */
+    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     pd.NumRenderTargets = (UINT)nrt;
     for (int _r = 0; _r < nrt; _r++) {
         pd.RTVFormats[_r] = rtfmt;
@@ -6420,6 +6425,7 @@ static void frame_log(long long q0, long long q1)
     { static int n = 0; if (++n % 64 == 0) fflush(f); }
 }
 
+static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 static void render_frame(void)
 {
     vpj_sync();   /* the batch's vertices, before anything reads vp_vb */
@@ -7169,6 +7175,7 @@ rtt_dump_done:;
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            s_vp_topo_strip = 0;
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
             ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
@@ -7504,6 +7511,13 @@ rtt_dump_done:;
                 if (dr->fetch)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstant(s_d3d.cmd_list, 5,
                         dr->fdesc, 0);
+                /* A strip draw's indices are a strip (vf_strip_native). */
+                if ((dr->fetch == 2) != s_vp_topo_strip) {
+                    s_vp_topo_strip = dr->fetch == 2;
+                    s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list,
+                        s_vp_topo_strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+                                        : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                }
                 if (dr->index_count)
                     s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
                         dr->index_count, 1, dr->ib_first, (INT)(dr->vb_byte_offset / 256), 0);
@@ -9773,6 +9787,74 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
                            pm, pp0, pp1, ib, plo, phi);
 }
 
+/* The strip as a strip (VF_NATIVE_STRIP, live, default 1): the draw is a
+ * TRIANGLESTRIP and the guest's indices go into the index buffer as they are,
+ * byte-swapped, with the restart index as D3D12's cut value (every VP PSO
+ * sets IBStripCutValue to it). One index in, one out, no branches, against
+ * the list's three out and a winding choice per triangle: the list walk was
+ * ~15% of the FIFO thread at ~109 fps, with that thread on the frame's path.
+ *
+ * A range starts with a cut and then restarts the strip it continues from
+ * the carry, with the winding parity the list would have used (triangle i
+ * of a strip is (i, i+1, i+2) when i is even and (i+1, i, i+2) when odd):
+ *   m == 1          -> p1
+ *   m even          -> p0 p1
+ *   m odd, m >= 3   -> p0 p0 p1   (one degenerate triangle shifts the parity)
+ * That holds whether the range opens a draw or extends the last one. The
+ * carry going out comes from the guest's last indices.
+ *
+ * Palace, same run: 108.9 -> 112.7 fps. Checked against the list walk, as
+ * triangles with degenerates dropped, over 26 million ranges (Tutorial and
+ * Palace) with no difference. VF_NATIVE_STRIP=0 goes back to the list. */
+#define VF_CUT 0xFFFFFFFFu
+static __forceinline u32 vf_ix(const u8* src, const int w16, u32 k)
+{
+    if (w16) { u16 v; memcpy(&v, src + (u64)k * 2, 2); return __builtin_bswap16(v); }
+    u32 v; memcpy(&v, src + (u64)k * 4, 4); return __builtin_bswap32(v);
+}
+static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 count,
+                                           const int restart, const u32 ridx, u32* pm,
+                                           u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
+{
+    u32 m = *pm, p0 = *pp0, p1 = *pp1, lo = *plo, hi = *phi, n = 0;
+    ib[n++] = VF_CUT;
+    if (m >= 1) {
+        if (m >= 3 && (m & 1u)) ib[n++] = p0;
+        if (m >= 2) { ib[n++] = p0; lo = p0 < lo ? p0 : lo; hi = p0 > hi ? p0 : hi; }
+        ib[n++] = p1; lo = p1 < lo ? p1 : lo; hi = p1 > hi ? p1 : hi;
+    }
+    /* ib is an upload heap (write-combined): written in order, never read
+     * back. A backward scan of it for the last restart was 29% of the FIFO
+     * thread, so the loop keeps r, and the tail comes from the guest's bytes. */
+    u32* b = ib + n;
+    u32 r = 0;   /* where the strip after the range's last restart begins (0: none) */
+#define VF_IX(k) vf_ix(src, w16, k)
+    for (u32 k = 0; k < count; k++) {
+        const u32 ix = VF_IX(k);
+        const int c = restart && ix == ridx;
+        b[k] = c ? VF_CUT : ix;
+        const u32 vl = c ? 0xFFFFFFFFu : ix, vh = c ? 0u : ix;
+        lo = vl < lo ? vl : lo; hi = vh > hi ? vh : hi;
+        r = c ? k + 1 : r;
+    }
+    const u32 tail = count - r;
+    m = r ? tail : m + count;
+    if (tail >= 2)      { p0 = VF_IX(count - 2); p1 = VF_IX(count - 1); }
+    else if (tail == 1) { p0 = p1; p1 = VF_IX(count - 1); }
+#undef VF_IX
+    *pm = m; *pp0 = p0; *pp1 = p1; *plo = lo; *phi = hi;
+    return n + count;
+}
+static u32 vf_strip_native(const GuestIdx* gi, u32 first, u32 count, int restart, u32 ridx,
+                           u32* pm, u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
+{
+    if (gi->w16) return vf_strip_native_w(gi->p + (u64)first * 2, 1, count, restart, ridx,
+                                          pm, pp0, pp1, ib, plo, phi);
+    return vf_strip_native_w(gi->p + (u64)first * 4, 0, count, restart, ridx,
+                             pm, pp0, pp1, ib, plo, phi);
+}
+static int s_up_strip;   /* the last upload_strip_vp_fetch wrote a strip */
+
 /* Returns the indices written (0 is a strip that made no triangle), or -1
  * when the draw has to take the CPU path. ext: the fetch draw this range
  * continues, or NULL. */
@@ -9781,7 +9863,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
 {
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_ib_mapped || !state->vertex_attribs[0].enabled) return -1;
-    if ((u64)s_vp_icap - s_d3d.vp_ib_offset < (u64)count * 3) { s_vf_stat[5]++; return -1; }
+    if ((u64)s_vp_icap - s_d3d.vp_ib_offset < (u64)count * 3 + 4) { s_vf_stat[5]++; return -1; }
     static rsx_fetch_plan pl;
     rsx_fetch_plan_init(state, &pl);
     for (u32 k = 0; k < pl.n_on; k++) {
@@ -9800,7 +9882,14 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * s_vp_icap + s_d3d.vp_ib_offset;
     const GuestIdx gi = guest_index_open(state);
     u32 ni = 0, lo = 0xFFFFFFFFu, hi = 0;
-    if (!fan) ni = vf_strip_list(&gi, first, count, restart, ridx, &m, &p0, &p1, ib, &lo, &hi);
+    static int nat = -1;
+    PS3_KNOB(nat, ps3_env_int("VF_NATIVE_STRIP", 1));
+    s_up_strip = !fan && nat;
+    if (s_up_strip) {
+        ni = vf_strip_native(&gi, first, count, restart, ridx, &m, &p0, &p1, ib, &lo, &hi);
+        if (lo > hi) ni = 0;   /* restarts only: no vertex, so no triangle */
+    }
+    else if (!fan) ni = vf_strip_list(&gi, first, count, restart, ridx, &m, &p0, &p1, ib, &lo, &hi);
     else for (u32 k = 0; k < count; k++) {
         const u32 ix = guest_index_at(&gi, first + k);
         if (restart && ix == ridx) { m = 0; continue; }
@@ -10258,11 +10347,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                                              primitive == RSX_PRIMITIVE_TRIANGLE_FAN,
                                              mpv && mpv->fetch ? mpv : NULL);
         if (ni >= 0) {
-            fetch = 1;
+            fetch = s_up_strip ? 2 : 1;   /* 2: the indices are a strip */
             s_vs_up[primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
             if (mpv) s_d3d.merge_first_end = first + count;
             if (!ni) return;
-            if (mpv && mpv->fetch && mpv->fdesc == s_up_fdesc) {
+            if (mpv && mpv->fetch == (u32)fetch && mpv->fdesc == s_up_fdesc) {
                 mpv->index_count  += (u32)ni;
                 mpv->vertex_count += (u32)ni;
                 return;
