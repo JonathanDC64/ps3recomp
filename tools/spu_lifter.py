@@ -255,6 +255,8 @@ class LiftedFunction:
     # instruction addresses lifted into this body; None for a plain function.
     entries: list = None
     lifted: set = None
+    # --native-block starts in this body -> (end, host function).
+    blocks: dict = None
 
     def holds(self, tgt: int) -> bool:
         """Whether a branch to `tgt` can be a goto inside this body."""
@@ -558,6 +560,10 @@ class SPULifter:
         # --native-hook: function entry address -> host function run first;
         # see emit_source.
         self.native_hooks: dict = {}
+        # --native-block: start address -> (end address, host function) run in
+        # place of the instructions [start, end) of a region body; see
+        # lift_region.
+        self.native_blocks: dict = {}
         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
@@ -654,6 +660,15 @@ class SPULifter:
             tgt = self._branch_target(by_addr[a])
             if tgt is not None and tgt in func.lifted:
                 labels.add(tgt)
+        # A native block jumps from its start to its end, both labels here.
+        func.blocks = {}
+        for a, (e, sym) in self.native_blocks.items():
+            if a in func.lifted:
+                if e not in func.lifted:
+                    raise SystemExit(f"--native-block 0x{a:X}-0x{e:X}: the end is "
+                                     f"not in the same region body as the start")
+                labels.update((a, e))
+                func.blocks[a] = (e, sym)
 
         for k, (s, e) in enumerate(rbounds):
             nxt = rbounds[k + 1][0] if k + 1 < len(rbounds) else None
@@ -673,6 +688,9 @@ class SPULifter:
                     func.body_lines.append(f"loc_{insn.addr:08X}:")
                 if insn.addr == s and hook:
                     func.body_lines.append(f"    if ({hook}(ctx)) {{ SPU_RET(ctx); }}")
+                if insn.addr in func.blocks:
+                    bend, bsym = func.blocks[insn.addr]
+                    func.body_lines.append(f"    if ({bsym}(ctx)) goto loc_{bend:08X};")
                 c = self._translate(insn, func)
                 if c:
                     if self.trace:
@@ -1189,6 +1207,8 @@ class SPULifter:
             hook = self.native_hooks.get(a)
             if hook:
                 lines.append(f"int {hook}(spu_context* ctx);   /* --native-hook */")
+        for a, (e, sym) in sorted((f.blocks or {}).items()):
+            lines.append(f"int {sym}(spu_context* ctx);   /* --native-block 0x{a:X}-0x{e:X} */")
         lines.append(f"static void {f.name}(spu_context* ctx, uint32_t entry) {{")
         if len(f.entries) > 1:
             lines.append("    switch (entry) {")
@@ -1320,6 +1340,14 @@ def main() -> None:
     p.add_argument("--region-max", type=int, default=2048,
                    help="--regions: most instructions in one body (compile "
                         "time and frame size). Default 2048.")
+    p.add_argument("--native-block", action="append", default=[], metavar="ADDR-END=SYMBOL",
+                   help="--regions only: run host function `int SYMBOL(spu_context*)` "
+                        "in place of the instructions from ADDR up to (not including) "
+                        "END, in one region body. When it returns nonzero it has done "
+                        "their work, leaving every register, local-store byte and "
+                        "channel as they would, and the lifted code goes on at END; 0 "
+                        "runs the instructions. For a hot step whose runtime calls "
+                        "have a cheaper equivalent (runtime/spu/spu_ring_hook.c).")
     p.add_argument("--native-hook", action="append", default=[], metavar="ADDR=SYMBOL",
                    help="Run host function `int SYMBOL(spu_context*)` at the entry "
                         "of the function at ADDR. When it returns nonzero it has "
@@ -1446,6 +1474,14 @@ def main() -> None:
         if not sym.isidentifier():
             p.error(f"--native-hook {h!r}: expected ADDR=SYMBOL")
         lifter.native_hooks[int(addr, 0)] = sym
+    for h in args.native_block:
+        rng, _, sym = h.partition("=")
+        a, _, e = rng.partition("-")
+        if not sym.isidentifier() or not a or not e or int(e, 0) <= int(a, 0):
+            p.error(f"--native-block {h!r}: expected ADDR-END=SYMBOL with END > ADDR")
+        if not args.regions:
+            p.error("--native-block needs --regions")
+        lifter.native_blocks[int(a, 0)] = (int(e, 0), sym)
     missing = set(lifter.native_hooks) - {s for s, e in bounds}
     if missing:
         p.error("--native-hook: no function starts at " +

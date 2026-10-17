@@ -54,6 +54,9 @@ void spu_lockline_unlock_ea(uint32_t ea, uint32_t len);
  * for a line already marked reserved (every store to one takes the stripe). */
 int spu_lockline_read_begin(uint32_t ea, long* seq);
 int spu_lockline_read_ok(uint32_t ea, long seq);
+/* _ok for a reader that set no reservation between begin and the copy: the
+ * same check without the StoreLoad fence _ok needs to publish one. */
+int spu_lockline_read_same(uint32_t ea, long seq);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
