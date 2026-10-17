@@ -86,9 +86,15 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f;
         break;
     case 1: /* S1: s16 normalized [-1,1] */
+        /* The RSX maps S1 as (2x + 1) / 65535, as GL's old signed-normalized
+         * rule does: 0 is not 0 but 1/65535, and -32768 and 32767 are exactly
+         * -1 and 1. x / 32767 made 0 an exact 0, and a vertex program that
+         * raises a weight to a negative power then divides by zero. That is
+         * Demon's Souls' Soldier starting shield, invisible on the CPU path
+         * (RPCS3 issue 3088, fixed there by the same decode). */
         for (u32 k = 0; k < n; k++) {
             s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
-            out[k] = (float)s / 32767.0f;
+            out[k] = rsx_snorm16(s);
         }
         break;
     case 5: /* S32K: s16 integer */
@@ -178,7 +184,7 @@ void rsx_fetch_vertex_arrays(const rsx_fetch_plan* pl, u32 vi, float out[16][4])
             break;
         case 1:
             for (u32 c = 0; c < n; c++)
-                o[c] = (float)(s16)((p[c*2] << 8) | p[c*2+1]) / 32767.0f;
+                o[c] = rsx_snorm16((s16)((p[c*2] << 8) | p[c*2+1]));
             break;
         case 5:
             for (u32 c = 0; c < n; c++) o[c] = (float)(s16)((p[c*2] << 8) | p[c*2+1]);

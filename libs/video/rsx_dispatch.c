@@ -293,10 +293,13 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     } else if ((m >= 0x1980 && m < 0x1A00) ||         /* DATA4S: unnormalised */
                (m >= 0x0A80 && m < 0x0B00)) {         /* DATA_SCALED4S: normalised */
         const u32 base = m >= 0x1980 ? 0x1980u : 0x0A80u;
-        const float k = m >= 0x1980 ? 1.0f : 1.0f / 32767.0f;
+        /* Scaled: (2x + 1) / 65535, the S1 array decode (rsx_snorm16). */
+        const int sc = m < 0x1980;
         attr = (m - base) >> 3; word = ((m - base) >> 2) & 1;
-        vtx_const_set(rsx, attr, word * 2 + 0, (float)(int16_t)(arg & 0xFFFF) * k);
-        vtx_const_set(rsx, attr, word * 2 + 1, (float)(int16_t)(arg >> 16) * k);
+        for (u32 h = 0; h < 2; h++) {
+            const float x = (float)(int16_t)(arg >> (16 * h));
+            vtx_const_set(rsx, attr, word * 2 + h, sc ? (2.0f * x + 1.0f) / 65535.0f : x);
+        }
     }
 }
 
