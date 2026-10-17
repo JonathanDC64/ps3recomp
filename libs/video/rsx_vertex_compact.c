@@ -58,7 +58,7 @@ int rsx_vertex_decode_element(
         case RSX_VTX_TYPE_SNORM16: {
             const s16 value = (s16)(
                 (source[component * 2] << 8) | source[component * 2 + 1]);
-            out[component] = value / 32767.0f;
+            out[component] = (2.0f * value + 1.0f) / 65535.0f;   /* rsx_snorm16 */
             break;
         }
         case RSX_VTX_TYPE_SINT16: {

@@ -4737,7 +4737,7 @@ static int fetch_attr(u32 i, u32 base, u32 vertex_id, u32 base_index,
             break;
         case RSX_VTX_TYPE_SNORM16: {
             const s16 v = (s16)((p[c * 2] << 8) | p[c * 2 + 1]);
-            out[c] = v / 32767.0f;
+            out[c] = (2.0f * v + 1.0f) / 65535.0f;   /* rsx_snorm16 */
             break;
         }
         case RSX_VTX_TYPE_SINT16: {

@@ -55,6 +55,8 @@ u32 cellGcmResolveLocated(int location, u32 offset);
  * in the PS3's byte order, so these are the bottom of every fetch path. */
 float rsx_rd_bef(const u8* p);      /* 4-byte IEEE float          */
 float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
+/* S1 (signed-normalized 16-bit) component: (2x + 1) / 65535. */
+static inline float rsx_snorm16(s16 x) { return (2.0f * x + 1.0f) / 65535.0f; }
 
 /* Fetch attribute `idx` (0..15) of vertex `vi` as a float4 into `out`.
  *
