@@ -345,7 +345,17 @@ typedef struct {
     int                        tearing;   /* swap chain made with ALLOW_TEARING */
     ID3D12DescriptorHeap*      rtv_heap;
     u32                        rtv_descriptor_size;
+    /* The game's frame, width x height (the title's display size): its own
+     * textures, not the swap chain's, so the window can be any size. At the
+     * present the frame is scaled into the swap chain's buffer (blit_to_window)
+     * and an overlay draws over that at the window's own resolution. */
     ID3D12Resource*            render_targets[FRAME_COUNT];
+    ID3D12Resource*            swap_buffers[FRAME_COUNT];   /* the window's, win_w x win_h */
+    ID3D12DescriptorHeap*      swap_rtv_heap;
+    u32                        win_w, win_h;
+    ID3D12RootSignature*       blit_rs;
+    ID3D12PipelineState*       blit_pso;
+    ID3D12DescriptorHeap*      blit_srv_heap;   /* shader-visible: one SRV per render_targets[i] */
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
 
@@ -695,8 +705,64 @@ static void session_lock_init(HWND hwnd)
 static rsx_d3d12_overlay s_overlay;
 static volatile long     s_overlay_on;
 
+/* The window's client size as of its last WM_SIZE, (w << 16) | h, written by
+ * the window thread; the render thread resizes the swap chain to it between
+ * frames (swap_resize). 0 until the first WM_SIZE. */
+static volatile LONG s_win_req;
+
+/* Borderless fullscreen (Alt+Enter, rsx_d3d12_set_borderless): the window
+ * covers its monitor, no frame. A window, not exclusive fullscreen, so alt-tab
+ * and the overlay behave as windowed. Window-thread state. */
+#define WM_RSX_BORDERLESS (WM_APP + 0x52)
+static int   s_borderless;
+static RECT  s_windowed_rect;
+static LONG  s_windowed_style;
+
+static void set_borderless(HWND hwnd, int on)
+{
+    if (!!on == s_borderless) return;
+    if (on) {
+        MONITORINFO mi = {sizeof mi};
+        GetWindowRect(hwnd, &s_windowed_rect);
+        s_windowed_style = GetWindowLongA(hwnd, GWL_STYLE);
+        if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
+        SetWindowLongA(hwnd, GWL_STYLE, (s_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongA(hwnd, GWL_STYLE, s_windowed_style);
+        SetWindowPos(hwnd, NULL, s_windowed_rect.left, s_windowed_rect.top,
+                     s_windowed_rect.right - s_windowed_rect.left, s_windowed_rect.bottom - s_windowed_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
+    }
+    s_borderless = !!on;
+}
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    switch (msg) {   /* before the overlay: the frame's own business */
+    case WM_SIZE:
+        if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
+            InterlockedExchange(&s_win_req, (LONG)(((u32)LOWORD(lp) << 16) | HIWORD(lp)));
+        break;
+    case WM_RSX_BORDERLESS:
+        set_borderless(hwnd, (int)wp);
+        return 0;
+    case WM_GETMINMAXINFO: {   /* a client area of at least 640x360: below that an overlay's text overlaps */
+        RECT r = {0, 0, 640, 360};
+        AdjustWindowRect(&r, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), FALSE);
+        ((MINMAXINFO*)lp)->ptMinTrackSize.x = r.right - r.left;
+        ((MINMAXINFO*)lp)->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {   /* Alt+Enter, not repeat */
+            set_borderless(hwnd, !s_borderless);
+            return 0;
+        }
+        break;
+    }
     if (s_overlay_on && s_overlay.wndproc) {
         long long r = 0;
         if (s_overlay.wndproc(s_overlay.user, hwnd, msg, (unsigned long long)wp, (long long)lp, &r))
@@ -762,6 +828,233 @@ static HWND create_window(u32 width, u32 height, const char* title)
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
+}
+
+/* The window lives on a thread of its own that does nothing but pump its
+ * messages. Moving or resizing a window runs a modal loop inside
+ * DispatchMessage until the mouse is released; when the vblank ticker pumped
+ * the messages, that loop stopped the ticks, the FIFO drain and the presents,
+ * and the game froze for as long as the window was held. Rendering and
+ * presenting stay where they were: DXGI's flip model presents to a window
+ * owned by another thread. RSX_WINDOW_THREAD=0 pumps on the ticker as before. */
+static int s_window_thread;
+
+typedef struct { u32 w, h; const char* title; HANDLE ready; } window_thread_args;
+
+static DWORD WINAPI window_thread(LPVOID p)
+{
+    window_thread_args* a = (window_thread_args*)p;
+    HWND hwnd = create_window(a->w, a->h, a->title);
+    s_d3d.hwnd = hwnd;
+    SetEvent(a->ready);   /* `a` is the creator's: not touched after this */
+    if (!hwnd) return 0;
+    MSG msg;
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    *(volatile int*)&s_d3d.window_closed = 1;
+    return 0;
+}
+
+static HWND open_window(u32 width, u32 height, const char* title)
+{
+    s_window_thread = ps3_env_int("RSX_WINDOW_THREAD", 1) != 0;
+    if (!s_window_thread) return create_window(width, height, title);
+    window_thread_args a = {width, height, title, CreateEventA(NULL, TRUE, FALSE, NULL)};
+    HANDLE t = a.ready ? CreateThread(NULL, 0, window_thread, &a, 0, NULL) : NULL;
+    if (!t) {
+        if (a.ready) CloseHandle(a.ready);
+        s_window_thread = 0;
+        return create_window(width, height, title);
+    }
+    WaitForSingleObject(a.ready, INFINITE);
+    CloseHandle(a.ready);
+    CloseHandle(t);
+    return s_d3d.hwnd;
+}
+
+/* The swap chain's buffers and their RTVs (init and after ResizeBuffers). */
+static int swap_buffers_get(void)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &h);
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        HRESULT hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
+            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.swap_buffers[i]);
+        if (FAILED(hr)) return -1;
+        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.swap_buffers[i], NULL, h);
+        h.ptr += s_d3d.rtv_descriptor_size;
+    }
+    return 0;
+}
+
+/* The scale pass: a full-screen triangle sampling the game's frame with
+ * linear filtering, into a viewport that keeps its aspect ratio. */
+static int blit_init(void)
+{
+    static const char vs[] =
+        "struct O { float4 p : SV_POSITION; float2 uv : TEXCOORD; };\n"
+        "O main(uint id : SV_VertexID) { O o; float2 t = float2((id << 1) & 2, id & 2);\n"
+        "  o.uv = t; o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n";
+    static const char ps[] =
+        "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+        "float4 main(float4 p : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {\n"
+        "  return float4(t.Sample(s, uv).rgb, 1); }\n";
+    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *rsb = NULL;
+    HRESULT hr = D3DCompile(vs, sizeof vs - 1, "blit_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err);
+    if (SUCCEEDED(hr)) hr = D3DCompile(ps, sizeof ps - 1, "blit_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err);
+    if (FAILED(hr)) {
+        printf("[D3D12] blit shader compile failed: %s\n", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+        return -1;
+    }
+    D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+    D3D12_ROOT_PARAMETER param = {0};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &range;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC smp = {0};
+    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    smp.MaxLOD = D3D12_FLOAT32_MAX;
+    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rsd = {1, &param, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
+    if (SUCCEEDED(hr))
+        hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, rsb->lpVtbl->GetBufferPointer(rsb),
+                                                        rsb->lpVtbl->GetBufferSize(rsb),
+                                                        &IID_ID3D12RootSignature, (void**)&s_d3d.blit_rs);
+    if (SUCCEEDED(hr)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_d3d.blit_rs;
+        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
+                                                               (void**)&s_d3d.blit_pso);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = FRAME_COUNT;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
+                                                        (void**)&s_d3d.blit_srv_heap);
+    }
+    if (SUCCEEDED(hr)) {
+        const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+            s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE h;
+        s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
+        for (u32 i = 0; i < FRAME_COUNT; i++, h.ptr += inc)
+            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[i], NULL, h);
+    }
+    if (vb) vb->lpVtbl->Release(vb);
+    if (pb) pb->lpVtbl->Release(pb);
+    if (rsb) rsb->lpVtbl->Release(rsb);
+    if (err) err->lpVtbl->Release(err);
+    if (FAILED(hr)) printf("[D3D12] blit pipeline failed (0x%08lX)\n", (long)hr);
+    return FAILED(hr) ? -1 : 0;
+}
+
+/* Records the scale of the game's frame fi into the window's buffer fi: the
+ * largest rectangle with the frame's aspect ratio, centred, black around it.
+ * Both resources are in PRESENT before and after. */
+static void blit_to_window(u32 fi)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[0].Transition.pResource   = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.pResource   = s_d3d.swap_buffers[fi];
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &rtv);
+    rtv.ptr += (u64)fi * s_d3d.rtv_descriptor_size;
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+
+    const float ww = (float)s_d3d.win_w, wh = (float)s_d3d.win_h;
+    const float gw = (float)s_d3d.width, gh = (float)s_d3d.height;
+    const float k = ww / gw < wh / gh ? ww / gw : wh / gh;
+    const float vw = floorf(gw * k + 0.5f), vh = floorf(gh * k + 0.5f);
+    D3D12_VIEWPORT vp = {floorf((ww - vw) * 0.5f), floorf((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
+    if (vw != ww || vh != wh) {
+        static const float black[4] = {0, 0, 0, 1};
+        cl->lpVtbl->ClearRenderTargetView(cl, rtv, black, 0, NULL);
+    }
+    D3D12_RECT sc = {0, 0, (LONG)s_d3d.win_w, (LONG)s_d3d.win_h};
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.blit_rs);
+    cl->lpVtbl->SetPipelineState(cl, s_d3d.blit_pso);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.blit_srv_heap);
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    s_d3d.blit_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &g);
+    g.ptr += (u64)fi * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+}
+
+static void wait_for_gpu(void);
+
+/* Between frames, on the render thread: the swap chain follows the window's
+ * client size (s_win_req). The GPU is idled first and the overlay drops its
+ * views of the old buffers, or ResizeBuffers fails on the references. */
+static void swap_resize(void)
+{
+    const LONG req = s_win_req;
+    const u32 w = (u32)req >> 16, h = (u32)req & 0xFFFF;
+    if (!w || !h || (w == s_d3d.win_w && h == s_d3d.win_h)) return;
+    wait_for_gpu();
+    if (s_overlay_on && s_overlay.release) s_overlay.release(s_overlay.user);
+    for (u32 i = 0; i < FRAME_COUNT; i++)
+        if (s_d3d.swap_buffers[i]) {
+            s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
+            s_d3d.swap_buffers[i] = NULL;
+        }
+    HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(
+        s_d3d.swap_chain, FRAME_COUNT, w, h, DXGI_FORMAT_R8G8B8A8_UNORM,
+        s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    if (SUCCEEDED(hr)) {
+        s_d3d.win_w = w;
+        s_d3d.win_h = h;
+    } else {
+        printf("[D3D12] ResizeBuffers %ux%u failed (0x%08lX); keeping %ux%u\n", w, h, (long)hr,
+               s_d3d.win_w, s_d3d.win_h);
+        InterlockedExchange(&s_win_req, (LONG)((s_d3d.win_w << 16) | s_d3d.win_h));
+    }
+    if (swap_buffers_get() != 0) printf("[D3D12] swap chain buffers lost after a resize\n");
+    /* The back buffer index starts over; the GPU is idle, so every frame's
+     * fence value moves to the highest one and the fence never steps back. */
+    s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+    u64 fv = 0;
+    for (u32 i = 0; i < FRAME_COUNT; i++) if (s_d3d.fence_values[i] > fv) fv = s_d3d.fence_values[i];
+    for (u32 i = 0; i < FRAME_COUNT; i++) s_d3d.fence_values[i] = fv;
 }
 
 /* ---------------------------------------------------------------------------
@@ -938,15 +1231,44 @@ static int init_d3d12(u32 width, u32 height)
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
 
+    /* The game's frame: textures of their own (see render_targets), in the
+     * PRESENT (= COMMON) state between frames as the swap chain's were, so
+     * every transition and readback of them is unchanged. */
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
-            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = width;
+        rd.Height           = height;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.SampleDesc.Count = 1;
+        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
         if (FAILED(hr)) return -1;
 
         s_d3d.device->lpVtbl->CreateRenderTargetView(
             s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
         rtv_handle.ptr += s_d3d.rtv_descriptor_size;
     }
+
+    /* The window's buffers, with RTVs of their own. */
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+        hd.NumDescriptors = FRAME_COUNT;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+            s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.swap_rtv_heap);
+        if (FAILED(hr)) return -1;
+    }
+    s_d3d.win_w = width;
+    s_d3d.win_h = height;
+    if (swap_buffers_get() != 0) return -1;
+    if (blit_init() != 0) return -1;
 
     /* ---------------------------------------------------------------
      * Depth/stencil buffer
@@ -7942,6 +8264,9 @@ skip_dump_consider: ;
         s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_zq_heap,
             D3D12_QUERY_TYPE_OCCLUSION, 0, (UINT)s_zq_n, s_zq_rb, 0);
 
+    /* The game's frame, scaled into the window's buffer. */
+    if (s_present_this_frame) blit_to_window(fi);
+
     /* Close and execute */
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
@@ -8135,8 +8460,8 @@ skip_dump_consider: ;
       }
       const int tear = !vsync && s_d3d.tearing;
       if (s_present_this_frame && s_overlay_on && s_overlay.frame)
-          s_overlay.frame(s_overlay.user, s_d3d.render_targets[s_d3d.frame_index], s_d3d.frame_index,
-                          s_d3d.width, s_d3d.height);
+          s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[s_d3d.frame_index], s_d3d.frame_index,
+                          s_d3d.win_w, s_d3d.win_h);
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
           s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1,
                                             tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
@@ -8147,6 +8472,7 @@ skip_dump_consider: ;
     if (s_present_this_frame) prof_record(s_rf_cp[9]);
 
     move_to_next_frame();
+    swap_resize();
 
     s_d3d.frame_count++;
 
@@ -10845,7 +11171,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
                  title ? title : "ps3recomp");
     }
-    s_d3d.hwnd = create_window(width, height, title);
+    s_d3d.hwnd = open_window(width, height, title);
     if (!s_d3d.hwnd) {
         printf("[D3D12] ERROR: Window creation failed\n");
         return -1;
@@ -10908,13 +11234,23 @@ void rsx_d3d12_backend_shutdown(void)
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
+        if (s_d3d.swap_buffers[i]) s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
+    if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
+    if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
+    if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
+    if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
 
-    if (s_d3d.hwnd) DestroyWindow(s_d3d.hwnd);
+    /* A window belongs to the thread that made it: the window thread
+     * destroys its own and then leaves its message loop. */
+    if (s_d3d.hwnd) {
+        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
+        else DestroyWindow(s_d3d.hwnd);
+    }
 
     rsx_set_backend(NULL);
     s_d3d.initialized = 0;
@@ -10930,16 +11266,25 @@ void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay)
         InterlockedExchange(&s_overlay_on, 1);
     }
 }
+void rsx_d3d12_set_borderless(int on)
+{
+    if (s_d3d.hwnd) {
+        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_RSX_BORDERLESS, (WPARAM)!!on, 0);
+        else set_borderless(s_d3d.hwnd, on);
+    }
+}
+int      rsx_d3d12_borderless(void)   { return s_borderless; }
 void*    rsx_d3d12_device(void)       { return s_d3d.device; }
 void*    rsx_d3d12_queue(void)        { return s_d3d.cmd_queue; }
 void*    rsx_d3d12_hwnd(void)         { return s_d3d.hwnd; }
-void*    rsx_d3d12_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.render_targets[i] : NULL; }
+void*    rsx_d3d12_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.swap_buffers[i] : NULL; }
 unsigned rsx_d3d12_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
 unsigned rsx_d3d12_back_buffer_format(void) { return (unsigned)DXGI_FORMAT_R8G8B8A8_UNORM; }
 
 int rsx_d3d12_backend_pump_messages(void)
 {
     MSG msg;
+    if (s_window_thread) return s_d3d.window_closed ? -1 : 0;   /* the window thread pumps */
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) return -1;
         TranslateMessage(&msg);
@@ -11133,5 +11478,7 @@ void*    rsx_d3d12_hwnd(void) { return NULL; }
 void*    rsx_d3d12_back_buffer(unsigned i) { (void)i; return NULL; }
 unsigned rsx_d3d12_back_buffer_count(void) { return 0; }
 unsigned rsx_d3d12_back_buffer_format(void) { return 0; }
+void     rsx_d3d12_set_borderless(int on) { (void)on; }
+int      rsx_d3d12_borderless(void) { return 0; }
 
 #endif /* _WIN32 */

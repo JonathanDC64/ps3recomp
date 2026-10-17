@@ -54,20 +54,26 @@ void rsx_d3d12_backend_present(void);
  * longer closes the window (the overlay decides what Esc does).
  *
  * wndproc: called first for every message the game window receives, on the
- *   thread that pumps messages. Return nonzero to consume it (*result is then
- *   the window procedure's return value).
+ *   window's own thread (RSX_WINDOW_THREAD=0: the thread that pumps
+ *   messages). Return nonzero to consume it (*result is then the window
+ *   procedure's return value).
  * frame: called on the render thread once per presented frame, after the
  *   frame's command list has been submitted and before Present. back_buffer
- *   is the ID3D12Resource about to be presented, in the PRESENT state; the
- *   hook leaves it in that state, with its own work submitted to the queue
- *   from rsx_d3d12_queue(). Screenshots and captures are taken before it,
- *   so they never contain the overlay. */
+ *   is the ID3D12Resource about to be presented, in the PRESENT state, at
+ *   the window's client size (width x height); the game's frame is already
+ *   scaled into it. The hook leaves it in that state, with its own work
+ *   submitted to the queue from rsx_d3d12_queue(). Screenshots and captures
+ *   are taken from the game's frame, so they never contain the overlay.
+ * release: called on the render thread before the window's buffers are
+ *   resized; the hook drops every reference it holds to them (and finishes
+ *   any work using them). Later frames pass the new buffers. */
 typedef struct rsx_d3d12_overlay {
     void* user;
     int  (*wndproc)(void* user, void* hwnd, unsigned msg, unsigned long long wp,
                     long long lp, long long* result);
     void (*frame)(void* user, void* back_buffer, unsigned index,
                   unsigned width, unsigned height);
+    void (*release)(void* user);
 } rsx_d3d12_overlay;
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay);
 /* For the overlay: ID3D12Device*, ID3D12CommandQueue*, HWND, the swap chain's
@@ -78,6 +84,10 @@ void*    rsx_d3d12_hwnd(void);
 void*    rsx_d3d12_back_buffer(unsigned index);
 unsigned rsx_d3d12_back_buffer_count(void);
 unsigned rsx_d3d12_back_buffer_format(void);
+/* Borderless fullscreen on the window's monitor (1) or the window as it was
+ * (0). Alt+Enter toggles it too. Any thread. */
+void     rsx_d3d12_set_borderless(int on);
+int      rsx_d3d12_borderless(void);
 
 /* Shader disk cache (PS3_SHADER_CACHE, default shader_cache beside the exe),
  * for filling it before a title runs (tools: rsx_shader_precompile).
