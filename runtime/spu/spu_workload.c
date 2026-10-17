@@ -40,6 +40,62 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
     return h;
 }
 
+/* The same value, remembered for the images that are dispatched again and
+ * again. A task create fingerprints the task's whole ELF, and FNV-1a takes one
+ * byte at a time through a 64-bit multiply: about 80 us for a Havok task image.
+ * Havok creates a task per physics job, hundreds a second, and a burst of them
+ * when a breakable object shatters, each one on the thread the frame's physics
+ * step waits for. An image is keyed by where it is and its size, and the entry
+ * keeps a copy of its bytes, so a hit costs a memcmp and an image the guest has
+ * since rewritten in place is hashed again. */
+#define SPU_FP_CACHE     8
+#define SPU_FP_CACHE_MAX (512u << 10)   /* a larger image is hashed every time */
+typedef struct { const void* p; size_t n; uint64_t fp; uint8_t* copy; } spu_fp_entry;
+static spu_fp_entry s_fp_cache[SPU_FP_CACHE];
+static unsigned     s_fp_next;
+#ifdef _WIN32
+static SRWLOCK s_fp_lock = SRWLOCK_INIT;
+#define FP_RDLOCK()   AcquireSRWLockShared(&s_fp_lock)
+#define FP_RDUNLOCK() ReleaseSRWLockShared(&s_fp_lock)
+#define FP_WRLOCK()   AcquireSRWLockExclusive(&s_fp_lock)
+#define FP_WRUNLOCK() ReleaseSRWLockExclusive(&s_fp_lock)
+#else
+static pthread_rwlock_t s_fp_lock = PTHREAD_RWLOCK_INITIALIZER;
+#define FP_RDLOCK()   pthread_rwlock_rdlock(&s_fp_lock)
+#define FP_RDUNLOCK() pthread_rwlock_unlock(&s_fp_lock)
+#define FP_WRLOCK()   pthread_rwlock_wrlock(&s_fp_lock)
+#define FP_WRUNLOCK() pthread_rwlock_unlock(&s_fp_lock)
+#endif
+
+static uint64_t spu_image_fingerprint(const void* data, size_t n)
+{
+    if (n > SPU_FP_CACHE_MAX) return spu_workload_fingerprint(data, n);
+    uint64_t fp = 0;
+    int hit = 0;
+    FP_RDLOCK();
+    for (unsigned i = 0; i < SPU_FP_CACHE && !hit; i++) {
+        const spu_fp_entry* e = &s_fp_cache[i];
+        if (e->p == data && e->n == n && memcmp(e->copy, data, n) == 0) { fp = e->fp; hit = 1; }
+    }
+    FP_RDUNLOCK();
+    if (hit) return fp;
+    /* Hash the copy, not the guest bytes, so the value and the bytes it is
+     * compared against later are the same even if the guest writes meanwhile. */
+    uint8_t* copy = (uint8_t*)malloc(n);
+    if (!copy) return spu_workload_fingerprint(data, n);
+    memcpy(copy, data, n);
+    fp = spu_workload_fingerprint(copy, n);
+    FP_WRLOCK();
+    spu_fp_entry* e = NULL;
+    for (unsigned i = 0; i < SPU_FP_CACHE && !e; i++)
+        if (s_fp_cache[i].p == data && s_fp_cache[i].n == n) e = &s_fp_cache[i];
+    if (!e) e = &s_fp_cache[s_fp_next++ % SPU_FP_CACHE];
+    free(e->copy);
+    e->p = data; e->n = n; e->fp = fp; e->copy = copy;
+    FP_WRUNLOCK();
+    return fp;
+}
+
 /* ---- registry ---------------------------------------------------------- */
 
 #ifndef SPU_WORKLOAD_MAX
@@ -234,7 +290,7 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_image_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1261,7 +1317,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_image_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -1807,7 +1863,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
 {
     if (!image || image_size == 0) return 0;
 
-    uint64_t fp = spu_workload_fingerprint(image, image_size);
+    uint64_t fp = spu_image_fingerprint(image, image_size);
     spu_lifted_entry_fn fn = NULL;
     int image_id = 0;
     for (unsigned i = 0; i < s_registry_count; i++)
