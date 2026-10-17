@@ -1224,7 +1224,11 @@ static void dbg_prof(DWORD tid, unsigned sec, int by_rip)
         static const char* tn[4] = { "exclusive", "inclusive", "exe caller of DLL leaf",
                                      "exclusive by address" };
         dbg_printf("  --- %s ---%c", tn[tab], 10);
-        for (int rank = 0; rank < 40; rank++) {
+        /* PROF_RIP_ROWS=<n>: rows of the by-address table (default 40), for
+         * a breakdown of one hot function. */
+        const char* rr = tab == 3 ? getenv("PROF_RIP_ROWS") : NULL;
+        const int rows = rr && atoi(rr) > 0 ? atoi(rr) : 40;
+        for (int rank = 0; rank < rows; rank++) {
             uint32_t best = 0; int bi = -1;
             for (int k = 0; k < PROF_SLOTS; k++) if (s_prof_ct[tab][k] > best) { best = s_prof_ct[tab][k]; bi = k; }
             if (bi < 0) break;
