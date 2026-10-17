@@ -26,9 +26,11 @@
  * unchanged PUTLLC become one plain read of the line
  * (spu_llar_noop_commit), and the GET and its tag wait go through the
  * channels as before. When the ring is empty it returns 0 and the lifted
- * code waits exactly as it always has.
+ * code waits exactly as it always has. While the line copy from the last
+ * read still shows commands ahead of get, the line is not read at all.
  *
- * SPU_NATIVE_RING=0 (live) runs the lifted code instead, for A/B.
+ * SPU_NATIVE_RING (live): 1 (default) as above, 2 reads the line for every
+ * command, 0 runs the lifted code, for A/B.
  */
 
 #include <string.h>
@@ -73,8 +75,14 @@ int spu_hook_ring_fetch(spu_context* ctx)
     const u128 state = spu_ls_read128(ctx, RING_STATE_LS);
     const uint32_t line_ea = old_line._u32[3] & ~127u;
     if (line_ea < 0x10000u) return 0;
+    /* While the copy from the last GETLLAR still shows a put ahead of get,
+     * the commands up to it are published (the producer moves put only past
+     * whole commands), so the line is not read again: the copy stays as it
+     * is, as if this GETLLAR had come before the producer's later stores.
+     * SPU_NATIVE_RING=2 reads it for every command. */
+    const int known = native_ring_on() == 1 && old_line._u32[0] != state._u32[0];
     /* The live put. Empty ring: the lifted code GETLLARs and waits. */
-    if (be32_at(vm_base + line_ea) == state._u32[0]) return 0;
+    if (!known && be32_at(vm_base + line_ea) == state._u32[0]) return 0;
 
     /* 0x4618-0x4690: wrch ch69 (no channel), event mask, GETLLAR. */
     r[58] = spu_il(0);
@@ -86,7 +94,10 @@ int spu_hook_ring_fetch(spu_context* ctx)
     r[52] = spu_il(208);
     r[53] = spu_ori(r[52], 0);
     /* The GETLLAR and the unchanged PUTLLC at 0x46BC, together. */
-    if (!spu_llar_noop_commit(ctx, r[82]._u32[0], r[54]._u32[0])) return 0;
+    if (known) {
+        if (ctx->resv_valid) __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
+        ctx->atomic_stat = 0;
+    } else if (!spu_llar_noop_commit(ctx, r[82]._u32[0], r[54]._u32[0])) return 0;
     r[5] = spu_il(0);
     r[6] = spu_ori(r[52], 0);
     /* 0x4694: the compare (not equal: the live put was read above, and the

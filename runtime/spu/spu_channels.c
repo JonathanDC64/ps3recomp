@@ -1361,7 +1361,7 @@ int spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea)
     for (int t = 0;; t++) {
         if (spu_lockline_read_begin(ea, &seq)) {
             memcpy(line, vm_base + ea, MFC_ATOMIC_LINE);
-            if (spu_lockline_read_ok(ea, seq)) break;
+            if (spu_lockline_read_same(ea, seq)) break;
         }
         if (t == 7) return 0;
         _mm_pause();
@@ -1370,7 +1370,9 @@ int spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea)
     memcpy(ls, line, MFC_ATOMIC_LINE);
     memcpy(ctx->resv_line, line, MFC_ATOMIC_LINE);
     ctx->resv_ea = ea;
-    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_SEQ_CST);
+    /* No reservation is taken, so nothing races this but a notifier
+     * clearing it too. */
+    if (ctx->resv_valid) __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
     ctx->atomic_stat = 0;
     spu_taskset_line_committed(ea);
     if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea);

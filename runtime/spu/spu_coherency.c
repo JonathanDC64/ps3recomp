@@ -185,6 +185,12 @@ int spu_lockline_read_ok(uint32_t ea, long seq)
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return __atomic_load_n(&g_ll[(ea >> 7) & spu_ll_mask()].v, __ATOMIC_ACQUIRE) == seq;
 }
+int spu_lockline_read_same(uint32_t ea, long seq)
+{
+    /* The copy's loads before the second read of the stripe word. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&g_ll[(ea >> 7) & spu_ll_mask()].v, __ATOMIC_RELAXED) == seq;
+}
 void spu_lockline_lock(void)
 {
     const unsigned m = spu_ll_mask();
@@ -204,6 +210,7 @@ void spu_lockline_lock_ea(uint32_t ea, uint32_t len)   { (void)ea; (void)len; sp
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; spu_lockline_unlock(); }
 int spu_lockline_read_begin(uint32_t ea, long* seq) { (void)ea; *seq = 0; return 0; }   /* always lock */
 int spu_lockline_read_ok(uint32_t ea, long seq)     { (void)ea; (void)seq; return 0; }
+int spu_lockline_read_same(uint32_t ea, long seq)   { (void)ea; (void)seq; return 0; }
 #endif
 
 /* ===========================================================================
