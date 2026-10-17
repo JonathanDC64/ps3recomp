@@ -17,35 +17,67 @@ extern uint8_t* vm_base;
 
 /* ---- export registry ---------------------------------------------------- *
  * Flat NID -> guest-address table, filled as modules load. A handful of system
- * PRXs export a few hundred symbols total, so a linear array with linear lookup
- * is plenty (lookups happen once per import resolution, not per call). */
+ * PRXs export a few hundred symbols total.
+ *
+ * The lookup is on every HLE call, not once per import: ps3_hle_call asks it
+ * whether a loaded PRX exports the NID before it runs the HLE stub, and the
+ * answer for most calls is no (sys_lwmutex_*, sys_cond_*, ...), which a
+ * linear scan found only at the end of the whole table. Demon's Souls'
+ * HighGraphics makes a few hundred thousand HLE calls a second. A hash index
+ * over the table answers in a probe or two. */
 typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
 #define PRX_EXPORT_REG_CAP 2048
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
 static uint32_t             s_export_reg_n = 0;
+/* Open addressing, linear probing; a slot holds an entry's index + 1, 0 when
+ * empty. Twice the table's capacity, so a probe run stays short. Entries are
+ * only added (an existing NID is overwritten in place), and a slot is
+ * published after its entry is written, so a lookup racing a module load
+ * sees either no entry or a complete one. */
+#define PRX_EXPORT_HASH_BITS 12
+static uint32_t s_export_hash[1u << PRX_EXPORT_HASH_BITS];
+
+static uint32_t prx_export_slot(uint32_t nid)
+{
+    return (nid * 0x9E3779B1u) >> (32 - PRX_EXPORT_HASH_BITS);
+}
+
+/* The entry index for nid, or -1. */
+static int prx_export_find(uint32_t nid)
+{
+    const uint32_t mask = (1u << PRX_EXPORT_HASH_BITS) - 1;
+    for (uint32_t h = prx_export_slot(nid);; h = (h + 1) & mask) {
+        const uint32_t v = __atomic_load_n(&s_export_hash[h], __ATOMIC_ACQUIRE);
+        if (!v) return -1;
+        if (s_export_reg[v - 1].nid == nid) return (int)(v - 1);
+    }
+}
 
 static void prx_export_register(uint32_t nid, uint32_t guest_addr)
 {
     /* Last writer wins if two modules export the same NID (matches the PS3
      * loader's link order). Overwrite an existing entry rather than duplicate. */
-    for (uint32_t i = 0; i < s_export_reg_n; i++) {
-        if (s_export_reg[i].nid == nid) {
-            s_export_reg[i].guest_addr = guest_addr;
-            return;
-        }
+    const int i = prx_export_find(nid);
+    if (i >= 0) {
+        __atomic_store_n(&s_export_reg[i].guest_addr, guest_addr, __ATOMIC_RELEASE);
+        return;
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
-        s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
+    if (s_export_reg_n >= PRX_EXPORT_REG_CAP) {
         fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
+        return;
+    }
+    const uint32_t n = s_export_reg_n++;
+    s_export_reg[n] = (prx_export_reg_entry){ nid, guest_addr };
+    const uint32_t mask = (1u << PRX_EXPORT_HASH_BITS) - 1;
+    uint32_t h = prx_export_slot(nid);
+    while (s_export_hash[h]) h = (h + 1) & mask;
+    __atomic_store_n(&s_export_hash[h], n + 1, __ATOMIC_RELEASE);
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
-        if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
-    return 0;
+    const int i = prx_export_find(nid);
+    return i < 0 ? 0 : __atomic_load_n(&s_export_reg[i].guest_addr, __ATOMIC_ACQUIRE);
 }
 
 uint32_t prx_export_registry_count(void) { return s_export_reg_n; }

@@ -467,18 +467,28 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * _cellSpursLFQueuePushBody, which has no HLE at all -- this moves just
          * that family onto Sony's own code instead of guessing its protocol. */
         if (opd) {
-            static const char* s_only = (const char*)1;
-            if (s_only == (const char*)1) s_only = getenv("LIBSRE_LLE_ONLY");
-            if (s_only && *s_only) {
-                char want[16]; snprintf(want, sizeof want, "%08X", nid);
-                int hit = 0;
-                for (const char* p2 = s_only; *p2 && !hit; p2++) {
-                    int k = 0;
-                    while (k < 8 && p2[k] &&
-                           (p2[k] == want[k] ||
-                            (p2[k] >= 'a' && p2[k] - 32 == want[k]))) k++;
-                    hit = (k == 8);
+            /* Parsed once: the list was matched as text, with a snprintf of
+             * the NID, on every call into a loaded PRX's export. s_only_n is -1
+             * until read, and 0 when unset (everything goes to the PRX). */
+            static int s_only_n = -1;
+            static uint32_t s_only[64];
+            int only_n = __atomic_load_n(&s_only_n, __ATOMIC_ACQUIRE);
+            if (only_n < 0) {
+                int n = 0;
+                const char* e = getenv("LIBSRE_LLE_ONLY");
+                for (const char* q = e; q && *q && n < 64; ) {
+                    char* end;
+                    const unsigned long v = strtoul(q, &end, 16);
+                    if (end == q) { q++; continue; }
+                    s_only[n++] = (uint32_t)v;
+                    q = end;
                 }
+                __atomic_store_n(&s_only_n, n, __ATOMIC_RELEASE);
+                only_n = n;
+            }
+            if (only_n > 0) {
+                int hit = 0;
+                for (int i = 0; i < only_n && !hit; i++) hit = s_only[i] == nid;
                 if (!hit) opd = 0;
                 else { static int _n = 0; if (_n++ < 8)
                     fprintf(stderr, "[LLE-ONLY] nid=0x%08X -> libsre\n", nid); }
