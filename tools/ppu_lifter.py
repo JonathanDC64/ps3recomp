@@ -3371,9 +3371,18 @@ class PPULifter:
         # DS_SHADOW_STACK is defined (emitted only for a --shadow-stack lift). The
         # backing storage (g_ds_sp/g_ds_stk) + ds_dump_shadow() live in the runtime
         # (ppu_loader.cpp) so they exist regardless; here we only declare/define the
-        # zero-cost guard the chunks emit per function.
+        # guard the chunks emit per function.
+        #
+        # Building with DS_NO_SHADOW_STACK defined compiles the guard out of a
+        # --shadow-stack lift, so one lift serves both a debugging build and a
+        # fast one. The guard is not free: a push and pop on thread-local
+        # storage, and an unwind cleanup, in every lifted function. Demon's
+        # Souls runs ~2.4% faster without it (Boletarian Palace, 104.4 ->
+        # 106.9 fps).
         if self.shadow_stack:
-            lines.append("#define DS_SHADOW_STACK 1")
+            lines.append("#ifndef DS_NO_SHADOW_STACK\n"
+                         "#define DS_SHADOW_STACK 1\n"
+                         "#endif")
         lines.append(
             "#ifdef DS_SHADOW_STACK\n"
             "#if defined(_MSC_VER)\n"
@@ -4327,7 +4336,9 @@ def main() -> None:
                              "thread-local guest call stack for a reliable backtrace "
                              "(ds_dump_shadow). For debugging use-before-construction "
                              "bugs where host/back-chain walks fail on tail calls. "
-                             "Adds per-call overhead; off by default (DS_FRAME no-op).")
+                             "Adds per-call overhead; off by default (DS_FRAME no-op). "
+                             "Compiling with DS_NO_SHADOW_STACK defined turns it off "
+                             "again without a new lift.")
     args = parser.parse_args()
 
     override_funcs: dict[int, str] = {}
