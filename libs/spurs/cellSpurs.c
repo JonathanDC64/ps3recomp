@@ -1086,10 +1086,30 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * step waited forever for a task that was never started.
      * ponytail: s_tasks[] is shared by every taskset and now only records the
      * last task per slot id -- enough for JoinTask2's lookup; key it by
-     * (taskset, id) if a title joins tasks in two tasksets at once. */
+     * (taskset, id) if a title joins tasks in two tasksets at once.
+     *
+     * The id is CLAIMED here, its enabled bit set in the same transaction that
+     * found it clear. SPU code takes ids from this bitset too, with a PUTLLC
+     * (spu_taskset_line_written), and a plain read here left the id free until
+     * spurs_taskset_add_task set the bit after writing task_info. Demon's
+     * Souls' HighGraphics creates its two tasks while the first one's SPU
+     * thread is already creating its own child: both took id 1 and their
+     * task_info writes interleaved -- the second task's ELF with the child's
+     * argument. That task worked the wrong half of the draw list, the other
+     * half was never reported done, and HighGraphics waited on its queue
+     * forever (the picture froze, the music played on). spu_coh_rmw32 runs
+     * under the lock-line lock and fails the SPU's reservation, so its PUTLLC
+     * retries and finds the id taken. */
     u32 free_slot = CELL_SPURS_MAX_TASK;
-    for (u32 t = 0; t < CELL_SPURS_MAX_TASK; t++)
-        if (!(vm_read8(taskset_ea + 0x30 + t / 8) & (0x80u >> (t % 8)))) { free_slot = t; break; }
+    for (u32 w = 0; w < CELL_SPURS_MAX_TASK / 32 && free_slot == CELL_SPURS_MAX_TASK; w++) {
+        const uint32_t word_ea = taskset_ea + 0x30 + w * 4;
+        uint32_t cur;
+        while ((cur = vm_read32(word_ea)) != 0xFFFFFFFFu) {
+            const uint32_t bit = (uint32_t)__builtin_clz(~cur);   /* first clear id, MSB = lowest */
+            const uint32_t mask = 0x80000000u >> bit;
+            if (!(spu_coh_rmw32(word_ea, mask, 0) & mask)) { free_slot = w * 32 + bit; break; }
+        }
+    }
     if (free_slot < CELL_SPURS_MAX_TASK) {
         u32 i = free_slot;
         {
