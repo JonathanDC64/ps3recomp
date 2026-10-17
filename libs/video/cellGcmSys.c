@@ -705,6 +705,12 @@ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
 #endif
+#ifdef _WIN32
+#define GCM_ANY_PENDING()    (s_gcm_pending != 0 || s_user_pending != 0)
+#else
+#define GCM_ANY_PENDING()    (atomic_load_explicit(&s_gcm_pending, memory_order_relaxed) != 0 || \
+                              atomic_load_explicit(&s_user_pending, memory_order_relaxed) != 0)
+#endif
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
@@ -737,9 +743,16 @@ void cellGcm_request_tick(void)
  * claim-and-deliver sequence across threads: an HLE boundary and a host ticker
  * may both pump, and newer causes must not overtake already claimed callbacks.
  * A nonblocking guard also prevents nested callbacks from reentering. Leave
- * pending notifications untouched when another pump is active. */
+ * pending notifications untouched when another pump is active.
+ *
+ * Every HLE call pumps, and almost always nothing is pending. Look first with
+ * plain loads: the guard and the two takes are locked writes to lines every
+ * guest thread shares, a few hundred thousand times a second in Demon's
+ * Souls. A tick set just after the look is delivered at the next boundary,
+ * as one set just after a take always was. */
 void ppu_gcm_pump(void)
 {
+    if (!GCM_ANY_PENDING()) return;
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
     u64 user = GCM_USER_PENDING_TAKE();

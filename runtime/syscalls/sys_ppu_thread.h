@@ -51,7 +51,8 @@ typedef struct ppu_thread_info {
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
-    uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    void*        prof_ra;      /* host return address of the last syscall/HLE
+                                * call; ppu_thread_prof_pc names its guest fn */
 
 #ifdef _WIN32
     HANDLE       host_thread;

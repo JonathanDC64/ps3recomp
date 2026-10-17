@@ -294,19 +294,28 @@ unsigned long long ppu_thread_cpu_us(unsigned tid)
     (void)tid; return 0;
 #endif
 }
-/* Last syscall/HLE callsite of guest thread `tid` (see prof_pc). */
+/* The guest function that holds host address ra (ppu_loader.cpp). Weak: not
+ * every program that links the runtime links the loader. */
+extern __attribute__((weak)) uint32_t ppu_prof_resolve_host(void* ra);
+
+static unsigned prof_resolve(void* ra)
+{
+    return (ra && ppu_prof_resolve_host) ? ppu_prof_resolve_host(ra) : 0;
+}
+
+/* Last syscall/HLE callsite of guest thread `tid` (see prof_ra). */
 unsigned ppu_thread_prof_pc(unsigned tid)
 {
     if (tid < 2 || tid > PPU_THREAD_MAX) return 0;
     ppu_thread_info* t = &g_ppu_threads[tid - 1];
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
-    return t->prof_pc;
+    return prof_resolve(t->prof_ra);
 }
 
 /* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
  * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
  * iterate guest threads without depending on ppu_thread_info's layout. */
-static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+static void* s_prof_main_ra = NULL;   /* main guest thread: ctx lives outside the table */
 
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
@@ -315,29 +324,30 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
     if (idx == 0 && t->state == PPU_THREAD_STATE_FREE) {
         /* slot 0 stays FREE (the main thread never registers) -- serve its
          * dispatcher breadcrumb here so the profiler sees tid 1. */
-        *tid = 1; *cia = s_prof_main_pc; *name = "main";
-        return s_prof_main_pc != 0;
+        *tid = 1; *cia = prof_resolve(s_prof_main_ra); *name = "main";
+        return *cia != 0;
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
     *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    *cia  = prof_resolve(t->prof_ra);
+    if (!*cia) *cia = (unsigned)t->ctx.cia;
     *name = t->name;
     return 1;
 }
 
-/* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
-void ppu_prof_stamp(void* vctx, unsigned lr)
+/* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx) and
+ * the dispatcher's host return address. This runs on every syscall and HLE
+ * call, so it only stores the address: naming the guest function (a binary
+ * search of every lifted function) waits until someone reads it. */
+void ppu_prof_stamp(void* vctx, void* ra)
 {
     /* container-of: every dispatched ctx is embedded in its ppu_thread_info */
     char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
     ppu_thread_info* t = (ppu_thread_info*)p;
-    int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (_n++ < 0)
-        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
-                vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
-        t->prof_pc = lr;
+    if (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX)
+        t->prof_ra = ra;
+    else
+        s_prof_main_ra = ra;
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)
