@@ -83,6 +83,7 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+static volatile long s_host_hold;   /* cellPad_set_host_hold */
 
 /* Pressure values for hosts with digital buttons: 0 or 255. */
 static void pad_press_from_buttons(PadHostState* hs)
@@ -489,6 +490,19 @@ static void pad_poll_backend(void)
 #ifdef _WIN32
     pad_poll_keyboard();
 #endif
+    if (s_host_hold)
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            PadHostState* hs = &s_host_state[i];
+            const int connected = hs->connected;
+            memset(hs, 0, sizeof *hs);
+            hs->connected = connected;
+            hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+        }
+}
+
+void cellPad_set_host_hold(int hold)
+{
+    s_host_hold = hold ? 1 : 0;
 }
 
 /* ---------------------------------------------------------------------------

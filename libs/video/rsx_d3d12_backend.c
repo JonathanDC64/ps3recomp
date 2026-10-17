@@ -690,8 +690,18 @@ static void session_lock_init(HWND hwnd)
         fprintf(stderr, "[D3D12] session locked: rendering without presenting until unlock%c", 10);
 }
 
+/* rsx_d3d12_set_overlay. Set from one thread, read by the window and render
+ * threads: the hooks are swapped in whole and then flagged. */
+static rsx_d3d12_overlay s_overlay;
+static volatile long     s_overlay_on;
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (s_overlay_on && s_overlay.wndproc) {
+        long long r = 0;
+        if (s_overlay.wndproc(s_overlay.user, hwnd, msg, (unsigned long long)wp, (long long)lp, &r))
+            return (LRESULT)r;
+    }
     switch (msg) {
     case WM_WTSSESSION_CHANGE:
         if (wp == WTS_SESSION_LOCK)   InterlockedExchange(&s_session_locked, 1);
@@ -705,7 +715,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
+        if (wp == VK_ESCAPE && !s_overlay_on) {
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
@@ -8515,6 +8525,9 @@ skip_dump_consider: ;
           if (!said++) printf("[D3D12] RSX_VSYNC=0: tearing is not supported on this system; presenting with vsync\n");
       }
       const int tear = !vsync && s_d3d.tearing;
+      if (s_present_this_frame && s_overlay_on && s_overlay.frame)
+          s_overlay.frame(s_overlay.user, s_d3d.render_targets[s_d3d.frame_index], s_d3d.frame_index,
+                          s_d3d.width, s_d3d.height);
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
           s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1,
                                             tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
@@ -11306,6 +11319,21 @@ void rsx_d3d12_backend_shutdown(void)
     printf("[D3D12] Backend shut down\n");
 }
 
+void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay)
+{
+    InterlockedExchange(&s_overlay_on, 0);
+    if (overlay) {
+        s_overlay = *overlay;
+        InterlockedExchange(&s_overlay_on, 1);
+    }
+}
+void*    rsx_d3d12_device(void)       { return s_d3d.device; }
+void*    rsx_d3d12_queue(void)        { return s_d3d.cmd_queue; }
+void*    rsx_d3d12_hwnd(void)         { return s_d3d.hwnd; }
+void*    rsx_d3d12_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.render_targets[i] : NULL; }
+unsigned rsx_d3d12_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
+unsigned rsx_d3d12_back_buffer_format(void) { return (unsigned)DXGI_FORMAT_R8G8B8A8_UNORM; }
+
 int rsx_d3d12_backend_pump_messages(void)
 {
     MSG msg;
@@ -11483,6 +11511,7 @@ int rsx_d3d12_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int m
 
 #include <ps3emu/ps3types.h>   /* u32 (header includes above are inside the _WIN32 guard) */
 #include <stdio.h>
+#include "rsx_d3d12_backend.h"   /* rsx_d3d12_overlay */
 
 /* Stub for non-Windows — D3D12 is Windows-only */
 int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
@@ -11494,5 +11523,12 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay) { (void)overlay; }
+void*    rsx_d3d12_device(void) { return NULL; }
+void*    rsx_d3d12_queue(void) { return NULL; }
+void*    rsx_d3d12_hwnd(void) { return NULL; }
+void*    rsx_d3d12_back_buffer(unsigned i) { (void)i; return NULL; }
+unsigned rsx_d3d12_back_buffer_count(void) { return 0; }
+unsigned rsx_d3d12_back_buffer_format(void) { return 0; }
 
 #endif /* _WIN32 */
