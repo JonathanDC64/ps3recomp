@@ -191,7 +191,7 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
     ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
 }
 
-extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" void ppu_prof_stamp(void* ctx, void* ra);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 /* Exit-on-condition for test runs: a probe asks one question, and once the
@@ -370,7 +370,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
-    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+    ppu_prof_stamp(ctx, __builtin_return_address(0));
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *

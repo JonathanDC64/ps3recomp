@@ -2323,7 +2323,10 @@ static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
 {
-    if (!g_inv_n) {
+    /* Built once, on the first call: a function-local static's initializer
+     * runs exactly once even when threads race to it (the first caller used
+     * to be the HLE dispatcher at boot; now it is whoever reads first). */
+    static const bool s_built = [] {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
             if (g_fn[i]) { g_inv[g_inv_n].host = (void*)g_fn[i]; g_inv[g_inv_n].guest = g_addr[i]; g_inv_n++; }
         /* insertion-sort-free: qsort by host ptr */
@@ -2333,8 +2336,10 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
                   const void* hb = ((decltype(&g_inv[0]))b)->host;
                   return ha < hb ? -1 : (ha > hb ? 1 : 0);
               });
-        if (!g_inv_n) return 0;
-    }
+        return true;
+    }();
+    (void)s_built;
+    if (!g_inv_n) return 0;
     /* greatest host fn <= ra */
     uint32_t lo = 0, hi = g_inv_n;
     while (lo < hi) { uint32_t mid = (lo + hi) / 2;
@@ -3317,7 +3322,7 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
-extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" void ppu_prof_stamp(void* ctx, void* ra);
 /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
@@ -3449,7 +3454,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
-    ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+    ppu_prof_stamp(ctx, __builtin_return_address(0));
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */
