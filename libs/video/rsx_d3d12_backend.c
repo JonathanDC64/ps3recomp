@@ -342,6 +342,7 @@ typedef struct {
     ID3D12Device*              device;
     ID3D12CommandQueue*        cmd_queue;
     IDXGISwapChain3*           swap_chain;
+    int                        tearing;   /* swap chain made with ALLOW_TEARING */
     ID3D12DescriptorHeap*      rtv_heap;
     u32                        rtv_descriptor_size;
     ID3D12Resource*            render_targets[FRAME_COUNT];
@@ -868,6 +869,24 @@ static int init_d3d12(u32 width, u32 height)
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sc_desc.BufferCount = FRAME_COUNT;
     sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    /* A windowed flip-model swap chain presenting with sync interval 0 is
+     * still paced by the compositor at the display's refresh unless it may
+     * tear: the swap chain has to be made with ALLOW_TEARING and each such
+     * Present pass DXGI_PRESENT_ALLOW_TEARING (RSX_VSYNC=0 below). Asked once;
+     * a system without it (no variable refresh support in the driver or OS)
+     * presents with vsync. */
+    {
+        IDXGIFactory5* f5 = NULL;
+        BOOL allow = FALSE;
+        if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, &IID_IDXGIFactory5, (void**)&f5))) {
+            if (FAILED(f5->lpVtbl->CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                       &allow, sizeof allow)))
+                allow = FALSE;
+            f5->lpVtbl->Release(f5);
+        }
+        s_d3d.tearing = allow ? 1 : 0;
+        if (allow) sc_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
 
     IDXGISwapChain1* swap_chain1 = NULL;
     hr = factory->lpVtbl->CreateSwapChainForHwnd(
@@ -8093,13 +8112,21 @@ skip_dump_consider: ;
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
       /* RSX_VSYNC (live, default 1): 0 presents without waiting for the
-       * display's refresh. The flip-model window does not tear; the
-       * compositor shows the newest frame. The title's own vblank stays the
-       * frame limit, so a game set above the display's rate is not held to it. */
+       * display's refresh, with tearing, so the title's own vblank is the
+       * frame limit and a game set above the display's rate is not held to
+       * it. Without tearing support (swap chain creation above) a sync
+       * interval of 0 would still be paced at the refresh by the compositor,
+       * so it presents with vsync and says so once. */
       static int vsync = -1;
       PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
+      if (!vsync && !s_d3d.tearing) {
+          static int said = 0;
+          if (!said++) printf("[D3D12] RSX_VSYNC=0: tearing is not supported on this system; presenting with vsync\n");
+      }
+      const int tear = !vsync && s_d3d.tearing;
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
-          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, vsync ? 1 : 0, 0);
+          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1,
+                                            tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       RSX_MARK("present", s_present_this_frame, 0); }
