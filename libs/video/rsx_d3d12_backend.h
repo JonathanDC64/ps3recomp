@@ -56,7 +56,10 @@ void rsx_d3d12_backend_present(void);
  * wndproc: called first for every message the game window receives, on the
  *   window's own thread (RSX_WINDOW_THREAD=0: the thread that pumps
  *   messages). Return nonzero to consume it (*result is then the window
- *   procedure's return value).
+ *   procedure's return value). Consuming WM_CLOSE keeps the window open (to
+ *   ask first); the backend's own close at shutdown is not passed to it.
+ *   The window is per-monitor DPI aware: an overlay sizes its text by the
+ *   window's DPI (GetDpiForWindow), not by the window's size.
  * frame: called on the render thread once per presented frame, after the
  *   frame's command list has been submitted and before Present. back_buffer
  *   is the ID3D12Resource about to be presented, in the PRESENT state, at

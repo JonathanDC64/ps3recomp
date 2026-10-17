@@ -739,6 +739,8 @@ static void set_borderless(HWND hwnd, int on)
     s_borderless = !!on;
 }
 
+static int window_dpi(HWND hwnd);
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {   /* before the overlay: the frame's own business */
@@ -749,11 +751,18 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_RSX_BORDERLESS:
         set_borderless(hwnd, (int)wp);
         return 0;
-    case WM_GETMINMAXINFO: {   /* a client area of at least 640x360: below that an overlay's text overlaps */
-        RECT r = {0, 0, 640, 360};
+    case WM_GETMINMAXINFO: {   /* a client area of at least 640x360 (at the display's scale): below that an overlay's text overlaps */
+        const int dpi = window_dpi(hwnd);
+        RECT r = {0, 0, MulDiv(640, dpi, 96), MulDiv(360, dpi, 96)};
         AdjustWindowRect(&r, (DWORD)GetWindowLongA(hwnd, GWL_STYLE), FALSE);
         ((MINMAXINFO*)lp)->ptMinTrackSize.x = r.right - r.left;
         ((MINMAXINFO*)lp)->ptMinTrackSize.y = r.bottom - r.top;
+        return 0;
+    }
+    case WM_DPICHANGED: {      /* moved to a display of another scale: take the size Windows suggests */
+        const RECT* r = (const RECT*)lp;
+        SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
     }
     case WM_SYSKEYDOWN:
@@ -805,6 +814,46 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+/* The window is per-monitor DPI aware, so it is drawn at the display's own
+ * resolution (not stretched by Windows on a display scaled above 100%) and an
+ * overlay can size its text by the display's scale (rsx_d3d12_overlay). Its
+ * first size is the title's at that scale. Loaded by name: these arrived in
+ * Windows 10 1607/1703, and dwmapi is not otherwise linked. */
+typedef BOOL (WINAPI *set_dpi_ctx_fn)(HANDLE);
+typedef UINT (WINAPI *dpi_fn)(HWND);
+typedef UINT (WINAPI *sys_dpi_fn)(void);
+typedef HRESULT (WINAPI *dwm_attr_fn)(HWND, DWORD, LPCVOID, DWORD);
+
+static int window_dpi(HWND hwnd)
+{
+    static dpi_fn get_dpi;
+    static int looked;
+    if (!looked) { get_dpi = (dpi_fn)(void*)GetProcAddress(GetModuleHandleA("user32.dll"), "GetDpiForWindow"); looked = 1; }
+    const UINT dpi = get_dpi && hwnd ? get_dpi(hwnd) : 0;
+    return dpi ? (int)dpi : 96;
+}
+
+static int dpi_aware(void)
+{
+    HMODULE u = GetModuleHandleA("user32.dll");
+    set_dpi_ctx_fn set_ctx = (set_dpi_ctx_fn)(void*)GetProcAddress(u, "SetProcessDpiAwarenessContext");
+    sys_dpi_fn sys_dpi = (sys_dpi_fn)(void*)GetProcAddress(u, "GetDpiForSystem");
+    if (set_ctx) set_ctx((HANDLE)(intptr_t)-4);   /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+    const UINT dpi = sys_dpi ? sys_dpi() : 0;
+    return dpi ? (int)dpi : 96;
+}
+
+/* A dark title bar, as dark-themed programs have (RSX_DARK_TITLE=0: the
+ * system's). DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Windows 10 20H1 and later). */
+static void dark_title(HWND hwnd)
+{
+    if (!ps3_env_int("RSX_DARK_TITLE", 1)) return;
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    dwm_attr_fn set_attr = dwm ? (dwm_attr_fn)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute") : NULL;
+    const BOOL on = TRUE;
+    if (set_attr) set_attr(hwnd, 20, &on, sizeof on);
+}
+
 static HWND create_window(u32 width, u32 height, const char* title)
 {
     WNDCLASSEXA wc = {0};
@@ -816,18 +865,46 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
+    const int dpi = dpi_aware();
+    int cw = MulDiv((int)width, dpi, 96), ch = MulDiv((int)height, dpi, 96);
+    /* Centred in the primary display's work area, and made smaller (same
+     * shape) if it would not fit there. */
+    MONITORINFO mi = {sizeof mi};
+    const POINT origin = {0, 0};
+    const int have_area = GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi);
+    RECT wr = {0, 0, cw, ch};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    if (have_area) {
+        const int aw = mi.rcWork.right - mi.rcWork.left, ah = mi.rcWork.bottom - mi.rcWork.top;
+        const int fw = (wr.right - wr.left) - cw, fh = (wr.bottom - wr.top) - ch;   /* the frame */
+        if (cw + fw > aw || ch + fh > ah) {
+            const int sw = aw - fw, sh = ah - fh;
+            if ((long long)sw * ch < (long long)sh * cw) { ch = MulDiv(ch, sw, cw); cw = sw; }
+            else { cw = MulDiv(cw, sh, ch); ch = sh; }
+            wr.left = 0; wr.top = 0; wr.right = cw; wr.bottom = ch;
+            AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        }
+    }
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    if (have_area) {
+        x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - (wr.right - wr.left)) / 2;
+        y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - (wr.bottom - wr.top)) / 2;
+    }
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-    return CreateWindowExA(
+    HWND hwnd = CreateWindowExA(
         0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
+        WS_OVERLAPPEDWINDOW,
+        x, y,
         wr.right - wr.left, wr.bottom - wr.top,
         NULL, NULL, GetModuleHandle(NULL), NULL);
+    if (hwnd) {   /* the title bar's colour before the window first shows */
+        dark_title(hwnd);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+    }
+    return hwnd;
 }
 
 /* The window lives on a thread of its own that does nothing but pump its
@@ -11644,6 +11721,7 @@ void rsx_d3d12_backend_shutdown(void)
 
     /* A window belongs to the thread that made it: the window thread
      * destroys its own and then leaves its message loop. */
+    InterlockedExchange(&s_overlay_on, 0);   /* (its device is gone; and this close must not ask first) */
     if (s_d3d.hwnd) {
         if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
         else DestroyWindow(s_d3d.hwnd);
