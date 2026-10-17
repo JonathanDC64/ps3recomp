@@ -200,6 +200,11 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Host input hold, for a wrapper UI that has the input: while set, every host
+ * port reads as connected with nothing pressed and the sticks centred.
+ * Scripted input (PAD_FILE, PAD_STICK, ...) still applies. */
+void cellPad_set_host_hold(int hold);
+
 #ifdef __cplusplus
 }
 #endif
