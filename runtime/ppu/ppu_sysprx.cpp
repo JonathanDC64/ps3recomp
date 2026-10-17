@@ -107,7 +107,9 @@ static void sys_process_is_stack(ppu_context* ctx)
  * unregistered context (bug); stamp a sentinel that matches no real thread. */
 #define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
 
-static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
+struct LwmSlot;
+static LwmSlot* lwm_slot(uint32_t addr);   /* fwd (defined below) */
+static void lwm_release(LwmSlot* s);
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -125,7 +127,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
-    { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
+    { LwmSlot* s = lwm_slot(lwm); if (s) lwm_release(s); }
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
@@ -138,18 +140,68 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * stamp -- Twisted Metal's FIOS layer then freed one block from two threads
  * and its dlmalloc free() aborted on a chunk already merged into top.
  *
- * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
+ * Backed by a binary semaphore, not a CRITICAL_SECTION: a CS may only be
  * released by its owning thread, but guest code passes lwmutex ownership
  * between threads (LBP's job system) and threads exit while holding -- one
  * cross-thread unlock silently failed and the still-owned CS parked the next
  * locker forever (the Network-node hang). A semaphore releases from any
  * thread. Recursion is handled explicitly via the guest owner/recur fields
  * we stamp (only the holder ever writes owner=self, so the re-lock check is
- * race-free). Keyed by guest address in an open-addressed table. */
+ * race-free). Keyed by guest address in an open-addressed table.
+ *
+ * The semaphore is a count in the slot: taken with one compare-exchange, and
+ * only a contended lock sleeps (on the slot's condition variable), as liblv2
+ * does on the console. It was a kernel semaphore, and every lock and unlock a
+ * system call, waited on or not: Demon's Souls' HighGraphics thread makes
+ * ~90,000 of each a second, ~0.4 us apiece, 7% of the thread the frame
+ * waits on. */
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem;
+static struct LwmSlot { volatile long addr;
+    volatile long cnt;               /* 1 free, 0 taken */
+    volatile long waiters;           /* lockers asleep on cv, or about to be */
+    SRWLOCK lk; CONDITION_VARIABLE cv;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
+static inline int lwm_try(LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
+/* Take the count, waiting up to ms (INFINITE: forever). 1 if taken. */
+static int lwm_wait(LwmSlot* s, DWORD ms)
+{
+    for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
+        if (s->cnt && lwm_try(s)) return 1;
+        YieldProcessor();
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    int got = 0;
+    AcquireSRWLockExclusive(&s->lk);
+    InterlockedIncrement(&s->waiters);      /* before the retry: see lwm_release */
+    for (;;) {
+        if (lwm_try(s)) { got = 1; break; }
+        DWORD w = INFINITE;
+        if (ms != INFINITE) {
+            const ULONGLONG el = GetTickCount64() - t0;
+            if (el >= ms) break;
+            w = (DWORD)(ms - el);
+        }
+        SleepConditionVariableSRW(&s->cv, &s->lk, w, 0);
+    }
+    InterlockedDecrement(&s->waiters);
+    ReleaseSRWLockExclusive(&s->lk);
+    return got;
+}
+/* Give the count back, from any thread. Over-release of a free mutex leaves
+ * it free, as the kernel semaphore's max count of 1 did. A locker counts
+ * itself a waiter under lk before its last try, and the exchange is a full
+ * barrier: either it sees the count, or this sees it and wakes it, under lk
+ * so the wake cannot fall between its try and its sleep. */
+static void lwm_release(LwmSlot* s)
+{
+    InterlockedExchange(&s->cnt, 1);
+    if (s->waiters) {
+        AcquireSRWLockExclusive(&s->lk);
+        ReleaseSRWLockExclusive(&s->lk);
+        WakeConditionVariable(&s->cv);
+    }
+}
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }
@@ -177,23 +229,23 @@ static struct LwmSlot* lwm_find(uint32_t addr){
         if(cur==0) return nullptr; }
     return nullptr;
 }
-static HANDLE lwm_sem(uint32_t addr)
+static LwmSlot* lwm_slot(uint32_t addr)
 {
     if (!addr) return nullptr;
     uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
     for (uint32_t i = 0; i < LWM_HASH; i++) {
         uint32_t idx = (h + i) & (LWM_HASH - 1);
         long cur = g_lwm[idx].addr;
-        if ((uint32_t)cur == addr) return g_lwm[idx].sem;
+        if ((uint32_t)cur == addr) return &g_lwm[idx];
         if (cur == 0) {
             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
-            HANDLE r = nullptr;
+            LwmSlot* r = nullptr;
             if (g_lwm[idx].addr == 0) {
-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
+                g_lwm[idx].cnt = 1;             /* free */
                 g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
-                r = g_lwm[idx].sem;
+                r = &g_lwm[idx];
             } else if ((uint32_t)g_lwm[idx].addr == addr) {
-                r = g_lwm[idx].sem;
+                r = &g_lwm[idx];
             }
             _InterlockedExchange(&g_lwm_tab_lock, 0);
             if (r) return r;
@@ -216,7 +268,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
      * contended lock yields to other threads instead of hard-blocking). We had
      * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
     uint64_t timeout_us = ctx->gpr[4];
-    HANDLE s = lwm_sem(lwm);
+    LwmSlot* s = lwm_slot(lwm);
     if (s) {
         /* Recursive re-lock by the current holder: bump the count, no wait.
          * Only the holder ever stamps owner=self, so this check is race-free. */
@@ -225,7 +277,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             ctx->gpr[3] = 0;
             return;
         }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
+        if (!lwm_try(s)) {
             /* Contended: log who we're stuck behind (owner stamped at acquire),
              * then block. Bounded diagnostics for park hunts; uncapped while the
              * probe window is open (g_nd_inpump). */
@@ -240,8 +292,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
-            DWORD wr = WaitForSingleObject(s, ms);
-            if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
+            if (!lwm_wait(s, ms)) {             /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
@@ -261,14 +312,14 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
 {
     uint32_t lwm = (uint32_t)ctx->gpr[3];
     uint32_t self = LWM_SELF(ctx);
-    HANDLE s = lwm_sem(lwm);
+    LwmSlot* s = lwm_slot(lwm);
     if (s) {
         if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
             vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
             ctx->gpr[3] = 0;
             return;
         }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
+        if (!lwm_try(s)) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
     }
     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
     vm_write32(lwm + LWM_OWNER, self);
@@ -313,11 +364,11 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
                 fprintf(stderr, "%s\n", b); fflush(stderr);
             }
             sl->holder = 0; } }
-    HANDLE s = lwm_sem(lwm);
-    /* Semaphore release works from ANY thread (unlike a CS) -- guest code
-     * hands lwmutex ownership across threads. Over-release (unlock of a free
-     * mutex) fails harmlessly at the max count of 1. */
-    if (s) ReleaseSemaphore(s, 1, NULL);
+    LwmSlot* s = lwm_slot(lwm);
+    /* Release works from ANY thread (unlike a CS) -- guest code hands
+     * lwmutex ownership across threads. Over-release (unlock of a free
+     * mutex) leaves it free (lwm_release). */
+    if (s) lwm_release(s);
     ctx->gpr[3] = 0;
 }
 
@@ -350,15 +401,15 @@ static void sys_lwcond_wait(ppu_context* ctx)
 {
     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex = (uint32_t)vm_read64(lwcond + 0x00);
-    HANDLE s = lwm_sem(lwmutex);
+    LwmSlot* s = lwm_slot(lwmutex);
     if (s) {
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
-        ReleaseSemaphore(s, 1, NULL);
+        lwm_release(s);
         Sleep(1);
-        WaitForSingleObject(s, INFINITE);
+        lwm_wait(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
