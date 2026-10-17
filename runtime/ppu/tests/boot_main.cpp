@@ -70,6 +70,12 @@ void     ps3_load_prx_modules(void) {}
  * lifted function table is registered, so it may re-register addresses. */
 void     ps3_title_options_init(void) __attribute__((weak));
 void     ps3_title_options_init(void) {}
+/* Optional hook: a title's startup work (filling the shader cache, say), run
+ * with the window open, after the frame clock starts and before the guest
+ * does. The ticker presents frames until the guest's first flip, so an
+ * overlay can show progress meanwhile. Weak default is a no-op. */
+void     ps3_title_prework(void) __attribute__((weak));
+void     ps3_title_prework(void) {}
 }
 
 #include <string.h>
@@ -2115,6 +2121,7 @@ int main(int argc, char** argv)
                        CreateThread(NULL, 0, debug_console, dbgpath, 0, NULL); } }   /* tlhelp32-based */
 #endif
 
+    ps3_title_prework();   /* the title's startup work, the window open (weak no-op by default) */
     ps3_ms("boot:entry");
 #ifdef _WIN32
     { extern void ps3_sampler_start(void); ps3_sampler_start(); } /* PS3_SAMPLE=<ms> */
