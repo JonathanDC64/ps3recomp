@@ -2714,8 +2714,60 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* The call itself, as ps3_indirect_call_impl makes it once the target is a
+ * lifted function: the recursion depth, the vcall stack, the call and the
+ * tail-call trampolines it leaves behind. */
+static PPU_THREAD_LOCAL int s_icall_depth = 0;
+static inline void icall_run(ppu_context* ctx, uint32_t addr, ppu_fn fn)
+{
+    s_icall_depth++;
+    if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+    g_vcall_sp++;
+    fn(ctx);
+    while (g_trampoline_fn) {
+        void (*tf)(void*) = g_trampoline_fn;
+        g_trampoline_fn = 0;
+        tf(ctx);
+    }
+    if (g_vcall_sp > 0) g_vcall_sp--;
+    s_icall_depth--;
+}
+
+/* Every variable that changes what an indirect call does besides calling its
+ * target. ps3_indirect_call_impl tests each of them, one static at a time, on
+ * every call -- ~2.5% of Demon's Souls' HighGraphics, which makes most of the
+ * calls. While none is set, a call to a lifted function skips them all; the
+ * set is read again when the console changes a variable (ps3_env_gen). */
+static int g_icall_diag = 1;
+static unsigned g_icall_diag_gen = ~0u;
+static int icall_diag_load(void)
+{
+    static const char* const names[] = {
+        "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
+        "PS3_CALLTRACE", "PS3_CALLTRACE_LR", "PS3_CALLTRACE_TO", "PS3_CALLTRACE_FROM",
+        "PS3_CALLTRACE_R5", "FLOW_FORCE_RTCFG", "SPURS_TRACE", "PS3_PRX_CALLTRACE",
+        "PPU_TOCFIX", "PPU_RETWATCH",
+    };
+    const unsigned gen = ps3_env_gen;
+    int d = 0;
+    for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
+        if (getenv(names[i])) d = 1;
+    g_icall_diag = d;
+    g_icall_diag_gen = gen;
+    return d;
+}
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
+    if ((g_icall_diag_gen == ps3_env_gen ? g_icall_diag : icall_diag_load()) == 0) {
+        const uint32_t addr = (uint32_t)ctx->ctr;
+        const ppu_fn fn = addr ? ppu_lookup(addr) : nullptr;
+        if (fn && s_icall_depth <= 4000) {
+            g_active_ctx = ctx;
+            icall_run(ctx, addr, fn);
+            return;
+        }
+    }
     static int on = -1;
     PS3_KNOB(on, getenv("PPU_CSCHECK") ? 1 : 0);
     { static int hg = -1; PS3_KNOB(hg, getenv("PS3_ICALL_GATE") ? 1 : 0);
@@ -3015,7 +3067,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
          * and blow the host stack. Cap the depth, log once, then unwind. */
-        static thread_local int s_depth = 0;
+        int& s_depth = s_icall_depth;
         if (s_depth > 4000) {
             static int warned = 0;
             if (warned++ < 8)
