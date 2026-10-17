@@ -267,8 +267,17 @@ typedef struct spu_context {
      * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
      * FAIL if the reserved 128-byte line changed since GETLLAR, or concurrent
      * claims corrupt the queue. */
+    /* On a cache line of their own (the padding, as contexts are malloc'd or
+     * on a stack without the alignment): every PPU store into a reserved line
+     * reads them in spu_coh_notify_write, and the fields around them -- the
+     * MFC staging registers, the tag status, atomic_stat -- are written by
+     * their SPU many times per DMA. Demon's Souls' HighGraphics stores to
+     * its ring's line ~4.4 million times a second, and each notify pulled
+     * the line back from the ring consumer's core. */
+    uint8_t  resv_pad0[64];
     uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
     int      resv_valid;
+    uint8_t  resv_pad1[64];
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
