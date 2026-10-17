@@ -205,8 +205,8 @@ static void test_putllc_breaks_peer(void)
 /* A PUTLLC that writes back the bytes its GETLLAR read: the HighGraphics ring
  * consumer in Demon's Souls issues one per command. It succeeds while the
  * reservation is held, and fails after any store into the line -- including
- * one that put the same bytes back, as hardware fails it -- so the runtime can
- * decide it from the reservation without reading the line. */
+ * one that put the same bytes back, as hardware fails it, and a raw store
+ * that clears no reservation (the lifted PPU's stvx and dcbz). */
 static void test_noop_putllc(void)
 {
     reset_pair();
@@ -243,6 +243,17 @@ static void test_noop_putllc(void)
     spu_put(&g_b, LSA_B, LINE_A, 128);
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
     CHECK_EQ_U32(g_a.atomic_stat, 1);
+
+    /* The Demon's Souls freeze: the HighGraphics ring producer's command
+     * landed this way, the consumer's no-op PUTLLC succeeded on its stale
+     * snapshot, and the entry was never read. */
+    TEST("a no-op PUTLLC after a store that clears no reservation fails");
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    memset(&g_guest_mem[LINE_A + 48], 0xD0, 16);   /* a lifted stvx: a raw memcpy */
+    CHECK(g_a.resv_valid == 1);
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 1);
+    CHECK_EQ_U32(g_guest_mem[LINE_A + 63], 0xD0);   /* the PUTLLC wrote nothing back */
 }
 
 /* A PUTLLC that fails its own compare stored nothing, so there is nothing to
