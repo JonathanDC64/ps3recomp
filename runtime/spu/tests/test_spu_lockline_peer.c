@@ -202,6 +202,49 @@ static void test_putllc_breaks_peer(void)
     CHECK(mem_is(LINE_A, 0xB0, 128));
 }
 
+/* A PUTLLC that writes back the bytes its GETLLAR read: the HighGraphics ring
+ * consumer in Demon's Souls issues one per command. It succeeds while the
+ * reservation is held, and fails after any store into the line -- including
+ * one that put the same bytes back, as hardware fails it -- so the runtime can
+ * decide it from the reservation without reading the line. */
+static void test_noop_putllc(void)
+{
+    reset_pair();
+    memset(g_guest_mem + LINE_A, 0x5A, 128);
+
+    TEST("a no-op PUTLLC with nothing in between succeeds");
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 0);
+    CHECK(g_a.resv_valid == 0);
+    CHECK_EQ_U32(g_guest_mem[LINE_A + 7], 0x5A);
+
+    TEST("a no-op PUTLLC after a peer's commit fails and writes nothing");
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    spu_atomic(&g_b, LSA_B, LINE_A, MFC_GETLLAR_CMD);
+    stage(&g_b, LSA_B, 0xB0, 128);
+    spu_atomic(&g_b, LSA_B, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_b.atomic_stat, 0);
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 1);
+    CHECK(mem_is(LINE_A, 0xB0, 128));
+
+    TEST("a no-op PUTLLC after a peer's plain PUT fails");
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    stage(&g_b, LSA_B, 0xC0, 16);
+    spu_put(&g_b, LSA_B, LINE_A + 32, 16);
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 1);
+    CHECK(mem_is(LINE_A + 32, 0xC0, 16));
+
+    TEST("a no-op PUTLLC after a peer put the same bytes back fails");
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);
+    memcpy(&g_b.ls[LSA_B], &g_guest_mem[LINE_A], 128);
+    spu_put(&g_b, LSA_B, LINE_A, 128);
+    spu_atomic(&g_a, LSA_A, LINE_A, MFC_PUTLLC_CMD);
+    CHECK_EQ_U32(g_a.atomic_stat, 1);
+}
+
 /* A PUTLLC that fails its own compare stored nothing, so there is nothing to
  * report -- the peer keeps its reservation. */
 static void test_failed_putllc_is_quiet(void)
@@ -489,6 +532,7 @@ static void test_host_rmw_keeps_an_spu_commit(void)
 int main(void)
 {
     test_putllc_breaks_peer();
+    test_noop_putllc();
     test_failed_putllc_is_quiet();
     test_putlluc_breaks_peer();
     test_plain_put_breaks_peer();
