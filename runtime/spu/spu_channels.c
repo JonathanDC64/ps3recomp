@@ -1333,6 +1333,50 @@ static int spu_atomic_lean(spu_context* ctx, uint32_t cmd)
     return 1;
 }
 
+/* A GETLLAR of a line and, straight after it, a PUTLLC that writes the line
+ * back unchanged, as one step: for a native hook that stands in for lifted
+ * code issuing that pair (spu_lifter.py --native-block). The line lands in
+ * the local store at lsa, the reservation snapshot is taken, and the commit
+ * is applied as the no-op PUTLLC applies it when nothing was stored between
+ * the two: the reservation is dropped, the atomic status reads 0 and the
+ * line's commit hooks run. Returns 0, having done nothing, while an atomic
+ * diagnostic needs the two commands to take their own paths, or when the
+ * line cannot be read without the lock. */
+int spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea)
+{
+    extern uint32_t g_barrier_sync_watch;
+    if ((g_spu_atom_diag_gen == ps3_env_gen ? g_spu_atom_diag : spu_atom_diag_load()) ||
+        g_yz_lockstep_on || g_barrier_sync_watch)
+        return 0;
+    ea &= ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    if (!mfc_ea_range_committed(ea, MFC_ATOMIC_LINE)) return 0;
+    /* The line from one instant, as spu_getllar_read's lock-free read takes
+     * it: only a line marked reserved (every store into it takes its
+     * stripe), and no writer in its stripe across the copy; a few tries,
+     * as a writer holds a stripe only for a store. Otherwise the lifted
+     * GETLLAR takes it under the lock. */
+    long seq;
+    uint8_t line[MFC_ATOMIC_LINE];
+    if (!spu_coh_is_reserved(ea)) return 0;
+    for (int t = 0;; t++) {
+        if (spu_lockline_read_begin(ea, &seq)) {
+            memcpy(line, vm_base + ea, MFC_ATOMIC_LINE);
+            if (spu_lockline_read_ok(ea, seq)) break;
+        }
+        if (t == 7) return 0;
+        _mm_pause();
+    }
+    uint8_t* ls = &ctx->ls[lsa & SPU_LS_MASK];
+    memcpy(ls, line, MFC_ATOMIC_LINE);
+    memcpy(ctx->resv_line, line, MFC_ATOMIC_LINE);
+    ctx->resv_ea = ea;
+    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_SEQ_CST);
+    ctx->atomic_stat = 0;
+    spu_taskset_line_committed(ea);
+    if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea);
+    return 1;
+}
+
 /* The hot path. Demon's Souls' HighGraphics ring consumer (img 2) issues ~31
  * channel writes per 16-byte ring entry, ~20 million a second, and almost all
  * of them only latch a DMA parameter (LSA, EA, size, tag) for the MFC_Cmd that
