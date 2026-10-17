@@ -92,9 +92,11 @@ int      rsx_d3d12_borderless(void);
 /* Shader disk cache (PS3_SHADER_CACHE, default shader_cache beside the exe),
  * for filling it before a title runs (tools: rsx_shader_precompile).
  * rsx_d3d12_shader_hlsl builds the HLSL a draw would compile for one RSX
- * program (fragment: exp32 = SET_SHADER_CONTROL 32-bit exports, cube/d2c =
- * per-unit masks; vertex: vp_start_slot = the slot it is loaded at) and
- * returns its instruction count, <= 0 on failure. Not thread-safe.
+ * program (fragment 1: exp32 = SET_SHADER_CONTROL 32-bit exports, cube/d2c =
+ * per-unit masks; vertex, fragment 0: vp_start_slot = the slot it is loaded
+ * at; fragment 2: the same vertex program in fetch form, reading its vertex
+ * arrays itself, as the draws the GPU fetch path records use) and returns
+ * its instruction count, <= 0 on failure. Not thread-safe.
  * rsx_d3d12_shader_cache_put compiles that text into the cache: 1 = already
  * there, 2 = compiled, 0 = failed. Thread-safe. */
 int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
