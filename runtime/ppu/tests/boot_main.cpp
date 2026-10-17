@@ -1405,6 +1405,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  spu              SPU program runs per lifted image id%c", 10);
             dbg_printf("  ctx <tid>        a guest thread's live registers (lr = where it is parked)%c", 10);
             dbg_printf("  synchist <id> [n] cond/mutex history for an id (create, wait, signal, destroy)%c", 10);
+            dbg_printf("  synctop [n]       the busiest (id, op, thread, caller) in that history%c", 10);
             dbg_printf("  spuhist [img] [n] SPU task history (dispatch, start, end, signal, user events)%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
             dbg_printf("  poke32 <hex> <v> write a guest u32%c", 10);
@@ -1592,6 +1593,33 @@ static DWORD WINAPI debug_console(LPVOID param)
                 const sync_hist_ent* e = &g_sync_hist[hits[nh] & (SYNC_HIST_N - 1)];
                 dbg_printf("  t=%u %c id=0x%X tid=%u lr=0x%08X x=0x%X r=0x%08X%c", e->t_ms, e->op,
                            e->id, e->tid, e->lr, e->extra, (unsigned)e->res, 10);
+            }
+        } else if (!strcmp(verb, "synctop")) {
+            /* synctop [n]: the n (default 12) busiest (id, op, tid, lr) tuples
+             * in the sync-history ring, with the span it covers: which cond a
+             * thread waits on most, and who signals it, without knowing the id. */
+            unsigned want = 12; sscanf(cmd, "%*s %u", &want);
+            const long n = g_sync_hist_n;
+            const long lo = n > SYNC_HIST_N ? n - SYNC_HIST_N : 0;
+            enum { TN = 256 };
+            static struct { uint32_t id, tid, lr; uint8_t op; unsigned c; } t[TN];
+            unsigned nt = 0;
+            for (long i = lo; i < n; i++) {
+                const sync_hist_ent* e = &g_sync_hist[i & (SYNC_HIST_N - 1)];
+                unsigned k = 0;
+                while (k < nt && !(t[k].id == e->id && t[k].op == e->op && t[k].tid == e->tid && t[k].lr == e->lr)) k++;
+                if (k == nt) { if (nt == TN) continue; t[nt].id = e->id; t[nt].op = e->op;
+                               t[nt].tid = e->tid; t[nt].lr = e->lr; t[nt].c = 0; nt++; }
+                t[k].c++;
+            }
+            const uint32_t t0 = n > lo ? g_sync_hist[lo & (SYNC_HIST_N - 1)].t_ms : 0;
+            const uint32_t t1 = n > lo ? g_sync_hist[(n - 1) & (SYNC_HIST_N - 1)].t_ms : 0;
+            dbg_printf("  %ld events over %u ms%c", n - lo, t1 - t0, 10);
+            for (unsigned r = 0; r < want && r < nt; r++) {
+                unsigned b = r;
+                for (unsigned k = r + 1; k < nt; k++) if (t[k].c > t[b].c) b = k;
+                if (b != r) { const auto s = t[r]; t[r] = t[b]; t[b] = s; }
+                dbg_printf("  %7u %c id=0x%X tid=%u lr=0x%08X%c", t[r].c, t[r].op, t[r].id, t[r].tid, t[r].lr, 10);
             }
         } else if (!strcmp(verb, "spuhist")) {
             /* spuhist [image] [n]: the last n (default 60) SPU history events,
