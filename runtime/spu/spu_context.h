@@ -504,6 +504,29 @@ SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
+/* One gate in front of every LS debug probe, so an access with all of them
+ * off tests one global: it was three globals plus ctx->image_id/policy_mode
+ * on every read and two globals plus an address compare on every write, in
+ * the hottest code there is (image 2's lifted regions make ~40 LS accesses
+ * per SPU basic block). -1 until the first access reads the environment, then
+ * the SPU_LSDBG_* bits of the probes that are on, or 0. Read once: setting a
+ * probe takes a restart. SPU_WWS_PROBE=1 turns on the WWS buffer and code
+ * probes, which ran for every image-2 policy-module access before. */
+SPU_GATE int g_spu_ls_dbg = -1;
+#define SPU_LSDBG_LOWREAD 1
+#define SPU_LSDBG_WATCH   2
+#define SPU_LSDBG_SMC     4
+#define SPU_LSDBG_WWS     8
+static __attribute__((noinline, cold)) int spu_ls_dbg_resolve(void)
+{
+    const char* w = getenv("SPU_LS_WATCH");
+    const int v = (getenv("SPU_LS_LOWREAD") ? SPU_LSDBG_LOWREAD : 0) |
+                  (w && *w ? SPU_LSDBG_WATCH : 0) |
+                  (getenv("SPU_SMC_WATCH") ? SPU_LSDBG_SMC : 0) |
+                  (getenv("SPU_WWS_PROBE") ? SPU_LSDBG_WWS : 0);
+    g_spu_ls_dbg = v;
+    return v;
+}
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     PS3_KNOB(g_spu_ls_probe, getenv("SPU_LS_LOWREAD") ? 1 : 0);
@@ -553,15 +576,25 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 #  define SPU_LS_INLINE static inline __attribute__((always_inline))
 #endif
 
+static __attribute__((noinline, cold)) void spu_ls_read_dbg(const spu_context* ctx, uint32_t lsa)
+{
+    const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
+    if ((d & SPU_LSDBG_LOWREAD) || ((d & SPU_LSDBG_WWS) && ctx->image_id == 2 && ctx->policy_mode))
+        spu_ls_read_probe(ctx, lsa);
+    if (d & SPU_LSDBG_WATCH) {
+        const uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+        spu_ls_watch_hit2(a, 0, &ctx->ls[a], (uint32_t)ctx->pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    }
+}
+
 SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
+    if (__builtin_expect(g_spu_ls_dbg != 0, 0))
+        spu_ls_read_dbg(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -632,6 +665,19 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
+/* After the store, so the watch prints the new bytes. */
+static __attribute__((noinline, cold)) void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, u128 val, const uint8_t* p)
+{
+    const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
+    if ((d & SPU_LSDBG_WWS) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
+        spu_ls_write_probe_pre(ctx, lsa, val);
+    if (d & SPU_LSDBG_WATCH)
+        spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                          ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    if (d & SPU_LSDBG_SMC)
+        spu_ls_write_probe_smc(ctx, lsa, p);
+}
+
 SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
@@ -642,8 +688,6 @@ SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
      * why it resolves to an empty buffer: the resolved address, the whole
      * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
      * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
@@ -658,10 +702,8 @@ SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
+    if (__builtin_expect(g_spu_ls_dbg != 0, 0))
+        spu_ls_write_dbg(ctx, lsa, val, p);
 }
 
 /* ---------------------------------------------------------------------------
