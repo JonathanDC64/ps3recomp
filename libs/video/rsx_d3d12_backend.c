@@ -354,6 +354,7 @@ typedef struct {
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
+    u32 uvclamp;            /* dr_uvclamp: the target's RSX_SCALE percent, 0 = off (PSO key) */
     ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
     int next;               /* vp_fp_find: next entry in this fp_addr's bucket */
 } VPFPEntry;
@@ -3407,7 +3408,8 @@ static VPFPEntry* vp_fp_find(const VPFPEntry* k)
             q->rtfmt == k->rtfmt && q->exp32 == k->exp32 &&
             q->ucode_hash == k->ucode_hash && q->cmask == k->cmask &&
             q->cull == k->cull && q->depth == k->depth &&
-            q->cube_mask == k->cube_mask && q->d2c_mask == k->d2c_mask)
+            q->cube_mask == k->cube_mask && q->d2c_mask == k->d2c_mask &&
+            q->uvclamp == k->uvclamp)
             return q;
     }
     return NULL;
@@ -3706,9 +3708,137 @@ static u32 fp_units_at(u32 off)
         return m->units;
     return rsx_fp_texture_units(vm_base + off, RSX_FP_MAX_BYTES);
 }
+/* RSX_SCALE: sprite edges sampled as at 1x.
+ *
+ * The HUD and menus are built from quads cut out of texture atlases. At 1x a
+ * quad drawn 1:1 puts each pixel centre on a texel centre, so linear filtering
+ * never reaches past the sprite's edge. On a target drawn at 2x the outermost
+ * pixel centre is a quarter texel from the edge, and the filter blends in the
+ * atlas's next sprite: thin bright or dark lines along panel edges, between
+ * the pieces of a framed window, around icons.
+ *
+ * For a draw without a depth test on a scaled target, the pipeline gets a
+ * geometry shader that hands each triangle's texture-coordinate bounds to the
+ * pixel shader (flat), for triangles whose vertices all have w = 1 (drawn in
+ * screen space, as 2D is; for others the bounds are unlimited). The pixel
+ * shader then keeps each coordinate half a guest pixel inside those bounds,
+ * which is where the 1x pixel centre nearest the edge samples. Half a guest
+ * pixel in texture units is half the coordinate's change over one guest pixel:
+ * fwidth over a host pixel times the scale. A quad split into two triangles
+ * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
+ * untouched. RSX_SCALE_UVCLAMP=0 turns it off. */
+static u32 dr_uvclamp(const D3D12DrawRecord* dr)
+{
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_SCALE_UVCLAMP", 1));
+    const u32 pct = rsx_scale_pct();
+    if (!en || pct == 100 || (dr->depth & 1u)) return 0;
+    if (dr->rt_off) {   /* an offscreen target: scaled unless it is small (rt_host_dim) */
+        const u32 w = dr->rt_w ? dr->rt_w : s_d3d.width, h = dr->rt_h ? dr->rt_h : s_d3d.height;
+        if (rt_host_dim(w, h, w) == w && rt_host_dim(w, h, h) == h) return 0;
+    }
+    return pct;
+}
+
+static ID3DBlob* uvclamp_gs(void)
+{
+    static ID3DBlob* gs = NULL;
+    static int tried = 0;
+    if (tried) return gs;
+    tried = 1;
+    static const char src[] =
+        "struct V {\n"
+        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
+        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+        "};\n"
+        "struct G {\n"
+        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
+        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+        "    nointerpolation float4 b0:UVBOUND0; nointerpolation float4 b1:UVBOUND1;\n"
+        "    nointerpolation float4 b2:UVBOUND2; nointerpolation float4 b3:UVBOUND3;\n"
+        "    nointerpolation float4 b4:UVBOUND4; nointerpolation float4 b5:UVBOUND5;\n"
+        "    nointerpolation float4 b6:UVBOUND6; nointerpolation float4 b7:UVBOUND7;\n"
+        "};\n"
+        "float4 bnd(float2 a, float2 b, float2 c, bool on) {\n"
+        "    return on ? float4(min(min(a, b), c), max(max(a, b), c)) : float4(-1e30, -1e30, 1e30, 1e30);\n"
+        "}\n"
+        "[maxvertexcount(3)]\n"
+        "void main(triangle V v[3], inout TriangleStream<G> s) {\n"
+        "    const bool on = v[0].pos.w == 1.0 && v[1].pos.w == 1.0 && v[2].pos.w == 1.0;\n"
+        "    G o;\n"
+        "    o.b0 = bnd(v[0].t0.xy, v[1].t0.xy, v[2].t0.xy, on); o.b1 = bnd(v[0].t1.xy, v[1].t1.xy, v[2].t1.xy, on);\n"
+        "    o.b2 = bnd(v[0].t2.xy, v[1].t2.xy, v[2].t2.xy, on); o.b3 = bnd(v[0].t3.xy, v[1].t3.xy, v[2].t3.xy, on);\n"
+        "    o.b4 = bnd(v[0].t4.xy, v[1].t4.xy, v[2].t4.xy, on); o.b5 = bnd(v[0].t5.xy, v[1].t5.xy, v[2].t5.xy, on);\n"
+        "    o.b6 = bnd(v[0].t6.xy, v[1].t6.xy, v[2].t6.xy, on); o.b7 = bnd(v[0].t7.xy, v[1].t7.xy, v[2].t7.xy, on);\n"
+        "    [unroll] for (int i = 0; i < 3; i++) {\n"
+        "        o.pos = v[i].pos; o.col0 = v[i].col0; o.col1 = v[i].col1; o.fog = v[i].fog;\n"
+        "        o.t0 = v[i].t0; o.t1 = v[i].t1; o.t2 = v[i].t2; o.t3 = v[i].t3; o.t4 = v[i].t4;\n"
+        "        o.t5 = v[i].t5; o.t6 = v[i].t6; o.t7 = v[i].t7; o.t8 = v[i].t8; o.t9 = v[i].t9;\n"
+        "        s.Append(o);\n"
+        "    }\n"
+        "}\n";
+    ID3DBlob* err = NULL;
+    if (FAILED(D3DCompile(src, sizeof src - 1, "uvclamp_gs", NULL, NULL, "main", "gs_5_0", 0, 0, &gs, &err))) {
+        if (err) { fprintf(stderr, "[D3D12] RSX_SCALE_UVCLAMP: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
+                   err->lpVtbl->Release(err); }
+        gs = NULL;
+    }
+    return gs;
+}
+
+/* The pixel-shader half of the above, on a translated program's HLSL: the
+ * bounds as inputs after TEXCOORD9 (declared here if the program did not read
+ * it, so the inputs line up with the geometry shader's outputs), and the clamp
+ * at the top of main. Returns 0, leaving hlsl as it was, if an anchor is
+ * missing or the buffer is too small. */
+static int fp_inject_uvclamp(char* hlsl, size_t cap, u32 pct)
+{
+    static const char tc7[] =
+        "float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n";
+    char* in = strstr(hlsl, tc7);
+    char* m = strstr(hlsl, "main(PSInput input)");
+    char* body = m ? strchr(m, '{') : NULL;
+    if (!in || !body || body < in) return 0;
+    /* The program's own TEXCOORD8/9, if it reads them, come right after TEXCOORD7. */
+    static const char tc9[] = "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n";
+    char* after_in = in + sizeof tc7 - 1;
+    const char* next = after_in + strspn(after_in, " ");
+    const int has9 = !strncmp(next, tc9, sizeof tc9 - 1);
+    if (has9) after_in = (char*)next + sizeof tc9 - 1;
+    char decl[1024];
+    snprintf(decl, sizeof decl, "%s"
+        "    nointerpolation float4 uvb0:UVBOUND0; nointerpolation float4 uvb1:UVBOUND1;\n"
+        "    nointerpolation float4 uvb2:UVBOUND2; nointerpolation float4 uvb3:UVBOUND3;\n"
+        "    nointerpolation float4 uvb4:UVBOUND4; nointerpolation float4 uvb5:UVBOUND5;\n"
+        "    nointerpolation float4 uvb6:UVBOUND6; nointerpolation float4 uvb7:UVBOUND7;\n",
+        has9 ? "" : "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
+    char code[2048];
+    int n = snprintf(code, sizeof code, "\n    { const float k = %u.0 / 200.0;   /* half the scale: half a guest pixel, in host pixels */\n", pct);
+    for (int i = 0; i < 8; i++)
+        n += snprintf(code + n, sizeof code - (size_t)n,
+            "      { const float2 h = k * fwidth(input.tc%d.xy);"
+            " input.tc%d.xy = clamp(input.tc%d.xy, input.uvb%d.xy + h, input.uvb%d.zw - h); }\n",
+            i, i, i, i, i);
+    snprintf(code + n, sizeof code - (size_t)n, "    }\n");
+    const size_t len = strlen(hlsl), dl = strlen(decl), cl = strlen(code);
+    if (len + dl + cl + 1 > cap) return 0;
+    const size_t body_off = (size_t)(body + 1 - hlsl) + dl;
+    memmove(after_in + dl, after_in, len - (size_t)(after_in - hlsl) + 1);
+    memcpy(after_in, decl, dl);
+    char* b = hlsl + body_off;
+    memmove(b + cl, b, strlen(b) + 1);
+    memcpy(b, code, cl);
+    return 1;
+}
+
+/* Compiled guest-FP pipeline for a draw (VS by cache slot + the FP at fp_addr). */
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 depth, u32 cube_mask, u32 d2c_mask)
+                                          u32 depth, u32 cube_mask, u32 d2c_mask, u32 uvclamp)
 {
     vp_pso_knobs_check();
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;
@@ -3757,7 +3887,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.gen = s_d3d.vp_gen; key.blend = blend; key.nrt = nrt;
     key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
-    key.d2c_mask = d2c_mask;
+    key.d2c_mask = d2c_mask; key.uvclamp = uvclamp;
     key.pso = NULL;
     { const VPFPEntry* hit = vp_fp_find(&key); if (hit) return hit->pso; }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -3979,6 +4109,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                       strchr(fs, ':') + 1, (unsigned)n2, 10);
           }
       } }
+    ID3DBlob* gsb = uvclamp ? uvclamp_gs() : NULL;
+    if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl, uvclamp)) gsb = NULL;
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
     HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
     if (FAILED(hr) || !pb) {
@@ -4005,6 +4137,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     pd.VS.BytecodeLength  = vsb->lpVtbl->GetBufferSize(vsb);
     pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
     pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+    if (gsb) {
+        pd.GS.pShaderBytecode = gsb->lpVtbl->GetBufferPointer(gsb);
+        pd.GS.BytecodeLength  = gsb->lpVtbl->GetBufferSize(gsb);
+    }
     pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].fetch)
         pd.InputLayout.NumElements = 0;   /* SV_VertexID only */
@@ -8150,7 +8286,7 @@ rtt_dump_done:;
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       _cmask, dr->d2c_mask);
+                                       _cmask, dr->d2c_mask, dr_uvclamp(dr));
         if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
@@ -8561,7 +8697,7 @@ rtt_dump_done:;
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                                dr_cube_mask(dr), dr->d2c_mask) : NULL;
+                                                dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
