@@ -101,6 +101,49 @@ static void pad_press_from_buttons(PadHostState* hs)
     hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
 }
 
+/* The PS3 pad's buttons by name, for PAD_MAP and PAD_KEYS: cross circle
+ * square triangle l1 r1 l2 r2 l3 r3 start select up down left right. */
+static const struct { const char* name; u16 bit; } s_pad_names[] = {
+    { "select", CELL_PAD_CTRL_SELECT }, { "l3", CELL_PAD_CTRL_L3 },
+    { "r3", CELL_PAD_CTRL_R3 },         { "start", CELL_PAD_CTRL_START },
+    { "up", CELL_PAD_CTRL_UP },         { "right", CELL_PAD_CTRL_RIGHT },
+    { "down", CELL_PAD_CTRL_DOWN },     { "left", CELL_PAD_CTRL_LEFT },
+    { "l2", CELL_PAD_CTRL_L2 },         { "r2", CELL_PAD_CTRL_R2 },
+    { "l1", CELL_PAD_CTRL_L1 },         { "r1", CELL_PAD_CTRL_R1 },
+    { "triangle", CELL_PAD_CTRL_TRIANGLE }, { "circle", CELL_PAD_CTRL_CIRCLE },
+    { "cross", CELL_PAD_CTRL_CROSS },   { "square", CELL_PAD_CTRL_SQUARE },
+};
+
+static int pad_name_index(const char* s, size_t n)
+{
+    for (int i = 0; i < 16; i++) {
+        const char* name = s_pad_names[i].name;
+        size_t k = 0;
+        while (k < n && name[k] && (s[k] | 0x20) == name[k]) k++;
+        if (k == n && !name[k]) return i;
+    }
+    return -1;
+}
+
+/* The next game=value pair of a PAD_MAP / PAD_KEYS list. Returns where the
+ * pair ends (NULL at the end of the list); *dst is the game button's index
+ * into s_pad_names, or -1 for a malformed pair. */
+static const char* pad_next_pair(const char* e, int* dst, const char** v, size_t* vn)
+{
+    while (*e == ',' || *e == ' ' || *e == ';') e++;
+    if (!*e) return NULL;
+    const char* end = e;
+    while (*end && *end != ',' && *end != ' ' && *end != ';') end++;
+    const char* eq = e;
+    while (eq < end && *eq != '=') eq++;
+    *dst = eq < end ? pad_name_index(e, (size_t)(eq - e)) : -1;
+    *v = eq < end ? eq + 1 : end;
+    *vn = (size_t)(end - *v);
+    if (*dst < 0 || !*vn)
+        fprintf(stderr, "[cellPad] ignoring \"%.*s\" in a button list\n", (int)(end - e), e);
+    return end;
+}
+
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
@@ -161,11 +204,41 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
+/* The keyboard pad's keys, in s_pad_names order (Windows virtual-key codes;
+ * 0 = no key). PAD_KEYS changes them: game=key pairs, a key being a letter or
+ * digit or a virtual-key code ("cross=Z,circle=X,l3=0x10"). Keys not listed
+ * keep these. Live. */
+static const int s_pad_keys_default[16] = {
+    VK_TAB, 0, 0, VK_RETURN,                  /* select l3 r3 start */
+    VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT,
+    '1', '2', 'Q', 'W',                       /* l2 r2 l1 r1 */
+    'S', 'X', 'Z', 'A',                       /* triangle circle cross square */
+};
+static int s_pad_keys[16];
+
+static int pad_parse_keys(const char* e)
+{
+    int dst;
+    const char* v;
+    size_t vn;
+    memcpy(s_pad_keys, s_pad_keys_default, sizeof s_pad_keys);
+    while (e && (e = pad_next_pair(e, &dst, &v, &vn)) != NULL) {
+        if (dst < 0) continue;
+        if (vn == 1 && ((v[0] >= '0' && v[0] <= '9') || ((v[0] | 0x20) >= 'a' && (v[0] | 0x20) <= 'z')))
+            s_pad_keys[dst] = v[0] >= 'a' ? v[0] - 0x20 : v[0];
+        else
+            s_pad_keys[dst] = (int)strtol(v, NULL, 0) & 0xFF;
+    }
+    return 1;
+}
+
 static void pad_poll_keyboard(void)
 {
-    static int off = -1;
+    static int off = -1, keys = -1;
     PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
     if (off) return;
+    PS3_KNOB(keys, pad_parse_keys(getenv("PAD_KEYS")));
+    (void)keys;
 
     PadHostState* hs = &s_host_state[0];
     const int pad = hs->connected;   /* a real pad on port 0: merge into it */
@@ -183,19 +256,9 @@ static void pad_poll_keyboard(void)
         return;
     }
 
-    static const struct { int vk; u16 btn; } map[] = {
-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
-    };
-
     u16 btns = 0;
-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+    for (int i = 0; i < 16; i++)
+        if (s_pad_keys[i] && (GetAsyncKeyState(s_pad_keys[i]) & 0x8000)) btns |= s_pad_names[i].bit;
 
     hs->connected = 1;
     if (!pad) {
@@ -468,6 +531,61 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* PAD_MAP: gamepad button remapping, for every host port.
+ * A list of game=host pairs, e.g. "cross=circle,circle=cross,l1=r2":
+ * the game's cross reads the host's circle, and so on. Names: cross circle
+ * square triangle l1 r1 l2 r2 l3 r3 start select up down left right.
+ * Buttons not listed read themselves. L2/R2's analog values follow the
+ * mapping (a digital source gives 0 or 255). Live.
+ *
+ * pad_parse_map fills src[i], the host button the game's button i reads (an
+ * index into s_pad_names), and returns 0 when nothing is remapped. */
+static int pad_parse_map(const char* e, signed char src[16])
+{
+    int any = 0, dst;
+    const char* v;
+    size_t vn;
+    for (int i = 0; i < 16; i++) src[i] = (signed char)i;
+    while (e && (e = pad_next_pair(e, &dst, &v, &vn)) != NULL) {
+        const int from = dst >= 0 && vn ? pad_name_index(v, vn) : -1;
+        if (from < 0) continue;
+        src[dst] = (signed char)from;
+        if (from != dst) any = 1;
+    }
+    if (any) {
+        printf("[cellPad] PAD_MAP:");
+        for (int i = 0; i < 16; i++)
+            if (src[i] != i) printf(" %s=%s", s_pad_names[i].name, s_pad_names[(int)src[i]].name);
+        printf("\n");
+        fflush(stdout);
+    }
+    return any;
+}
+
+static void pad_apply_map(void)
+{
+    static signed char src[16];
+    static int on = -1;
+    PS3_KNOB(on, pad_parse_map(getenv("PAD_MAP"), src));
+    if (!on) return;
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+        PadHostState* hs = &s_host_state[p];
+        if (!hs->connected) continue;
+        const u16 in = hs->buttons;
+        const u8 l2 = hs->trigger_l2, r2 = hs->trigger_r2;
+        u16 out = 0;
+        for (int i = 0; i < 16; i++)
+            if (in & s_pad_names[(int)src[i]].bit) out |= s_pad_names[i].bit;
+        hs->buttons = out;
+        /* index 8 = l2, 9 = r2 */
+        const u8 v8 = src[8] == 8 ? l2 : src[8] == 9 ? r2 : ((out & CELL_PAD_CTRL_L2) ? 255 : 0);
+        const u8 v9 = src[9] == 9 ? r2 : src[9] == 8 ? l2 : ((out & CELL_PAD_CTRL_R2) ? 255 : 0);
+        hs->trigger_l2 = v8;
+        hs->trigger_r2 = v9;
+        pad_press_from_buttons(hs);
+    }
+}
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -487,6 +605,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    pad_apply_map();   /* the pads only: the keyboard has its own keys */
 #ifdef _WIN32
     pad_poll_keyboard();
 #endif
