@@ -541,6 +541,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 
     /* Color mask */
     if (method == NV4097_SET_COLOR_MASK) {
+        /* 0 or 1 in each byte; hardware ignores a write with other bits set
+         * and keeps the old mask (rsx_dispatch.c says the same). */
+        if (data & 0xFEFEFEFEu) return 0;
         state->color_mask = data;
         state->color_mask_dirty = 1;
         return 0;
