@@ -1017,6 +1017,81 @@ static int swap_buffers_get(void)
     return 0;
 }
 
+/* RSX_OUTFILTER (live): the filter blit_to_window scales the game's frame
+ * into the window with. 0, the default, is the single bilinear tap it has
+ * always taken. 1 filters each axis by its ratio: where the frame is bigger
+ * than the viewport (a render resolution above the window's), an area filter,
+ * so every window pixel averages the texels under it and nothing shimmers at
+ * ratios other than 1:1 and 2:1; where it is smaller, a Catmull-Rom bicubic,
+ * sharper than bilinear. The pipeline (rsx_outfilter.h) is made on first use;
+ * if that fails, the bilinear blit stays. */
+#include "rsx_outfilter.h"
+static int knob_outfilter(void) { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_OUTFILTER", 0)); return v; }
+static struct { ID3D12RootSignature* rs; ID3D12PipelineState* pso; int failed; } s_of;
+
+static int of_ready(void)
+{
+    if (s_of.pso) return 1;
+    if (s_of.failed || !s_d3d.device) return 0;
+    s_of.failed = 1;   /* until it is made */
+    ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
+    HRESULT hr = D3DCompile(rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL, NULL,
+                            "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb, &err);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps", NULL, NULL,
+                        "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb, &err);
+    if (FAILED(hr))
+        printf("[D3D12] RSX_OUTFILTER shader compile failed: %s\n",
+               err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        D3D12_ROOT_PARAMETER rp[2] = {0};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 1;
+        rp[0].DescriptorTable.pDescriptorRanges = &range;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.Num32BitValues = 8;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {2, rp, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
+        if (SUCCEEDED(hr))
+            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
+                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
+                &IID_ID3D12RootSignature, (void**)&s_of.rs);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_of.rs;
+        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
+            &IID_ID3D12PipelineState, (void**)&s_of.pso);
+    }
+    if (vb) vb->lpVtbl->Release(vb);
+    if (pb) pb->lpVtbl->Release(pb);
+    if (rsb) rsb->lpVtbl->Release(rsb);
+    if (err) err->lpVtbl->Release(err);
+    if (FAILED(hr) || !s_of.pso) {
+        printf("[D3D12] RSX_OUTFILTER pipeline failed (0x%08lX): the bilinear blit stays\n", (long)hr);
+        return 0;
+    }
+    s_of.failed = 0;
+    return 1;
+}
+
 /* The scale pass: a full-screen triangle sampling the game's frame with
  * linear filtering, into a viewport that keeps its aspect ratio. */
 static int blit_init(void)
@@ -1128,14 +1203,21 @@ static void blit_to_window(u32 fi)
         cl->lpVtbl->ClearRenderTargetView(cl, rtv, black, 0, NULL);
     }
     D3D12_RECT sc = {0, 0, (LONG)s_d3d.win_w, (LONG)s_d3d.win_h};
-    cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.blit_rs);
-    cl->lpVtbl->SetPipelineState(cl, s_d3d.blit_pso);
+    /* RSX_OUTFILTER=1: the area / bicubic pass instead of the bilinear tap. */
+    const int sharp = knob_outfilter() == 1 && vw >= 1.0f && vh >= 1.0f && of_ready();
+    cl->lpVtbl->SetGraphicsRootSignature(cl, sharp ? s_of.rs : s_d3d.blit_rs);
+    cl->lpVtbl->SetPipelineState(cl, sharp ? s_of.pso : s_d3d.blit_pso);
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.blit_srv_heap);
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     s_d3d.blit_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &g);
     g.ptr += (u64)fi * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    if (sharp) {   /* viewport origin, frame texels per window pixel, frame size */
+        const float of[8] = {vp.TopLeftX, vp.TopLeftY, (float)s_d3d.host_w / vw, (float)s_d3d.host_h / vh,
+                             (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 0.0f};
+        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 8, of, 0);
+    }
     cl->lpVtbl->RSSetViewports(cl, 1, &vp);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -12206,6 +12288,9 @@ void rsx_d3d12_backend_shutdown(void)
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
+    if (s_of.pso) s_of.pso->lpVtbl->Release(s_of.pso);
+    if (s_of.rs) s_of.rs->lpVtbl->Release(s_of.rs);
+    memset(&s_of, 0, sizeof s_of);
     if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
