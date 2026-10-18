@@ -233,6 +233,9 @@ typedef struct {
     ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
     u32                   snap_w, snap_h, snap_dxgi;
     D3D12_RESOURCE_STATES snap_st;
+    ID3D12Resource*       down;        /* guest-size copy of a scaled target (write-back) */
+    u32                   down_w, down_h, down_dxgi;
+    D3D12_RESOURCE_STATES down_st;
     /* Guest bytes after our last write-back (tex_csum over [gaddr, +glen)).
      * If they differ later, the title put something else there. */
     u32                   gaddr, glen, gsum;
@@ -6004,6 +6007,182 @@ static u32 rt_guest_bpp(u32 dxgi)
            dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 4u;
 }
 
+/* RSX_SCALE: the write-back of a scaled target.
+ *
+ * A target drawn at a multiple of its guest size is drawn down to a guest-size
+ * copy of the same format (one texel of each guest texel's block, Load), and
+ * that copy is read back like any other target. Without it the guest memory
+ * under a scaled target kept whatever was there before, and a target created
+ * later at that offset was filled from it: the Profile List showed coloured
+ * noise below its footer, where it draws nothing over a recreated target. */
+static ID3D12RootSignature*  s_down_rs;
+static ID3D12PipelineState*  s_down_pso[4];
+static u32                   s_down_pso_fmt[4];
+static ID3D12DescriptorHeap* s_down_srv;   /* shader visible, 2 x MAX_OFF_RTS (frame parity) */
+static ID3D12DescriptorHeap* s_down_rtv;
+static ID3DBlob*             s_down_vs;
+static ID3DBlob*             s_down_ps;
+
+static int down_init(void)
+{
+    static int state = 0;   /* 0 not tried, 1 ready, -1 failed */
+    if (state) return state > 0;
+    state = -1;
+    static const char vs[] =
+        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+        "    float2 t = float2((id << 1) & 2, id & 2);\n"
+        "    return float4(t * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+        "}\n";
+    static const char ps[] =
+        "Texture2D<float4> src : register(t0);\n"
+        "cbuffer K : register(b0) { float2 ratio; };\n"
+        "float4 main(float4 p : SV_Position) : SV_Target {\n"
+        "    return src.Load(int3(int2(p.xy * ratio), 0));\n"
+        "}\n";
+    ID3DBlob* err = NULL;
+    if (FAILED(D3DCompile(vs, sizeof vs - 1, "down_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &s_down_vs, &err)) ||
+        FAILED(D3DCompile(ps, sizeof ps - 1, "down_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &s_down_ps, &err))) {
+        if (err) { fprintf(stderr, "[D3D12] write-back downscale: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
+                   err->lpVtbl->Release(err); }
+        return 0;
+    }
+    D3D12_DESCRIPTOR_RANGE range = {0};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER rp[2] = {0};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &range;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.Num32BitValues = 2;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd = {0};
+    rd.NumParameters = 2; rd.pParameters = rp;
+    ID3DBlob* sig = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+        if (err) err->lpVtbl->Release(err);
+        return 0;
+    }
+    HRESULT hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
+        sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
+        &IID_ID3D12RootSignature, (void**)&s_down_rs);
+    sig->lpVtbl->Release(sig);
+    if (FAILED(hr)) return 0;
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2 * MAX_OFF_RTS;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd,
+            &IID_ID3D12DescriptorHeap, (void**)&s_down_srv))) return 0;
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    hd.NumDescriptors = MAX_OFF_RTS;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd,
+            &IID_ID3D12DescriptorHeap, (void**)&s_down_rtv))) return 0;
+    state = 1;
+    return 1;
+}
+
+static ID3D12PipelineState* down_pso(DXGI_FORMAT f)
+{
+    for (int i = 0; i < 4; i++)
+        if (s_down_pso[i] && s_down_pso_fmt[i] == (u32)f) return s_down_pso[i];
+    int slot = -1;
+    for (int i = 0; i < 4; i++) if (!s_down_pso[i]) { slot = i; break; }
+    if (slot < 0) return NULL;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_down_rs;
+    pd.VS.pShaderBytecode = s_down_vs->lpVtbl->GetBufferPointer(s_down_vs);
+    pd.VS.BytecodeLength  = s_down_vs->lpVtbl->GetBufferSize(s_down_vs);
+    pd.PS.pShaderBytecode = s_down_ps->lpVtbl->GetBufferPointer(s_down_ps);
+    pd.PS.BytecodeLength  = s_down_ps->lpVtbl->GetBufferSize(s_down_ps);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = f;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
+            &IID_ID3D12PipelineState, (void**)&s_down_pso[slot]))) { s_down_pso[slot] = NULL; return NULL; }
+    s_down_pso_fmt[slot] = (u32)f;
+    return s_down_pso[slot];
+}
+
+/* Draw scaled target i down to its guest size; the copy is left in COPY_SOURCE.
+ * Returns NULL if that cannot be done (the target is then not written back). */
+static ID3D12Resource* off_rt_downscale(int i)
+{
+    OffRT* r = &s_d3d.off_rt[i];
+    if (!down_init()) return NULL;
+    ID3D12PipelineState* pso = down_pso((DXGI_FORMAT)r->dxgi);
+    if (!pso) return NULL;
+    if (r->down && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->dxgi)) {
+        off_rt_defer_release(r->down); r->down = NULL;
+    }
+    if (!r->down) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = r->w; td.Height = r->h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = (DXGI_FORMAT)r->dxgi; td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(d3d_create_committed(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
+                &IID_ID3D12Resource, (void**)&r->down)) || !r->down) { r->down = NULL; return NULL; }
+        r->down_w = r->w; r->down_h = r->h; r->down_dxgi = r->dxgi;
+        r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    off_rt_transition(i, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (r->down_st != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+        D3D12_RESOURCE_BARRIER b = {0};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = r->down;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = r->down_st;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        cl->lpVtbl->ResourceBarrier(cl, 1, &b);
+        r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const u32 di = (u32)(s_d3d.frame_count & 1u) * MAX_OFF_RTS + (u32)i;
+    D3D12_CPU_DESCRIPTOR_HANDLE sc; D3D12_GPU_DESCRIPTOR_HANDLE sg;
+    s_down_srv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_down_srv, &sc);
+    s_down_srv->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_down_srv, &sg);
+    sc.ptr += (SIZE_T)di * inc; sg.ptr += (u64)di * inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, r->res, NULL, sc);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    s_down_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_down_rtv, &rtv);
+    rtv.ptr += (SIZE_T)i * s_d3d.rtv_descriptor_size;
+    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, r->down, NULL, rtv);
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_down_rs);
+    cl->lpVtbl->SetPipelineState(cl, pso);
+    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_down_srv);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, sg);
+    const float ratio[2] = {(float)r->hw / (float)r->w, (float)r->hh / (float)r->h};
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 2, ratio, 0);
+    D3D12_VIEWPORT vp = {0, 0, (float)r->w, (float)r->h, 0.0f, 1.0f};
+    D3D12_RECT rc = {0, 0, (LONG)r->w, (LONG)r->h};
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &rc);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r->down;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->lpVtbl->ResourceBarrier(cl, 1, &b);
+    r->down_st = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    return r->down;
+}
+
 /* Record the copies (before the frame's command list closes). */
 static void rt_writeback_record(void)
 {
@@ -6011,10 +6190,7 @@ static void rt_writeback_record(void)
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!r->res || !r->used) continue;
-        /* A scaled target is not written back: the copy would have to be
-         * scaled down first, and the targets the title reads (its exposure)
-         * are below RSX_SCALE_MIN and stay at guest size. */
-        if (r->hw != r->w || r->hh != r->h) continue;
+        const int scaled = r->hw != r->w || r->hh != r->h;
         u32 pitch = (r->w * rt_guest_bpp(r->dxgi) + 255) & ~255u;
         u64 need = (u64)pitch * r->h;
         if (r->rb && r->rb_size < need) { r->rb->lpVtbl->Release(r->rb); r->rb = NULL; }
@@ -6034,7 +6210,9 @@ static void rt_writeback_record(void)
             r->rb_size = need;
         }
         D3D12_RESOURCE_STATES prior = r->st;
-        off_rt_transition(i, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12Resource* from = r->res;
+        if (scaled) { if (!(from = off_rt_downscale(i))) continue; }
+        else off_rt_transition(i, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
         dst.pResource = r->rb;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -6043,7 +6221,7 @@ static void rt_writeback_record(void)
         dst.PlacedFootprint.Footprint.Height   = r->h;
         dst.PlacedFootprint.Footprint.Depth    = 1;
         dst.PlacedFootprint.Footprint.RowPitch = pitch;
-        src.pResource = r->res;
+        src.pResource = from;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
         off_rt_transition(i, prior);
@@ -6191,6 +6369,7 @@ static void off_rt_drop_rewritten(void)
         off_rt_defer_release(r->res);  r->res = NULL;
         off_rt_defer_release(r->up);   r->up = NULL;
         off_rt_defer_release(r->snap); r->snap = NULL;
+        off_rt_defer_release(r->down); r->down = NULL;
         r->gsum_ok = 0;
     }
 }
