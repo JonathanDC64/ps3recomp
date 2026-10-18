@@ -290,7 +290,7 @@ void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 /* NID: 0x0B4B62D5 */
 void cellGcmSetUserHandler(CellGcmUserHandler handler);
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 */
 u64 cellGcmGetLastFlipTime(void);
 
 /* Address translation / IO mapping */

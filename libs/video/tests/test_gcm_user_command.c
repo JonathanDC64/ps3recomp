@@ -19,6 +19,7 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+uint64_t lv2_system_time_usec(void) { return 0; }
 ps3_guest_caller_fn g_ps3_guest_caller;
 static unsigned calls;
 static uint32_t last;

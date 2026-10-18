@@ -74,6 +74,38 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest system time, in microseconds.
+ *
+ * sys_time_get_system_time (runtime/ppu/ppu_sysprx.cpp) returns this, and so
+ * does every guest-visible timestamp that is meant to be compared with it:
+ * cellGcmGetLastFlipTime on hardware is the system time of the last flip.
+ * On Windows it counts from the first call, as sys_time_get_system_time
+ * always has; the compare-exchange keeps two first callers on one origin.
+ * Elsewhere it is CLOCK_MONOTONIC, also as before.
+ * -----------------------------------------------------------------------*/
+uint64_t lv2_system_time_usec(void)
+{
+#ifdef _WIN32
+    static volatile LONGLONG s_origin = 0;
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    LONGLONG origin = s_origin;
+    if (!origin) {
+        LONGLONG prev = InterlockedCompareExchange64(&s_origin, now.QuadPart, 0);
+        origin = prev ? prev : now.QuadPart;
+    }
+    uint64_t d = (uint64_t)(now.QuadPart - origin);
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * 1000000ull + (d % q) * 1000000ull / q;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+#endif
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
