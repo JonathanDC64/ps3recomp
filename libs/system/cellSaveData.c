@@ -575,7 +575,8 @@ static u32 enumerate_save_files(const char* save_path,
             return 0;
 
         do {
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || savedata_system_file(fd.cFileName))
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.' ||
+                savedata_system_file(fd.cFileName))
                 continue;
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
@@ -695,18 +696,24 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
         ensure_dirs(save_path);
-        const char* mode;
-        if (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0) {
-            mode = "wb";
-        } else {
-            mode = "r+b";
+        /* A whole-file write goes to ".<name>.tmp" and then replaces the file,
+         * so a crash or a full disk in the middle leaves the old file whole
+         * rather than a short one (an autosave's character data). The listing
+         * skips names starting with '.', so a leftover is never shown. */
+        const int whole = set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0;
+        char tmp_path[1024 + 8];
+        snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.tmp", save_path, name);
+#ifdef _WIN32
+        for (char* p = tmp_path; *p; p++) {
+            if (*p == '/') *p = '\\';
         }
-        FILE* fp = fopen(file_path, mode);
-        if (!fp) {
+#endif
+        FILE* fp = whole ? fopen(tmp_path, "wb") : fopen(file_path, "r+b");
+        if (!fp && !whole) {
             fp = fopen(file_path, "wb");
         }
         if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s'\n", file_path);
+            printf("[cellSaveData] file write: cannot open '%s'\n", whole ? tmp_path : file_path);
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -721,6 +728,17 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
         int failed = wrote != write_size;
         if (fclose(fp) != 0) failed = 1;
+        if (whole) {
+#ifdef _WIN32
+            if (!failed && !MoveFileExA(tmp_path, file_path, MOVEFILE_REPLACE_EXISTING)) failed = 1;
+#else
+            if (!failed && rename(tmp_path, file_path) != 0) failed = 1;
+#endif
+            if (failed) {
+                printf("[cellSaveData] file write: '%s' failed, old file kept\n", file_path);
+                remove(tmp_path);
+            }
+        }
         if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
             pfd_add(save_path, name);
         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
