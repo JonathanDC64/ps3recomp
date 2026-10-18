@@ -373,7 +373,14 @@ static const char* input_expr(u32 input_src)
         "input.tc0", "input.tc1", "input.tc2", "input.tc3",
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
-    case 0x0: return "input.position"; /* WPOS */
+    case 0x0:                          /* WPOS */
+        /* Under RSX_SCALE it is in host pixels, not the guest's (docs/37). */
+        { static int said = 0;
+          if (!said && ps3_env_int("RSX_SCALE", 100) != 100) {
+              said = 1;
+              fprintf(stderr, "[FP] a fragment program reads WPOS, which RSX_SCALE scales%c", 10);
+          } }
+        return "input.position";
     case 0x1: return "input.col0";     /* COL0 */
     case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
