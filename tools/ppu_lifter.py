@@ -718,6 +718,13 @@ class PPULifter:
         # state, so override_syms has to exist from construction.
         self.override_funcs: dict[int, str] = {}
         self.override_syms: set[str] = set()
+        # Per-game instruction hooks: {guest_addr -> host symbol}. The lifted
+        # code calls `sym(ctx, addr)` right after the instruction at addr, so
+        # a title can adjust a value the instruction just produced (e.g. scale
+        # a per-frame rate it loaded) without replacing the whole function.
+        # The instruction must not be a branch: nothing after a taken branch
+        # runs.
+        self.insn_hooks: dict[int, str] = {}
 
     def _range_insns(self, instructions: list["Instruction"],
                      start: int, end: int) -> list["Instruction"]:
@@ -810,6 +817,10 @@ class PPULifter:
             c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
+            hook = self.insn_hooks.get(insn.addr)
+            if hook is not None:
+                func.body_lines.append(
+                    f"    {hook}(ctx, 0x{insn.addr:08X}u);  /* INSN HOOK -> host */")
 
         # An in-range branch target with no decoded instruction at its address
         # (a branch into a data / undecoded region inside a too-large function
@@ -3407,6 +3418,8 @@ class PPULifter:
         # Host override symbols (provided by the per-game project, e.g. des_heap.cpp)
         for sym in sorted(self.override_syms):
             lines.append(f'extern "C" void {sym}(ppu_context* ctx); /* override host impl */')
+        for sym in sorted(set(self.insn_hooks.values())):
+            lines.append(f'extern "C" void {sym}(ppu_context* ctx, uint32_t addr); /* insn hook host impl */')
         lines.append("")
         return "\n".join(lines)
 
@@ -4181,7 +4194,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, override_funcs=None):
+                 toc_base=0, override_funcs=None, insn_hooks=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4197,6 +4210,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["override_funcs"] = override_funcs or {}
+    _WORKER_STATE["insn_hooks"] = insn_hooks or {}
 
 
 def _worker_lift(task):
@@ -4213,6 +4227,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.override_funcs = _WORKER_STATE.get("override_funcs", {})
+    lifter.insn_hooks = _WORKER_STATE.get("insn_hooks", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -4248,7 +4263,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.override_funcs))
+                             lifter.override_funcs, lifter.insn_hooks))
     try:
         for idx0, results, ct, bt, osyms in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4330,6 +4345,14 @@ def main() -> None:
                              "function's body is replaced with a tail call to the "
                              "host symbol, letting a title swap out e.g. its "
                              "allocator for a clean host implementation.")
+    parser.add_argument("--insn-hooks", metavar="LIST", default=None,
+                        help="Comma-separated addr=symbol pairs. The lifted code "
+                             "calls symbol(ctx, addr) right after the instruction at "
+                             "each addr (not a branch), letting a title adjust what "
+                             "that instruction produced without replacing the whole "
+                             "function. A symbol may be listed for many addresses. "
+                             "@FILE reads the pairs from FILE instead, one or more "
+                             "per line, with # starting a comment.")
     parser.add_argument("--shadow-stack", action="store_true",
                         help="Emit a per-function shadow-call-stack guard (DS_FRAME) "
                              "and define DS_SHADOW_STACK, so the runtime keeps a "
@@ -4350,6 +4373,19 @@ def main() -> None:
             addr_s, _, sym = pair.partition("=")
             override_funcs[int(addr_s, 0)] = sym.strip()
         print(f"  overrides: {len(override_funcs)} function(s) -> host symbols")
+    insn_hooks: dict[int, str] = {}
+    if args.insn_hooks:
+        hook_list = args.insn_hooks
+        if hook_list.startswith("@"):
+            with open(hook_list[1:], encoding="utf-8") as f:
+                hook_list = ",".join(line.split("#", 1)[0] for line in f)
+        for pair in hook_list.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            addr_s, _, sym = pair.partition("=")
+            insn_hooks[int(addr_s, 0)] = sym.strip()
+        print(f"  insn hooks: {len(insn_hooks)} instruction(s) -> host symbols")
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
     # and the lifter below.
@@ -4805,6 +4841,7 @@ def main() -> None:
     lifter.shadow_stack = args.shadow_stack
     lifter.hle_stub_nids = hle_stubs
     lifter.override_funcs = override_funcs
+    lifter.insn_hooks = insn_hooks
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
 
