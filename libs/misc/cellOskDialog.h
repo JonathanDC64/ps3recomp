@@ -139,6 +139,20 @@ s32 cellOskDialogGetInputText(CellOskDialogCallbackReturnParam* result);
  * instead of asking on the host. */
 void cellOskDialogSetDefaultResponse(const char* text);
 
+/* A host interface for the dialog, such as a port's own menus, in place of
+ * the Windows text-input window. open runs on the title's thread at LoadAsync
+ * with the prompt and the initial text (host-order UTF-16, NUL-terminated)
+ * and the most characters the title takes. close runs when the title stops
+ * the dialog first (Abort, or UnloadAsync while it is still up). The host
+ * answers once with cellOskDialog_host_finish, from any thread: ok = 0 is
+ * Cancel. NULL removes the host. Not SDK functions. */
+typedef struct CellOskDialogHost {
+    void (*open)(const CellOskDialogChar* prompt, const CellOskDialogChar* text, u32 limit);
+    void (*close)(void);
+} CellOskDialogHost;
+void cellOskDialog_set_host(const CellOskDialogHost* host);
+void cellOskDialog_host_finish(int ok, const CellOskDialogChar* text, u32 n);
+
 #ifdef __cplusplus
 }
 #endif

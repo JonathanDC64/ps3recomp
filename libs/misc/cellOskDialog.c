@@ -7,8 +7,10 @@
  * UNLOADED. Titles drive their name-entry screens off those three events, so
  * a dialog that never posts them leaves the title waiting for good.
  *
- * The player types on the host. On Windows LoadAsync opens a small text-input
- * window on its own thread (Enter accepts, Esc cancels). PS3_OSK_TEXT=<utf-8>
+ * The player types on the host. A host interface (cellOskDialog_set_host, a
+ * port's own menus) takes the dialog when there is one; otherwise, on Windows,
+ * LoadAsync opens a small text-input window on its own thread (Enter accepts,
+ * Esc cancels). PS3_OSK_TEXT=<utf-8>
  * -- or cellOskDialogSetDefaultResponse -- answers at once instead, for
  * scripted runs and hosts without a window.
  */
@@ -52,6 +54,7 @@ static char s_default_response[CELL_OSK_MAX_TEXT_LENGTH + 1] = "";
 /* The text, in host-order UTF-16 code units, NUL-terminated. */
 static CellOskDialogChar s_text[CELL_OSK_MAX_TEXT_LENGTH + 1];
 static CellOskDialogChar s_prompt[CELL_OSK_MAX_TEXT_LENGTH + 1];
+static const CellOskDialogHost* volatile s_ui_host;
 
 /* Log a UTF-16 string as UTF-8 (ASCII with '?' where there is no converter). */
 static void osk_log(const char* what, const CellOskDialogChar* s)
@@ -295,6 +298,17 @@ static s32 osk_write_result(u32 res_ea, s32 result)
     return CELL_OK;
 }
 
+void cellOskDialog_set_host(const CellOskDialogHost* host)
+{
+    s_ui_host = host;
+}
+
+void cellOskDialog_host_finish(int ok, const CellOskDialogChar* text, u32 n)
+{
+    osk_close(ok ? CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK : CELL_OSK_DIALOG_INPUT_FIELD_RESULT_CANCELED,
+              ok ? text : NULL, ok ? n : 0);
+}
+
 void cellOskDialogSetDefaultResponse(const char* text)
 {
     if (text) {
@@ -362,6 +376,11 @@ s32 cellOskDialogLoadAsync(u32 container,
         osk_close(CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK, text, n);
         return CELL_OK;
     }
+    const CellOskDialogHost* host = s_ui_host;
+    if (host && host->open) {
+        host->open(s_prompt, s_text, s_limit);
+        return CELL_OK;
+    }
 #ifdef _WIN32
     HANDLE t = CreateThread(NULL, 0, osk_window_thread, NULL, 0, NULL);
     if (t) CloseHandle(t);
@@ -385,14 +404,17 @@ s32 cellOskDialogUnloadAsync(CellOskDialogCallbackReturnParam* result)
         return (s32)OSK_ERROR_NOT_OPENED;
     }
     /* Unloading a dialog still on screen takes what it holds. */
+    const int was_open = s_state == OSK_OPEN;
 #ifdef _WIN32
-    if (s_state == OSK_OPEN && s_hwnd) PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
+    if (was_open && s_hwnd) PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
 #endif
     const s32 rc = osk_write_result(res_ea, s_result);
     if (rc == CELL_OK) s_state = OSK_UNLOADED;
     OSK_UNLOCK();
     if (rc != CELL_OK)
         return rc;
+    const CellOskDialogHost* host = s_ui_host;
+    if (was_open && host && host->close) host->close();
     printf("[cellOskDialog] UnloadAsync, result %d\n", s_result);
     osk_post(CELL_SYSUTIL_OSKDIALOG_UNLOADED);
     return CELL_OK;
@@ -426,6 +448,8 @@ s32 cellOskDialogAbort(void)
     if (s_hwnd) PostMessageW(s_hwnd, WM_CLOSE, 0, 0);
 #endif
     OSK_UNLOCK();
+    const CellOskDialogHost* host = s_ui_host;
+    if (was_open && host && host->close) host->close();
     if (was_open) osk_post(CELL_SYSUTIL_OSKDIALOG_FINISHED);
     return CELL_OK;
 }
