@@ -162,7 +162,9 @@ typedef struct {
         u32 raw;        /* raw RSX offset (offscreen-RT matching) */
         u32 w, h, fmt;  /* dims + RSX base format */
         u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
-        u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state */
+        u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
+                         * filt bits 20-22 (unused by the register) hold
+                         * TEXTURE_CONTROL0's max anisotropy */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -5528,6 +5530,34 @@ static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap_to_d3d(u32 m)
  * addressing and filtering -- the colour-grading LUT wrapped instead of
  * clamping, and bright pixels came out blue, magenta and grey. A full heap now
  * gives up the table used longest ago, once the GPU is done with it. */
+/* RSX_TEXFILTER (live; 0 the game's): 1 nearest, 2 bilinear, 3 trilinear,
+ * for the units the game samples with mipmaps (min filter 3-6), which are its
+ * surface textures. Colour-grading LUTs, render targets and other data are
+ * sampled without mipmaps and keep the game's filter: a LUT read nearest
+ * bands, and one read linear where the game reads it nearest blends entries.
+ *
+ * RSX_ANISO (live): 0 uses the game's own max anisotropy (TEXTURE_CONTROL0,
+ * as RPCS3 does), 1-16 replaces it. It applies to mipmapped units whose min
+ * and mag filters are linear, and never to depth comparison. The key's low
+ * five bits carry the level, so a change makes new tables and the old ones
+ * age out. */
+static u32 tex_filter_key(u32 filt, int shadow)
+{
+    static int force = -1, aniso = -1;
+    PS3_KNOB(force, ps3_env_int("RSX_TEXFILTER", 0));
+    PS3_KNOB(aniso, ps3_env_int("RSX_ANISO", 0));
+    u32 minf = (filt >> 16) & 7, magf = (filt >> 24) & 7;
+    const int mipped = minf >= 3 && minf <= 6;
+    if (mipped && !shadow && force >= 1 && force <= 3) {
+        static const u8 fmin[4] = {0, 3, 4, 6}, fmag[4] = {0, 1, 2, 2};
+        minf = fmin[force]; magf = fmag[force];
+    }
+    static const u8 guest_level[8] = {1, 2, 4, 6, 8, 10, 12, 16};
+    u32 level = aniso > 0 ? (u32)(aniso > 16 ? 16 : aniso) : guest_level[(filt >> 20) & 7];
+    if (shadow || !(minf == 4 || minf == 6) || magf != 2) level = 1;
+    return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
+}
+
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
@@ -5535,9 +5565,8 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     u32 k[RSX_FP_UNITS * 2];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
         k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * 2 + 1] = dr && dr->tex[u].set ? (dr->tex[u].filt & 0x07070000u)
-                                            : (u ? 0x02060000u : 0x01010000u);
-        if (dr_unit_shadow(dr, u)) k[u * 2 + 1] |= 0x80000000u;   /* comparison */
+        k[u * 2 + 1] = dr && dr->tex[u].set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+                                            : (u ? 0x02060001u : 0x01010001u);
     }
     const u64 now = s_d3d.frame_count;
     /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
@@ -5594,6 +5623,10 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         sd.AddressV = rsx_wrap_to_d3d((a >> 8) & 0xF);
         sd.AddressW = rsx_wrap_to_d3d((a >> 16) & 0xF);
         sd.MaxAnisotropy = 1;
+        if ((f & 0x1Fu) > 1) {   /* tex_filter_key's anisotropy level */
+            sd.Filter = D3D12_FILTER_ANISOTROPIC;
+            sd.MaxAnisotropy = f & 0x1Fu;
+        }
         /* zfunc uses the GL order (D3D12_COMPARISON_FUNC minus one), but the
          * stored function is the reverse of the sampling compare: LESS means
          * "texel < reference" (RPCS3 swaps LESS/GREATER and LEQUAL/GEQUAL the
@@ -11825,7 +11858,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].addr  = tex->address;
-        s_d3d.cur_texs[unit].filt  = tex->filter;
+        s_d3d.cur_texs[unit].filt  = (tex->filter & ~0x00700000u) | (((tex->control0 >> 4) & 7u) << 20);
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;
