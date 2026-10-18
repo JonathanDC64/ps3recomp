@@ -13,6 +13,7 @@
 #include <time.h>
 #include "ps3emu/ps3_knob.h"
 #include "cellPad.h"
+#include "pad_stick.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,26 +113,24 @@ static int s_sdl_inited = 0;
 
 #if PAD_BACKEND_XINPUT
 
-/* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
-#define PAD_STICK_DEADZONE  7849
 #define PAD_TRIGGER_THRESHOLD 30
+#endif
 
-static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
+/* One stick, -32768..32767 per axis with down positive, through the radial
+ * deadzone (pad_stick.h). PAD_STICK_DEADZONE (of 32767, default 7849, as
+ * XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE and RPCS3) and PAD_STICK_ANTI_DEADZONE
+ * (percent, default 13, RPCS3's). */
+static void pad_host_stick_to_u8(int x, int y, u8* out_x, u8* out_y)
 {
-    float normalized;
-    if (raw > deadzone)
-        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
-    else if (raw < -deadzone)
-        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
-    else
-        normalized = 0.0f;
-
-    /* Map -1.0..1.0 to 0..255 with center at 128 */
-    int val = (int)(normalized * 127.0f) + 128;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
+    static int d = -1, a = -1;
+    PS3_KNOB(d, ps3_env_int("PAD_STICK_DEADZONE", 7849));
+    PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
+    pad_stick_to_u8(x / 32767.0f, y / 32767.0f, d / 32767.0f, a / 100.0f, out_x, out_y);
 }
+#endif
+
+#if PAD_BACKEND_XINPUT
 
 /* Keyboard fallback for port 0.
  *
@@ -261,14 +260,14 @@ static void pad_poll_xinput(void)
 
         s_host_state[i].buttons = btns;
 
-        /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0). Reflect about
-         * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
-         * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
+        /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0): negate it
+         * before the conversion, so a centred stick stays 128. 127 would alias
+         * SELECT+START (0x7F) and can make the guest self-exit.
          * (via sagemono, PR #42) */
-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        pad_host_stick_to_u8(gp->sThumbLX, -gp->sThumbLY,
+                             &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+        pad_host_stick_to_u8(gp->sThumbRX, -gp->sThumbRY,
+                             &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -315,15 +314,6 @@ static void pad_shutdown_backend(void)
  * -----------------------------------------------------------------------*/
 
 #if PAD_BACKEND_SDL2
-
-static u8 pad_sdl_axis_to_u8(int raw)
-{
-    /* SDL axis: -32768..32767 -> 0..255 with center at 128 */
-    int val = ((raw + 32768) * 255) / 65535;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
 
 static u8 pad_sdl_trigger_to_u8(int raw)
 {
@@ -383,10 +373,12 @@ static void pad_poll_sdl2(void)
         s_host_state[i].buttons = btns;
 
         /* Analog sticks */
-        s_host_state[i].analog_lx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
-        s_host_state[i].analog_ly = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
-        s_host_state[i].analog_rx = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
-        s_host_state[i].analog_ry = pad_sdl_axis_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
+                             SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY),
+                             &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+        pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
+                             SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY),
+                             &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
         s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);

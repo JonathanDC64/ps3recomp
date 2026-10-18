@@ -27,13 +27,15 @@
  *
  * Knobs: PAD_NO_HID=1 turns it off (if Steam Input already presents the pad
  * as XInput, the game would otherwise see it twice). PAD_HID_DEADZONE
- * (default 10, of 128): a stick within that of centre on an axis reads
- * centred -- a DualSense at rest sits a few counts off 128.
+ * (default 20, of 128, RPCS3's 40/255) is the sticks' radial deadzone -- a
+ * DualSense at rest sits a few counts off 128 -- and PAD_STICK_ANTI_DEADZONE
+ * (percent, default 13) the output at its edge; see pad_stick.h.
  */
 #ifdef _WIN32
 
 #include "pad_hid_sony.h"
 #include "cellPad.h"
+#include "pad_stick.h"
 #include "ps3emu/ps3_knob.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -77,11 +79,13 @@ static int sony_kind(USHORT vid, USHORT pid)
     }
 }
 
-static uint8_t dz(uint8_t v)
+/* One stick's raw bytes (centre 128) through the radial deadzone. */
+static void stick(uint8_t rx, uint8_t ry, uint8_t* x, uint8_t* y)
 {
-    static int d = -1;
-    PS3_KNOB(d, getenv("PAD_HID_DEADZONE") ? atoi(getenv("PAD_HID_DEADZONE")) : 10);
-    return (v >= 128 - d && v <= 128 + d) ? 128 : v;
+    static int d = -1, a = -1;
+    PS3_KNOB(d, ps3_env_int("PAD_HID_DEADZONE", 20));
+    PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
+    pad_stick_to_u8((rx - 128) / 127.0f, (ry - 128) / 127.0f, d / 128.0f, a / 100.0f, x, y);
 }
 
 static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
@@ -102,7 +106,8 @@ static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
     const uint8_t b1 = full ? q[8] : q[5];
     const uint8_t b2 = full ? q[9] : q[6];
     PadHidSonyState s;
-    s.lx = dz(q[0]); s.ly = dz(q[1]); s.rx = dz(q[2]); s.ry = dz(q[3]);
+    stick(q[0], q[1], &s.lx, &s.ly);
+    stick(q[2], q[3], &s.rx, &s.ry);
     s.l2 = full ? q[4] : q[7];
     s.r2 = full ? q[5] : q[8];
 
