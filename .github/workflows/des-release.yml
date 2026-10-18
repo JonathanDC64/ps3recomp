@@ -1,0 +1,117 @@
+# Releases of this fork for DemonsSoulsRecomp (its docs/54). Pushing a tag des-<upstream version>-<n> builds the
+# runtime on Windows, runs the lifter test suites, then drafts a GitHub release with notes. des-0.14.0-1 is the
+# first fork release on top of upstream v0.14.0, des-0.14.0-2 the next one, des-0.15.0-1 the first after merging
+# upstream v0.15.0. These tags never match v*, so upstream's release.yml does not run for them and they cannot clash
+# with upstream's tags. The release stays a draft until it is published by hand. DemonsSoulsRecomp pins one of these
+# tags in its ps3recomp.pin.
+name: Fork release
+
+on:
+  push:
+    tags:
+      - 'des-[0-9]+.[0-9]+.[0-9]+-[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Windows x64 build and lifter tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lifter test suites
+        shell: bash
+        env:
+          CI: "1"
+        run: |
+          set -e
+          for t in tools/test_*.py; do
+            echo "--- $t"
+            python "$t"
+          done
+
+      - name: PPU boot scaffold
+        run: python tools/check_ppu_scaffold.py
+
+  draft:
+    name: Draft the release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to create the draft release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # master and the earlier des-* tags, for the checks and the notes
+
+      - name: The tag is on master
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::$TAG is not on master"
+            exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != tag ]; then
+            echo "::warning::$TAG is a lightweight tag; the scheme uses annotated ones (git tag -a)"
+          fi
+
+      # This fork's pull requests since the previous des-* tag (all of them for the first), oldest first, and the
+      # upstream releases merged in.
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, subprocess
+          tag, owner = os.environ["TAG"], os.environ["OWNER"]
+          base, n = re.match(r"^des-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$", tag).groups()
+          def git(*args):
+              return subprocess.run(["git", *args], capture_output=True, text=True, check=False).stdout.strip()
+          prev = git("describe", "--tags", "--abbrev=0", "--match", "des-*", f"{tag}^")
+          log = git("log", "--first-parent", "--merges", "--reverse", "--format=%s%x1f%b%x1e",
+                    f"{prev}..{tag}" if prev else tag)
+          mine, upstream = [], []
+          for record in log.split("\x1e"):
+              subject, _, body = record.strip().partition("\x1f")
+              title = next((line.strip() for line in body.splitlines() if line.strip()), "")
+              m = re.match(r"^Merge pull request #([0-9]+) from ([^/\s]+)/(\S+)$", subject)
+              if m and m.group(2) == owner:
+                  mine.append(f"- {title or m.group(3)} (#{m.group(1)})")
+              elif subject.lower().startswith("merge upstream"):
+                  upstream.append(f"- {subject}")
+          lines = [f"ps3recomp for DemonsSoulsRecomp: upstream v{base} with this fork's changes (fork release {n} "
+                   f"on that base).", "", f"Changes since {prev}:" if prev else "This fork's pull requests:", ""]
+          lines += mine or ["- (none)"]
+          if upstream:
+              lines += ["", "Upstream merged in:", ""] + upstream
+          open("notes.md", "w").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          EOF
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" --draft --verify-tag --title "ps3recomp $TAG" --notes-file notes.md
