@@ -40,21 +40,28 @@ static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RS
 
 /* RSX_SCALE=<percent> (default 100, 50-800): render the display buffers and
  * the offscreen colour and depth targets at that multiple of their guest size
- * (docs/37); blit_to_window fits the display buffer to the window. Read once,
- * since the targets live across frames. A target whose larger side is
+ * (docs/37); blit_to_window fits the display buffer to the window. The knob is
+ * live: render_frame remakes the targets at the next batch (rsx_scale_apply),
+ * and until then rsx_scale_pct stays at the scale they were made at. A target
+ * whose larger side is
  * RSX_SCALE_MIN (default 64) or less stays at its guest size: Demon's Souls's
  * exposure chain (64x64, then 16x16 targets the title reads back) must keep
  * its texel counts. Each target keeps its guest size (w, h; what matching and
  * the guest's viewport use) and its host size (hw, hh; the resource). */
+static u32 rsx_scale_wanted(void)
+{
+    static int p = -1;
+    PS3_KNOB(p, ps3_env_int("RSX_SCALE", 100));
+    return (u32)(p < 50 ? 50 : p > 800 ? 800 : p);
+}
+static u32 s_scale_pct;   /* the scale the targets are at */
 static u32 rsx_scale_pct(void)
 {
-    static u32 v = 0;
-    if (!v) {
-        int p = ps3_env_int("RSX_SCALE", 100);
-        v = (u32)(p < 50 ? 50 : p > 800 ? 800 : p);
-        if (v != 100) printf("[D3D12] RSX_SCALE: render targets at %u%%\n", v);
+    if (!s_scale_pct) {
+        s_scale_pct = rsx_scale_wanted();
+        if (s_scale_pct != 100) printf("[D3D12] RSX_SCALE: render targets at %u%%\n", s_scale_pct);
     }
-    return v;
+    return s_scale_pct;
 }
 static u32 rt_host_dim(u32 w, u32 h, u32 n)
 {
@@ -1187,6 +1194,87 @@ static u64 fnv_bytes(u64 h, const void* p, size_t n)
     return h;
 }
 
+/* The display buffers and the shared depth buffer, at RSX_SCALE's size: made
+ * by init_d3d12, and again by rsx_scale_apply when the scale changes. Their
+ * descriptor heaps already exist. */
+static int display_targets_make(void)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
+
+    /* The game's frame: textures of their own (see render_targets), in the
+     * PRESENT (= COMMON) state between frames as the swap chain's were, so
+     * every transition and readback of them is unchanged. */
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = s_d3d.host_w;
+        rd.Height           = s_d3d.host_h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.SampleDesc.Count = 1;
+        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        HRESULT hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL,
+            &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
+        if (FAILED(hr)) return -1;
+
+        s_d3d.device->lpVtbl->CreateRenderTargetView(
+            s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
+        rtv_handle.ptr += s_d3d.rtv_descriptor_size;
+    }
+    return 0;
+}
+
+static int depth_buffer_make(void)
+{
+    D3D12_HEAP_PROPERTIES heap_props = {0};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC depth_desc = {0};
+    depth_desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    /* Sized to cover the LARGEST render target, not just the window:
+     * D3D12 clips rasterization to the smallest bound attachment, and
+     * this DSV is shared by every pass -- with a window-sized depth
+     * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
+     * image) were silently cropped to the window rect. */
+    depth_desc.Width              = rt_host_dim(2048, 2048, 2048);
+    depth_desc.Height             = rt_host_dim(2048, 2048, 2048);
+    depth_desc.DepthOrArraySize   = 1;
+    depth_desc.MipLevels          = 1;
+    depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_desc.SampleDesc.Count   = 1;
+    depth_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    depth_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE depth_clear = {0};
+    depth_clear.Format                       = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depth_clear.DepthStencil.Depth           = 1.0f;
+    depth_clear.DepthStencil.Stencil         = 0;
+
+    HRESULT hr = d3d_create_committed(
+        s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
+        &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
+        &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
+    if (FAILED(hr)) {
+        printf("[D3D12] Depth buffer creation failed (0x%08lX)\n", hr);
+        return -1;
+    }
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
+    dsv_desc.Format         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsv_desc.ViewDimension  = D3D12_DSV_DIMENSION_TEXTURE2D;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
+    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
+    s_d3d.device->lpVtbl->CreateDepthStencilView(
+        s_d3d.device, s_d3d.depth_buffer, &dsv_desc, dsv_handle);
+    return 0;
+}
+
 static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
@@ -1355,34 +1443,7 @@ static int init_d3d12(u32 width, u32 height)
     s_d3d.rtv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-    /* Create RTVs for each frame */
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
-
-    /* The game's frame: textures of their own (see render_targets), in the
-     * PRESENT (= COMMON) state between frames as the swap chain's were, so
-     * every transition and readback of them is unchanged. */
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        D3D12_HEAP_PROPERTIES hp = {0};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd = {0};
-        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width            = s_d3d.host_w;
-        rd.Height           = s_d3d.host_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels        = 1;
-        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rd.SampleDesc.Count = 1;
-        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        hr = s_d3d.device->lpVtbl->CreateCommittedResource(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL,
-            &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
-        if (FAILED(hr)) return -1;
-
-        s_d3d.device->lpVtbl->CreateRenderTargetView(
-            s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
-        rtv_handle.ptr += s_d3d.rtv_descriptor_size;
-    }
+    if (display_targets_make() != 0) return -1;
 
     /* The window's buffers, with RTVs of their own. */
     {
@@ -1416,47 +1477,7 @@ static int init_d3d12(u32 width, u32 height)
             return -1;
         }
 
-        D3D12_HEAP_PROPERTIES heap_props = {0};
-        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-        D3D12_RESOURCE_DESC depth_desc = {0};
-        depth_desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        /* Sized to cover the LARGEST render target, not just the window:
-         * D3D12 clips rasterization to the smallest bound attachment, and
-         * this DSV is shared by every pass -- with a window-sized depth
-         * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
-         * image) were silently cropped to the window rect. */
-        depth_desc.Width              = rt_host_dim(2048, 2048, 2048);
-        depth_desc.Height             = rt_host_dim(2048, 2048, 2048);
-        depth_desc.DepthOrArraySize   = 1;
-        depth_desc.MipLevels          = 1;
-        depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        depth_desc.SampleDesc.Count   = 1;
-        depth_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        depth_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-        D3D12_CLEAR_VALUE depth_clear = {0};
-        depth_clear.Format                       = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        depth_clear.DepthStencil.Depth           = 1.0f;
-        depth_clear.DepthStencil.Stencil         = 0;
-
-        hr = d3d_create_committed(
-            s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
-            &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
-            &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
-        if (FAILED(hr)) {
-            printf("[D3D12] Depth buffer creation failed (0x%08lX)\n", hr);
-            return -1;
-        }
-
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
-        dsv_desc.Format         = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        dsv_desc.ViewDimension  = D3D12_DSV_DIMENSION_TEXTURE2D;
-
-        D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-        s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
-        s_d3d.device->lpVtbl->CreateDepthStencilView(
-            s_d3d.device, s_d3d.depth_buffer, &dsv_desc, dsv_handle);
+        if (depth_buffer_make() != 0) return -1;
 
         printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
     }
@@ -7481,6 +7502,49 @@ static void frame_log(long long q0, long long q1)
     { static int n = 0; if (++n % 64 == 0) fflush(f); }
 }
 
+/* RSX_SCALE changed (the port's Settings window sets it while the game runs):
+ * at the start of a batch, with the GPU idle and the last write-back stored,
+ * everything sized from it is dropped and made again at the new size. Colour
+ * targets refill from guest memory, which the write-back keeps current at any
+ * scale; depth surfaces start cleared, as a new one does. */
+static void rsx_scale_apply(void)
+{
+    const u32 want = rsx_scale_wanted();
+    if (want == rsx_scale_pct()) return;
+    s_scale_pct = want;
+    printf("[D3D12] RSX_SCALE: render targets at %u%%%c", want, 10);
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        OffRT* r = &s_d3d.off_rt[i];
+        off_rt_defer_release(r->res);  r->res = NULL;
+        off_rt_defer_release(r->up);   r->up = NULL;
+        off_rt_defer_release(r->snap); r->snap = NULL;
+        off_rt_defer_release(r->down); r->down = NULL;
+        r->gsum_ok = 0; r->used = 0;
+    }
+    for (int i = 0; i < MAX_ZETA; i++) {
+        off_rt_defer_release(s_zeta[i].res); s_zeta[i].res = NULL; s_zeta[i].used = 0;
+    }
+    for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
+    off_rt_defer_release(s_screen_copy);      s_screen_copy = NULL;
+    off_rt_defer_release(s_d3d.readback_buf); s_d3d.readback_buf = NULL;
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;
+    }
+    off_rt_defer_release(s_d3d.depth_buffer); s_d3d.depth_buffer = NULL;
+    s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
+    s_d3d.host_h = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.height);
+    if (display_targets_make() != 0 || depth_buffer_make() != 0) {
+        fprintf(stderr, "[D3D12] RSX_SCALE: the targets at %u%% could not be made%c", want, 10);
+        abort();
+    }
+    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
+    for (u32 i = 0; i < FRAME_COUNT; i++, h.ptr += inc)
+        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[i], NULL, h);
+}
+
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 static void render_frame(void)
 {
@@ -7513,6 +7577,7 @@ static void render_frame(void)
       QueryPerformanceCounter(&_w2); QueryPerformanceFrequency(&_f);
       s_fl_wait_ms  = (double)(_w1.QuadPart - _w0.QuadPart) * 1000.0 / (double)_f.QuadPart;
       s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
+    rsx_scale_apply();
     off_rt_release_deferred();   /* RT resources the previous frame dropped */
     tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);
