@@ -52,6 +52,26 @@ static int mtx_find_free(void)
     return -1;
 }
 
+/* The host lock without waiting: 1 if this thread now holds it (also when it
+ * already did, on a recursive host lock), 0 if another thread holds it. */
+static int host_trylock(sys_mutex_info* m)
+{
+#ifdef _WIN32
+    return TryEnterCriticalSection(&m->cs) ? 1 : 0;
+#else
+    return pthread_mutex_trylock(&m->mtx) == 0;
+#endif
+}
+
+static void host_unlock(sys_mutex_info* m)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&m->cs);
+#else
+    pthread_mutex_unlock(&m->mtx);
+#endif
+}
+
 /* Byteswap helper for writing u32 to guest memory */
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -83,8 +103,17 @@ int64_t sys_mutex_create(ppu_context* ctx)
     }
 
     sys_mutex_info* m = &g_sys_mutexes[slot];
-    memset(m, 0, sizeof(*m));
-    m->active = 1;
+    /* No memset: on Windows the CRITICAL_SECTION is made once per slot and
+     * kept. A thread that read this slot's id just before the last destroy
+     * can still be on its way into the lock; it must find a valid one, and
+     * sys_mutex_lock then sees the slot inactive (or the new mutex). */
+    memset(m->name, 0, sizeof(m->name));
+    m->protocol = 0;
+    m->recursive = 0;
+    m->owner_tid = 0;
+    m->lock_count = 0;
+    m->cond_count = 0;
+    m->relock_pending = 0;
 
     /* Read attributes from guest memory */
     if (attr_addr != 0) {
@@ -113,7 +142,10 @@ int64_t sys_mutex_create(ppu_context* ctx)
 
     /* Initialize host mutex */
 #ifdef _WIN32
-    InitializeCriticalSection(&m->cs);
+    if (!m->initialized) {
+        InitializeCriticalSection(&m->cs);
+        m->initialized = 1;
+    }
     m->wait_handle = CreateEventA(NULL, FALSE, TRUE, NULL);
 #else
     {
@@ -128,6 +160,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
         pthread_mutexattr_destroy(&mattr);
     }
 #endif
+    m->active = 1;   /* after the host lock is ready */
 
     /* Write mutex ID (slot + 1) to guest */
     uint32_t mutex_id = (uint32_t)(slot + 1);
@@ -161,18 +194,43 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    DeleteCriticalSection(&m->cs);
-    if (m->wait_handle) CloseHandle(m->wait_handle);
-#else
-    pthread_mutex_destroy(&m->mtx);
-#endif
+    /* lv2 refuses while the mutex has an owner (EBUSY), then while a cond is
+     * still created on it (EPERM) -- RPCS3's sys_mutex_destroy, as oracle,
+     * checks in that order. Destroying anyway deleted the CRITICAL_SECTION
+     * under its holder and its waiters (undefined behaviour) and left the
+     * conds pointing at a dead or reused id.
+     * Owner test: the host lock cannot be taken while another thread holds
+     * it, and the caller's own hold shows in lock_count. A cond waiter on
+     * its way back to the mutex (relock_pending) is an owner too: lv2 gives
+     * it the mutex, or queues it for it, in the same step that ends the
+     * wait. */
+    int32_t result = CELL_OK;
+    if (!host_trylock(m)) {
+        result = (int32_t)CELL_EBUSY;
+    } else {
+        if (m->lock_count > 0 || m->relock_pending > 0)
+            result = (int32_t)CELL_EBUSY;
+        else if (m->cond_count > 0)
+            result = (int32_t)CELL_EPERM;
+        else
+            m->active = 0;
+        host_unlock(m);
+    }
 
-    m->active = 0;
+    if (result == CELL_OK) {
+#ifdef _WIN32
+        /* The CRITICAL_SECTION stays for the slot's next mutex (see create). */
+        if (m->wait_handle) { CloseHandle(m->wait_handle); m->wait_handle = NULL; }
+#else
+        pthread_mutex_destroy(&m->mtx);
+#endif
+    }
+
     mtx_table_unlock();
     { extern void sync_hist(char, uint32_t, const ppu_context*, uint32_t, int32_t);
-      sync_hist('X', mutex_id, ctx, (uint32_t)m->owner_tid, m->lock_count); }
-    return CELL_OK;
+      sync_hist('X', mutex_id, ctx, (uint32_t)m->owner_tid,
+                result == CELL_OK ? m->lock_count : result); }
+    return result;
 }
 
 /* ---------------------------------------------------------------------------
@@ -241,6 +299,14 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     }
 #endif
 
+    if (!m->active) {
+        /* Destroyed while this thread was on its way in: destroy only takes
+         * a free lock, so it can win the race to a lock just released. lv2
+         * answers ESRCH for an id that is gone. */
+        host_unlock(m);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
     m->owner_tid = caller_tid;
     m->lock_count++;
     return CELL_OK;
@@ -263,6 +329,15 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     uint64_t caller_tid = ctx->thread_id;
+
+    /* The owner trying a non-recursive mutex again: lv2 answers EDEADLK, as
+     * sys_mutex_lock does above. The host lock cannot say so: a
+     * CRITICAL_SECTION is recursive, so TryEnter succeeded and the guest got
+     * CELL_OK and a second count (and the POSIX error-checking mutex gave
+     * EBUSY). */
+    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+        return (int64_t)(int32_t)CELL_EDEADLK;
+    }
 
     /* Recursive re-entry. MUST still acquire the host primitive: unlock
      * calls LeaveCriticalSection unconditionally per guest unlock, so every
@@ -302,9 +377,41 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
     }
 #endif
 
+    if (!m->active) {   /* destroyed meanwhile, as in sys_mutex_lock */
+        host_unlock(m);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+
     m->owner_tid = caller_tid;
     m->lock_count++;
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Conds bound to a mutex (sys_cond.c)
+ * -----------------------------------------------------------------------*/
+int sys_mutex_bind_cond(uint32_t mutex_id)
+{
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return 0;
+    mtx_table_lock();
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    int ok = m->active;
+    if (ok)
+        m->cond_count++;
+    mtx_table_unlock();
+    return ok;
+}
+
+void sys_mutex_unbind_cond(uint32_t mutex_id)
+{
+    if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
+        return;
+    mtx_table_lock();
+    sys_mutex_info* m = &g_sys_mutexes[mutex_id - 1];
+    if (m->cond_count > 0)
+        m->cond_count--;
+    mtx_table_unlock();
 }
 
 /* ---------------------------------------------------------------------------

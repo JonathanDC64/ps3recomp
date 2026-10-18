@@ -76,7 +76,11 @@ int64_t sys_cond_create(ppu_context* ctx)
     uint32_t out = LV2_ARG_PTR(ctx, 0);
     uint32_t mid = LV2_ARG_U32(ctx, 1);
     uint32_t attr = LV2_ARG_PTR(ctx, 2);
-    if (!mid || mid > SYS_MUTEX_MAX || !g_sys_mutexes[mid - 1].active)
+    /* Check the mutex and count this cond on it in one step under the mutex
+     * table lock: checking .active alone raced sys_mutex_destroy, which could
+     * then leave a cond on a dead mutex (RPCS3 PR #8340 fixed the same race).
+     * Every failure below must give the count back. */
+    if (!sys_mutex_bind_cond(mid))
         return (int32_t)CELL_ESRCH;
     table_lock();
     for (unsigned i = 0; i < SYS_COND_MAX; ++i) {
@@ -88,11 +92,11 @@ int64_t sys_cond_create(ppu_context* ctx)
             InitializeConditionVariable(&c->cv);
 #else
             int rc = pthread_mutex_init(&c->signal_lock, NULL);
-            if (rc) { table_unlock(); return (int32_t)CELL_EAGAIN; }
+            if (rc) { table_unlock(); sys_mutex_unbind_cond(mid); return (int32_t)CELL_EAGAIN; }
             rc = pthread_cond_init(&c->cv, NULL);
             if (rc) {
                 pthread_mutex_destroy(&c->signal_lock);
-                table_unlock(); return (int32_t)CELL_EAGAIN;
+                table_unlock(); sys_mutex_unbind_cond(mid); return (int32_t)CELL_EAGAIN;
             }
 #endif
             c->initialized = 1;
@@ -119,6 +123,7 @@ int64_t sys_cond_create(ppu_context* ctx)
         return CELL_OK;
     }
     table_unlock();
+    sys_mutex_unbind_cond(mid);
     return (int32_t)CELL_EAGAIN;
 }
 
@@ -131,10 +136,12 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     if (!c->active) { table_unlock(); return (int32_t)CELL_ESRCH; }
     cond_lock(c);
     int32_t result = CELL_OK;
+    uint32_t mid = 0;
     if (c->waiters) result = (int32_t)CELL_EBUSY;
-    else { c->active = 0; g_cond_id_addr[id] = 0; }
+    else { mid = c->mutex_id; c->active = 0; g_cond_id_addr[id] = 0; }
     cond_unlock(c);
     table_unlock();
+    if (result == CELL_OK) sys_mutex_unbind_cond(mid);
     sync_hist('D', id, ctx, 0, result);
     return result;
 }
@@ -239,10 +246,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
     struct sys_cond_waiter** link = &c->waiters;
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
+    /* Off the cond and not yet back on the mutex. lv2 gives a waiter the
+     * mutex, or queues it for it, in the same step that ends its wait, so
+     * sys_mutex_destroy cannot slip in here; count as an owner until the
+     * relock is done. */
+    __sync_add_and_fetch(&m->relock_pending, 1);
     cond_unlock(c);
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
+    __sync_sub_and_fetch(&m->relock_pending, 1);
     sync_hist('w', LV2_ARG_U32(ctx, 0), ctx, c->mutex_id, result);
     return result;
 }
