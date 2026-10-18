@@ -112,7 +112,7 @@ if(WIN32)
     target_include_directories(test_destroy_semantics PRIVATE
         "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
     target_compile_definitions(test_destroy_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
-    foreach(mode mutex_busy mutex_conds trylock relock)
+    foreach(mode mutex_busy mutex_conds trylock relock signal timeout)
         add_test(NAME destroy_${mode} COMMAND test_destroy_semantics ${mode})
         set_tests_properties(destroy_${mode} PROPERTIES TIMEOUT 10)
     endforeach()

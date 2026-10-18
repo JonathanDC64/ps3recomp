@@ -7,10 +7,15 @@
  *               EPERM; a cond cannot be made on a destroyed mutex (ESRCH).
  *   trylock     the owner's trylock of a non-recursive mutex is EDEADLK and
  *               takes no second count; a recursive one counts up.
- *   relock      a cond waiter that has left its cond but not yet taken the
- *               mutex back still owns it: sys_mutex_destroy is EBUSY.
- * Windows only, like test_cond_semantics: the waiter is a host thread that
- * the test parks, and for relock suspends, at a chosen point.
+ *   relock      a signalled cond waiter that has not yet taken the mutex
+ *               back still owns it: sys_mutex_destroy is EBUSY.
+ *   signal      a signal takes the woken thread off the cond, as lv2's
+ *               does: sys_cond_destroy is EBUSY only while a thread is
+ *               still waiting, and succeeds right after the last signal.
+ *   timeout     a timed-out waiter leaves the cond and the mutex's count
+ *               as it found them.
+ * Windows only, like test_cond_semantics: the waiters are host threads that
+ * the test parks, and for relock freezes, at a chosen point.
  */
 #include "runtime/platform/win32_compat.h"
 #include "runtime/syscalls/sys_cond.h"
@@ -20,6 +25,9 @@
 
 uint8_t* vm_base;
 static int failures;
+
+/* sys_cond.c's wait record, completed here to count a cond's waiters. */
+struct sys_cond_waiter { struct sys_cond_waiter* next; int signalled; };
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); failures++; } } while (0)
 
 static int32_t call(int64_t (*f)(ppu_context*), ppu_context* c, uint64_t a, uint64_t b, uint64_t d)
@@ -146,28 +154,62 @@ static void mode_trylock(void)
 }
 
 /* A guest thread that waits on the cond once and records the result. */
-typedef struct { uint32_t mid, cid; int32_t rc; volatile LONG done; } waiter_args;
+typedef struct { uint32_t mid, cid; uint64_t tid, timeout; int32_t rc; volatile LONG done; HANDLE h; } waiter_args;
 
 static DWORD WINAPI waiter(void* raw)
 {
     waiter_args* a = (waiter_args*)raw;
-    ppu_context c = {0}; c.thread_id = 7;
+    ppu_context c = {0}; c.thread_id = a->tid;
     if (call(sys_mutex_lock, &c, a->mid, 0, 0) == CELL_OK) {
-        a->rc = call(sys_cond_wait, &c, a->cid, 0, 0);
+        a->rc = call(sys_cond_wait, &c, a->cid, a->timeout, 0);
         call(sys_mutex_unlock, &c, a->mid, 0, 0);
     }
     InterlockedExchange(&a->done, 1);
     return 0;
 }
 
-/* Wait until the waiter is parked: its record is on the cond and it has let
- * go of the cond's lock, which it holds from entry until it sleeps. */
-static void wait_parked(sys_cond_info* ci)
+static void start_waiter(waiter_args* a, uint32_t mid, uint32_t cid, uint64_t tid, uint64_t timeout)
 {
-    for (int i = 0; i < 5000 && !*(struct sys_cond_waiter* volatile*)&ci->waiters; i++) Sleep(1);
-    CHECK(ci->waiters != NULL);
-    EnterCriticalSection(&ci->signal_lock);
-    LeaveCriticalSection(&ci->signal_lock);
+    waiter_args init = {mid, cid, tid, timeout, -1, 0, NULL};
+    *a = init;
+    a->h = CreateThread(NULL, 0, waiter, a, 0, NULL);
+    CHECK(a->h != NULL);
+}
+
+static int32_t join_waiter(waiter_args* a)
+{
+    CHECK(WaitForSingleObject(a->h, 5000) == WAIT_OBJECT_0);
+    CloseHandle(a->h);
+    CHECK(a->done);
+    return a->rc;
+}
+
+/* Wait until n waiters are parked: their records are on the cond and they
+ * have let go of the cond's lock, which a waiter holds from entry until it
+ * sleeps. */
+static void wait_parked(sys_cond_info* ci, int n)
+{
+    int count = 0;
+    for (int i = 0; i < 5000; i++) {
+        EnterCriticalSection(&ci->signal_lock);
+        count = 0;
+        for (struct sys_cond_waiter* w = ci->waiters; w; w = w->next) count++;
+        LeaveCriticalSection(&ci->signal_lock);
+        if (count >= n) break;
+        Sleep(1);
+    }
+    CHECK(count == n);
+}
+
+/* SuspendThread returns before the thread has stopped; GetThreadContext
+ * waits until it has. */
+static void freeze(HANDLE h)
+{
+    CHECK(SuspendThread(h) != (DWORD)-1);
+    CONTEXT tc;
+    memset(&tc, 0, sizeof(tc));
+    tc.ContextFlags = CONTEXT_CONTROL;
+    CHECK(GetThreadContext(h, &tc));
 }
 
 static void mode_relock(void)
@@ -177,31 +219,74 @@ static void mode_relock(void)
     uint32_t cid = make_cond(&c1, mid, 0x204);
     sys_cond_info* ci = &g_sys_conds[cid - 1];
     sys_mutex_info* mi = &g_sys_mutexes[mid - 1];
-    waiter_args a = {mid, cid, -1, 0};
-    HANDLE h = CreateThread(NULL, 0, waiter, &a, 0, NULL);
-    CHECK(h != NULL);
-    wait_parked(ci);
+    waiter_args a;
+    start_waiter(&a, mid, cid, 7, 0);
+    wait_parked(ci, 1);
 
-    /* Signal while holding the mutex: the waiter can leave the cond but not
-     * get the mutex back. Freeze it there, out of the cond's lock. */
+    /* Signal while holding the cond's lock (recursive, so the syscalls
+     * still take it): the woken waiter cannot get back out of its wait.
+     * Freeze it there, then let go of everything. */
+    EnterCriticalSection(&ci->signal_lock);
     CHECK(call(sys_mutex_lock, &c1, mid, 0, 0) == CELL_OK);
     CHECK(call(sys_cond_signal, &c1, cid, 0, 0) == CELL_OK);
-    for (int i = 0; i < 5000 && !mi->relock_pending; i++) Sleep(1);
     CHECK(mi->relock_pending == 1);
-    EnterCriticalSection(&ci->signal_lock);
+    freeze(a.h);
     LeaveCriticalSection(&ci->signal_lock);
-    CHECK(SuspendThread(h) != (DWORD)-1);
 
     /* Nobody holds the mutex now, but the waiter is owed it. */
     CHECK(call(sys_mutex_unlock, &c1, mid, 0, 0) == CELL_OK);
     CHECK(call(sys_cond_destroy, &c1, cid, 0, 0) == CELL_OK);
     CHECK(call(sys_mutex_destroy, &c1, mid, 0, 0) == (int32_t)CELL_EBUSY);
 
-    CHECK(ResumeThread(h) != (DWORD)-1);
-    CHECK(WaitForSingleObject(h, 5000) == WAIT_OBJECT_0);
-    CloseHandle(h);
-    CHECK(a.done && a.rc == CELL_OK);
+    CHECK(ResumeThread(a.h) != (DWORD)-1);
+    CHECK(join_waiter(&a) == CELL_OK);
     CHECK(mi->relock_pending == 0);
+    CHECK(call(sys_mutex_destroy, &c1, mid, 0, 0) == CELL_OK);
+}
+
+static void mode_signal(void)
+{
+    ppu_context c1 = {0}; c1.thread_id = 1;
+    uint32_t mid = make_mutex(&c1, 0, 0x200);
+    uint32_t cid = make_cond(&c1, mid, 0x204);
+    sys_cond_info* ci = &g_sys_conds[cid - 1];
+    sys_mutex_info* mi = &g_sys_mutexes[mid - 1];
+    waiter_args a, b;
+    start_waiter(&a, mid, cid, 7, 0);
+    start_waiter(&b, mid, cid, 8, 0);
+    wait_parked(ci, 2);
+
+    /* Hold the cond's lock to keep the woken waiters from running until the
+     * destroys are done. */
+    EnterCriticalSection(&ci->signal_lock);
+    CHECK(call(sys_mutex_lock, &c1, mid, 0, 0) == CELL_OK);
+    CHECK(call(sys_cond_signal, &c1, cid, 0, 0) == CELL_OK);
+    CHECK(mi->relock_pending == 1);
+    CHECK(call(sys_cond_destroy, &c1, cid, 0, 0) == (int32_t)CELL_EBUSY);   /* one still waits */
+    CHECK(call(sys_cond_signal_all, &c1, cid, 0, 0) == CELL_OK);
+    CHECK(mi->relock_pending == 2);
+    CHECK(call(sys_cond_destroy, &c1, cid, 0, 0) == CELL_OK);
+    CHECK(call(sys_mutex_unlock, &c1, mid, 0, 0) == CELL_OK);
+    LeaveCriticalSection(&ci->signal_lock);
+
+    CHECK(join_waiter(&a) == CELL_OK);
+    CHECK(join_waiter(&b) == CELL_OK);
+    CHECK(mi->relock_pending == 0);
+    CHECK(call(sys_mutex_destroy, &c1, mid, 0, 0) == CELL_OK);
+}
+
+static void mode_timeout(void)
+{
+    ppu_context c1 = {0}; c1.thread_id = 1;
+    uint32_t mid = make_mutex(&c1, 0, 0x200);
+    uint32_t cid = make_cond(&c1, mid, 0x204);
+    sys_mutex_info* mi = &g_sys_mutexes[mid - 1];
+    waiter_args a;
+    start_waiter(&a, mid, cid, 7, 1000);
+    CHECK(join_waiter(&a) == (int32_t)CELL_ETIMEDOUT);
+    CHECK(g_sys_conds[cid - 1].waiters == NULL);
+    CHECK(mi->relock_pending == 0 && mi->lock_count == 0);
+    CHECK(call(sys_cond_destroy, &c1, cid, 0, 0) == CELL_OK);
     CHECK(call(sys_mutex_destroy, &c1, mid, 0, 0) == CELL_OK);
 }
 
@@ -213,6 +298,8 @@ int main(int argc, char** argv)
     else if (!strcmp(mode, "mutex_conds")) mode_mutex_conds();
     else if (!strcmp(mode, "trylock"))     mode_trylock();
     else if (!strcmp(mode, "relock"))      mode_relock();
+    else if (!strcmp(mode, "signal"))      mode_signal();
+    else if (!strcmp(mode, "timeout"))     mode_timeout();
     else { fprintf(stderr, "unknown mode %s\n", mode); return 2; }
     printf("destroy %s: %s\n", mode, failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

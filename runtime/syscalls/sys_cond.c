@@ -173,9 +173,11 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (cond_traced(LV2_ARG_U32(ctx, 0)))
         fprintf(stderr, "[COND_TRACE] t=%llu wait cond=%u by tid=%llu lr=0x%08llX%c", ps3_ms_now(), LV2_ARG_U32(ctx, 0),
                 (unsigned long long)ctx->thread_id, (unsigned long long)ctx->lr, 10);
-    sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
+    const uint32_t cid = LV2_ARG_U32(ctx, 0);
+    sys_cond_info* c = acquire_cond(cid);
     if (!c) return (int32_t)CELL_ESRCH;
-    sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
+    const uint32_t mid = c->mutex_id;
+    sys_mutex_info* m = &g_sys_mutexes[mid - 1];
     if (!m->active) { cond_unlock(c); return (int32_t)CELL_ESRCH; }
     if (m->owner_tid != ctx->thread_id || m->lock_count <= 0) {
         cond_unlock(c); return (int32_t)CELL_EPERM;
@@ -243,20 +245,26 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #endif
-    struct sys_cond_waiter** link = &c->waiters;
-    while (*link != &waiter) link = &(*link)->next;
-    *link = waiter.next;
-    /* Off the cond and not yet back on the mutex. lv2 gives a waiter the
-     * mutex, or queues it for it, in the same step that ends its wait, so
-     * sys_mutex_destroy cannot slip in here; count as an owner until the
-     * relock is done. */
-    __sync_add_and_fetch(&m->relock_pending, 1);
+    if (!waiter.signalled) {
+        /* Timed out or failed: still on the cond. A signal took a signalled
+         * record off already and counted it on the mutex. */
+        struct sys_cond_waiter** link = &c->waiters;
+        while (*link != &waiter) link = &(*link)->next;
+        *link = waiter.next;
+        /* Off the cond and not yet back on the mutex. lv2 gives a waiter
+         * the mutex, or queues it for it, in the same step that ends its
+         * wait, so sys_mutex_destroy cannot slip in here; count as an
+         * owner until the relock is done. */
+        __sync_add_and_fetch(&m->relock_pending, 1);
+    }
+    /* After this unlock a signalled waiter's cond may be destroyed and its
+     * slot reused: use only cid and mid from here on. */
     cond_unlock(c);
     for (int i = 0; i < depth; ++i) guest_lock(m);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
     __sync_sub_and_fetch(&m->relock_pending, 1);
-    sync_hist('w', LV2_ARG_U32(ctx, 0), ctx, c->mutex_id, result);
+    sync_hist('w', cid, ctx, mid, result);
     return result;
 }
 
@@ -281,10 +289,19 @@ static int64_t signal_cond(uint32_t id, int all)
 {
     sys_cond_info* c = acquire_cond(id);
     if (!c) return (int32_t)CELL_ESRCH;
+    /* lv2 takes the woken thread off the cond in the signal itself and
+     * hands it the mutex or queues it for it. Leaving the record on until
+     * the woken thread ran made a sys_cond_destroy right after the signal
+     * answer EBUSY (RPCS3 PR #8340 fixed the same spurious EBUSY). The
+     * mutex counts the thread as an owner until it has relocked: the mutex
+     * cannot be destroyed while this cond exists, so m is live here. */
+    sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
     int selected = 0;
-    for (struct sys_cond_waiter* w = c->waiters; w; w = w->next) {
-        if (w->signalled) continue;
+    while (c->waiters) {
+        struct sys_cond_waiter* w = c->waiters;
+        c->waiters = w->next;
         w->signalled = 1;
+        __sync_add_and_fetch(&m->relock_pending, 1);
         selected = 1;
         if (!all) break;
     }
