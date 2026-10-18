@@ -8083,7 +8083,12 @@ rtt_dump_done:;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
-            float tgt_sx = 1.0f, tgt_sy = 1.0f;    /* its host size over guest size (RSX_SCALE) */
+            /* its host size over guest size (RSX_SCALE). The batch starts on the display
+             * buffer, already bound: a batch that never changes target (a loading
+             * screen) draws with this ratio, and at 1.0 it drew at the guest size, in
+             * the top-left quarter of every other frame. */
+            float tgt_sx = (float)s_d3d.host_w / (float)s_d3d.width;
+            float tgt_sy = (float)s_d3d.host_h / (float)s_d3d.height;
             float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
             int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
             int cur_z = -1;                        /* zeta: -1 = shared buffer  */
