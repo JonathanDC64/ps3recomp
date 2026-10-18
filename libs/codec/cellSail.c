@@ -291,9 +291,34 @@ static u32 sail_scratch(int slot)
 /* PS3_SAIL_MOVIES=0: never play, every stream ends at once (the old answer).
  * PS3_SAIL_MOVIES=<text> (diagnostic): play only movies whose path contains
  * <text> (e.g. "title"), so a test reaches a later movie without sitting
- * through the unskippable ones before it. Default 1: play everything. */
+ * through the unskippable ones before it. Default 1: play everything.
+ * PS3_SAIL_SKIP=<text>[,<text>...]: never play the movies whose path contains
+ * one of the texts, and play the rest (a title's option to skip its opening
+ * movie, and only that one). A skipped movie ends as soon as it starts, as
+ * with PS3_SAIL_MOVIES=0. */
+static int sail_path_listed(const char* path, const char* list)
+{
+    while (*list) {
+        const char* end = strchr(list, ',');
+        const size_t n = end ? (size_t)(end - list) : strlen(list);
+        if (n > 0) {
+            for (const char* p = path; *p; p++) {
+                if (strncmp(p, list, n) == 0) return 1;
+            }
+        }
+        if (!end) break;
+        list = end + 1;
+    }
+    return 0;
+}
+
 static int sail_movie_wanted(const char* path)
 {
+    const char* skip = getenv("PS3_SAIL_SKIP");
+    if (skip && *skip && sail_path_listed(path, skip)) {
+        printf("[cellSail] PS3_SAIL_SKIP: %s skipped\n", path);
+        return 0;
+    }
     const char* e = getenv("PS3_SAIL_MOVIES");
     if (!e || !*e || strcmp(e, "1") == 0) return 1;
     if (strcmp(e, "0") == 0) return 0;
