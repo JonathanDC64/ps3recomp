@@ -6695,6 +6695,7 @@ static int  s_zq_on_start;                 /* ... when the current batch began *
 static struct { u32 at, kind, idx; } s_zq_ev[ZQ_EV_MAX];
 static int  s_zq_nev;
 static u32  s_zq_rec[ZQ_MAX];              /* cb_slot of each query issued */
+static float s_zq_area[ZQ_MAX];            /* its target's host/guest pixel ratio (RSX_SCALE) */
 static int  s_zq_n;                        /* queries issued this batch */
 static u64  s_zq_acc;                      /* samples since the last clear */
 
@@ -6760,6 +6761,10 @@ static void zq_finish(void)
             D3D12_RANGE wr = {0, 0};
             s_zq_rb->lpVtbl->Unmap(s_zq_rb, 0, &wr);
         }
+        /* A scaled target covers more samples; report what the guest's size would,
+         * rounded up so a sliver that showed is never reported as hidden. */
+        for (int i = 0; i < s_zq_n; i++)
+            if (s_zq_area[i] > 1.0f && cnt[i]) cnt[i] = (u64)ceil((double)cnt[i] / s_zq_area[i]);
     }
     extern void cellGcm_report_store(u32 index, u32 value);
     static int logn = -1, logged = 0;
@@ -8392,6 +8397,7 @@ rtt_dump_done:;
                       s_zq_n < ZQ_MAX && zq_counted(dr->cb_slot) && zq_ready()) {
                       zq = s_zq_n++;
                       s_zq_rec[zq] = dr->cb_slot;
+                      s_zq_area[zq] = tgt_sx * tgt_sy;
                       s_d3d.cmd_list->lpVtbl->BeginQuery(s_d3d.cmd_list, s_zq_heap,
                           D3D12_QUERY_TYPE_OCCLUSION, (UINT)zq);
                   }
