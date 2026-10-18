@@ -319,6 +319,15 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                     method, arg);
         return;
     }
+    /* COLOR_MASK takes 0 or 1 in each byte. Real hardware ignores a write
+     * with any other bit set and keeps the old mask (RPCS3 PR #14545,
+     * nv4097::set_color_mask); decoding "byte != 0" would turn it into a mask. */
+    if (method == M_COLOR_MASK && (arg & 0xFEFEFEFEu)) {
+        static int n = 0;
+        if (n++ < 4)
+            fprintf(stderr, "[rsx-dispatch] COLOR_MASK 0x%08X has reserved bits -- ignored\n", arg);
+        return;
+    }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
