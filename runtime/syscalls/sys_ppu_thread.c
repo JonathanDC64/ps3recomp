@@ -297,6 +297,12 @@ unsigned long long ppu_thread_cpu_us(unsigned tid)
 /* The guest function that holds host address ra (ppu_loader.cpp). Weak: not
  * every program that links the runtime links the loader. */
 extern __attribute__((weak)) uint32_t ppu_prof_resolve_host(void* ra);
+#if defined(__APPLE__)
+/* Mach-O's linker rejects a weak reference that nothing defines (see the note
+ * in ppu_hle.cpp), so there the runtime carries a weak default instead, and the
+ * loader's definition overrides it. Elsewhere the reference is null. */
+uint32_t ppu_prof_resolve_host(void* ra) { (void)ra; return 0; }
+#endif
 
 static unsigned prof_resolve(void* ra)
 {
