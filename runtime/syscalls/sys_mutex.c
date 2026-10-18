@@ -226,10 +226,22 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
 #endif
     }
 
+    const uint32_t owner = (uint32_t)m->owner_tid;
+    const int conds = m->cond_count;
+    const long relocking = m->relock_pending;
     mtx_table_unlock();
     { extern void sync_hist(char, uint32_t, const ppu_context*, uint32_t, int32_t);
-      sync_hist('X', mutex_id, ctx, (uint32_t)m->owner_tid,
-                result == CELL_OK ? m->lock_count : result); }
+      sync_hist('X', mutex_id, ctx, owner, result == CELL_OK ? m->lock_count : result); }
+    if (result != CELL_OK) {
+        /* New answers: this used to free the mutex whatever its state. Say
+         * who asked, the first few times, so a run shows whether the title
+         * ever relied on the old one. */
+        static volatile long s_said;
+        if (__sync_add_and_fetch(&s_said, 1) <= 16)
+            fprintf(stderr, "[SYNC] sys_mutex_destroy(%u) -> %s: owner tid %u, %ld relocking, %d conds, lr=0x%08X\n",
+                    mutex_id, result == (int32_t)CELL_EPERM ? "EPERM" : "EBUSY",
+                    owner, relocking, conds, (uint32_t)ctx->lr);
+    }
     return result;
 }
 
