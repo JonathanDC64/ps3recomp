@@ -32,6 +32,11 @@ extern "C" {
  * to the PS3 timebase. Called from every lifted mftb site (ppu_lifter.py). */
 uint64_t ppu_timebase_now(void);
 
+/* The guest's system time in microseconds: what sys_time_get_system_time
+ * returns. Anything the guest compares with it, such as
+ * cellGcmGetLastFlipTime, reads this clock too. */
+uint64_t lv2_system_time_usec(void);
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,

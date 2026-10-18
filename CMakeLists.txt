@@ -394,6 +394,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    # The guest system-time clock (sys_time_get_system_time, and the flip
+    # time cellGcmGetLastFlipTime reports) counts microseconds.
+    add_subdirectory(tests/lv2_time)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)

@@ -60,18 +60,13 @@ static void sys_initialize_tls(ppu_context* ctx)
  * wall-time. LBP's Bink movie clock (sysGetSystemTime import 0x8461E528
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
- * and every frontend animation timed off it crawled. */
+ * and every frontend animation timed off it crawled.
+ * The clock lives in sys_timer.c so that cellGcmGetLastFlipTime, which the
+ * guest compares with this, reads the same one. */
+extern "C" uint64_t lv2_system_time_usec(void);   /* runtime/syscalls/sys_timer.c */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
-#else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-#endif
+    ctx->gpr[3] = lv2_system_time_usec();
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model

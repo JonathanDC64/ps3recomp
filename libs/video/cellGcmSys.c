@@ -252,7 +252,12 @@ static CellGcmVBlankHandler  s_vblank_handler  = NULL;
 static CellGcmUserHandler    s_user_handler    = NULL;
 static CellGcmSecondVHandler s_second_v_handler = NULL;
 
-/* Flip timing */
+/* Flip timing: the system time of the last flip, in microseconds on the
+ * clock sys_time_get_system_time returns, which is what hardware reports.
+ * It was nanoseconds from a clock of its own, 1000 times too large and on a
+ * different origin, so "now - last flip" came out wrong in the guest. Report
+ * timestamps stay in nanoseconds (get_timestamp_ns): those are the GPU's. */
+extern uint64_t lv2_system_time_usec(void);   /* runtime/syscalls/sys_timer.c */
 static u64 s_last_flip_time = 0;
 
 /* VBlank counter (incremented on each flip as approximation) */
@@ -468,7 +473,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_vblank_handler = NULL;
     s_user_handler = NULL;
     s_second_v_handler = NULL;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = lv2_system_time_usec();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -2640,7 +2645,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = lv2_system_time_usec();
 
     /* Invoke via OPD resolution, not a raw call into guest code.
      *
@@ -2768,7 +2773,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
-    s_last_flip_time = get_timestamp_ns();
+    s_last_flip_time = lv2_system_time_usec();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
@@ -2834,7 +2839,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 */
 u64 cellGcmGetLastFlipTime(void)
 {
     return s_last_flip_time;
