@@ -526,7 +526,20 @@ SPU_GATE int g_spu_ls_dbg = -1;
 #define SPU_LSDBG_WATCH   2
 #define SPU_LSDBG_SMC     4
 #define SPU_LSDBG_WWS     8
-static __attribute__((noinline, cold)) int spu_ls_dbg_resolve(void)
+/* The probes below are cold, and noinline under Clang. Under GCC they are
+ * declared inline instead, so a file that never calls them does not get them:
+ * GCC at -O0 emits every static function not declared inline, used or not,
+ * and these reach g_spu_ls_watch_n and spu_ls_watch_slow, which only
+ * spu_channels.c defines, so the SPU unit tests and sync_stress failed to
+ * link. GCC warns on inline with noinline (or noipa), so an optimised GCC
+ * build may inline the two small dispatchers into the accessors' cold paths.
+ * Clang drops unused static functions at any -O and sees what it did before. */
+#if defined(__GNUC__) && !defined(__clang__)
+#  define SPU_LS_COLD static inline __attribute__((cold))
+#else
+#  define SPU_LS_COLD static __attribute__((noinline, cold))
+#endif
+SPU_LS_COLD int spu_ls_dbg_resolve(void)
 {
     const char* w = getenv("SPU_LS_WATCH");
     const int v = (getenv("SPU_LS_LOWREAD") ? SPU_LSDBG_LOWREAD : 0) |
@@ -536,7 +549,7 @@ static __attribute__((noinline, cold)) int spu_ls_dbg_resolve(void)
     g_spu_ls_dbg = v;
     return v;
 }
-static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+SPU_LS_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
     PS3_KNOB(g_spu_ls_probe, getenv("SPU_LS_LOWREAD") ? 1 : 0);
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
@@ -585,7 +598,7 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 #  define SPU_LS_INLINE static inline __attribute__((always_inline))
 #endif
 
-static __attribute__((noinline, cold)) void spu_ls_read_dbg(const spu_context* ctx, uint32_t lsa)
+SPU_LS_COLD void spu_ls_read_dbg(const spu_context* ctx, uint32_t lsa)
 {
     const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
     if ((d & SPU_LSDBG_LOWREAD) || ((d & SPU_LSDBG_WWS) && ctx->image_id == 2 && ctx->policy_mode))
@@ -621,7 +634,7 @@ SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
+SPU_LS_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
@@ -652,7 +665,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
 }
 /* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
 extern int g_spu_smc_watch;
-static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
+SPU_LS_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
     PS3_KNOB(g_spu_smc_watch, getenv("SPU_SMC_WATCH") ? 1 : 0);
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
@@ -675,7 +688,7 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
 }
 
 /* After the store, so the watch prints the new bytes. */
-static __attribute__((noinline, cold)) void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, u128 val, const uint8_t* p)
+SPU_LS_COLD void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, u128 val, const uint8_t* p)
 {
     const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
     if ((d & SPU_LSDBG_WWS) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)

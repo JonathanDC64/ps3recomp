@@ -1405,7 +1405,7 @@ int spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea)
             if (spu_lockline_read_same(ea, seq)) break;
         }
         if (t == 7) return 0;
-        _mm_pause();
+        YieldProcessor();
     }
     uint8_t* ls = &ctx->ls[lsa & SPU_LS_MASK];
     memcpy(ls, line, MFC_ATOMIC_LINE);
