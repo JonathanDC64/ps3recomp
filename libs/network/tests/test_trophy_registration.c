@@ -2,6 +2,7 @@
  * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_trophy_registration
  */
 #include "../sceNpTrophy.c"
+#include "../np_trophy_set.c"
 #include <assert.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -15,7 +16,15 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
-ps3_guest_caller_fn g_ps3_guest_caller;
+/* g_ps3_guest_caller is cellSysutil.c's, which this test links: a second
+ * definition here is a duplicate symbol under -fno-common (every current
+ * gcc and clang). */
+/* No trophy set on disk: registration falls back to the placeholder set. */
+void sys_fs_translate_path(const char* p, char* host, int n) { snprintf(host, (size_t)n, "/nonexistent%s", p); }
+const char* cellGame_get_title_id(void) { return ""; }
+/* What cellSysutilCheckCallback also pumps (cellMsgDialog.c, np_psnr.c), not linked here */
+void cellMsgDialog_tick(void) {}
+void np_psnr_pump(void) {}
 static unsigned calls;
 static void callback(u32 opd, u64 context, u64 status, u64 completed, u64 total,
                      u64 arg, u64 a, u64 b, u64 c)
