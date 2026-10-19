@@ -426,7 +426,7 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
-/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+/* Indirect call dispatch (bctrl/bctr) -- implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
@@ -642,20 +642,25 @@ _HOOK_MARK = "/* INSN HOOK -> host */"
 
 
 def _write_if_changed(path: str, text: str) -> bool:
-    """Write text to path (text mode, as open(path, "w") does) unless the file
-    already holds exactly those bytes. Returns True if it wrote.
+    """Write text to path (text mode, UTF-8) unless the file already holds
+    exactly those bytes. Returns True if it wrote.
 
     Leaving an unchanged file alone keeps its timestamp, so a build only
     recompiles the chunks a re-lift really changed: re-lifting with one hook
-    more, or with the same input, no longer rebuilds every chunk."""
+    more, or with the same input, no longer rebuilds every chunk.
+
+    The encoding is explicit: without one, open() uses the system code page,
+    so the same lift wrote different bytes on different PCs, and the
+    Japanese and Korean code pages (cp932, cp949) could not write it at all.
+    The lifter's own text is ASCII (test_lifter_output_ascii.py)."""
     try:
-        with open(path, "r", newline="") as f:
+        with open(path, "r", encoding="utf-8", newline="") as f:
             old = f.read()
     except (OSError, UnicodeDecodeError):
         old = None
     if old == text.replace("\n", os.linesep):
         return False
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return True
 
@@ -2172,7 +2177,7 @@ class PPULifter:
             return f"/* {mn} {insn.operands}: FPSCR unmodeled */;"
 
         if mn == "mtfsf":
-            return f"/* mtfsf: FPSCR update — ignored for now */;"
+            return f"/* mtfsf: FPSCR update -- ignored for now */;"
 
         # ------- Store/load with update indexed -------
         if mn == "stdux":
@@ -2252,7 +2257,7 @@ class PPULifter:
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
         if mn == "tw" or mn == "twi" or mn == "td" or mn == "tdi":
-            return f"/* trap: {mn} {insn.operands} — ignored */;"
+            return f"/* trap: {mn} {insn.operands} -- ignored */;"
 
         # ------- Byte-reverse loads/stores -------
         if mn == "lwbrx":
@@ -4345,6 +4350,11 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
 
 
 def main() -> None:
+    # Paths are printed, and one with characters outside stdout's encoding
+    # (a pipe gets the system code page) must not end the run.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description="PPU to C lifter for PS3 recompilation")
     parser.add_argument("input", help="Input ELF or raw binary")
     parser.add_argument("--output", "-o", default=".", help="Output directory")

@@ -176,6 +176,11 @@ def parse_imports(elf):
 
 
 def main():
+    # Paths are printed, and one with characters outside stdout's encoding
+    # (a pipe gets the system code page) must not end the run.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser(description="PS3 PPU loader (image + OPD + TOC + functions)")
     ap.add_argument("input")
     ap.add_argument("--output", "-o", default="ppu_loader_out")
