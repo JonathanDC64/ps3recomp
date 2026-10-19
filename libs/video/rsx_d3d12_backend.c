@@ -5876,6 +5876,23 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
+ * words, folded. */
+#define VP_SAMP_HINTS 1024
+static u32 samp_key_slot(const u32* k)
+{
+    u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
+    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+        a = (a ^ k[i])     * 0x01000193u;
+        b = (b ^ k[i + 1]) * 0x01000193u;
+        c = (c ^ k[i + 2]) * 0x01000193u;
+        d = (d ^ k[i + 3]) * 0x01000193u;
+    }
+    u32 h = a ^ (b << 7 | b >> 25) ^ (c << 14 | c >> 18) ^ (d << 21 | d >> 11);
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15;
+    return h & (VP_SAMP_HINTS - 1);
+}
+
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
@@ -5892,8 +5909,22 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     static u32 cap = 0;
     if (!cap) { int c = ps3_env_int("RSX_SAMP_TABLES", VP_SAMP_TABLES);
                 cap = (u32)(c < 2 ? 2 : c > VP_SAMP_TABLES ? VP_SAMP_TABLES : c); }
+    /* RSX_SAMP_HASH (live, default 1; 0 = compare with every table): a hash
+     * of the key names the table to try first, checked against its stored
+     * key. The scan below compares up to 128 keys of 128 bytes a draw. A
+     * slot is only a hint: a miss, a collision or a table rewritten since
+     * falls back to the scan, which sets the slot again. */
+    static int hashed = 1;
+    PS3_KNOB(hashed, ps3_env_int("RSX_SAMP_HASH", 1) != 0);
+    static u16 hint[VP_SAMP_HINTS];   /* table + 1; 0 = none */
+    u32 hs = 0;
+    if (hashed) {
+        hs = samp_key_slot(k);
+        const u32 i = hint[hs];
+        if (i && i <= s_d3d.samp_n && !memcmp(keys[i - 1], k, sizeof k)) { last[i - 1] = now; return i - 1; }
+    }
     for (u32 i = 0; i < s_d3d.samp_n; i++)
-        if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; return i; }
+        if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; hint[hs] = (u16)(i + 1); return i; }
     u32 t;
     if (s_d3d.samp_n < cap) {
         t = s_d3d.samp_n++;
@@ -5920,6 +5951,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     }
     last[t] = now;
     memcpy(keys[t], k, sizeof k);
+    hint[hs] = (u16)(t + 1);
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
     for (int u = 0; u < RSX_FP_UNITS; u++) {
