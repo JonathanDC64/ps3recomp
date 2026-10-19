@@ -622,11 +622,23 @@ static int   s_samp_main = -1;
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
     (void)h;
-    const uintptr_t* sp = (const uintptr_t*)c->Rsp;
-    for (int i = 0; i < 512; i++) {          /* 4 KB of stack */
-        uintptr_t v;
-        __try { v = sp[i]; } __except (1) { return 0; }
-        uint32_t g = samp_lookup(v);
+    /* Up to 4 KB of the stack above rsp, cut at the end of the committed
+     * region that holds rsp: a read past it would take the game down. A
+     * __try around the load did not guard it. clang-cl at /EHsc emits no
+     * handler for a fault inside the __try body itself; only /EHa catches
+     * it (measured with clang-cl 22 at /O2 and /Od). */
+    const uintptr_t sp = (uintptr_t)c->Rsp;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)sp, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+        !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    size_t n = ((uintptr_t)mbi.BaseAddress + mbi.RegionSize - sp) / sizeof(uintptr_t);
+    if (n > 512) n = 512;
+    const uintptr_t* slot = (const uintptr_t*)sp;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t g = samp_lookup(slot[i]);
         if (g) return g;
     }
     return 0;
