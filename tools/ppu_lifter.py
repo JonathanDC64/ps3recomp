@@ -636,6 +636,30 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
     return False
 
 
+# Ends the line that calls an --insn-hooks host function; _hook_decl_lines finds
+# the calls by it.
+_HOOK_MARK = "/* INSN HOOK -> host */"
+
+
+def _write_if_changed(path: str, text: str) -> bool:
+    """Write text to path (text mode, as open(path, "w") does) unless the file
+    already holds exactly those bytes. Returns True if it wrote.
+
+    Leaving an unchanged file alone keeps its timestamp, so a build only
+    recompiles the chunks a re-lift really changed: re-lifting with one hook
+    more, or with the same input, no longer rebuilds every chunk."""
+    try:
+        with open(path, "r", newline="") as f:
+            old = f.read()
+    except (OSError, UnicodeDecodeError):
+        old = None
+    if old == text.replace("\n", os.linesep):
+        return False
+    with open(path, "w") as f:
+        f.write(text)
+    return True
+
+
 class PPULifter:
     """Translates PPU instructions into C source."""
 
@@ -820,7 +844,7 @@ class PPULifter:
             hook = self.insn_hooks.get(insn.addr)
             if hook is not None:
                 func.body_lines.append(
-                    f"    {hook}(ctx, 0x{insn.addr:08X}u);  /* INSN HOOK -> host */")
+                    f"    {hook}(ctx, 0x{insn.addr:08X}u);  {_HOOK_MARK}")
 
         # An in-range branch target with no decoded instruction at its address
         # (a branch into a data / undecoded region inside a too-large function
@@ -3418,8 +3442,9 @@ class PPULifter:
         # Host override symbols (provided by the per-game project, e.g. des_heap.cpp)
         for sym in sorted(self.override_syms):
             lines.append(f'extern "C" void {sym}(ppu_context* ctx); /* override host impl */')
-        for sym in sorted(set(self.insn_hooks.values())):
-            lines.append(f'extern "C" void {sym}(ppu_context* ctx, uint32_t addr); /* insn hook host impl */')
+        # The --insn-hooks host functions are declared at the top of the chunks
+        # that call them (_hook_decl_lines), not here: every chunk includes this
+        # header, so a hook added here rebuilt all of them.
         lines.append("")
         return "\n".join(lines)
 
@@ -3619,6 +3644,30 @@ class PPULifter:
         lines.append("")
         return lines
 
+    def _hook_decl_lines(self, funcs) -> list[str]:
+        """Declarations of the --insn-hooks host functions that `funcs` call,
+        for the top of the source file that defines them (none, and no lines,
+        if they call none). A hook call is only emitted inside a function whose
+        range holds the hooked address, so only those functions are scanned."""
+        if not self.insn_hooks:
+            return []
+        import bisect
+        hook_addrs = sorted(self.insn_hooks)
+        syms: set[str] = set()
+        for func in funcs:
+            i = bisect.bisect_left(hook_addrs, func.start_addr)
+            if i == len(hook_addrs) or hook_addrs[i] >= func.end_addr:
+                continue
+            for bline in func.body_lines:
+                if bline.endswith(_HOOK_MARK):
+                    syms.add(bline.strip().split("(", 1)[0])
+        if not syms:
+            return []
+        return (["/* --insn-hooks host functions called in this file (declared here, "
+                 "not in the header, so a hook change rebuilds only the files it touches) */"] +
+                [f'extern "C" void {sym}(ppu_context* ctx, uint32_t addr); /* insn hook host impl */'
+                 for sym in sorted(syms)] + [""])
+
     def _table_lines(self) -> list[str]:
         """The exported function table (typedef + extern declaration live in
         the header). Emitted once, into the final chunk file."""
@@ -3642,7 +3691,7 @@ class PPULifter:
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
-        lines = self._preamble_lines()
+        lines = self._preamble_lines() + self._hook_decl_lines(emit_funcs)
         for func in emit_funcs:
             lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
         lines += self._table_lines()
@@ -3654,7 +3703,9 @@ class PPULifter:
         past 16,777,215 lines (C4049/C1088), which a large game exceeds in a
         single file; splitting also lets the build compile chunks in parallel
         and rebuild incrementally. Chunks are cut only at function
-        boundaries. Returns the list of written paths."""
+        boundaries. A chunk whose file already holds the same text is left
+        alone (see _write_if_changed). Returns the list of chunk paths, written
+        or not."""
         emit_funcs = self._emit_functions()
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
@@ -3664,18 +3715,20 @@ class PPULifter:
         written: list[str] = []
         chunk_idx = 0
 
-        def flush(body_lines: list[str], trailer: list[str] | None = None) -> None:
+        def flush(funcs, body_lines: list[str], trailer: list[str] | None = None) -> None:
             nonlocal chunk_idx
             path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
-            with open(path, "w") as f:
-                f.write("\n".join(preamble + body_lines + (trailer or [])))
+            # The hook declarations do not count towards max_lines, so the cut
+            # points stay where they are without them.
+            lines = preamble + self._hook_decl_lines(funcs) + body_lines + (trailer or [])
+            changed = _write_if_changed(path, "\n".join(lines))
             written.append(path)
-            print(f"  wrote {os.path.basename(path)} "
-                  f"({len(preamble) + len(body_lines) + len(trailer or [])} lines)",
-                  flush=True)
+            print(f"  {'wrote' if changed else 'unchanged'} {os.path.basename(path)} "
+                  f"({len(lines)} lines)", flush=True)
             chunk_idx += 1
 
         cur: list[str] = []
+        cur_funcs: list = []
         cur_len = len(preamble)
         n = len(emit_funcs)
         for i, func in enumerate(emit_funcs):
@@ -3683,14 +3736,16 @@ class PPULifter:
                 print(f"  ... emitting {i}/{n} functions", flush=True)
             deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
             if cur and cur_len + len(deflines) > max_lines:
-                flush(cur)
+                flush(cur_funcs, cur)
                 cur = []
+                cur_funcs = []
                 cur_len = len(preamble)
             cur += deflines
+            cur_funcs.append(func)
             cur_len += len(deflines)
 
         # Final chunk carries the function table.
-        flush(cur, self._table_lines())
+        flush(cur_funcs, cur, self._table_lines())
         return written
 
 
@@ -4893,37 +4948,41 @@ def main() -> None:
 
     os.makedirs(args.output, exist_ok=True)
 
+    # Each output file is written only if its text changed (_write_if_changed),
+    # so a re-lift leaves the files it did not change, and their timestamps,
+    # alone, and the build recompiles only what did change.
     header_path = os.path.join(args.output, args.header_name)
-    with open(header_path, "w") as f:
-        f.write(lifter.emit_header())
+    header_state = "Wrote" if _write_if_changed(header_path, lifter.emit_header()) else "Unchanged"
 
-    # Remove stale output (the old single-file source and any previous chunk
-    # set) so a build doesn't pick up both.
     import glob as _glob
     base = args.source_name[:-2] if args.source_name.endswith(".c") else args.source_name
-    for stale in ([os.path.join(args.output, args.source_name)] +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
-        if os.path.exists(stale):
-            os.remove(stale)
-
     if args.single_file:
         # One ppu_recomp.c (the old layout). Slower to compile for huge images,
         # but some workflows post-process a single file (e.g. flOw's vmx_splice).
         src_path = os.path.join(args.output, args.source_name)
         print(f"Writing single-file C source -> {os.path.basename(src_path)} ...", flush=True)
-        with open(src_path, "w") as f:
-            f.write(lifter.emit_source())
+        src_state = "Wrote" if _write_if_changed(src_path, lifter.emit_source()) else "Unchanged"
         paths = [src_path]
-        print(f"Wrote {header_path}")
-        print(f"Wrote {os.path.basename(src_path)}")
+        print(f"{header_state} {header_path}")
+        print(f"{src_state} {os.path.basename(src_path)}")
     else:
         print("Writing C source (split into chunks)...", flush=True)
         paths = lifter.write_source_files(args.output, base=base,
                                           max_lines=args.chunk_lines)
-        print(f"Wrote {header_path}")
-        print(f"Wrote {len(paths)} source chunks: "
+        print(f"{header_state} {header_path}")
+        print(f"{len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
+
+    # Remove stale output (the old single-file source, or chunks past the new
+    # last one) so a build doesn't pick up both. This runs after the writes,
+    # not before them, so that the files this lift kept are not deleted.
+    keep = {os.path.normcase(os.path.abspath(p)) for p in paths}
+    for stale in ([os.path.join(args.output, args.source_name)] +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
+                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
+        if os.path.exists(stale) and os.path.normcase(os.path.abspath(stale)) not in keep:
+            os.remove(stale)
+            print(f"Removed stale {os.path.basename(stale)}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
 
