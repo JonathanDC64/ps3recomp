@@ -70,9 +70,20 @@ typedef struct sys_mutex_info {
     pthread_mutex_t  mtx;
 #endif
 
+    int           initialized;     /* cs made; kept for the slot's life (Windows) */
+    int           cond_count;      /* conds created on this mutex, not yet destroyed */
+    volatile long relock_pending;  /* cond waiters off their cond, not yet back on this */
+
 } sys_mutex_info;
 
 extern sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
+
+/* For sys_cond.c. A cond holds its mutex for as long as the cond exists:
+ * lv2's sys_mutex_destroy answers EPERM while one does. bind returns 0 when
+ * the mutex does not exist, under the same lock destroy takes, so a cond
+ * can never be created on a mutex that is being destroyed. */
+int  sys_mutex_bind_cond(uint32_t mutex_id);
+void sys_mutex_unbind_cond(uint32_t mutex_id);
 
 /* Syscall handlers */
 int64_t sys_mutex_create(ppu_context* ctx);

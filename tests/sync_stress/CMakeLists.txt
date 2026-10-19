@@ -103,4 +103,17 @@ if(WIN32)
         add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
         set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
     endforeach()
+
+    # Destroy and trylock results against lv2's (test_destroy_semantics.c).
+    add_executable(test_destroy_semantics
+        test_destroy_semantics.c test_shims.c
+        "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+        "${RUNTIME_SYNC_DIR}/sys_cond.c")
+    target_include_directories(test_destroy_semantics PRIVATE
+        "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
+    target_compile_definitions(test_destroy_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
+    foreach(mode mutex_busy mutex_conds trylock relock signal timeout)
+        add_test(NAME destroy_${mode} COMMAND test_destroy_semantics ${mode})
+        set_tests_properties(destroy_${mode} PROPERTIES TIMEOUT 10)
+    endforeach()
 endif()
