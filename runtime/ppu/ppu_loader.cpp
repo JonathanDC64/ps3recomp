@@ -4012,24 +4012,71 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * The PRX path (sys_initialize_tls in ppu_sysprx.cpp) has always done this per
  * block; this is the same thing for the static path.
  *
- * ponytail: bump allocator, never freed. A thread's block is dead once it
- * exits, but the window holds dozens and titles create their threads at boot
- * and keep them. Reuse a free list if a title ever churns threads. */
+ * A block goes back to the window when its thread finishes
+ * (ppu_tls_thread_done, from the thread proc), as liblv2 frees it in
+ * sys_ppu_thread_exit (RPCS3: ppu_free_tls). It used to be a bump allocator
+ * that never freed, and titles churn threads: Demon's Souls starts a
+ * ChrInsManThread and ChrProxyThreadMan pair on every level load and ends the
+ * old pair. Its window holds 31 blocks, so the pair of the fourth load shared
+ * one block, and with it Havok's per-thread allocator (a TLS pointer, no
+ * lock). Two ragdoll bodies still in the world were handed out again, and the
+ * physics step froze in the game's heap. */
+static uint8_t s_tls_used[256];   /* one per block of the window: 1 while a thread holds it */
+
+/* The block this host thread claimed, as its thread pointer (0: none). Kept
+ * here rather than read back from the guest thread's slot at the end: a
+ * joiner may already have given the slot to a new thread by then. */
+static PPU_THREAD_LOCAL uint32_t s_tls_mine = 0;
+
+static uint32_t ppu_tls_block_bytes(void)
+{
+    return (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
+}
+
+/* How many thread blocks fit above the main one. */
+static uint32_t ppu_tls_block_count(uint32_t total)
+{
+    uint32_t lim = 0x11000000u;                 /* same bound the main block uses */
+    if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
+    const uint32_t first = PPU_TLS_IMG + total; /* main block occupies the first */
+    const uint32_t n = lim > first ? (lim - first) / total : 0;
+    return n < sizeof s_tls_used ? n : (uint32_t)sizeof s_tls_used;
+}
+
 static uint32_t ppu_tls_new_block(void)
 {
     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
-    uint32_t total = (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
-    uint32_t lim   = 0x11000000u;               /* same bound the main block uses */
-    if (ppu_vm_size && ppu_vm_size < lim) lim = ppu_vm_size;
-    /* Threads are created concurrently, so hand out offsets atomically. */
-    static uint32_t s_bump = 0;
-    uint32_t off  = __atomic_fetch_add(&s_bump, total, __ATOMIC_RELAXED);
-    uint32_t base = PPU_TLS_IMG + total + off;  /* main block occupies the first */
-    if (base + total > lim) return 0;           /* out of room: share, as before */
-    if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
-    if (g_tls_memsz > g_tls_filesz)
-        memset(vm_base + base + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
-    return base + 0x7000u;                      /* TLS data at r13 - 0x7000 */
+    const uint32_t total = ppu_tls_block_bytes(), n = ppu_tls_block_count(total);
+    for (uint32_t i = 0; i < n; i++) {
+        /* Threads are created concurrently, so claim a block atomically. */
+        if (__atomic_load_n(&s_tls_used[i], __ATOMIC_RELAXED) ||
+            __atomic_exchange_n(&s_tls_used[i], (uint8_t)1, __ATOMIC_ACQUIRE)) continue;
+        /* A reused block starts as a fresh one: the image is what thread code
+         * touches, and .tdata is copied and .tbss zeroed again here. */
+        const uint32_t base = PPU_TLS_IMG + total * (i + 1);
+        if (g_tls_filesz) memcpy(vm_base + base, vm_base + g_tls_vaddr, g_tls_filesz);
+        if (g_tls_memsz > g_tls_filesz)
+            memset(vm_base + base + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
+        return base + 0x7000u;                  /* TLS data at r13 - 0x7000 */
+    }
+    static int n_full = 0;
+    if (n_full < 4) {
+        n_full++;
+        fprintf(stderr, "[ppu] TLS: all %u thread blocks are in use; a new thread shares the main block\n", n);
+    }
+    return 0;                                   /* out of room: share, as before */
+}
+
+/* This host thread runs no more guest code: the block it claimed can go to the
+ * next thread. The thread proc calls this after the body and any interrupt
+ * handler passes. */
+extern "C" void ppu_tls_thread_done(void)
+{
+    const uint32_t tp = s_tls_mine;
+    if (!tp) return;
+    s_tls_mine = 0;
+    const uint32_t i = (tp - 0x7000u - PPU_TLS_IMG) / ppu_tls_block_bytes() - 1;
+    __atomic_store_n(&s_tls_used[i], (uint8_t)0, __ATOMIC_RELEASE);
 }
 
 static void ppu_thread_entry_trampoline(ppu_context* ctx)
@@ -4038,6 +4085,7 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
     ppu_opd_resolve((uint32_t)ctx->cia, &code, &toc);
     if (toc) ctx->gpr[2] = toc;
     if (!ctx->gpr[13]) { uint32_t tp = ppu_tls_new_block();
+                         s_tls_mine = tp;   /* given back by ppu_tls_thread_done */
                          ctx->gpr[13] = tp ? tp : PPU_TLS_TP; }
     ppu_fn fn = ppu_lookup(code);
     if (!fn) {

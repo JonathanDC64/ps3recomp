@@ -174,6 +174,10 @@ static void* ppu_host_thread_proc(void* param)
                   s_exit_armed = 0;
               }
           } }
+
+        /* No more guest code on this thread: its TLS block can go to the next
+         * one (ppu_tls_new_block in ppu_loader.cpp). */
+        { extern void ppu_tls_thread_done(void); ppu_tls_thread_done(); }
     } else {
         fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
                 (unsigned long long)info->ctx.thread_id);
