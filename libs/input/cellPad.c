@@ -89,7 +89,6 @@ static volatile long s_host_hold;   /* cellPad_set_host_hold */
 /* Host mouse input and the menu layer for the keyboard pad (cellPad_host_mouse_buttons, _mouse_wheel, _set_menu),
  * and the buttons a wheel notch presses now, up and down (pad_poll_keyboard works them out from PAD_KEYS). */
 static volatile unsigned s_mouse_buttons;
-static volatile int      s_wheel_pending;
 static volatile int      s_menu_layer;
 static volatile unsigned s_wheel_bits[2];
 
@@ -248,7 +247,12 @@ static int pad_host_window_focused(void)
  * its menus is open (cellPad_host_set_menu), and the same input's other
  * bindings do not count meanwhile. While a chord is held, the bindings of its
  * two inputs alone do not count: with r1=mouse1 and r2=shift+mouse1, Shift
- * and a left click give R2, not R1 as well. "none" binds nothing.
+ * and a left click give R2, not R1 as well. A held input keeps the binding it
+ * went down with until it is let go: letting go of Shift first leaves R2
+ * held, and Shift pressed during a click leaves R1. A left or right Shift,
+ * Ctrl or Alt holds the plain one down too, so lshift's bindings also wait
+ * while a shift+ chord is held, and shift's while an lshift+ one is. "none"
+ * binds nothing.
  *
  *   PAD_KEYS="r1=mouse1,r2=shift+mouse1,circle=space|menu:q,r3=q|mouse3"
  *
@@ -266,8 +270,12 @@ static int pad_host_window_focused(void)
 typedef struct { u16 in, mod; u8 menu; } PadBind;
 static PadBind s_binds[PAD_TARGETS][PAD_BIND_MAX];
 static u8      s_nbind[PAD_TARGETS];
-static u16     s_watch[2 * PAD_TARGETS * PAD_BIND_MAX];   /* the keys the bindings name, read once a poll */
+static u16     s_watch[PAD_IN_MOUSE];   /* the keys the bindings name, read once a poll */
 static int     s_nwatch;
+/* Which bindings a held input counts for, chosen when it went down and kept until it is let go: 0 its plain ones,
+ * else the modifier of the chord it went down with (pad_poll_keyboard). */
+static u8      s_held[PAD_IN_SLOTS];
+static u16     s_held_mod[PAD_IN_SLOTS];
 
 /* The default keys, in s_pad_names order (0 = no key). */
 static const int s_pad_keys_default[16] = {
@@ -336,11 +344,51 @@ static void pad_parse_value(int t, const char* v, size_t vn)
     }
 }
 
+/* A left or right Shift, Ctrl or Alt: the plain key it also holds down (GetAsyncKeyState(VK_SHIFT) is either
+ * Shift). Any other input: itself. */
+static u16 pad_mod_plain(u16 c)
+{
+    switch (c) {
+    case VK_LSHIFT:   case VK_RSHIFT:   return VK_SHIFT;
+    case VK_LCONTROL: case VK_RCONTROL: return VK_CONTROL;
+    case VK_LMENU:    case VK_RMENU:    return VK_MENU;
+    default:                            return c;
+    }
+}
+
+/* c, or for Shift, Ctrl or Alt the plain key and both sides, into out; returns how many. */
+static int pad_mod_family(u16 c, u16 out[3])
+{
+    switch (pad_mod_plain(c)) {
+    case VK_SHIFT:   out[0] = VK_SHIFT;   out[1] = VK_LSHIFT;   out[2] = VK_RSHIFT;   return 3;
+    case VK_CONTROL: out[0] = VK_CONTROL; out[1] = VK_LCONTROL; out[2] = VK_RCONTROL; return 3;
+    case VK_MENU:    out[0] = VK_MENU;    out[1] = VK_LMENU;    out[2] = VK_RMENU;    return 3;
+    default:         out[0] = c;                                                    return 1;
+    }
+}
+
 static void pad_watch(u16 code)
 {
     if (!code || code >= PAD_IN_MOUSE) return;
-    for (int i = 0; i < s_nwatch; i++) if (s_watch[i] == code) return;
-    s_watch[s_nwatch++] = code;
+    u16 fam[3];
+    const int n = pad_mod_family(code, fam);   /* a modifier's both sides are read (pad_take) */
+    for (int k = 0; k < n; k++) {
+        int i = 0;
+        while (i < s_nwatch && s_watch[i] != fam[k]) i++;
+        if (i == s_nwatch && s_nwatch < PAD_IN_MOUSE) s_watch[s_nwatch++] = fam[k];
+    }
+}
+
+/* Input c is part of a chord held now: its bindings alone do not count, and for Shift, Ctrl or Alt neither do the
+ * bindings of the keys holding it down: shift+ takes lshift and rshift too, lshift+ takes shift but not rshift. */
+static void pad_take(u8* taken, u16 c)
+{
+    taken[c] = 1;
+    const u16 plain = pad_mod_plain(c);
+    if (plain != c) { taken[plain] = 1; return; }
+    u16 fam[3];
+    const int n = pad_mod_family(c, fam);
+    for (int k = 0; k < n; k++) taken[fam[k]] = 1;
 }
 
 static int pad_parse_keys(const char* e)
@@ -362,10 +410,12 @@ static int pad_parse_keys(const char* e)
 /* A stick axis byte: dir -1, 0 or 1, deflected r of the way. */
 static u8 pad_axis_byte(int dir, float r)
 {
+    r = r < 0.0f ? 0.0f : r > 1.0f ? 1.0f : r;
     return (u8)(dir < 0 ? lroundf(127.5f - 127.5f * r) : dir > 0 ? lroundf(127.5f + 127.5f * r) : 128);
 }
 
-static void pad_poll_keyboard(void)
+/* One keyboard poll (pad_poll_keyboard runs one at a time). */
+static void pad_poll_keyboard_once(void)
 {
     static int off = -1, keys = -1, walk = -1;
     PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
@@ -380,6 +430,7 @@ static void pad_poll_keyboard(void)
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
         s_wheel_bits[0] = s_wheel_bits[1] = 0;
+        memset(s_held, 0, sizeof s_held);   /* keys still held on the way back start over */
         if (!pad) {
             hs->buttons = 0;
             hs->analog_lx = hs->analog_ly = 128;
@@ -391,7 +442,7 @@ static void pad_poll_keyboard(void)
         return;
     }
 
-    u8 down[PAD_IN_SLOTS], claimed[PAD_IN_SLOTS], chorded[PAD_IN_SLOTS];
+    u8 down[PAD_IN_SLOTS], claimed[PAD_IN_SLOTS], chorded[PAD_IN_SLOTS], fresh[PAD_IN_SLOTS];
     memset(down, 0, sizeof down);
     memset(claimed, 0, sizeof claimed);
     memset(chorded, 0, sizeof chorded);
@@ -404,11 +455,24 @@ static void pad_poll_keyboard(void)
             for (int j = 0; j < s_nbind[t]; j++)
                 if (s_binds[t][j].menu) claimed[s_binds[t][j].in] = 1;
 #define PAD_LAYER_OK(b) ((b).menu ? menu : !claimed[(b).in])
+    for (int c = 0; c < PAD_IN_WHEEL_UP; c++) {   /* an input that just went down counts for its plain bindings... */
+        fresh[c] = down[c] && !s_held[c];
+        s_held[c] = down[c];
+        if (fresh[c]) s_held_mod[c] = 0;
+    }
+    for (int t = 0; t < PAD_TARGETS; t++)   /* ...or for a chord whose modifier is held then, until it is let go */
+        for (int j = 0; j < s_nbind[t]; j++) {
+            const PadBind b = s_binds[t][j];
+            if (b.mod && b.in < PAD_IN_WHEEL_UP && fresh[b.in] && !s_held_mod[b.in] && PAD_LAYER_OK(b) && down[b.mod])
+                s_held_mod[b.in] = b.mod;
+        }
     for (int t = 0; t < PAD_TARGETS; t++)   /* chords held now: their inputs alone do not count */
         for (int j = 0; j < s_nbind[t]; j++) {
             const PadBind b = s_binds[t][j];
-            if (b.mod && b.in < PAD_IN_WHEEL_UP && PAD_LAYER_OK(b) && down[b.in] && down[b.mod])
-                chorded[b.in] = chorded[b.mod] = 1;
+            if (b.mod && b.in < PAD_IN_WHEEL_UP && PAD_LAYER_OK(b) && down[b.in] && s_held_mod[b.in] == b.mod) {
+                pad_take(chorded, b.in);
+                pad_take(chorded, b.mod);
+            }
         }
     unsigned on = 0, wheel_chord[2] = { 0, 0 }, wheel_plain[2] = { 0, 0 };
     for (int t = 0; t < PAD_TARGETS; t++)
@@ -422,7 +486,8 @@ static void pad_poll_keyboard(void)
                 else if (down[b.mod]) wheel_chord[d] |= s_pad_names[t].bit;
                 continue;
             }
-            if (b.mod ? (down[b.in] && down[b.mod]) : (down[b.in] && !chorded[b.in])) on |= 1u << t;
+            if (b.mod ? (down[b.in] && s_held_mod[b.in] == b.mod)
+                      : (down[b.in] && !s_held_mod[b.in] && !chorded[b.in])) on |= 1u << t;
         }
 #undef PAD_LAYER_OK
     s_wheel_bits[0] = wheel_chord[0] ? wheel_chord[0] : wheel_plain[0];
@@ -443,7 +508,7 @@ static void pad_poll_keyboard(void)
     const int ry = (int)PAD_ON(PAD_T_RS + 1) - (int)PAD_ON(PAD_T_RS);
     float r = 1.0f;
     if (ls_keys && PAD_ON(PAD_T_WALK)) {   /* the same walking speed in all eight directions */
-        r = (float)walk / 100.0f;
+        r = (float)(walk < 0 ? 0 : walk > 100 ? 100 : walk) / 100.0f;
         if (lx && ly) r *= 0.70710678f;
     }
 #undef PAD_ON
@@ -472,6 +537,16 @@ static void pad_poll_keyboard(void)
       if (!said && (btns || lx || ly || rx || ry)) { said = 1;
           printf("[cellPad] keyboard input on port 0 (%s)\n", pad ? "merged with the pad" : "no pad");
           fflush(stdout); } }
+}
+
+/* Two threads can poll in the same tick (pad_poll_backend). The keyboard poll runs one at a time: a live PAD_KEYS
+ * change rebuilds the bindings it reads, and a second poll at the same moment would only read the same keys. */
+static volatile int s_kb_busy;
+static void pad_poll_keyboard(void)
+{
+    if (__atomic_exchange_n(&s_kb_busy, 1, __ATOMIC_ACQUIRE)) return;
+    pad_poll_keyboard_once();
+    __atomic_store_n(&s_kb_busy, 0, __ATOMIC_RELEASE);
 }
 #endif
 
@@ -896,7 +971,11 @@ static int pad_always_change(void)
 #define PAD_HOST_SLOTS 8
 typedef struct { u16 bits; u8 stick, x, y; int left; } PadHostPress;   /* stick: 0 none, 1 left, 2 right */
 static PadHostPress s_hp[PAD_HOST_SLOTS];
-static volatile int s_hp_lock;
+static volatile int s_hp_lock;   /* s_hp, the wheel queue and the notch pad_host_overlay is pressing */
+/* Wheel notches waiting their turn, oldest first, each with the buttons it presses (cellPad_host_mouse_wheel). */
+#define PAD_WHEEL_QUEUE 4
+static u16 s_wheel_q[PAD_WHEEL_QUEUE];
+static int s_wheel_qn;
 
 unsigned (*g_pad_keys_hook)(unsigned buttons) = NULL;
 
@@ -931,14 +1010,17 @@ void cellPad_host_mouse_buttons(unsigned mask)
     s_mouse_buttons = mask & 0x1F;
 }
 
+/* Each notch is queued with the buttons it presses as it turns (s_wheel_bits: the modifiers and menu layer of the
+ * latest keyboard poll), so it keeps Shift while it waits its turn, and up and down notches never cancel out. */
 void cellPad_host_mouse_wheel(int notches)
 {
-    int cur = __atomic_load_n(&s_wheel_pending, __ATOMIC_RELAXED), next;
-    do {
-        next = cur + notches;
-        if (next > 4) next = 4;
-        if (next < -4) next = -4;
-    } while (!__atomic_compare_exchange_n(&s_wheel_pending, &cur, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    if (!notches) return;
+    const u16 bits = (u16)s_wheel_bits[notches > 0 ? 0 : 1];
+    if (!bits) return;   /* nothing bound to it, or the window is in the background */
+    int k = notches > 0 ? notches : notches < -PAD_WHEEL_QUEUE ? PAD_WHEEL_QUEUE : -notches;
+    pad_hp_lock();
+    for (; k > 0 && s_wheel_qn < PAD_WHEEL_QUEUE; k--) s_wheel_q[s_wheel_qn++] = bits;
+    pad_hp_unlock();
 }
 
 void cellPad_host_set_menu(int open)
@@ -947,30 +1029,28 @@ void cellPad_host_set_menu(int open)
 }
 
 /* Port 0's packet gets the host presses, stick holds and the current wheel notch. A wheel notch presses the
- * buttons PAD_KEYS gives it (pad_poll_keyboard keeps s_wheel_bits current, modifiers and menu layer included) for
- * PAD_WHEEL_READS packets, then lets go for as many, so two quick notches to the same button are two presses. */
+ * buttons it was queued with (cellPad_host_mouse_wheel) for PAD_WHEEL_READS packets, then lets go for as many, so
+ * two quick notches to the same button are two presses. */
 static void pad_host_overlay(CellPadData* data)
 {
     static int reads = -1;
     PS3_KNOB(reads, ps3_env_int("PAD_WHEEL_READS", 2));
     static u16 w_bits;
     static int w_left, w_gap;
+    pad_hp_lock();
     if (s_host_hold) {   /* a wrapper UI has the input: nothing pending reaches the title */
-        pad_hp_lock();
         for (int i = 0; i < PAD_HOST_SLOTS; i++) s_hp[i].left = 0;
-        pad_hp_unlock();
-        __atomic_store_n(&s_wheel_pending, 0, __ATOMIC_RELAXED);
+        s_wheel_qn = 0;
         w_left = w_gap = 0;
+        pad_hp_unlock();
         return;
     }
     const int delivers = pad_always_change() || s_data_fresh[0];   /* this read hands out a packet */
-    if (!w_left && !w_gap) {
-        const int p = __atomic_load_n(&s_wheel_pending, __ATOMIC_RELAXED);
-        if (p) {
-            __atomic_add_fetch(&s_wheel_pending, p > 0 ? -1 : 1, __ATOMIC_RELAXED);
-            w_bits = (u16)s_wheel_bits[p > 0 ? 0 : 1];
-            if (w_bits) w_left = reads > 0 ? reads : 1;
-        }
+    if (!w_left && !w_gap && s_wheel_qn) {
+        w_bits = s_wheel_q[0];
+        s_wheel_qn--;
+        memmove(s_wheel_q, s_wheel_q + 1, (size_t)s_wheel_qn * sizeof s_wheel_q[0]);
+        w_left = reads > 0 ? reads : 1;
     }
     u16 bits = 0;
     if (w_left) {
@@ -979,7 +1059,6 @@ static void pad_host_overlay(CellPadData* data)
     } else if (w_gap && delivers) {
         w_gap--;
     }
-    pad_hp_lock();
     for (int i = 0; i < PAD_HOST_SLOTS; i++) {
         PadHostPress* h = &s_hp[i];
         if (h->left <= 0) continue;

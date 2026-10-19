@@ -206,12 +206,14 @@ void cellPad_poll(void);
 void cellPad_set_host_hold(int hold);
 
 /* The mouse, for the keyboard pad's bindings (PAD_KEYS names mouse1 to mouse5,
- * wheelup and wheeldown). The title's window code passes them from raw input
- * while its window has the mouse, so a click that brings the window to the
- * front or a drag of its title bar never presses anything.
+ * wheelup and wheeldown). The title's window code passes them while the
+ * game has its window's mouse, so a click that brings the window to the
+ * front, a drag of its title bar or a click on the title's own menus never
+ * presses anything.
  * Buttons held: bit 0 = mouse1 (left), 1 = right, 2 = middle, 3 and 4 = the
- * side buttons. Wheel: notches, positive away from the user (up); queued, at
- * most 4 either way. */
+ * side buttons. Wheel: notches, positive away from the user (up); each is
+ * queued with the buttons it presses as it turns (Shift held then counts
+ * when its turn comes), at most 4 waiting. */
 void cellPad_host_mouse_buttons(unsigned mask);
 void cellPad_host_mouse_wheel(int notches);
 

@@ -14,7 +14,15 @@
 #include <string.h>
 
 static unsigned char s_keys[256];   /* the stubbed keyboard: 1 = held */
-static SHORT test_key_state(int vk) { return (SHORT)(vk > 0 && vk < 256 && s_keys[vk] ? 0x8000 : 0); }
+/* As on Windows, a left or right Shift, Ctrl or Alt also holds the plain one down. */
+static SHORT test_key_state(int vk)
+{
+    int held = vk > 0 && vk < 256 && s_keys[vk];
+    if (vk == VK_SHIFT)   held |= s_keys[VK_LSHIFT] | s_keys[VK_RSHIFT];
+    if (vk == VK_CONTROL) held |= s_keys[VK_LCONTROL] | s_keys[VK_RCONTROL];
+    if (vk == VK_MENU)    held |= s_keys[VK_LMENU] | s_keys[VK_RMENU];
+    return (SHORT)(held ? 0x8000 : 0);
+}
 static HWND test_foreground(void) { return GetDesktopWindow(); }
 static DWORD test_xinput_get(DWORD i, XINPUT_STATE* s) { (void)i; (void)s; return ERROR_DEVICE_NOT_CONNECTED; }
 static DWORD test_xinput_set(DWORD i, XINPUT_VIBRATION* v) { (void)i; (void)v; return ERROR_DEVICE_NOT_CONNECTED; }
@@ -126,14 +134,24 @@ int main(void)
     KEYS();
     cellPad_host_mouse_buttons(1);
     p = rd(); CHECK(p.buttons == R1);
+    cellPad_host_mouse_buttons(0);
     KEYS(VK_SHIFT);
+    p = rd(); CHECK(p.buttons == 0);
+    cellPad_host_mouse_buttons(1);
     p = rd(); CHECK(p.buttons == R2);                                      /* Shift + left: R2, not R1 too */
-    cellPad_host_mouse_buttons(2);
-    p = rd(); CHECK(p.buttons == L2);                                      /* Shift + right: L2, not L1 */
     cellPad_host_mouse_buttons(3);
-    p = rd(); CHECK(p.buttons == (R2 | L2));
+    p = rd(); CHECK(p.buttons == (R2 | L2));                               /* Shift + right: L2, not L1 */
+    cellPad_host_mouse_buttons(2);
+    p = rd(); CHECK(p.buttons == L2);
     KEYS();
+    p = rd(); CHECK(p.buttons == L2);                                      /* Shift let go first: L2 stays held */
+    cellPad_host_mouse_buttons(0);
+    p = rd(); CHECK(p.buttons == 0);
+    cellPad_host_mouse_buttons(3);
     p = rd(); CHECK(p.buttons == (R1 | L1));
+    KEYS(VK_SHIFT);
+    p = rd(); CHECK(p.buttons == (R1 | L1));                               /* Shift during a click: still R1 and L1 */
+    KEYS();
     cellPad_host_mouse_buttons(4);
     p = rd(); CHECK(p.buttons == R3);
     cellPad_host_mouse_buttons(0);
@@ -201,6 +219,60 @@ int main(void)
     set_env("PAD_KEYS", "cross=none,r1=mouse1");
     KEYS('Z', VK_RIGHT);
     p = rd(); CHECK(p.buttons == RIGHT && p.lx == 255);
+
+    /* up and down notches queue in turn instead of cancelling out, and each keeps the Shift it was turned with */
+    set_env("PAD_KEYS", "up=wheelup,down=wheeldown,right=shift+wheelup");
+    KEYS();
+    p = rd();
+    cellPad_host_mouse_wheel(1);
+    cellPad_host_mouse_wheel(-1);
+    for (int i = 0; i < 8; i++) seq[i] = rd().buttons;
+    CHECK(seq[0] == UP && seq[1] == UP && seq[2] == 0 && seq[3] == 0 && seq[4] == DOWN && seq[5] == DOWN && seq[6] == 0 && seq[7] == 0);
+    KEYS(VK_LSHIFT);                                                      /* a left Shift holds Shift down */
+    p = rd();
+    cellPad_host_mouse_wheel(2);
+    KEYS();                                                               /* let go before the second notch's turn */
+    for (int i = 0; i < 8; i++) seq[i] = rd().buttons;
+    CHECK(seq[0] == RIGHT && seq[1] == RIGHT && seq[2] == 0 && seq[3] == 0 && seq[4] == RIGHT && seq[5] == RIGHT && seq[6] == 0);
+
+    /* left and right Shift: a shift+ chord takes lshift's bindings too, an lshift+ chord takes shift's */
+    set_env("PAD_KEYS", "r1=mouse1,r2=shift+mouse1,triangle=lshift");
+    KEYS(VK_LSHIFT);
+    p = rd(); CHECK(p.buttons == TRIANGLE);
+    cellPad_host_mouse_buttons(1);
+    p = rd(); CHECK(p.buttons == R2);                                      /* not TRIANGLE as well */
+    cellPad_host_mouse_buttons(0);
+    p = rd(); CHECK(p.buttons == TRIANGLE);
+    set_env("PAD_KEYS", "r1=mouse1,r2=lshift+mouse1,triangle=shift");
+    cellPad_host_mouse_buttons(1);
+    p = rd(); CHECK(p.buttons == R2);                                      /* not TRIANGLE as well */
+    cellPad_host_mouse_buttons(0);
+    KEYS(VK_RSHIFT);
+    p = rd(); CHECK(p.buttons == TRIANGLE);
+    cellPad_host_mouse_buttons(1);
+    p = rd(); CHECK(p.buttons == (R1 | TRIANGLE));                         /* the right Shift is not the chord's */
+    cellPad_host_mouse_buttons(0);
+    KEYS();
+
+    /* PAD_WALK outside 0-100 is held to it */
+    set_env("PAD_KEYS", "ls_up=w,walk=lalt");
+    set_env("PAD_WALK", "250");
+    KEYS('W', VK_LMENU);
+    p = rd(); CHECK(p.ly == 0);
+    set_env("PAD_WALK", "-5");
+    p = rd(); CHECK(p.ly == 128);
+    set_env("PAD_WALK", NULL);
+    p = rd(); CHECK(p.ly == 57);
+
+    /* one keyboard poll at a time: a poll that finds another one running leaves the keys to it */
+    set_env("PAD_KEYS", NULL);
+    KEYS('Z');
+    p = rd(); CHECK(p.buttons == CROSS);
+    s_kb_busy = 1;
+    KEYS();
+    p = rd(); CHECK(p.buttons == CROSS);
+    s_kb_busy = 0;
+    p = rd(); CHECK(p.buttons == 0);
 
     printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
     return failures ? 1 : 0;
