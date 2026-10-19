@@ -73,6 +73,38 @@ static u32 rt_host_dim(u32 w, u32 h, u32 n)
     return (u32)(v < 1 ? 1 : v > 16384 ? 16384 : v);
 }
 
+/* RSX_ASPECT=<w:h, WxH or a number> (default unset: the display buffer's own
+ * shape, 1280x720): the shape the frame is shown at. blit_to_window stretches
+ * the frame to the largest rectangle of that shape in the window, so a title
+ * that draws a wider view into its 1280x720 buffers (Demon's Souls's
+ * DES_ASPECT) fills a 21:9 or 32:9 window, as RPCS3's "Stretch To Display
+ * Area" does. The window's first size takes the same shape. Live. A value
+ * outside 0.5-8, or one that does not read as a number, is the buffer's
+ * shape. */
+static float rsx_aspect_parse(const char* s)
+{
+    char* end = NULL;
+    double a;
+    if (!s || !*s) return 0.0f;
+    a = strtod(s, &end);
+    if (end && (*end == ':' || *end == 'x' || *end == 'X' || *end == '/')) {
+        const double b = strtod(end + 1, NULL);
+        a = b > 0.0 ? a / b : 0.0;
+    }
+    return a >= 0.5 && a <= 8.0 ? (float)a : 0.0f;
+}
+static float rsx_aspect(void)
+{
+    static float a = -1.0f, said = 0.0f;
+    PS3_KNOB(a, rsx_aspect_parse(getenv("RSX_ASPECT")));
+    if (a != said) {
+        said = a;
+        if (a > 0.0f) printf("[D3D12] RSX_ASPECT: the frame is shown at %.4f:1\n", (double)a);
+        else printf("[D3D12] RSX_ASPECT off: the frame keeps its own shape\n");
+    }
+    return a;
+}
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -917,6 +949,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
     RegisterClassExA(&wc);
 
     const int dpi = dpi_aware();
+    if (rsx_aspect() > 0.0f) width = (u32)((float)height * rsx_aspect() + 0.5f);   /* the shape the frame is shown at */
     int cw = MulDiv((int)width, dpi, 96), ch = MulDiv((int)height, dpi, 96);
     /* Centred in the primary display's work area, and made smaller (same
      * shape) if it would not fit there. */
@@ -1172,8 +1205,8 @@ static int blit_init(void)
 }
 
 /* Records the scale of the game's frame fi into the window's buffer fi: the
- * largest rectangle with the frame's aspect ratio, centred, black around it.
- * Both resources are in PRESENT before and after. */
+ * largest rectangle with the frame's aspect ratio (RSX_ASPECT's, when set),
+ * centred, black around it. Both resources are in PRESENT before and after. */
 static void blit_to_window(u32 fi)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
@@ -1194,7 +1227,8 @@ static void blit_to_window(u32 fi)
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
 
     const float ww = (float)s_d3d.win_w, wh = (float)s_d3d.win_h;
-    const float gw = (float)s_d3d.width, gh = (float)s_d3d.height;
+    const float gh = (float)s_d3d.height, ar = rsx_aspect();
+    const float gw = ar > 0.0f ? gh * ar : (float)s_d3d.width;   /* RSX_ASPECT: stretched to that shape */
     const float k = ww / gw < wh / gh ? ww / gw : wh / gh;
     const float vw = floorf(gw * k + 0.5f), vh = floorf(gh * k + 0.5f);
     D3D12_VIEWPORT vp = {floorf((ww - vw) * 0.5f), floorf((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
