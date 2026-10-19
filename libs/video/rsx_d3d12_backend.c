@@ -3276,7 +3276,10 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                 if (pass == 0) {
                     if (q->ver != g_rsx_vp_ucode_ver) continue;
                 } else {
-                    if (q->ver == g_rsx_vp_ucode_ver || !q->code ||
+                    /* !q->len: the one-entry memo wrote this entry and kept
+                     * no copy (RSX_VP_MEMO=1, then 2 again, live). Compared
+                     * over 0 bytes, it matched any program at this start. */
+                    if (q->ver == g_rsx_vp_ucode_ver || !q->code || !q->len ||
                         (q->end ? q->len > avail : q->len != avail) ||
                         memcmp(q->code, st->vp_ucode + vstart, q->len))
                         continue;
