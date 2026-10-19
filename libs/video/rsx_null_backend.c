@@ -94,6 +94,8 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_KEYDOWN:
+        if (ps3_no_user_input())   /* (ps3_knob.h): no key of the user's ends the run or captures a frame */
+            break;
         if (wp == VK_ESCAPE) {
             s_state.window_closed = 1;
             DestroyWindow(hwnd);
