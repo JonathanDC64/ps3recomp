@@ -101,7 +101,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     } else if (s_fresh || s_pm_data[wid][spu_num] != wkl_data) {
         if (!s_fresh) {
             static int _n = 0;
-            if (_n++ < 8)
+            if (_n < 8 && ++_n)
                 fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
                         "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
                         (unsigned long long)s_pm_data[wid][spu_num],
@@ -222,7 +222,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (tracing) {
         g_pm_flow_n = 0; g_pm_flow_ctx = ctx;
         s_flow_arm_ms = ps3_ms_now();
-        { static int _a = 0; if (_a++ < 8) {
+        { static int _a = 0; if (_a < 8 && ++_a) {
             fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
                     wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
@@ -272,7 +272,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
         extern unsigned spu_recent_pcs(uint32_t*, unsigned);
         uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
-        static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+        static volatile long s_pe; if (s_pe < 64 && __atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
             fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
                     spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
                     ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);

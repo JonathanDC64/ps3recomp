@@ -740,7 +740,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        { static int _n = 0; if (_n++ < 24)
+        { static int _n = 0; if (_n < 24 && ++_n)
             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
@@ -1153,7 +1153,7 @@ static void spu_async_run(spu_async_job* j)
                   uint8_t* w = vm_base + s_dw_ea + 0x0C;
                   w[0]=(uint8_t)(endp>>24); w[1]=(uint8_t)(endp>>16);
                   w[2]=(uint8_t)(endp>>8);  w[3]=(uint8_t)endp;
-                  static int _n = 0; if (_n++ < 12)
+                  static int _n = 0; if (_n < 12 && ++_n)
                       fprintf(stderr, "[done-word] image=%d done -> [0x%08X+0x0C]=0x%08X (bisect)\n",
                               j->image_id, s_dw_ea, endp);
               } }
@@ -1541,7 +1541,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (_n < 24 && ++_n)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
@@ -1654,8 +1654,8 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (_n++ < 200 || (_n % 500) == 0)
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
+      static long long _n = 0; if (_n++ < 200 || (_n % 500) == 0)
+        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%lld enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
@@ -1683,7 +1683,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                     }
                 }
             }
-            { static int _a = 0; if (_a++ < 8)
+            { static int _a = 0; if (_a < 8 && ++_a)
                 fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
         }
     }
@@ -1722,7 +1722,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
               s_rn = s_rn_ea ? 1 : 0; } }
       if (s_rn) {
           extern void spurs_ef_set_from_spu(uint32_t, uint16_t);
-          static int _n = 0; if (_n++ < 12)
+          static int _n = 0; if (_n < 12 && ++_n)
               fprintf(stderr, "[round-notify] task %u finished a round -> set flag "
                       "0x%08X bits=0x%04X\n", taskId, s_rn_ea, (unsigned)s_rn_bits);
           spurs_ef_set_from_spu(s_rn_ea, (uint16_t)s_rn_bits);
@@ -1769,7 +1769,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (!drained && !killed) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    if (drained) { static int _d = 0; if (_d++ < 24)
+    if (drained) { static int _d = 0; if (_d < 24 && ++_d)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     if (killed) {
@@ -1934,7 +1934,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
         (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
-        static int _d=0; if (_d++ < 1) {
+        static int _d=0; if (_d < 1 && ++_d) {
             /* Dump a larger window of the task context buffer + scan for any word
              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
              * to see if the kernel-restored LS data lives here (real game data). */
