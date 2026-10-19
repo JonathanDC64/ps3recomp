@@ -65,9 +65,14 @@ typedef struct ppu_context {
     u128     vr[32] __attribute__((aligned(16)));
 #endif
 
-    /* Condition register -- 8 x 4-bit fields packed into 32 bits.
-     * CR0 is bits 31:28, CR1 is 27:24, ..., CR7 is 3:0. */
-    uint32_t cr;
+    /* Condition register -- one byte per 4-bit field: crf[0] is CR0 ...
+     * crf[7] is CR7, each LT=8 GT=4 EQ=2 SO=1 in its low nibble (RPCS3 keeps
+     * the fields apart too). A lifted compare writes its field with one byte
+     * store; with one packed 32-bit word every compare was a read-modify-write
+     * of that word, which chained all of a function's compares through memory.
+     * ppu_cr_pack / ppu_cr_unpack give the packed value (mfcr, mtcr). The 8
+     * bytes take the old uint32_t and its padding, so later offsets stay. */
+    uint8_t  crf[8];
 
     /* Link register -- return address */
     uint64_t lr;
@@ -115,15 +120,32 @@ static inline void ppu_context_init(ppu_context* ctx)
 /* Get a 4-bit CR field (0-7). */
 static inline uint8_t ppu_cr_get(const ppu_context* ctx, int field)
 {
-    return (uint8_t)((ctx->cr >> (28 - field * 4)) & 0xF);
+    return (uint8_t)(ctx->crf[field] & 0xF);
 }
 
 /* Set a 4-bit CR field (0-7). */
 static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
 {
-    uint32_t shift = (uint32_t)(28 - field * 4);
-    ctx->cr = (ctx->cr & ~(0xFu << shift)) | ((uint32_t)(value & 0xF) << shift);
+    ctx->crf[field] = (uint8_t)(value & 0xF);
 }
+
+/* The whole register as the guest sees it (mfcr) and back (mtcr): CR0 is
+ * bits 31:28 of the packed value, CR7 bits 3:0. The lifter's generated
+ * ppu_recomp.h defines these two and the field get/set above, for host
+ * code built against it (a port's insn hooks). */
+#ifndef PPU_CR_PACK_DEFINED
+#define PPU_CR_PACK_DEFINED
+static inline uint32_t ppu_cr_pack(const ppu_context* ctx)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 4) | (ctx->crf[i] & 0xFu);
+    return v;
+}
+static inline void ppu_cr_unpack(ppu_context* ctx, uint32_t v)
+{
+    for (int i = 0; i < 8; i++) ctx->crf[i] = (uint8_t)((v >> (28 - 4 * i)) & 0xFu);
+}
+#endif
 
 /* Set a CR field from a signed 64-bit comparison result. */
 static inline void ppu_cr_set_s64(ppu_context* ctx, int field, int64_t a, int64_t b)

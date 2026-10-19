@@ -95,7 +95,7 @@ typedef struct ppu_context {
 #else
     ppu_vr   vr[32] __attribute__((aligned(16)));
 #endif
-    uint32_t cr;        /* Condition register          */
+    uint8_t  crf[8];    /* Condition register: one byte per field, CR0..CR7 */
     uint64_t lr;        /* Link register               */
     uint64_t ctr;       /* Count register              */
     uint32_t xer;       /* Fixed-point exception reg   */
@@ -107,6 +107,33 @@ typedef struct ppu_context {
     uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
     int      reserve_valid; /* lwarx/stwcx. reservation flag    */
 } ppu_context;
+
+/* Condition register access for host code (insn hooks, HLE): ppu_cr_get and
+ * ppu_cr_set read and write one field (0 = CR0 ... 7 = CR7; LT=8 GT=4 EQ=2
+ * SO=1), ppu_cr_pack and ppu_cr_unpack the whole register as the guest sees
+ * it (mfcr / mtcr: CR0 is bits 31:28, CR7 bits 3:0). runtime/ppu/ppu_context.h
+ * has the same four. */
+#ifndef PPU_CR_PACK_DEFINED
+#define PPU_CR_PACK_DEFINED
+static inline uint8_t ppu_cr_get(const ppu_context* ctx, int field)
+{
+    return (uint8_t)(ctx->crf[field] & 0xF);
+}
+static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
+{
+    ctx->crf[field] = (uint8_t)(value & 0xF);
+}
+static inline uint32_t ppu_cr_pack(const ppu_context* ctx)
+{
+    uint32_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 4) | (ctx->crf[i] & 0xFu);
+    return v;
+}
+static inline void ppu_cr_unpack(ppu_context* ctx, uint32_t v)
+{
+    for (int i = 0; i < 8; i++) ctx->crf[i] = (uint8_t)((v >> (28 - 4 * i)) & 0xFu);
+}
+#endif
 
 /* Memory access helpers (provided by runtime) */
 #ifdef __cplusplus
@@ -588,11 +615,29 @@ def _imm(token: str) -> str:
         return token
 
 
+# The condition register is kept as one byte per field (ctx->crf[0] = CR0 ...
+# ctx->crf[7] = CR7, each LT=8 GT=4 EQ=2 SO=1), the way RPCS3 keeps it apart.
+# A compare then writes its field with one byte store. With the 32-bit packed
+# register every compare was a read-modify-write of the same word, so all the
+# compares of a function formed one dependency chain through memory, each link
+# a store-to-load forward. mfcr and mtcrf pack and unpack (ppu_cr_pack and
+# ppu_cr_unpack in ppu_context.h).
+
 def _cr_field_set(bf: int) -> str:
-    """Generate C to set a CR field from a comparison result."""
-    shift = (7 - bf) * 4
-    return (f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | "
-            f"(cr_val << {shift})")
+    """Generate C to set a CR field from a comparison result (`cr_val`)."""
+    return f"ctx->crf[{bf}] = (uint8_t)cr_val"
+
+
+def _crb_get(bit: int) -> str:
+    """C expression, 0 or 1, for CR bit `bit` (0 = CR0.LT ... 31 = CR7.SO)."""
+    return f"((ctx->crf[{bit >> 2}] >> {3 - (bit & 3)}) & 1u)"
+
+
+def _crb_set(bit: int, val: str) -> str:
+    """C statement that sets CR bit `bit` to `val`, an expression that is 0 or 1."""
+    f, s = bit >> 2, 3 - (bit & 3)
+    return (f"ctx->crf[{f}] = (uint8_t)((ctx->crf[{f}] & 0x{0xF & ~(1 << s):X}u) | "
+            f"(({val}) << {s}));")
 
 
 @dataclass
@@ -1082,7 +1127,7 @@ class PPULifter:
                 code += (f" {{ int64_t _r = (int64_t)ctx->gpr[{m.group(1)}]; "
                          f"uint32_t _c = (_r < 0) ? 8u : (_r > 0) ? 4u : 2u; "
                          f"_c |= (uint32_t)((ctx->xer >> 31) & 1u); "
-                         f"ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (_c << 28); }}")
+                         f"ctx->crf[0] = (uint8_t)_c; }}")
         return code
 
     def _translate_op(self, insn: Instruction, func: LiftedFunction) -> str:
@@ -1549,10 +1594,9 @@ class PPULifter:
                 ra_i = _reg_idx(ops[0])
                 imm = _imm(ops[1])
             cast = "(int32_t)" if mn == "cmpwi" else "(int64_t)"
-            shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = (int64_t){imm}; "
                     f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+                    f"ctx->crf[{bf}] = (uint8_t)cr_val; }}")
 
         if mn in ("cmplwi", "cmpldi"):
             if ops[0].startswith("cr"):
@@ -1564,10 +1608,9 @@ class PPULifter:
                 ra_i = _reg_idx(ops[0])
                 imm = _imm(ops[1])
             cast = "(uint32_t)" if mn == "cmplwi" else "(uint64_t)"
-            shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = (uint64_t){imm}; "
                     f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+                    f"ctx->crf[{bf}] = (uint8_t)cr_val; }}")
 
         if mn in ("cmpw", "cmpd"):
             if ops[0].startswith("cr"):
@@ -1579,10 +1622,9 @@ class PPULifter:
                 ra_i = _reg_idx(ops[0])
                 rb_i = _reg_idx(ops[1])
             cast = "(int32_t)" if mn == "cmpw" else "(int64_t)"
-            shift = (7 - bf) * 4
             return (f"{{ int64_t a = {cast}ctx->gpr[{ra_i}]; int64_t b = {cast}ctx->gpr[{rb_i}]; "
                     f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+                    f"ctx->crf[{bf}] = (uint8_t)cr_val; }}")
 
         if mn in ("cmplw", "cmpld"):
             if ops[0].startswith("cr"):
@@ -1594,10 +1636,9 @@ class PPULifter:
                 ra_i = _reg_idx(ops[0])
                 rb_i = _reg_idx(ops[1])
             cast = "(uint32_t)" if mn == "cmplw" else "(uint64_t)"
-            shift = (7 - bf) * 4
             return (f"{{ uint64_t a = {cast}ctx->gpr[{ra_i}]; uint64_t b = {cast}ctx->gpr[{rb_i}]; "
                     f"uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+                    f"ctx->crf[{bf}] = (uint8_t)cr_val; }}")
 
         # ------- Branches -------
         if mn == "blr":
@@ -1783,7 +1824,7 @@ class PPULifter:
 
         if mn == "mfcr":
             rd_i = _reg_idx(ops[0])
-            return f"ctx->gpr[{rd_i}] = ctx->cr;"
+            return f"ctx->gpr[{rd_i}] = ppu_cr_pack(ctx);"
 
         if mn in ("mfspr", "mtspr"):
             # Only the user-mode SPRs exist on the PPU from a title's point of
@@ -1820,21 +1861,19 @@ class PPULifter:
             return f"ctx->{spr_field} = ctx->gpr[{g}];"
 
         if mn == "mtcr":
-            return f"ctx->cr = (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}];"
+            return f"ppu_cr_unpack(ctx, (uint32_t)ctx->gpr[{_reg_idx(ops[-1])}]);"
         if mn == "mtcrf":
             # mtcrf CRM, rS -- update ONLY the CR fields whose CRM bit is set
-            # (the others are preserved). CR0 = cr bits 28-31 ... CR7 = bits 0-3;
+            # (the others are preserved). CR0 = rS bits 28-31 ... CR7 = bits 0-3;
             # CRM 0x80 selects CR0 ... 0x01 selects CR7.
             crm = int(ops[0], 0) if len(ops) > 1 else 0xFF
-            mask = 0
-            for f in range(8):
-                if crm & (0x80 >> f):
-                    mask |= 0xF << (28 - 4 * f)
+            fields = [f for f in range(8) if crm & (0x80 >> f)]
             rS = _reg_idx(ops[-1])
-            if mask == 0xFFFFFFFF:
-                return f"ctx->cr = (uint32_t)ctx->gpr[{rS}];"
-            return (f"ctx->cr = (ctx->cr & 0x{(~mask) & 0xFFFFFFFF:08X}u) | "
-                    f"((uint32_t)ctx->gpr[{rS}] & 0x{mask:08X}u);")
+            if len(fields) == 8:
+                return f"ppu_cr_unpack(ctx, (uint32_t)ctx->gpr[{rS}]);"
+            sets = "".join(f" ctx->crf[{f}] = (uint8_t)((_v >> {28 - 4 * f}) & 0xFu);"
+                           for f in fields)
+            return f"{{ uint32_t _v = (uint32_t)ctx->gpr[{rS}];{sets} (void)_v; }}"
 
         # ------- Syscall -------
         if mn == "sc":
@@ -2009,13 +2048,12 @@ class PPULifter:
                 bf = 0
                 fra = _reg_idx(ops[0])
                 frb = _reg_idx(ops[1])
-            shift = (7 - bf) * 4
             # Book I 4.6.8: either operand NaN => c = 0b0001 (FU/unordered).
             # Mapping NaN to EQ steers every cror-composed >=/<= the wrong
             # way on a NaN-poisoned float.
             return (f"{{ double a = ctx->fpr[{fra}]; double b = ctx->fpr[{frb}]; "
                     f"uint32_t cr_val = (a != a || b != b) ? 1 : (a < b) ? 8 : (a > b) ? 4 : 2; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {shift})) | (cr_val << {shift}); }}")
+                    f"ctx->crf[{bf}] = (uint8_t)cr_val; }}")
 
         # ------- 64-bit multiply / divide -------
         if mn == "mulld":
@@ -2094,63 +2132,23 @@ class PPULifter:
                     f"ctx->gpr[{rd}] = result; }}")
 
         # ------- Condition register logical ops -------
-        if mn == "cror":
+        # bt, ba, bb are CR bit numbers (0 = CR0.LT ... 31 = CR7.SO).
+        cr_logic = {
+            "cror": "a | b", "crand": "a & b", "crnand": "~(a & b) & 1u",
+            "crxor": "a ^ b", "crnor": "~(a | b) & 1u", "creqv": "~(a ^ b) & 1u",
+            "crorc": "a | (~b & 1u)", "crandc": "a & (~b & 1u)",
+        }
+        if mn in cr_logic:
             bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a | b) << (31 - {bt})); }}")
-
-        if mn == "crand":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a & b) << (31 - {bt})); }}")
-
-        if mn == "crnand":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a & b) & 1) << (31 - {bt})); }}")
-
-        if mn == "crxor":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a ^ b) << (31 - {bt})); }}")
-
-        if mn == "crnor":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a | b) & 1) << (31 - {bt})); }}")
-
-        if mn == "creqv":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((~(a ^ b) & 1) << (31 - {bt})); }}")
-
-        if mn == "crorc":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a | (~b & 1)) << (31 - {bt})); }}")
-
-        if mn == "crandc":
-            bt, ba, bb = int(ops[0]), int(ops[1]), int(ops[2])
-            return (f"{{ uint32_t a = (ctx->cr >> (31 - {ba})) & 1; "
-                    f"uint32_t b = (ctx->cr >> (31 - {bb})) & 1; "
-                    f"ctx->cr = (ctx->cr & ~(1u << (31 - {bt}))) | ((a & (~b & 1)) << (31 - {bt})); }}")
+            return (f"{{ uint32_t a = {_crb_get(ba)}; uint32_t b = {_crb_get(bb)}; "
+                    f"{_crb_set(bt, cr_logic[mn])} }}")
 
         # mcrf — move condition register field
         if mn == "mcrf":
             # mcrf crD, crS — copy 4-bit CR field
             bf = int(ops[0][2:]) if ops[0].startswith("cr") else int(ops[0])
             bfa = int(ops[1][2:]) if ops[1].startswith("cr") else int(ops[1])
-            dst_shift = (7 - bf) * 4
-            src_shift = (7 - bfa) * 4
-            return (f"{{ uint32_t field = (ctx->cr >> {src_shift}) & 0xF; "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << {dst_shift})) | (field << {dst_shift}); }}")
+            return f"ctx->crf[{bf}] = ctx->crf[{bfa}];"
 
         # rlwnm — rotate left word then AND with mask (register shift)
         if mn.startswith("rlwnm"):
@@ -2236,7 +2234,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "  # CR0 EQ = success
+                    f"ctx->crf[0] = (uint8_t)(_sc ? 2u : 0u); "  # CR0 EQ = success
                     f"ctx->reserve_addr = 0; }}")
 
         if mn == "ldarx":
@@ -2252,7 +2250,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {ea}; "
                     f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
                     f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u); "
+                    f"ctx->crf[0] = (uint8_t)(_sc ? 2u : 0u); "
                     f"ctx->reserve_addr = 0; }}")
 
         # ------- Trap (tw) — used for assertions, safe to no-op in recomp -------
@@ -2637,7 +2635,7 @@ class PPULifter:
                     f"memcpy(&ctx->vr[{vd}], d, 16);")
             if mn.endswith("."):
                 body += (" uint32_t c6=(t==4?8u:0u)|(t==0?2u:0u); "
-                         "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+                         "ctx->crf[6]=(uint8_t)c6;")
             return body + " }"
 
         # VMX shift (vsldoi) — shift left double by octet immediate
@@ -2673,7 +2671,7 @@ class PPULifter:
                     f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; int t=0; "
                     f"for(int i=0;i<8;i++){{ d[i]=a[i]==b[i]?(uint16_t)~0:0; t+=a[i]==b[i]; }}"
                     + (" uint32_t c6=(t==8?8u:0u)|(t==0?2u:0u); "
-                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                       "ctx->crf[6]=(uint8_t)c6;" if mn.endswith(".") else "")
                     + " }")
 
         if mn.startswith("vcmpequw"):
@@ -2686,7 +2684,7 @@ class PPULifter:
         # Previously unhandled (fell to the TODO catch-all = silently skipped
         # stores, so vD kept stale data). Dot forms set CR6 per the AltiVec
         # PEM: bit0 (value 8) = all lanes true, bit2 (value 2) = all lanes
-        # false, written to CR field 6 (bits 4-7 of our packed ctx->cr).
+        # false, written to CR field 6 (ctx->crf[6]).
         vcmpgt_family = {
             "vcmpgtsb": ("int8_t",   16), "vcmpgtsh": ("int16_t",  8),
             "vcmpgtsw": ("int32_t",   4),
@@ -2716,7 +2714,7 @@ class PPULifter:
                     f"memcpy(&ctx->vr[{vd}], d, 16);")
             if mn.endswith("."):
                 body += (f" uint32_t c6=(t=={n}?8u:0u)|(t==0?2u:0u); "
-                         f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);")
+                         f"ctx->crf[6]=(uint8_t)c6;")
             return body + " }"
 
         # ------- VMX integer arithmetic (generated from disasm decode table) -------
@@ -2913,7 +2911,7 @@ class PPULifter:
             return (f"{{ float a[4],b[4]; uint32_t d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
                     f"for(int i=0;i<4;i++) {{ uint32_t r=0; "
                     f"if(!(a[i]<=b[i])) r|=0x80000000u; if(!(a[i]>=-b[i])) r|=0x40000000u; d[i]=r; }} "
-                    f"ppu_vstu4(&ctx->vr[{vd}],d); " + (f"ctx->cr=(ctx->cr & ~(0xFu<<4))|(((d[0]|d[1]|d[2]|d[3])==0?2u:0u)<<4); " if mn.endswith(".") else "") + "}")
+                    f"ppu_vstu4(&ctx->vr[{vd}],d); " + (f"ctx->crf[6]=(uint8_t)((d[0]|d[1]|d[2]|d[3])==0?2u:0u); " if mn.endswith(".") else "") + "}")
 
         # ------- Additional VMX integer instructions -------
         # Byte compare equal
@@ -2924,7 +2922,7 @@ class PPULifter:
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
                     f"for(int i=0;i<16;i++){{ d[i]=a[i]==b[i]?0xFFu:0u; t+=a[i]==b[i]; }}"
                     + (" uint32_t c6=(t==16?8u:0u)|(t==0?2u:0u); "
-                       "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
+                       "ctx->crf[6]=(uint8_t)c6;" if mn.endswith(".") else "")
                     + " }")
 
         # Saturating add
@@ -3238,17 +3236,16 @@ class PPULifter:
             except ValueError:
                 pass
 
-        shift = (7 - cr_field) * 4
-
+        f = cr_field
         cond_map = {
-            "eq": f"((ctx->cr >> {shift}) & 2)",
-            "ne": f"(!((ctx->cr >> {shift}) & 2))",
-            "lt": f"((ctx->cr >> {shift}) & 8)",
-            "ge": f"(!((ctx->cr >> {shift}) & 8))",
-            "gt": f"((ctx->cr >> {shift}) & 4)",
-            "le": f"(!((ctx->cr >> {shift}) & 4))",
-            "so": f"((ctx->cr >> {shift}) & 1)",
-            "ns": f"(!((ctx->cr >> {shift}) & 1))",
+            "eq": f"(ctx->crf[{f}] & 2)",
+            "ne": f"(!(ctx->crf[{f}] & 2))",
+            "lt": f"(ctx->crf[{f}] & 8)",
+            "ge": f"(!(ctx->crf[{f}] & 8))",
+            "gt": f"(ctx->crf[{f}] & 4)",
+            "le": f"(!(ctx->crf[{f}] & 4))",
+            "so": f"(ctx->crf[{f}] & 1)",
+            "ns": f"(!(ctx->crf[{f}] & 1))",
             "dnz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) != 0)",
             "dz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) == 0)",
         }

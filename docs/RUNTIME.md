@@ -155,7 +155,8 @@ typedef struct ppu_context {
     uint64_t gpr[32];       // General-purpose registers r0–r31
     double   fpr[32];       // Floating-point registers f0–f31
     u128     vr[32];        // VMX/AltiVec vector registers vr0–vr31 (128-bit, 16-byte aligned)
-    uint32_t cr;            // Condition register (8 × 4-bit fields)
+    uint8_t  crf[8];        // Condition register, one byte per 4-bit field (crf[0] = CR0);
+                            // ppu_cr_pack/ppu_cr_unpack give the 32-bit value mfcr sees
     uint64_t lr;            // Link register (return address from bl/blr)
     uint64_t ctr;           // Count register (loop counter for bdnz)
     uint32_t xer;           // Fixed-point exception register (SO/OV/CA)

@@ -445,9 +445,9 @@ typedef void (*ppu_recompiled_fn)(ppu_context*);
 #define PPU_LOOKUP_FUNC(table, addr) \
     ((ppu_recompiled_fn)(table)[(addr) >> 2])
 
-/* Branch condition testing */
+/* Branch condition testing: CR bit 0 is CR0.LT ... 31 is CR7.SO. */
 #define PPU_CR_BIT(ctx, bit) \
-    (((ctx)->cr >> (31 - (bit))) & 1)
+    (((ctx)->crf[(bit) >> 2] >> (3 - ((bit) & 3))) & 1)
 
 /* LR / CTR management */
 #define PPU_MTLR(ctx, rs)  (ctx)->lr  = (ctx)->gpr[rs]
