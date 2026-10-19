@@ -183,7 +183,9 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
-    /* Mark as finished */
+    /* Mark as finished, and signal anyone waiting for join, both under the
+     * table lock: once the slot reads FINISHED or FREE a joiner or a detach can
+     * free it and a new thread take it, so this is the last use of the slot. */
     table_lock();
     info->exit_status = (int64_t)info->ctx.gpr[3];
 
@@ -193,17 +195,19 @@ static void* ppu_host_thread_proc(void* param)
     } else {
         info->state = PPU_THREAD_STATE_FINISHED;
     }
-    table_unlock();
 
-    /* Signal anyone waiting for join */
 #ifdef _WIN32
     SetEvent(info->finish_event);
-    return 0;
 #else
     pthread_mutex_lock(&info->finish_mutex);
     info->finished = 1;
     pthread_cond_signal(&info->finish_cond);
     pthread_mutex_unlock(&info->finish_mutex);
+#endif
+    table_unlock();
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
 #endif
 }
@@ -568,6 +572,20 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
             (unsigned long long)tid, (unsigned long long)status);
 
+    /* Hardware never returns from this. Unwind to the thread proc so the guest
+     * cannot keep running past its own exit. The proc's epilogue then marks the
+     * thread finished, with the status still in r3, after its last use of the
+     * slot. Marking it here as well, as this used to, woke a joiner before the
+     * epilogue ran: the joiner freed the slot and the epilogue stamped it
+     * FINISHED again, so it was never handed out again. Demon's Souls joins two
+     * threads on every level load and ran out of the PPU_THREAD_MAX slots. */
+    {
+        static int allow = -1;
+        PS3_KNOB(allow, getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1);
+        if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
+    }
+
+    /* No unwind: the thread runs on, so mark it finished here. */
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (t) {
@@ -588,14 +606,6 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
 #endif
     }
     table_unlock();
-
-    /* Hardware never returns from this. Unwind to the thread proc so the guest
-     * cannot keep running past its own exit. */
-    {
-        static int allow = -1;
-        PS3_KNOB(allow, getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1);
-        if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
-    }
     return CELL_OK;
 }
 
@@ -656,6 +666,12 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 
     /* Clean up */
 #ifdef _WIN32
+    /* Wait for the thread procedure to return first, as pthread_join does
+     * below, with the table lock released for the same reason: when
+     * sys_ppu_thread_exit cannot unwind it sets finish_event from inside the
+     * thread body, and the epilogue still to come would stamp a freed slot
+     * FINISHED again. */
+    WaitForSingleObject(t->host_thread, INFINITE);
     table_lock();
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
@@ -666,13 +682,13 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
      *
      * pthread_join blocks until the thread procedure returns, and that
      * procedure's epilogue takes the table lock to stamp its own state. The
-     * joiner is woken well before that epilogue runs, because a guest thread
-     * normally ends at sys_ppu_thread_exit, which signals `finished` from
-     * INSIDE the thread body and then longjmps back out to the epilogue. So a
-     * joiner that holds the lock across the join is waiting for a thread that
-     * is waiting for the lock -- and the whole title stops with no message.
+     * joiner can be woken before that epilogue runs: sys_ppu_thread_exit
+     * signals `finished` from INSIDE the thread body when it cannot unwind,
+     * and it used to every time. So a joiner that holds the lock across the
+     * join is waiting for a thread that is waiting for the lock -- and the
+     * whole title stops with no message.
      *
-     * Windows never saw it: its half of this block is CloseHandle, which
+     * Windows never saw it: its half of this block was only CloseHandle, which
      * records nothing about whether the thread has finished and never waits.
      * The two halves have to be read as one thing, and only one of them was.
      * Take the lock again afterwards for the teardown, which is what actually
