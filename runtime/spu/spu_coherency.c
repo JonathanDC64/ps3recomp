@@ -230,16 +230,30 @@ int spu_lockline_read_same(uint32_t ea, long seq)   { (void)ea; (void)seq; retur
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
 /* Exported (ppu_loader.cpp tests it inline on every guest store). */
+#ifndef PS3_GAME_SPLIT
 unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
 #define s_coh_bitmap g_spu_coh_bitmap
+#else
+/* Split build: the lifted code's inline stores test the game module's copy,
+ * so the host uses it too once the module loads (ps3emu/game_split.h). */
+static unsigned char s_coh_bitmap_host[SPU_COH_BITMAP_SZ];
+unsigned char* ps3_split_coh_bitmap = s_coh_bitmap_host;
+#define s_coh_bitmap ps3_split_coh_bitmap
+#endif
 
 /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
  * bitmap entirely for a title that runs no SPU code, and keeps every existing
  * test that stores through vm_write* paying one compare against a hot global.
  * Written once, under the lock; read unlocked, where a stale zero costs at most
  * one missed event on the very first reservation of the run. */
+#ifndef PS3_GAME_SPLIT
 SPU_COH_LINE(int) g_spu_coh_armed_line;   /* own line, as g_lockline; exported as above */
 #define s_coh_armed g_spu_coh_armed_line.v
+#else
+static SPU_COH_LINE(int) s_coh_armed_host;   /* the game module's once it loads */
+int* ps3_split_coh_armed = &s_coh_armed_host.v;
+#define s_coh_armed (*ps3_split_coh_armed)
+#endif
 
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */

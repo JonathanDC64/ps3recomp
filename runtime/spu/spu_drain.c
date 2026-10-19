@@ -19,7 +19,9 @@ typedef struct spu_irq_frame {
 } spu_irq_frame;
 
 /* Pending cross-function transfer target for this host thread's SPU context. */
+#ifndef PS3_GAME_SPLIT   /* split build: the game module's (ps3emu/game_split.h) */
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+#endif
 SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
 SPU_THREAD_LOCAL unsigned g_spu_pch_n;
 
@@ -34,7 +36,11 @@ SPU_THREAD_LOCAL unsigned g_spu_pch_n;
  * armed/dumped by spu_run_policy_module. */
 uint32_t          g_pm_flow_buf[8192];
 volatile unsigned g_pm_flow_n = 0;
+#ifndef PS3_GAME_SPLIT
 void* volatile    g_pm_flow_ctx = 0;
+#else
+PS3_SPLIT_DEFINE(void* volatile, g_pm_flow_ctx, 0);   /* the game module's once it loads */
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -72,10 +78,18 @@ static unsigned s_step_diag_gen = ~0u;
 /* Whether a region goto (SPU_RGOTO) must take the trampoline instead: set
  * while anything below needs to see every hop. 1 until the first step has
  * read the knobs. SPU_TAILRET and SPU_PCHIST are SPU_DRAIN's per-hop work. */
+#ifndef PS3_GAME_SPLIT
 volatile int g_spu_goto_slow = 1;
+#else
+PS3_SPLIT_DEFINE(volatile int, g_spu_goto_slow, 1);   /* the game module's once it loads */
+#endif
 /* Jump-table gotos (spu_lifter --bi-switch, spu_bi_switch.h): on unless
  * SPU_BI_SWITCH=0, read with the other knobs; 0 until then. */
+#ifndef PS3_GAME_SPLIT
 volatile int g_spu_bi_switch = 0;
+#else
+PS3_SPLIT_DEFINE(volatile int, g_spu_bi_switch, 0);   /* the game module's once it loads */
+#endif
 static void spu_step_diag_load(void)
 {
     { const char* e = getenv("SPU_BI_SWITCH"); g_spu_bi_switch = !(e && e[0] == '0'); }
@@ -464,7 +478,15 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
+#ifndef PS3_GAME_SPLIT
             if (g_spu_trampoline_fn == spu_indirect_branch &&
+#else
+            /* A split build's game module stores its own address for
+             * spu_indirect_branch, a jump thunk to this one
+             * (ps3emu/game_split.h): either is the return dispatch. */
+            if ((g_spu_trampoline_fn == spu_indirect_branch ||
+                 (void*)g_spu_trampoline_fn == ps3_split_module_spu_indirect_branch) &&
+#endif
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
                 g_spu_trampoline_fn = 0;
                 SPU_DRAIN_POP_IRQ();

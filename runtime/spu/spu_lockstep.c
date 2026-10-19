@@ -59,7 +59,11 @@ static uint64_t ls_now_ns(void)
 }
 #endif
 
+#ifndef PS3_GAME_SPLIT
 volatile int g_yz_lockstep_on = -1;
+#else
+PS3_SPLIT_DEFINE(volatile int, g_yz_lockstep_on, -1);   /* the game module's once it loads */
+#endif
 
 #define YZ_LOCKSTEP_MAX_SPUS         32
 #define YZ_LOCKSTEP_DEFAULT_QUANTUM  65536ull

@@ -397,6 +397,27 @@ if(NOT MSVC AND NOT WIN32)
     target_compile_definitions(ps3recomp_runtime PRIVATE _GNU_SOURCE)
 endif()
 
+# Game module split (include/ps3emu/game_module.h): the runtime for a host exe
+# that loads the lifted code from a DLL. The globals and the two trampoline
+# thread-locals the lifted code shares with the runtime then live in the DLL,
+# and include/ps3emu/game_split.h, force-included into every source, reaches
+# them through pointers. Build it in its own build directory, and only the
+# ps3recomp_runtime target there (the host exe's sources, runtime/ppu among
+# them, are the title's to compile, with the same definition and header): the
+# default library is unchanged. Windows (clang-cl) only for now.
+option(PS3RECOMP_GAME_SPLIT "Build the runtime for a host that loads the game from a DLL" OFF)
+if(PS3RECOMP_GAME_SPLIT)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3_GAME_SPLIT)
+    if(MSVC)   # also true for clang-cl
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "/FI${CMAKE_CURRENT_SOURCE_DIR}/include/ps3emu/game_split.h")
+    else()
+        target_compile_options(ps3recomp_runtime PRIVATE
+            -include "${CMAKE_CURRENT_SOURCE_DIR}/include/ps3emu/game_split.h")
+    endif()
+    message(STATUS "  Game split:   ON (the runtime for a host exe and a game DLL)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
