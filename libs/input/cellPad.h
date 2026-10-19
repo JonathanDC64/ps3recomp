@@ -205,6 +205,33 @@ void cellPad_poll(void);
  * Scripted input (PAD_FILE, PAD_STICK, ...) still applies. */
 void cellPad_set_host_hold(int hold);
 
+/* The mouse, for the keyboard pad's bindings (PAD_KEYS names mouse1 to mouse5,
+ * wheelup and wheeldown). The title's window code passes them from raw input
+ * while its window has the mouse, so a click that brings the window to the
+ * front or a drag of its title bar never presses anything.
+ * Buttons held: bit 0 = mouse1 (left), 1 = right, 2 = middle, 3 and 4 = the
+ * side buttons. Wheel: notches, positive away from the user (up); queued, at
+ * most 4 either way. */
+void cellPad_host_mouse_buttons(unsigned mask);
+void cellPad_host_mouse_wheel(int notches);
+
+/* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
+ * and the other bindings of the same inputs do not. */
+void cellPad_host_set_menu(int open);
+
+/* Press buttons on port 0 (CELL_PAD_CTRL_* packed as PAD_SCRIPT's masks,
+ * (DIGITAL2 << 8) | DIGITAL1) for the next `reads` packets the title receives,
+ * or hold a stick there (0 = left, 1 = right; 0-255, 128 = centred), over
+ * whatever else drives it. For title code that turns host input into presses:
+ * a jump from a double tap, a stick flick from the mouse. Dropped while the
+ * host hold is set. */
+void cellPad_host_press(unsigned buttons, unsigned reads);
+void cellPad_host_stick(int stick, unsigned char x, unsigned char y, unsigned reads);
+
+/* The keyboard pad's buttons after its bindings, before they join port 0
+ * (same packing): title code can rework them. NULL by default. */
+extern unsigned (*g_pad_keys_hook)(unsigned buttons);
+
 #ifdef __cplusplus
 }
 #endif
