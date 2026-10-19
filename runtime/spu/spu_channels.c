@@ -244,7 +244,7 @@ void spu_dbg_e60(spu_context* ctx)
 {
     static int s_e = -1; PS3_KNOB(s_e, getenv("YDKJ_E60") ? 1 : 0);
     if (!s_e) return;
-    static int _d = 0; if (_d++ >= 6) return;
+    static int _d = 0; if (_d >= 6) return; _d++;
     const uint8_t* L = ctx->ls;
     #define RD(o) (((uint32_t)L[(o)]<<24)|((uint32_t)L[(o)+1]<<16)|((uint32_t)L[(o)+2]<<8)|L[(o)+3])
     fprintf(stderr, "[E60] r20=%08X r24=%08X | run2700=%08X ready2710=%08X pend2720=%08X en2730=%08X sig2740=%08X wait2750=%08X x2770=%08X\n",
@@ -747,7 +747,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     { static int s_at = -1;
       if (s_at < 0) { const char* e = getenv("SPU_ATOMTRACE");
                       int v = e ? atoi(e) : 0; s_at = e ? (v > 1 ? v : 40) : 0; }
-      if (s_at) { static int _a=0; if (_a++ < s_at)
+      if (s_at) { static int _a=0; if (_a < s_at && ++_a)
         fprintf(stderr, "[atom] cmd=0x%02X ea=0x%08X (img=%d)\n", cmd, ea, ctx->image_id); } }
     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
@@ -809,7 +809,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           static int _n = 0, s_cap = -1;
           /* SPU_ATOM_EA_MAX=<n>: lines to print (default 48, 0 = unlimited). */
           PS3_KNOB(s_cap, ps3_env_int("SPU_ATOM_EA_MAX", 48));
-          if (!s_cap || _n++ < s_cap) {
+          if (!s_cap || (_n < s_cap && ++_n)) {
               extern uint8_t* vm_base;
               const uint8_t* r = vm_base + ((uint32_t)ea & ~127u);
               static int s_af = -1;
@@ -3405,7 +3405,7 @@ void spu_indirect_branch(spu_context* ctx)
       static int _bt0[BT0_MAX_IMG];
       unsigned img = (ctx->image_id >= 0 && ctx->image_id < BT0_MAX_IMG)
                      ? (unsigned)ctx->image_id : 0;
-      if (_bt0[img]++ < BT0_PER_IMG)
+      if (_bt0[img] < BT0_PER_IMG && ++_bt0[img])
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
     /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at

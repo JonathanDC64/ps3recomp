@@ -1495,7 +1495,8 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 static void gcm_fifo_dump_around(u32 getoff)
 {
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (!getenv("GCM_RECDBG") || d >= 3) return;
+    d++;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -1997,7 +1998,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * blocks on. */
                 { static int sd = -1; static unsigned long s7 = 0;
                   PS3_KNOB(sd, getenv("GCM_SUBCH7") ? 1 : 0);
-                  if (sd && subch == 7 && (s7++ < 16))
+                  if (sd && subch == 7 && s7 < 16 && ++s7)
                       fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {

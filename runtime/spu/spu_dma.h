@@ -237,7 +237,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 mark((cmd & 0xF0) == 0x20 ? "spu_put" : "spu_get", (uint32_t)ea,
                      (uint32_t)w[0] << 24 | (uint32_t)w[1] << 16 | (uint32_t)w[2] << 8 | w[3]);
             } }
-          if ((s_img < 0 || spu->image_id == s_img) && (!s_max || _n++ < s_max)) {
+          if ((s_img < 0 || spu->image_id == s_img) && (!s_max || (_n < s_max && ++_n))) {
               extern unsigned long long ps3_ms_now(void);
               const uint8_t* w = &spu->ls[lsa & SPU_LS_MASK];
               fprintf(stderr, "[dma-range] t=%llu img=%d pc=0x%05X cmd=0x%X lsa=0x%05X ea=0x%08X size=%u w0=%02X%02X%02X%02X\n",
@@ -1391,7 +1391,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
       if (s_pe && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
           static int shown[8];
           const unsigned sp2 = spu->spu_id & 7u;
-          if (shown[sp2]++ < 6)
+          if (shown[sp2] < 6 && ++shown[sp2])
               fprintf(stderr, "[putea] spu%u cmd=0x%02X ea=0x%016llX size=%u lsa=0x%05X\n",
                       sp2, cmd & 0xFFu, (unsigned long long)ea, size, lsa);
       } }
@@ -1655,7 +1655,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     cmd, lsa, (unsigned long long)ea, size, tag);
         } else if (_pn == 96)
             fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-        _pn++;
+        if (_pn <= 96) _pn++;
     }
 
     /* Execute the transfer.

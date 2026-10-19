@@ -464,7 +464,7 @@ static void cellFsRead(ppu_context* ctx)
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
      * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
+    { static uint64_t tot=0; static int _n=0; static uint64_t _reads=0; _reads++;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
@@ -475,7 +475,7 @@ static void cellFsRead(ppu_context* ctx)
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+      if ((_reads % 2000)==0) { fprintf(stderr,"[fs] read summary after %llu reads:",(unsigned long long)_reads);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
     if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */

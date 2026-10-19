@@ -284,7 +284,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
             static unsigned s_cl = 0;
-            if (s_cl++ < 64) {
+            if (s_cl < 64 && ++s_cl) {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
                 fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "

@@ -1650,7 +1650,7 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                 CreateThread(NULL, 1u << 18, pm_write_watch, NULL, 0, NULL);
             }
         }
-        _n++;
+        if (_n <= 3) _n++;
     }
 
     /* Forward the BE-decoded values (priority as guest EA of the 8-byte table). */
@@ -2022,7 +2022,7 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
         else if (_n == 32)
             printf("[cellSpurs] ReadyCountStore further logs suppressed\n");
-        _n++;
+        if (_n <= 32) _n++;
     }
     return CELL_OK;
 }
@@ -2528,7 +2528,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
         } else if (_n == 3) {
             printf("[cellSpurs] CreateJobChainWA raw dumps suppressed from here\n");
         }
-        _n++;
+        if (_n <= 3) _n++;
     }
     if (ps3_log_verbose()) printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
@@ -2615,7 +2615,7 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
           }
           printf("\n");
       }
-      _n++; }
+      if (_n < 8) _n++; }
 
     if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
         static int _b = 0;
@@ -3176,7 +3176,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
                    (u32)queue_ea, (u32)data_ea, isBlocking);
         else if (_n == 8)
             printf("[cellSpurs] QueuePushBody further logs suppressed\n");
-        _n++;
+        if (_n <= 8) _n++;
         return CELL_OK;
     }
 
@@ -3250,7 +3250,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
         spu_taskset_signal_task(tsp, (uint32_t)woke);
     }
 
-    if (_n++ < 16)
+    if (_n < 16 && ++_n)
         printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
                "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
                _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);

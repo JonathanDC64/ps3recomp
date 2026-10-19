@@ -8305,7 +8305,7 @@ static void render_frame(void)
     /* RTT_DUMP_SKIP=<n>: skip the first n frames that have ops (dump late frames). */
     { static int _sk = -1; PS3_KNOB(_sk, ps3_env_int("RTT_DUMP_SKIP", 0));
       if (_sk > 0 && s_d3d.draw_count > 0 && getenv("RTT_DUMP")) { _sk--; goto rtt_dump_done; } }
-    if (getenv("RTT_DUMP") && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(getenv("RTT_DUMP")); if (_cap < 2) _cap = 14; if (_f++ < _cap) {
+    if (getenv("RTT_DUMP") && s_d3d.draw_count > 0) { static int _f=0; int _cap = atoi(getenv("RTT_DUMP")); if (_cap < 2) _cap = 14; if (_f < _cap && ++_f) {
         fprintf(stderr, "[RTT] frame %d: %u ops\n", _f, s_d3d.draw_count);
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
             D3D12DrawRecord* r = &s_d3d.draws[_d];

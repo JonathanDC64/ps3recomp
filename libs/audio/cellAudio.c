@@ -525,7 +525,7 @@ static void audio_mix_one_block(void)
               else {
                   if (run[p] && run[p] <= 40 && heard[p]) {
                       g_audio_gaps++; g_audio_gap_blocks += run[p];
-                      if (logged++ < 50) {
+                      if (logged < 50 && ++logged) {
                           char map[36]; u32 b;
                           for (b = 0; b < nblock && b < 32; b++) {
                               const float* bp = port->buffer + b * n;

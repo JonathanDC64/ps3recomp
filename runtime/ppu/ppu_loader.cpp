@@ -93,7 +93,7 @@ extern "C" void ppu_guest_caller(char* out, size_t n)
 static void ps3_report_guest_ptr(uintptr_t at, const char* how)
 {
     static LONG n = 0;
-    if (InterlockedIncrement(&n) > 32) return;
+    if (n >= 32 || InterlockedIncrement(&n) > 32) return;
     char who[64]; ppu_guest_caller(who, sizeof who);
     fprintf(stderr,
             "\n[ps3] UNTRANSLATED GUEST POINTER: %s of guest 0x%08X as a host "
@@ -1248,7 +1248,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
             if (en < 0) { const char* e = getenv("PPU_GUARD_CHANGE");
                           en = e ? (atoi(e) > 1 ? atoi(e) : 24) : 0; }
             static int _c = 0;
-            if (en && nowv != s_guard_pre && _c++ < en) {
+            if (en && nowv != s_guard_pre && _c < en && ++_c) {
                 fprintf(stderr, "[GUARD] CHANGED 0x%08X: 0x%08X -> 0x%08X cia=0x%08X lr=0x%08X\n",
                         s_guard_ea, s_guard_pre, nowv,
                         g_active_ctx ? g_active_ctx->cia : 0, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
@@ -1737,7 +1737,8 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
     if (!s_on) return;
     static long s_n = 0;
-    if (s_n++ >= 16) return;
+    if (s_n >= 16) return;
+    s_n++;
     const uint32_t fn = ppu_prof_resolve_host(ra);
     fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
             width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "");
@@ -2030,7 +2031,8 @@ extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     static int n = 0;
-    if (n++ >= 64) return;
+    if (n >= 64) return;
+    n++;
     fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
             addr, (unsigned long long)val, width);
     fflush(stderr);
@@ -2251,7 +2253,7 @@ void flow_record_alloc(unsigned int ptr, unsigned int size, unsigned int lr) {
 void flow_lookup_alloc(unsigned int p) {
     static int en = -1; PS3_KNOB(en, getenv("PS3_ALLOCTAG") ? 1 : 0);
     if (!en) return;
-    static int n = 0; if (n++ >= 4) return;
+    static int n = 0; if (n >= 4) return; n++;
     const flow_alloc_rec* best = 0;
     for (int i = 0; i < 8192; i++) {
         const flow_alloc_rec& r = g_alloc_ring[i];
@@ -2559,7 +2561,8 @@ int ppu_alloc_probe(void* vctx, uint32_t size, uint32_t obj, uint32_t sp)
     if (!en) return 0;
     if (size < 0x40000000u) return 0;            /* sane size -> ignore */
     static int n = 0;
-    if (n++ >= 6) return 0;
+    if (n >= 6) return 0;
+    n++;
     ppu_context* ctx = (ppu_context*)vctx;
     fprintf(stderr, "\n[ALLOCPROBE] size=0x%08X (%d) obj=0x%08X sp=0x%08X lr=0x%08X bswap(size)=0x%08X\n",
             size, (int)size, obj, sp, (uint32_t)ctx->lr, __builtin_bswap32(size));
@@ -2603,7 +2606,8 @@ void ppu_dbg4(const char* tag, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
     PS3_KNOB(en, getenv("ALLOCPROBE") ? 1 : 0);
     if (!en) return;
     static int n = 0;
-    if (n++ >= 16) return;
+    if (n >= 16) return;
+    n++;
     fprintf(stderr, "[DBG:%s] a=0x%08X b=0x%08X c=0x%08X d=0x%08X\n", tag, a, b, c, d);
 }
 

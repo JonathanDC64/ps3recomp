@@ -1002,7 +1002,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
             vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedSilver), per_grade[3]);
             vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedBronze), per_grade[4]);
         }
-        log_it = s_logged_game_info++ < TROPHY_LOG_QUERIES;
+        log_it = s_logged_game_info < TROPHY_LOG_QUERIES && ++s_logged_game_info;
     }
     TROPHY_UNLOCK();
 
@@ -1048,7 +1048,7 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
                 trophy_write_data(c, trophyId, GUEST_EA(data));
             grade = trophy_grade(c, trophyId);
             unlocked = c->prog.unlocked[trophyId];
-            log_it = s_logged_info++ < TROPHY_LOG_QUERIES;
+            log_it = s_logged_info < TROPHY_LOG_QUERIES && ++s_logged_info;
         }
     }
     TROPHY_UNLOCK();

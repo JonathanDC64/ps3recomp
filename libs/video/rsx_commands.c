@@ -438,7 +438,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
-      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+      if(_rt){ static int _m=0; if(_m<_rt && ++_m) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence

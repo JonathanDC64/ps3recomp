@@ -614,9 +614,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 if (getenv("YDKJ_GUESTINIT_CRI") && _ts!=0x40131000u) { /* skip audio */ }
                 else if (vm_base[desc+0xC]!=0xFF) {
                     uint32_t iopd = prx_resolve_export(0x22AAB31Du);
-                    static int _g=0; if(_g < 6 && ++_g) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
+                    static int _g=0; const int _say = _g < 6 && ++_g; if(_say) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
                     if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398, 0, 0, 0, 0);
-                        if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
+                        if(_say) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
             }
             /* CRI_ATTR: the real task-add libsre_func_30012310 (nid 0x1D46FEDF) STATs
@@ -691,18 +691,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         uint32_t want = (_ed && _ed[0] == (char)49) ? 1u : 3u;
                         static int _ei = 0;
                         if (iopd) {
-                            if (_ei++ < 6) {
+                            const int _say = _ei < 6 && ++_ei;
+                            if (_say) {
                                 fprintf(stderr, "[EVFLAG] eager _cellSpursEventFlagInitialize"
                                                 " flag=0x%08X spurs=0x%08X taskset=0x%08X dir=%u\n",
                                         ef, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, want);
                                 fflush(stderr); }
                             ppu_guest_call(iopd, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea,
                                            ef, 0, want, 0, 0, 0);
-                            if (_ei <= 6) {
+                            if (_say) {
                                 fprintf(stderr, "[EVFLAG] after init: +0C=%02X +0D=%02X +0E=%02X\n",
                                         vm_base[ef+0xC], vm_base[ef+0xD], vm_base[ef+0xE]);
                                 fflush(stderr); }
-                        } else if (_ei++ < 2) {
+                        } else if (_ei < 2 && ++_ei) {
                             fprintf(stderr, "[EVFLAG] 0x5EF96465 not resolvable via the PRX registry\n");
                         }
                     }

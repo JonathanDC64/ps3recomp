@@ -549,7 +549,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
         static u32 logs = 0;
-        if (logs++ < 8)
+        if (logs < 8 && ++logs)
             fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
@@ -576,7 +576,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->color_serial = 0;
     s->guest_dirty = 0;
     if (slot == g.n_surfaces) g.n_surfaces++;
-    { static u32 logs = 0; if (logs++ < 16)
+    { static u32 logs = 0; if (logs < 16 && ++logs)
         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
                 location, offset, want_w, want_h, (int)want_fmt,
                 seed ? " (seeded from guest memory)" : ""); }
@@ -1432,7 +1432,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (logs++ < 32)
+    { static u32 logs = 0; if (logs < 32 && ++logs)
         fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
