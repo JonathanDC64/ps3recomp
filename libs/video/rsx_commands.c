@@ -57,6 +57,27 @@ rsx_backend* rsx_get_backend(void)
  * while this stays the same. */
 u32 g_rsx_vp_ucode_ver = 1;
 
+/* A vertex-program or constant word that re-sends the value already stored
+ * is not a change, so g_rsx_vp_ucode_ver and vertex_constants_gen stay put
+ * and the backend keeps what it derived from them. Demon's Souls re-sends its
+ * vertex program, and many constants, before each of the ~2,240 draws of a
+ * Palace frame, so the D3D12 backend sized, hashed and looked up the program
+ * again, and copied a fresh 8 KB constant bank, for nearly every draw.
+ * RSX_VP_UCODE_CMP=0 (program words) and RSX_VCONST_CMP=0 (constants) count
+ * every write as a change again. Both live. */
+static int rsx_vp_ucode_cmp(void)
+{
+    static int on = 1;
+    PS3_KNOB(on, ps3_env_int("RSX_VP_UCODE_CMP", 1) != 0);
+    return on;
+}
+static int rsx_vconst_cmp(void)
+{
+    static int on = 1;
+    PS3_KNOB(on, ps3_env_int("RSX_VCONST_CMP", 1) != 0);
+    return on;
+}
+
 void rsx_state_init(rsx_state* state)
 {
     g_rsx_vp_ucode_ver++;
@@ -380,18 +401,21 @@ u32 rsx_process_method_run(rsx_state* state, u32 method, const u8* src, u32 coun
     u32 i = 0;
     if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
-        u32 w = state->vp_ucode_write, n = 0;
+        u32 w = state->vp_ucode_write, n = 0, chg = 0;
         for (; i < count && method + i * 4 < NV4097_SET_TRANSFORM_PROGRAM + 32 * 4; i++) {
             if (w + 4 > sizeof(state->vp_ucode)) continue;   /* dropped, as per word */
             const u32 data = RUN_WORD(i);
+            u32 old;
+            memcpy(&old, &state->vp_ucode[w], 4);
+            chg |= old ^ data;
             memcpy(&state->vp_ucode[w], &data, 4);           /* little-endian, as per word */
             w += 4; n++;
         }
         if (n) {
             state->vp_ucode_write = w;
-            if (w > state->vp_ucode_bytes) state->vp_ucode_bytes = w;
+            if (w > state->vp_ucode_bytes) { state->vp_ucode_bytes = w; chg = 1; }
             state->vp_dirty = 1;
-            g_rsx_vp_ucode_ver += n;
+            if (chg || !rsx_vp_ucode_cmp()) g_rsx_vp_ucode_ver += n;
         }
         return i;
     }
@@ -412,6 +436,9 @@ u32 rsx_process_method_run(rsx_state* state, u32 method, const u8* src, u32 coun
         const u32 slot = load + (reg_offset >> 2);
         if (slot >= RSX_MAX_VERTEX_CONSTANTS) continue;
         const u32 data = RUN_WORD(i);
+        u32 old;
+        memcpy(&old, &state->vertex_constants[slot][reg_offset & 3], 4);
+        if (old == data && rsx_vconst_cmp()) continue;
         memcpy(&state->vertex_constants[slot][reg_offset & 3], &data, 4);
         state->vertex_constants_gen++;
         if (!state->vertex_constants_dirty) {
@@ -711,6 +738,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
         u32 w = state->vp_ucode_write;
         if (w + 4 <= sizeof(state->vp_ucode)) {
+            u32 old;
+            memcpy(&old, &state->vp_ucode[w], 4);
+            const int chg = old != data || w + 4 > state->vp_ucode_bytes || !rsx_vp_ucode_cmp();
             /* data is host-endian already; store as little-endian bytes. */
             state->vp_ucode[w+0] = (u8)(data);
             state->vp_ucode[w+1] = (u8)(data >> 8);
@@ -719,7 +749,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
             state->vp_ucode_write = w + 4;
             if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
             state->vp_dirty = 1;
-            g_rsx_vp_ucode_ver++;
+            if (chg) g_rsx_vp_ucode_ver++;
         }
         return 0;
     }
@@ -792,10 +822,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
               int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
               if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+            u32 old;
+            memcpy(&old, &state->vertex_constants[slot][lane], 4);
+            const int same = old == data && rsx_vconst_cmp();
             state->vertex_constants[slot][lane] = f;
-            state->vertex_constants_gen++;
+            if (!same) state->vertex_constants_gen++;
             { static int _sq=0, _e=-1; PS3_KNOB(_e, getenv("SEQ_DBG") ? 1 : 0); if (_e && slot==256 && lane==0 && _sq < 500 && ++_sq)
                 fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+            if (same) return 0;
             if (!state->vertex_constants_dirty) {
                 state->vertex_constants_lo = slot;
                 state->vertex_constants_hi = slot;

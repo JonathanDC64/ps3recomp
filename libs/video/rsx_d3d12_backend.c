@@ -3248,29 +3248,72 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
     /* Sizing and hashing the program, then scanning the cache, ran for every
      * draw. While the store has not been written since, a program start
      * resolves to the slot it resolved to before (if that slot still holds
-     * the same program). RSX_VP_MEMO=0 looks it up every time. */
+     * the same program). RSX_VP_MEMO=0 looks it up every time.
+     * RSX_VP_MEMO=2 (the default) keeps two programs per start, each with a
+     * copy of its bytes: when the store was written since, a program whose
+     * bytes are those of the copy (up to its end bit) is still that slot. A
+     * title that switches one start between two programs, or re-sends a
+     * program with a word changed and back, then skips the sizing, the hash
+     * and the cache scan. 1 is the one-entry memo without the copies. */
     extern u32 g_rsx_vp_ucode_ver;
-    typedef struct { const rsx_state* st; u32 ver, vstart, hash; int idx; } VsMemo;
-    static VsMemo memo[2][64];
+    typedef struct { const rsx_state* st; u32 ver, vstart, hash; int idx;
+                     u8* code; u32 len, cap; int end; } VsMemo;
+    static VsMemo memo[2][64][2];
+    static u8 memo_next[2][64];
     static int memo_en = -1;
-    PS3_KNOB(memo_en, ps3_env_int("RSX_VP_MEMO", 1));
-    VsMemo* m = &memo[fetch ? 1 : 0][(vstart >> 4) & 63];
-    if (memo_en && m->st == st && m->ver == g_rsx_vp_ucode_ver && m->vstart == vstart &&
-        m->idx >= 0 && m->idx < s_d3d.vp_vs_n && s_d3d.vp_vs[m->idx].hash == m->hash)
-        return s_d3d.vp_vs[m->idx].vs ? m->idx : -1;
+    PS3_KNOB(memo_en, ps3_env_int("RSX_VP_MEMO", 2));
+    const int mf = fetch ? 1 : 0, mb = (int)((vstart >> 4) & 63);
+    VsMemo* mw = memo[mf][mb];
+    const int ways = memo_en >= 2 ? 2 : 1;
+    const u32 avail = st->vp_ucode_bytes - vstart;
+    if (memo_en) {
+        for (int pass = 0; pass < (ways > 1 ? 2 : 1); pass++)
+            for (int w = 0; w < ways; w++) {
+                VsMemo* q = &mw[w];
+                if (q->st != st || q->vstart != vstart || q->idx < 0 ||
+                    q->idx >= s_d3d.vp_vs_n || s_d3d.vp_vs[q->idx].hash != q->hash)
+                    continue;
+                if (pass == 0) {
+                    if (q->ver != g_rsx_vp_ucode_ver) continue;
+                } else {
+                    if (q->ver == g_rsx_vp_ucode_ver || !q->code ||
+                        (q->end ? q->len > avail : q->len != avail) ||
+                        memcmp(q->code, st->vp_ucode + vstart, q->len))
+                        continue;
+                    q->ver = g_rsx_vp_ucode_ver;
+                }
+                memo_next[mf][mb] = (u8)(w ^ 1);
+                return s_d3d.vp_vs[q->idx].vs ? q->idx : -1;
+            }
+    }
+    VsMemo* m = &mw[ways > 1 ? (memo_next[mf][mb] & 1) : 0];
     const u8* vuc = st->vp_ucode + vstart;
-    u32 vlen = st->vp_ucode_bytes - vstart;
+    u32 vlen = avail;
     /* Key the program by its own instructions, up to its end bit. The store
      * holds every resident program, so hashing to the end of the store made
      * each program's key change whenever any program after it was uploaded. */
+    int vend = 0;
     { const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
-      if (instrs) vlen = instrs * 16u; }
+      if (instrs) { vlen = instrs * 16u; vend = 1; } }
     u32 hash = vp_hash_ucode(vuc, vlen);
     if (fetch) hash ^= 0x9E3779B9u;
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) {
             m->st = st; m->ver = g_rsx_vp_ucode_ver; m->vstart = vstart;
             m->hash = hash; m->idx = i;
+            m->len = 0;
+            if (ways > 1) {
+                if (m->cap < vlen) {
+                    u8* grown = (u8*)realloc(m->code, vlen);
+                    if (grown) { m->code = grown; m->cap = vlen; }
+                }
+                if (m->code && m->cap >= vlen) {
+                    memcpy(m->code, vuc, vlen); m->len = vlen; m->end = vend;
+                } else {
+                    m->st = NULL;   /* no room for the copy: drop the entry */
+                }
+                memo_next[mf][mb] = (u8)((m - mw) ^ 1);
+            }
             return s_d3d.vp_vs[i].vs ? i : -1;
         }
 
@@ -5682,7 +5725,13 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
                        ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;
     float* c = (float*)dst;
-    float c00 = c[0];
+    /* c0.x from the state, not from the bank just copied: dst is the
+     * write-combined upload heap, and reading it back waited for the whole
+     * 8 KB copy to drain (~2% of the render thread at the Palace). The same
+     * value. RSX_VCB_C00=0 reads the bank, as before. */
+    static int c00_st = -1;
+    PS3_KNOB(c00_st, ps3_env_int("RSX_VCB_C00", 1));
+    float c00 = c00_st ? st->vertex_constants[0][0] : c[0];
     static int s_guess = -1;
     PS3_KNOB(s_guess, getenv("VP_GUESSPROJ") ? 1 : 0);
     int garbage = s_guess && !(c00 > 0.0f && c00 < 8.0f);
@@ -5827,6 +5876,23 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
+ * words, folded. */
+#define VP_SAMP_HINTS 1024
+static u32 samp_key_slot(const u32* k)
+{
+    u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
+    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+        a = (a ^ k[i])     * 0x01000193u;
+        b = (b ^ k[i + 1]) * 0x01000193u;
+        c = (c ^ k[i + 2]) * 0x01000193u;
+        d = (d ^ k[i + 3]) * 0x01000193u;
+    }
+    u32 h = a ^ (b << 7 | b >> 25) ^ (c << 14 | c >> 18) ^ (d << 21 | d >> 11);
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15;
+    return h & (VP_SAMP_HINTS - 1);
+}
+
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
@@ -5843,8 +5909,22 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     static u32 cap = 0;
     if (!cap) { int c = ps3_env_int("RSX_SAMP_TABLES", VP_SAMP_TABLES);
                 cap = (u32)(c < 2 ? 2 : c > VP_SAMP_TABLES ? VP_SAMP_TABLES : c); }
+    /* RSX_SAMP_HASH (live, default 1; 0 = compare with every table): a hash
+     * of the key names the table to try first, checked against its stored
+     * key. The scan below compares up to 128 keys of 128 bytes a draw. A
+     * slot is only a hint: a miss, a collision or a table rewritten since
+     * falls back to the scan, which sets the slot again. */
+    static int hashed = 1;
+    PS3_KNOB(hashed, ps3_env_int("RSX_SAMP_HASH", 1) != 0);
+    static u16 hint[VP_SAMP_HINTS];   /* table + 1; 0 = none */
+    u32 hs = 0;
+    if (hashed) {
+        hs = samp_key_slot(k);
+        const u32 i = hint[hs];
+        if (i && i <= s_d3d.samp_n && !memcmp(keys[i - 1], k, sizeof k)) { last[i - 1] = now; return i - 1; }
+    }
     for (u32 i = 0; i < s_d3d.samp_n; i++)
-        if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; return i; }
+        if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; hint[hs] = (u16)(i + 1); return i; }
     u32 t;
     if (s_d3d.samp_n < cap) {
         t = s_d3d.samp_n++;
@@ -5871,6 +5951,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     }
     last[t] = now;
     memcpy(keys[t], k, sizeof k);
+    hint[hs] = (u16)(t + 1);
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
     for (int u = 0; u < RSX_FP_UNITS; u++) {
