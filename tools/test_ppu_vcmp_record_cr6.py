@@ -95,15 +95,16 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
     src = "\n".join([
         "#include <stdint.h>", "#include <string.h>", "#include <stdio.h>",
         _accessors(),
-        "typedef struct { uint8_t vr[32][16]; uint32_t cr; } ctx_t;",
+        "typedef struct { uint8_t vr[32][16]; uint8_t crf[8]; } ctx_t;",
         "int main(void) { static ctx_t c; ctx_t* ctx = &c;",
         "  const unsigned char A[16] = {" + ",".join(str(x) for x in _be(kind, a)) + "};",
         "  const unsigned char B[16] = {" + ",".join(str(x) for x in _be(kind, b)) + "};",
         "  memcpy(ctx->vr[1], A, 16); memcpy(ctx->vr[2], B, 16);",
-        "  ctx->cr = 0xFFFFFFFFu;  /* stale CR6 = 0xF: must be overwritten */",
+        "  memset(ctx->crf, 0xF, 8);  /* stale CR6 = 0xF: must be overwritten */",
         body,
-        "  printf(\"%X\\n\", (unsigned)((ctx->cr >> 4) & 0xF));",
-        "  return (ctx->cr & ~0xF0u) == (0xFFFFFFFFu & ~0xF0u) ? 0 : 3; }",
+        "  printf(\"%X\\n\", (unsigned)ctx->crf[6]);",
+        "  for (int i = 0; i < 8; i++) if (i != 6 && ctx->crf[i] != 0xF) return 3;",
+        "  return 0; }",
     ])
     with tempfile.TemporaryDirectory() as td:
         c = Path(td) / "t.c"

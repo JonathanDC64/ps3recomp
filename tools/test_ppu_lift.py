@@ -274,11 +274,15 @@ CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, 
              # IEEE-754 pattern via memcpy, not value).
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None):
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None, in_cr=None, exp_crw=None):
+    # in_cr / exp_crw: the whole condition register as the guest sees it
+    # (mfcr's 32-bit value, CR0 in bits 31:28), set before the instruction and
+    # compared after it in full, SO bits included.
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
                       in_mem=in_mem or {}, exp_mem=exp_mem or {},
-                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or []))
+                      in_fpr=in_fpr or {}, exp_fpr=exp_fpr or [],
+                      in_cr=in_cr, exp_crw=exp_crw))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -517,6 +521,46 @@ def build_cases():
         nib = 8 if s64(v) < 0 else (4 if s64(v) > 0 else 2)
         case(f"add. a={a:#x} b={b:#x}", xo_form(266, R[0], R[1], R[2], rc=1),
              {R[1]: a, R[2]: b}, [(R[0], v, MASK64)], exp_cr=(nib, 28))
+
+    # --- the condition register as a whole ----------------------------------
+    # CR logical ops, mcrf, mfcr and mtcr/mtcrf, against a bit-numbered model
+    # of the 32-bit register (bit 0 = CR0.LT is the top bit). These pin the
+    # guest-visible CR whatever layout the lifter keeps it in.
+    def crb(cr, b):
+        return (cr >> (31 - b)) & 1
+    def crb_set(cr, b, v):
+        return (cr & ~(1 << (31 - b)) & 0xFFFFFFFF) | (v << (31 - b))
+    cr_words = [0x00000000, 0xFFFFFFFF, 0x8C3A5F10, 0x2468ACE1]
+    cr_logic = [("crand", 257, lambda x, y: x & y), ("crandc", 129, lambda x, y: x & (y ^ 1)),
+                ("creqv", 289, lambda x, y: (x ^ y) ^ 1), ("crnand", 225, lambda x, y: (x & y) ^ 1),
+                ("crnor", 33, lambda x, y: (x | y) ^ 1), ("cror", 449, lambda x, y: x | y),
+                ("crorc", 417, lambda x, y: x | (y ^ 1)), ("crxor", 193, lambda x, y: x ^ y)]
+    for nm, xo, fn in cr_logic:
+        for cr in cr_words:
+            for bt, ba, bb in ((2, 0, 1), (30, 28, 31), (5, 14, 22), (0, 31, 3)):
+                want = crb_set(cr, bt, fn(crb(cr, ba), crb(cr, bb)))
+                case(f"{nm} {bt},{ba},{bb} cr={cr:#010x}",
+                     (19 << 26) | (bt << 21) | (ba << 16) | (bb << 11) | (xo << 1),
+                     {}, [], in_cr=cr, exp_crw=want)
+    for cr in cr_words:
+        for bf, bfa in ((0, 7), (7, 0), (3, 5), (6, 6)):
+            f = (cr >> (28 - 4 * bfa)) & 0xF
+            want = (cr & ~(0xF << (28 - 4 * bf)) & 0xFFFFFFFF) | (f << (28 - 4 * bf))
+            case(f"mcrf cr{bf},cr{bfa} cr={cr:#010x}", (19 << 26) | (bf << 23) | (bfa << 18),
+                 {}, [], in_cr=cr, exp_crw=want)
+        case(f"mfcr cr={cr:#010x}", (31 << 26) | (R[0] << 21) | (19 << 1),
+             {R[0]: MASK64}, [(R[0], cr, MASK64)], in_cr=cr, exp_crw=cr)
+        for v in (0x00000000, 0xFFFFFFFF, 0x13579BDF, 0xFEDCBA9876543210):
+            for fxm in (0xFF, 0x80, 0x01, 0x5A):
+                mask = 0
+                for i in range(8):
+                    if fxm & (0x80 >> i):
+                        mask |= 0xF << (28 - 4 * i)
+                want = (cr & ~mask & 0xFFFFFFFF) | (v & mask)
+                mn = "mtcr" if fxm == 0xFF else "mtcrf"
+                case(f"{mn} fxm={fxm:#04x} v={v:#x} cr={cr:#010x}",
+                     (31 << 26) | (R[1] << 21) | (fxm << 12) | (144 << 1),
+                     {R[1]: v}, [(R[1], v, MASK64)], in_cr=cr, exp_crw=want)
 
     # --- FP D-form load/store-with-update RA writeback ---------------------
     # lfsu/lfdu/stfsu/stfdu (opcodes 49/51/53/55) sat in the plain lfs/lfd/
@@ -863,6 +907,10 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
         printf("FAIL %s: CR nibble@%d = %X want %X\\n", name, shift, got, nib); g_fail++;
     } else g_pass++;
 }
+static void check_crw(const char* name, uint32_t got, uint32_t want) {
+    if (got != want) { printf("FAIL %s: CR = %08X want %08X\\n", name, got, want); g_fail++; }
+    else g_pass++;
+}
 static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) {
     if (memcmp(got, want, 16) != 0) {
         printf("FAIL %s: vr =", name);
@@ -975,6 +1023,8 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
             out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
         if c["in_ca"]:
             out.append("      ctx->xer |= (1u << 29);")
+        if c["in_cr"] is not None:
+            out.append(f"      ppu_cr_unpack(ctx, 0x{c['in_cr']:08X}u);")
         for addr, blob in c["in_mem"].items():
             byts = ", ".join(f"0x{b:02X}" for b in blob)
             out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
@@ -996,7 +1046,9 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
             body.append(f'        check_ca("{nm}", ctx->xer, {int(bool(c["exp_ca"]))});')
         if c["exp_cr"] is not None:
             nib, shift = c["exp_cr"]
-            body.append(f'        check_cr("{nm}", ctx->cr, {nib}, {shift});')
+            body.append(f'        check_cr("{nm}", ppu_cr_pack(ctx), {nib}, {shift});')
+        if c["exp_crw"] is not None:
+            body.append(f'        check_crw("{nm}", ppu_cr_pack(ctx), 0x{c["exp_crw"]:08X}u);')
         if c["may_trap"]:
             out.append("      CONF_TRY")
             out.extend(body)

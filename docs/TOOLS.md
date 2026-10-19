@@ -225,7 +225,7 @@ The disassembler performs basic block analysis:
 
 ### Translation Strategy
 
-Each PowerPC instruction maps to one or more C statements. The lifter operates directly on the `ppu_context` struct — registers are accessed via `ctx->gpr[N]`, `ctx->lr`, `ctx->cr`, etc.:
+Each PowerPC instruction maps to one or more C statements. The lifter operates directly on the `ppu_context` struct — registers are accessed via `ctx->gpr[N]`, `ctx->lr`, `ctx->crf[N]` (one byte per CR field), etc.:
 
 ```c
 void func_00010000(ppu_context* ctx) {
@@ -274,8 +274,8 @@ The preamble declares `g_trampoline_fn` as `extern "C" __declspec(thread)` to ma
 | `bl 0x10200` | `func_00010200(ctx);` | Direct function call |
 | `bctrl` | `ps3_indirect_call(ctx);` | Indirect call via hash table |
 | `blr` | `return;` | Function return |
-| `cmpwi cr0, r3, 0` | `{ int64_t a = ...; int64_t b = ...; cr_val = ...; }` | Inline CR update |
-| `beq target` | `if (((ctx->cr >> shift) & 2)) goto loc_XXXX;` | CR EQ bit check |
+| `cmpwi cr0, r3, 0` | `{ int64_t a = ...; int64_t b = ...; uint32_t cr_val = ...; ctx->crf[0] = (uint8_t)cr_val; }` | One byte store per compare |
+| `beq target` | `if ((ctx->crf[0] & 2)) goto loc_XXXX;` | CR EQ bit check |
 | `sc` | `lv2_syscall(ctx);` | System call dispatch |
 | `lwarx r3, 0, r4` | `ctx->gpr[3] = vm_read32(ea); ctx->reserve_addr = ea;` | Atomic reservation |
 | `stwcx. r3, 0, r4` | `if (reserve_addr == ea) { store; CR0=EQ; } else { CR0=0; }` | Conditional store |
