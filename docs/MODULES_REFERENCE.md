@@ -695,15 +695,15 @@ All sceNp modules simulate an offline PSN environment. Multiplayer features repo
 
 ### sceNpTrophy
 
-**File:** `libs/network/sceNpTrophy.c`
+**File:** `libs/network/sceNpTrophy.c` (the trophy set reader: `libs/network/np_trophy_set.c`)
 **Purpose:** Trophy/achievement system
 
-- **Persistent JSON storage** — trophies are saved to a JSON file on the host
-- Unlock with timestamps
-- Progress tracking (percentage-based trophies)
-- Trophy configuration from TROPCONF.SFM
-- Trophy types: Bronze, Silver, Gold, Platinum
-- `sceNpTrophyUnlockTrophy(ctx, handle, id, &platinum)` — unlock and check for platinum
+- **The title's own trophy set** — `RegisterContext` reads `TROPHY.TRP` through the VFS (`/dev_bdvd/PS3_GAME/TROPDIR/<comm id>_<nn>/`, then the game folder's `TROPDIR`) and takes the count, grades, names and platinum links from `TROP_01.SFM`, `TROP.SFM` or `TROPCONF.SFM`. Without one it keeps a placeholder set (32 reported, ids 0-127 accepted, all bronze).
+- **Persistent JSON storage** — `gamedata/trophies/<comm id>.json` (or `$PS3_TROPHY_DIR`, or the `sceNpTrophySetStoragePath` folder), Unix-second timestamps, replaced through a temporary file and a rename
+- The firmware's struct layouts, written big-endian, and its error codes (0x800229xx) in its check order
+- Unlock rules: a repeat returns ALREADY_UNLOCKED, the platinum cannot be unlocked directly, a hidden trophy stays HIDDEN until unlocked, and the platinum unlocks with the last trophy linked to it (`sceNpTrophyUnlockTrophy(ctx, handle, id, &platinum)`)
+- Unlock times reported as `CellRtcTick`; progress as a rounded percentage
+- A host API for a port's UI (`sceNpTrophy.h`): an unlock hook, a snapshot of the list, the icons, and a debug unlock for test knobs
 
 ### sceNpTus
 
