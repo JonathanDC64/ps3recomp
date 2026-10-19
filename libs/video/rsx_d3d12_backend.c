@@ -888,6 +888,13 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
+    case WM_SYSCOMMAND:
+        /* Alt on its own, or Alt+Space, from the keyboard: Windows would put
+         * the window's menu up, and it would then take the keys the keyboard
+         * pad reads (Left Alt walks and Space rolls in a Souls-style layout).
+         * The menu still opens from the title bar with the mouse. */
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+        break;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }

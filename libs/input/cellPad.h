@@ -205,6 +205,28 @@ void cellPad_poll(void);
  * Scripted input (PAD_FILE, PAD_STICK, ...) still applies. */
 void cellPad_set_host_hold(int hold);
 
+/* The mouse, for the keyboard pad's bindings (PAD_KEYS names mouse1 to mouse5,
+ * wheelup and wheeldown). The title's window code passes them while the
+ * game has its window's mouse, so a click that brings the window to the
+ * front, a drag of its title bar or a click on the title's own menus never
+ * presses anything.
+ * Buttons held: bit 0 = mouse1 (left), 1 = right, 2 = middle, 3 and 4 = the
+ * side buttons. Wheel: notches, positive away from the user (up); each is
+ * queued with the buttons it presses as it turns (Shift held then counts
+ * when its turn comes), at most 4 waiting. */
+void cellPad_host_mouse_buttons(unsigned mask);
+void cellPad_host_mouse_wheel(int notches);
+
+/* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
+ * and the other bindings of the same inputs do not. */
+void cellPad_host_set_menu(int open);
+
+/* Hold a stick on port 0 (0 = left, 1 = right; 0-255, 128 = centred) for the
+ * next `reads` packets the title receives, over whatever else drives it. For
+ * title code that turns host input into stick moves, such as a stick flick
+ * from the mouse. Dropped while the host hold is set. */
+void cellPad_host_stick(int stick, unsigned char x, unsigned char y, unsigned reads);
+
 #ifdef __cplusplus
 }
 #endif
