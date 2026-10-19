@@ -7796,6 +7796,316 @@ static void rsx_scale_apply(void)
         s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[i], NULL, h);
 }
 
+/* ---------------------------------------------------------------------------
+ * Post anti-aliasing (RSX_AA, docs/43)
+ *
+ * RSX_AA=1 runs an FXAA-style filter (rsx_fxaa.h) over the frame's scene
+ * target before the HUD is drawn into it: the scene's edges are smoothed and
+ * HUD text stays sharp. Live. 0, the default, leaves every frame as it was.
+ *
+ * Where the pass goes is decided per batch from its draw records alone (guest
+ * state, not timing), before the replay starts (aa_pick). Batches that present
+ * and hold at least AA_MIN_SCENE records are looked at:
+ *   1. The display copy: the last draw into a display buffer that writes
+ *      colour and samples an offscreen target. The largest target it samples
+ *      is T, the scene target. No display copy: no pass.
+ *   2. Fewer than AA_MIN_SCENE depth-tested draws into T: a 2D frame (title,
+ *      loading screen, movie), no pass.
+ *   3. The last post op: before the display copy, the last draw into T that
+ *      writes colour, has blending and the depth test off, and samples a
+ *      target or a depth surface. The pass runs right after it. The HUD comes
+ *      after: Demon's Souls draws it blended, into T, after its post chain.
+ * The pass filters a copy of T (off_rt_snapshot) back into T, RGB only: alpha
+ * can hold data (Demon's Souls keeps its depth-of-field mask there).
+ *
+ * RSX_AA_BEFORE_FP=<fp>[,<fp>...]: run the pass before the first draw with one
+ * of these fragment programs (SET_SHADER_PROGRAM values in hex, as the F9 draw
+ * list prints them) instead, where the rule picks the wrong place.
+ * RSX_AA_AT=present: filter the finished display buffer instead, HUD and all.
+ * RSX_AA_LOG: 0 quiet, 1 (default) a line when the choice changes, 2 a line
+ * every batch.
+ * -----------------------------------------------------------------------*/
+#include "rsx_fxaa.h"
+#define AA_SRV_SLOT  21   /* SRV heap: the pass's source (slots 21-31 were spare) */
+#define AA_MIN_SCENE 16   /* depth-tested draws into T that make a 3D frame */
+#define AA_FP_MAX    8
+#define AA_LOG_MAX   100  /* change lines per run at RSX_AA_LOG=1 */
+
+static int knob_aa(void)     { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_AA", 0)); return v; }
+static int knob_aa_log(void) { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_AA_LOG", 1)); return v; }
+static int aa_at_present_env(void)
+{
+    const char* e = getenv("RSX_AA_AT");
+    return e && !strcmp(e, "present");
+}
+static int knob_aa_at_present(void) { static int v = -1; PS3_KNOB(v, aa_at_present_env()); return v; }
+
+enum { AA_RUN, AA_NO_COPY, AA_SMALL, AA_FORMAT, AA_NO_SCENE, AA_NO_POST };
+static const char* const s_aa_why[] = {
+    "", "no display copy", "the display copy's source is small",
+    "the scene target is not RGBA8", "no 3D scene", "no post pass before the display copy",
+};
+
+static struct {
+    ID3D12RootSignature*  rs;
+    ID3D12PipelineState*  pso;
+    int                   failed;     /* the pipeline could not be made: stay off */
+    ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
+    u32                   disp_w, disp_h;
+    D3D12_RESOURCE_STATES disp_st;
+    u32                   fp[AA_FP_MAX];   /* RSX_AA_BEFORE_FP */
+    int                   fp_n;
+    unsigned              fp_gen;
+    u32                   log_key[4];      /* the choice last logged */
+    int                   log_valid, log_n;
+    int                   present_logged;  /* RSX_AA_AT=present's line is out */
+} s_aa;
+
+static void aa_before_fp_load(void)
+{
+    if (s_aa.fp_gen == ps3_env_gen) return;
+    s_aa.fp_gen = ps3_env_gen;
+    s_aa.fp_n = 0;
+    const char* e = getenv("RSX_AA_BEFORE_FP");
+    while (e && *e && s_aa.fp_n < AA_FP_MAX) {
+        char* end;
+        const unsigned long v = strtoul(e, &end, 16);
+        if (end == e) break;
+        s_aa.fp[s_aa.fp_n++] = (u32)v;
+        e = *end == ',' ? end + 1 : end;
+    }
+}
+
+/* The filter's root signature (t0 table, b0 = 4 constants, a bilinear clamp
+ * static sampler) and pipeline (RGBA8, RGB written, no depth), made on first
+ * use. */
+static int aa_ready(void)
+{
+    if (s_aa.pso) return 1;
+    if (s_aa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
+    s_aa.failed = 1;   /* until it is made */
+    ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
+    HRESULT hr = D3DCompile(rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL, NULL, "main",
+                            "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb, &err);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL, NULL, "main",
+                        "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb, &err);
+    if (FAILED(hr))
+        printf("[AA] shader compile failed: %s\n",
+               err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+    if (SUCCEEDED(hr)) {
+        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
+                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
+        D3D12_ROOT_PARAMETER rp[2] = {0};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 1;
+        rp[0].DescriptorTable.pDescriptorRanges = &range;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.Num32BitValues = 4;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC smp = {0};
+        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        smp.MaxLOD = D3D12_FLOAT32_MAX;
+        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {2, rp, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
+        if (SUCCEEDED(hr))
+            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
+                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
+                &IID_ID3D12RootSignature, (void**)&s_aa.rs);
+    }
+    if (SUCCEEDED(hr)) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+        pd.pRootSignature = s_aa.rs;
+        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
+        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)(D3D12_COLOR_WRITE_ENABLE_RED |
+            D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE);
+        pd.SampleMask = UINT_MAX;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pd.SampleDesc.Count = 1;
+        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
+            &IID_ID3D12PipelineState, (void**)&s_aa.pso);
+    }
+    if (vb) vb->lpVtbl->Release(vb);
+    if (pb) pb->lpVtbl->Release(pb);
+    if (rsb) rsb->lpVtbl->Release(rsb);
+    if (err) err->lpVtbl->Release(err);
+    if (FAILED(hr) || !s_aa.pso) {
+        printf("[AA] pipeline failed (0x%08lX): anti-aliasing stays off\n", (long)hr);
+        return 0;
+    }
+    s_aa.failed = 0;
+    return 1;
+}
+
+/* One pass: src (an RGBA8 copy of the target, in PIXEL_SHADER_RESOURCE)
+ * filtered into the target behind rtv, w x h, in RENDER_TARGET. Binds its own
+ * root signature, pipeline, target, viewport and topology; the shader-visible
+ * heap must be srv_heap. The backend waits for the GPU before each batch, so
+ * the one descriptor at AA_SRV_SLOT is free to rewrite. */
+static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+{
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    srv_write(AA_SRV_SLOT, src, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    D3D12_GPU_DESCRIPTOR_HANDLE g;
+    s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g);
+    g.ptr += (u64)AA_SRV_SLOT * s_d3d.srv_inc;
+    const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
+    const D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+    const D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
+    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
+    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
+    cl->lpVtbl->SetGraphicsRootSignature(cl, s_aa.rs);
+    cl->lpVtbl->SetPipelineState(cl, s_aa.pso);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
+    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+}
+
+/* The in-frame pass on offscreen target t. The caller puts its own state
+ * back afterwards. */
+static int aa_run_rt(int t)
+{
+    OffRT* r = &s_d3d.off_rt[t];
+    if (!aa_ready() || !r->res || r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) return 0;
+    ID3D12Resource* src = off_rt_snapshot(t);
+    if (!src) return 0;
+    off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    aa_draw(src, off_rt_rtv(t), r->hw, r->hh);
+    return 1;
+}
+
+/* RSX_AA_AT=present: display buffer fi (in RENDER_TARGET, behind rtv),
+ * finished, filtered from a copy of it. */
+static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
+{
+    if (!aa_ready()) return;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    const u32 w = s_d3d.host_w, h = s_d3d.host_h;
+    if (s_aa.disp && (s_aa.disp_w != w || s_aa.disp_h != h)) {
+        off_rt_defer_release(s_aa.disp);   /* the open list may still use it */
+        s_aa.disp = NULL;
+    }
+    if (!s_aa.disp) {
+        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC td = {0};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(d3d_create_committed(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_aa.disp))) {
+            s_aa.disp = NULL;
+            return;
+        }
+        s_aa.disp_w = w; s_aa.disp_h = h;
+        s_aa.disp_st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[0].Transition.pResource   = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource   = s_aa.disp;
+    b[1].Transition.StateBefore = s_aa.disp_st;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    cl->lpVtbl->ResourceBarrier(cl, s_aa.disp_st != D3D12_RESOURCE_STATE_COPY_DEST ? 2 : 1, b);
+    cl->lpVtbl->CopyResource(cl, s_aa.disp, s_d3d.render_targets[fi]);
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    s_aa.disp_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
+    cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, heaps);
+    aa_draw(s_aa.disp, rtv, w, h);
+}
+
+/* Where this batch's pass goes (see the top of this section): returns T's
+ * off_rt slot and sets *before to the op the pass runs before, or returns -1
+ * and sets *why. Needs the pre-pass's tex_rt / tex_z. */
+static int aa_pick(u32* before, int* why)
+{
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    int t = -1;
+    u32 dc = 0;
+    for (u32 d = n; d-- > 0; ) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        if (!dr->is_vp || dr->is_clear || dr->rt_off || !(dr->cmask & 7u)) continue;
+        u64 best = 0;
+        for (int u = 0; u < RSX_FP_UNITS; u++) {
+            const int s = dr->tex_rt[u];
+            if (s < 0) continue;
+            const u64 a = (u64)s_d3d.off_rt[s].w * s_d3d.off_rt[s].h;
+            if (a > best) { best = a; t = s; }
+        }
+        if (t >= 0) { dc = d; break; }
+    }
+    if (t < 0) { *why = AA_NO_COPY; return -1; }
+    const OffRT* T = &s_d3d.off_rt[t];
+    if ((u64)T->w * T->h * 4u < (u64)s_d3d.width * s_d3d.height) { *why = AA_SMALL; return -1; }
+    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) { *why = AA_FORMAT; return -1; }
+    aa_before_fp_load();
+    u32 scene = 0;
+    int post = -1, named = -1;
+    for (u32 d = 0; d < dc; d++) {
+        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        if (!dr->is_vp || dr->is_clear) continue;
+        for (int k = 0; named < 0 && k < s_aa.fp_n; k++)
+            if (dr->fp_addr == s_aa.fp[k]) named = (int)d;
+        if (dr->rt_off != T->off) continue;
+        if (dr->depth & 1u) { scene++; continue; }
+        if (dr->blend || !(dr->cmask & 7u)) continue;
+        for (int u = 0; u < RSX_FP_UNITS; u++)
+            if (dr->tex_rt[u] >= 0 || dr->tex_z[u] >= 0) { post = (int)d; break; }
+    }
+    if (scene < AA_MIN_SCENE) { *why = AA_NO_SCENE; return -1; }
+    if (named >= 0) { *before = (u32)named; return t; }
+    if (post < 0) { *why = AA_NO_POST; return -1; }
+    *before = (u32)post + 1;
+    return t;
+}
+
+/* The choice, logged when it changes (RSX_AA_LOG=1) or every batch (2). */
+static void aa_log(int t, u32 before, int why)
+{
+    const int lv = knob_aa_log();
+    if (lv <= 0) return;
+    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    const u32 fa = t >= 0 && before > 0 && before <= n ? s_d3d.draws[before - 1].fp_addr : 0;
+    const u32 fb = t >= 0 && before < n ? s_d3d.draws[before].fp_addr : 0;
+    const u32 key[4] = {t >= 0 ? s_d3d.off_rt[t].off : 0u, fa, fb, (u32)why};
+    if (lv == 1) {
+        if (s_aa.log_valid && !memcmp(key, s_aa.log_key, sizeof key)) return;
+        memcpy(s_aa.log_key, key, sizeof key);
+        s_aa.log_valid = 1;
+        if (s_aa.log_n > AA_LOG_MAX) return;
+        if (s_aa.log_n++ == AA_LOG_MAX) {
+            printf("[AA] further changes not logged (RSX_AA_LOG=2 logs every batch)\n");
+            return;
+        }
+    }
+    if (t >= 0)
+        printf("[AA] FXAA on T=0x%08X %ux%u before op %u of %u (after fp 0x%X, before fp 0x%X)\n",
+               s_d3d.off_rt[t].off, s_d3d.off_rt[t].w, s_d3d.off_rt[t].h, before, n, fa, fb);
+    else
+        printf("[AA] no pass: %s\n", s_aa_why[why]);
+}
+
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 static void render_frame(void)
 {
@@ -8598,9 +8908,50 @@ rtt_dump_done:;
             if (skip_gen != ps3_env_gen) { const char* e = getenv("DRAW_SKIP");
                 skip_gen = ps3_env_gen; skip_a = 1; skip_b = 0;
                 if (e && sscanf(e, "%u-%u", &skip_a, &skip_b) == 1) skip_b = skip_a; }
+            /* RSX_AA: this batch's anti-aliasing pass, on target aa_t before
+             * op aa_before (aa_pick). A batch with fewer draws than a 3D
+             * frame needs is left alone and not logged: Demon's Souls shows
+             * every other present from a one-op batch that copies the last
+             * frame out again, which would make the log alternate. */
+            int aa_t = -1;
+            u32 aa_before = 0;
+            if (knob_aa() != 1 || knob_aa_at_present())
+                s_aa.log_valid = 0;   /* when it comes back on, log the first choice */
+            else if (s_present_this_frame && s_d3d.draw_count >= AA_MIN_SCENE) {
+                int why = AA_RUN;
+                aa_t = aa_pick(&aa_before, &why);
+                aa_log(aa_t, aa_before, why);
+            }
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
+                /* The pass binds its own pipeline. Then the VP pass's state
+                 * goes back: its root signature, which drops every root
+                 * argument (vf_buf's is set again here, the rest per draw
+                 * below), its topology, and the targets bound now. */
+                if (aa_t >= 0 && d >= aa_before) {
+                    if (aa_run_rt(aa_t)) {
+                        ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+                        cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
+                        if (s_d3d.vf_buf)
+                            cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 4,
+                                s_d3d.vf_buf->lpVtbl->GetGPUVirtualAddress(s_d3d.vf_buf)
+                                + (u64)s_d3d.vp_parity * s_vf_cap);
+                        cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                        s_vp_topo_strip = 0;
+                        D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
+                        UINT nrt = 0;
+                        if (!cur_nocol) {
+                            rh[nrt++] = cur_rt >= 0 ? off_rt_rtv(cur_rt) : rtv_handle;
+                            for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
+                                rh[nrt++] = off_rt_rtv(cur_m[_m]);
+                        }
+                        D3D12_CPU_DESCRIPTOR_HANDLE dz = cur_z < 0 ? dsv_handle
+                                                       : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
+                        cl->lpVtbl->OMSetRenderTargets(cl, nrt, nrt ? rh : NULL, FALSE, &dz);
+                    }
+                    aa_t = -1;
+                }
                 if (d >= skip_a && d <= skip_b && !dr->is_clear) continue;
                 /* The reduced-viewport passes (this title's reflection, drawn
                  * into a region of the same target) finish here -- snapshot
@@ -9252,6 +9603,14 @@ skip_dump_consider: ;
               if (v > 0) { s_d3d.dump_frames_left = v; s_d3d.dump_skip_left = 0; } } } }
     guest_fb_present(fi);
     composite_present(fi);
+    if (knob_aa() != 1 || !knob_aa_at_present())
+        s_aa.present_logged = 0;
+    else if (s_present_this_frame) {
+        if (!s_aa.present_logged && knob_aa_log() > 0)
+            printf("[AA] FXAA on the finished frame, HUD included (RSX_AA_AT=present)\n");
+        s_aa.present_logged = 1;
+        aa_run_display(fi, rtv_handle);
+    }
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
@@ -12294,6 +12653,10 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
+    if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
+    if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
+    if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
+    memset(&s_aa, 0, sizeof s_aa);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
