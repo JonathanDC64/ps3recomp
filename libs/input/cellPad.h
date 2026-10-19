@@ -221,18 +221,11 @@ void cellPad_host_mouse_wheel(int notches);
  * and the other bindings of the same inputs do not. */
 void cellPad_host_set_menu(int open);
 
-/* Press buttons on port 0 (CELL_PAD_CTRL_* packed as PAD_SCRIPT's masks,
- * (DIGITAL2 << 8) | DIGITAL1) for the next `reads` packets the title receives,
- * or hold a stick there (0 = left, 1 = right; 0-255, 128 = centred), over
- * whatever else drives it. For title code that turns host input into presses:
- * a jump from a double tap, a stick flick from the mouse. Dropped while the
- * host hold is set. */
-void cellPad_host_press(unsigned buttons, unsigned reads);
+/* Hold a stick on port 0 (0 = left, 1 = right; 0-255, 128 = centred) for the
+ * next `reads` packets the title receives, over whatever else drives it. For
+ * title code that turns host input into stick moves, such as a stick flick
+ * from the mouse. Dropped while the host hold is set. */
 void cellPad_host_stick(int stick, unsigned char x, unsigned char y, unsigned reads);
-
-/* The keyboard pad's buttons after its bindings, before they join port 0
- * (same packing): title code can rework them. NULL by default. */
-extern unsigned (*g_pad_keys_hook)(unsigned buttons);
 
 #ifdef __cplusplus
 }

@@ -82,9 +82,6 @@ static void keys(const int* vks, int n)
 static int failures;
 #define CHECK(c) do { if (!(c)) { failures++; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
 
-static unsigned hook_bits;
-static unsigned test_hook(unsigned b) { return b | hook_bits; }
-
 enum {
     SELECT = 0x0001, L3 = 0x0002, R3 = 0x0004, START = 0x0008, UP = 0x0010, RIGHT = 0x0020, DOWN = 0x0040, LEFT = 0x0080,
     L2 = 0x0100, R2 = 0x0200, L1 = 0x0400, R1 = 0x0800, TRIANGLE = 0x1000, CIRCLE = 0x2000, CROSS = 0x4000,
@@ -191,29 +188,22 @@ int main(void)
     for (int i = 0; i < 24; i++) if (rd().buttons == DOWN) n++;
     CHECK(n == 8);
 
-    /* host presses and stick holds, counted in packets */
-    cellPad_host_press(L3, 2);
+    /* stick holds, counted in packets */
     cellPad_host_stick(1, 255, 128, 3);
-    p = rd(); CHECK(p.buttons == L3 && p.rx == 255 && p.ry == 128);
-    p = rd(); CHECK(p.buttons == L3 && p.rx == 255);
-    p = rd(); CHECK(p.buttons == 0 && p.rx == 255);
-    p = rd(); CHECK(p.buttons == 0 && p.rx == 128);
+    cellPad_host_stick(0, 0, 128, 2);                                      /* both sticks at once */
+    p = rd(); CHECK(p.buttons == 0 && p.rx == 255 && p.ry == 128 && p.lx == 0);
+    p = rd(); CHECK(p.rx == 255 && p.lx == 0);
+    p = rd(); CHECK(p.rx == 255 && p.lx == 128);
+    p = rd(); CHECK(p.rx == 128);
     cellPad_host_stick(1, 0, 128, 5);
     cellPad_host_stick(1, 128, 0, 1);                                     /* a new hold replaces the old */
     p = rd(); CHECK(p.rx == 128 && p.ry == 0);
     p = rd(); CHECK(p.rx == 128 && p.ry == 128);
     cellPad_set_host_hold(1);
-    cellPad_host_press(CROSS, 3);
-    p = rd(); CHECK(p.buttons == 0);                                       /* dropped while the UI has the input */
+    cellPad_host_stick(1, 255, 128, 3);
+    p = rd(); CHECK(p.rx == 128);                                          /* dropped while the UI has the input */
     cellPad_set_host_hold(0);
-    p = rd(); CHECK(p.buttons == 0);
-
-    /* the title's hook sees the keyboard pad's buttons */
-    hook_bits = L3;
-    g_pad_keys_hook = test_hook;
-    KEYS(VK_SPACE);
-    p = rd(); CHECK(p.buttons == (CIRCLE | L3));
-    g_pad_keys_hook = NULL;
+    p = rd(); CHECK(p.rx == 128);
 
     /* none unbinds; with no left-stick keys the arrows move the stick again */
     set_env("PAD_KEYS", "cross=none,r1=mouse1");

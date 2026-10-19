@@ -496,7 +496,6 @@ static void pad_poll_keyboard_once(void)
     u16 btns = 0;
     for (int t = 0; t < 16; t++)
         if (on & (1u << t)) btns |= s_pad_names[t].bit;
-    if (g_pad_keys_hook) btns = (u16)g_pad_keys_hook(btns);
 
 #define PAD_ON(t) ((on >> (t)) & 1u)
     const int ls_keys = s_nbind[PAD_T_LS] || s_nbind[PAD_T_LS + 1] || s_nbind[PAD_T_LS + 2] || s_nbind[PAD_T_LS + 3];
@@ -965,44 +964,37 @@ static int pad_always_change(void)
     return always;
 }
 
-/* Host input for port 0 that title code asks for (cellPad_host_press, _stick) and the mouse wheel's notches, held
- * for a number of packets the title receives rather than for a time: a title reads the pad once a frame, so a
- * press of two packets is two of its frames at any frame rate. */
-#define PAD_HOST_SLOTS 8
-typedef struct { u16 bits; u8 stick, x, y; int left; } PadHostPress;   /* stick: 0 none, 1 left, 2 right */
-static PadHostPress s_hp[PAD_HOST_SLOTS];
+/* Stick holds for port 0 that title code asks for (cellPad_host_stick) and the mouse wheel's notches, held for a
+ * number of packets the title receives rather than for a time: a title reads the pad once a frame, so a hold of two
+ * packets is two of its frames at any frame rate. */
+#define PAD_HOST_SLOTS 2   /* one a stick */
+typedef struct { u8 stick, x, y; int left; } PadHostHold;   /* stick: 1 left, 2 right */
+static PadHostHold s_hp[PAD_HOST_SLOTS];
 static volatile int s_hp_lock;   /* s_hp, the wheel queue and the notch pad_host_overlay is pressing */
 /* Wheel notches waiting their turn, oldest first, each with the buttons it presses (cellPad_host_mouse_wheel). */
 #define PAD_WHEEL_QUEUE 4
 static u16 s_wheel_q[PAD_WHEEL_QUEUE];
 static int s_wheel_qn;
 
-unsigned (*g_pad_keys_hook)(unsigned buttons) = NULL;
-
 static void pad_hp_lock(void)   { while (__atomic_exchange_n(&s_hp_lock, 1, __ATOMIC_ACQUIRE)) { } }
 static void pad_hp_unlock(void) { __atomic_store_n(&s_hp_lock, 0, __ATOMIC_RELEASE); }
 
-static void pad_hp_add(u16 bits, u8 stick, u8 x, u8 y, unsigned reads)
+static void pad_hp_add(u8 stick, u8 x, u8 y, unsigned reads)
 {
     if (!reads) return;
     pad_hp_lock();
     int k = -1;
     for (int i = 0; i < PAD_HOST_SLOTS && k < 0; i++)   /* a new hold of a stick replaces the old one */
-        if (stick && s_hp[i].left > 0 && s_hp[i].stick == stick) k = i;
+        if (s_hp[i].left > 0 && s_hp[i].stick == stick) k = i;
     for (int i = 0; i < PAD_HOST_SLOTS && k < 0; i++)
         if (s_hp[i].left <= 0) k = i;
-    if (k >= 0) s_hp[k] = (PadHostPress){ bits, stick, x, y, (int)(reads > 1000 ? 1000 : reads) };
+    if (k >= 0) s_hp[k] = (PadHostHold){ stick, x, y, (int)(reads > 1000 ? 1000 : reads) };
     pad_hp_unlock();
-}
-
-void cellPad_host_press(unsigned buttons, unsigned reads)
-{
-    if (buttons & 0xFFFF) pad_hp_add((u16)buttons, 0, 0, 0, reads);
 }
 
 void cellPad_host_stick(int stick, unsigned char x, unsigned char y, unsigned reads)
 {
-    if (stick == 0 || stick == 1) pad_hp_add(0, (u8)(stick + 1), x, y, reads);
+    if (stick == 0 || stick == 1) pad_hp_add((u8)(stick + 1), x, y, reads);
 }
 
 void cellPad_host_mouse_buttons(unsigned mask)
@@ -1028,7 +1020,7 @@ void cellPad_host_set_menu(int open)
     s_menu_layer = open ? 1 : 0;
 }
 
-/* Port 0's packet gets the host presses, stick holds and the current wheel notch. A wheel notch presses the
+/* Port 0's packet gets the stick holds and the current wheel notch. A wheel notch presses the
  * buttons it was queued with (cellPad_host_mouse_wheel) for PAD_WHEEL_READS packets, then lets go for as many, so
  * two quick notches to the same button are two presses. */
 static void pad_host_overlay(CellPadData* data)
@@ -1060,9 +1052,8 @@ static void pad_host_overlay(CellPadData* data)
         w_gap--;
     }
     for (int i = 0; i < PAD_HOST_SLOTS; i++) {
-        PadHostPress* h = &s_hp[i];
+        PadHostHold* h = &s_hp[i];
         if (h->left <= 0) continue;
-        bits |= h->bits;
         if (h->stick == 1) { data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X] = h->x;  data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y] = h->y; }
         if (h->stick == 2) { data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = h->x; data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = h->y; }
         if (delivers) h->left--;
