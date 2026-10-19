@@ -255,6 +255,13 @@ typedef struct {
      * offset of the draw's attribute records in vf_buf's half. fetch is 1
      * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
     u32   fetch, fdesc;
+    /* The pre-pass's vp_get_fp_pso result, and the render_frame it was made
+     * in (s_rf_serial). The VP pass binds it instead of looking the pipeline
+     * up a second time (RSX_PSO_IN_REC); a draw the pre-pass skipped keeps an
+     * older serial. Pipelines are only released at shutdown, so the pointer
+     * stays good. */
+    ID3D12PipelineState* pso;
+    u32   pso_serial;
 } D3D12DrawRecord;
 
 /* Offscreen render target (render-to-texture). Persistent across frames --
@@ -311,6 +318,11 @@ static HRESULT d3d_create_committed(ID3D12Device* dev, const D3D12_HEAP_PROPERTI
     s_res_gen++;
     return dev->lpVtbl->CreateCommittedResource(dev, hp, hf, rd, st, cv, riid, out);
 }
+
+/* Counts render_frame calls. What one call's pre-pass leaves for its later
+ * passes carries this stamp (D3D12DrawRecord.pso, the TEX_CSUM_THREADS sums),
+ * so nothing an earlier frame left passes for this one's. */
+static u32 s_rf_serial = 0;
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
@@ -4577,6 +4589,124 @@ static int vp_tex_free_slot(void)
     return -1;
 }
 
+/* TEX_CSUM_THREADS=<n> (live, default 2): worker threads that take the
+ * sparse checksums the draw pre-pass is about to want. A held texture is
+ * checked again on its first bind of every frame (vp_upload_tex_slot): about
+ * a thousand reads spread over the whole texture, most of them cache misses,
+ * 5.8% of the FIFO thread at the Boletarian Palace. At the start of the
+ * pre-pass the workers sum the slots the previous frame bound, in the order
+ * it first bound them, and a cache hit takes a worker's sum when it covers
+ * the same bytes. A texture the last frame did not bind, or one no worker
+ * has reached yet, is summed on the FIFO thread as before. 0 = all on the
+ * FIFO thread. */
+#define TCJ_THREADS_MAX 8
+typedef struct { u32 off, nb; int slot; } TcjJob;
+static TcjJob s_tcj_job[VP_TEX_SLOTS];
+/* Per slot: the sum a worker took, as (render_frame serial << 32 | sum) in
+ * one write, and the bytes its job covered (set by the FIFO thread). */
+static volatile LONG64 s_tcj_pre[VP_TEX_SLOTS];
+static u32 s_tcj_pre_off[VP_TEX_SLOTS], s_tcj_pre_nb[VP_TEX_SLOTS];
+/* The slots this frame has bound so far, in first-bind order: the next
+ * frame's jobs. */
+static u16 s_tcj_order[VP_TEX_SLOTS];
+static int s_tcj_order_n;
+static struct {
+    SRWLOCK            lk;
+    CONDITION_VARIABLE cv;
+    u32                gen;     /* one per dispatch */
+    u32                serial;  /* the render_frame the jobs are for */
+    int                want;    /* workers in use (the knob) */
+    LONG               n;       /* jobs; 0 while they are rewritten */
+    int                started; /* FIFO thread only */
+} s_tcj = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT };   /* gen..n under lk */
+/* The workers' counters, each on its own cache line. */
+typedef struct { volatile LONG v; char pad[60]; } TcjCounter;
+static __declspec(align(64)) TcjCounter s_tcj_ctr[2];
+#define s_tcj_next (s_tcj_ctr[0].v)   /* the next job to take */
+#define s_tcj_busy (s_tcj_ctr[1].v)   /* workers inside the job loop */
+
+static DWORD WINAPI tcj_worker(LPVOID arg)
+{
+    extern uint8_t* vm_base;
+    const int me = (int)(intptr_t)arg;
+    u32 seen = 0;
+    for (;;) {
+        AcquireSRWLockExclusive(&s_tcj.lk);
+        while (s_tcj.gen == seen)
+            SleepConditionVariableSRW(&s_tcj.cv, &s_tcj.lk, INFINITE, 0);
+        seen = s_tcj.gen;
+        const u64 tag = (u64)s_tcj.serial << 32;
+        const LONG n = me < s_tcj.want ? s_tcj.n : 0;
+        InterlockedIncrement(&s_tcj_busy);   /* under lk: see tcj_dispatch */
+        ReleaseSRWLockExclusive(&s_tcj.lk);
+        for (LONG j; n && (j = InterlockedIncrement(&s_tcj_next) - 1) < n; ) {
+            const TcjJob* jb = &s_tcj_job[j];
+            InterlockedExchange64(&s_tcj_pre[jb->slot],
+                                  (LONG64)(tag | tex_csum(vm_base + jb->off, jb->nb)));
+        }
+        InterlockedDecrement(&s_tcj_busy);
+    }
+}
+
+/* Start of the draw pre-pass: hand the previous frame's slots to the workers. */
+static void tcj_dispatch(void)
+{
+    extern uint8_t* vm_base;
+    static int want = -1;
+    PS3_KNOB(want, ps3_env_int("TEX_CSUM_THREADS", 2));
+    const int norder = s_tcj_order_n;
+    s_tcj_order_n = 0;                    /* this frame's list starts here */
+    const int use = want < TCJ_THREADS_MAX ? want : TCJ_THREADS_MAX;
+    if (use <= 0 || !norder || !vm_base) return;
+    /* The jobs are rewritten below. Last frame's workers finished long ago,
+     * but one that wakes late must find no jobs, and none may still be in
+     * the job loop: a worker raises busy under lk, as it reads n. */
+    AcquireSRWLockExclusive(&s_tcj.lk);
+    s_tcj.n = 0;
+    ReleaseSRWLockExclusive(&s_tcj.lk);
+    while (s_tcj_busy) YieldProcessor();
+    LONG nj = 0;
+    for (int k = 0; k < norder; k++) {
+        const int i = s_tcj_order[k];
+        const VPTexSlot* c = &s_d3d.vp_tex[i];
+        if (!c->res) continue;
+        rsx_tex_layout tl;
+        rsx_texture_layout(c->fmt, c->w, c->h, &tl);
+        /* vp_upload_tex_slot's byte count for a cache hit */
+        const u32 nb = tl.compressed ? tl.row_bytes * tl.rows : c->w * c->h * tl.bytes_per_texel;
+        s_tcj_pre_off[i] = c->off; s_tcj_pre_nb[i] = nb;
+        s_tcj_job[nj].off = c->off; s_tcj_job[nj].nb = nb; s_tcj_job[nj].slot = i;
+        nj++;
+    }
+    while (s_tcj.started < use) {
+        HANDLE h = CreateThread(NULL, 0, tcj_worker, (LPVOID)(intptr_t)s_tcj.started, 0, NULL);
+        if (!h) break;
+        CloseHandle(h);
+        s_tcj.started++;
+    }
+    AcquireSRWLockExclusive(&s_tcj.lk);
+    s_tcj.serial = s_rf_serial; s_tcj.want = use; s_tcj_next = 0; s_tcj.n = nj; s_tcj.gen++;
+    ReleaseSRWLockExclusive(&s_tcj.lk);
+    WakeAllConditionVariable(&s_tcj.cv);
+}
+
+/* Slot i's first bind this frame: the next frame's workers sum it. */
+static void tcj_order_add(int i)
+{
+    if (s_tcj_order_n < VP_TEX_SLOTS) s_tcj_order[s_tcj_order_n++] = (u16)i;
+}
+
+/* The checksum of slot i's source bytes [off, +nb): a worker's from this
+ * render_frame when its job covered the same bytes, else taken here. */
+static u32 tcj_sum(int i, u32 off, u32 nb)
+{
+    extern uint8_t* vm_base;
+    const u64 pre = (u64)s_tcj_pre[i];
+    if ((u32)(pre >> 32) == s_rf_serial && s_tcj_pre_off[i] == off && s_tcj_pre_nb[i] == nb)
+        return (u32)pre;
+    return tex_csum(vm_base + off, nb);
+}
+
 /* Texture staging: one upload buffer, persistently mapped, that every
  * texture upload of a frame decodes into, from the start again each frame
  * (render_frame waits for the GPU before the pre-pass uploads anything).
@@ -4828,7 +4958,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
-            u32 cs = TEX_CSUM(vm_base + c->off, nb);
+            u32 cs = tcj_sum(i, c->off, nb);
             /* TEX_VERIFY=1 (live): hash every byte of each cache hit as well,
              * and re-upload one the sparse checksum called unchanged. Slow; it
              * tells whether a held texture is ever stale. */
@@ -4846,7 +4976,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                       slot = i; break;
                   }
               } }
-            if (cs == c->csum) { c->used = 1; return i; }
+            if (cs == c->csum) { c->used = 1; tcj_order_add(i); return i; }
             slot = i; break;                      /* stale: fall through and redo */
         }
     }
@@ -5357,6 +5487,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         s_vp_tex_index_dirty = 1;
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = cube; t->used = 1; t->face_bytes = _face_bytes;
+    tcj_order_add(slot);
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
       t->csum = TEX_CSUM(vm_base + off, nb);
       t->fsum = ps3_env_int("TEX_VERIFY", 0) ? tex_csum_full(vm_base + off, nb) : 0; }
@@ -8244,6 +8375,7 @@ static void render_frame(void)
     vpj_sync();   /* the batch's vertices, before anything reads vp_vb */
     double _rf0 = perf_on() ? perf_now() : 0.0;
     { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); s_rf_entry_qpc = _q.QuadPart; }
+    s_rf_serial++;
     RSX_MARK("render_frame", s_dbg_last_draws, 0);
     memset(s_rf_cp, 0, sizeof s_rf_cp); RF_CP(0);
     u32 fi = s_d3d.frame_index;
@@ -8565,6 +8697,7 @@ rtt_dump_done:;
     RF_CP(3); rf_pp_snap(s_rf_pp0, s_rf_ppn0);
     late_check();
     double _pre0 = perf_on() ? perf_now() : 0.0;
+    tcj_dispatch();
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
@@ -8805,12 +8938,15 @@ rtt_dump_done:;
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
         const int _pm0 = s_perf_pso_miss;
-        if (dr->fp_addr) vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
-                                       dr_num_rts(dr),
-                                       dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
-                                                  : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       _cmask, dr->d2c_mask, dr_uvclamp(dr));
+        if (dr->fp_addr) {
+            dr->pso = vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
+                                    dr_num_rts(dr),
+                                    dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
+                                               : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                    _cmask, dr->d2c_mask, dr_uvclamp(dr));
+            dr->pso_serial = s_rf_serial;
+        }
         if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
@@ -9255,14 +9391,37 @@ rtt_dump_done:;
                     continue;
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
-                 * back to the hardcoded atlas/colour PS pair. */
-                ID3D12PipelineState* dpso =
-                    dr->fp_addr ? vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
-                                                dr_num_rts(dr),
-                                                dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
-                                                           : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                                dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr)) : NULL;
+                 * back to the hardcoded atlas/colour PS pair. The pre-pass
+                 * looked it up already and kept it in the record.
+                 * RSX_PSO_IN_REC (live): 1 (default) binds the record's,
+                 * 0 looks it up again here, 2 does both and reports a
+                 * difference. A draw whose pre-pass lookup failed looks
+                 * again, as before. */
+                static int pso_in_rec = -1;
+                PS3_KNOB(pso_in_rec, ps3_env_int("RSX_PSO_IN_REC", 1));
+                ID3D12PipelineState* dpso = NULL;
+                if (dr->fp_addr) {
+                    if (pso_in_rec && dr->pso && dr->pso_serial == s_rf_serial) dpso = dr->pso;
+                    if (!dpso || pso_in_rec == 2) {
+                        ID3D12PipelineState* look =
+                            vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
+                                          dr_num_rts(dr),
+                                          dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
+                                                     : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                          dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                          dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr));
+                        if (dpso && look != dpso) {
+                            static int n = 0;
+                            if (n < 8) {
+                                n++;
+                                fprintf(stderr, "[PSO] draw %u: the record's pipeline differs "
+                                                "from a new lookup (frame %llu)\n",
+                                        d, (unsigned long long)s_d3d.frame_count);
+                            }
+                        }
+                        dpso = look;
+                    }
+                }
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
