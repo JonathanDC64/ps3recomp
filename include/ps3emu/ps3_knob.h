@@ -48,3 +48,15 @@ static inline int ps3_env_int(const char* name, int def)
         const unsigned kg_now_ = ps3_env_gen;                            \
         if (var##_kgen_ != kg_now_) { (var) = (expr); var##_kgen_ = kg_now_; } \
     } while (0)
+
+/* PS3_NO_USER_INPUT=1, for test runs: the title ignores the user's pads,
+ * keyboard and mouse, and its window never takes the focus (when it opens or
+ * when it is clicked), so a script drives the run (PAD_FILE, PAD_STICK,
+ * PAD_SCRIPT, a title's own hooks) while the user goes on working at the PC.
+ * 0 or unset: off. */
+static inline int ps3_no_user_input(void)
+{
+    static int on = 0;
+    PS3_KNOB(on, ps3_env_int("PS3_NO_USER_INPUT", 0) != 0);
+    return on;
+}

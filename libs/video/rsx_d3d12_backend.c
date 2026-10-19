@@ -807,12 +807,12 @@ static void set_borderless(HWND hwnd, int on)
         SetWindowLongA(hwnd, GWL_STYLE, (s_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | (ps3_no_user_input() ? SWP_NOACTIVATE : 0));
     } else {
         SetWindowLongA(hwnd, GWL_STYLE, s_windowed_style);
         SetWindowPos(hwnd, NULL, s_windowed_rect.left, s_windowed_rect.top,
                      s_windowed_rect.right - s_windowed_rect.left, s_windowed_rect.bottom - s_windowed_rect.top,
-                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER);
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER | (ps3_no_user_input() ? SWP_NOACTIVATE : 0));
     }
     s_borderless = !!on;
 }
@@ -821,6 +821,12 @@ static int window_dpi(HWND hwnd);
 
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* PS3_NO_USER_INPUT=1 (ps3_knob.h): no key, mouse or raw input message of
+     * the user's reaches the overlay or the hot keys. The window can still be
+     * moved, sized and closed from its frame. */
+    if (((msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
+         msg == WM_INPUT) && ps3_no_user_input())
+        return DefWindowProcA(hwnd, msg, wp, lp);
     switch (msg) {   /* before the overlay: the frame's own business */
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
@@ -984,8 +990,12 @@ static HWND create_window(u32 width, u32 height, const char* title)
 
     /* Keep the display awake (see rsx_null_backend.c). */
     SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+    /* PS3_NO_USER_INPUT=1 (ps3_knob.h): the window never takes the focus, when
+     * it opens or when it is clicked, so the user's typing stays where it was.
+     * It still shows, keeps its taskbar button and presents as usual. */
+    const int no_user_input = ps3_no_user_input();
     HWND hwnd = CreateWindowExA(
-        0, "ps3recomp_d3d12",
+        no_user_input ? WS_EX_NOACTIVATE | WS_EX_APPWINDOW : 0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
         WS_OVERLAPPEDWINDOW,
         x, y,
@@ -993,7 +1003,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
         NULL, NULL, GetModuleHandle(NULL), NULL);
     if (hwnd) {   /* the title bar's colour before the window first shows */
         dark_title(hwnd);
-        ShowWindow(hwnd, SW_SHOWNORMAL);
+        ShowWindow(hwnd, no_user_input ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
     }
     return hwnd;
 }

@@ -16,6 +16,7 @@
  */
 
 #include "cellOskDialog.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -382,7 +383,9 @@ s32 cellOskDialogLoadAsync(u32 container,
         return CELL_OK;
     }
 #ifdef _WIN32
-    HANDLE t = CreateThread(NULL, 0, osk_window_thread, NULL, 0, NULL);
+    /* PS3_NO_USER_INPUT=1 (ps3_knob.h): nobody types into a window, so none
+     * opens, and the initial text is the answer, as on a host without one. */
+    HANDLE t = ps3_no_user_input() ? NULL : CreateThread(NULL, 0, osk_window_thread, NULL, 0, NULL);
     if (t) CloseHandle(t);
     else osk_close(CELL_OSK_DIALOG_INPUT_FIELD_RESULT_OK, NULL, 0);
 #else

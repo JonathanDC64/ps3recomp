@@ -840,6 +840,25 @@ static void pad_apply_map(void)
     }
 }
 
+/* PS3_NO_USER_INPUT=1 (ps3_knob.h): no pad or key of the user's is read. Port
+ * 0 stays a pad at rest, so scripted input (PAD_FILE, PAD_STICK, PAD_SCRIPT,
+ * g_pad_title_hook) still has a pad to press; the other ports are empty. */
+static void pad_poll_none(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        PadHostState* hs = &s_host_state[i];
+        memset(hs, 0, sizeof *hs);
+        hs->connected = i == 0;
+        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+    }
+    static int said = 0;
+    if (!said) {
+        said = 1;
+        printf("[cellPad] PS3_NO_USER_INPUT: no pad or key of the user's is read; scripted input only\n");
+        fflush(stdout);
+    }
+}
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -853,6 +872,10 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    if (ps3_no_user_input()) {   /* (nothing for the host hold to hold) */
+        pad_poll_none();
+        return;
+    }
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
     pad_poll_hid();
