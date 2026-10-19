@@ -19,6 +19,7 @@
 #include "spu_lockstep.h"
 #include "spu_workload.h"  /* spu_hist / spu_hist_line */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+#include "spu_bi_switch.h" /* spu_bi_switch_verify -- defined below */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2061,6 +2062,7 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
  * its (prefixed) spu_recomp_register(). Single-image callers leave it 0. */
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
+int spu_registering_image(void) { return s_reg_image; }
 
 void spu_register_function(uint32_t addr, spu_fn fn)
 {
@@ -2278,8 +2280,12 @@ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
 #define SPU_TASK_ENTRY_MAX 16
 static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX];
 static int s_task_entry_count = 0;
+/* Task entries and task ELFs registered: while there are none, the dispatch
+ * never adopts a resident task (spu_bi_switch_on relies on that). */
+int g_spu_task_regs = 0;
 void spu_taskset_register_task_entry(uint32_t entry, int image_id)
 {
+    g_spu_task_regs++;
     if (s_task_entry_count < SPU_TASK_ENTRY_MAX) {
         s_task_entry[s_task_entry_count].entry = entry & SPU_LS_MASK;
         s_task_entry[s_task_entry_count].image_id = image_id;
@@ -2299,6 +2305,7 @@ static struct { uint32_t elf_ea; int image_id, policy_image_id; }
 static int s_task_elf_count;
 void spu_taskset_register_task_elf(uint32_t elf_ea, int image_id, int policy_image_id)
 {
+    g_spu_task_regs++;
     if (s_task_elf_count < SPU_TASK_ENTRY_MAX) {
         s_task_elf[s_task_elf_count].elf_ea = elf_ea & ~7u;
         s_task_elf[s_task_elf_count].image_id = image_id;
@@ -2840,6 +2847,35 @@ static int spu_smc_microstep(spu_context* ctx)
         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
                 ctx->image_id, ctx->pc & SPU_LS_MASK); }
     return 0;
+}
+
+/* spu_bi_switch_on's one-time check of an image's --bi-switch targets (see
+ * spu_bi_switch.h): 1 when spu_indirect_branch, in a context that runs the
+ * image's own code, would dispatch each target to that target's own lifted
+ * function and do nothing else for it. Not for the one image the dispatch
+ * rewrites local store for (YDKJ_CRI_CHAIN), and not for the addresses it
+ * handles before or instead of the lookup: LS 0 (a job's end), the policy
+ * module's kernel services, the taskset syscall, the policy entry's trace
+ * and the job return. */
+int spu_bi_switch_verify(int self, const spu_bi_target* t, unsigned n)
+{
+    const char* why = 0;
+    uint32_t at = 0;
+    if (self == SPU_RESOLVER_ONLY_IMAGE_ID)
+        why = "the dispatch rewrites this image's local store";
+    for (unsigned i = 0; !why && i < n; i++) {
+        at = t[i].pc;
+        if (at == 0 || at == SPURS_PM_EXIT_TO_KERNEL_LS || at == SPURS_PM_SELECT_WORKLOAD_LS ||
+            at == SPURS_TASKSET_PM_SYSCALL_LS || at == 0xA00u || at == SPU_JOB_RETURN_LS)
+            why = "a target the dispatch handles specially";
+        else if (spu_lookup(at, self) != t[i].fn)
+            why = "the dispatch finds another function for a target";
+    }
+    if (why)
+        fprintf(stderr, "[spu] img=%d: jump-table gotos off: %s (LS 0x%05X)\n", self, why, at);
+    else
+        fprintf(stderr, "[spu] img=%d: jump-table gotos on (%u targets)\n", self, n);
+    return !why;
 }
 
 void spu_indirect_branch(spu_context* ctx)
