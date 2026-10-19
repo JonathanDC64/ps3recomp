@@ -147,7 +147,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
         /* Since signals take the woken threads off the cond, EBUSY here
          * means a thread is still waiting. The first few, with the caller. */
         static volatile long s_said;
-        if (__sync_add_and_fetch(&s_said, 1) <= 16)
+        if (s_said < 16 && __sync_add_and_fetch(&s_said, 1) <= 16)
             fprintf(stderr, "[SYNC] sys_cond_destroy(%u) -> EBUSY: a thread still waits, lr=0x%08X\n",
                     id, (uint32_t)ctx->lr);
     }
