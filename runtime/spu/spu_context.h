@@ -680,7 +680,7 @@ SPU_LS_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const ui
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
           static int _n = 0;
-          if (_n++ < 48)
+          if (_n < 48 && ++_n)
               fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
                       p[0], p[1], p[2], p[3]);

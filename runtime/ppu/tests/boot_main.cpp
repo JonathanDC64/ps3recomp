@@ -690,7 +690,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         if (getenv("YDKJ_INJECT_Q3")) {
             static int s_q3=0; const char* qe=getenv("YDKJ_INJECT_Q3"); uint32_t qid=(uint32_t)strtoul(qe,0,0); if(qid==0||qid==1) qid=3;
             if(++s_q3 % 8 == 0){ int r=sys_event_queue_inject(qid, 0x1234, 0, 0, 0);
-              static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
+              static int _n=0; if(_n<12 && ++_n) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
             /* The player closed the window: that is quitting the game. Only
              * stopping the presents left the title running headless, a
@@ -1931,7 +1931,7 @@ static LONG WINAPI guard_report_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == 0x80000001u /*STATUS_GUARD_PAGE_VIOLATION*/) {
         static LONG s_n = 0;
-        if (InterlockedIncrement(&s_n) <= 8) {
+        if (s_n < 8 && InterlockedIncrement(&s_n) <= 8) {
             char* mbase = (char*)GetModuleHandleA(NULL);
             fprintf(stderr, "\n[GUARDVIOLATION] tid=%lu %s fault=0x%llX rip-rva=0x%llX\n",
                     GetCurrentThreadId(),

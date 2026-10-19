@@ -451,7 +451,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * functions are registered in. */
     if (entry == 0) {
         static int _n = 0;
-        if (_n++ < 4) {
+        if (_n < 4 && ++_n) {
             fprintf(stderr, "[thread] NULL entry for \"%s\" -- caller chain:%c", t->name, 10);
             extern void ppu_log_host_chain(const char* tag);
             ppu_log_host_chain("null-thread-entry");
@@ -605,7 +605,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if(n < 30 && ++n) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);

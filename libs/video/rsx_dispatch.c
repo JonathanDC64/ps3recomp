@@ -314,7 +314,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * constants. Drop it, and say what it was. */
     if (idx >= RSX_DSP_NUM_REGS) {
         static int n = 0;
-        if (n++ < 8)
+        if (n < 8 && ++n)
             fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
                     method, arg);
         return;
@@ -324,7 +324,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * nv4097::set_color_mask); decoding "byte != 0" would turn it into a mask. */
     if (method == M_COLOR_MASK && (arg & 0xFEFEFEFEu)) {
         static int n = 0;
-        if (n++ < 4)
+        if (n < 4 && ++n)
             fprintf(stderr, "[rsx-dispatch] COLOR_MASK 0x%08X has reserved bits -- ignored\n", arg);
         return;
     }
