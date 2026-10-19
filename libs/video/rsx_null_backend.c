@@ -7,6 +7,7 @@
  */
 
 #include "rsx_null_backend.h"
+#include "ps3emu/ps3_knob.h"
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ps3_log.h"
@@ -256,7 +257,8 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
     s_state.hwnd = CreateWindowExA(
-        0, "ps3recomp_null",
+        ps3_no_user_input() ? WS_EX_NOACTIVATE | WS_EX_APPWINDOW : 0,   /* never the focus (ps3_knob.h) */
+        "ps3recomp_null",
         title ? title : "ps3recomp",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
