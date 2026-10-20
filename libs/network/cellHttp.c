@@ -172,6 +172,36 @@ static void http_close_slot_socket(HttpTransSlot* t)
     t->body_overflow_len = 0;
 }
 
+/* PS3_HTTP_HEADER="Name: value": one more header on every request, for a
+ * server that wants something the title never sends (Demon's Souls' port
+ * sends its matchmaking group this way, to a server of the player's own).
+ * Used only when it is a token name (letters, digits, '-'), a colon and one
+ * line of printable ASCII, and the title did not add a header of that name.
+ * Writes "Name" and "value" (spaces around the value trimmed); 0 if unset or
+ * not usable. */
+static int http_extra_header(char* name, size_t name_cap, char* value, size_t value_cap)
+{
+    const char* e = getenv("PS3_HTTP_HEADER");
+    if (!e || !*e) return 0;
+    const char* colon = strchr(e, ':');
+    if (!colon || colon == e || (size_t)(colon - e) >= name_cap) return 0;
+    for (const char* q = e; q < colon; q++)
+        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || (*q >= '0' && *q <= '9') || *q == '-'))
+            return 0;
+    const char* v = colon + 1;
+    while (*v == ' ') v++;
+    size_t vl = strlen(v);
+    while (vl && v[vl - 1] == ' ') vl--;
+    if (!vl || vl >= value_cap) return 0;
+    for (size_t i = 0; i < vl; i++)
+        if ((unsigned char)v[i] < 0x20 || (unsigned char)v[i] > 0x7E) return 0;   /* (no CR or LF: one line) */
+    memcpy(name, e, (size_t)(colon - e));
+    name[colon - e] = 0;
+    memcpy(value, v, vl);
+    value[vl] = 0;
+    return 1;
+}
+
 /* Send all bytes on a socket, handling partial sends. Returns 0 on success. */
 static int http_send_all(http_socket_t sock, const char* data, u32 len)
 {
@@ -591,6 +621,21 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                             "%s: %s\r\n",
                             t->custom_headers[i].name,
                             t->custom_headers[i].value);
+    }
+
+    /* PS3_HTTP_HEADER, unless the title sent that name itself */
+    {
+        char xn[64], xv[256];
+        if (http_extra_header(xn, sizeof xn, xv, sizeof xv)) {
+            int dup = 0;
+            for (u32 i = 0; i < t->custom_header_count; i++)
+                if (http_strcasestr(t->custom_headers[i].name, xn) == t->custom_headers[i].name &&
+                    strlen(t->custom_headers[i].name) == strlen(xn))
+                    dup = 1;
+            if (!dup)
+                req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+                                    "%s: %s\r\n", xn, xv);
+        }
     }
 
     /* End of headers */
