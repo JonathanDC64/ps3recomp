@@ -404,6 +404,40 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           }
       } }
 
+    /* HLE_BT_NID=<hex nid>: dump the guest stack on the first 4 calls of one
+     * import. HLE_LR names the caller and its caller; a decision made five
+     * frames up (who tore a service down) needs the whole chain. */
+    { static uint32_t bt_nid = 0xFFFFFFFFu; static volatile int bt_n = 0;
+      if (bt_nid == 0xFFFFFFFFu) { const char* e = getenv("HLE_BT_NID");
+                                   bt_nid = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
+      if (bt_nid && nid == bt_nid && ctx && bt_n < 4) {
+          bt_n++;
+          extern void ppu_dump_guest_stack(ppu_context*, const char*);
+          char tag[64];
+          snprintf(tag, sizeof tag, "nid=0x%08X tid=%llu r3=0x%08X", nid,
+                   (unsigned long long)ctx->thread_id, (uint32_t)ctx->gpr[3]);
+          ppu_dump_guest_stack(ctx, tag);
+      } }
+
+    /* HLE_TRACE_AFTER=<hex nid>,<n>: from the first call of one import, log
+     * the next n HLE calls of every thread: what a title did between two
+     * known points (PS3_HLE_TRACE only covers the start of the run). */
+    { static uint32_t ta_nid = 0xFFFFFFFFu; static int ta_count = 0; static volatile int ta_left = -1;
+      if (ta_nid == 0xFFFFFFFFu) {
+          const char* e = getenv("HLE_TRACE_AFTER"); char* end = 0;
+          ta_nid = e ? (uint32_t)strtoul(e, &end, 16) : 0;
+          ta_count = (end && *end == ',') ? atoi(end + 1) : 200;
+      }
+      if (ta_nid && ctx) {
+          if (ta_left < 0 && nid == ta_nid) ta_left = ta_count;
+          if (ta_left > 0) {
+              ta_left--;
+              fprintf(stderr, "[hle-after] t=%llu tid=%llu nid=0x%08X lr=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X\n",
+                      ps3_ms_now(), (unsigned long long)ctx->thread_id, nid, (uint32_t)ctx->lr,
+                      (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
+          }
+      } }
+
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
      * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
      * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
