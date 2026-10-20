@@ -108,6 +108,16 @@ static void host_path(char* out, size_t cap, const char* guest)
         return;
     }
 
+    /* PS3_HDD1_ROOT: the host dir /dev_hdd1 (the game's HDD cache) maps into, default the vfs root. Two copies of
+     * a title run side by side from one disc tree each need their own cache, as each has its own saves. */
+    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
+    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
+    if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
+        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
+        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+        return;
+    }
+
     /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
      * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
      * /dev_flash/sys/external/flashMP3.pic and, on a miss, prints "mp3 failed to

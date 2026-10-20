@@ -52,6 +52,18 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
+/* PS3_SAVEDATA_ROOT: the host dir holding the save folders, instead of the default above (which is relative
+ * to the working directory). Two copies of a title run side by side each need their own. Read once, by the
+ * two functions that use the root, before the first path is built. */
+static void save_root_init(void)
+{
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    const char* e = getenv("PS3_SAVEDATA_ROOT");
+    if (e && *e) snprintf(s_save_root, sizeof(s_save_root), "%s", e);
+}
+
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
 {
@@ -72,6 +84,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
+    save_root_init();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
@@ -436,6 +449,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
+    save_root_init();
     ensure_dirs(s_save_root);
 
 #ifdef _WIN32
