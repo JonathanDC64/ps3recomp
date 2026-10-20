@@ -888,6 +888,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             elif xo_full == 711:
                 fm = bits(insn, 7, 14)
                 result.operands = f"0x{fm:02X}, f{frb}"
+            elif xo_full == 64:   # mcrfs BF, BFA: CR field, FPSCR field
+                result.operands = f"cr{bits(insn, 6, 8)}, cr{bits(insn, 11, 13)}"
             else:
                 result.operands = f"f{frd}, f{frb}"
             return result

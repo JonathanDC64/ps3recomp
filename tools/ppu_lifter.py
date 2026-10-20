@@ -1112,8 +1112,16 @@ class PPULifter:
     # arithmetic; the _translate wrapper appends the CR0 update for any
     # dot-form whose first operand is the destination GPR. Excluded:
     # stwcx./stdcx. (their handlers set CR0 themselves), FP dot-forms
-    # (those set CR1), VMX dot-forms (those set CR6), mt*/mf* specials.
+    # (those set CR1, below), VMX dot-forms (those set CR6), mt*/mf* specials.
     _CR0_SELF_HANDLED = ("stwcx.", "stdcx.")
+
+    # Record-form FP ops (fadd. ... fcfid., and the FPSCR moves below) copy
+    # FPSCR[FX FEX VX OX], its top nibble, to CR1 (Book I 2.3.1). Nothing
+    # lifted writes ctx->fpscr -- the exception bits are not modeled, and
+    # mtfsf/mtfsb0/mtfsb1/mtfsfi are no-ops -- so CR1 gets what mffs would
+    # read there, 0 from a zeroed context. RPCS3 puts the result's FPCC
+    # class in CR1 instead (marked TODO there); this follows the ISA.
+    _CR1_FPSCR_OPS = ("mffs.", "mtfsf.", "mtfsfi.", "mtfsb0.", "mtfsb1.")
 
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._translate_op(insn, func)
@@ -1128,6 +1136,9 @@ class PPULifter:
                          f"uint32_t _c = (_r < 0) ? 8u : (_r > 0) ? 4u : 2u; "
                          f"_c |= (uint32_t)((ctx->xer >> 31) & 1u); "
                          f"ctx->crf[0] = (uint8_t)_c; }}")
+        if (mn.endswith(".") and code and not code.startswith("/* TODO")
+                and (mn.startswith("f") or mn in self._CR1_FPSCR_OPS)):
+            code += " ctx->crf[1] = (uint8_t)((ctx->fpscr >> 28) & 0xFu);"
         return code
 
     def _translate_op(self, insn: Instruction, func: LiftedFunction) -> str:
@@ -2164,6 +2175,16 @@ class PPULifter:
             frd = _reg_idx(ops[0])
             return f"{{ uint64_t fpscr64 = ctx->fpscr; memcpy(&ctx->fpr[{frd}], &fpscr64, 8); }}"
 
+        # mcrfs crD, crS — copy FPSCR field crS to CR field crD. The ISA also
+        # clears the exception bits it copies (FX OX, UX ZX XX VXSNAN, VXISI
+        # VXIDI VXZDZ VXIMZ, VXVC, VXSOFT VXSQRT VXCVI in fields 0, 1, 2, 3,
+        # 5); FPSCR writes are not modeled (see mtfsf below), so only the copy
+        # is lifted. RPCS3's MCRFS clears nothing either.
+        if mn == "mcrfs":
+            bf = int(ops[0][2:]) if ops[0].startswith("cr") else int(ops[0])
+            bfa = int(ops[1][2:]) if ops[1].startswith("cr") else int(ops[1])
+            return f"ctx->crf[{bf}] = (uint8_t)((ctx->fpscr >> {28 - 4 * bfa}) & 0xFu);"
+
         # mtfsf — move to FPSCR fields
         # mtfsb0/mtfsb1 clear/set a single FPSCR bit; mtfsfi sets a 4-bit field.
         # Those bits are the rounding mode, the exception enables and the sticky
@@ -2174,7 +2195,7 @@ class PPULifter:
         if mn.rstrip(".") in ("mtfsb0", "mtfsb1", "mtfsfi"):
             return f"/* {mn} {insn.operands}: FPSCR unmodeled */;"
 
-        if mn == "mtfsf":
+        if mn.rstrip(".") == "mtfsf":   # mtfsf. sets CR1 too (_translate)
             return f"/* mtfsf: FPSCR update -- ignored for now */;"
 
         # ------- Store/load with update indexed -------
@@ -3225,6 +3246,7 @@ class PPULifter:
         if mn.startswith("b"):
             mn = mn[1:]  # strip leading 'b'
 
+        via_ctr = mn.endswith("ctr")
         # strip trailing 'lr', 'ctr'
         mn = mn.replace("lr", "").replace("ctr", "")
 
@@ -3249,6 +3271,23 @@ class PPULifter:
             "dnz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) != 0)",
             "dz": "((ctx->ctr = (uint32_t)(ctx->ctr - 1)) == 0)",
         }
+
+        # bcctr never decrements CTR: its BO2=0 forms are invalid (Book I
+        # 2.4) and RPCS3's BCCTR tests only BO0/BO1, so drop the CTR part.
+        if via_ctr and mn.startswith(("dnz", "dz")):
+            mn = mn[3:] if mn.startswith("dnz") else mn[2:]
+            if not mn:
+                return "1"
+        # bdnzt/bdnzf/bdzt/bdzf come through as dnz/dz plus the CR condition
+        # (bdnzf eq -> dnzne). Branch only if both hold; the CTR test goes
+        # first so && never skips the decrement (Book I 2.4, RPCS3 BC/BCLR).
+        for dec in ("dnz", "dz"):
+            if mn.startswith(dec) and mn[len(dec):] in cond_map:
+                return f"({cond_map[dec]} && {cond_map[mn[len(dec):]]})"
+        if mn == "c":
+            # bc/bclr/bcctr printed raw: the disassembler does that only for
+            # BO = 1z1zz, branch always.
+            return "1"
 
         return cond_map.get(mn, f"/* cond: {mnemonic} */ 1")
 
