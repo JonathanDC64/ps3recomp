@@ -110,6 +110,15 @@ jobs:
           .\test_sys_net.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
+      # big-endian units, the byte count returned.
+      - name: Run the cellL10n test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_l10n.exe libs/font/tests/test_l10n.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_l10n.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # Matching2 over psnr without a server: response relocation, attribute
       # packing, and the room structs a title reads.
       - name: Run the Matching2 test

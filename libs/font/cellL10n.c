@@ -8,6 +8,7 @@
  */
 
 #include "cellL10n.h"
+#include "../../runtime/ppu/ppu_memory.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -118,8 +119,8 @@ static int encode_utf16(u32 cp, u16* out, u32 max)
  * UTF-8 <-> UTF-16
  * -----------------------------------------------------------------------*/
 
-s32 UTF8toUTF16(const u8* utf8, u32 utf8_len,
-                u16* utf16, u32* utf16_len)
+s32 l10n_utf8_to_utf16(const u8* utf8, u32 utf8_len,
+                       u16* utf16, u32* utf16_len)
 {
     if (!utf8 || !utf16 || !utf16_len)
         return (s32)CELL_L10N_ERROR_INVALID_PARAM;
@@ -144,6 +145,37 @@ s32 UTF8toUTF16(const u8* utf8, u32 utf8_len,
 
     *utf16_len = out_pos;
     return CELL_OK;
+}
+
+/* HLE export */
+s32 UTF8toUTF16(u32 src_addr, u32 dst_addr, u32 dst_len_addr)
+{
+    /* The firmware call, at guest addresses: convert the ONE character at src
+     * to big-endian UTF-16 at dst (1 unit, or a surrogate pair), store the
+     * unit count at dst_len, and return the bytes consumed; 0 means an illegal
+     * sequence and writes nothing. Titles loop over a string with it.
+     * Demon's Souls converts the server's login messages this way: before it
+     * was registered, the import answered 0 at the first character, and each
+     * message showed as "You have no new messages". */
+    if (!src_addr || !dst_addr || !dst_len_addr)
+        return 0;
+    u8 s[4];
+    u32 n = 1;
+    s[0] = vm_read8(src_addr);
+    if (s[0] >= 0xC0) n = s[0] >= 0xF0 ? 4 : s[0] >= 0xE0 ? 3 : 2;
+    for (u32 i = 1; i < n; i++) {
+        s[i] = vm_read8(src_addr + i);
+        if ((s[i] & 0xC0) != 0x80) return 0;   /* stop at a short sequence's end */
+    }
+    u32 cp;
+    int used = decode_utf8(s, n, &cp);
+    if (used == 0) return 0;
+    u16 out[2];
+    int units = encode_utf16(cp, out, 2);
+    if (units == 0) return 0;
+    for (int i = 0; i < units; i++) vm_write16(dst_addr + 2 * i, out[i]);
+    vm_write32(dst_len_addr, (u32)units);
+    return used;
 }
 
 s32 UTF16toUTF8(const u16* utf16, u32 utf16_len,
@@ -333,7 +365,7 @@ s32 UTF8stoUTF16s(const u8* utf8, u32* utf8_len,
         src_len++;
 
     u32 dst_max = *utf16_len;
-    s32 rc = UTF8toUTF16(utf8, src_len, utf16, &dst_max);
+    s32 rc = l10n_utf8_to_utf16(utf8, src_len, utf16, &dst_max);
     if (rc != CELL_OK) return rc;
 
     /* Null-terminate if space available */
@@ -477,7 +509,7 @@ s32 l10n_convert(u32 src_encoding, const void* src, u32 src_len,
     /* UTF-8 -> UTF-16 */
     if (src_encoding == L10N_UTF8 && dst_encoding == L10N_UTF16) {
         u32 out_len = dst_max / sizeof(u16);
-        s32 rc = UTF8toUTF16((const u8*)src, src_len,
+        s32 rc = l10n_utf8_to_utf16((const u8*)src, src_len,
                              (u16*)dst, &out_len);
         *dst_len = out_len * sizeof(u16);
         return rc;
