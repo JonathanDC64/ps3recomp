@@ -110,6 +110,15 @@ jobs:
           .\test_sys_net.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # cellHttp end to end on loopback: guest pointers, the network gate, and
+      # PS3_HTTP_HEADER's extra header.
+      - name: Run the cellHttp loopback test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_http_loopback.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
       # big-endian units, the byte count returned.
       - name: Run the cellL10n test

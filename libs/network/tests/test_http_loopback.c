@@ -5,7 +5,7 @@
  * +16, the username at +8), the POST body, the header name and value, and
  * the buffer the response body lands in. Also the network gate in front of
  * it: offline nothing connects, and with PS3_NET_HOSTS set only listed
- * names do. Nothing leaves the PC.
+ * names do. And PS3_HTTP_HEADER's extra header. Nothing leaves the PC.
  *
  *   clang-cl /I include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_http_loopback libs/network/tests/test_http_loopback.c
@@ -165,6 +165,44 @@ int main(void)
     assert(!memcmp(vm_base + RBUF, "0123456789", 10));
     cellHttpDestroyTransaction(t);
     http_closesocket(c);
+
+    /* PS3_HTTP_HEADER adds one header to each request; a malformed one, or a
+     * name the title sent itself, adds nothing. */
+    {
+        static const struct { const char* env; const char* want; } cases[] = {
+            {"", NULL},                              /* first: the header lines without it */
+            {"X-DeS-Group:  ab12 ", "\r\nX-DeS-Group: ab12\r\n"},
+            {"X-Test: no", NULL},                    /* the title's X-Test: yes stays the only one */
+            {"Bad Name: x", NULL},
+            {"X-Two: a\r\nX-Evil: b", NULL},
+            {"X-Empty:   ", NULL},
+        };
+        int base = -1;
+        for (size_t k = 0; k < sizeof cases / sizeof cases[0]; k++) {
+            env("PS3_HTTP_HEADER", cases[k].env);
+            t = new_trans(client, HOST, port);
+            assert(cellHttpAddRequestHeader(t, (const char*)(uintptr_t)HNAME, (const char*)(uintptr_t)HVALUE) == CELL_OK);
+            assert(cellHttpSendRequest(t, (const void*)(uintptr_t)BODY, 7, (u32*)(uintptr_t)SENT) == CELL_OK);
+            c = accept(l, NULL, NULL);
+            read_request(c, req, sizeof req, 7);
+            const char* end = strstr(req, "\r\n\r\n");
+            assert(end);
+            int lines = 0;
+            for (const char* q = req; q < end; q++)
+                if (q[0] == '\r' && q[1] == '\n') lines++;
+            if (base < 0) base = lines;
+            if (cases[k].want) {
+                assert(strstr(req, cases[k].want));
+                assert(lines == base + 1);
+            } else {
+                assert(lines == base);
+            }
+            assert(strstr(req, "\r\nX-Test: yes\r\n"));
+            cellHttpDestroyTransaction(t);
+            http_closesocket(c);
+        }
+        env("PS3_HTTP_HEADER", "");
+    }
 
     env("PS3_NET_HOSTS", "");
     http_closesocket(l);
