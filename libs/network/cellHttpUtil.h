@@ -22,6 +22,7 @@ extern "C" {
 #define CELL_HTTP_UTIL_ERROR_NO_MEMORY          0x80711001
 #define CELL_HTTP_UTIL_ERROR_NO_BUFFER          0x80711002
 #define CELL_HTTP_UTIL_ERROR_NO_STRING          0x80711003
+#define CELL_HTTP_UTIL_ERROR_INSUFFICIENT       0x80711004
 #define CELL_HTTP_UTIL_ERROR_INVALID_URI        0x80711005
 #define CELL_HTTP_UTIL_ERROR_INVALID_LENGTH     0x80711009
 #define CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER  0x8071100a
@@ -33,6 +34,7 @@ extern "C" {
  * Types
  * -----------------------------------------------------------------------*/
 
+/* This runtime's own layout, used by cellHttpUtilBuildUri only (not the SDK's) */
 typedef struct CellHttpUtilUri {
     char scheme[16];
     char hostname[256];
@@ -48,8 +50,11 @@ typedef struct CellHttpUtilUri {
  * URL parsing
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
-                          void* pool, u32 poolSize, u32* required);
+/* SDK layout: uri is a CellHttpUri (cellHttp.h), its strings go in `pool`.
+ * uri NULL asks for the pool size in *required. */
+struct CellHttpUri;
+s32 cellHttpUtilParseUri(struct CellHttpUri* uri, const char* str,
+                          void* pool, u32 size, u32* required);
 s32 cellHttpUtilBuildUri(char* urlBuf, u32 urlBufSize,
                           const CellHttpUtilUri* uri, u32* written);
 
