@@ -1,0 +1,10 @@
+# Exceptions to .github/scripts/check_game_files.py: files the check would flag that are this repository's
+# own, not made from a game or the PS3 firmware. One glob per line, matched against the path from the
+# repository root ("*" also crosses folders), each with a comment saying what the file is.
+
+# SPU programs the runtime's tests generate (runtime/spu/tests/gen_test_*.py), lifted by tools/spu_lifter.py.
+runtime/spu/tests/out_*/*
+# The lifter's conformance driver: synthetic instruction cases, lifted by tools/test_ppu_lift.py.
+scratch/ppu_conformance.cpp
+# ps3recomp's own application icon.
+packaging/macos/icon_1024.png
