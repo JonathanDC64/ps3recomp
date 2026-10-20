@@ -324,9 +324,11 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
+extern "C" void rsx_d3d12_overlay_tick(void);
 #  define rsx_backend_init    rsx_d3d12_backend_init
 #  define rsx_backend_present rsx_d3d12_backend_present
 #  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
+#  define rsx_backend_idle    rsx_d3d12_overlay_tick
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
@@ -334,6 +336,7 @@ extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_metal_backend_init
 #  define rsx_backend_present rsx_metal_backend_present
 #  define rsx_backend_pump    rsx_metal_backend_pump_messages
+#  define rsx_backend_idle()  ((void)0)
 #else
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);
@@ -341,6 +344,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #  define rsx_backend_init    rsx_null_backend_init
 #  define rsx_backend_present rsx_null_backend_present
 #  define rsx_backend_pump    rsx_null_backend_pump_messages
+#  define rsx_backend_idle()  ((void)0)
 #endif
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
@@ -728,6 +732,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                     rsx_backend_present();
                 }
             }
+            /* Between the game's frames: an overlay that asked to move at
+             * the display's rate shows the last frame again (a menu over a
+             * 30 fps game, or through a hitch). */
+            if (!s_rsx_live) rsx_backend_idle();
         }
     }
     return 0;

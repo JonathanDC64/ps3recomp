@@ -110,6 +110,7 @@ static float rsx_aspect(void)
 #endif
 #include <windows.h>
 #include <wtsapi32.h>         /* session lock notifications (s_session_locked) */
+#include <dwmapi.h>           /* DWM_TIMING_INFO (dwmapi.dll is loaded, not linked) */
 
 /* D3D12 headers */
 #include <d3d12.h>
@@ -794,6 +795,7 @@ static void session_lock_init(HWND hwnd)
  * threads: the hooks are swapped in whole and then flagged. */
 static rsx_d3d12_overlay s_overlay;
 static volatile long     s_overlay_on;
+static volatile long     s_overlay_repaint;   /* rsx_d3d12_overlay_repaint */
 
 /* The window's client size as of its last WM_SIZE, (w << 16) | h, written by
  * the window thread; the render thread resizes the swap chain to it between
@@ -1291,6 +1293,95 @@ static void blit_to_window(u32 fi)
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
+}
+
+/* rsx_d3d12_overlay_repaint: the last game frame shown, as blit_to_window
+ * read it (render_targets[fi] is cleared by the next batch, a frame shown or
+ * not). Render thread. */
+static ID3D12Resource* s_hold;
+static u32 s_hold_w, s_hold_h;
+static int s_hold_valid;            /* s_hold has the last frame shown */
+static long long s_last_present_qpc;   /* the last Present, a repaint's too */
+static u32 s_repaints;                 /* repaints made (GCM_RATES) */
+
+static int repaint_knob(void)
+{
+    static int v = -1;
+    PS3_KNOB(v, ps3_env_int("RSX_OVERLAY_REPAINT", 1));
+    return v;
+}
+
+/* Records the copy of the game's frame fi into s_hold, while repaints are on.
+ * render_targets[fi] is in PRESENT before and after. */
+static void hold_frame(u32 fi)
+{
+    if (!s_overlay_repaint || !repaint_knob()) {
+        s_hold_valid = 0;
+        return;
+    }
+    if (s_hold && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
+        s_hold->lpVtbl->Release(s_hold);
+        s_hold = NULL;
+    }
+    if (!s_hold) {
+        D3D12_HEAP_PROPERTIES hp = {0};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {0};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = s_d3d.host_w;
+        rd.Height           = s_d3d.host_h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rd.SampleDesc.Count = 1;
+        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
+                &IID_ID3D12Resource, (void**)&s_hold))) {
+            s_hold = NULL;
+            s_hold_valid = 0;
+            return;
+        }
+        s_hold_w = s_d3d.host_w;
+        s_hold_h = s_d3d.host_h;
+    }
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[0].Transition.pResource   = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource   = s_hold;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    cl->lpVtbl->CopyResource(cl, s_hold, s_d3d.render_targets[fi]);
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    s_hold_valid = 1;
+}
+
+/* Present, at the refresh or (RSX_VSYNC=0, live, default 1) at once with
+ * tearing, so the title's own vblank is the frame limit and a game set above
+ * the display's rate is not held to it. Without tearing support (swap chain
+ * creation above) a sync interval of 0 would still be paced at the refresh
+ * by the compositor, so it presents with vsync and says so once. */
+static void swap_present(void)
+{
+    static int vsync = -1;
+    PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
+    if (!vsync && !s_d3d.tearing) {
+        static int said = 0;
+        if (!said++) printf("[D3D12] RSX_VSYNC=0: tearing is not supported on this system; presenting with vsync\n");
+    }
+    const int tear = !vsync && s_d3d.tearing;
+    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    s_last_present_qpc = q.QuadPart;
 }
 
 static void wait_for_gpu(void);
@@ -9959,8 +10050,12 @@ skip_dump_consider: ;
         s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_zq_heap,
             D3D12_QUERY_TYPE_OCCLUSION, 0, (UINT)s_zq_n, s_zq_rb, 0);
 
-    /* The game's frame, scaled into the window's buffer. */
-    if (s_present_this_frame) blit_to_window(fi);
+    /* The game's frame, scaled into the window's buffer (and held for the
+     * overlay's repaints). */
+    if (s_present_this_frame) {
+        hold_frame(fi);
+        blit_to_window(fi);
+    }
 
     /* Close and execute */
     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
@@ -10141,25 +10236,11 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
-      /* RSX_VSYNC (live, default 1): 0 presents without waiting for the
-       * display's refresh, with tearing, so the title's own vblank is the
-       * frame limit and a game set above the display's rate is not held to
-       * it. Without tearing support (swap chain creation above) a sync
-       * interval of 0 would still be paced at the refresh by the compositor,
-       * so it presents with vsync and says so once. */
-      static int vsync = -1;
-      PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
-      if (!vsync && !s_d3d.tearing) {
-          static int said = 0;
-          if (!said++) printf("[D3D12] RSX_VSYNC=0: tearing is not supported on this system; presenting with vsync\n");
-      }
-      const int tear = !vsync && s_d3d.tearing;
       if (s_present_this_frame && s_overlay_on && s_overlay.frame)
           s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[s_d3d.frame_index], s_d3d.frame_index,
                           s_d3d.win_w, s_d3d.win_h);
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
-          s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1,
-                                            tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+          swap_present();
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       if (s_present_this_frame) pso_lib_tick();
@@ -10205,13 +10286,17 @@ skip_dump_consider: ;
                   /* boundaries: at a flip (render / no display draws), at a
                    * display clear (render / no display draws / no flip since
                    * the last present / batch too small) */
-                  static u32 c0, f1, f2, k1, k2, k3;
+                  /* repaints: the overlay's frames between the game's
+                   * (rsx_d3d12_overlay_repaint), not counted in presents. */
+                  static u32 c0, f1, f2, k1, k2, k3, rp0;
                   fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s flips=%u/s label255=%08X (+%u) draws=%u"
-                          " | flip:render=%u nodisp=%u clear:render=%u nodisp=%u sameflip=%u small=%u%c",
+                          " | flip:render=%u nodisp=%u clear:render=%u nodisp=%u sameflip=%u small=%u repaints=%u%c",
                           (unsigned long long)tnow, s_tframes * 1000.0 / (double)(tnow - s_tt0),
                           fw - fw0, fr - fr0, l, l - l0, s_dbg_last_draws,
                           s_pc_flip_render - f1, s_pc_flip_nodisp - f2, s_clear_presents - c0,
-                          s_pc_clear_nodisp - k1, s_pc_clear_sameflip - k2, s_pc_clear_small - k3, 10);
+                          s_pc_clear_nodisp - k1, s_pc_clear_sameflip - k2, s_pc_clear_small - k3,
+                          s_repaints - rp0, 10);
+                  rp0 = s_repaints;
                   fw0 = fw; l0 = l; fr0 = fr;
                   f1 = s_pc_flip_render; f2 = s_pc_flip_nodisp; c0 = s_clear_presents;
                   k1 = s_pc_clear_nodisp; k2 = s_pc_clear_sameflip; k3 = s_pc_clear_small;
@@ -12969,6 +13054,128 @@ void rsx_d3d12_backend_shutdown(void)
     printf("[D3D12] Backend shut down\n");
 }
 
+void rsx_d3d12_overlay_repaint(int on)
+{
+    InterlockedExchange(&s_overlay_repaint, on ? 1 : 0);
+}
+
+/* The display's refresh: its period and the time of a vblank, in performance
+ * counter ticks. DWM's timing, read again every quarter second (the window
+ * can move to another display); without it the window's display mode gives
+ * the period and *vblank is 0 (unknown). */
+static long long refresh_period(long long now, long long freq, long long* vblank)
+{
+    static long long period, vb, read_at;
+    static int dwm_state;   /* 0 = not loaded yet, 1 = loaded, -1 = missing */
+    typedef HRESULT (WINAPI *timing_fn)(HWND, DWM_TIMING_INFO*);
+    static timing_fn timing;
+    if (!period || now - read_at >= freq / 4) {
+        read_at = now;
+        if (!dwm_state) {
+            HMODULE dwm = LoadLibraryA("dwmapi.dll");
+            timing = dwm ? (timing_fn)(void*)GetProcAddress(dwm, "DwmGetCompositionTimingInfo") : NULL;
+            dwm_state = timing ? 1 : -1;
+        }
+        long long p = 0;
+        vb = 0;
+        if (timing) {
+            DWM_TIMING_INFO ti;
+            memset(&ti, 0, sizeof ti);
+            ti.cbSize = sizeof ti;
+            if (SUCCEEDED(timing(NULL, &ti)) && ti.qpcRefreshPeriod >= (QPC_TIME)(freq / 1000) &&
+                ti.qpcRefreshPeriod <= (QPC_TIME)(freq / 20)) {
+                p = (long long)ti.qpcRefreshPeriod;
+                vb = (long long)ti.qpcVBlank;
+            }
+        }
+        if (!p && s_d3d.hwnd) {
+            MONITORINFOEXW mi;
+            memset(&mi, 0, sizeof mi);
+            mi.cbSize = sizeof mi;
+            DEVMODEW dm;
+            memset(&dm, 0, sizeof dm);
+            dm.dmSize = sizeof dm;
+            if (GetMonitorInfoW(MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO*)&mi) &&
+                EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 20 &&
+                dm.dmDisplayFrequency < 1000)
+                p = freq / (long long)dm.dmDisplayFrequency;
+        }
+        period = p ? p : freq / 60;
+    }
+    *vblank = vb;
+    return period;
+}
+
+/* Is a frame presented and not yet shown? 1 / 0, or -1 when the swap
+ * chain's statistics cannot say. */
+static int present_queued(void)
+{
+    UINT last = 0;
+    DXGI_FRAME_STATISTICS fs;
+    memset(&fs, 0, sizeof fs);
+    if (FAILED(s_d3d.swap_chain->lpVtbl->GetLastPresentCount(s_d3d.swap_chain, &last)) ||
+        FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)) || !fs.PresentCount)
+        return -1;
+    const UINT ahead = last - fs.PresentCount;
+    if (ahead > FRAME_COUNT + 1) return -1;   /* (statistics that do not follow this swap chain) */
+    return ahead != 0;
+}
+
+void rsx_d3d12_overlay_tick(void)
+{
+    if (!s_overlay_repaint || !s_hold_valid || !s_overlay_on || !s_overlay.frame || !s_d3d.initialized ||
+        !repaint_knob() || !knob_present() || s_session_locked)
+        return;
+    if (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h) return;   /* (held before RSX_SCALE moved) */
+    LARGE_INTEGER q, f;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&f);
+    const long long now = q.QuadPart;
+    long long vblank = 0;
+    const long long period = refresh_period(now, f.QuadPart, &vblank);
+    if (vblank && vblank <= now) {
+        /* Late in a refresh that has no frame yet: a frame the game presents
+         * earlier in it shows instead, and this one still makes the vblank. */
+        const long long last_vblank = vblank + (now - vblank) / period * period;
+        if (s_last_present_qpc >= last_vblank || now - last_vblank < period / 2) return;
+    } else if (now - s_last_present_qpc < period) {
+        return;
+    }
+    if (present_queued() == 1) return;   /* (presenting now would wait for it) */
+
+    /* The held frame into the game's buffer for this index (cleared by the
+     * next batch anyway), then into the window's as for any frame. */
+    const u32 fi = s_d3d.frame_index;
+    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+    cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[0].Transition.pResource   = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.pResource   = s_hold;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    blit_to_window(fi);
+    cl->lpVtbl->Close(cl);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+    s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[fi], fi, s_d3d.win_w, s_d3d.win_h);
+    swap_present();
+    s_repaints++;
+    move_to_next_frame();
+    swap_resize();
+}
+
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay)
 {
     InterlockedExchange(&s_overlay_on, 0);
@@ -13185,6 +13392,8 @@ void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay) { (void)overlay; }
+void rsx_d3d12_overlay_repaint(int on) { (void)on; }
+void rsx_d3d12_overlay_tick(void) {}
 void*    rsx_d3d12_device(void) { return NULL; }
 void*    rsx_d3d12_queue(void) { return NULL; }
 void*    rsx_d3d12_hwnd(void) { return NULL; }

@@ -79,6 +79,18 @@ typedef struct rsx_d3d12_overlay {
     void (*release)(void* user);
 } rsx_d3d12_overlay;
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay);
+/* The overlay at the display's refresh rate (on = 1), not only with the
+ * game's frames: between them the render thread shows the last game frame
+ * again, with the overlay's frame hook called on it as for any other frame.
+ * For a menu that should move smoothly whatever the game's frame rate, and
+ * through the game's hitches. The game's own frames still show as soon as
+ * they are presented: a repaint is made only late in a refresh with no
+ * frame of its own. Any thread; 0 (the default) is off. RSX_OVERLAY_REPAINT=0
+ * (live) turns it off whatever the overlay asks. */
+void rsx_d3d12_overlay_repaint(int on);
+/* The render thread's idle point (the ticker, between FIFO drains): makes
+ * the repaint above when one is due. Cheap when none is. */
+void rsx_d3d12_overlay_tick(void);
 /* For the overlay: ID3D12Device*, ID3D12CommandQueue*, HWND, the swap chain's
  * back buffers (ID3D12Resource*, count, DXGI_FORMAT). NULL / 0 before init. */
 void*    rsx_d3d12_device(void);
