@@ -84,6 +84,10 @@ typedef struct {
     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
     int           listening;
+    uint16_t      lo_port;  /* a bound DGRAM_P2P socket: its loopback port (see "P2P datagram vports") */
+    int           has_peer; /* a connected DGRAM_P2P socket: where send goes */
+    struct sockaddr_in peer;
+    uint16_t      peer_vport;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
@@ -100,6 +104,8 @@ static int32_t  s_errno = 0;   /* ponytail: one errno for every thread, per-thre
 #define HOSTENT_SCRATCH 320u
 
 static int net_trace(void);   /* PS3_NET_TRACE; defined with the send/recv paths */
+static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a);
+static int host_recv_flags(int32_t flags);
 
 static uint32_t scratch(uint32_t* ea, uint32_t size)
 {
@@ -179,6 +185,8 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].stream = 0;
             s_sockets[i].vport = 0;
             s_sockets[i].listening = 0;
+            s_sockets[i].lo_port = 0;
+            s_sockets[i].has_peer = 0;
             return i;
         }
     return -1;
@@ -268,10 +276,7 @@ int32_t sys_net_initialize_network_ex(void* param)
 int32_t sys_net_finalize_network(void)
 {
     for (int i = 1; i < SYS_NET_MAX_SOCKETS; i++)
-        if (s_sockets[i].in_use) {
-            host_closesocket(s_sockets[i].host_fd);
-            s_sockets[i].in_use = 0;
-        }
+        if (s_sockets[i].in_use) sys_net_bnet_close(i);   /* (a bound DGRAM_P2P one also lets go of the P2P port) */
     return CELL_OK;
 }
 
@@ -290,10 +295,9 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
         case SYS_NET_SOCK_STREAM:
         case SYS_NET_SOCK_STREAM_P2P: host_type = SOCK_STREAM; break;
         case SYS_NET_SOCK_DGRAM:
-        /* ponytail: a P2P socket is plain UDP/TCP on this instance's P2P port
-         * (see bind), with no vport multiplexing: one DGRAM_P2P and any number
-         * of STREAM_P2P sockets per instance, which is what titles use so far.
-         * Two DGRAM_P2P sockets on different vports would need a demux layer. */
+        /* P2P sockets live on this instance's P2P port (see bind): every
+         * STREAM_P2P socket shares it, and DGRAM_P2P sockets share it by vport
+         * ("P2P datagram vports" below). */
         case SYS_NET_SOCK_DGRAM_P2P:  host_type = SOCK_DGRAM;  break;
         default: return fail(SYS_NET_EINVAL);
     }
@@ -355,29 +359,304 @@ static int relayed_pending(int32_t s)
     return n > 0;
 }
 
-/* The title's P2P datagram socket: np_psnr sends its probes and punches from
- * it (np_psnr.h), so they leave through the same router mapping as the
- * title's own traffic. ponytail: the first one bound; titles have one. */
-static int s_p2p_dgram = -1;
+/* ---- P2P datagram vports ----
+ *
+ * A console carries every DGRAM_P2P socket over its one P2P port and tells
+ * them apart by vport (sockaddr_in_p2p's sin_vport, offset 8). Demon's Souls
+ * opens two for a summon; with a host socket each on the P2P port the second
+ * bind failed (the port was taken) and the title left the room it had made.
+ *
+ * Here the P2P port is one host UDP socket per instance, opened by the first
+ * DGRAM_P2P bind, and a thread that reads it. Datagrams go out with a vport
+ * header, and the thread hands each one that arrives to the socket bound to its
+ * destination vport. A DGRAM_P2P socket's own host fd is bound to loopback, and
+ * only that thread sends to it, so poll, select, blocking reads, timeouts and
+ * MSG_PEEK work on it unchanged.
+ *   - On the wire: "VP01", destination vport, source vport (big-endian u16),
+ *     then the payload. Both peers need this runtime. A datagram without the
+ *     header goes to the first DGRAM_P2P socket bound, as before.
+ *   - Loopback hand-off: the sender's IPv4 address (4 bytes) and port (2,
+ *     network order), its vport (2, big-endian; 0 when it sent no header),
+ *     then the payload.
+ * np_psnr sends its probes and punches from the P2P port too (np_psnr.h), so
+ * they leave through the same router mapping as the title's traffic, and the
+ * thread passes everything that arrives through np_psnr_p2p_filter first. */
+#define P2P_MAGIC     "VP01"
+#define P2P_HDR       8     /* on the wire */
+#define P2P_FWD       8     /* on the loopback hand-off */
+#define P2P_MAX_DGRAM 65507
+
+#ifndef SIO_UDP_CONNRESET
+#  define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)   /* mstcpip.h */
+#endif
+
+static host_socket_t s_p2p_fd = HOST_INVALID_SOCKET;   /* the instance's P2P port */
+static uint16_t      s_p2p_bound_port;                  /* its port, host order */
+static volatile int  s_p2p_gen;                         /* bumped when it closes: its thread stops */
+static int           s_p2p_dgram = -1;                  /* the first DGRAM_P2P bound: headerless datagrams */
+#ifdef _WIN32
+static SRWLOCK s_p2p_lock = SRWLOCK_INIT;
+#  define P2P_LOCK()   AcquireSRWLockExclusive(&s_p2p_lock)
+#  define P2P_UNLOCK() ReleaseSRWLockExclusive(&s_p2p_lock)
+#else
+static pthread_mutex_t s_p2p_lock = PTHREAD_MUTEX_INITIALIZER;
+#  define P2P_LOCK()   pthread_mutex_lock(&s_p2p_lock)
+#  define P2P_UNLOCK() pthread_mutex_unlock(&s_p2p_lock)
+#endif
+
+static int p2p_dgram_bound(int s)
+{
+    return s_sockets[s].in_use && s_sockets[s].p2p && !s_sockets[s].stream && s_sockets[s].lo_port;
+}
 
 static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
 {
     struct sockaddr_in a;
-    if (s_p2p_dgram < 0 || ps3_net_locked_offline()) return -1;
+    if (s_p2p_fd == HOST_INVALID_SOCKET || ps3_net_locked_offline()) return -1;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     memcpy(&a.sin_addr, ip, 4);
     a.sin_port = htons(port);
-    return (int)sendto(s_sockets[s_p2p_dgram].host_fd, (const char*)buf, (int)len, 0,
-                       (struct sockaddr*)&a, sizeof(a));
+    return (int)sendto(s_p2p_fd, (const char*)buf, (int)len, 0, (struct sockaddr*)&a, sizeof(a));
+}
+
+/* The socket a datagram for `vport` goes to: the one bound to it, else the
+ * first bound. Callers hold P2P_LOCK. */
+static int p2p_target(uint16_t vport)
+{
+    if (vport)
+        for (int i = 1; i < SYS_NET_MAX_SOCKETS; i++)
+            if (p2p_dgram_bound(i) && s_sockets[i].vport == vport) return i;
+    return s_p2p_dgram;
+}
+
+static void p2p_rx(host_socket_t fd, int gen)
+{
+    /* Received at +P2P_FWD, so the hand-off header fits in front of the
+     * payload whether or not the datagram had a vport header. */
+    uint8_t* buf = (uint8_t*)malloc(P2P_FWD + P2P_MAX_DGRAM);
+    if (!buf) return;
+    while (s_p2p_gen == gen) {
+        host_pollfd p;
+        p.fd = fd;
+        p.events = POLLIN;
+        p.revents = 0;
+        if (host_poll(&p, 1, 250) <= 0) continue;   /* (250 ms: how soon a closed port's thread notices) */
+        if (s_p2p_gen != gen) break;
+        struct sockaddr_in a;
+        socklen_t alen = sizeof(a);
+        int n = recvfrom(fd, (char*)buf + P2P_FWD, P2P_MAX_DGRAM, 0, (struct sockaddr*)&a, &alen);
+        if (n == HOST_SOCKET_ERROR || n <= 0) continue;
+        uint32_t un = (uint32_t)n;
+        uint16_t port = ntohs(a.sin_port);
+        if (np_psnr_p2p_filter(buf + P2P_FWD, &un, (uint8_t*)&a.sin_addr, &port)) continue;   /* psnr's own */
+        uint8_t* pl = buf + P2P_FWD;
+        uint16_t dst = 0, src = 0;
+        if (un >= P2P_HDR && !memcmp(pl, P2P_MAGIC, 4)) {
+            dst = (uint16_t)(pl[4] << 8 | pl[5]);
+            src = (uint16_t)(pl[6] << 8 | pl[7]);
+            pl += P2P_HDR;
+            un -= P2P_HDR;
+        }
+        uint8_t* f = pl - P2P_FWD;
+        uint16_t port_be = htons(port);
+        memcpy(f, &a.sin_addr, 4);
+        memcpy(f + 4, &port_be, 2);
+        f[6] = (uint8_t)(src >> 8);
+        f[7] = (uint8_t)src;
+        P2P_LOCK();
+        int t = p2p_target(dst);
+        uint16_t lo = t > 0 ? s_sockets[t].lo_port : 0;
+        P2P_UNLOCK();
+        if (net_trace()) {
+            char ip[16];
+            printf("[sys_net] p2p in %s:%u vport %u -> %u: %u bytes to socket %d\n",
+                   ip_str(&a.sin_addr, ip), port, src, dst, un, lo ? t : -1);
+        }
+        if (!lo) continue;   /* no socket for it: dropped, as a console drops one for an unbound vport */
+        struct sockaddr_in to;
+        memset(&to, 0, sizeof(to));
+        to.sin_family = AF_INET;
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        to.sin_port = htons(lo);
+        sendto(fd, (const char*)f, (int)(un + P2P_FWD), 0, (struct sockaddr*)&to, sizeof(to));
+    }
+    free(buf);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI p2p_rx_main(LPVOID u)
+{
+    int gen = (int)(intptr_t)u;
+    P2P_LOCK();
+    host_socket_t fd = s_p2p_gen == gen ? s_p2p_fd : HOST_INVALID_SOCKET;
+    P2P_UNLOCK();
+    if (fd != HOST_INVALID_SOCKET) p2p_rx(fd, gen);
+    return 0;
+}
+#else
+static void* p2p_rx_main(void* u)
+{
+    int gen = (int)(intptr_t)u;
+    P2P_LOCK();
+    host_socket_t fd = s_p2p_gen == gen ? s_p2p_fd : HOST_INVALID_SOCKET;
+    P2P_UNLOCK();
+    if (fd != HOST_INVALID_SOCKET) p2p_rx(fd, gen);
+    return NULL;
+}
+#endif
+
+/* Opens the P2P port and its thread, once. Callers hold P2P_LOCK. */
+static int32_t p2p_open_port(void)
+{
+    if (s_p2p_fd != HOST_INVALID_SOCKET) return 0;
+    host_socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == HOST_INVALID_SOCKET) return host_fail();
+#ifdef _WIN32
+    /* Without this, the ICMP "port unreachable" a peer that left sends back
+     * fails the next recvfrom on the whole port (WSAECONNRESET). */
+    BOOL off = FALSE;
+    DWORD got = 0;
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &off, sizeof(off), NULL, 0, &got, NULL, NULL);
+#endif
+    /* On every interface. Titles bind the console's own IP (what cellNetCtl
+     * reports), and Windows then refuses to send from that socket to a peer
+     * on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons Arcade's every packet failed
+     * that way. The port is what peers use. */
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_port = htons(np_psnr_p2p_port());
+    if (bind(fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
+        int32_t r = host_fail();
+        host_closesocket(fd);
+        return r;
+    }
+    s_p2p_fd = fd;
+    s_p2p_bound_port = np_psnr_p2p_port();
+    int gen = s_p2p_gen;
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, p2p_rx_main, (LPVOID)(intptr_t)gen, 0, NULL);
+    if (th) CloseHandle(th);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, p2p_rx_main, (void*)(intptr_t)gen) == 0) pthread_detach(th);
+#endif
+    np_psnr_set_p2p_sender(p2p_send);
+    return 0;
+}
+
+/* A DGRAM_P2P bind: the socket takes `vport` on the P2P port. */
+static int32_t p2p_bind_dgram(int32_t s, uint16_t vport)
+{
+    struct sockaddr_in lo;
+    socklen_t len = sizeof(lo);
+    memset(&lo, 0, sizeof(lo));
+    lo.sin_family = AF_INET;
+    lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(s_sockets[s].host_fd, (struct sockaddr*)&lo, sizeof(lo)) == HOST_SOCKET_ERROR ||
+        getsockname(s_sockets[s].host_fd, (struct sockaddr*)&lo, &len) == HOST_SOCKET_ERROR)
+        return host_fail();
+    P2P_LOCK();
+    int32_t r = p2p_open_port();
+    if (r == 0) {
+        s_sockets[s].vport = vport;
+        s_sockets[s].lo_port = ntohs(lo.sin_port);
+        if (s_p2p_dgram < 0) s_p2p_dgram = s;
+    }
+    P2P_UNLOCK();
+    if (r == 0) printf("[sys_net] bind(%d, 0.0.0.0:%u, p2p vport %u)\n", s, s_p2p_bound_port, vport);
+    return r;
+}
+
+/* A DGRAM_P2P send: the vport header in front, out of the P2P port (or
+ * psnr's relay). Returns the payload's length or a host error. */
+static int32_t p2p_send_dgram(int32_t s, const void* buf, uint32_t len,
+                              const struct sockaddr_in* to, uint16_t to_vport)
+{
+    uint8_t small[1536];
+    uint8_t* f = (len + P2P_HDR <= sizeof(small)) ? small : (uint8_t*)malloc(len + P2P_HDR);
+    if (!f) return fail(SYS_NET_ENOMEM);
+    memcpy(f, P2P_MAGIC, 4);
+    f[4] = (uint8_t)(to_vport >> 8);
+    f[5] = (uint8_t)to_vport;
+    f[6] = (uint8_t)(s_sockets[s].vport >> 8);
+    f[7] = (uint8_t)s_sockets[s].vport;
+    memcpy(f + P2P_HDR, buf, len);
+    int n;
+    if (np_psnr_p2p_route(f, len + P2P_HDR, (const uint8_t*)&to->sin_addr, ntohs(to->sin_port)))
+        n = (int)(len + P2P_HDR);   /* went through psnr's relay */
+    else
+        n = sendto(s_p2p_fd, (const char*)f, (int)(len + P2P_HDR), 0, (const struct sockaddr*)to, sizeof(*to));
+    if (net_trace()) trace("sendto", s, n, to);
+    if (f != small) free(f);
+    if (n == HOST_SOCKET_ERROR) return host_fail();
+    return (int32_t)len;
+}
+
+/* A DGRAM_P2P receive: one hand-off from the thread, its header taken off.
+ * `from_ea`/`fromlen_ea` may be 0 (recv). */
+static int32_t p2p_recv_dgram(int32_t s, uint32_t buf_ea, uint32_t len, int32_t flags,
+                              uint32_t from_ea, uint32_t fromlen_ea)
+{
+    uint8_t* tmp = (uint8_t*)malloc(len + P2P_FWD);
+    if (!tmp) return fail(SYS_NET_ENOMEM);
+    int n;
+    for (;;) {
+        if (would_block(s, flags, POLLIN)) { free(tmp); return fail(SYS_NET_EWOULDBLOCK); }
+        struct sockaddr_in a;
+        socklen_t alen = sizeof(a);
+        n = recvfrom(s_sockets[s].host_fd, (char*)tmp, (int)(len + P2P_FWD), host_recv_flags(flags),
+                     (struct sockaddr*)&a, &alen);
+        if (n == HOST_SOCKET_ERROR) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEMSGSIZE) n = (int)(len + P2P_FWD);   /* truncated, as on a console */
+            else
+#endif
+            { free(tmp); return host_fail(); }
+        }
+        /* Only the thread sends here (it sends from the P2P port); anything
+         * else on loopback is dropped. */
+        if (n >= P2P_FWD && a.sin_addr.s_addr == htonl(INADDR_LOOPBACK) &&
+            ntohs(a.sin_port) == s_p2p_bound_port)
+            break;
+        if (flags & SYS_NET_MSG_PEEK)   /* take the stray one off, or a peek sees it forever */
+            recv(s_sockets[s].host_fd, (char*)tmp, (int)(len + P2P_FWD), 0);
+    }
+    struct sockaddr_in from;
+    memset(&from, 0, sizeof(from));
+    from.sin_family = AF_INET;
+    memcpy(&from.sin_addr, tmp, 4);
+    memcpy(&from.sin_port, tmp + 4, 2);
+    uint16_t src = (uint16_t)(tmp[6] << 8 | tmp[7]);
+    n -= P2P_FWD;
+    memcpy(GUEST_PTR(buf_ea, char*), tmp + P2P_FWD, (size_t)n);
+    free(tmp);
+    if (net_trace()) trace("recvfrom", s, n, &from);
+    write_sockaddr(from_ea, fromlen_ea, &from);
+    if (from_ea) vm_write16(from_ea + 8, src ? src : s_sockets[s].vport);
+    return n;
 }
 
 int32_t sys_net_bnet_close(int32_t s)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
-    if (s == s_p2p_dgram) {
-        s_p2p_dgram = -1;
-        np_psnr_set_p2p_sender(NULL);
+    if (p2p_dgram_bound(s)) {
+        P2P_LOCK();
+        s_sockets[s].lo_port = 0;
+        if (s == s_p2p_dgram) {
+            s_p2p_dgram = -1;
+            for (int i = 1; i < SYS_NET_MAX_SOCKETS && s_p2p_dgram < 0; i++)
+                if (p2p_dgram_bound(i)) s_p2p_dgram = i;
+        }
+        if (s_p2p_dgram < 0) {   /* the last one: let go of the P2P port */
+            s_p2p_gen++;
+            host_closesocket(s_p2p_fd);
+            s_p2p_fd = HOST_INVALID_SOCKET;
+            np_psnr_set_p2p_sender(NULL);
+        }
+        P2P_UNLOCK();
     }
     host_closesocket(s_sockets[s].host_fd);
     s_sockets[s].in_use = 0;
@@ -390,30 +669,25 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
+    if (s_sockets[s].p2p && !s_sockets[s].stream) return p2p_bind_dgram(s, vm_read16(EA(addr) + 8));
     if (s_sockets[s].p2p) {
         /* P2P sockets live on this instance's P2P port (PS3_NET_P2P_PORT,
          * default 3658), whatever port the title names: that is the port psnr
          * hands to peers, and peers send straight to it. sockaddr_in_p2p keeps
-         * the vport at offset 8. */
+         * the vport at offset 8. On every interface, as p2p_open_port says. */
         s_sockets[s].vport = vm_read16(EA(addr) + 8);
         a.sin_port = htons(np_psnr_p2p_port());
-        /* ...on every interface. Titles bind the console's own IP (what
-         * cellNetCtl reports), and Windows then refuses to send from that
-         * socket to a peer on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons
-         * Arcade's every packet failed that way. The port is what peers use. */
         a.sin_addr.s_addr = htonl(INADDR_ANY);
         /* Every P2P stream socket shares that port, the listener and the ones
          * that connect out, as on a console. A connection's source port is
          * then the P2P port, and titles check it: Simpsons Arcade drops the
          * host's game setup when it arrives from any port but the one
          * signaling reported for the host. */
-        if (s_sockets[s].stream) {
-            int on = 1;
-            setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+        int on = 1;
+        setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
 #ifdef SO_REUSEPORT
-            setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
+        setsockopt(s_sockets[s].host_fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
 #endif
-        }
     }
     if (bind(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
         /* Last resort for a P2P stream socket that still can't share the
@@ -427,10 +701,6 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
     char ip[16];
     printf("[sys_net] bind(%d, %s:%u%s)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port),
            s_sockets[s].p2p ? ", p2p" : "");
-    if (s_sockets[s].p2p && !s_sockets[s].stream && s_p2p_dgram < 0) {
-        s_p2p_dgram = s;
-        np_psnr_set_p2p_sender(p2p_send);
-    }
     return 0;
 }
 
@@ -515,6 +785,14 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
+    if (p2p_dgram_bound(s)) {
+        /* A DGRAM_P2P "connect" only sets where send goes: its host socket is
+         * the loopback hand-off, which a host connect would cut off. */
+        s_sockets[s].peer = a;
+        s_sockets[s].peer_vport = vm_read16(EA(addr) + 8);
+        s_sockets[s].has_peer = 1;
+        return 0;
+    }
     if (s_sockets[s].p2p && s_sockets[s].stream && vm_read16(EA(addr) + 8)) {
         /* A stream P2P endpoint is (address, vport): titles put their own
          * constant in sin_port and the peer's P2P port -- what signaling
@@ -609,6 +887,10 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
+    if (p2p_dgram_bound(s)) {
+        if (!s_sockets[s].has_peer) return fail(SYS_NET_ENOTCONN);
+        return p2p_send_dgram(s, GUEST_PTR(EA(buf), const char*), len, &s_sockets[s].peer, s_sockets[s].peer_vport);
+    }
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0);
     if (net_trace()) trace("send", s, n, NULL);
@@ -624,6 +906,8 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
+    if (p2p_dgram_bound(s))
+        return p2p_send_dgram(s, GUEST_PTR(EA(buf), const char*), len, &a, vm_read16(EA(to) + 8));
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
@@ -638,6 +922,7 @@ int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
+    if (p2p_dgram_bound(s)) return p2p_recv_dgram(s, EA(buf), len, flags, 0, 0);
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
     int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
     if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
@@ -652,6 +937,7 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
     if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
+    if (p2p_dgram_bound(s)) return p2p_recv_dgram(s, EA(buf), len, flags, EA(from), EA(fromlen));
 
     /* psnr's own packets (probe replies, peers' punches) are consumed here;
      * the title only ever sees its own traffic. */
@@ -797,6 +1083,13 @@ int32_t sys_net_bnet_getsockname(int32_t s, sys_net_sockaddr* addr, uint32_t* ad
     struct sockaddr_in a;
     socklen_t len = sizeof(a);
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (p2p_dgram_bound(s)) {   /* the P2P port and its vport, not the loopback hand-off */
+        memset(&a, 0, sizeof(a));
+        a.sin_port = htons(s_p2p_bound_port);
+        write_sockaddr(EA(addr), EA(addrlen), &a);
+        if (EA(addr)) vm_write16(EA(addr) + 8, s_sockets[s].vport);
+        return 0;
+    }
     if (getsockname(s_sockets[s].host_fd, (struct sockaddr*)&a, &len) == HOST_SOCKET_ERROR)
         return host_fail();
     write_sockaddr(EA(addr), EA(addrlen), &a);
