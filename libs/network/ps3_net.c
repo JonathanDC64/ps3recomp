@@ -21,10 +21,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+static volatile int s_locked;
+
+void ps3_net_lock_offline(void)
+{
+    if (s_locked) return;
+    s_locked = 1;
+    printf("[net] locked offline for the rest of this run\n");
+}
+
+int ps3_net_locked_offline(void)
+{
+    return s_locked;
+}
+
 int ps3_net_online(void)
 {
     const char* v = getenv("PS3_NET_ONLINE");
-    return v && *v && strcmp(v, "0") != 0;
+    return !s_locked && v && *v && strcmp(v, "0") != 0;
 }
 
 /* ---- PS3_NET_HOSTS ---- */

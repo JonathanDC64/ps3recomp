@@ -2,7 +2,7 @@
  * ps3recomp - the connection to a psnr server. See np_psnr.h.
  */
 #include "np_psnr.h"
-#include "ps3emu/ps3_net.h"   /* ps3_net_online */
+#include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_locked_offline */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +56,18 @@ static int clean_online_id(const char* in, char out[17])
 }
 
 static char s_id[17];
-static int  s_id_state;     /* 0 unresolved, 1 a name applies, 2 none (offline) */
+static volatile int s_id_state;   /* 0 unresolved, 1 a name applies, 2 none (offline) */
+static const char*  s_flag_name;  /* --username, for the first lookup */
+
+#ifdef _WIN32
+static SRWLOCK s_id_lock = SRWLOCK_INIT;
+#  define ID_LOCK()   AcquireSRWLockExclusive(&s_id_lock)
+#  define ID_UNLOCK() ReleaseSRWLockExclusive(&s_id_lock)
+#else
+static pthread_mutex_t s_id_lock = PTHREAD_MUTEX_INITIALIZER;
+#  define ID_LOCK()   pthread_mutex_lock(&s_id_lock)
+#  define ID_UNLOCK() pthread_mutex_unlock(&s_id_lock)
+#endif
 
 void np_psnr_setup(const char* username, const char* server)
 {
@@ -66,9 +77,18 @@ void np_psnr_setup(const char* username, const char* server)
         set_env("PS3_NET_ONLINE", "1");
         set_env("PSNR_SERVER", server);
     }
-    /* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online
-     * only -- the OS login name. */
-    const char* named[2] = { username, getenv("PS3_NP_ONLINE_ID") };
+    /* The name itself is settled on first use (np_psnr_identity): main calls
+     * this before the title's options hook applies its settings, and a
+     * PS3_NP_ONLINE_ID or PS3_NET_ONLINE set there must count. */
+    s_flag_name = username;
+    s_id_state = 0;
+}
+
+/* The first valid one of: --username, PS3_NP_ONLINE_ID, and -- online only --
+ * the OS login name. */
+static void resolve_identity(void)
+{
+    const char* named[2] = { s_flag_name, getenv("PS3_NP_ONLINE_ID") };
     int found = 0;
     for (int i = 0; i < 2 && !found; i++) {
         if (!named[i] || !*named[i]) continue;
@@ -87,18 +107,28 @@ void np_psnr_setup(const char* username, const char* server)
         if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
     }
     s_id_state = 1;
-    printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? "" : " (offline)");
+    printf("[psnr] player \"%s\"%s\n", s_id, np_psnr_enabled() ? ""
+           : ps3_net_online() ? " (online, no psnr server)" : " (offline)");
 }
 
 const char* np_psnr_identity(void)
 {
-    if (!s_id_state) np_psnr_setup(NULL, NULL);
+    if (!s_id_state) {
+        ID_LOCK();
+        if (!s_id_state) resolve_identity();
+        ID_UNLOCK();
+    }
     return s_id_state == 1 ? s_id : NULL;
 }
 
 int np_psnr_enabled(void)
 {
     return ps3_net_online() && getenv("PSNR_SERVER");
+}
+
+int np_psnr_signed_in(void)
+{
+    return ps3_net_online() && np_psnr_identity() != NULL;
 }
 
 const char* np_psnr_online_id(void)
@@ -160,7 +190,7 @@ uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len,
 {
     uint32_t req = 0;
     LOCK();
-    if (s_client) {
+    if (s_client && !ps3_net_locked_offline()) {
         int slot = -1;
         for (int i = 0; i < PENDING_MAX; i++)
             if (!s_pending[i].req) { slot = i; break; }

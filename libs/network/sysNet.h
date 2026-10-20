@@ -38,6 +38,7 @@ extern "C" {
 #define SYS_NET_EMSGSIZE            40
 #define SYS_NET_EADDRINUSE          48
 #define SYS_NET_EADDRNOTAVAIL       49
+#define SYS_NET_ENETDOWN            50
 #define SYS_NET_ENETUNREACH         51
 #define SYS_NET_ECONNABORTED        53
 #define SYS_NET_ECONNRESET          54

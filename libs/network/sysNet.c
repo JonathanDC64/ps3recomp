@@ -52,7 +52,7 @@
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
 #include "np_psnr.h"   /* np_psnr_p2p_port, NAT traversal on the P2P socket */
-#include "ps3emu/ps3_net.h"   /* ps3_net_resolve: PS3_NET_HOSTS */
+#include "ps3emu/ps3_net.h"   /* ps3_net_resolve (PS3_NET_HOSTS), ps3_net_locked_offline */
 
 #include <stdio.h>
 #include <string.h>
@@ -282,6 +282,7 @@ int32_t sys_net_finalize_network(void)
 int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 {
     net_startup();
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (domain != SYS_NET_AF_INET) return fail(SYS_NET_EINVAL);
 
     int host_type;
@@ -362,7 +363,7 @@ static int s_p2p_dgram = -1;
 static int p2p_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
 {
     struct sockaddr_in a;
-    if (s_p2p_dgram < 0) return -1;
+    if (s_p2p_dgram < 0 || ps3_net_locked_offline()) return -1;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     memcpy(&a.sin_addr, ip, 4);
@@ -448,6 +449,7 @@ int32_t sys_net_bnet_accept(int32_t s, sys_net_sockaddr* addr, uint32_t* addrlen
     struct sockaddr_in a;
     socklen_t len = sizeof(a);
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
 
     host_socket_t fd = HOST_INVALID_SOCKET;
     if (s_sockets[s].p2p && s_sockets[s].stream && !s_sockets[s].nonblocking) {
@@ -511,6 +513,7 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
     (void)addrlen;
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (read_sockaddr(EA(addr), &a)) return fail(SYS_NET_EINVAL);
     if (s_sockets[s].p2p && s_sockets[s].stream && vm_read16(EA(addr) + 8)) {
         /* A stream P2P endpoint is (address, vport): titles put their own
@@ -605,6 +608,7 @@ static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
 int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = send(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, 0);
     if (net_trace()) trace("send", s, n, NULL);
@@ -617,6 +621,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     (void)tolen;
     struct sockaddr_in a;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (!to) return sys_net_bnet_send(s, buf, len, flags);   /* connected socket */
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
@@ -632,6 +637,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
 int32_t sys_net_bnet_recv(int32_t s, void* buf, uint32_t len, int32_t flags)
 {
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
     if (would_block(s, flags, POLLIN)) return fail(SYS_NET_EWOULDBLOCK);
     int n = recv(s_sockets[s].host_fd, GUEST_PTR(EA(buf), char*), (int)len, host_recv_flags(flags));
     if (net_trace() && n != HOST_SOCKET_ERROR) trace("recv", s, n, NULL);
@@ -645,6 +651,7 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     socklen_t alen;
     int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (ps3_net_locked_offline()) return fail(SYS_NET_ENETDOWN);
 
     /* psnr's own packets (probe replies, peers' punches) are consumed here;
      * the title only ever sees its own traffic. */

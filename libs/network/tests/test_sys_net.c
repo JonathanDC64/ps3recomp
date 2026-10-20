@@ -346,6 +346,15 @@ int main(void)
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
 
+    /* ps3_net_lock_offline: the network is down for good, even with
+     * PS3_NET_ONLINE still set. Sockets that exist can still be closed. */
+    ps3_net_lock_offline();
+    assert((uint32_t)C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0) == 0x80010232u);   /* ENETDOWN */
+    assert((uint32_t)call("send", c, BUF, 4, 0, 0, 0) == 0x80010232u && errno_cell() == SYS_NET_ENETDOWN);
+    assert((uint32_t)call("recv", srv, BUF, 16, 0, 0, 0) == 0x80010232u);
+    strcpy((char*)vm_base + STR, "localhost");
+    assert(call("gethostbyname", STR, 0, 0, 0, 0, 0) == 0);
+
     /* A bad fd is EBADF (9), and closing works. */
     assert((uint32_t)C1("socketclose", 99) == 0x80010209u && errno_cell() == SYS_NET_EBADF);
     assert(C1("socketclose", a) == 0 && C1("socketclose", b) == 0);

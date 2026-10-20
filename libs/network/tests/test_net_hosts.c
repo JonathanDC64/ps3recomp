@@ -104,6 +104,15 @@ int main(void)
     assert(!*resolve("other.test"));   /* said once: see the log */
     env("PS3_NET_HOSTS", "");
 
+    /* ps3_net_lock_offline: offline from then on, whatever the environment
+     * says, and calling it again changes nothing. */
+    assert(ps3_net_online() && !ps3_net_locked_offline());
+    ps3_net_lock_offline();
+    assert(!ps3_net_online() && ps3_net_locked_offline() && !*resolve("127.0.0.1"));
+    env("PS3_NET_ONLINE", "1");
+    ps3_net_lock_offline();
+    assert(!ps3_net_online() && !*resolve("localhost"));
+
     printf("test_net_hosts: all passed\n");
     return 0;
 }

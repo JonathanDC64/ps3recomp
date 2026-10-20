@@ -17,8 +17,16 @@
 extern "C" {
 #endif
 
-/* PS3_NET_ONLINE is on. Live. */
+/* PS3_NET_ONLINE is on and ps3_net_lock_offline() was never called. Live. */
 int ps3_net_online(void);
+
+/* Offline for the rest of the process, whatever the environment says later:
+ * cellNetCtl, NP (psnr and local sign-in), the sys_net host sockets and
+ * cellHttp all report no network. Sticky; for sessions that must never
+ * reach other players, such as one with dev cheats. Call it before the
+ * title starts to keep the host sockets from being registered at all. */
+void ps3_net_lock_offline(void);
+int  ps3_net_locked_offline(void);
 
 /* Look `host` up in a host map string. 1 and its address text in addr (cap
  * bytes) if an entry matches, 0 if none does. *bad, if given, counts the
