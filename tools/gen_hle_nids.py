@@ -32,12 +32,23 @@ DEF_RE = re.compile(
     re.M)
 
 
+# A firmware export whose name has none of those prefixes (cellL10n's
+# UTF8toUTF16) is registered when its definition follows a `/* HLE export */`
+# line. Opt-in, because such files also hold host-side helpers under
+# firmware-like names that take host pointers and must not be registered.
+EXPORT_RE = re.compile(r"^/\* HLE export \*/[ \t]*\r?\n[^;{]*?\b(\w+)\s*\(", re.M)
+
+
 def scan(c_path):
     txt = open(c_path, encoding="latin1").read()
     out = []
     for m in DEF_RE.finditer(txt):
         name = m.group(1)
         out.append((compute_nid(name), name))
+    for m in EXPORT_RE.finditer(txt):
+        name = m.group(1)
+        if all(name != n for _, n in out):
+            out.append((compute_nid(name), name))
     return out
 
 
