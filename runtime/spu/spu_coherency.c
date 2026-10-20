@@ -246,6 +246,30 @@ SPU_COH_LINE(int) g_spu_coh_armed_line;   /* own line, as g_lockline; exported a
 #define SPU_COH_MAX_CTX 8
 static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
 
+/* The line (ea & ~127) each slot's context reserved last, so a notify passes
+ * over the contexts whose reservation is on another line without reading
+ * them. spu_coh_notify_write looked at all eight on every store into a
+ * reserved line -- Demon's Souls' HighGraphics makes ~30,000 a frame, and the
+ * scan was 3.3% of that thread -- although nearly every store is to a line
+ * one context or none holds.
+ *
+ * Written only by the slot's own context, in spu_coh_reserve, before the
+ * GETLLAR sets resv_valid: under the line's stripe on the locked path, and
+ * before the StoreLoad fence of spu_lockline_read_ok on the lock-free one. A
+ * notifier holds the line's stripe, so it sees the hint of every reservation
+ * it has to break, by the argument that makes it see resv_valid (see
+ * spu_coh_notify_write). A hint is never cleared: a stale one names a line
+ * whose context then fails the full check, as before. On a cache line of its
+ * own, as it changes only when a context moves to another line. */
+typedef uint32_t spu_coh_hint_t[SPU_COH_MAX_CTX];
+static SPU_COH_LINE(spu_coh_hint_t) s_coh_hint;
+
+static void spu_coh_hint_set(int i, uint32_t line_ea)
+{
+    if (__atomic_load_n(&s_coh_hint.v[i], __ATOMIC_RELAXED) != line_ea)
+        __atomic_store_n(&s_coh_hint.v[i], line_ea, __ATOMIC_RELAXED);
+}
+
 unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
@@ -272,17 +296,25 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * runs during other threads' unregisters), and stopping at the first empty
      * slot registered a context a second time below its own entry. Unregister
      * cleared one; the other dangled once the context's stack was gone, and
-     * spu_coh_notify_write faulted on it. */
+     * spu_coh_notify_write faulted on it. The slot found or claimed takes
+     * the line's hint before the caller sets resv_valid. */
+    const uint32_t line_ea = ea & ~127u;
     for (int i = 0; i < SPU_COH_MAX_CTX; i++)
-        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
+        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) {
+            spu_coh_hint_set(i, line_ea);
+            return;
+        }
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
         spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
         if (c == NULL) {
             /* Claim the slot: another stripe's holder may be claiming it too. */
             spu_context* expect = NULL;
             if (__atomic_compare_exchange_n(&s_coh_ctxs[i], &expect, ctx, 0,
-                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return;
-            if (expect == ctx) return;
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ||
+                expect == ctx) {
+                spu_coh_hint_set(i, line_ea);
+                return;
+            }
         }
     }
     /* More live SPU contexts than the registry holds. The ones already in it
@@ -409,7 +441,21 @@ uint32_t spu_coh_rmw32(uint32_t ea, uint32_t set, uint32_t clr)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    /* Only the slots whose hint is this line (s_coh_hint). Every caller holds
+     * the line's stripe, taken with a locked RMW before this runs. A GETLLAR
+     * that took its reservation under the stripe released it after writing
+     * the hint; one that took it without the lock wrote the hint, fenced, and
+     * found the stripe word unchanged, so its fence came before our RMW and
+     * the hint is visible here. Either way a reservation this store has to
+     * break shows its line in the hint, unless its context has since begun a
+     * GETLLAR of another line: that GETLLAR replaces the reservation, and the
+     * store reads as one that landed after it. A reservation whose GETLLAR
+     * this store overlaps redoes its read under the stripe and sees the
+     * store. SPU_COH_HINT=0 (live) checks every context, as before. */
+    static int s_hint = -1;
+    PS3_KNOB(s_hint, ps3_env_int("SPU_COH_HINT", 1));
     for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+        if (s_hint && __atomic_load_n(&s_coh_hint.v[i], __ATOMIC_RELAXED) != line) continue;
         spu_context* c = s_coh_ctxs[i];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
