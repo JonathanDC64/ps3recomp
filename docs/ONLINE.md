@@ -57,7 +57,7 @@ stage starts, and the title drops the peer as "not responding". Set
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
 | sceNp manager | Reports ONLINE when online with psnr, or online with a player name; fires the manager callback once with that status. |
 | cellNetCtl | Connected only online. The net-start dialog reports `CELL_NET_CTL_ERROR_DIALOG_CANCELED` offline, 0 online. |
-| sys_net | P2P sockets map to plain UDP/TCP on `PS3_NET_P2P_PORT`. There is no vport multiplexing. |
+| sys_net | P2P sockets map to UDP/TCP on `PS3_NET_P2P_PORT`. Datagram P2P sockets share the port by vport: each datagram carries an 8-byte vport header (`VP01`, destination and source vport), so both peers need a runtime with it. Stream P2P sockets share the port as plain TCP. |
 
 ## How it was verified
 
@@ -78,8 +78,9 @@ shows its "sign in to post scores" notice, and plays Stage 1.
 
 Tests: `libs/network/tests/test_np_matching2.c` covers response relocation,
 attribute packing and the room structures a title reads. `test_sys_net.c`
-covers sockets over loopback, including a P2P bind and receive, and two P2P
-stream sockets sharing the port with the peer seeing that port on accept.
+covers sockets over loopback, including a P2P bind and receive, two datagram P2P
+sockets on different vports sharing the port, and two P2P stream sockets
+sharing the port with the peer seeing that port on accept.
 
 What it took to get the lobby up, each of which a title will hit:
 - **RoomMemberDataInternal layout.** userInfo is at +4 and memberId at +56,

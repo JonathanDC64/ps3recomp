@@ -245,6 +245,45 @@ int main(void)
         assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 4);
         assert(memcmp(vm_base + BUF, "game", 4) == 0);
     }
+
+    /* Two DGRAM_P2P sockets share the P2P port by vport (Demon's Souls binds
+     * two for a summon): a datagram reaches the socket bound to its
+     * destination vport only, and the receiver sees the sender's vport. */
+    {
+        int32_t p2 = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
+        put_sockaddr(ADDR_A, 0x0A000001u, 3658);
+        vm_write16(ADDR_A + 8, 2000);
+        assert(C3("bind", p2, ADDR_A, 16) == 0);
+        put_sockaddr(ADDR_A, LOOP, 36658);
+        vm_write16(ADDR_A + 8, 2000);
+        memcpy(vm_base + BUF, "to2000", 6);
+        assert(call("sendto", p2p, BUF, 6, 0, ADDR_A, 16) == 6);
+        vm_write32(POLLFD, (uint32_t)p2);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        vm_write32(LEN, 16);
+        assert(call("recvfrom", p2, BUF, 64, 0, ADDR_B, LEN) == 6);
+        assert(memcmp(vm_base + BUF, "to2000", 6) == 0);
+        assert(vm_read16(ADDR_B + 2) == 36658);   /* from the peer's P2P port */
+        assert(vm_read16(ADDR_B + 8) == 1000);    /* and its vport */
+        vm_write32(POLLFD, (uint32_t)p2p);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 100) == 0);   /* nothing for vport 1000 */
+
+        vm_write16(ADDR_A + 8, 1000);
+        memcpy(vm_base + BUF, "to1000", 6);
+        assert(call("sendto", p2, BUF, 6, 0, ADDR_A, 16) == 6);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        vm_write32(LEN, 16);
+        assert(call("recvfrom", p2p, BUF, 64, 0, ADDR_B, LEN) == 6);
+        assert(memcmp(vm_base + BUF, "to1000", 6) == 0);
+        assert(vm_read16(ADDR_B + 8) == 2000);
+        vm_write32(LEN, 16);
+        assert(C3("getsockname", p2, ADDR_B, LEN) == 0);
+        assert(vm_read16(ADDR_B + 2) == 36658 && vm_read16(ADDR_B + 8) == 2000);
+        assert(C1("socketclose", p2) == 0);
+        assert(s_sender);   /* the P2P port stays open while a DGRAM_P2P socket is bound */
+    }
     assert(C1("socketclose", p2p) == 0);
     assert(!s_sender);   /* closing it unregisters */
 
