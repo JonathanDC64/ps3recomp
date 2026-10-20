@@ -188,6 +188,69 @@ typedef struct IoMapping {
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;
 
+/* Every SPU PUT asks the mapping list whether it landed in RSX-visible memory
+ * (gcm_note_spu_put), and most land in no mapping at all, so the scan ran all
+ * 16 slots for nothing: 1.4% of Demon's Souls' busiest SPU thread. One bit per
+ * 1MB page answers those at once. A mapping's pages are marked after its slot
+ * is written, and stay marked when it is unmapped, so the bits are always a
+ * superset of what the list maps: a clear bit means the scan would find
+ * nothing. Only cellGcmInit and cellGcmTerminate clear them, after the list.
+ * Every writer of s_io_mappings marks the pages it adds (gcm_io_pages_mark).
+ *
+ * Threads: the mapping calls run on PPU threads while SPU threads read. The
+ * mark is a release OR after the slot's stores and the test an acquire load,
+ * so a reader that sees a bit sees the slot behind it. A PUT that races a map
+ * call may miss the new mapping, as the scan alone could; a PUT ordered after
+ * the call cannot, because a bit only goes from 0 to 1 until the list itself
+ * is cleared.
+ *
+ * GCM_SPU_PUT_FILTER (live): 1 (default) as above; 0 scans every mapping for
+ * every PUT, as before; 2 scans every PUT and reports a mapped PUT whose page
+ * bit is clear (a writer that does not mark; a PUT racing a map call can
+ * also show once). */
+#define GCM_IO_PAGE_WORDS (4096u / 64u)      /* 4 GiB of 1MB pages */
+static _Atomic(u64) s_io_pages[GCM_IO_PAGE_WORDS];
+
+static void gcm_io_pages_mark(u32 ea, u32 size)
+{
+    if (!size) return;                       /* the scan skips these */
+    /* A range past 4 GiB wraps in the scan's u32 sum and never matches there;
+     * marking up to the last page is only generous. */
+    const u64 end  = (u64)ea + size;
+    const u32 last = end > 0x100000000ull ? 4095u : (u32)((end - 1) >> 20);
+    for (u32 p = ea >> 20; p <= last; p++)
+        atomic_fetch_or_explicit(&s_io_pages[p >> 6], 1ull << (p & 63), memory_order_release);
+}
+
+static void gcm_io_pages_clear(void)
+{
+    for (u32 w = 0; w < GCM_IO_PAGE_WORDS; w++)
+        atomic_store_explicit(&s_io_pages[w], 0, memory_order_relaxed);
+}
+
+static int gcm_io_page_maybe(u32 ea)
+{
+    const u32 p = ea >> 20;
+    return (int)((atomic_load_explicit(&s_io_pages[p >> 6], memory_order_acquire) >> (p & 63)) & 1u);
+}
+
+static int gcm_put_filter_mode(void)
+{
+    static int mode = -1;
+    PS3_KNOB(mode, ps3_env_int("GCM_SPU_PUT_FILTER", 1));
+    return mode;
+}
+
+static void gcm_put_filter_miss(u32 ea, int slot)
+{
+    static int n = 0;
+    if (n >= 8) return;
+    n++;
+    printf("[cellGcmSys] GCM_SPU_PUT_FILTER: PUT to ea 0x%08X is in mapping %d "
+           "(ea 0x%08X, size 0x%X) but its page bit is clear\n",
+           ea, slot, s_io_mappings[slot].ea, s_io_mappings[slot].size);
+}
+
 /* Callback handlers — these are GUEST OPD addresses passed by the
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
@@ -443,6 +506,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    gcm_io_pages_clear();                    /* after the list (s_io_pages) */
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
@@ -496,6 +560,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mappings[0].size   = ioSize;
         s_io_mappings[0].active = 1;
         s_io_mapping_count = 1;
+        gcm_io_pages_mark(ioAddress, ioSize);
     }
 
     /* Zero the guest-visible control register (put/get/ref). */
@@ -1334,13 +1399,18 @@ static void gcm_ref_push_at(u32 v, u32 getoff);
 static struct { u32 io_start, io_end; } s_spu_blk[GCM_SPU_BLK_N];
 static int s_spu_blk_w = 0;
 
-/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
+/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact).
+ * A page no mapping has touched answers at once (s_io_pages). */
 static u32 gcm_ea2io_range(u32 ea, u32* room)
 {
+    const int filter = gcm_put_filter_mode();
+    const int maybe  = filter ? gcm_io_page_maybe(ea) : 1;
+    if (!maybe && filter != 2) return 0xFFFFFFFFu;
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
         IoMapping* m = &s_io_mappings[i];
         if (!m->active || !m->size) continue;
         if (ea >= m->ea && ea < m->ea + m->size) {
+            if (!maybe) gcm_put_filter_miss(ea, i);
             if (room) *room = m->ea + m->size - ea;
             return m->io + (ea - m->ea);
         }
@@ -2972,6 +3042,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         if (m) {
             m->ea = ea_page; m->io = io; m->size = 0x100000u; m->active = 1;
             s_io_mapping_count++;
+            gcm_io_pages_mark(ea_page, 0x100000u);
         } else {
             printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
                    "the FIFO will not be able to walk io 0x%08X\n", io);
@@ -3048,6 +3119,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     mapping->size   = size;
     mapping->active = 1;
     s_io_mapping_count++;
+    gcm_io_pages_mark(ea, size);
 
     populate_offset_table(ea, io_offset, size);
 
@@ -3087,6 +3159,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     mapping->size   = size;
     mapping->active = 1;
     s_io_mapping_count++;
+    gcm_io_pages_mark(ea, size);
 
     populate_offset_table(ea, io, size);
 
@@ -3103,7 +3176,7 @@ s32 cellGcmUnmapEaIoAddress(u32 ea)
     printf("[cellGcmSys] UnmapEaIoAddress(ea=0x%08X)\n", ea);
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
-    mapping->active = 0;
+    mapping->active = 0;                     /* its page bits stay set (s_io_pages) */
     s_io_mapping_count--;
 
     return CELL_OK;
@@ -3119,7 +3192,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
     printf("[cellGcmSys] UnmapIoAddress(io=0x%08X)\n", io);
 
     clear_offset_table(mapping->ea, mapping->io, mapping->size);
-    mapping->active = 0;
+    mapping->active = 0;                     /* its page bits stay set (s_io_pages) */
     s_io_mapping_count--;
 
     return CELL_OK;
@@ -3534,6 +3607,7 @@ void cellGcmTerminate(void)
     memset(&s_config, 0, sizeof(s_config));
     memset(&s_control, 0, sizeof(s_control));
     memset(s_io_mappings, 0, sizeof(s_io_mappings));
+    gcm_io_pages_clear();                    /* after the list (s_io_pages) */
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
@@ -3882,6 +3956,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
         s_io_mappings[s_io_mapping_count].size   = size;
         s_io_mappings[s_io_mapping_count].active = 1;
         s_io_mapping_count++;
+        gcm_io_pages_mark(ea, size);
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
 }
@@ -4169,6 +4244,8 @@ int cellGcm_replay_load(const char* file, u32** methods)
         free(b);
     }
     fclose(f);
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)   /* the restored list (s_io_pages) */
+        if (s_io_mappings[i].active) gcm_io_pages_mark(s_io_mappings[i].ea, s_io_mappings[i].size);
     s_rcap_state0 = s_state;
     s_inited = 1;
     s_gcm_initialized = 1;
