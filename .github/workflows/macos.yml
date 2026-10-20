@@ -86,6 +86,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
+      # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
+      # big-endian units, the byte count returned.
+      - name: Run the cellL10n test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_l10n libs/font/tests/test_l10n.c
+          /tmp/test_l10n
+
       # Matching2 over psnr without a server: response relocation, attribute
       # packing, and the room structs a title reads.
       - name: Run the Matching2 test

@@ -61,9 +61,12 @@ extern "C" {
  * Single-character conversion
  * -----------------------------------------------------------------------*/
 
-/* UTF-8 <-> UTF-16 */
-s32 UTF8toUTF16(const u8* utf8, u32 utf8_len,
-                u16* utf16, u32* utf16_len);
+/* UTF-8 <-> UTF-16. The firmware's UTF8toUTF16 converts ONE character at
+ * guest addresses (see cellL10n.c); this host-side string helper backs the
+ * library's own string conversions. */
+s32 l10n_utf8_to_utf16(const u8* utf8, u32 utf8_len,
+                       u16* utf16, u32* utf16_len);
+s32 UTF8toUTF16(u32 src_addr, u32 dst_addr, u32 dst_len_addr);
 s32 UTF16toUTF8(const u16* utf16, u32 utf16_len,
                 u8* utf8, u32* utf8_len);
 
