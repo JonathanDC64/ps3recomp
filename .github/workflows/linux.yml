@@ -112,6 +112,13 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
+      # cellHttp end to end on loopback: guest pointers, the network gate, and
+      # PS3_HTTP_HEADER's extra header.
+      - name: Run the cellHttp loopback test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c
+          /tmp/test_http_loopback
+
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
       # big-endian units, the byte count returned.
       - name: Run the cellL10n test
