@@ -12,6 +12,7 @@
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_resolve */
+#include "ps3emu/endian.h"    /* ps3_bswap32 */
 
 /* ---------------------------------------------------------------------------
  * Platform socket abstraction
@@ -350,7 +351,7 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
             s_clients[i].connect_timeout = 30000000;
             s_clients[i].send_timeout    = 120000000;
             s_clients[i].recv_timeout    = 120000000;
-            *clientId_h = i;
+            *clientId_h = ps3_bswap32(i);   /* guest big-endian */
             printf("[cellHttp] CreateClient(id=%u)\n", i);
             return CELL_OK;
         }
@@ -389,14 +390,15 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
     if (!method || !uri || !transId)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    /* CellHttpUri is { const char* scheme, hostname, path, username,
-     * password; u32 port; } -- five 4-byte EAs then the port, twenty bytes
-     * to the guest against forty to us, so nothing but scheme lines up if
-     * you cast. Pull each field out by guest offset. */
+    /* CellHttpUri is { const char* scheme, hostname, username, password,
+     * path; u32 port; u8 reserved[4]; } -- five 4-byte EAs, then the port,
+     * so nothing but scheme lines up if you cast. Pull each field out by
+     * guest offset: the path is at +16 (+8, the username, is usually NULL,
+     * which sent every request as "GET /"). */
     u32 uri_ea = (u32)(uintptr_t)uri;
     u32 ea_scheme   = vm_read32(uri_ea +  0);
     u32 ea_hostname = vm_read32(uri_ea +  4);
-    u32 ea_path     = vm_read32(uri_ea +  8);
+    u32 ea_path     = vm_read32(uri_ea + 16);
     u32 uri_port    = vm_read32(uri_ea + 20);
     const char* uri_scheme   = ea_scheme   ? (const char*)(vm_base + ea_scheme)   : NULL;
     const char* uri_hostname = ea_hostname ? (const char*)(vm_base + ea_hostname) : NULL;
@@ -564,7 +566,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
 
     /* ---- Send body if provided ---- */
     if (buf && size > 0) {
-        if (http_send_all(sock, (const char*)buf, size) != 0) {
+        if (http_send_all(sock, GUEST_PTR(buf, const char*), size) != 0) {
             printf("[cellHttp]   Failed to send request body\n");
             http_closesocket(sock);
             if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
@@ -707,7 +709,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         if (want == 0)
             break;
 
-        int n = recv(t->sock, (char*)buf + filled, (int)want, 0);
+        int n = recv(t->sock, GUEST_PTR(buf, char*) + filled, (int)want, 0);
         if (n < 0) {
             /* Error - if we already have some data, return it */
             if (filled > 0)
@@ -878,7 +880,7 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
     t->custom_header_count++;
 
     printf("[cellHttp] AddRequestHeader(trans=%u, '%s: %s')\n",
-           transId, name, value);
+           transId, h->name, h->value);
     return CELL_OK;
 }
 

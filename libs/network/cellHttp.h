@@ -62,13 +62,15 @@ extern "C" {
 typedef u32 CellHttpClientId;
 typedef u32 CellHttpTransId;
 
+/* Guest order; only ever a pointer here (cellHttp.c reads it by guest offset). */
 typedef struct CellHttpUri {
     const char* scheme;
     const char* hostname;
-    const char* path;
     const char* username;
     const char* password;
+    const char* path;
     u32         port;
+    u8          reserved[4];
 } CellHttpUri;
 
 /* Max number of concurrent clients and transactions */
