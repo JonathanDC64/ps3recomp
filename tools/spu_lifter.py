@@ -257,6 +257,8 @@ class LiftedFunction:
     lifted: set = None
     # --native-block starts in this body -> (end, host function).
     blocks: dict = None
+    # --bi-switch sites in this body -> their distinct table targets.
+    bisw: dict = None
 
     def holds(self, tgt: int) -> bool:
         """Whether a branch to `tgt` can be a goto inside this body."""
@@ -564,6 +566,13 @@ class SPULifter:
         # place of the instructions [start, end) of a region body; see
         # lift_region.
         self.native_blocks: dict = {}
+        # --bi-switch: address of a jump-table `bi` -> (table address, entry
+        # count); see _bi_switch_targets. `image` is (code bytes, base address),
+        # to read the tables from, and `bisw_targets` collects every target of
+        # the image for the table the runtime verifies (emit_source).
+        self.bi_switch: dict = {}
+        self.image = None
+        self.bisw_targets: set = set()
         # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
         # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
         # set => every `bi $r0` is a return (the prior behaviour).
@@ -669,6 +678,13 @@ class SPULifter:
                                      f"not in the same region body as the start")
                 labels.update((a, e))
                 func.blocks[a] = (e, sym)
+        # A jump-table `bi` becomes a switch of gotos to its targets, which are
+        # entries of this body and so labels already.
+        func.bisw = {}
+        for a, (tab, n) in self.bi_switch.items():
+            if a in func.lifted:
+                func.bisw[a] = self._bi_switch_targets(a, tab, n, func, by_addr)
+                self.bisw_targets.update(func.bisw[a])
 
         for k, (s, e) in enumerate(rbounds):
             nxt = rbounds[k + 1][0] if k + 1 < len(rbounds) else None
@@ -720,6 +736,60 @@ class SPULifter:
 
         self.functions.append(func)
         return func
+
+    def _bi_switch_targets(self, a: int, tab: int, n: int, func: LiftedFunction,
+                           by_addr: dict) -> list:
+        """--bi-switch: the distinct targets of the n-word jump table at `tab`
+        that the `bi` at `a` dispatches through, in address order.
+
+        The lift stops with an error unless every case can be a region goto
+        that reaches what spu_indirect_branch would: the instruction is a plain
+        `bi` through a register (not a return, no interrupt enable/disable),
+        and each target is an entry of this body (a label with its exported
+        function, which is what the dispatch finds for that address and what
+        SPU_RGOTO falls back to) that does not follow a call. An address right
+        after a brsl/bisl is a return address, and the drain loop returns there
+        instead of dispatching."""
+        def refuse(why):
+            raise SystemExit(f"--bi-switch 0x{a:X}=0x{tab:X}:{n}: {why}")
+        insn = by_addr.get(a)
+        if insn is None or insn.mnemonic != "bi":
+            refuse("there is no `bi` at that address")
+        if insn.raw & 0xC0000:
+            refuse("that `bi` enables or disables interrupts")
+        if ((_bi_target_reg(insn) == "0" and a not in self.bi_r0_jump)
+                or a in self.link_return):
+            refuse("that `bi` is lifted as a return")
+        data, base = self.image
+        off = tab - base
+        if n <= 0 or off < 0 or off + 4 * n > len(data):
+            refuse("the table is not inside the image")
+        tgts = []
+        for k in range(n):
+            t = int.from_bytes(data[off + 4 * k:off + 4 * k + 4], "big") & 0x3FFFF
+            if t not in tgts:
+                tgts.append(t)
+        for t in tgts:
+            if t == 0 or t & 3:
+                refuse(f"table word 0x{t:X} is not a code address")
+            if t not in func.entries:
+                refuse(f"target 0x{t:X} is not an entry of the region body "
+                       f"that holds the `bi`")
+            prev = by_addr.get(t - 4)
+            if prev is not None and (prev.mnemonic in ("brsl", "brasl")
+                                     or prev.mnemonic.startswith("bisl")):
+                refuse(f"target 0x{t:X} follows a call (a return address)")
+        return sorted(tgts)
+
+    def _bi_switch(self, reg: str, tgts: list) -> str:
+        """The switch emitted ahead of the indirect dispatch of a --bi-switch
+        `bi` (spu_bi_switch_on, runtime/spu/spu_bi_switch.h)."""
+        nl = "\n        "
+        cases = [f"case 0x{t:X}u: SPU_RGOTO(ctx, 0x{t:X}u, "
+                 f"{self.prefix}spu_func_{t:08X}, loc_{t:08X});" for t in tgts]
+        return (f"if (spu_bi_switch_on(ctx, s_bisw_self, &s_bisw_ok, s_bisw_targets, "
+                f"S_BISW_N)) switch (ctx->gpr[{reg}]._u32[0] & SPU_LS_MASK) {{"
+                + nl + nl.join(cases) + nl + "default: break;" + nl + "}" + nl)
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -1087,7 +1157,9 @@ class SPULifter:
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            # A --bi-switch jump table first tries a goto to each of its targets.
+            sw = self._bi_switch(tgt_reg, func.bisw[addr]) if func.bisw and addr in func.bisw else ""
+            return (f"{sw}{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
@@ -1226,6 +1298,20 @@ class SPULifter:
 
     def emit_source(self,header_name: str) -> str:
         lines = [SOURCE_PREAMBLE.format(header_name=header_name), ""]
+        if self.bisw_targets:
+            lines.append('#include "../../runtime/spu/spu_bi_switch.h"')
+            lines.append("")
+            lines.append("/* --bi-switch: this image's id (set at registration) and every")
+            lines.append(" * jump-table target, which spu_bi_switch_verify checks once")
+            lines.append(" * against the function table (runtime/spu/spu_bi_switch.h). */")
+            lines.append("static int s_bisw_self;")
+            lines.append("static int s_bisw_ok = -1;")
+            lines.append("static const spu_bi_target s_bisw_targets[] = {")
+            for t in sorted(self.bisw_targets):
+                lines.append(f"    {{ 0x{t:X}u, {self.prefix}spu_func_{t:08X} }},")
+            lines.append("};")
+            lines.append("#define S_BISW_N ((unsigned)(sizeof s_bisw_targets / sizeof s_bisw_targets[0]))")
+            lines.append("")
         for f in self.functions:
             if f.entries is not None:
                 self._emit_region(f, lines)
@@ -1270,6 +1356,8 @@ class SPULifter:
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
+        if self.bisw_targets:
+            lines.append("    s_bisw_self = spu_registering_image();")
         lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
         lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
@@ -1348,6 +1436,16 @@ def main() -> None:
                         "channel as they would, and the lifted code goes on at END; 0 "
                         "runs the instructions. For a hot step whose runtime calls "
                         "have a cheaper equivalent (runtime/spu/spu_ring_hook.c).")
+    p.add_argument("--bi-switch", action="append", default=[], metavar="ADDR=TABLE:COUNT",
+                   help="--regions only: the `bi` at ADDR dispatches through the COUNT "
+                        "big-endian words of the jump table at TABLE. Its targets must be "
+                        "entries of the region body that holds the `bi`; the lift stops "
+                        "with an error otherwise. The `bi` is lifted as a switch of region "
+                        "gotos to those targets, taken when spu_bi_switch_on says the "
+                        "indirect dispatch would reach the same function "
+                        "(runtime/spu/spu_bi_switch.h), then the usual dispatch for any "
+                        "other value. SPU_BI_SWITCH=0 (live) turns the gotos off. "
+                        "Repeatable.")
     p.add_argument("--native-hook", action="append", default=[], metavar="ADDR=SYMBOL",
                    help="Run host function `int SYMBOL(spu_context*)` at the entry "
                         "of the function at ADDR. When it returns nonzero it has "
@@ -1482,6 +1580,16 @@ def main() -> None:
         if not args.regions:
             p.error("--native-block needs --regions")
         lifter.native_blocks[int(a, 0)] = (int(e, 0), sym)
+    for h in args.bi_switch:
+        site, _, tab = h.partition("=")
+        tab, _, cnt = tab.partition(":")
+        try:
+            lifter.bi_switch[int(site, 0)] = (int(tab, 0), int(cnt, 0))
+        except ValueError:
+            p.error(f"--bi-switch {h!r}: expected ADDR=TABLE:COUNT")
+        if not args.regions:
+            p.error("--bi-switch needs --regions")
+    lifter.image = (data, base)
     missing = set(lifter.native_hooks) - {s for s, e in bounds}
     if missing:
         p.error("--native-hook: no function starts at " +
@@ -1511,6 +1619,14 @@ def main() -> None:
         for r in regions:
             lifter.lift_region(insns, r)
         print(f"  --regions: {len(bounds)} function(s) in {len(regions)} body(ies)")
+        found = {a for f in lifter.functions for a in (f.bisw or {})}
+        lost = set(lifter.bi_switch) - found
+        if lost:
+            p.error("--bi-switch: no instruction at " +
+                    ", ".join(f"0x{a:X}" for a in sorted(lost)) + " in any region body")
+        if found:
+            print(f"  --bi-switch: {len(found)} jump table(s), "
+                  f"{len(lifter.bisw_targets)} target(s)")
     else:
         for s, e in bounds:
             lifter.lift_function(insns, s, e)

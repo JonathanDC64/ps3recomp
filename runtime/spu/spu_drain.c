@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_bi_switch.h"
 #include "ps3emu/ps3_knob.h"
 #include <setjmp.h>
 
@@ -72,8 +73,12 @@ static unsigned s_step_diag_gen = ~0u;
  * while anything below needs to see every hop. 1 until the first step has
  * read the knobs. SPU_TAILRET and SPU_PCHIST are SPU_DRAIN's per-hop work. */
 volatile int g_spu_goto_slow = 1;
+/* Jump-table gotos (spu_lifter --bi-switch, spu_bi_switch.h): on unless
+ * SPU_BI_SWITCH=0, read with the other knobs; 0 until then. */
+volatile int g_spu_bi_switch = 0;
 static void spu_step_diag_load(void)
 {
+    { const char* e = getenv("SPU_BI_SWITCH"); g_spu_bi_switch = !(e && e[0] == '0'); }
     s_step_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
     s_step_diag = (getenv("SPU_EXITTRACE") || getenv("SPU_STEPTRACE") ||
                    getenv("SPU_JOBDRAIN")) ? 1 : 0;
