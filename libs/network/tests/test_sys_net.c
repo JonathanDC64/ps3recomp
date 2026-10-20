@@ -11,6 +11,7 @@
  */
 
 #include "../sysNet.c"
+#include "../ps3_net.c"
 
 #include <assert.h>
 
@@ -109,8 +110,19 @@ static void put_sockaddr(uint32_t ea, uint32_t ip_be, uint16_t port)
     vm_write32(ea + 4, ip_be);
 }
 
+static void env(const char* k, const char* v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    if (*v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
 int main(void)
 {
+    env("PS3_NET_ONLINE", "1");   /* the host sockets are the online path */
+    env("PS3_NET_HOSTS", "");
     vm_base = (uint8_t*)calloc(1, 1u << 20);
     ps3_net_host_register(bump_alloc);
     assert(s_reg[0].nid == 0x9C056962u);   /* "socket", as nid_database.py has it */
@@ -185,6 +197,18 @@ int main(void)
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
     assert(vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);   /* *h_addr_list[0] */
+
+    /* PS3_NET_HOSTS: a listed name resolves through it (any case), and while
+     * it is set an unlisted one doesn't, though the OS could resolve it. */
+    env("PS3_NET_HOSTS", "game.test=127.0.0.1");
+    strcpy((char*)vm_base + STR, "GAME.Test");
+    h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+    assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);
+    assert(strcmp((const char*)vm_base + vm_read32(h), "GAME.Test") == 0);   /* h_name: the name asked */
+    strcpy((char*)vm_base + STR, "localhost");
+    assert(call("gethostbyname", STR, 0, 0, 0, 0, 0) == 0);
+    assert(vm_read32((uint32_t)call("_sys_net_h_errno_loc", 0, 0, 0, 0, 0, 0)) == SYS_NET_HOST_NOT_FOUND);
+    env("PS3_NET_HOSTS", "");
 
     /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
      * socket lands on this instance's P2P port on every interface, so a peer

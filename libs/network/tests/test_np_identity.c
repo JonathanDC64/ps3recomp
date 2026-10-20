@@ -6,6 +6,7 @@
  */
 #include "../psnr/psnr.c"
 #include "../np_psnr.c"
+#include "../ps3_net.c"
 
 #include <assert.h>
 

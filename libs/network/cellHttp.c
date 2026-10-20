@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_resolve */
 
 /* ---------------------------------------------------------------------------
  * Platform socket abstraction
@@ -485,30 +486,27 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     http_close_slot_socket(t);
 
     /* ---- Resolve hostname ---- */
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", t->port);
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    struct addrinfo* result = NULL;
-    int gai = getaddrinfo(t->hostname, port_str, &hints, &result);
-    if (gai != 0 || !result) {
-        printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
-        if (result) freeaddrinfo(result);
+    /* Offline (PS3_NET_ONLINE unset) nothing leaves the PC, and online the
+     * name goes through PS3_NET_HOSTS when it is set (ps3emu/ps3_net.h). */
+    if (!ps3_net_online()) {
+        printf("[cellHttp]   offline: no connection to '%s'\n", t->hostname);
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+        return CELL_HTTP_ERROR_CONNECTION_FAILED;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((u16)t->port);
+    if (ps3_net_resolve(t->hostname, (uint8_t*)&addr.sin_addr) != 0) {
+        printf("[cellHttp]   could not resolve '%s'\n", t->hostname);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
     /* ---- Create socket and connect ---- */
-    http_socket_t sock = socket(result->ai_family, result->ai_socktype,
-                                result->ai_protocol);
+    http_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == HTTP_INVALID_SOCKET) {
         printf("[cellHttp]   socket() failed\n");
-        freeaddrinfo(result);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
@@ -518,15 +516,13 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     http_apply_timeout(sock, 1, c->send_timeout);
     http_apply_timeout(sock, 0, c->recv_timeout);
 
-    if (connect(sock, result->ai_addr, (int)result->ai_addrlen) != 0) {
+    if (connect(sock, (struct sockaddr*)&addr, (int)sizeof(addr)) != 0) {
         printf("[cellHttp]   connect() failed to %s:%u\n", t->hostname, t->port);
         http_closesocket(sock);
-        freeaddrinfo(result);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
-    freeaddrinfo(result);
     printf("[cellHttp]   Connected to %s:%u\n", t->hostname, t->port);
 
     /* ---- Format HTTP request ---- */

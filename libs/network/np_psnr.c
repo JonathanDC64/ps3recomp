@@ -2,6 +2,7 @@
  * ps3recomp - the connection to a psnr server. See np_psnr.h.
  */
 #include "np_psnr.h"
+#include "ps3emu/ps3_net.h"   /* ps3_net_online */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,7 +98,7 @@ const char* np_psnr_identity(void)
 
 int np_psnr_enabled(void)
 {
-    return getenv("PS3_NET_ONLINE") && getenv("PSNR_SERVER");
+    return ps3_net_online() && getenv("PSNR_SERVER");
 }
 
 const char* np_psnr_online_id(void)

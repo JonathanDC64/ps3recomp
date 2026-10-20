@@ -52,6 +52,7 @@
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../include/ps3emu/nid.h"
 #include "np_psnr.h"   /* np_psnr_p2p_port, NAT traversal on the P2P socket */
+#include "ps3emu/ps3_net.h"   /* ps3_net_resolve: PS3_NET_HOSTS */
 
 #include <stdio.h>
 #include <string.h>
@@ -963,17 +964,15 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
 {
     const char* host = GUEST_PTR(EA(name), const char*);
     uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
-    struct addrinfo hints, *res = NULL;
+    struct in_addr addr;
     if (!host || !h) return 0;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+    /* Through PS3_NET_HOSTS when it is set (ps3emu/ps3_net.h). */
+    if (ps3_net_resolve(host, (uint8_t*)&addr) != 0) {
         printf("[sys_net] gethostbyname('%s') failed\n", host);
         if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
         return 0;
     }
-    const struct sockaddr_in* sa = (const struct sockaddr_in*)res->ai_addr;
 
     memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
     vm_write32(h + 0,  h + 64);           /* h_name */
@@ -982,12 +981,11 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     vm_write32(h + 12, 4);                /* h_length */
     vm_write32(h + 16, h + 40);           /* h_addr_list -> { &addr, NULL } */
     vm_write32(h + 40, h + 48);
-    memcpy(vm_ptr8(h + 48), &sa->sin_addr, 4);
+    memcpy(vm_ptr8(h + 48), &addr, 4);
     strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
 
     char ip[16];
-    printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
-    freeaddrinfo(res);
+    printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&addr, ip));
     return h;
 }
 

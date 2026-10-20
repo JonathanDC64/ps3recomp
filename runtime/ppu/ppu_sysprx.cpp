@@ -12,6 +12,7 @@
  */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
+#include "ps3emu/ps3_net.h" /* ps3_net_online */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -896,8 +897,8 @@ extern "C" void ppu_sysprx_register(void)
 
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the
-     * offline model below; without the variable nothing changes. */
-    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
+     * offline model below; offline nothing changes. */
+    if (ps3_net_online()) ps3_net_host_register(gcm_guest_alloc);
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();

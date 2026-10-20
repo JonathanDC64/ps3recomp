@@ -6,7 +6,7 @@
  */
 
 #include "cellNetCtl.h"
-#include "ps3emu/ps3_knob.h"
+#include "ps3emu/ps3_net.h"  /* ps3_net_online */
 #include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
@@ -45,9 +45,7 @@ static int s_netctl_initialized = 0;
  * fake-connected behaviour for online experiments. */
 static int netctl_online(void)
 {
-    static int v = -1;
-    PS3_KNOB(v, getenv("PS3_NET_ONLINE") ? 1 : 0);
-    return v;
+    return ps3_net_online();   /* live */
 }
 
 typedef struct {
