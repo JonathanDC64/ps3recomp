@@ -38,128 +38,126 @@ static int is_unreserved(u8 c)
  * URL parsing
  * -----------------------------------------------------------------------*/
 
-s32 cellHttpUtilParseUri(CellHttpUtilUri* uri, const char* url,
-                          void* pool, u32 poolSize, u32* required)
+/* The SDK's contract (cellHttpUtilParseUri(CellHttpUri*, const char*, void*
+ * pool, u32 size, u32* required)): CellHttpUri is five guest string pointers
+ * (scheme, hostname, username, password, path) and a u32 port, and the strings
+ * live in the caller's pool. Titles call it twice: with uri NULL to learn the
+ * pool size from *required, then with a pool of that size. Demon's Souls does
+ * exactly that before every cellHttpCreateTransaction. The path keeps the query
+ * (it is what goes on the request line); a fragment is dropped. */
+s32 cellHttpUtilParseUri(struct CellHttpUri* uri, const char* str,
+                          void* pool, u32 size, u32* required)
 {
-    (void)pool;
-    (void)poolSize;
-    (void)required;
+    u32 uri_ea  = (u32)(uintptr_t)uri;
+    u32 pool_ea = (u32)(uintptr_t)pool;
+    u32 req_ea  = (u32)(uintptr_t)required;
 
-    if (!uri || !url)
-        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_PARAM;
+    if (!str)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_STRING;
+    if ((!pool_ea || !uri_ea) && !req_ea)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
 
-    /* CellHttpUtilUri is seven char arrays and a trailing u32: the guest
-     * layout is identical to ours, so the strings can be written straight
-     * through the translated pointer and only `port` needs a byte swap.
-     * It is parsed into a local and stored once at the end. */
-    u32 uri_ea = (u32)(uintptr_t)uri;
-    u32 port = 0;
-    uri = GUEST_PTR(uri, CellHttpUtilUri*);
-    url = GUEST_PTR(url, const char*);
+    const char* p = GUEST_PTR(str, const char*);
 
-    memset(uri, 0, sizeof(CellHttpUtilUri));
-    port = 0;
-
-    const char* p = url;
-
-    /* Scheme (http, https, etc.) */
-    const char* colon = strstr(p, "://");
-    if (colon) {
-        u32 scheme_len = (u32)(colon - p);
-        if (scheme_len >= sizeof(uri->scheme))
-            scheme_len = sizeof(uri->scheme) - 1;
-        memcpy(uri->scheme, p, scheme_len);
-        uri->scheme[scheme_len] = '\0';
-        p = colon + 3;
+    /* scheme "://" */
+    const char* sep = strstr(p, "://");
+    if (!sep || sep == p)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
+    const char* scheme = p;
+    u32 scheme_len = (u32)(sep - p);
+    for (u32 i = 0; i < scheme_len; i++) {
+        char c = scheme[i];
+        if (!isalnum((unsigned char)c) && c != '+' && c != '-' && c != '.')
+            return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
     }
 
-    /* User info (user:pass@) */
-    const char* at = strchr(p, '@');
-    const char* slash = strchr(p, '/');
-    if (at && (!slash || at < slash)) {
-        const char* user_colon = strchr(p, ':');
-        if (user_colon && user_colon < at) {
-            u32 ulen = (u32)(user_colon - p);
-            if (ulen >= sizeof(uri->username)) ulen = sizeof(uri->username) - 1;
-            memcpy(uri->username, p, ulen);
-
-            u32 plen = (u32)(at - user_colon - 1);
-            if (plen >= sizeof(uri->password)) plen = sizeof(uri->password) - 1;
-            memcpy(uri->password, user_colon + 1, plen);
-        } else {
-            u32 ulen = (u32)(at - p);
-            if (ulen >= sizeof(uri->username)) ulen = sizeof(uri->username) - 1;
-            memcpy(uri->username, p, ulen);
+    /* authority: [user[:pass]@]host[:port], up to the path, query or fragment */
+    const char* auth = sep + 3;
+    const char* auth_end = auth + strcspn(auth, "/?#");
+    const char* user = NULL; u32 user_len = 0;
+    const char* pass = NULL; u32 pass_len = 0;
+    const char* at = NULL;
+    for (const char* q = auth; q < auth_end; q++)
+        if (*q == '@') at = q;
+    const char* host = auth;
+    if (at) {
+        const char* colon = memchr(auth, ':', (size_t)(at - auth));
+        user = auth;
+        user_len = (u32)((colon ? colon : at) - auth);
+        if (colon) { pass = colon + 1; pass_len = (u32)(at - pass); }
+        host = at + 1;
+    }
+    const char* host_end = auth_end;
+    const char* port_str = NULL;
+    if (*host == '[') {                         /* IPv6 literal */
+        const char* rb = memchr(host, ']', (size_t)(auth_end - host));
+        if (!rb) return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
+        host_end = rb + 1;
+        if (host_end < auth_end) {
+            if (*host_end != ':') return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
+            port_str = host_end + 1;
         }
-        p = at + 1;
+    } else {
+        const char* colon = memchr(host, ':', (size_t)(auth_end - host));
+        if (colon) { host_end = colon; port_str = colon + 1; }
     }
+    u32 host_len = (u32)(host_end - host);
+    if (host_len == 0)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
 
-    /* Hostname and port */
-    const char* host_end = p;
-    while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != '#')
-        host_end++;
-
-    /* Check for port */
-    const char* port_colon = NULL;
-    for (const char* c = p; c < host_end; c++) {
-        if (*c == ':') port_colon = c;
-    }
-
-    if (port_colon) {
-        u32 hlen = (u32)(port_colon - p);
-        if (hlen >= sizeof(uri->hostname)) hlen = sizeof(uri->hostname) - 1;
-        memcpy(uri->hostname, p, hlen);
-
+    u32 port;
+    if (port_str && port_str < auth_end) {
         port = 0;
-        for (const char* c = port_colon + 1; c < host_end; c++)
-            port = port * 10 + (*c - '0');
+        for (const char* q = port_str; q < auth_end; q++) {
+            if (*q < '0' || *q > '9' || port > 65535)
+                return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
+            port = port * 10 + (u32)(*q - '0');
+        }
+        if (port > 65535)
+            return (s32)CELL_HTTP_UTIL_ERROR_INVALID_URI;
     } else {
-        u32 hlen = (u32)(host_end - p);
-        if (hlen >= sizeof(uri->hostname)) hlen = sizeof(uri->hostname) - 1;
-        memcpy(uri->hostname, p, hlen);
-
-        /* Default ports */
-        if (strcmp(uri->scheme, "https") == 0)
-            port = 443;
-        else if (strcmp(uri->scheme, "http") == 0)
-            port = 80;
+        port = (scheme_len == 5 && strncmp(scheme, "https", 5) == 0) ? 443 : 80;
     }
 
-    p = host_end;
+    /* path (with query), "/" when the URL has none */
+    const char* path = auth_end;
+    u32 path_len = (u32)strcspn(path, "#");
+    int add_slash = (path_len == 0 || path[0] != '/');
 
-    /* Path */
-    if (*p == '/') {
-        const char* path_end = p;
-        while (*path_end && *path_end != '?' && *path_end != '#')
-            path_end++;
-        u32 plen = (u32)(path_end - p);
-        if (plen >= sizeof(uri->path)) plen = sizeof(uri->path) - 1;
-        memcpy(uri->path, p, plen);
-        p = path_end;
-    } else {
-        strcpy(uri->path, "/");
+    /* pool layout as the SDK has it: scheme, host, path, username, password */
+    u32 off_scheme = 0;
+    u32 off_host   = off_scheme + scheme_len + 1;
+    u32 off_path   = off_host + host_len + 1;
+    u32 off_user   = off_path + path_len + (u32)add_slash + 1;
+    u32 off_pass   = off_user + user_len + 1;
+    u32 total      = off_pass + pass_len + 1;
+
+    if (!uri_ea || !pool_ea) {
+        vm_write32(req_ea, total);
+        return CELL_OK;
     }
+    if (size < total)
+        return (s32)CELL_HTTP_UTIL_ERROR_INSUFFICIENT;
+    if (req_ea)
+        vm_write32(req_ea, total);
 
-    /* Query */
-    if (*p == '?') {
-        p++;
-        const char* q_end = strchr(p, '#');
-        if (!q_end) q_end = p + strlen(p);
-        u32 qlen = (u32)(q_end - p);
-        if (qlen >= sizeof(uri->query)) qlen = sizeof(uri->query) - 1;
-        memcpy(uri->query, p, qlen);
-        p = q_end;
-    }
+    char* out = (char*)(vm_base + pool_ea);
+    memcpy(out + off_scheme, scheme, scheme_len); out[off_scheme + scheme_len] = '\0';
+    memcpy(out + off_host, host, host_len);       out[off_host + host_len] = '\0';
+    char* pp = out + off_path;
+    if (add_slash) *pp++ = '/';
+    memcpy(pp, path, path_len);                   pp[path_len] = '\0';
+    if (user_len) memcpy(out + off_user, user, user_len);
+    out[off_user + user_len] = '\0';
+    if (pass_len) memcpy(out + off_pass, pass, pass_len);
+    out[off_pass + pass_len] = '\0';
 
-    /* Fragment */
-    if (*p == '#') {
-        p++;
-        u32 flen = (u32)strlen(p);
-        if (flen >= sizeof(uri->fragment)) flen = sizeof(uri->fragment) - 1;
-        memcpy(uri->fragment, p, flen);
-    }
-
-    vm_write32(uri_ea + (u32)offsetof(CellHttpUtilUri, port), port);
+    vm_write32(uri_ea +  0, pool_ea + off_scheme);
+    vm_write32(uri_ea +  4, pool_ea + off_host);
+    vm_write32(uri_ea +  8, pool_ea + off_user);
+    vm_write32(uri_ea + 12, pool_ea + off_pass);
+    vm_write32(uri_ea + 16, pool_ea + off_path);
+    vm_write32(uri_ea + 20, port);
     return CELL_OK;
 }
 
@@ -421,4 +419,62 @@ s32 cellHttpUtilBase64Decode(u8* out, u32 outSize,
         vm_write32((u32)(uintptr_t)written, (u32)pos);
 
     return CELL_OK;
+}
+
+/* cellHttpUtilBase64Encoder(out, input, len) and cellHttpUtilBase64Decoder
+ * (output, in, len), the SDK pair Demon's Souls imports. Both return the
+ * number of bytes written, which the title uses as the length:
+ * - the encoder writes the padded text and a NUL after it (Demon's Souls sizes
+ *   the buffer 4 bytes past the text);
+ * - the decoder takes a multiple of 4 and writes no NUL (the buffer is exactly
+ *   len / 4 * 3 bytes). */
+s32 cellHttpUtilBase64Encoder(char* out, const void* input, u32 len)
+{
+    if (!input || !len)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_STRING;
+    if (!out)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
+    const u8* src = (const u8*)(vm_base + (u32)(uintptr_t)input);
+    char* dst = (char*)(vm_base + (u32)(uintptr_t)out);
+    u32 pos = 0;
+    for (u32 i = 0; i < len; i += 3) {
+        u32 n = ((u32)src[i]) << 16;
+        if (i + 1 < len) n |= ((u32)src[i + 1]) << 8;
+        if (i + 2 < len) n |= src[i + 2];
+        dst[pos++] = s_b64_table[(n >> 18) & 0x3F];
+        dst[pos++] = s_b64_table[(n >> 12) & 0x3F];
+        dst[pos++] = (i + 1 < len) ? s_b64_table[(n >> 6) & 0x3F] : '=';
+        dst[pos++] = (i + 2 < len) ? s_b64_table[n & 0x3F] : '=';
+    }
+    dst[pos] = '\0';
+    return (s32)pos;
+}
+
+s32 cellHttpUtilBase64Decoder(char* output, const void* in, u32 len)
+{
+    if (!in)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_STRING;
+    if (len & 3)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_LENGTH;
+    if (!output)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
+    const char* src = (const char*)(vm_base + (u32)(uintptr_t)in);
+    u8* dst = (u8*)(vm_base + (u32)(uintptr_t)output);
+    u32 pos = 0;
+    for (u32 i = 0; i < len; i += 4) {
+        int v[4];
+        for (int k = 0; k < 4; k++) {
+            v[k] = src[i + k] == '=' ? -2 : b64_decode_char(src[i + k]);
+            if (v[k] == -1 || (v[k] == -2 && (k < 2 || i + 4 < len)))
+                return (s32)CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER;
+        }
+        if (v[2] == -2 && v[3] != -2)
+            return (s32)CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER;
+        u32 n = ((u32)v[0] << 18) | ((u32)v[1] << 12) |
+                ((u32)(v[2] < 0 ? 0 : v[2]) << 6) | (u32)(v[3] < 0 ? 0 : v[3]);
+        dst[pos++] = (u8)(n >> 16);
+        if (v[2] >= 0) dst[pos++] = (u8)(n >> 8);
+        if (v[3] >= 0) dst[pos++] = (u8)n;
+    }
+    return (s32)pos;
 }

@@ -23,13 +23,16 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 
 | Variable | What it does |
 |---|---|
-| `PS3_NET_ONLINE=1` | Real host sockets (`libs/network/sysNet.c`), and cellNetCtl reports a connection. |
+| `PS3_NET_ONLINE=1` | Real host sockets (`libs/network/sysNet.c`) and cellHttp, and cellNetCtl reports a connection. Unset, empty or `0` is offline: cellHttp then connects nowhere. |
+| `PS3_NET_HOSTS=name=addr&&name2=addr2` | The host map (RPCS3's IP/Hosts switch format) that `gethostbyname` and cellHttp resolve through. Names match whole and ignore case, `*` stands for any run of characters, and the first match wins. `addr` is an IPv4 address or a host name, which is then resolved normally. While it is set, a name it doesn't list doesn't resolve; the first refusal of each name is logged. Unset, names resolve through the OS. |
 | `PSNR_SERVER=host[:port]` | The psnr server. Port 36100 by default. With `PS3_NET_ONLINE`, the NP manager reports ONLINE. |
-| `PS3_NP_ONLINE_ID=name` | The player's name, if `--username` isn't given. The name also gives the instance its own console identity: the OpenPSID (`sys_ss_get_open_psid`) and MAC are derived from it. Titles tell consoles apart by these, so two instances with the same name count as one player. Offline with no name, both stay at their old fixed values, so offline saves are untouched. |
+| `PS3_NP_ONLINE_ID=name` | The player's name, if `--username` isn't given. The name also gives the instance its own console identity: the OpenPSID (`sys_ss_get_open_psid`) and MAC are derived from it. Titles tell consoles apart by these, so two instances with the same name count as one player. Offline with no name, both stay at their old fixed values, so offline saves are untouched. Online without `PSNR_SERVER`, a name alone signs NP in (ONLINE): there is no matching server, so Matching2 rooms stay unavailable, but a title's own servers (cellHttp) can be reached. The name is read on first use, so a title's options hook may set it. |
 | `PS3_OPEN_PSID=<32 hex>` | Set the OpenPSID outright instead. |
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
 | `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000. |
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
+
+`ps3_net_lock_offline()` (`include/ps3emu/ps3_net.h`) keeps a process offline for good, whatever the variables say later: cellNetCtl, NP, the sys_net host sockets and cellHttp all report no network. A port calls it for sessions that must never reach other players. Called before the title starts, the host sockets are never registered.
 
 ## Two players on one machine
 
@@ -52,7 +55,8 @@ stage starts, and the title drops the peer as "not responding". Set
 | sceNpScore | Title and transaction contexts. Record score, and ranking by range and by NP ID, sync and async, all on psnr leaderboards. |
 | sceNpLookup | Profiles are answered locally from the online ID. There is no avatar. |
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
-| sceNp manager | Reports ONLINE when psnr is set, and fires the manager callback once. |
+| sceNp manager | Reports ONLINE when online with psnr, or online with a player name; fires the manager callback once with that status. |
+| cellNetCtl | Connected only online. The net-start dialog reports `CELL_NET_CTL_ERROR_DIALOG_CANCELED` offline, 0 online. |
 | sys_net | P2P sockets map to plain UDP/TCP on `PS3_NET_P2P_PORT`. There is no vport multiplexing. |
 
 ## How it was verified

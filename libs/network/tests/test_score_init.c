@@ -17,7 +17,9 @@ void spu_lockline_unlock(void) {}
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 /* sceNp.c reports ONLINE and queues its manager callback through these. */
-int np_psnr_enabled(void) { return 0; }
+int np_psnr_signed_in(void) { return 0; }
+uint64_t ppu_guest_call(uint32_t opd, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{ (void)opd; (void)a; (void)b; (void)c; (void)d; return 0; }
 const char* np_psnr_online_id(void) { return "PS3Player"; }
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return 0; }
 int main(void)

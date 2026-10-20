@@ -6,7 +6,7 @@
  */
 
 #include "cellNetCtl.h"
-#include "ps3emu/ps3_knob.h"
+#include "ps3emu/ps3_net.h"  /* ps3_net_online */
 #include "cellSysutil.h"   /* cellSysutilQueueEvent, CELL_SYSUTIL_MAX_CALLBACKS */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 (guest mem) */
 #include "ps3emu/endian.h" /* ps3_bswap32 -- CellNetCtlInfo/NatInfo integer fields are guest big-endian */
@@ -45,9 +45,7 @@ static int s_netctl_initialized = 0;
  * fake-connected behaviour for online experiments. */
 static int netctl_online(void)
 {
-    static int v = -1;
-    PS3_KNOB(v, getenv("PS3_NET_ONLINE") ? 1 : 0);
-    return v;
+    return ps3_net_online();   /* live */
 }
 
 typedef struct {
@@ -330,11 +328,11 @@ s32 cellNetCtlDelHandler(s32 hid)
  *
  * Real hardware shows a system dialog and signals progress asynchronously
  * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
- * game calls UnloadAsync to retrieve the result. In an offline native recomp
- * there is nothing to show and we are already "connected", so we immediately
- * post LOADED + FINISHED to every registered sysutil callback slot and report a
- * successful result on unload. This unblocks the common boot-time "connecting
- * to network" gate without requiring a real PSN session.
+ * game calls UnloadAsync to retrieve the result. There is nothing to show, so
+ * we immediately post LOADED + FINISHED to every registered sysutil callback
+ * slot. The result on unload follows the connection, as RPCS3's does: 0
+ * (connected) online, CELL_NET_CTL_ERROR_DIALOG_CANCELED offline -- a title
+ * told "connected" while offline goes on to its online path.
  * -----------------------------------------------------------------------*/
 
 static void netstart_broadcast(u32 status)
@@ -348,7 +346,8 @@ static void netstart_broadcast(u32 status)
 s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
 {
     (void)param;
-    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> %s\n",
+           netctl_online() ? "auto-connect" : "offline (will report cancelled)");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
     return CELL_OK;
@@ -362,11 +361,13 @@ s32 cellNetCtlNetStartDialogAbortAsync(void)
 
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
 {
+    const s32 r = netctl_online() ? 0 : (s32)CELL_NET_CTL_ERROR_DIALOG_CANCELED;
     if (result) {
         result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
-        result->result = 0;   /* 0 = connected; endian-safe */
+        result->result = (s32)ps3_bswap32((u32)r);   /* guest big-endian */
     }
-    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08X (%s)\n",
+           (u32)r, r ? "cancelled: offline" : "connected");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

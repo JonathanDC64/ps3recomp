@@ -24,18 +24,26 @@
 extern "C" {
 #endif
 
-/* PS3_NET_ONLINE and PSNR_SERVER are both set. */
+/* PS3_NET_ONLINE and PSNR_SERVER are both set (and not locked offline). */
 int np_psnr_enabled(void);
+
+/* What the NP manager reports as signed in: online with psnr, or online with
+ * a name of the player's own (--username or PS3_NP_ONLINE_ID) and no psnr --
+ * then Matching2 has no server, so rooms stay unavailable, but a title's own
+ * servers (cellHttp) can be reached. */
+int np_psnr_signed_in(void);
 
 /* Connect (once) as this title. 0 if connected, -1 if not. */
 int np_psnr_connect(const char* comm_id);
 int np_psnr_connected(void);
 
-/* Settle the player's name and server at startup, before the title runs; the
+/* Take the player's name and server at startup, before the title runs; the
  * runtime's main passes --username and --psnr (either may be NULL).
- *   --psnr host[:port]  sets PS3_NET_ONLINE=1 and PSNR_SERVER.
- *   The name is --username, else PS3_NP_ONLINE_ID, else -- online only -- the
- *   OS login name. Offline with neither, nothing changes ("PS3Player").
+ *   --psnr host[:port]  sets PS3_NET_ONLINE=1 and PSNR_SERVER at once.
+ *   The name is settled on first use, so settings a title's options hook
+ *   applies after main count: --username, else PS3_NP_ONLINE_ID, else --
+ *   online with psnr only -- the OS login name. Offline with neither,
+ *   nothing changes ("PS3Player").
  * Names follow PSN's online ID rules: 3-16 letters, digits, '-' or '_',
  * starting with a letter. */
 void np_psnr_setup(const char* username, const char* server);

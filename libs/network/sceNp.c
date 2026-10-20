@@ -217,6 +217,7 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
  * manager reports OFFLINE — games gate their online flows on GetStatus and skip
  * them cleanly — while the identity getters still hand back the fake account,
  * matching how NP behaves on a real signed-in-but-disconnected console.
+ * Online (np_psnr_signed_in: a psnr server, or a player name) it reports ONLINE.
  * Imported by most online-capable titles.
  * -----------------------------------------------------------------------*/
 
@@ -230,21 +231,23 @@ static u32                  s_npmgr_cb_arg_ea = 0; /* raw guest EA of the user a
  * settles (offline / signed-in-but-disconnected). Never firing it stalls
  * event-driven titles: Demon's Souls polls sceNpManagerGetNpId/GetOnlineName every
  * frame but only ADVANCES on the callback event, so it never reaches the NP
- * teardown -> save-data (auto-save dialog) phase. Fire once with OFFLINE status,
- * from a real guest context (the title's own NP poll thread). NP_NO_FIRE_CB
- * disables. (fork 2dda550 / 9e79c60) */
+ * teardown -> save-data (auto-save dialog) phase. Fire once with the current
+ * status (OFFLINE unless signed in), from a real guest context (the title's own
+ * NP poll thread). NP_NO_FIRE_CB disables. (fork 2dda550 / 9e79c60) */
+static int s_npmgr_cb_fired = 0;   /* the status event went, or is queued */
+
 static void np_fire_manager_cb_once(void)
 {
-    static int fired = 0, in_fire = 0;
-    if (fired || in_fire) return;
+    static int in_fire = 0;
+    if (s_npmgr_cb_fired || in_fire) return;
     if (!s_npmgr_cb_opd) return;
     if (getenv("NP_NO_FIRE_CB")) return;
     extern uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-    in_fire = 1; fired = 1;
-    fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=OFFLINE arg=0x%08X\n",
-            s_npmgr_cb_opd, s_npmgr_cb_arg_ea);
-    ppu_guest_call(s_npmgr_cb_opd, (uint64_t)(int64_t)SCE_NP_MANAGER_STATUS_OFFLINE,
-                   0, (uint64_t)s_npmgr_cb_arg_ea, 0);
+    const s32 st = np_psnr_signed_in() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    in_fire = 1; s_npmgr_cb_fired = 1;
+    fprintf(stderr, "[sceNp] firing manager callback opd=0x%08X event=%s arg=0x%08X\n",
+            s_npmgr_cb_opd, st < 0 ? "OFFLINE" : "ONLINE", s_npmgr_cb_arg_ea);
+    ppu_guest_call(s_npmgr_cb_opd, (uint64_t)(int64_t)st, 0, (uint64_t)s_npmgr_cb_arg_ea, 0);
     in_fire = 0;
 }
 
@@ -258,8 +261,8 @@ s32 sceNpManagerGetStatus(s32* status)
      * parameters straight through as guest values, so dereferencing one
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
-    /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    /* Signed in when online with a psnr server or a player name (np_psnr.h). */
+    s32 st = np_psnr_signed_in() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
     vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
     { static s32 last = -2;
       if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
@@ -277,11 +280,13 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
     s_npmgr_cb_arg_ea = (u32)(size_t)arg;
     printf("[sceNp] ManagerRegisterCallback()\n");
     /* Online: tell the title it is signed in, as the console does once the
-     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
-    if (np_psnr_enabled() && callback) {
+     * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback,
+     * and the getters then fire no second (stale) status. */
+    if (np_psnr_signed_in() && callback) {
         const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
                               (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
         cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);
+        s_npmgr_cb_fired = 1;
     }
     return CELL_OK;
 }
