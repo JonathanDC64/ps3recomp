@@ -92,14 +92,16 @@ int main(void)
     assert(!strcmp(resolve("localhost"), "127.0.0.1"));
 
     /* With a map: listed names go where it says (a literal, or a name that is
-     * then resolved), and everything else fails closed -- even a literal or
-     * a name the OS knows. */
-    env("PS3_NET_HOSTS", "game.test=127.0.0.2&&*.alias.test=localhost");
+     * then resolved), and every other name fails closed -- even one the OS
+     * knows. An IPv4 literal is an address: it passes, unless an entry remaps it. */
+    env("PS3_NET_HOSTS", "game.test=127.0.0.2&&*.alias.test=localhost&&10.9.8.7=127.0.0.3");
     assert(!strcmp(resolve("game.test"), "127.0.0.2"));
     assert(!strcmp(resolve("GAME.TEST"), "127.0.0.2"));
     assert(!strcmp(resolve("a.alias.test"), "127.0.0.1"));
     assert(!*resolve("localhost"));
-    assert(!*resolve("127.0.0.1"));
+    assert(!strcmp(resolve("127.0.0.1"), "127.0.0.1"));
+    assert(!strcmp(resolve("10.9.8.7"), "127.0.0.3"));
+    assert(!*resolve("127.0.0.1.example"));
     assert(!*resolve("other.test"));
     assert(!*resolve("other.test"));   /* said once: see the log */
     env("PS3_NET_HOSTS", "");

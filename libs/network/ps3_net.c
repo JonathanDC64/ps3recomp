@@ -132,9 +132,17 @@ int ps3_net_resolve(const char* host, uint8_t ip[4])
             printf("[net] PS3_NET_HOSTS: %d malformed entr%s skipped (want name=addr&&name=addr)\n",
                    bad, bad == 1 ? "y" : "ies");
         }
-        if (!hit) { refused(host); return -1; }
-        name = mapped;
-        if (trace_on()) printf("[net] '%s' -> '%s' (PS3_NET_HOSTS)\n", host, name);
+        if (hit) {
+            name = mapped;
+            if (trace_on()) printf("[net] '%s' -> '%s' (PS3_NET_HOSTS)\n", host, name);
+        } else {
+            /* An IPv4 literal is an address, not a name: nothing to look up.
+             * Servers hand them out (Demon's Souls' bootstrap gives the game
+             * server as http://<ip>:<port>/), so they pass unless an entry
+             * remaps them. */
+            struct in_addr lit;
+            if (inet_pton(AF_INET, host, &lit) != 1) { refused(host); return -1; }
+        }
     }
 
     struct in_addr a;

@@ -11,7 +11,8 @@
  *                      case; '*' stands for any run of characters; the first
  *                      match wins. addr is an IPv4 literal or a host name,
  *                      which is then resolved normally. While it is set, a
- *                      name it does not list does not resolve (fail closed).
+ *                      name it does not list does not resolve (fail closed);
+ *                      an IPv4 literal it does not list is used as is.
  *                      Unset: names resolve through the OS as before. */
 #ifdef __cplusplus
 extern "C" {
@@ -35,7 +36,8 @@ int  ps3_net_locked_offline(void);
 int ps3_net_hosts_lookup(const char* map, const char* host, char* addr, size_t cap, int* bad);
 
 /* A guest host name to an IPv4 address in network order: offline fails; with
- * PS3_NET_HOSTS set only listed names resolve; otherwise the OS resolver.
+ * PS3_NET_HOSTS set only listed names (and IPv4 literals) resolve; otherwise
+ * the OS resolver.
  * 0 on success, -1 if the name does not resolve. The caller has started
  * Winsock. */
 int ps3_net_resolve(const char* host, uint8_t ip[4]);
