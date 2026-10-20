@@ -274,15 +274,20 @@ CASES = []   # dicts: name, word, in_regs {idx:val}, in_ca, expects [(reg, val, 
              # IEEE-754 pattern via memcpy, not value).
 
 def case(name, word, in_regs, expects, in_ca=None, exp_ca=None, exp_cr=None, may_trap=False,
-         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None, in_cr=None, exp_crw=None):
+         in_mem=None, exp_mem=None, in_fpr=None, exp_fpr=None, in_cr=None, exp_crw=None,
+         in_fpscr=None, in_ctr=None, exp_ctr=None, exp_taken=None):
     # in_cr / exp_crw: the whole condition register as the guest sees it
     # (mfcr's 32-bit value, CR0 in bits 31:28), set before the instruction and
     # compared after it in full, SO bits included.
+    # in_fpscr / in_ctr seed FPSCR and CTR; exp_ctr is CTR after the
+    # instruction. exp_taken marks a conditional branch: emit_c runs it in a
+    # helper function and checks whether it was taken.
     CASES.append(dict(name=name, word=word, in_regs=in_regs, expects=expects,
                       in_ca=in_ca, exp_ca=exp_ca, exp_cr=exp_cr, may_trap=may_trap,
                       in_mem=in_mem or {}, exp_mem=exp_mem or {},
                       in_fpr=in_fpr or {}, exp_fpr=exp_fpr or [],
-                      in_cr=in_cr, exp_crw=exp_crw))
+                      in_cr=in_cr, exp_crw=exp_crw, in_fpscr=in_fpscr,
+                      in_ctr=in_ctr, exp_ctr=exp_ctr, exp_taken=exp_taken))
 
 # VMX/vector cases: unlike the GPR CASES above, a vupk-family op reads/writes
 # ctx->vr[] directly (no memory load/store instructions needed to exercise
@@ -561,6 +566,78 @@ def build_cases():
                 case(f"{mn} fxm={fxm:#04x} v={v:#x} cr={cr:#010x}",
                      (31 << 26) | (R[1] << 21) | (fxm << 12) | (144 << 1),
                      {R[1]: v}, [(R[1], v, MASK64)], in_cr=cr, exp_crw=want)
+
+    # --- conditional branches: CTR and CR together --------------------------
+    # Every BO value of bc and bclr, with the CR bit set and clear and a CTR
+    # that does and does not reach zero. bdnzt/bdnzf/bdzt/bdzf (BO2 clear,
+    # BO0 clear) lifted to an always-taken branch that never decremented CTR,
+    # so a loop closed by `bdnzf eq,loop` ran on past its count. Book I 2.4
+    # and RPCS3's BC/BCLR: CTR -= 1 unless BO2, then branch if
+    # (BO2 | ((CTR != 0) ^ BO3)) & (BO0 | (CR[BI] == BO1)). CTR stays 32-bit,
+    # as mtctr writes it. The mnemonic is the decoder's own (all 32 BO values
+    # map to some name); the expectation comes from BO alone.
+    def ref_bc(bo, crbit, ctr):
+        if not bo & 0x04:
+            ctr = (ctr - 1) & MASK32
+        ctr_ok = bool(bo & 0x04) or ((ctr != 0) != bool(bo & 0x02))
+        cond_ok = bool(bo & 0x10) or crbit == (bo >> 3) & 1
+        return ctr_ok and cond_ok, ctr
+    for bo in range(32):
+        for bclr, bi in ((False, 30), (True, 1)):   # bc on cr7.eq, bclr on cr0.gt
+            if bclr:
+                word = (19 << 26) | (bo << 21) | (bi << 16) | (16 << 1)
+            else:
+                word = (16 << 26) | (bo << 21) | (bi << 16) | 8   # target $+8
+            mn = ppu_disasm.decode(word, 0).mnemonic
+            for crbit in (0, 1):
+                cr = crb_set(0x2468ACE1, bi, crbit)
+                for ctr in (1, 2):
+                    taken, ctr_out = ref_bc(bo, crbit, ctr)
+                    case(f"{mn} bo={bo} bi={bi} crbit={crbit} ctr={ctr}", word,
+                         {}, [], in_cr=cr, exp_crw=cr, in_ctr=ctr, exp_ctr=ctr_out,
+                         exp_taken=taken)
+
+    # --- FP record forms set CR1 -------------------------------------------
+    # Rc=1 FP ops copy FPSCR[FX FEX VX OX], its top nibble, to CR1 (Book I
+    # 2.3.1); nothing wrote CR1 before. No lifted op sets an FPSCR bit, so
+    # FPSCR is seeded here, and CR1 must follow it as mffs does.
+    def dbits(v):
+        return struct.unpack(">Q", struct.pack(">d", v))[0]
+    fa, fb = 1.5, 2.25   # exact in single and double, and so are a+b and a*b
+    for fpscr in (0x00000000, 0xA0000000, 0x5F0F0000):
+        for cr in (0xFFFFFFFF, 0x2468ACE1):
+            want = (cr & ~0x0F000000 & 0xFFFFFFFF) | ((fpscr >> 28) << 24)
+            fin = {1: dbits(fa), 2: dbits(fb)}
+            sfx = f"fpscr={fpscr:#010x} cr={cr:#010x}"
+            case(f"fadd. {sfx}", (63 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | (21 << 1) | 1,
+                 {}, [], in_fpr=fin, exp_fpr=[(3, dbits(fa + fb))],
+                 in_fpscr=fpscr, in_cr=cr, exp_crw=want)
+            case(f"fmuls. {sfx}", (59 << 26) | (3 << 21) | (1 << 16) | (2 << 6) | (25 << 1) | 1,
+                 {}, [], in_fpr=fin, exp_fpr=[(3, dbits(fa * fb))],
+                 in_fpscr=fpscr, in_cr=cr, exp_crw=want)
+            case(f"fmr. {sfx}", (63 << 26) | (3 << 21) | (2 << 11) | (72 << 1) | 1,
+                 {}, [], in_fpr=fin, exp_fpr=[(3, dbits(fb))],
+                 in_fpscr=fpscr, in_cr=cr, exp_crw=want)
+            case(f"mffs. {sfx}", (63 << 26) | (3 << 21) | (583 << 1) | 1,
+                 {}, [], exp_fpr=[(3, fpscr)], in_fpscr=fpscr, in_cr=cr, exp_crw=want)
+        case(f"fadd fpscr={fpscr:#010x} leaves cr1 alone",
+             (63 << 26) | (3 << 21) | (1 << 16) | (2 << 11) | (21 << 1),
+             {}, [], in_fpr={1: dbits(fa), 2: dbits(fb)}, exp_fpr=[(3, dbits(fa + fb))],
+             in_fpscr=fpscr, in_cr=0xFFFFFFFF, exp_crw=0xFFFFFFFF)
+
+    # --- mcrfs: an FPSCR field into a CR field -------------------------------
+    # It had no handler (and the decoder printed its fields as FPRs, losing
+    # BFA), so the CR field was never written. The ISA then clears the
+    # exception bits it copied; FPSCR writes are not modeled, so only the CR
+    # side is checked.
+    for fpscr in (0x9F3C5A61, 0x00000000, 0xFFFFFFFF):
+        for cr in (0x2468ACE1, 0xFFFFFFFF):
+            for bf, bfa in ((7, 4), (1, 0), (0, 5), (6, 6), (3, 7)):
+                f = (fpscr >> (28 - 4 * bfa)) & 0xF
+                want = (cr & ~(0xF << (28 - 4 * bf)) & 0xFFFFFFFF) | (f << (28 - 4 * bf))
+                case(f"mcrfs cr{bf},cr{bfa} fpscr={fpscr:#010x} cr={cr:#010x}",
+                     (63 << 26) | (bf << 23) | (bfa << 18) | (64 << 1),
+                     {}, [], in_fpscr=fpscr, in_cr=cr, exp_crw=want)
 
     # --- FP D-form load/store-with-update RA writeback ---------------------
     # lfsu/lfdu/stfsu/stfdu (opcodes 49/51/53/55) sat in the plain lfs/lfd/
@@ -864,6 +941,68 @@ def check_barrier_lowering():
     return fails == 0
 
 # ---------------------------------------------------------------------------
+# Branch conditions and the FPSCR moves, as text.
+#
+# Every BO value of every conditional-branch form has to lift to a real
+# condition: the "/* cond */ 1" fallback is a branch that is always taken and
+# never touches CTR, which is what bdnzt/bdnzf/bdzt/bdzf lifted to. bcctr and
+# b<cond>lrl call through ps3_indirect_call, which the CASES driver cannot
+# run, so they are only checked here. bcctr must not decrement CTR: BO2=0 is
+# an invalid form there, and RPCS3 tests only BO0/BO1.
+# ---------------------------------------------------------------------------
+
+def check_branch_and_fpscr_lifts():
+    lifter = PPULifter()
+    dummy = LiftedFunction(name="conf", start_addr=0x30000, end_addr=0x30100)
+    fails = n = 0
+    for bo in range(32):
+        for bi in (0, 2, 29, 31):
+            words = [(16 << 26) | (bo << 21) | (bi << 16) | 8 | (aa << 1) | lk
+                     for aa in (0, 1) for lk in (0, 1)]
+            words += [(19 << 26) | (bo << 21) | (bi << 16) | (xo << 1) | lk
+                      for xo in (16, 528) for lk in (0, 1)]
+            for word in words:
+                insn = ppu_disasm.decode(word, 0x30010)
+                code = lifter._translate(insn, dummy)
+                n += 1
+                bcctr = word >> 26 == 19 and (word >> 1) & 0x3FF == 528
+                if code.startswith("/*") or "/* cond" in code:
+                    why = "no condition"
+                elif bcctr and "ctx->ctr - 1" in code:
+                    why = "bcctr decrements CTR"
+                else:
+                    continue
+                print(f"FAIL branch {insn.mnemonic} {insn.operands} "
+                      f"(word {word:#010x}): {why}: {code}")
+                fails += 1
+
+    # mcrfs names both fields as CR fields (it printed FPRs, which lost the
+    # FPSCR field), and lifts to a copy of that FPSCR field.
+    insn = ppu_disasm.decode((63 << 26) | (7 << 23) | (4 << 18) | (64 << 1), 0x30000)
+    code = lifter._translate(insn, dummy)
+    n += 1
+    if (insn.mnemonic, insn.operands) != ("mcrfs", "cr7, cr4") or \
+            code != "ctx->crf[7] = (uint8_t)((ctx->fpscr >> 12) & 0xFu);":
+        print(f"FAIL mcrfs: {insn.mnemonic} {insn.operands} -> {code}")
+        fails += 1
+
+    # The FPSCR moves' record forms keep their lift and set CR1 (mtfsf. was
+    # reaching the TODO catch-all).
+    for word, want_mn in (((63 << 26) | (0xFF << 17) | (4 << 11) | (711 << 1) | 1, "mtfsf."),
+                          (fp_x_form(70, 5, rc=1), "mtfsb0."),
+                          ((63 << 26) | (3 << 21) | (583 << 1) | 1, "mffs.")):
+        insn = ppu_disasm.decode(word, 0x30000)
+        code = lifter._translate(insn, dummy)
+        n += 1
+        if (insn.mnemonic != want_mn or "TODO" in code
+                or "ctx->crf[1] = (uint8_t)((ctx->fpscr >> 28) & 0xFu);" not in code):
+            print(f"FAIL {want_mn}: {insn.mnemonic} {insn.operands} -> {code}")
+            fails += 1
+
+    print(f"[branches/fpscr] {n - fails} checks passed, {fails} FAILED")
+    return fails == 0
+
+# ---------------------------------------------------------------------------
 # C driver generation
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1049,20 @@ static void check_cr(const char* name, uint32_t cr, int nib, int shift) {
 static void check_crw(const char* name, uint32_t got, uint32_t want) {
     if (got != want) { printf("FAIL %s: CR = %08X want %08X\\n", name, got, want); g_fail++; }
     else g_pass++;
+}
+static void check_br(const char* name, int got, int want) {
+    if (got != want) {
+        printf("FAIL %s: branch %s, want %s\\n", name, got ? "taken" : "not taken",
+               want ? "taken" : "not taken");
+        g_fail++;
+    } else g_pass++;
+}
+static void check_ctr(const char* name, uint64_t got, uint64_t want) {
+    if (got != want) {
+        printf("FAIL %s: CTR = 0x%016llX want 0x%016llX\\n", name,
+               (unsigned long long)got, (unsigned long long)want);
+        g_fail++;
+    } else g_pass++;
 }
 static void check_vr(const char* name, const uint8_t* got, const uint8_t* want) {
     if (memcmp(got, want, 16) != 0) {
@@ -997,6 +1150,10 @@ extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy
 extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }
 extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
 """)
+    # A branch case runs in a function of its own, emitted ahead of main(): a
+    # taken bclr form returns from it, a taken bc form jumps to the label after
+    # it, and falling out of the statement marks the branch not taken.
+    helpers, main_at = [], len(out)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
     n_encoding_skipped = 0
@@ -1009,7 +1166,10 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
                   f"{insn.mnemonic} {insn.operands} (word {c['word']:#010x}) -- case skipped")
             n_encoding_skipped += 1
             continue
-        code = lifter._translate(insn, dummy)
+        func = dummy
+        if c["exp_taken"] is not None:   # lift inside a function that holds the target
+            func = LiftedFunction(name="conf", start_addr=insn.addr, end_addr=insn.addr + 0x10)
+        code = lifter._translate(insn, func)
         if code.startswith("/*"):
             print(f"UNHANDLED by lifter: {c['name']!r} -> {code[:60]} -- case skipped")
             n_encoding_skipped += 1
@@ -1025,6 +1185,10 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
             out.append("      ctx->xer |= (1u << 29);")
         if c["in_cr"] is not None:
             out.append(f"      ppu_cr_unpack(ctx, 0x{c['in_cr']:08X}u);")
+        if c["in_fpscr"] is not None:
+            out.append(f"      ctx->fpscr = 0x{c['in_fpscr']:08X}u;")
+        if c["in_ctr"] is not None:
+            out.append(f"      ctx->ctr = 0x{c['in_ctr']:016X}ULL;")
         for addr, blob in c["in_mem"].items():
             byts = ", ".join(f"0x{b:02X}" for b in blob)
             out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
@@ -1032,6 +1196,17 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
         for reg, bits in c["in_fpr"].items():
             out.append(f"      {{ uint64_t _b = 0x{bits:016X}ULL; memcpy(&ctx->fpr[{reg}], &_b, 8); }}")
         body = [f"        {code}"]
+        if c["exp_taken"] is not None:
+            fn = f"conf_branch_{i}"
+            helpers += [f"static void {fn}(ppu_context* ctx, int* fell, int* jumped) {{",
+                        f"    {code}", "    *fell = 1; return;"]
+            if "goto loc_" in code:
+                helpers.append(f"{code.split('goto ', 1)[1].split(';', 1)[0]}: *jumped = 1;")
+            helpers.append("}")
+            body = [f"        {{ int _fell = 0, _jumped = 0; {fn}(ctx, &_fell, &_jumped); "
+                    f'check_br("{nm}", _jumped || !_fell, {int(bool(c["exp_taken"]))}); }}']
+        if c["exp_ctr"] is not None:
+            body.append(f'        check_ctr("{nm}", ctx->ctr, 0x{c["exp_ctr"]:016X}ULL);')
         for reg, val, mask in c["expects"]:
             body.append(f'        check_reg("{nm}", {reg}, ctx->gpr[{reg}], '
                         f"0x{val:016X}ULL, 0x{mask:016X}ULL);")
@@ -1142,6 +1317,7 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
     return g_fail ? 1 : 0;
 }
 """)
+    out[main_at:main_at] = helpers
     text = "\n".join(out)
     with open(path, "w") as f:
         f.write(text)
@@ -1174,6 +1350,7 @@ def main():
 
     decode_ok = check_decode_and_lift()
     decode_ok = check_barrier_lowering() and decode_ok
+    decode_ok = check_branch_and_fpscr_lifts() and decode_ok
 
     os.makedirs(os.path.join(ROOT, "scratch"), exist_ok=True)
     cpath = os.path.join(ROOT, "scratch", "ppu_conformance.cpp")   # preamble is C++ (extern "C")
