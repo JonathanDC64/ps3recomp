@@ -45,10 +45,63 @@ static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
 static ps3_nid_table  g_hle_nids;
 static int            g_hle_inited = 0;
 
+/* NID -> entry index, one index per handler table. ps3_hle_call looks the NID
+ * up on every HLE call, in the context-handler list and then in the NID
+ * table, and both were linear scans: a call that goes to the NID table paid a
+ * scan of the whole context list first (~100 compares a call, 1.1% of
+ * Demon's Souls' HighGraphics). A hash index answers in a probe or two, as
+ * prx_resolve_export's does. Open addressing, linear probing; a slot holds
+ * (entry index + 1) << 32 | NID, 0 when empty; twice the table's capacity.
+ *
+ * Same answers as the scans: a NID registered twice keeps its first entry in
+ * the index, which is the one the scan stops at. Lookups take no lock: a slot
+ * goes from 0 to its value once and never changes again, and it is published
+ * (release) after its entry is written, so a lookup racing a registration
+ * sees no entry or a whole one, and a probe run only grows. Registrations take
+ * g_hle_reg_lock, so two of them cannot claim one slot. PS3_HLE_HASH=0 (live)
+ * brings back the scans; both indexes are kept either way. */
+#define HLE_NID_HASH_BITS 13
+static uint64_t g_hle_nid_hash[1u << HLE_NID_HASH_BITS];
+static volatile long g_hle_reg_lock = 0;
+
+static void hle_reg_lock(void)   { while (__atomic_exchange_n(&g_hle_reg_lock, 1, __ATOMIC_ACQUIRE)) { } }
+static void hle_reg_unlock(void) { __atomic_store_n(&g_hle_reg_lock, 0, __ATOMIC_RELEASE); }
+
+/* The entry index for nid, or -1. */
+static int hle_hash_find(const uint64_t* tab, unsigned bits, uint32_t nid)
+{
+    const uint32_t mask = (1u << bits) - 1;
+    for (uint32_t h = (nid * 0x9E3779B1u) >> (32 - bits);; h = (h + 1) & mask) {
+        const uint64_t v = __atomic_load_n(&tab[h], __ATOMIC_ACQUIRE);
+        if (!v) return -1;
+        if ((uint32_t)v == nid) return (int)(v >> 32) - 1;
+    }
+}
+
+/* Under g_hle_reg_lock, after entry i is written. */
+static void hle_hash_add(uint64_t* tab, unsigned bits, uint32_t nid, uint32_t i)
+{
+    const uint32_t mask = (1u << bits) - 1;
+    uint32_t h = (nid * 0x9E3779B1u) >> (32 - bits);
+    for (uint64_t v; (v = tab[h]) != 0; h = (h + 1) & mask)
+        if ((uint32_t)v == nid) return;      /* the first entry wins, as in the scan */
+    __atomic_store_n(&tab[h], ((uint64_t)(i + 1) << 32) | nid, __ATOMIC_RELEASE);
+}
+
+static int hle_hash_on(void)
+{
+    static int s_on = -1;
+    PS3_KNOB(s_on, ps3_env_int("PS3_HLE_HASH", 1));
+    return s_on;
+}
+
 extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 {
+    hle_reg_lock();
     if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
-    ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+    if (ps3_nid_table_add(&g_hle_nids, nid, name, handler) == 0)
+        hle_hash_add(g_hle_nid_hash, HLE_NID_HASH_BITS, nid, g_hle_nids.count - 1);
+    hle_reg_unlock();
 }
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
@@ -60,14 +113,36 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 #define HLE_CTX_CAP 256
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
+#define HLE_CTX_HASH_BITS 9
+static uint64_t g_ctx_hash[1u << HLE_CTX_HASH_BITS];   /* see g_hle_nid_hash */
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
+    hle_reg_lock();
     if (g_ctx_count < HLE_CTX_CAP) {
         g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
+        hle_hash_add(g_ctx_hash, HLE_CTX_HASH_BITS, nid, g_ctx_count);
         g_ctx_count++;
     }
+    hle_reg_unlock();
+}
+
+/* nid's context handler (its index in g_ctx), or -1. */
+static int hle_ctx_find(uint32_t nid)
+{
+    if (hle_hash_on()) return hle_hash_find(g_ctx_hash, HLE_CTX_HASH_BITS, nid);
+    for (uint32_t i = 0; i < g_ctx_count; i++)
+        if (g_ctx[i].nid == nid) return (int)i;
+    return -1;
+}
+
+/* nid's entry in the NID table (the first one registered), or null. */
+static ps3_nid_entry* hle_nid_find(uint32_t nid)
+{
+    if (!hle_hash_on()) return g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    const int k = hle_hash_find(g_hle_nid_hash, HLE_NID_HASH_BITS, nid);
+    return k >= 0 ? &g_hle_storage[k] : nullptr;
 }
 
 /* Is this NID implemented here? Lets a host boot harness that owns its own
@@ -76,10 +151,8 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
  * "unresolved NID" error it cannot distinguish from a real failure. */
 extern "C" int ps3_hle_has(uint32_t nid)
 {
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) return 1;
-    if (!g_hle_inited) return 0;
-    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+    if (hle_ctx_find(nid) >= 0) return 1;
+    ps3_nid_entry* e = hle_nid_find(nid);
     return (e && e->handler) ? 1 : 0;
 }
 
@@ -783,28 +856,29 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
-            ps3_msf("hle:%s", g_ctx[i].name);
-            /* Record the name here too. This loop dispatches every
-             * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
-             * and CRT surface: spinlocks, lwmutex, thread and fs ops -- and it
-             * returned without touching g_last_hle_name or the in-flight slot.
-             * So for a title wedged anywhere in that surface the watchdog named
-             * whichever TABLE handler ran last instead, with total confidence.
-             *
-             * Guitar Hero III wedges in sys_spinlock_unlock and was reported as
-             * "cellPadInit", which for a game that needs a guitar controller is
-             * a very convincing wrong answer to chase. */
-            g_last_hle_name = g_ctx[i].name;
-            hle_first_seen(nid, g_ctx[i].name, ctx); hle_lr_seen(nid, g_ctx[i].name, ctx);
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
-            g_ctx[i].fn(ctx);
-            return;   /* the guard clears the in-flight slot (after `waits` reads it) */
-        }
+    const int ci = hle_ctx_find(nid);
+    if (ci >= 0) {
+        const uint32_t i = (uint32_t)ci;
+        ps3_msf("hle:%s", g_ctx[i].name);
+        /* Record the name here too. This branch dispatches every
+         * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
+         * and CRT surface: spinlocks, lwmutex, thread and fs ops -- and it
+         * returned without touching g_last_hle_name or the in-flight slot.
+         * So for a title wedged anywhere in that surface the watchdog named
+         * whichever TABLE handler ran last instead, with total confidence.
+         *
+         * Guitar Hero III wedges in sys_spinlock_unlock and was reported as
+         * "cellPadInit", which for a game that needs a guitar controller is
+         * a very convincing wrong answer to chase. */
+        g_last_hle_name = g_ctx[i].name;
+        hle_first_seen(nid, g_ctx[i].name, ctx); hle_lr_seen(nid, g_ctx[i].name, ctx);
+        { unsigned t = (unsigned)ctx->thread_id;
+          if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+        g_ctx[i].fn(ctx);
+        return;   /* the guard clears the in-flight slot (after `waits` reads it) */
+    }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = hle_nid_find(nid);
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
