@@ -18,10 +18,16 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_HTTP_UTIL_ERROR_INVALID_PARAM  0x80711001
-#define CELL_HTTP_UTIL_ERROR_NO_MEMORY      0x80711002
-#define CELL_HTTP_UTIL_ERROR_NO_BUFFER      0x80711003
-#define CELL_HTTP_UTIL_ERROR_PARSE_FAILED   0x80711004
+/* The firmware's values (libhttp's util range, 0x80711001-) */
+#define CELL_HTTP_UTIL_ERROR_NO_MEMORY          0x80711001
+#define CELL_HTTP_UTIL_ERROR_NO_BUFFER          0x80711002
+#define CELL_HTTP_UTIL_ERROR_NO_STRING          0x80711003
+#define CELL_HTTP_UTIL_ERROR_INVALID_URI        0x80711005
+#define CELL_HTTP_UTIL_ERROR_INVALID_LENGTH     0x80711009
+#define CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER  0x8071100a
+/* This runtime's older names */
+#define CELL_HTTP_UTIL_ERROR_INVALID_PARAM      CELL_HTTP_UTIL_ERROR_NO_STRING
+#define CELL_HTTP_UTIL_ERROR_PARSE_FAILED       CELL_HTTP_UTIL_ERROR_INVALID_URI
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -68,6 +74,9 @@ s32 cellHttpUtilBase64Encode(char* out, u32 outSize,
                               const u8* data, u32 dataSize, u32* written);
 s32 cellHttpUtilBase64Decode(u8* out, u32 outSize,
                               const char* encoded, u32 encodedLen, u32* written);
+/* SDK names: they return the length written (encoded text, or decoded bytes) */
+s32 cellHttpUtilBase64Encoder(char* out, const void* input, u32 len);
+s32 cellHttpUtilBase64Decoder(char* output, const void* in, u32 len);
 
 #ifdef __cplusplus
 }

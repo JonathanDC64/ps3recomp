@@ -17,23 +17,38 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_HTTP_ERROR_NOT_INITIALIZED         0x80710101
-#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     0x80710102
-#define CELL_HTTP_ERROR_NO_MEMORY               0x80710103
-#define CELL_HTTP_ERROR_NOT_FOUND               0x80710104
-#define CELL_HTTP_ERROR_INVALID_PARAMETER       0x80710105
-#define CELL_HTTP_ERROR_NO_BUFFER               0x80710106
-#define CELL_HTTP_ERROR_CONNECTION_FAILED       0x80710107
-#define CELL_HTTP_ERROR_SEND_FAILED             0x80710108
-#define CELL_HTTP_ERROR_RECV_FAILED             0x80710109
-#define CELL_HTTP_ERROR_TIMEOUT                 0x8071010A
-#define CELL_HTTP_ERROR_INVALID_URL             0x8071010B
-#define CELL_HTTP_ERROR_ABORTED                 0x8071010C
-#define CELL_HTTP_ERROR_UNKNOWN                 0x807101FF
-/* "No Content-Length" from cellHttpResponseGetContentLength. The value is the
- * one titles compare the result with before reading the body to the end; the
- * SDK's own name for it is not confirmed here. */
+/* The firmware's values (libhttp: 0x80710001-0x80710fff). Titles compare some
+ * of them, e.g. ALREADY_INITIALIZED from cellHttpInit. */
+#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     0x80710001
+#define CELL_HTTP_ERROR_NOT_INITIALIZED         0x80710002
+#define CELL_HTTP_ERROR_NO_MEMORY               0x80710003
+#define CELL_HTTP_ERROR_NO_BUFFER               0x80710004
+#define CELL_HTTP_ERROR_NO_STRING               0x80710005
+#define CELL_HTTP_ERROR_INSUFFICIENT            0x80710006
+#define CELL_HTTP_ERROR_INVALID_URI             0x80710007
+#define CELL_HTTP_ERROR_BAD_CLIENT              0x80710010
+#define CELL_HTTP_ERROR_BAD_TRANS               0x80710011
+#define CELL_HTTP_ERROR_NO_CONNECTION           0x80710012
+/* "No Content-Length" from cellHttpResponseGetContentLength: titles compare
+ * the result with it before reading the body to the end. */
 #define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017
+#define CELL_HTTP_ERROR_TRANS_ABORTED           0x80710024
+#define CELL_HTTP_ERROR_UNKNOWN                 0x80710051
+/* Network failures are a class (0x807101xx resolver ... 0x807107xx recv)
+ * with the errno in the low byte; these are the classes alone. */
+#define CELL_HTTP_ERROR_NET_RESOLVER            0x80710100
+#define CELL_HTTP_ERROR_NET_CONNECT             0x80710500
+#define CELL_HTTP_ERROR_NET_SEND                0x80710600
+#define CELL_HTTP_ERROR_NET_RECV                0x80710700
+/* This runtime's older names for the codes above. */
+#define CELL_HTTP_ERROR_NOT_FOUND               CELL_HTTP_ERROR_BAD_TRANS
+#define CELL_HTTP_ERROR_INVALID_PARAMETER       CELL_HTTP_ERROR_NO_BUFFER
+#define CELL_HTTP_ERROR_CONNECTION_FAILED       CELL_HTTP_ERROR_NET_CONNECT
+#define CELL_HTTP_ERROR_SEND_FAILED             CELL_HTTP_ERROR_NET_SEND
+#define CELL_HTTP_ERROR_RECV_FAILED             CELL_HTTP_ERROR_NET_RECV
+#define CELL_HTTP_ERROR_TIMEOUT                 (CELL_HTTP_ERROR_NET_RECV | 0x3C)   /* ETIMEDOUT */
+#define CELL_HTTP_ERROR_INVALID_URL             CELL_HTTP_ERROR_INVALID_URI
+#define CELL_HTTP_ERROR_ABORTED                 CELL_HTTP_ERROR_TRANS_ABORTED
 
 /* ---------------------------------------------------------------------------
  * HTTP methods
@@ -120,6 +135,17 @@ s32 cellHttpSetRequestContentLength(CellHttpTransId transId, u64 length);
 s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
                              const char* value);
 s32 cellHttpAbortTransaction(CellHttpTransId transId);
+
+/* SDK names for the client and transaction settings (b8 / size_t / system_time_t
+ * are 32- and 64-bit guest values) */
+s32 cellHttpClientSetKeepAlive(CellHttpClientId clientId, u32 enable);
+s32 cellHttpClientSetPerHostPoolSize(CellHttpClientId clientId, u32 poolSize);
+s32 cellHttpClientSetUserAgent(CellHttpClientId clientId, const char* userAgent);
+s32 cellHttpClientGetUserAgent(CellHttpClientId clientId, char* userAgent, u32 size, u32* required);
+s32 cellHttpClientCloseAllConnections(CellHttpClientId clientId);
+s32 cellHttpClientPollConnections(CellHttpClientId clientId, CellHttpTransId* transId, s64 usec);
+s32 cellHttpTransactionAbortConnection(CellHttpTransId transId);
+s32 cellHttpRequestSetContentLength(CellHttpTransId transId, u64 totalSize);
 
 #ifdef __cplusplus
 }

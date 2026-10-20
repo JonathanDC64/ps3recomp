@@ -57,6 +57,9 @@ typedef struct {
     u32                  connect_timeout;
     u32                  send_timeout;
     u32                  recv_timeout;
+    int                  keep_alive;
+    u32                  per_host_pool;
+    char                 user_agent[256];
 } HttpClientSlot;
 
 /* Custom header key/value pair */
@@ -104,6 +107,25 @@ typedef struct {
 
 static HttpClientSlot s_clients[CELL_HTTP_MAX_CLIENTS];
 static HttpTransSlot  s_transactions[CELL_HTTP_MAX_TRANSACTIONS];
+
+/* Client and transaction ids are the slot + 1. The firmware's are never 0,
+ * and titles take 0 for "none": Demon's Souls skips its whole network service
+ * when its client id is 0, and reads a 0 from cellHttpClientPollConnections as
+ * "no transaction ready". */
+#define HTTP_CLIENT(id) (&s_clients[(id) - 1])
+#define HTTP_TRANS(id)  (&s_transactions[(id) - 1])
+static int http_client_ok(CellHttpClientId id)
+{
+    return id - 1u < CELL_HTTP_MAX_CLIENTS && s_clients[id - 1].in_use;
+}
+static int http_trans_ok(CellHttpTransId id)
+{
+    return id - 1u < CELL_HTTP_MAX_TRANSACTIONS && s_transactions[id - 1].in_use;
+}
+
+/* The User-Agent a new client starts with. The firmware's string isn't known
+ * here; this has its form, and a title can read it and replace it. */
+#define HTTP_DEFAULT_USER_AGENT "PS3Application libhttp/1.0.0-000 (CellOS)"
 
 /* ---------------------------------------------------------------------------
  * Helpers
@@ -351,8 +373,12 @@ s32 cellHttpCreateClient(CellHttpClientId* clientId)
             s_clients[i].connect_timeout = 30000000;
             s_clients[i].send_timeout    = 120000000;
             s_clients[i].recv_timeout    = 120000000;
-            *clientId_h = ps3_bswap32(i);   /* guest big-endian */
-            printf("[cellHttp] CreateClient(id=%u)\n", i);
+            s_clients[i].keep_alive      = 1;
+            s_clients[i].per_host_pool   = 1;
+            snprintf(s_clients[i].user_agent, sizeof(s_clients[i].user_agent), "%s",
+                     HTTP_DEFAULT_USER_AGENT);
+            *clientId_h = ps3_bswap32(i + 1);   /* guest big-endian */
+            printf("[cellHttp] CreateClient(id=%u)\n", i + 1);
             return CELL_OK;
         }
     }
@@ -365,8 +391,8 @@ s32 cellHttpDestroyClient(CellHttpClientId clientId)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (clientId >= CELL_HTTP_MAX_CLIENTS || !s_clients[clientId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
 
     /* Destroy all transactions belonging to this client */
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
@@ -376,7 +402,7 @@ s32 cellHttpDestroyClient(CellHttpClientId clientId)
         }
     }
 
-    s_clients[clientId].in_use = 0;
+    HTTP_CLIENT(clientId)->in_use = 0;
     printf("[cellHttp] DestroyClient(id=%u)\n", clientId);
     return CELL_OK;
 }
@@ -405,8 +431,8 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
     const char* uri_path     = ea_path     ? (const char*)(vm_base + ea_path)     : NULL;
     method = GUEST_PTR(method, const char*);
 
-    if (clientId >= CELL_HTTP_MAX_CLIENTS || !s_clients[clientId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
 
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
         if (!s_transactions[i].in_use) {
@@ -441,9 +467,9 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
                      uri_scheme   ? uri_scheme   : "http",
                      t->hostname, t->port, t->path);
 
-            vm_write32((u32)(uintptr_t)transId, (u32)i);
+            vm_write32((u32)(uintptr_t)transId, (u32)i + 1);
             printf("[cellHttp] CreateTransaction(client=%u, %s %s) -> trans=%u\n",
-                   clientId, method, t->url, i);
+                   clientId, method, t->url, i + 1);
             return CELL_OK;
         }
     }
@@ -456,11 +482,11 @@ s32 cellHttpDestroyTransaction(CellHttpTransId transId)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    http_close_slot_socket(&s_transactions[transId]);
-    s_transactions[transId].in_use = 0;
+    http_close_slot_socket(HTTP_TRANS(transId));
+    HTTP_TRANS(transId)->in_use = 0;
     printf("[cellHttp] DestroyTransaction(trans=%u)\n", transId);
     return CELL_OK;
 }
@@ -471,10 +497,10 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
+    HttpTransSlot* t = HTTP_TRANS(transId);
 
     if (t->aborted) {
         printf("[cellHttp] SendRequest(trans=%u) - transaction aborted\n", transId);
@@ -514,7 +540,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     }
 
     /* Apply timeouts from the owning client */
-    HttpClientSlot* c = &s_clients[t->client];
+    HttpClientSlot* c = HTTP_CLIENT(t->client);
     http_apply_timeout(sock, 1, c->send_timeout);
     http_apply_timeout(sock, 0, c->recv_timeout);
 
@@ -533,6 +559,21 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                            "%s %s HTTP/1.1\r\n"
                            "Host: %s\r\n",
                            t->method, t->path, t->hostname);
+
+    /* The client's User-Agent, unless the title added its own; and
+     * "Connection: close" when the title turned keep-alive off (this client
+     * opens a new connection per request either way). */
+    int ua_added = 0;
+    for (u32 i = 0; i < t->custom_header_count; i++)
+        if (http_strcasestr(t->custom_headers[i].name, "user-agent") == t->custom_headers[i].name &&
+            strlen(t->custom_headers[i].name) == 10)
+            ua_added = 1;
+    if (!ua_added && c->user_agent[0])
+        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+                            "User-Agent: %s\r\n", c->user_agent);
+    if (!c->keep_alive)
+        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+                            "Connection: close\r\n");
 
     /* Content-Length header if body provided or explicitly set */
     if (size > 0) {
@@ -598,10 +639,10 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
+    HttpTransSlot* t = HTTP_TRANS(transId);
 
     if (t->aborted) {
         printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
@@ -752,8 +793,8 @@ static HttpTransSlot* http_resp_slot(CellHttpTransId transId, s32* err)
 {
     *err = CELL_OK;
     if (!s_http_initialized) { *err = CELL_HTTP_ERROR_NOT_INITIALIZED; return NULL; }
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use) { *err = CELL_HTTP_ERROR_NOT_FOUND; return NULL; }
-    HttpTransSlot* t = &s_transactions[transId];
+    if (!http_trans_ok(transId)) { *err = CELL_HTTP_ERROR_BAD_TRANS; return NULL; }
+    HttpTransSlot* t = HTTP_TRANS(transId);
     if (!t->headers_parsed) {
         *err = cellHttpRecvResponse(transId, NULL, 0, NULL);   /* reads and parses the headers only */
         if (*err != CELL_OK) return NULL;
@@ -840,13 +881,13 @@ s32 cellHttpGetResponseContentLength(CellHttpTransId transId, u64* length)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
     if (!length)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    vm_write64((u32)(uintptr_t)length, (u64)s_transactions[transId].content_length);
+    vm_write64((u32)(uintptr_t)length, (u64)HTTP_TRANS(transId)->content_length);
     return CELL_OK;
 }
 
@@ -855,13 +896,13 @@ s32 cellHttpGetStatusCode(CellHttpTransId transId, s32* code)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
     if (!code)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    vm_write32((u32)(uintptr_t)code, (u32)s_transactions[transId].status_code);
+    vm_write32((u32)(uintptr_t)code, (u32)HTTP_TRANS(transId)->status_code);
     return CELL_OK;
 }
 
@@ -870,11 +911,11 @@ s32 cellHttpSetResolveTimeOut(CellHttpTransId transId, u32 usec)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
-    HttpClientSlot* c = &s_clients[t->client];
+    HttpTransSlot* t = HTTP_TRANS(transId);
+    HttpClientSlot* c = HTTP_CLIENT(t->client);
     c->resolve_timeout = usec;
     printf("[cellHttp] SetResolveTimeOut(trans=%u, %u us)\n", transId, usec);
     return CELL_OK;
@@ -885,11 +926,11 @@ s32 cellHttpSetConnectTimeOut(CellHttpTransId transId, u32 usec)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
-    HttpClientSlot* c = &s_clients[t->client];
+    HttpTransSlot* t = HTTP_TRANS(transId);
+    HttpClientSlot* c = HTTP_CLIENT(t->client);
     c->connect_timeout = usec;
     printf("[cellHttp] SetConnectTimeOut(trans=%u, %u us)\n", transId, usec);
     return CELL_OK;
@@ -900,11 +941,11 @@ s32 cellHttpSetSendTimeOut(CellHttpTransId transId, u32 usec)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
-    HttpClientSlot* c = &s_clients[t->client];
+    HttpTransSlot* t = HTTP_TRANS(transId);
+    HttpClientSlot* c = HTTP_CLIENT(t->client);
     c->send_timeout = usec;
 
     /* Apply immediately if socket is already open */
@@ -920,11 +961,11 @@ s32 cellHttpSetRecvTimeOut(CellHttpTransId transId, u32 usec)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
-    HttpClientSlot* c = &s_clients[t->client];
+    HttpTransSlot* t = HTTP_TRANS(transId);
+    HttpClientSlot* c = HTTP_CLIENT(t->client);
     c->recv_timeout = usec;
 
     /* Apply immediately if socket is already open */
@@ -940,11 +981,11 @@ s32 cellHttpSetRequestContentLength(CellHttpTransId transId, u64 length)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    s_transactions[transId].request_content_length     = length;
-    s_transactions[transId].request_content_length_set = 1;
+    HTTP_TRANS(transId)->request_content_length     = length;
+    HTTP_TRANS(transId)->request_content_length_set = 1;
     printf("[cellHttp] SetRequestContentLength(trans=%u, %llu)\n",
            transId, (unsigned long long)length);
     return CELL_OK;
@@ -956,13 +997,13 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
     if (!name || !value)
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
 
-    HttpTransSlot* t = &s_transactions[transId];
+    HttpTransSlot* t = HTTP_TRANS(transId);
     if (t->custom_header_count >= CELL_HTTP_MAX_CUSTOM_HEADERS) {
         printf("[cellHttp] AddRequestHeader - too many custom headers\n");
         return CELL_HTTP_ERROR_NO_BUFFER;
@@ -985,12 +1026,146 @@ s32 cellHttpAbortTransaction(CellHttpTransId transId)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    if (transId >= CELL_HTTP_MAX_TRANSACTIONS || !s_transactions[transId].in_use)
-        return CELL_HTTP_ERROR_NOT_FOUND;
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
 
-    HttpTransSlot* t = &s_transactions[transId];
+    HttpTransSlot* t = HTTP_TRANS(transId);
     t->aborted = 1;
     http_close_slot_socket(t);
     printf("[cellHttp] AbortTransaction(trans=%u)\n", transId);
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * Client and transaction settings under their SDK names. Demon's Souls calls
+ * all of these; unregistered they returned CELL_OK with no effect, so
+ * cellHttpClientGetUserAgent left its buffer and size unwritten and
+ * cellHttpClientPollConnections never named a transaction.
+ * -----------------------------------------------------------------------*/
+
+s32 cellHttpClientSetKeepAlive(CellHttpClientId clientId, u32 enable)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    HTTP_CLIENT(clientId)->keep_alive = (enable & 0xFF) != 0;   /* b8 */
+    return CELL_OK;
+}
+
+s32 cellHttpClientSetPerHostPoolSize(CellHttpClientId clientId, u32 poolSize)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    HTTP_CLIENT(clientId)->per_host_pool = poolSize;   /* kept; one connection per request here */
+    return CELL_OK;
+}
+
+s32 cellHttpClientSetUserAgent(CellHttpClientId clientId, const char* userAgent)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    if (!userAgent)
+        return CELL_HTTP_ERROR_NO_BUFFER;
+    HttpClientSlot* c = HTTP_CLIENT(clientId);
+    snprintf(c->user_agent, sizeof(c->user_agent), "%s", GUEST_PTR(userAgent, const char*));
+    printf("[cellHttp] ClientSetUserAgent(client=%u, '%s')\n", clientId, c->user_agent);
+    return CELL_OK;
+}
+
+/* *required is the size with the NUL. With no buffer (or size 0) only
+ * *required is written, which titles use to size the buffer. */
+s32 cellHttpClientGetUserAgent(CellHttpClientId clientId, char* userAgent, u32 size, u32* required)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    const char* ua = HTTP_CLIENT(clientId)->user_agent;
+    u32 need = (u32)strlen(ua) + 1;
+    if (required)
+        vm_write32((u32)(uintptr_t)required, need);
+    if (!userAgent || !size)
+        return required ? CELL_OK : CELL_HTTP_ERROR_NO_BUFFER;
+    if (size < need)
+        return CELL_HTTP_ERROR_INSUFFICIENT;
+    memcpy(GUEST_PTR(userAgent, char*), ua, need);
+    return CELL_OK;
+}
+
+s32 cellHttpClientCloseAllConnections(CellHttpClientId clientId)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++)
+        if (s_transactions[i].in_use && s_transactions[i].client == clientId)
+            http_close_slot_socket(&s_transactions[i]);
+    return CELL_OK;
+}
+
+/* Names one of the client's transactions whose response can be read, waiting
+ * up to usec (0: just look; negative: no limit). *transId is 0 when none is
+ * ready. A transaction counts when its connection has bytes (or the end of
+ * the stream) to read, or holds body bytes from an earlier read. */
+s32 cellHttpClientPollConnections(CellHttpClientId clientId, CellHttpTransId* transId, s64 usec)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+    if (!http_client_ok(clientId))
+        return CELL_HTTP_ERROR_BAD_CLIENT;
+    if (!transId)
+        return CELL_HTTP_ERROR_NO_BUFFER;
+
+    fd_set rd;
+    FD_ZERO(&rd);
+    int nfds = 0, waiting = 0;
+    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
+        HttpTransSlot* t = &s_transactions[i];
+        if (!t->in_use || t->client != clientId || t->aborted || t->sock == HTTP_INVALID_SOCKET)
+            continue;
+        if (t->body_overflow_len > 0) {
+            vm_write32((u32)(uintptr_t)transId, i + 1);
+            return CELL_OK;
+        }
+        FD_SET(t->sock, &rd);
+        if ((int)t->sock + 1 > nfds) nfds = (int)t->sock + 1;   /* ignored by Winsock */
+        waiting++;
+    }
+    vm_write32((u32)(uintptr_t)transId, 0);
+    if (!waiting)
+        return CELL_OK;
+
+    struct timeval tv, *ptv = NULL;
+    if (usec >= 0) {
+        tv.tv_sec  = (long)(usec / 1000000);
+        tv.tv_usec = (long)(usec % 1000000);
+        ptv = &tv;
+    }
+    if (select(nfds, &rd, NULL, NULL, ptv) <= 0)
+        return CELL_OK;
+    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
+        HttpTransSlot* t = &s_transactions[i];
+        if (t->in_use && t->client == clientId && !t->aborted && t->sock != HTTP_INVALID_SOCKET &&
+            FD_ISSET(t->sock, &rd)) {
+            vm_write32((u32)(uintptr_t)transId, i + 1);
+            break;
+        }
+    }
+    return CELL_OK;
+}
+
+s32 cellHttpTransactionAbortConnection(CellHttpTransId transId)
+{
+    return cellHttpAbortTransaction(transId);
+}
+
+s32 cellHttpRequestSetContentLength(CellHttpTransId transId, u64 totalSize)
+{
+    return cellHttpSetRequestContentLength(transId, totalSize);
 }

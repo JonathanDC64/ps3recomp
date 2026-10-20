@@ -8,21 +8,28 @@
  * do; the rest of the body is only written after the headers were read, so
  * cellHttpRecvResponse has to recv() it straight into the guest buffer.
  * The getters are declared weak so a build without them still runs and
- * reports them missing. POSIX sockets; on Windows it reports SKIP.
+ * reports them missing (POSIX; on Windows they are plain declarations).
  *
  *   cc -std=gnu17 -I include -o test_http_response_getters libs/network/tests/test_http_response_getters.c
+ *   clang-cl /I include /Fe:test_http_response_getters.exe libs/network/tests/test_http_response_getters.c ws2_32.lib
  * Driven by tools/test_http_response_getters.py.
  */
-#ifdef _WIN32
-#include <stdio.h>
-int main(void) { puts("SKIP: POSIX sockets only"); return 0; }
-#else
 #include "../cellHttp.h"
+#ifndef _WIN32
 s32 cellHttpResponseGetStatusCode(CellHttpTransId, s32*) __attribute__((weak));
 s32 cellHttpResponseGetContentLength(CellHttpTransId, u64*) __attribute__((weak));
 s32 cellHttpResponseGetAllHeaders(CellHttpTransId, void*, u32*, void*, u32, u32*) __attribute__((weak));
+#endif
 #include "../cellHttp.c"
+#include "../ps3_net.c"
+#ifdef _WIN32
+typedef int socklen_t;
+typedef int ssize_t;
+#define close(fd) closesocket(fd)
+#define setenv(k, v, o) _putenv_s(k, v)
+#else
 #include <arpa/inet.h>
+#endif
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -34,6 +41,8 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 
 static int fails = 0;
 #define CHECK(c, ...) do { printf((c) ? "[PASS] " : "[FAIL] "); printf(__VA_ARGS__); printf("\n"); \
@@ -58,7 +67,7 @@ static int send_request(CellHttpTransId* trans)
         return -1;
     *trans = vm_read32(TRANS);
     if (cellHttpSendRequest(*trans, NULL, 0, (u32*)(uintptr_t)U32OUT) != CELL_OK) return -1;
-    int cfd = accept(lfd, NULL, NULL);
+    int cfd = (int)accept(lfd, NULL, NULL);
     char req[2048]; size_t n = 0;
     while (cfd >= 0 && n < sizeof req - 1) {
         ssize_t r = recv(cfd, req + n, sizeof req - 1 - n, 0);
@@ -74,6 +83,7 @@ static void send_str(int fd, const char* s) { send(fd, s, strlen(s), 0); }
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    setenv("PS3_NET_ONLINE", "1", 1);   /* cellHttp connects only online */
     vm_base = calloc(1, MEM);
     ppu_vm_size = MEM;
     strcpy((char*)vm_base + 0x100, "http");
@@ -81,7 +91,11 @@ int main(void)
     strcpy((char*)vm_base + 0x140, "/list.jsp");
     strcpy((char*)vm_base + 0x180, "GET");
 
-    lfd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);   /* the listener opens before cellHttpInit */
+#endif
+    lfd = (int)socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     socklen_t al = sizeof a;
@@ -93,7 +107,7 @@ int main(void)
     port = ntohs(a.sin_port);
     if (cellHttpInit(NULL, 0) != CELL_OK ||
         cellHttpCreateClient((CellHttpClientId*)(uintptr_t)CLIENT) != CELL_OK) { puts("FAIL: init"); return 1; }
-    client = *(CellHttpClientId*)(vm_base + CLIENT);   /* written host-endian */
+    client = vm_read32(CLIENT);   /* written big-endian */
 
     char body[BODY_LEN];
     for (int i = 0; i < BODY_LEN; i++) body[i] = (char)('a' + i % 26);
@@ -170,4 +184,3 @@ int main(void)
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
-#endif

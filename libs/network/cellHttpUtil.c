@@ -422,3 +422,61 @@ s32 cellHttpUtilBase64Decode(u8* out, u32 outSize,
 
     return CELL_OK;
 }
+
+/* cellHttpUtilBase64Encoder(out, input, len) and cellHttpUtilBase64Decoder
+ * (output, in, len), the SDK pair Demon's Souls imports. Both return the
+ * number of bytes written, which the title uses as the length:
+ * - the encoder writes the padded text and a NUL after it (Demon's Souls sizes
+ *   the buffer 4 bytes past the text);
+ * - the decoder takes a multiple of 4 and writes no NUL (the buffer is exactly
+ *   len / 4 * 3 bytes). */
+s32 cellHttpUtilBase64Encoder(char* out, const void* input, u32 len)
+{
+    if (!input || !len)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_STRING;
+    if (!out)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
+    const u8* src = (const u8*)(vm_base + (u32)(uintptr_t)input);
+    char* dst = (char*)(vm_base + (u32)(uintptr_t)out);
+    u32 pos = 0;
+    for (u32 i = 0; i < len; i += 3) {
+        u32 n = ((u32)src[i]) << 16;
+        if (i + 1 < len) n |= ((u32)src[i + 1]) << 8;
+        if (i + 2 < len) n |= src[i + 2];
+        dst[pos++] = s_b64_table[(n >> 18) & 0x3F];
+        dst[pos++] = s_b64_table[(n >> 12) & 0x3F];
+        dst[pos++] = (i + 1 < len) ? s_b64_table[(n >> 6) & 0x3F] : '=';
+        dst[pos++] = (i + 2 < len) ? s_b64_table[n & 0x3F] : '=';
+    }
+    dst[pos] = '\0';
+    return (s32)pos;
+}
+
+s32 cellHttpUtilBase64Decoder(char* output, const void* in, u32 len)
+{
+    if (!in)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_STRING;
+    if (len & 3)
+        return (s32)CELL_HTTP_UTIL_ERROR_INVALID_LENGTH;
+    if (!output)
+        return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
+    const char* src = (const char*)(vm_base + (u32)(uintptr_t)in);
+    u8* dst = (u8*)(vm_base + (u32)(uintptr_t)output);
+    u32 pos = 0;
+    for (u32 i = 0; i < len; i += 4) {
+        int v[4];
+        for (int k = 0; k < 4; k++) {
+            v[k] = src[i + k] == '=' ? -2 : b64_decode_char(src[i + k]);
+            if (v[k] == -1 || (v[k] == -2 && (k < 2 || i + 4 < len)))
+                return (s32)CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER;
+        }
+        if (v[2] == -2 && v[3] != -2)
+            return (s32)CELL_HTTP_UTIL_ERROR_INVALID_CHARACTER;
+        u32 n = ((u32)v[0] << 18) | ((u32)v[1] << 12) |
+                ((u32)(v[2] < 0 ? 0 : v[2]) << 6) | (u32)(v[3] < 0 ? 0 : v[3]);
+        dst[pos++] = (u8)(n >> 16);
+        if (v[2] >= 0) dst[pos++] = (u8)(n >> 8);
+        if (v[3] >= 0) dst[pos++] = (u8)n;
+    }
+    return (s32)pos;
+}

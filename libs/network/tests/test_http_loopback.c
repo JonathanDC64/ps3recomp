@@ -108,12 +108,13 @@ int main(void)
     assert(getsockname(l, (struct sockaddr*)&a, &al) == 0);
     u16 port = ntohs(a.sin_port);
 
-    /* A second client gets id 1, written big-endian for the guest. */
+    /* Ids start at 1 (titles take 0 for "none"): a second client gets 2,
+     * written big-endian for the guest. */
     assert(cellHttpCreateClient((CellHttpClientId*)(uintptr_t)CLIENT) == CELL_OK);
-    assert(vm_read32(CLIENT) == 0);
+    assert(vm_read32(CLIENT) == 1);
     assert(cellHttpCreateClient((CellHttpClientId*)(uintptr_t)CLIENT) == CELL_OK);
     CellHttpClientId client = vm_read32(CLIENT);
-    assert(client == 1);
+    assert(client == 2);
 
     /* Offline: no connection at all. */
     env("PS3_NET_ONLINE", "");
@@ -151,7 +152,7 @@ int main(void)
     const char* hdr = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
     send(c, hdr, (int)strlen(hdr), 0);
     assert(cellHttpRecvResponse(t, NULL, 0, (u32*)(uintptr_t)RECVD) == CELL_OK);
-    assert(t < CELL_HTTP_MAX_TRANSACTIONS && s_transactions[t].status_code == 200);
+    assert(http_trans_ok(t) && HTTP_TRANS(t)->status_code == 200);
     send(c, "0123456789", 10, 0);
     memset(vm_base + RBUF, 0, 32);
     u32 got = 0;
