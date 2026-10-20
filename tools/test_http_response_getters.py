@@ -45,6 +45,8 @@ def main():
         exe = os.path.join(td, "test_http_response_getters")
         cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
                "-o", exe] + SOURCES
+        if os.name == "nt":
+            cmd.append("-lws2_32")   # MinGW: Winsock is a separate library
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")

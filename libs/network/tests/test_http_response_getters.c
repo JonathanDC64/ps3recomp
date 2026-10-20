@@ -23,8 +23,10 @@ s32 cellHttpResponseGetAllHeaders(CellHttpTransId, void*, u32*, void*, u32, u32*
 #include "../cellHttp.c"
 #include "../ps3_net.c"
 #ifdef _WIN32
+#ifdef _MSC_VER   /* MinGW has both */
 typedef int socklen_t;
 typedef int ssize_t;
+#endif
 #define close(fd) closesocket(fd)
 #define setenv(k, v, o) _putenv_s(k, v)
 #else
