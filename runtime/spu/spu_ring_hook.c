@@ -31,9 +31,28 @@
  *
  * SPU_NATIVE_RING (live): 1 (default) as above, 2 reads the line for every
  * command, 0 runs the lifted code, for A/B.
+ *
+ * SPU_RING_HIST=<n> (live; 0, the default, is off) counts what the block
+ * hands to the lifted loop, to choose what else to write natively, and
+ * prints the counts after every n commands it took, then starts the next
+ * interval from 0:
+ *     each command byte (byte 3 of the command at 0x13560);
+ *     for command 37 (a copy into the local RSX command buffer), power-of-two
+ *         buckets of its payload size (w0 >> 8) and of its copy length (w1);
+ *     segment switches, 0x3C90's slow path: the segment index at 0x13358
+ *         differs from the last counted command's (the semaphore at 0x13350,
+ *         +1 per switch, is printed beside it as a check);
+ *     fallbacks, the returns of 0: each is one command the lifted code
+ *         fetches (the first after every wait), and is in no other count.
+ * The first counted command also prints the context fields
+ * spu_indirect_branch reads, and the end of an interval prints them again if
+ * they changed. Nothing else changes with it on: it reads local store
+ * directly (no LS probe sees it) and writes only its own counters.
  */
 
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "ps3emu/ps3_knob.h"
 #include "spu_context.h"
 #include "spu_helpers.h"
@@ -48,6 +67,15 @@ int  spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea);
 #define RING_LINE_LS  0x13480u   /* the control line's copy (GETLLAR target) */
 #define RING_STATE_LS 0x13400u   /* word 0: get; word 2: where the state is PUT */
 #define RING_CMD_LS   0x13560u   /* the command being dispatched */
+#define RING_SEG_LS   0x13350u   /* FIFO segments: semaphore, count, index, next output */
+
+#if defined(_MSC_VER)
+#define RING_INLINE   static __forceinline
+#define RING_NOINLINE static __declspec(noinline)
+#else
+#define RING_INLINE   static inline __attribute__((always_inline))
+#define RING_NOINLINE static __attribute__((noinline))
+#endif
 
 static int native_ring_on(void)
 {
@@ -61,7 +89,8 @@ static inline uint32_t be32_at(const uint8_t* p)
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-int spu_hook_ring_fetch(spu_context* ctx)
+/* The fetch step: 1 when it took a command, 0 runs the lifted code. */
+RING_INLINE int ring_fetch(spu_context* ctx)
 {
     if (!native_ring_on() || !vm_base) return 0;
     /* The channel latches below are written in place, as spu_wrch_latch
@@ -139,4 +168,190 @@ int spu_hook_ring_fetch(spu_context* ctx)
     r[3] = spu_rotqbyi(r[70], 8);
     spu_ls_write128(ctx, RING_STATE_LS, r[70]);
     return 1;
+}
+
+/* SPU_RING_HIST: n, or 0 for off. Refreshed on ps3_env_gen as g_spu_ch_diag
+ * is, so with it off a fetch tests two globals that do not change. */
+static int g_spu_ring_hist;
+static unsigned g_spu_ring_hist_gen = ~0u;
+static unsigned g_spu_ring_hist_epoch;   /* +1 when it is turned on or n changes */
+RING_NOINLINE int spu_ring_hist_load(void)
+{
+    const unsigned gen = ps3_env_gen;
+    int n = ps3_env_int("SPU_RING_HIST", 0);
+    if (n < 0) n = 0;
+    if (n && n != g_spu_ring_hist) g_spu_ring_hist_epoch++;
+    g_spu_ring_hist = n;
+    g_spu_ring_hist_gen = gen;
+    return n;
+}
+
+/* What spu_indirect_branch reads to pick the image a target resolves in. */
+typedef struct ring_fields {
+    int image_id, resident_task, resident_ovl, policy_mode, module_img_a00;
+    int code_img[4];
+    uint32_t code_lsa[4], code_size[4];
+    uint32_t host_depth;
+} ring_fields;
+
+/* The counts are per host thread, which makes them the running context's:
+ * a context stays on one host thread for its lifetime (spu_context.h). Two
+ * contexts running this image at once would each count their own, with no
+ * atomics and no line shared between threads. */
+typedef struct ring_hist_state {
+    unsigned epoch;
+    int armed;                        /* a command was counted in this epoch */
+    int field_prints;
+    uint32_t seg;                     /* segment index at the last counted command */
+    uint32_t sem0;                    /* semaphore at the start of the interval */
+    uint64_t t0_ms, interval, cmds, fallbacks, switches;
+    uint32_t cmd[256];
+    uint32_t size37[13], copy37[13];  /* ring_bucket */
+    ring_fields fields;               /* as last printed */
+} ring_hist_state;
+static SPU_THREAD_LOCAL ring_hist_state t_ring_hist;
+
+/* 0, then up to 16, 32, ... 16K bytes, then above 16K (the helpers' DMA
+ * fast case ends at 16K). */
+static unsigned ring_bucket(uint32_t v)
+{
+    if (!v) return 0;
+    unsigned b = 1;
+    for (uint32_t top = 16; v > top && b < 12; top <<= 1) b++;
+    return b;
+}
+
+static uint64_t ring_ms(void)
+{
+    struct timespec ts;
+#ifdef _WIN32
+    timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static void ring_fields_get(const spu_context* ctx, ring_fields* f)
+{
+    memset(f, 0, sizeof *f);
+    f->image_id = ctx->image_id;
+    f->resident_task = ctx->resident_task;
+    f->resident_ovl = ctx->resident_ovl;
+    f->policy_mode = ctx->policy_mode;
+    f->module_img_a00 = ctx->module_img_a00;
+    for (int s = 0; s < 4; s++) {
+        f->code_img[s] = ctx->resident_code[s].image_id;
+        f->code_lsa[s] = ctx->resident_code[s].lsa;
+        f->code_size[s] = ctx->resident_code[s].size;
+    }
+    f->host_depth = ctx->host_depth;
+}
+
+static void ring_fields_print(const ring_fields* f, uint32_t spu, const char* what)
+{
+    char rc[4][48];
+    for (int s = 0; s < 4; s++) {
+        if (f->code_img[s])
+            snprintf(rc[s], sizeof rc[s], "%d@0x%05X+0x%X",
+                     f->code_img[s], f->code_lsa[s], f->code_size[s]);
+        else
+            snprintf(rc[s], sizeof rc[s], "0");
+    }
+    fprintf(stderr, "[ring-hist] spu=%u %s: image_id=%d resident_task=%d resident_ovl=%d"
+                    " policy_mode=%d module_img_a00=%d resident_code=%s,%s,%s,%s"
+                    " host_depth=%u\n",
+            spu, what, f->image_id, f->resident_task, f->resident_ovl, f->policy_mode,
+            f->module_img_a00, rc[0], rc[1], rc[2], rc[3], f->host_depth);
+}
+
+/* The end of an interval: three lines, then the counts start again. */
+RING_NOINLINE void ring_hist_print(const spu_context* ctx, ring_hist_state* t, uint32_t sem)
+{
+    static const char* const bk[13] = { "0", "<=16", "<=32", "<=64", "<=128", "<=256", "<=512",
+                                        "<=1K", "<=2K", "<=4K", "<=8K", "<=16K", ">16K" };
+    const uint64_t now = ring_ms(), ms = now - t->t0_ms;
+    const unsigned long long iv = (unsigned long long)++t->interval;
+    char line[4096];
+    int p = 0;
+#define RING_CAT(...) do { if (p < (int)sizeof line) \
+        p += snprintf(line + p, sizeof line - (size_t)p, __VA_ARGS__); } while (0)
+    const double per_s = ms ? (double)(t->cmds + t->fallbacks) * 1000.0 / (double)ms : 0.0;
+    fprintf(stderr, "[ring-hist] spu=%u #%llu: %llu taken + %llu fallbacks in %llu ms"
+                    " (%.0f a second), %llu segment switches (semaphore +%u)\n",
+            ctx->spu_id, iv, (unsigned long long)t->cmds, (unsigned long long)t->fallbacks,
+            (unsigned long long)ms, per_s, (unsigned long long)t->switches, sem - t->sem0);
+    RING_CAT("[ring-hist] spu=%u #%llu cmd", ctx->spu_id, iv);
+    for (int c = 0; c < 256; c++)
+        if (t->cmd[c]) RING_CAT(" %d:%u", c, t->cmd[c]);
+    fprintf(stderr, "%s\n", line);
+    if (t->cmd[37]) {
+        p = 0;
+        RING_CAT("[ring-hist] spu=%u #%llu cmd37 size", ctx->spu_id, iv);
+        for (int b = 0; b < 13; b++)
+            if (t->size37[b]) RING_CAT(" %s:%u", bk[b], t->size37[b]);
+        RING_CAT(" | w1");
+        for (int b = 0; b < 13; b++)
+            if (t->copy37[b]) RING_CAT(" %s:%u", bk[b], t->copy37[b]);
+        fprintf(stderr, "%s\n", line);
+    }
+#undef RING_CAT
+    ring_fields f;
+    ring_fields_get(ctx, &f);
+    if (memcmp(&f, &t->fields, sizeof f)) {
+        if (t->field_prints < 8 && ++t->field_prints)
+            ring_fields_print(&f, ctx->spu_id, "image fields changed");
+        t->fields = f;
+    }
+    fflush(stderr);
+    t->cmds = t->fallbacks = t->switches = 0;
+    memset(t->cmd, 0, sizeof t->cmd);
+    memset(t->size37, 0, sizeof t->size37);
+    memset(t->copy37, 0, sizeof t->copy37);
+    t->sem0 = sem;
+    t->t0_ms = now;
+}
+
+/* One fetch, with SPU_RING_HIST on (or its generation stale). */
+RING_NOINLINE void ring_hist_count(spu_context* ctx, int took)
+{
+    if (g_spu_ring_hist_gen != ps3_env_gen) spu_ring_hist_load();
+    const int n = g_spu_ring_hist;
+    if (!n) return;
+    ring_hist_state* t = &t_ring_hist;
+    if (t->epoch != g_spu_ring_hist_epoch) {   /* turned on, or a new n: start over */
+        memset(t, 0, sizeof *t);
+        t->epoch = g_spu_ring_hist_epoch;
+    }
+    if (!took) { t->fallbacks++; return; }
+    const uint8_t* ls = ctx->ls;
+    const uint32_t w0 = be32_at(ls + RING_CMD_LS);
+    const uint32_t sem = be32_at(ls + RING_SEG_LS), seg = be32_at(ls + RING_SEG_LS + 8);
+    const unsigned cmd = w0 & 255u;              /* byte 3 of 0x13560 */
+    t->cmd[cmd]++;
+    if (cmd == 37) {
+        t->size37[ring_bucket(w0 >> 8)]++;
+        t->copy37[ring_bucket(be32_at(ls + RING_CMD_LS + 4))]++;
+    }
+    if (!t->armed) {
+        t->armed = 1;
+        t->seg = seg;
+        t->sem0 = sem;
+        t->t0_ms = ring_ms();
+        ring_fields_get(ctx, &t->fields);
+        ring_fields_print(&t->fields, ctx->spu_id, "image fields");
+        fflush(stderr);
+    } else if (seg != t->seg) {
+        t->switches++;
+        t->seg = seg;
+    }
+    if (++t->cmds >= (uint64_t)n) ring_hist_print(ctx, t, sem);
+}
+
+int spu_hook_ring_fetch(spu_context* ctx)
+{
+    const int took = ring_fetch(ctx);
+    if (__builtin_expect(g_spu_ring_hist_gen != ps3_env_gen || g_spu_ring_hist, 0))
+        ring_hist_count(ctx, took);
+    return took;
 }
