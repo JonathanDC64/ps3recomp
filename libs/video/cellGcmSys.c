@@ -1354,9 +1354,13 @@ void gcm_forget_spu_blocks(void)
     s_spu_blk_w = 0;
 }
 
+static void gcm_put_moved(void);   /* FIFO_PUT_WAKE, with the kick wait below */
+
 void gcm_note_spu_put(u32 ea, u32 size)
 {
     if (!size || size > 0x40000u) return;
+    if (ea <= GCM_CONTROL_GUEST_ADDR && GCM_CONTROL_GUEST_ADDR + 4u <= ea + size)
+        gcm_put_moved();                            /* this PUT stored `put` itself */
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
@@ -1594,11 +1598,54 @@ void* cellGcm_fifo_kick_event(void)
  * starved guest still paid the full tick. Waiting here instead costs nothing
  * when no one kicks (the timeout is the old sleep) and drains immediately when
  * someone does. */
+/* FIFO_PUT_WAKE (live, default 1): wake the walker when the title moves
+ * `put`. A title whose SPU builds the pushbuffer and DMAs `put` into the
+ * control register (Demon's Souls) never polls a dry fence queue, so nothing
+ * kicked: the present thread slept its whole FIFO_KICK_MS with commands
+ * queued behind it, about once a frame. Now the wait is skipped when `put`
+ * moved since the last drain read it, and an SPU PUT that stores `put` ends a
+ * wait in progress. Each put value skips one wait at most, so a walker
+ * stopped short of `put` (on a semaphore) still sleeps. */
+static u32 s_drain_put;                 /* the put the last drain read */
+static volatile int s_kick_waiting;     /* the present thread is in (or entering) its wait */
+
+static int fifo_put_wake_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("FIFO_PUT_WAKE", 1));
+    return on;
+}
+
+/* SPU side, after the DMA has stored `put`. The fence orders that store before
+ * the load of s_kick_waiting, and the wait orders its store of the flag before
+ * its load of `put`, so one of the two sees the other: the wait finds the new
+ * put, or this finds the waiter and sets the event. */
+static void gcm_put_moved(void)
+{
+    if (!fifo_put_wake_on()) return;
+    atomic_thread_fence(memory_order_seq_cst);
+    if (s_kick_waiting && s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("GCM_FIFO_KICK"); on = (e && *e == '0') ? 0 : 1; }
     HANDLE ev = on ? (HANDLE)cellGcm_fifo_kick_event() : NULL;
+    if (ev && fifo_put_wake_on() && (s_gcm_context_ea || s_gcm_syscall_mode)) {
+        static u32 s_skipped = 0xFFFFFFFFu;
+        s_kick_waiting = 1;
+        atomic_thread_fence(memory_order_seq_cst);
+        const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        if (put != s_drain_put && put != s_skipped) {
+            s_skipped = put;                /* new commands since the last drain: walk them now */
+            s_kick_waiting = 0;
+            return;
+        }
+        WaitForSingleObject(ev, ms);
+        s_kick_waiting = 0;
+        return;
+    }
     if (ev) WaitForSingleObject(ev, ms);
     else    Sleep(ms);
 }
@@ -1685,6 +1732,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    s_drain_put = put;                        /* FIFO_PUT_WAKE: what this pass will reach */
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
      * in order; on arm64 it does not, so without an acquire here the ring
