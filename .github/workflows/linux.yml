@@ -322,6 +322,23 @@ jobs:
           cmake --build build-fiber
           ./build-fiber/fiber_switch
 
+      # cellSail's movies off Windows: MPEG-2 through FFmpeg loaded at run
+      # time, on a PAMF file the test encodes and writes itself (B-frames,
+      # pictures split across PES packets, LPCM split mid-sample), with the
+      # cellVdec and cellPamf tests next to it. It needs the FFmpeg libraries,
+      # not the ffmpeg program (without that the cellVdec decode tests are not
+      # added). The movie test missing means CMake did not find the libraries,
+      # which must fail, not skip.
+      - name: Run the codec tests with FFmpeg (movies)
+        run: |
+          sudo apt-get install -y libavcodec-dev
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          cmake -S . -B build-codec -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DPS3RECOMP_BUILD_TESTS=ON -DPS3RECOMP_FFMPEG_RUNTIME=ON
+          cmake --build build-codec --target test_sail_movie test_vdec_stub test_vdec_ffmpeg test_cellPamf
+          ctest --test-dir build-codec -N -R sail_movie_play | grep -q sail_movie_play
+          ctest --test-dir build-codec -R "sail_movie|vdec|pamf" --output-on-failure
+
       # An SPU parked on a GETLLAR reservation has to be told when the PPU
       # writes that line. Nothing else in the tree fails when that notify is
       # missing -- the SPU just never wakes -- so it gets its own check.
