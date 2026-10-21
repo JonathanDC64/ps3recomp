@@ -111,7 +111,7 @@ typedef uint32_t           UINT;
 typedef int32_t            LONG;      /* 32-bit, as on Windows -- see the header comment */
 typedef int32_t            INT;
 typedef long long          LONGLONG;  /* long long, not int64_t: distinct from `long` everywhere */
-typedef long long          LONG64;
+typedef int64_t            LONG64;    /* as vkd3d's Windows types spell it, so a file can include both */
 typedef unsigned long long ULONGLONG;
 typedef unsigned long long ULONG64;
 typedef unsigned long long DWORD64;
@@ -335,7 +335,7 @@ PS3__ILK_OVERLOADS2(InterlockedAnd, and)
 PS3__ILK_OVERLOADS2(InterlockedOr, or)
 PS3__ILK_OVERLOADS2(InterlockedXor, xor)
 PS3__ILK_OVERLOADS3(InterlockedCompareExchange)
-/* The 64 names: LONG64 is long long, and int64_t is `long` on Linux. */
+/* The 64 names: LONG64 is int64_t, `long` on Linux and `long long` on Darwin; LONGLONG is long long. */
 static inline long      InterlockedIncrement64(volatile long* t)                { return ps3__ilk_inc_l(t); }
 static inline long long InterlockedIncrement64(volatile long long* t)           { return ps3__ilk_inc_ll(t); }
 static inline long      InterlockedDecrement64(volatile long* t)                { return ps3__ilk_dec_l(t); }
@@ -1199,6 +1199,42 @@ static inline BOOL CreateDirectoryA(LPCSTR path, void* security_attributes)
     case EROFS:   SetLastError(ERROR_ACCESS_DENIED);  break;
     default:      SetLastError(ERROR_GEN_FAILURE);    break;
     }
+    return FALSE;
+}
+
+/* MoveFileExA with MOVEFILE_REPLACE_EXISTING is rename(2), which replaces the
+ * target atomically: the reason a caller writes a temporary file and moves it
+ * into place. Without the flag an existing target is refused, as on Windows.
+ * DeleteFileA is unlink(2). */
+#define MOVEFILE_REPLACE_EXISTING 0x00000001u
+static inline void ps3__file_error(void)
+{
+    switch (errno) {
+    case ENOENT:
+    case ENOTDIR: SetLastError(ERROR_PATH_NOT_FOUND); break;
+    case EACCES:
+    case EPERM:
+    case EROFS:   SetLastError(ERROR_ACCESS_DENIED);  break;
+    default:      SetLastError(ERROR_GEN_FAILURE);    break;
+    }
+}
+static inline BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags)
+{
+    if (!from || !to) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    struct stat st;
+    if (!(flags & MOVEFILE_REPLACE_EXISTING) && stat(to, &st) == 0) {
+        SetLastError(ERROR_ALREADY_EXISTS);
+        return FALSE;
+    }
+    if (rename(from, to) == 0) return TRUE;
+    ps3__file_error();
+    return FALSE;
+}
+static inline BOOL DeleteFileA(LPCSTR path)
+{
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (unlink(path) == 0) return TRUE;
+    ps3__file_error();
     return FALSE;
 }
 
