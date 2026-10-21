@@ -211,10 +211,21 @@ static void audio_backend_shutdown(void)
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
-                       num_samples * 2 * sizeof(float));
+    if (!s_sdl_audio_dev) return;
+    /* AUDIO_MUTE=1 (live): queue silence at the same rate, as the WASAPI
+     * backend does, so the audio clock and the game's pacing are unchanged. */
+    static int mute = -1;
+    PS3_KNOB(mute, getenv("AUDIO_MUTE") && getenv("AUDIO_MUTE")[0] != '0' ? 1 : 0);
+    if (mute) {
+        static const float silence[256 * 2];
+        for (u32 left = num_samples; left; ) {
+            const u32 n = left < 256 ? left : 256;
+            SDL_QueueAudio(s_sdl_audio_dev, silence, n * 2 * sizeof(float));
+            left -= n;
+        }
+        return;
     }
+    SDL_QueueAudio(s_sdl_audio_dev, stereo_samples, num_samples * 2 * sizeof(float));
 }
 
 /* SDL queues without bound: keep about four blocks ahead of the device. */
