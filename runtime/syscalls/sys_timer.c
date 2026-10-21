@@ -141,6 +141,36 @@ static void write_be64(uint32_t addr, uint64_t val)
  * dumps the CALLING thread's guest stack. NULL otherwise. */
 void (*g_shadow_stack_dump_hook)(void) = 0;
 
+/* A usleep of at most USLEEP_YIELD_US microseconds (default 10; 0 = none)
+ * is a yield, not idling: see the sub-millisecond branch below. */
+static uint64_t usleep_yield_us(void)
+{
+    static int s_yield = -1;
+    PS3_KNOB(s_yield, getenv("USLEEP_YIELD_US") ? atoi(getenv("USLEEP_YIELD_US")) : 10);
+    return s_yield > 0 ? (uint64_t)s_yield : 0;
+}
+
+/* Such a yield waits in place, as RPCS3's does. USLEEP_SHORT_SWITCH=1 is the
+ * old behaviour: it hands the core to another ready thread (SwitchToThread on
+ * Windows, nanosleep elsewhere). */
+static int usleep_short_in_place(void)
+{
+    static int s_on = -1;
+    PS3_KNOB(s_on, getenv("USLEEP_SHORT_SWITCH") ? 0 : 1);
+    return s_on;
+}
+
+static inline void usleep_relax(void)
+{
+#if defined(_WIN32)
+    YieldProcessor();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
 #ifdef _WIN32
 /* Short-usleep idle detection (see the sub-millisecond branch below). */
 static __declspec(thread) int64_t t_last_end;
@@ -330,7 +360,13 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * for the physics step, and on the timer each poll came back up to
          * 0.5 ms late: after a breakable broke, step frames took up to 54 ms
          * (21 at most with the spin). Sleeps of at most USLEEP_YIELD_US
-         * (default 10; 0 = off) keep the spin in a streak too. */
+         * (default 10; 0 = off) keep the spin in a streak too.
+         *
+         * Those yields also wait in place, without SwitchToThread. A yield
+         * hands the core to any thread ready on it, and Havok's poller then
+         * waited behind it for a whole quantum: about 1 in 40 of its
+         * usleep(1) calls took 0.05-1.7 ms, and the SPU tasks it feeds jobs
+         * to waited with it. */
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
@@ -345,9 +381,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               t_timer_hr = t_timer != NULL;
               if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
           }
-          static int s_yield = -1;
-          PS3_KNOB(s_yield, getenv("USLEEP_YIELD_US") ? atoi(getenv("USLEEP_YIELD_US")) : 10);
-          if (!s_spin && t_streak >= 64 && usec > (uint64_t)(s_yield > 0 ? s_yield : 0)) {
+          if (!s_spin && t_streak >= 64 && usec > usleep_yield_us()) {
               if (t_timer) {
                   LARGE_INTEGER due;
                   due.QuadPart = -((LONGLONG)usec * 10);
@@ -379,14 +413,21 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        const int in_place = usec <= usleep_yield_us() && usleep_short_in_place();
         do {
-            SwitchToThread();
+            if (in_place) usleep_relax();
+            else SwitchToThread();
             QueryPerformanceCounter(&qpc_now);
         } while (qpc_now.QuadPart < qpc_deadline);
         t_last_end = qpc_now.QuadPart;
     }
 #else
-    if (usec > 0) {
+    if (usec > 0 && usec <= usleep_yield_us() && usleep_short_in_place()) {
+        /* A yield, as above. nanosleep would add the timer slack, 50 us by
+         * default, to every one. */
+        const uint64_t end = lv2_system_time_usec() + usec;
+        while (lv2_system_time_usec() < end) usleep_relax();
+    } else if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
