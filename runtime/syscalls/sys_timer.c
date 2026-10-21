@@ -323,7 +323,14 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * previous one's end -- sleep for real on a high-resolution waitable
          * timer (~0.5 ms granularity) until the thread does something else.
          * Short one-off waits keep the precise spin. USLEEP_SPIN=1 restores
-         * the old always-spin behaviour. */
+         * the old always-spin behaviour.
+         *
+         * A sleep of a few microseconds is a yield, not idling: Havok's job
+         * queue polls its SPU jobs with usleep(1) while the main thread waits
+         * for the physics step, and on the timer each poll came back up to
+         * 0.5 ms late: after a breakable broke, step frames took up to 54 ms
+         * (21 at most with the spin). Sleeps of at most USLEEP_YIELD_US
+         * (default 10; 0 = off) keep the spin in a streak too. */
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
@@ -338,7 +345,9 @@ int64_t sys_timer_usleep(ppu_context* ctx)
               t_timer_hr = t_timer != NULL;
               if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
           }
-          if (!s_spin && t_streak >= 64) {
+          static int s_yield = -1;
+          PS3_KNOB(s_yield, getenv("USLEEP_YIELD_US") ? atoi(getenv("USLEEP_YIELD_US")) : 10);
+          if (!s_spin && t_streak >= 64 && usec > (uint64_t)(s_yield > 0 ? s_yield : 0)) {
               if (t_timer) {
                   LARGE_INTEGER due;
                   due.QuadPart = -((LONGLONG)usec * 10);
