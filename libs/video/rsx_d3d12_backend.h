@@ -88,6 +88,13 @@ void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay);
  * frame of its own. Any thread; 0 (the default) is off. RSX_OVERLAY_REPAINT=0
  * (live) turns it off whatever the overlay asks. */
 void rsx_d3d12_overlay_repaint(int on);
+/* The overlay has input waiting (a key that opens its menu) while its
+ * repaints are off. When the game has not presented for a quarter of a
+ * second (it has stopped: a hang, or a long stall), the render thread calls
+ * the frame hook once over the last frame shown, so the overlay can open its
+ * menu and turn repaints on; a game that is presenting runs the hook with its
+ * next frame anyway. Any thread (the window procedure). */
+void rsx_d3d12_overlay_wake(void);
 /* The render thread's idle point (the ticker, between FIFO drains): makes
  * the repaint above when one is due. Cheap when none is. */
 void rsx_d3d12_overlay_tick(void);
