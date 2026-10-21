@@ -42,6 +42,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 extern "C" {
 uint32_t ppu_load_elf(const char* path);
@@ -316,11 +319,12 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a5, uint64_t a6, uint64_t a7)
 { ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
 
-/* RSX present backend. D3D12 on Windows, Metal on Apple, and the null
- * backend's headless software path anywhere else -- the same selection
- * runtime/host/host_posix.c makes, so the ticker below is backend-agnostic
- * and a POSIX host gets a frame clock instead of no clock at all. */
-#if defined(_WIN32)
+/* RSX present backend. D3D12 on Windows (and on vkd3d off it, with
+ * PS3RECOMP_RSX_D3D12_VKD3D), Metal on Apple, and the null backend's headless
+ * software path anywhere else -- the same selection runtime/host/host_posix.c
+ * makes, so the ticker below is backend-agnostic and a POSIX host gets a
+ * frame clock instead of no clock at all. */
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
@@ -2171,8 +2175,26 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
-    ppu_vm_size = 0xE0000000u;
+    /* The same space, read/write with no swap reserved: the kernel backs a page
+     * with zeros when it is first touched, as the handler above commits one on
+     * Windows. On a 4 GB boundary, which a host pointer's truncation to a guest
+     * address depends on (vm.h), by mapping 4 GB more and giving back both ends.
+     * It was calloc'd: no alignment past malloc's own, so the low 32 bits were
+     * never zero, and every vm_commit failed (mprotect on an address off a page
+     * boundary), so every sys_memory_allocate returned ENOMEM. */
+    {
+        const size_t align = 0x100000000ull;
+        uint8_t* raw = (uint8_t*)mmap(NULL, (size_t)VM_SIZE + align, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (raw != (uint8_t*)MAP_FAILED) {
+            uint8_t* at = (uint8_t*)(((uintptr_t)raw + align - 1u) & ~(uintptr_t)(align - 1u));
+            uint8_t* end = raw + (size_t)VM_SIZE + align;
+            if (at > raw) munmap(raw, (size_t)(at - raw));
+            if (end > at + VM_SIZE) munmap(at + VM_SIZE, (size_t)(end - (at + VM_SIZE)));
+            vm_base = at;
+        }
+    }
+    ppu_vm_size = 0;   /* full 32-bit space backed, as on Windows */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
 

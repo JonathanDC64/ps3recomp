@@ -202,7 +202,7 @@ static void pad_host_stick_to_u8(int x, int y, u8* out_x, u8* out_y)
 }
 #endif
 
-#if PAD_BACKEND_XINPUT
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
 
 /* Keyboard fallback for port 0.
  *
@@ -222,7 +222,12 @@ static void pad_host_stick_to_u8(int x, int y, u8* out_x, u8* out_y)
  * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. With no keys bound to the left
  * stick (below), the left stick mirrors the d-pad so a title that reads the
- * stick instead is playable too. */
+ * stick instead is playable too.
+ *
+ * Off Windows the keys come from SDL's keyboard state, which the game window's
+ * thread keeps (the D3D12 backend on vkd3d), and "this process's window" is
+ * the window SDL says has the keyboard: none in a headless run, so the keyboard
+ * stays off there. The bindings keep their Windows virtual-key codes. */
 #ifdef _WIN32
 static int pad_host_window_focused(void)
 {
@@ -232,6 +237,107 @@ static int pad_host_window_focused(void)
     GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
 }
+
+static int pad_host_key_down(int vk)
+{
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+#else
+#define VK_BACK     0x08
+#define VK_TAB      0x09
+#define VK_RETURN   0x0D
+#define VK_SHIFT    0x10
+#define VK_CONTROL  0x11
+#define VK_MENU     0x12
+#define VK_CAPITAL  0x14
+#define VK_ESCAPE   0x1B
+#define VK_SPACE    0x20
+#define VK_PRIOR    0x21
+#define VK_NEXT     0x22
+#define VK_END      0x23
+#define VK_HOME     0x24
+#define VK_LEFT     0x25
+#define VK_UP       0x26
+#define VK_RIGHT    0x27
+#define VK_DOWN     0x28
+#define VK_INSERT   0x2D
+#define VK_DELETE   0x2E
+#define VK_NUMPAD0  0x60
+#define VK_F1       0x70
+#define VK_LSHIFT   0xA0
+#define VK_RSHIFT   0xA1
+#define VK_LCONTROL 0xA2
+#define VK_RCONTROL 0xA3
+#define VK_LMENU    0xA4
+#define VK_RMENU    0xA5
+
+static int pad_host_window_focused(void)
+{
+    return SDL_GetKeyboardFocus() != NULL;
+}
+
+/* A virtual-key code's keys: letters and digits through the keyboard layout,
+ * as Windows' own codes follow it, and the rest by position. */
+static int pad_host_key_down(int vk)
+{
+    const Uint8* st = SDL_GetKeyboardState(NULL);
+    SDL_Scancode a = SDL_SCANCODE_UNKNOWN, b = SDL_SCANCODE_UNKNOWN;
+    if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+        a = SDL_GetScancodeFromKey((SDL_Keycode)(vk >= 'A' ? vk + 0x20 : vk));
+    else if (vk >= VK_F1 && vk < VK_F1 + 12)
+        a = (SDL_Scancode)(SDL_SCANCODE_F1 + (vk - VK_F1));
+    else if (vk >= VK_F1 + 12 && vk < VK_F1 + 24)
+        a = (SDL_Scancode)(SDL_SCANCODE_F13 + (vk - VK_F1 - 12));
+    else if (vk > VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9)
+        a = (SDL_Scancode)(SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD0 - 1));
+    else switch (vk) {
+    case VK_NUMPAD0:  a = SDL_SCANCODE_KP_0; break;
+    case VK_BACK:     a = SDL_SCANCODE_BACKSPACE; break;
+    case VK_TAB:      a = SDL_SCANCODE_TAB; break;
+    case VK_RETURN:   a = SDL_SCANCODE_RETURN; b = SDL_SCANCODE_KP_ENTER; break;
+    case VK_SHIFT:    a = SDL_SCANCODE_LSHIFT; b = SDL_SCANCODE_RSHIFT; break;
+    case VK_CONTROL:  a = SDL_SCANCODE_LCTRL; b = SDL_SCANCODE_RCTRL; break;
+    case VK_MENU:     a = SDL_SCANCODE_LALT; b = SDL_SCANCODE_RALT; break;
+    case VK_CAPITAL:  a = SDL_SCANCODE_CAPSLOCK; break;
+    case VK_ESCAPE:   a = SDL_SCANCODE_ESCAPE; break;
+    case VK_SPACE:    a = SDL_SCANCODE_SPACE; break;
+    case VK_PRIOR:    a = SDL_SCANCODE_PAGEUP; break;
+    case VK_NEXT:     a = SDL_SCANCODE_PAGEDOWN; break;
+    case VK_END:      a = SDL_SCANCODE_END; break;
+    case VK_HOME:     a = SDL_SCANCODE_HOME; break;
+    case VK_LEFT:     a = SDL_SCANCODE_LEFT; break;
+    case VK_UP:       a = SDL_SCANCODE_UP; break;
+    case VK_RIGHT:    a = SDL_SCANCODE_RIGHT; break;
+    case VK_DOWN:     a = SDL_SCANCODE_DOWN; break;
+    case VK_INSERT:   a = SDL_SCANCODE_INSERT; break;
+    case VK_DELETE:   a = SDL_SCANCODE_DELETE; break;
+    case VK_LSHIFT:   a = SDL_SCANCODE_LSHIFT; break;
+    case VK_RSHIFT:   a = SDL_SCANCODE_RSHIFT; break;
+    case VK_LCONTROL: a = SDL_SCANCODE_LCTRL; break;
+    case VK_RCONTROL: a = SDL_SCANCODE_RCTRL; break;
+    case VK_LMENU:    a = SDL_SCANCODE_LALT; break;
+    case VK_RMENU:    a = SDL_SCANCODE_RALT; break;
+    case 0x6A: a = SDL_SCANCODE_KP_MULTIPLY; break;
+    case 0x6B: a = SDL_SCANCODE_KP_PLUS; break;
+    case 0x6D: a = SDL_SCANCODE_KP_MINUS; break;
+    case 0x6E: a = SDL_SCANCODE_KP_PERIOD; break;
+    case 0x6F: a = SDL_SCANCODE_KP_DIVIDE; break;
+    case 0xBA: a = SDL_SCANCODE_SEMICOLON; break;      /* VK_OEM_1 */
+    case 0xBB: a = SDL_SCANCODE_EQUALS; break;         /* VK_OEM_PLUS */
+    case 0xBC: a = SDL_SCANCODE_COMMA; break;
+    case 0xBD: a = SDL_SCANCODE_MINUS; break;
+    case 0xBE: a = SDL_SCANCODE_PERIOD; break;
+    case 0xBF: a = SDL_SCANCODE_SLASH; break;          /* VK_OEM_2 */
+    case 0xC0: a = SDL_SCANCODE_GRAVE; break;          /* VK_OEM_3 */
+    case 0xDB: a = SDL_SCANCODE_LEFTBRACKET; break;    /* VK_OEM_4 */
+    case 0xDC: a = SDL_SCANCODE_BACKSLASH; break;      /* VK_OEM_5 */
+    case 0xDD: a = SDL_SCANCODE_RIGHTBRACKET; break;   /* VK_OEM_6 */
+    case 0xDE: a = SDL_SCANCODE_APOSTROPHE; break;     /* VK_OEM_7 */
+    default: break;
+    }
+    return (a != SDL_SCANCODE_UNKNOWN && st[a]) || (b != SDL_SCANCODE_UNKNOWN && st[b]);
+}
+#endif
 
 /* The keyboard pad's bindings. PAD_KEYS changes them: target=binding pairs.
  * Targets: the 16 buttons (s_pad_names), the left stick's four directions
@@ -446,7 +552,7 @@ static void pad_poll_keyboard_once(void)
     memset(down, 0, sizeof down);
     memset(claimed, 0, sizeof claimed);
     memset(chorded, 0, sizeof chorded);
-    for (int i = 0; i < s_nwatch; i++) down[s_watch[i]] = (GetAsyncKeyState(s_watch[i]) & 0x8000) ? 1 : 0;
+    for (int i = 0; i < s_nwatch; i++) down[s_watch[i]] = (u8)pad_host_key_down(s_watch[i]);
     const unsigned mouse = s_mouse_buttons;
     for (int i = 0; i < 5; i++) down[PAD_IN_MOUSE + i] = (u8)((mouse >> i) & 1);
     const int menu = s_menu_layer;
@@ -547,8 +653,9 @@ static void pad_poll_keyboard(void)
     pad_poll_keyboard_once();
     __atomic_store_n(&s_kb_busy, 0, __ATOMIC_RELEASE);
 }
-#endif
+#endif /* PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2 */
 
+#if PAD_BACKEND_XINPUT
 static void pad_poll_xinput(void)
 {
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
@@ -883,7 +990,7 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
-#ifdef _WIN32
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
     pad_poll_keyboard();
 #endif
     if (s_host_hold)
