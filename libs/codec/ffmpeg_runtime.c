@@ -83,6 +83,9 @@ static int ff_load(void)
     FF_RESOLVE(codec, avcodec_flush_buffers);
     FF_RESOLVE(codec, av_packet_alloc);
     FF_RESOLVE(codec, av_packet_free);
+    FF_RESOLVE(codec, av_parser_init);
+    FF_RESOLVE(codec, av_parser_parse2);
+    FF_RESOLVE(codec, av_parser_close);
     FF_RESOLVE(util, avutil_version);
     FF_RESOLVE(util, av_frame_alloc);
     FF_RESOLVE(util, av_frame_free);

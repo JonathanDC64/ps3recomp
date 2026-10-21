@@ -3,7 +3,7 @@
  *
  * Player lifecycle, state and events are modelled call by call. A PAMF
  * stream with MPEG-2 video and LPCM audio is played for real (sail_movie.c*:
- * Media Foundation on Windows): the graphics adapter hands out decoded frames
+ * Media Foundation on Windows, FFmpeg elsewhere): the graphics adapter hands out decoded frames
  * in buffers the title allocates through its own pAlloc callback, the sound
  * adapter hands out float PCM, and the end of the stream is reported when the
  * last frame has been shown. Anything else -- or PS3_SAIL_MOVIES=0, or a host

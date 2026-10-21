@@ -1,8 +1,8 @@
 /*
  * ps3recomp - FFmpeg, loaded at run time
  *
- * The codec modules (cellVdec today; cellAdec, cellDmux later) decode through
- * libavcodec when the host has it. It is never linked: the library is opened
+ * The codec modules (cellVdec, and cellSail's movies off Windows; cellAdec,
+ * cellDmux later) decode through libavcodec when the host has it. It is never linked: the library is opened
  * with dlopen / LoadLibrary the first time a decoder is created, and only the
  * handful of functions the modules call are resolved into a table. So
  *
@@ -46,6 +46,12 @@ typedef struct PS3FFmpeg {
     void (*avcodec_flush_buffers)(AVCodecContext* ctx);
     AVPacket* (*av_packet_alloc)(void);
     void (*av_packet_free)(AVPacket** pkt);
+    /* Splitting an elementary stream into pictures (sail_movie: PES payloads
+     * do not end on picture boundaries). */
+    AVCodecParserContext* (*av_parser_init)(int codec_id);
+    int  (*av_parser_parse2)(AVCodecParserContext* s, AVCodecContext* ctx, uint8_t** out, int* out_size,
+                             const uint8_t* buf, int buf_size, int64_t pts, int64_t dts, int64_t pos);
+    void (*av_parser_close)(AVCodecParserContext* s);
     unsigned (*avutil_version)(void);
     AVFrame* (*av_frame_alloc)(void);
     void (*av_frame_free)(AVFrame** frame);
