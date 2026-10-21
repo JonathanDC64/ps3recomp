@@ -1,0 +1,99 @@
+# Builds the D3D12 RSX backend on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D) and boots
+# the smoke title through it, with Mesa's lavapipe standing in for a GPU and
+# Xvfb for a display.
+#
+# This is the backend a title takes on Linux: rsx_d3d12_backend.c, the same
+# file Windows builds, on vkd3d (Wine's D3D12 on Vulkan) in an SDL window,
+# with the DXGI half from rsx_vkd3d_dxgi.c. linux.yml never compiles any of
+# it -- that job is the null backend -- so without this one a change made on
+# Windows can break the Linux build and nothing says so.
+#
+# vkd3d comes from its release tarball: Ubuntu packages 1.2, which has no HLSL
+# compiler, and the backend compiles its shaders with vkd3d's D3DCompile. The
+# build is cached on the version.
+name: Linux (D3D12 on vkd3d)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vkd3d:
+    name: Linux x64 D3D12 on vkd3d, lavapipe (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      VKD3D_VERSION: "2.1"
+      VKD3D_SHA256: 7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a
+      VKD3D_PREFIX: ${{ github.workspace }}/../vkd3d
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # SDL2 is required off Windows (and is the backend's window). vkd3d's
+      # build needs flex, bison, Perl's JSON module and the SPIR-V headers; the
+      # Vulkan headers and loader build and run it; lavapipe is in
+      # mesa-vulkan-drivers; Xvfb is the display the window opens on.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config clang libsdl2-dev \
+            libvulkan-dev mesa-vulkan-drivers flex bison libjson-perl spirv-headers xvfb
+
+      - name: Cache vkd3d
+        id: vkd3d-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.VKD3D_PREFIX }}
+          key: vkd3d-${{ env.VKD3D_VERSION }}-${{ runner.os }}-ubuntu-24.04-v1
+
+      - name: Build vkd3d
+        if: steps.vkd3d-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://dl.winehq.org/vkd3d/source/vkd3d-$VKD3D_VERSION.tar.xz"
+          echo "$VKD3D_SHA256  vkd3d-$VKD3D_VERSION.tar.xz" | sha256sum -c -
+          tar xf "vkd3d-$VKD3D_VERSION.tar.xz"
+          cd "vkd3d-$VKD3D_VERSION"
+          ./configure -q --prefix="$VKD3D_PREFIX" --disable-doxygen-doc
+          make -s -j"$(nproc)"
+          make -s install
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON | tee configure.log
+          grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure.log
+
+      - name: Build
+        run: cmake --build build --target ps3recomp_runtime ps3recomp_boot_smoke
+
+      # The smoke title (see linux.yml) again, this time presenting through
+      # the D3D12 backend: three frames cleared and flipped through the FIFO,
+      # on lavapipe, in an SDL window on Xvfb. Exit 0 is the title's own
+      # verdict; the greps make sure it was this backend on vkd3d that
+      # presented them, not a fallback.
+      - name: Run the PPU boot smoke title (D3D12 on vkd3d)
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          SDL_AUDIODRIVER: dummy
+        run: |
+          set -o pipefail
+          export LD_LIBRARY_PATH="$VKD3D_PREFIX/lib"
+          test -x build/ps3recomp_boot_smoke
+          xvfb-run -a -s "-screen 0 1920x1080x24" \
+            ./build/ps3recomp_boot_smoke build/smoke/smoke.elf 2>&1 | tee smoke.log
+          grep -q "\[D3D12\] vkd3d: llvmpipe" smoke.log
+          grep -q "\[D3D12\] Backend ready" smoke.log
+          grep -q "frames presented: 3" smoke.log
+          grep -q "\[smoke\] PASS" smoke.log
