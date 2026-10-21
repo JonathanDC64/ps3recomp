@@ -46,6 +46,26 @@ add_test(NAME vdec_ffmpeg_missing COMMAND test_vdec_ffmpeg stub)
 set_tests_properties(vdec_ffmpeg_missing PROPERTIES ENVIRONMENT
     "PS3RECOMP_FFMPEG_AVCODEC=${CMAKE_CURRENT_BINARY_DIR}/no-such-libavcodec;${VDEC_LIB_ENV}")
 
+# cellSail's movie player off Windows (sail_movie.cpp), MPEG-2 through the same
+# run-time FFmpeg, on a PAMF file the test writes. It encodes the pictures with
+# libavcodec, so it links the libraries but needs no ffmpeg program.
+find_library(PS3RECOMP_AVUTIL_LIBRARY NAMES avutil)
+if(NOT WIN32 AND PS3RECOMP_AVCODEC_LIBRARY AND PS3RECOMP_AVUTIL_LIBRARY)
+    find_package(Threads REQUIRED)
+    add_executable(test_sail_movie test_sail_movie.cpp
+        "${PROJECT_SOURCE_DIR}/libs/codec/sail_movie.cpp"
+        "${PROJECT_SOURCE_DIR}/libs/codec/ffmpeg_runtime.c")
+    target_include_directories(test_sail_movie PRIVATE
+        "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/libs/codec" "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
+    target_compile_definitions(test_sail_movie PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
+    target_link_libraries(test_sail_movie PRIVATE
+        ${PS3RECOMP_AVCODEC_LIBRARY} ${PS3RECOMP_AVUTIL_LIBRARY} Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME sail_movie_play COMMAND test_sail_movie play ${CMAKE_CURRENT_BINARY_DIR})
+    add_test(NAME sail_movie_no_decoder COMMAND test_sail_movie nodecoder ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(sail_movie_play PROPERTIES ENVIRONMENT "${VDEC_LIB_ENV}")
+    set_tests_properties(sail_movie_no_decoder PROPERTIES ENVIRONMENT "PS3RECOMP_FFMPEG=0;${VDEC_LIB_ENV}")
+endif()
+
 # Real decode needs streams, made by the ffmpeg CLI at test time.
 find_program(PS3RECOMP_FFMPEG_EXECUTABLE ffmpeg)
 if(NOT PS3RECOMP_FFMPEG_EXECUTABLE)

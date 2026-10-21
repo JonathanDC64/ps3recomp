@@ -208,7 +208,9 @@ if(PS3RECOMP_RSX_VULKAN)
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
-# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
+# cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on, and off
+# Windows cellSail's movies decode their MPEG-2 video through it (Windows uses
+# Media Foundation; libs/codec/sail_movie.cpp). libavcodec
 # is loaded at run time (dlopen / LoadLibrary), never linked, so building needs
 # only the FFmpeg headers, and a binary run where FFmpeg is absent -- or with
 # PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a

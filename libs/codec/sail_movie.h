@@ -4,14 +4,17 @@
  * A PAMF file is a small header followed by an MPEG program stream: MPEG-2 or
  * AVC video (stream 0xE0) and LPCM / ATRAC3+ / AC3 audio in private stream 1.
  * This module demuxes it on a thread of its own, decodes MPEG-2 video with
- * the operating system's decoder (Media Foundation on Windows) and 16-bit
- * LPCM itself, and hands out frames on the wall clock from sail_movie_start.
- * cellSail's adapters copy them into the guest buffers the title reads.
+ * the host's decoder (Media Foundation on Windows; elsewhere FFmpeg's
+ * libavcodec, loaded at run time in a build with PS3RECOMP_FFMPEG_RUNTIME)
+ * and 16-bit LPCM itself, and hands out frames on the wall clock from
+ * sail_movie_start. cellSail's adapters copy them into the guest buffers the
+ * title reads.
  *
  * Only MPEG-2 video and LPCM audio for now (what Demon's Souls ships); a
  * stream with anything else opens without that track. Where there is no
- * decoder (non-Windows hosts), sail_movie_open returns NULL and cellSail
- * keeps its old behaviour (the movie ends at once).
+ * decoder (a build without FFmpeg off Windows, or FFmpeg not found when the
+ * movie opens), sail_movie_open returns NULL and cellSail keeps its old
+ * behaviour (the movie ends at once).
  */
 #ifndef PS3RECOMP_SAIL_MOVIE_H
 #define PS3RECOMP_SAIL_MOVIE_H
