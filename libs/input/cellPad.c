@@ -48,6 +48,7 @@
 
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
+  #include "pad_hid_sony.h"   /* (pad_hid_sony_poll off Windows: the SDL pads, below) */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -338,6 +339,20 @@ static int pad_host_key_down(int vk)
     return (a != SDL_SCANCODE_UNKNOWN && st[a]) || (b != SDL_SCANCODE_UNKNOWN && st[b]);
 }
 #endif
+
+/* cellPad.h. Off Windows the mouse buttons' codes read SDL's mouse state. */
+int cellPad_host_key_down(int vk)
+{
+#ifndef _WIN32
+    static const struct { int vk; Uint32 mask; } kButtons[] = {
+        { 0x01, SDL_BUTTON_LMASK },  { 0x02, SDL_BUTTON_RMASK },  { 0x04, SDL_BUTTON_MMASK },
+        { 0x05, SDL_BUTTON_X1MASK }, { 0x06, SDL_BUTTON_X2MASK },
+    };
+    for (size_t i = 0; i < sizeof kButtons / sizeof kButtons[0]; i++)
+        if (vk == kButtons[i].vk) return (SDL_GetMouseState(NULL, NULL) & kButtons[i].mask) != 0;
+#endif
+    return pad_host_key_down(vk);
+}
 
 /* The keyboard pad's bindings. PAD_KEYS changes them: target=binding pairs.
  * Targets: the 16 buttons (s_pad_names), the left stick's four directions
@@ -653,6 +668,8 @@ static void pad_poll_keyboard(void)
     pad_poll_keyboard_once();
     __atomic_store_n(&s_kb_busy, 0, __ATOMIC_RELEASE);
 }
+#else
+int cellPad_host_key_down(int vk) { (void)vk; return 0; }   /* (no host input in this build) */
 #endif /* PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2 */
 
 #if PAD_BACKEND_XINPUT
@@ -756,6 +773,49 @@ static u8 pad_sdl_trigger_to_u8(int raw)
     return (u8)val;
 }
 
+/* One controller's buttons, sticks and triggers, as the PS3 pad has them. */
+static void pad_sdl_read(SDL_GameController* gc, PadHostState* hs)
+{
+    u16 btns = 0;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= CELL_PAD_CTRL_L3;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK))    btns |= CELL_PAD_CTRL_R3;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))         btns |= CELL_PAD_CTRL_START;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP))       btns |= CELL_PAD_CTRL_UP;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    btns |= CELL_PAD_CTRL_RIGHT;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN))     btns |= CELL_PAD_CTRL_DOWN;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT))     btns |= CELL_PAD_CTRL_LEFT;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  btns |= CELL_PAD_CTRL_L1;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) btns |= CELL_PAD_CTRL_R1;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y))             btns |= CELL_PAD_CTRL_TRIANGLE;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B))             btns |= CELL_PAD_CTRL_CIRCLE;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A))             btns |= CELL_PAD_CTRL_CROSS;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X))             btns |= CELL_PAD_CTRL_SQUARE;
+
+    /* Triggers via axis */
+    int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+    if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
+    if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
+
+    hs->buttons = btns;
+
+    /* Analog sticks */
+    pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
+                         SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY),
+                         &hs->analog_lx, &hs->analog_ly);
+    pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
+                         SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY),
+                         &hs->analog_rx, &hs->analog_ry);
+
+    /* Triggers */
+    hs->trigger_l2 = pad_sdl_trigger_to_u8(lt);
+    hs->trigger_r2 = pad_sdl_trigger_to_u8(rt);
+
+    /* Pressure: SDL has digital buttons, so 0 or 255 */
+    pad_press_from_buttons(hs);
+}
+
 static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
@@ -772,63 +832,43 @@ static void pad_poll_sdl2(void)
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
             s_host_state[i].connected = 0;
             if (gc) {
+                SDL_LockJoysticks();   /* (pad_hid_sony_poll reads the list from another thread) */
                 SDL_GameControllerClose(gc);
                 s_sdl_controllers[i] = NULL;
+                SDL_UnlockJoysticks();
             }
             continue;
         }
 
         s_host_state[i].connected = 1;
-
-        u16 btns = 0;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= CELL_PAD_CTRL_L3;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK))    btns |= CELL_PAD_CTRL_R3;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))         btns |= CELL_PAD_CTRL_START;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP))       btns |= CELL_PAD_CTRL_UP;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    btns |= CELL_PAD_CTRL_RIGHT;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN))     btns |= CELL_PAD_CTRL_DOWN;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT))     btns |= CELL_PAD_CTRL_LEFT;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  btns |= CELL_PAD_CTRL_L1;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) btns |= CELL_PAD_CTRL_R1;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y))             btns |= CELL_PAD_CTRL_TRIANGLE;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B))             btns |= CELL_PAD_CTRL_CIRCLE;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A))             btns |= CELL_PAD_CTRL_CROSS;
-        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X))             btns |= CELL_PAD_CTRL_SQUARE;
-
-        /* Triggers via axis */
-        int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-        int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-        if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
-        if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
-
-        s_host_state[i].buttons = btns;
-
-        /* Analog sticks */
-        pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
-                             SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY),
-                             &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
-        pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
-                             SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY),
-                             &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
-
-        /* Triggers */
-        s_host_state[i].trigger_l2 = pad_sdl_trigger_to_u8(lt);
-        s_host_state[i].trigger_r2 = pad_sdl_trigger_to_u8(rt);
-
-        /* Pressure: SDL has digital buttons, so 0 or 255 */
-        s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
-        s_host_state[i].press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
-        s_host_state[i].press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
-        s_host_state[i].press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
-        s_host_state[i].press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
-        s_host_state[i].press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
-        s_host_state[i].press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
-        s_host_state[i].press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
-        s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
-        s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+        pad_sdl_read(gc, &s_host_state[i]);
     }
 }
+
+#ifndef _WIN32
+/* pad_hid_sony.h, off Windows: there is no HID reader there (SDL reads every pad, Sony ones too), so this reads the
+ * SDL game controllers cellPad has open. For the title's window code that reads the pads itself, such as a wrapper
+ * UI's menus while the game's input is held. */
+int pad_hid_sony_poll(PadHidSonyState* out, int max)
+{
+    int n = 0;
+    SDL_LockJoysticks();
+    for (int i = 0; i < PAD_MAX_HOST_PORTS && n < max; i++) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
+        PadHostState hs;
+        memset(&hs, 0, sizeof hs);
+        pad_sdl_read(gc, &hs);
+        out[n].buttons = hs.buttons;
+        out[n].lx = hs.analog_lx; out[n].ly = hs.analog_ly;
+        out[n].rx = hs.analog_rx; out[n].ry = hs.analog_ry;
+        out[n].l2 = hs.trigger_l2; out[n].r2 = hs.trigger_r2;
+        n++;
+    }
+    SDL_UnlockJoysticks();
+    return n;
+}
+#endif
 
 static void pad_init_backend(void)
 {

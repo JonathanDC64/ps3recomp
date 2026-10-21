@@ -139,12 +139,16 @@ static float rsx_aspect(void)
 #include <glob.h>
 #endif
 
-/* Between a directory and a file in it (the shader cache's paths). */
-#ifdef _WIN32
-#define RSX_PATH_SEP "\\"
-#else
-#define RSX_PATH_SEP "/"
-#endif
+/* Paths are joined with '/' on every host (Windows takes it too); one that
+ * comes from the host may hold either separator. */
+static char* rsx_path_last_sep(char* path)
+{
+    char* fwd = strrchr(path, '/');
+    char* back = strrchr(path, '\\');
+    if (!fwd) return back;
+    if (!back) return fwd;
+    return fwd > back ? fwd : back;
+}
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -1150,16 +1154,209 @@ static void win_refresh_note(void)
         InterlockedExchange(&s_refresh_hz, (LONG)m.refresh_rate);
 }
 
-/* The hot keys d3d12_wndproc takes, and nothing else (the keyboard pad reads
- * the keys on its own). */
+/* The overlay's messages off Windows (rsx_d3d12_overlay): the Win32 messages it would get there, made from SDL's
+ * events, with Windows' values. */
+#define WM_SIZE          0x0005u
+#define WM_SETFOCUS      0x0007u
+#define WM_KILLFOCUS     0x0008u
+#define WM_CLOSE         0x0010u
+#define WM_KEYDOWN       0x0100u
+#define WM_KEYUP         0x0101u
+#define WM_CHAR          0x0102u
+#define WM_SYSKEYDOWN    0x0104u
+#define WM_SYSKEYUP      0x0105u
+#define WM_MOUSEMOVE     0x0200u
+#define WM_LBUTTONDOWN   0x0201u
+#define WM_LBUTTONUP     0x0202u
+#define WM_RBUTTONDOWN   0x0204u
+#define WM_RBUTTONUP     0x0205u
+#define WM_MBUTTONDOWN   0x0207u
+#define WM_MBUTTONUP     0x0208u
+#define WM_MOUSEWHEEL    0x020Au
+#define WM_XBUTTONDOWN   0x020Bu
+#define WM_XBUTTONUP     0x020Cu
+#define WM_MOUSELEAVE    0x02A3u
+
+/* rsx_d3d12_post_message's mails carry the message in the code, above the plain mails. */
+#define WIN_MAIL_MESSAGE 0x10000
+
+/* An SDL key's Windows virtual-key code, or 0: letters, digits and punctuation by what the key types (Windows' codes
+ * follow the keyboard layout too), the rest by what the key is. */
+static unsigned win_vk(const SDL_Keysym* k)
+{
+    const SDL_Keycode c = k->sym;
+    if (c >= 'a' && c <= 'z') return (unsigned)(c - 0x20);
+    if (c >= '0' && c <= '9') return (unsigned)c;
+    if (c >= SDLK_F1 && c <= SDLK_F12) return 0x70u + (unsigned)(c - SDLK_F1);
+    if (c >= SDLK_F13 && c <= SDLK_F24) return 0x7Cu + (unsigned)(c - SDLK_F13);
+    if (c >= SDLK_KP_1 && c <= SDLK_KP_9) return 0x61u + (unsigned)(c - SDLK_KP_1);
+    switch (c) {
+    case SDLK_KP_0:         return 0x60;
+    case SDLK_BACKSPACE:    return 0x08;
+    case SDLK_TAB:          return 0x09;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:     return 0x0D;
+    case SDLK_LSHIFT:
+    case SDLK_RSHIFT:       return 0x10;
+    case SDLK_LCTRL:
+    case SDLK_RCTRL:        return 0x11;
+    case SDLK_LALT:
+    case SDLK_RALT:         return 0x12;
+    case SDLK_PAUSE:        return 0x13;
+    case SDLK_CAPSLOCK:     return 0x14;
+    case SDLK_ESCAPE:       return 0x1B;
+    case SDLK_SPACE:        return 0x20;
+    case SDLK_PAGEUP:       return 0x21;
+    case SDLK_PAGEDOWN:     return 0x22;
+    case SDLK_END:          return 0x23;
+    case SDLK_HOME:         return 0x24;
+    case SDLK_LEFT:         return 0x25;
+    case SDLK_UP:           return 0x26;
+    case SDLK_RIGHT:        return 0x27;
+    case SDLK_DOWN:         return 0x28;
+    case SDLK_PRINTSCREEN:  return 0x2C;
+    case SDLK_INSERT:       return 0x2D;
+    case SDLK_DELETE:       return 0x2E;
+    case SDLK_LGUI:         return 0x5B;
+    case SDLK_RGUI:         return 0x5C;
+    case SDLK_APPLICATION:  return 0x5D;
+    case SDLK_KP_MULTIPLY:  return 0x6A;
+    case SDLK_KP_PLUS:      return 0x6B;
+    case SDLK_KP_MINUS:     return 0x6D;
+    case SDLK_KP_PERIOD:    return 0x6E;
+    case SDLK_KP_DIVIDE:    return 0x6F;
+    case SDLK_NUMLOCKCLEAR: return 0x90;
+    case SDLK_SCROLLLOCK:   return 0x91;
+    case SDLK_SEMICOLON:    return 0xBA;   /* VK_OEM_1 */
+    case SDLK_EQUALS:       return 0xBB;   /* VK_OEM_PLUS */
+    case SDLK_COMMA:        return 0xBC;
+    case SDLK_MINUS:        return 0xBD;
+    case SDLK_PERIOD:       return 0xBE;
+    case SDLK_SLASH:        return 0xBF;   /* VK_OEM_2 */
+    case SDLK_BACKQUOTE:    return 0xC0;   /* VK_OEM_3 */
+    case SDLK_LEFTBRACKET:  return 0xDB;   /* VK_OEM_4 */
+    case SDLK_BACKSLASH:    return 0xDC;   /* VK_OEM_5 */
+    case SDLK_RIGHTBRACKET: return 0xDD;   /* VK_OEM_6 */
+    case SDLK_QUOTE:        return 0xDE;   /* VK_OEM_7 */
+    default:                return 0;
+    }
+}
+
+/* Hands the overlay one message; 1 when it took it. */
+static int win_overlay(unsigned msg, unsigned long long wp, long long lp)
+{
+    if (!s_overlay_on || !s_overlay.wndproc) return 0;
+    long long r = 0;
+    return s_overlay.wndproc(s_overlay.user, s_sdl_window, msg, wp, lp, &r);
+}
+
+/* A position as Win32 packs it in a message's lParam (signed 16-bit x low, y high). */
+static long long win_xy(int x, int y)
+{
+    return (long long)(((u32)(u16)(s16)y << 16) | (u16)(s16)x);
+}
+
+/* The overlay's messages for one SDL event, as Windows would send them; PS3_NO_USER_INPUT=1 (ps3_knob.h) keeps the
+ * keyboard's and the mouse's from it. Returns 1 when the overlay took the event: a key the hot keys then skip, or
+ * the close (it asks first, and posts WM_CLOSE once answered). */
+static int win_overlay_event(const SDL_Event* e)
+{
+    const int input = !ps3_no_user_input();
+    switch (e->type) {
+    case SDL_KEYDOWN:
+    case SDL_KEYUP: {
+        const unsigned vk = input ? win_vk(&e->key.keysym) : 0;
+        if (!vk) return 0;
+        const int down = e->type == SDL_KEYDOWN;
+        const int alt = (e->key.keysym.mod & KMOD_ALT) != 0;
+        const int sys = alt || vk == 0x12 || vk == 0x79;   /* Alt held, Alt itself or F10: WM_SYSKEY*, as on Windows */
+        long long lp = 1 | (long long)(e->key.keysym.scancode & 0xFF) << 16;
+        if (alt) lp |= 1LL << 29;
+        if (!down || e->key.repeat) lp |= 1LL << 30;   /* down before this message */
+        if (!down) lp |= 1LL << 31;
+        const int took = win_overlay(down ? (sys ? WM_SYSKEYDOWN : WM_KEYDOWN) : (sys ? WM_SYSKEYUP : WM_KEYUP), vk, lp);
+        /* What TranslateMessage adds: the control characters these keys type. */
+        if (down && !sys && (vk == 0x08 || vk == 0x09 || vk == 0x0D || vk == 0x1B)) win_overlay(WM_CHAR, vk, lp);
+        return took;
+    }
+    case SDL_TEXTINPUT: {   /* UTF-8 to code points, a WM_CHAR each */
+        const unsigned char* s = (const unsigned char*)e->text.text;
+        while (input && *s) {
+            unsigned c = *s++;
+            int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+            c &= more == 3 ? 0x07u : more == 2 ? 0x0Fu : more == 1 ? 0x1Fu : 0x7Fu;
+            while (more-- > 0 && (*s & 0xC0) == 0x80) c = (c << 6) | (*s++ & 0x3Fu);
+            win_overlay(WM_CHAR, c, 1);
+        }
+        return 0;
+    }
+    case SDL_MOUSEMOTION:
+        if (!input) return 0;
+        win_overlay(WM_MOUSEMOVE, 0, win_xy(e->motion.x, e->motion.y));
+        if (e->motion.xrel || e->motion.yrel)
+            win_overlay(WM_RSX_MOUSE_MOTION, (unsigned long long)(long long)e->motion.xrel, (long long)e->motion.yrel);
+        return 0;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP: {
+        if (!input) return 0;
+        const int down = e->type == SDL_MOUSEBUTTONDOWN;
+        unsigned msg;
+        unsigned long long wp = 0;
+        switch (e->button.button) {
+        case SDL_BUTTON_LEFT:   msg = down ? WM_LBUTTONDOWN : WM_LBUTTONUP; break;
+        case SDL_BUTTON_RIGHT:  msg = down ? WM_RBUTTONDOWN : WM_RBUTTONUP; break;
+        case SDL_BUTTON_MIDDLE: msg = down ? WM_MBUTTONDOWN : WM_MBUTTONUP; break;
+        case SDL_BUTTON_X1:
+        case SDL_BUTTON_X2:     /* XBUTTON1 or XBUTTON2 in the high word */
+            msg = down ? WM_XBUTTONDOWN : WM_XBUTTONUP;
+            wp = (unsigned long long)(e->button.button == SDL_BUTTON_X1 ? 1 : 2) << 16;
+            break;
+        default: return 0;
+        }
+        win_overlay(msg, wp, win_xy(e->button.x, e->button.y));
+        return 0;
+    }
+    case SDL_MOUSEWHEEL: {   /* WHEEL_DELTA (120) a notch in the high word, positive away from the user */
+        const int notches = e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+        if (input && notches) win_overlay(WM_MOUSEWHEEL, (unsigned long long)(u16)(s16)(notches * 120) << 16, 0);
+        return 0;
+    }
+    case SDL_WINDOWEVENT:
+        switch (e->window.event) {
+        case SDL_WINDOWEVENT_CLOSE:        return win_overlay(WM_CLOSE, 0, 0);
+        case SDL_WINDOWEVENT_FOCUS_GAINED: win_overlay(WM_SETFOCUS, 0, 0); break;
+        case SDL_WINDOWEVENT_FOCUS_LOST:   win_overlay(WM_KILLFOCUS, 0, 0); break;
+        case SDL_WINDOWEVENT_LEAVE:        win_overlay(WM_MOUSELEAVE, 0, 0); break;
+        case SDL_WINDOWEVENT_MINIMIZED:    win_overlay(WM_SIZE, 1 /* SIZE_MINIMIZED */, 0); break;
+        case SDL_WINDOWEVENT_RESTORED:
+        case SDL_WINDOWEVENT_SIZE_CHANGED: {
+            int w = 0, h = 0;
+            SDL_GetWindowSize(s_sdl_window, &w, &h);
+            win_overlay(WM_SIZE, 0, win_xy(w, h));
+            break;
+        }
+        default: break;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* Alt+Enter, which d3d12_wndproc takes before the overlay sees the key: 1 when this was it. */
+static int win_alt_enter(const SDL_KeyboardEvent* k)
+{
+    if (ps3_no_user_input() || k->keysym.sym != SDLK_RETURN || !(k->keysym.mod & KMOD_ALT)) return 0;
+    if (!k->repeat) set_borderless(s_sdl_window, !s_borderless);
+    return 1;
+}
+
+/* The hot keys d3d12_wndproc takes after the overlay, and nothing else (the
+ * keyboard pad reads the keys on its own). */
 static void win_key(const SDL_KeyboardEvent* k)
 {
     if (ps3_no_user_input()) return;
     const SDL_Keycode c = k->keysym.sym;
-    if (c == SDLK_RETURN && (k->keysym.mod & KMOD_ALT)) {
-        if (!k->repeat) set_borderless(s_sdl_window, !s_borderless);
-        return;
-    }
     if (c == SDLK_ESCAPE && !s_overlay_on) s_d3d.window_closed = 1;
     if (k->repeat) return;
     if (c == SDLK_F9) {
@@ -1184,6 +1381,9 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
     /* PS3_NO_USER_INPUT=1 (ps3_knob.h): the window does not take the focus
      * when it opens, so the user's typing stays where it was. */
     if (ps3_no_user_input()) SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+    /* The close button is the window's close event alone (the overlay can ask first); SDL_QUIT is then only a
+     * signal (Ctrl+C, SIGTERM), which closes at once. */
+    SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", SDL_WINDOWPOS_CENTERED,
                                      SDL_WINDOWPOS_CENTERED, cw, ch,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
@@ -1215,19 +1415,20 @@ static DWORD WINAPI window_thread(LPVOID p)
     if (!w) return 0;
     /* Closing (the window's close button, or Escape) only flags it: the swap
      * chain still presents to this window until the backend shuts down and
-     * posts WIN_MAIL_CLOSE, so the window is hidden until then. */
+     * posts WIN_MAIL_CLOSE, so the window is hidden until then. The overlay
+     * sees each event first, as its messages (win_overlay_event); a close it
+     * takes is not one. */
     SDL_Event e;
     while (SDL_WaitEvent(&e)) {
         if (e.type == SDL_QUIT) {
             s_d3d.window_closed = 1;
-        } else if (e.type == SDL_WINDOWEVENT) {
-            const Uint8 ev = e.window.event;
-            if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
-            else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
-            else if (ev == SDL_WINDOWEVENT_CLOSE) s_d3d.window_closed = 1;
-        } else if (e.type == SDL_KEYDOWN) {
-            win_key(&e.key);
         } else if (s_sdl_mail && e.type == s_sdl_mail) {
+            if (e.user.code >= WIN_MAIL_MESSAGE) {   /* rsx_d3d12_post_message */
+                const unsigned msg = (unsigned)(e.user.code - WIN_MAIL_MESSAGE);
+                const int took = win_overlay(msg, (unsigned long long)(uintptr_t)e.user.data1,
+                                             (long long)(intptr_t)e.user.data2);
+                if (msg == WM_CLOSE && !took) s_d3d.window_closed = 1;
+            }
             if (e.user.code == WIN_MAIL_CLOSE) break;
             if (e.user.code == WIN_MAIL_BORDERLESS) set_borderless(w, (int)(intptr_t)e.user.data1);
             if (e.user.code == WIN_MAIL_TITLE) {
@@ -1237,6 +1438,17 @@ static DWORD WINAPI window_thread(LPVOID p)
                 ReleaseSRWLockExclusive(&s_win_title_lock);
                 SDL_SetWindowTitle(w, t);
             }
+        } else {
+            if (e.type == SDL_WINDOWEVENT) {
+                const Uint8 ev = e.window.event;
+                if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
+                else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
+            }
+            const int alt_enter = e.type == SDL_KEYDOWN && win_alt_enter(&e.key);
+            const int took = !alt_enter && win_overlay_event(&e);
+            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE && !took)
+                s_d3d.window_closed = 1;
+            if (e.type == SDL_KEYDOWN && !alt_enter && !took) win_key(&e.key);
         }
         if (s_d3d.window_closed && (SDL_GetWindowFlags(w) & SDL_WINDOW_SHOWN)) SDL_HideWindow(w);
     }
@@ -3051,8 +3263,8 @@ static const char* shader_cache_dir(void)
         else {
             char exe[MAX_PATH];
             DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-            char* slash = (n && n < sizeof exe) ? strrchr(exe, RSX_PATH_SEP[0]) : NULL;
-            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s" RSX_PATH_SEP "shader_cache", exe); }
+            char* slash = (n && n < sizeof exe) ? rsx_path_last_sep(exe) : NULL;
+            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s/shader_cache", exe); }
             else snprintf(dir, sizeof dir, "shader_cache");
         }
         if (dir[0]) CreateDirectoryA(dir, NULL);
@@ -3104,7 +3316,7 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
     char path[MAX_PATH + 64]; path[0] = 0;
     const char* dir = shader_cache_dir();
     if (dir[0]) {
-        snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", dir, profile,
+        snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", dir, profile,
                  (unsigned long long)shader_key(src, n, profile));
         if ((*out = shader_cache_load(path)) != NULL) { if (perf_on()) s_perf_sc_hits++; return S_OK; }
     }
@@ -3200,7 +3412,7 @@ static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
 }
 static void pso_path(char* out, size_t n, const char* leaf)
 {
-    snprintf(out, n, "%s" RSX_PATH_SEP "%s", shader_cache_dir(), leaf);
+    snprintf(out, n, "%s/%s", shader_cache_dir(), leaf);
 }
 /* Through a temporary name and a rename, so a crash or a second process never
  * leaves a half-written file under the real name. */
@@ -3375,7 +3587,7 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
         *ls[i] = (u32)sh[i]->BytecodeLength;
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)*hs[i]);
+        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)*hs[i]);
         if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES &&
             !pso_write_file(bp, sh[i]->pShaderBytecode, sh[i]->BytecodeLength))
             return;
@@ -3404,7 +3616,7 @@ static int pso_prebuild_one(const pso_rec* r)
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)hs[i]);
+        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)hs[i]);
         blob[i] = pso_read_file(bp, &len[i]);
         if (!blob[i] || (u32)len[i] != ls[i] ||
             fnv_bytes(14695981039346656037ull, blob[i], (size_t)len[i]) != hs[i])
@@ -3423,7 +3635,7 @@ static int pso_prebuild_one(const pso_rec* r)
     if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
             s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
         WCHAR name[20];
-        _snwprintf(name, 20, L"%016llx", (unsigned long long)r->name);
+        swprintf(name, 20, L"%016llx", (unsigned long long)r->name);
         AcquireSRWLockExclusive(&s_pso_lib_lock);
         if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso)))
             InterlockedIncrement(&s_pso_lib_new);
@@ -3486,7 +3698,7 @@ static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
             s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
     const u64 key = pso_desc_key(pd);
     WCHAR name[20];
-    _snwprintf(name, 20, L"%016llx", (unsigned long long)key);
+    swprintf(name, 20, L"%016llx", (unsigned long long)key);
     AcquireSRWLockExclusive(&s_pso_lib_lock);
     HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
                      &IID_ID3D12PipelineState, (void**)out);
@@ -4099,7 +4311,7 @@ static void fpv_load(void)
     s_fpv_loaded = 1;
     if (!shader_cache_dir()[0]) return;
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "r");
     if (!f) return;
     unsigned h, e, c, d;
@@ -4114,7 +4326,7 @@ static void fpv_note(const u8* ucode, u32 exp32, u32 cube, u32 d2c)
     if (!shader_cache_dir()[0] || fpv_find(hash, exp32, cube, d2c)) return;
     fpv_add(hash, exp32, cube, d2c);
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "a");
     if (f) { fprintf(f, "%08x %x %x %x\n", hash, exp32, cube, d2c); fclose(f); }
 }
@@ -4923,7 +5135,7 @@ static struct {
 } s_tcj = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT };   /* gen..n under lk */
 /* The workers' counters, each on its own cache line. */
 typedef struct { volatile LONG v; char pad[60]; } TcjCounter;
-static __declspec(align(64)) TcjCounter s_tcj_ctr[2];
+static _Alignas(64) TcjCounter s_tcj_ctr[2];
 #define s_tcj_next (s_tcj_ctr[0].v)   /* the next job to take */
 #define s_tcj_busy (s_tcj_ctr[1].v)   /* workers inside the job loop */
 
@@ -7087,7 +7299,7 @@ static void wb_conv_row(u8* d, const u8* s, u32 n, int kind)
         u32 v; memcpy(&v, s + (u64)i * 4, 4); v = (EXPR); memcpy(d + (u64)i * 4, &v, 4); }
     if (kind == 0)      WB_LOOP((v << 8) | (v >> 24))
     else if (kind == 1) WB_LOOP(((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu))
-    else                WB_LOOP(_byteswap_ulong(v))
+    else                WB_LOOP(__builtin_bswap32(v))
     #undef WB_LOOP
 }
 
@@ -11165,7 +11377,7 @@ static u32 s_vpj_vis_n;
  * `next` and count into `done` while the FIFO thread publishes into `pub`,
  * and on one line every publish waited for the workers' writes. */
 typedef struct { volatile LONG v; char pad[60]; } VPJCounter;
-static __declspec(align(64)) VPJCounter s_vpj_ctr[4];
+static _Alignas(64) VPJCounter s_vpj_ctr[4];
 #define s_vpj_pub      (s_vpj_ctr[0].v)   /* jobs the workers may take */
 #define s_vpj_next     (s_vpj_ctr[1].v)
 #define s_vpj_done     (s_vpj_ctr[2].v)
@@ -12133,7 +12345,7 @@ static u32 vf_resolve(const rsx_fetch_slot* sl, u64 a, u64 b)
  * compares) was 16% of that thread. Once the FIFO thread is on the frame's
  * path, as it is at ~105 fps, this is worth 100.2 -> 106.2 fps. Checked
  * against the general loop over 6.8 million draws with no difference. */
-static __forceinline u32 vf_strip_list_w(const u8* src, const int w16, u32 count,
+static inline __attribute__((always_inline)) u32 vf_strip_list_w(const u8* src, const int w16, u32 count,
                                          const int restart, const u32 ridx, u32* pm,
                                          u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
 {
@@ -12189,12 +12401,12 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
 #include <emmintrin.h>
 #endif
 #define VF_CUT 0xFFFFFFFFu
-static __forceinline u32 vf_ix(const u8* src, const int w16, u32 k)
+static inline __attribute__((always_inline)) u32 vf_ix(const u8* src, const int w16, u32 k)
 {
     if (w16) { u16 v; memcpy(&v, src + (u64)k * 2, 2); return __builtin_bswap16(v); }
     u32 v; memcpy(&v, src + (u64)k * 4, 4); return __builtin_bswap32(v);
 }
-static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 count,
+static inline __attribute__((always_inline)) u32 vf_strip_native_w(const u8* src, const int w16, u32 count,
                                            const int restart, const u32 ridx, u32* pm,
                                            u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
 {
@@ -12236,8 +12448,8 @@ static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 cou
             vhi = _mm_max_epi16(vhi, _mm_xor_si128(_mm_andnot_si128(c, v), bias));
             real = _mm_or_si128(real, _mm_xor_si128(c, _mm_set1_epi32(-1)));
             const int mk = _mm_movemask_epi8(c);
-            if (mk) { unsigned long top; _BitScanReverse(&top, (unsigned long)mk);
-                      r = k + (u32)(top >> 1) + 1; }
+            if (mk) { const u32 top = 31u - (u32)__builtin_clz((unsigned)mk);   /* the highest set bit */
+                      r = k + (top >> 1) + 1; }
         }
         if (_mm_movemask_epi8(real)) {
             u16 l8[8], h8[8];
@@ -13475,6 +13687,23 @@ int      rsx_d3d12_borderless(void)   { return s_borderless; }
 void*    rsx_d3d12_device(void)       { return s_d3d.device; }
 void*    rsx_d3d12_queue(void)        { return s_d3d.cmd_queue; }
 void*    rsx_d3d12_hwnd(void)         { return s_d3d.hwnd; }
+
+void rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long lp)
+{
+    if (!s_d3d.hwnd) return;
+#ifdef _WIN32
+    PostMessageA((HWND)s_d3d.hwnd, msg, (WPARAM)wp, (LPARAM)lp);
+#else
+    if (!s_sdl_mail || msg > 0xFFFFu) return;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = s_sdl_mail;
+    e.user.code = WIN_MAIL_MESSAGE + (Sint32)msg;
+    e.user.data1 = (void*)(uintptr_t)wp;
+    e.user.data2 = (void*)(intptr_t)lp;
+    SDL_PushEvent(&e);
+#endif
+}
 void*    rsx_d3d12_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.swap_buffers[i] : NULL; }
 unsigned rsx_d3d12_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
 unsigned rsx_d3d12_back_buffer_format(void) { return (unsigned)DXGI_FORMAT_R8G8B8A8_UNORM; }
@@ -13627,7 +13856,7 @@ int rsx_d3d12_shader_cache_put(int fragment, const char* hlsl)
     const char* profile = fragment ? "ps_5_0" : "vs_5_0";
     if (!shader_cache_dir()[0] || !hlsl) return 0;
     char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", shader_cache_dir(), profile,
+    snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", shader_cache_dir(), profile,
              (unsigned long long)shader_key(hlsl, strlen(hlsl), profile));
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return 1;
     ID3DBlob* b = NULL; ID3DBlob* e = NULL;
@@ -13680,6 +13909,7 @@ void rsx_d3d12_overlay_tick(void) {}
 void*    rsx_d3d12_device(void) { return NULL; }
 void*    rsx_d3d12_queue(void) { return NULL; }
 void*    rsx_d3d12_hwnd(void) { return NULL; }
+void     rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long lp) { (void)msg; (void)wp; (void)lp; }
 void*    rsx_d3d12_back_buffer(unsigned i) { (void)i; return NULL; }
 unsigned rsx_d3d12_back_buffer_count(void) { return 0; }
 unsigned rsx_d3d12_back_buffer_format(void) { return 0; }
