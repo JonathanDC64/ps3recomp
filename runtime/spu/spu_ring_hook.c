@@ -65,6 +65,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "ps3emu/ps3_knob.h"
@@ -535,11 +536,324 @@ int spu_hook_ring_post(spu_context* ctx)
     return ring_post_run(ctx, NULL) == POST_OK;
 }
 
+/* ---- SPU_NATIVE_LOOP: commands 7 and 8 without leaving the fetch ---------
+ *
+ * The two commands are four in five the ring carries in the Palace (8 alone
+ * is two in three): 7 stores a word into the state block and ORs a byte pick
+ * from the table at 0x12D60 into the dirty quadword, 8 stores a word and sets
+ * a dirty quadword to {1, 1, 1, 1}. Neither moves data by DMA or calls out.
+ * For each, the lifted loop still calls 0xC358 to PUT the state (a call
+ * bracket around spu_hook_put_wait), decodes the command, branches through
+ * the table, runs the handler's thirty-odd instructions against registers in
+ * memory, calls 0x3C90 (spu_hook_ring_post) and branches back to 0x4618, the
+ * fetch. With the loop on, the fetch block does those steps itself and goes
+ * on to the next command:
+ *     0x4730  the call bracket and spu_hook_put_wait, as the lifted call runs
+ *             them (r0 = the link, the hook's stack stores and channel
+ *             accesses, pc, drain_ret_pc and the image id after the return);
+ *     0x4734  the dispatch: nothing it writes is read again (r2-r79 are
+ *             volatile and dead at the handler's end -- see below);
+ *     handler the lifted instructions in their order, with the volatile
+ *             registers kept in locals: the same local-store reads and
+ *             writes, r80 (command 7) and r81 = r83 & 255, r5 = the command;
+ *     0x4808  spu_hook_ring_post;
+ *     0x4818  r81 == 0, back to 0x4618: the fetch block again.
+ * plus ctx->steps for the three region branches the lifted path takes.
+ *
+ * Every condition that would take the lifted path off this course is checked
+ * before the command's first side effect, and any of them leaves the command
+ * to the lifted code from 0x4730, with the fetch's registers written as
+ * always: a command other than 7 and 8; r83 & 255 != 0 (the loop would end);
+ * a put_wait or post case the hooks leave to the lifted code (state EA not
+ * 16-byte aligned; the frame; the local buffer at its limit, a segment
+ * switch); a handler store into the ring's own quadwords 0x13300-0x135FF or
+ * the frame (sp - 0x100 to sp + 0x20), which those steps read; and whatever a
+ * region branch would hand to the trampoline -- the slow-goto knobs, the
+ * lockstep scheduler, a PM flow trace, a pending interrupt -- or an LS or
+ * channel diagnostic, a knob change, the post check or the histogram.
+ *
+ * Registers: r2-r79 are volatile in the SPU ABI. At 0x4618 none is live: the
+ * branch there comes from 0x4818, after a call, and the fetch writes every
+ * one it reads before reading it (the same rule spu_hook_put_wait already
+ * relies on). So the handlers' scratch values stay in host locals, and what
+ * reaches ctx is what can be read later: r0 and r2-r8, r29, r30 from the
+ * hooks, r5 and r81 from the handler, r80 from command 7.
+ *
+ * SPU_NATIVE_LOOP (live): 1 (default) on; 0 off, for A/B; 2 checks: every
+ * SPU_NATIVE_LOOP_EVERY-th command it would run (default 256) runs lifted
+ * instead, against a prediction made on a copy of local store, and the next
+ * fetch compares all of local store outside the frame and the segment
+ * quadword, and r80 and r81 ([ring-loop] lines; a mismatch turns the loop off
+ * on that thread for the session). */
+int spu_hook_put_wait(spu_context* ctx);
+
+#define RING_DIRTY_PTR_LS 0x133A0u   /* word 0: the dirty block */
+#define RING_STATE_PTR_LS 0x13390u   /* word 0: the state block */
+
+static int native_loop_mode(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_NATIVE_LOOP", 1));
+    return on;
+}
+static int native_loop_every(void)
+{
+    static int n = -1;
+    PS3_KNOB(n, ps3_env_int("SPU_NATIVE_LOOP_EVERY", 256));
+    return n > 0 ? n : 1;
+}
+
+/* spu_ls_read128 / write128 on any copy of local store (no probes: the loop
+ * is off while g_spu_ls_dbg is set). */
+RING_INLINE u128 lsq(const uint8_t* ls, uint32_t lsa)
+{
+    const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+    u128 v;
+    v._u32[0] = be32_at(p); v._u32[1] = be32_at(p + 4);
+    v._u32[2] = be32_at(p + 8); v._u32[3] = be32_at(p + 12);
+    return v;
+}
+RING_INLINE void lsq_put(uint8_t* ls, uint32_t lsa, u128 v)
+{
+    uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+    for (int i = 0; i < 4; i++) {
+        p[4 * i] = (uint8_t)(v._u32[i] >> 24); p[4 * i + 1] = (uint8_t)(v._u32[i] >> 16);
+        p[4 * i + 2] = (uint8_t)(v._u32[i] >> 8); p[4 * i + 3] = (uint8_t)v._u32[i];
+    }
+}
+
+/* The two quadwords a handler stores to, worked out from local store as it
+ * is before the command (the handlers read only 0x13560, 0x13390 and 0x133A0
+ * besides their targets and the table, and the targets are checked to miss
+ * those three). */
+RING_INLINE void loop_targets(const uint8_t* ls, unsigned cmd, uint32_t* a1, uint32_t* a2)
+{
+    const u128 c = lsq(ls, RING_CMD_LS);
+    const uint32_t w1 = c._u32[1], w2 = c._u32[2];
+    const uint32_t state = lsq(ls, RING_STATE_PTR_LS)._u32[0];
+    const uint32_t dirty = lsq(ls, RING_DIRTY_PTR_LS)._u32[0];
+    if (cmd == 7u) {
+        *a1 = 4u * w1 + state + 10320u;
+        *a2 = dirty;
+    } else {
+        *a1 = 4u * (24u * w1 + w2) + state + 10672u;
+        *a2 = (w1 & 16u) + dirty + 16u;
+    }
+    *a1 &= SPU_LS_MASK & ~0xFu;
+    *a2 &= SPU_LS_MASK & ~0xFu;
+}
+
+/* 0x4958: command 7, the lifted instructions in order. Returns r80. */
+RING_INLINE u128 loop_cmd7(uint8_t* ls)
+{
+    const u128 r37 = spu_il(10320);
+    const u128 r50 = lsq(ls, RING_CMD_LS);
+    const u128 r46 = spu_ila(0x12D60);
+    const u128 r44 = lsq(ls, RING_STATE_PTR_LS);
+    const u128 r47 = spu_rotqbyi(r50, 4);
+    const u128 r41 = spu_rotqbyi(r50, 8);
+    const u128 r43 = spu_shli(r47, 2);
+    const u128 r45 = spu_andi(r47, 240);
+    const u128 r35 = spu_andi(r47, 15);
+    const u128 r36 = spu_a(r45, r46);
+    const u128 r38 = spu_a(r43, r44);
+    const u128 r40 = lsq(ls, r38._u32[0] + r37._u32[0]);
+    const u128 r42 = spu_cwx(r38, r37);
+    const u128 r39 = spu_shufb(r41, r40, r42);
+    lsq_put(ls, r38._u32[0] + r37._u32[0], r39);
+    const u128 r80 = lsq(ls, RING_DIRTY_PTR_LS);
+    const u128 r34 = lsq(ls, r36._u32[0]);
+    const u128 r33 = lsq(ls, r80._u32[0]);
+    const u128 r32 = spu_shufb(r34, r34, r35);
+    const u128 r31 = spu_or(r32, r33);
+    lsq_put(ls, r80._u32[0], r31);
+    return r80;
+}
+
+/* 0x49C0, then 0x4A08: command 8. */
+RING_INLINE void loop_cmd8(uint8_t* ls)
+{
+    const u128 r51 = spu_il(10672);
+    const u128 r67 = lsq(ls, RING_CMD_LS);
+    const u128 r58 = lsq(ls, RING_STATE_PTR_LS);
+    const u128 r65 = spu_rotqbyi(r67, 4);
+    const u128 r61 = spu_rotqbyi(r67, 8);
+    const u128 r55 = spu_rotqbyi(r67, 12);
+    const u128 r64 = spu_a(r65, r65);
+    const u128 r62 = spu_a(r64, r65);
+    const u128 r60 = spu_shli(r62, 3);
+    const u128 r59 = spu_a(r60, r61);
+    const u128 r57 = spu_shli(r59, 2);
+    const u128 r52 = spu_a(r57, r58);
+    const u128 r54 = lsq(ls, r52._u32[0] + r51._u32[0]);
+    const u128 r56 = spu_cwx(r52, r51);
+    const u128 r53 = spu_shufb(r55, r54, r56);
+    lsq_put(ls, r52._u32[0] + r51._u32[0], r53);
+    const u128 r10 = spu_il(1);
+    const u128 r11 = lsq(ls, RING_CMD_LS);
+    const u128 r8 = lsq(ls, RING_DIRTY_PTR_LS);
+    const u128 r9 = spu_rotqbyi(r11, 4);
+    const u128 r14 = spu_ai(r8, 16);
+    const u128 r6 = spu_andi(r9, 16);
+    const u128 r13 = spu_a(r6, r14);
+    lsq_put(ls, r13._u32[0], r10);
+}
+
+/* A store target that misses the ring's quadwords and the frame. */
+RING_INLINE int loop_target_ok(uint32_t a, uint32_t sp)
+{
+    if (a >= 0x13300u && a < 0x13600u) return 0;
+    return !(a + 16u > sp - 0x100u && a < sp + 0x20u);
+}
+
+/* SPU_NATIVE_LOOP=2: per host thread, so per context. */
+typedef struct loop_check {
+    uint8_t* ls;                 /* the prediction: local store after the command */
+    u128 r80;
+    unsigned cmd;
+    uint32_t sp;
+    int pending, bad, prints;
+    unsigned long long n, miss, skip;
+} loop_check;
+static SPU_THREAD_LOCAL loop_check t_loop;
+static SPU_THREAD_LOCAL unsigned t_loop_count;
+
+/* What would hand the next region branch to the trampoline, or turn a hook
+ * or this loop off. */
+RING_INLINE int loop_yield(const spu_context* ctx, unsigned gen)
+{
+    return g_spu_goto_slow || g_yz_lockstep_on || g_pm_flow_ctx ||
+           (ctx->int_enable && (__atomic_load_n(&ctx->event_status, __ATOMIC_RELAXED) & ctx->event_mask)) ||
+           ps3_env_gen != gen || g_spu_trampoline_fn || g_spu_ls_dbg || g_spu_ch_diag ||
+           g_post_checking || g_spu_ring_hist || t_post_bad || t_loop.bad;
+}
+
+/* The command at 0x13560 (fetched, the lifted code about to go on at 0x4730)
+ * can run here: 7 or 8, and every check above. */
+RING_INLINE int loop_case_ok(const spu_context* ctx, unsigned* cmd_out)
+{
+    const uint8_t* ls = ctx->ls;
+    const unsigned cmd = ls[RING_CMD_LS + 3];
+    if (cmd != 7u && cmd != 8u) return 0;
+    const u128* r = ctx->gpr;
+    if ((r[83]._u32[0] & 255u) != 0) return 0;
+    /* put_wait's case: r3 = the state's EA, r4 = 0x13400, r5 = 16. */
+    if ((r[3]._u32[1] & 15u) || r[4]._u32[0] != RING_STATE_LS || r[5]._u32[0] != 16u) return 0;
+    /* post's frame, and its local buffer under the limit. */
+    const uint32_t sp = r[1]._u32[0];
+    if ((sp & 15u) || sp < 0x100u || sp > SPU_LS_SIZE - 0x20u) return 0;
+    if (sp - 0x100u < RING_DESC_LS + 16u && sp + 0x20u > RING_SEG_LS) return 0;
+    const u128 d = lsq(ls, RING_DESC_LS);
+    if (!(d._u32[1] > d._u32[2])) return 0;
+    uint32_t a1, a2;
+    loop_targets(ls, cmd, &a1, &a2);
+    if (!loop_target_ok(a1, sp) || !loop_target_ok(a2, sp)) return 0;
+    *cmd_out = cmd;
+    return 1;
+}
+
+RING_NOINLINE void loop_check_start(spu_context* ctx, unsigned cmd)
+{
+    loop_check* k = &t_loop;
+    if (!k->ls && !(k->ls = (uint8_t*)malloc(SPU_LS_SIZE))) return;
+    memcpy(k->ls, ctx->ls, SPU_LS_SIZE);
+    if (cmd == 7u) k->r80 = loop_cmd7(k->ls);
+    else { loop_cmd8(k->ls); k->r80 = ctx->gpr[80]; }
+    k->cmd = cmd;
+    k->sp = ctx->gpr[1]._u32[0];
+    k->pending = 1;
+}
+
+/* At the next fetch: local store as the lifted command left it, outside the
+ * frame (put_wait's and post's stack stores) and the segment quadword
+ * (post's store), and r80 and r81. */
+RING_NOINLINE void loop_check_end(spu_context* ctx)
+{
+    loop_check* k = &t_loop;
+    k->pending = 0;
+    if ((uint32_t)(ctx->pc & SPU_LS_MASK) != RING_POST_END) { k->skip++; return; }   /* something else ran */
+    const uint32_t lo = k->sp - 0x100u, hi = k->sp + 0x20u;
+    uint32_t bad = ~0u;
+    for (uint32_t a = 0; a < SPU_LS_SIZE; a += 16) {
+        if ((a + 16u > lo && a < hi) || a == RING_SEG_LS) continue;
+        if (memcmp(k->ls + a, ctx->ls + a, 16)) { bad = a; break; }
+    }
+    const u128* r = ctx->gpr;
+    const int regs_bad = memcmp(&k->r80, &r[80], 16) != 0 ||
+                         (r[81]._u32[0] | r[81]._u32[1] | r[81]._u32[2] | r[81]._u32[3]) != 0;
+    k->n++;
+    if (bad != ~0u || regs_bad) {
+        k->miss++;
+        k->bad = 1;
+        if (k->prints++ < 8) {
+            const uint32_t a = bad == ~0u ? 0u : bad;
+            fprintf(stderr, "[ring-loop] spu=%u cmd %u MISMATCH at LS 0x%05X (r80/r81 %s): "
+                    "lifted %08X %08X %08X %08X, loop %08X %08X %08X %08X -- loop off on this thread\n",
+                    ctx->spu_id, k->cmd, a, regs_bad ? "differ" : "same",
+                    be32_at(ctx->ls + a), be32_at(ctx->ls + a + 4), be32_at(ctx->ls + a + 8), be32_at(ctx->ls + a + 12),
+                    be32_at(k->ls + a), be32_at(k->ls + a + 4), be32_at(k->ls + a + 8), be32_at(k->ls + a + 12));
+            fflush(stderr);
+        }
+    }
+    if ((k->n & (k->n - 1)) == 0 && k->n >= 64) {
+        fprintf(stderr, "[ring-loop] spu=%u check: %llu compared, %llu mismatches, %llu skipped\n",
+                ctx->spu_id, k->n, k->miss, k->skip);
+        fflush(stderr);
+    }
+}
+
+/* From the fetch, which just took a command: run the commands it can. 1: the
+ * lifted code goes on at 0x4730 with the command at 0x13560; 0: at 0x4618. */
+RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
+{
+    const unsigned gen = ps3_env_gen;
+    for (;;) {
+        unsigned cmd;
+        if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &cmd))
+            return 1;
+        if (mode == 2) {
+            if (++t_loop_count % (unsigned)native_loop_every() == 0) loop_check_start(ctx, cmd);
+            return 1;
+        }
+        u128* r = ctx->gpr;
+        /* 0x4730: brsl to 0xC358, whose entry hook does the PUT. */
+        r[0] = spu_link(0x4734);
+        const int32_t si = (int32_t)ctx->image_id;
+        ctx->host_depth++;
+        if (!spu_hook_put_wait(ctx)) { ctx->host_depth--; return 1; }   /* SPU_NATIVE_PUT=0 */
+        ctx->pc = 0x4734;                                                /* SPU_RET */
+        ctx->drain_ret_pc = 0;                                           /* spu_call_done */
+        ctx->host_depth--;
+        ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : si;
+        /* 0x4734-0x4758 and the handler. */
+        if (cmd == 7u) r[80] = loop_cmd7(ctx->ls);
+        else loop_cmd8(ctx->ls);
+        r[81] = spu_andi(r[83], 255);
+        r[5] = spu_ls_read128(ctx, RING_CMD_LS);
+        ctx->steps += 2;
+        /* 0x4808 */
+        if (ring_post_run(ctx, NULL) != POST_OK) {   /* cannot happen: loop_case_ok checked its cases */
+            fprintf(stderr, "[ring-loop] spu=%u post refused after cmd %u\n", ctx->spu_id, cmd);
+            fflush(stderr);
+            abort();
+        }
+        /* 0x4818: r81 == 0, the branch back to 0x4618. */
+        ctx->steps++;
+        if (loop_yield(ctx, gen)) return 0;
+        if (!ring_fetch(ctx)) return 0;
+    }
+}
+
 int spu_hook_ring_fetch(spu_context* ctx)
 {
     if (__builtin_expect(g_post_checking, 0)) ring_post_check(ctx);   /* SPU_NATIVE_POST=2 */
+    if (__builtin_expect(t_loop.pending, 0)) loop_check_end(ctx);     /* SPU_NATIVE_LOOP=2 */
     const int took = ring_fetch(ctx);
     if (__builtin_expect(g_spu_ring_hist_gen != ps3_env_gen || g_spu_ring_hist, 0))
         ring_hist_count(ctx, took);
+    if (took) {
+        const int mode = native_loop_mode();
+        if (mode) return ring_loop(ctx, mode);
+    }
     return took;
 }
