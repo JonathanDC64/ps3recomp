@@ -70,6 +70,17 @@ void rsx_d3d12_backend_present(void);
  * release: called on the render thread before the window's buffers are
  *   resized; the hook drops every reference it holds to them (and finishes
  *   any work using them). Later frames pass the new buffers. */
+/* Off Windows (the backend on vkd3d) the window is SDL's and the window
+ * thread hands wndproc the Win32 messages Windows would, made from SDL's
+ * events, with Windows' values: WM_KEYDOWN / WM_KEYUP (WM_SYSKEY* with Alt,
+ * and for Alt and F10) with virtual-key codes and the repeat bit, WM_CHAR,
+ * the mouse's button messages and WM_MOUSEMOVE (window coordinates, in
+ * SDL's points), WM_MOUSEWHEEL, WM_SETFOCUS, WM_KILLFOCUS, WM_MOUSELEAVE,
+ * WM_SIZE and WM_CLOSE, and messages posted with rsx_d3d12_post_message.
+ * hwnd is the SDL_Window. Raw mouse input is WM_RSX_MOUSE_MOTION instead
+ * of WM_INPUT: wp and lp are the motion in x and y as signed counts (SDL's
+ * relative motion, with no acceleration in relative mouse mode). */
+#define WM_RSX_MOUSE_MOTION (0x8000u + 0x53u)   /* WM_APP + 0x53 */
 typedef struct rsx_d3d12_overlay {
     void* user;
     int  (*wndproc)(void* user, void* hwnd, unsigned msg, unsigned long long wp,
@@ -103,6 +114,11 @@ void rsx_d3d12_overlay_tick(void);
 void*    rsx_d3d12_device(void);
 void*    rsx_d3d12_queue(void);
 void*    rsx_d3d12_hwnd(void);
+/* Posts a message to the game window's thread, as PostMessage: the window
+ * procedure, and so the overlay's wndproc hook, gets it there. Off Windows
+ * the overlay gets it and a WM_CLOSE it does not take closes the window.
+ * Any thread. */
+void     rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long lp);
 void*    rsx_d3d12_back_buffer(unsigned index);
 unsigned rsx_d3d12_back_buffer_count(void);
 unsigned rsx_d3d12_back_buffer_format(void);
