@@ -428,12 +428,21 @@ static int rsx_pump_messages(void)
  * deliberately not counted: they carry no guest frame. */
 static volatile LONG g_frames_presented = 0;
 extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
+static volatile ULONGLONG s_last_frame_ms = 0;   /* GetTickCount64 at the last one */
 static void present_guest_frame(void)
 {
     rsx_present_frame();
     /* The ticker increments, a guest thread reads: interlocked rather than a
      * volatile ++, which is neither atomic nor a fence on arm64. */
     InterlockedIncrement(&g_frames_presented);
+    s_last_frame_ms = GetTickCount64();
+}
+/* Milliseconds since the last of those frames, or -1 before the first: for a
+ * port's problem report ("no new frame for 12 s"). Any thread. */
+extern "C" long long ps3_ms_since_frame(void)
+{
+    const ULONGLONG t = s_last_frame_ms;
+    return t ? (long long)(GetTickCount64() - t) : -1;
 }
 
 /* ---- Guest-PC sampling profiler (PS3_GUEST_PROF=1) -----------------------
@@ -777,7 +786,7 @@ static __declspec(thread) size_t s_dbg_capn = 0;
 extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
-static void dump_threads(const char* label, HMODULE self)
+static void dump_threads(const char* label, HMODULE self, int guest_lrs)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
@@ -799,8 +808,10 @@ static void dump_threads(const char* label, HMODULE self)
           dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
       }
       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
-    dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
-    ppu_report_guest_lrs();
+    if (guest_lrs) {   /* (stderr only: ps3_diag_report prints its own table) */
+        dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
+        ppu_report_guest_lrs();
+    }
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -1376,6 +1387,25 @@ static void dbg_waits_report(double win_ms, unsigned rows)
     }
 }
 
+/* spuhist [image] [n]: the last n (default 60) SPU history events, oldest
+ * first, for one lifted image (0 = all). Ops: D dispatched, N not started,
+ * S started, R entry returned (c=rc), X thread done, G signalled, W/w
+ * WAIT_SIGNAL enter/resume, P user event (a=port | data0<<8, b=queue | bit31
+ * if the queue refused it, c=data1). */
+static void dbg_spuhist(unsigned img, unsigned want)
+{
+    const long n = g_spu_hist_n;
+    const long lo = n > SPU_HIST_N ? n - SPU_HIST_N : 0;
+    static long hits[4096]; unsigned nh = 0;
+    for (long i = n - 1; i >= lo && nh < want && nh < 4096; i--)
+        if (!img || g_spu_hist[i & (SPU_HIST_N - 1)].image == img) hits[nh++] = i;
+    while (nh--) {
+        const spu_hist_ent* e = &g_spu_hist[hits[nh] & (SPU_HIST_N - 1)];
+        dbg_printf("  t=%u %c img=%u a=0x%08X b=0x%08X c=0x%08X htid=%u%c", e->t_ms, e->op,
+                   e->image, e->a, e->b, e->c, e->htid, 10);
+    }
+}
+
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -1437,7 +1467,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             if (ds_print_all_shadows) ds_print_all_shadows(dbg_printf, a ? a : 14);
             else dbg_printf("  no shadow stacks in this build%c", 10);
         } else if (!strcmp(verb, "threads")) {
-            dump_threads("console", self);
+            dump_threads("console", self, 1);
         } else if (!strcmp(verb, "find32") && sscanf(cmd, "%*s %x", &a) == 1) {
             /* find32 <hex>: every aligned big-endian u32 equal to <hex> in committed
              * guest memory below 0xC0000000 (first 4096 hits). */
@@ -1640,23 +1670,9 @@ static DWORD WINAPI debug_console(LPVOID param)
                 dbg_printf("  %7u %c id=0x%X tid=%u lr=0x%08X%c", t[r].c, t[r].op, t[r].id, t[r].tid, t[r].lr, 10);
             }
         } else if (!strcmp(verb, "spuhist")) {
-            /* spuhist [image] [n]: the last n (default 60) SPU history events,
-             * oldest first, for one lifted image (0 = all). Ops: D dispatched,
-             * N not started, S started, R entry returned (c=rc), X thread done,
-             * G signalled, W/w WAIT_SIGNAL enter/resume, P user event (a=port |
-             * data0<<8, b=queue | bit31 if the queue refused it, c=data1). */
             unsigned img = 0, want = 60;
             sscanf(cmd, "%*s %u %u", &img, &want);
-            const long n = g_spu_hist_n;
-            const long lo = n > SPU_HIST_N ? n - SPU_HIST_N : 0;
-            static long hits[4096]; unsigned nh = 0;
-            for (long i = n - 1; i >= lo && nh < want && nh < 4096; i--)
-                if (!img || g_spu_hist[i & (SPU_HIST_N - 1)].image == img) hits[nh++] = i;
-            while (nh--) {
-                const spu_hist_ent* e = &g_spu_hist[hits[nh] & (SPU_HIST_N - 1)];
-                dbg_printf("  t=%u %c img=%u a=0x%08X b=0x%08X c=0x%08X htid=%u%c", e->t_ms, e->op,
-                           e->image, e->a, e->b, e->c, e->htid, 10);
-            }
+            dbg_spuhist(img, want);
         } else if (!strcmp(verb, "spu")) {
             /* SPU program runs per lifted image id since start (dispatch HITs). */
             for (int k = 0; k < 64; k++)
@@ -1893,6 +1909,79 @@ static DWORD WINAPI profile_thread(LPVOID)
     return 0;
 }
 
+/* ---- ps3_diag_report: the runtime's part of a port's problem report ----
+ * What the console's stat, cpu, waits, threads, spu, spuhist and knobs would
+ * say, in one go, into `out`: mostly for a report of a hang, from a player
+ * who has no console. CPU and waits are sampled over the same sample_sec
+ * seconds (at least 1), so the call takes that long. Thread names, counters
+ * and guest and host addresses only, never guest memory: the report is
+ * posted publicly and must hold nothing of the game. One at a time; a
+ * console command running meanwhile may print into it. Any thread but a
+ * guest one (it suspends threads). */
+extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
+{
+    static SRWLOCK lock = SRWLOCK_INIT;
+    if (!out) return;
+    if (!sample_sec) sample_sec = 1;
+    AcquireSRWLockExclusive(&lock);
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&ps3_diag_report, &self);
+    s_dbg_redirect = out;
+
+    const long long since = ps3_ms_since_frame();
+    dbg_printf("frames %u (flip requests %u); ", (unsigned)g_frames_presented, cellGcm_flip_request_count());
+    if (since < 0) dbg_printf("no frame yet%c", 10);
+    else dbg_printf("the last frame %.1f s ago%c", (double)since / 1000.0, 10);
+    dbg_printf("last HLE call 0x%08X (%s)%c", g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "", 10);
+
+    dbg_printf("%c--- guest threads (lr: the last direct call; r11: the last syscall's number) ---%c", 10, 10);
+    for (int g = 0; g < PPU_THREAD_MAX; g++) {
+        const ppu_thread_info* t = &g_ppu_threads[g];
+        if (t->state == PPU_THREAD_STATE_FREE) continue;
+        const ppu_context* c = (g == 0 && g_ppu_main_ctx) ? g_ppu_main_ctx : &t->ctx;
+        const unsigned tid = (unsigned)c->thread_id;
+        const char* hle = tid < 64 ? g_hle_inflight[tid] : NULL;
+        const uint32_t sc = (uint32_t)c->gpr[11];
+        const char* scn = sc < 1024 ? sc_name(sc) : "";
+        dbg_printf("  %-3u %-28.28s %-8s host %-6lu cia=0x%08X lr=0x%08X r3=0x%08X r11=%u%s%s%s%s%c",
+                   tid, t->name,
+                   t->state == PPU_THREAD_STATE_RUNNING ? "running" :
+                   t->state == PPU_THREAD_STATE_FINISHED ? "finished" : "detached",
+                   (unsigned long)t->host_tid, (unsigned)c->cia, (unsigned)c->lr, (unsigned)c->gpr[3],
+                   (unsigned)sc, scn[0] ? " " : "", scn, hle ? "  in HLE " : "", hle ? hle : "", 10);
+    }
+
+    dbg_printf("%c--- SPU program runs per lifted image ---%c", 10, 10);
+    for (int k = 0; k < 64; k++)
+        if (g_spu_image_runs[k]) dbg_printf("  image %2d: %llu run(s)%c", k, g_spu_image_runs[k], 10);
+
+    dbg_printf("%c--- CPU per host thread over %u s ---%c", 10, sample_sec, 10);
+    memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
+    g_waits_dropped = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t w0 = ppu_waits_now();
+    g_waits_armed = 1;
+    dbg_cpu(sample_sec);
+    g_waits_armed = 0;
+    const double win_ms = (double)(ppu_waits_now() - w0) * 1000.0 / (double)f.QuadPart;
+    Sleep(100);   /* calls in flight at the close land */
+    dbg_printf("%c--- calls each guest thread finished in that time (a call still blocked is not here) ---%c", 10, 10);
+    dbg_waits_report(win_ms, 30);
+
+    dbg_printf("%c--- host threads ---%c", 10, 10);
+    dump_threads("report", self, 0);
+    dbg_printf("%c--- SPU history, the last 60 events ---%c", 10, 10);
+    dbg_spuhist(0, 60);
+    dbg_printf("%c--- diagnostic knobs set ---%c", 10, 10);
+    dbg_knobs(NULL);
+
+    s_dbg_redirect = NULL;
+    fflush(out);
+    ReleaseSRWLockExclusive(&lock);
+}
+
 static DWORD WINAPI hang_watchdog(LPVOID)
 {
     HMODULE self = NULL;
@@ -1907,10 +1996,47 @@ static DWORD WINAPI hang_watchdog(LPVOID)
       if (e && sscanf(e, "%d,%d", &a, &b) == 2 && a > 0 && b > a) { t1 = a; t2 = b; } }
     char lbl[64];
     Sleep((DWORD)t1 * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self, 1);
     Sleep((DWORD)(t2 - t1) * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self, 1);
+
+    /* A hang after the game's first frame: no new frame for PS3_FREEZE_SNAPSHOT
+     * seconds (default 10; 0 = off) puts one ps3_diag_report in the log, so the
+     * log of a game the player then closes still says where it stopped. Seconds
+     * are counted here, one a second, so a PC that slept does not count. */
+    int freeze_s;
+    { const char* e = getenv("PS3_FREEZE_SNAPSHOT"); freeze_s = e && *e ? atoi(e) : 10; }
+    if (freeze_s <= 0) return 0;
+    unsigned seen = (unsigned)g_frames_presented;
+    int stuck = 0, reported = 0;
+    ULONGLONG prev = GetTickCount64();
+    for (;;) {
+        Sleep(1000);
+        const ULONGLONG now = GetTickCount64();
+        const int jumped = now - prev > 5000;   /* (the PC slept, or the process was stopped) */
+        prev = now;
+        const unsigned frames = (unsigned)g_frames_presented;
+        if (frames != seen || !frames || jumped) {
+            if (reported && frames != seen)
+                fprintf(stderr, "[freeze] new frames again, after about %d s without one%c", stuck, 10);
+            seen = frames;
+            stuck = 0;
+            reported = 0;
+            continue;
+        }
+        if (++stuck < freeze_s || reported) continue;
+        reported = 1;
+        fprintf(stderr, "[freeze] no new frame for %d s: a snapshot for problem reports follows%c", stuck, 10);
+        ps3_diag_report(stderr, 2);
+        fprintf(stderr, "[freeze] end of the snapshot%c", 10);
+    }
     return 0;
+}
+#else
+extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
+{
+    (void)sample_sec;
+    if (out) fprintf(out, "(the runtime snapshot is not available on this platform yet)%c", 10);
 }
 #endif
 

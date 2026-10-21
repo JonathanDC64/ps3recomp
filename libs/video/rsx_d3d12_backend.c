@@ -796,6 +796,7 @@ static void session_lock_init(HWND hwnd)
 static rsx_d3d12_overlay s_overlay;
 static volatile long     s_overlay_on;
 static volatile long     s_overlay_repaint;   /* rsx_d3d12_overlay_repaint */
+static volatile long     s_overlay_wake;      /* rsx_d3d12_overlay_wake */
 
 /* The window's client size as of its last WM_SIZE, (w << 16) | h, written by
  * the window thread; the render thread resizes the swap chain to it between
@@ -1301,7 +1302,9 @@ static void blit_to_window(u32 fi)
 static ID3D12Resource* s_hold;
 static u32 s_hold_w, s_hold_h;
 static int s_hold_valid;            /* s_hold has the last frame shown */
+static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last frame shown */
 static long long s_last_present_qpc;   /* the last Present, a repaint's too */
+static long long s_game_frame_qpc;     /* the last game frame shown (hold_frame) */
 static u32 s_repaints;                 /* repaints made (GCM_RATES) */
 
 static int repaint_knob(void)
@@ -1311,14 +1314,10 @@ static int repaint_knob(void)
     return v;
 }
 
-/* Records the copy of the game's frame fi into s_hold, while repaints are on.
- * render_targets[fi] is in PRESENT before and after. */
-static void hold_frame(u32 fi)
+/* Records the copy of the game's frame fi into s_hold. render_targets[fi] is
+ * in PRESENT before and after. */
+static void hold_copy(u32 fi)
 {
-    if (!s_overlay_repaint || !repaint_knob()) {
-        s_hold_valid = 0;
-        return;
-    }
     if (s_hold && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
         s_hold->lpVtbl->Release(s_hold);
         s_hold = NULL;
@@ -1362,6 +1361,20 @@ static void hold_frame(u32 fi)
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
     s_hold_valid = 1;
+}
+
+/* The copy above for each frame shown while repaints are on. */
+static void hold_frame(u32 fi)
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    s_game_frame_qpc = q.QuadPart;
+    s_shown_fi = fi;
+    if (!s_overlay_repaint || !repaint_knob()) {
+        s_hold_valid = 0;
+        return;
+    }
+    hold_copy(fi);
 }
 
 /* Present, at the refresh or (RSX_VSYNC=0, live, default 1) at once with
@@ -10236,9 +10249,11 @@ skip_dump_consider: ;
     /* Present */
     { LARGE_INTEGER _pq0, _pq1;
       QueryPerformanceCounter(&_pq0);
-      if (s_present_this_frame && s_overlay_on && s_overlay.frame)
+      if (s_present_this_frame && s_overlay_on && s_overlay.frame) {
+          if (s_overlay_wake) InterlockedExchange(&s_overlay_wake, 0);   /* (this call is the wake) */
           s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[s_d3d.frame_index], s_d3d.frame_index,
                           s_d3d.win_w, s_d3d.win_h);
+      }
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
           swap_present();
       QueryPerformanceCounter(&_pq1);
@@ -13059,6 +13074,11 @@ void rsx_d3d12_overlay_repaint(int on)
     InterlockedExchange(&s_overlay_repaint, on ? 1 : 0);
 }
 
+void rsx_d3d12_overlay_wake(void)
+{
+    InterlockedExchange(&s_overlay_wake, 1);
+}
+
 /* The display's refresh: its period and the time of a vblank, in performance
  * counter ticks. DWM's timing, read again every quarter second (the window
  * can move to another display); without it the window's display mode gives
@@ -13123,17 +13143,28 @@ static int present_queued(void)
 
 void rsx_d3d12_overlay_tick(void)
 {
-    if (!s_overlay_repaint || !s_hold_valid || !s_overlay_on || !s_overlay.frame || !s_d3d.initialized ||
+    /* Woken (rsx_d3d12_overlay_wake) with repaints off: the hold is made here
+     * from the last frame shown, once the game has stopped presenting. */
+    const int wake = s_overlay_wake && !s_overlay_repaint;
+    if ((!s_overlay_repaint && !wake) || !s_overlay_on || !s_overlay.frame || !s_d3d.initialized ||
         !repaint_knob() || !knob_present() || s_session_locked)
         return;
-    if (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h) return;   /* (held before RSX_SCALE moved) */
+    const int held = s_hold_valid && s_hold_w == s_d3d.host_w && s_hold_h == s_d3d.host_h;
+    if (!held && !wake) return;   /* (held before RSX_SCALE moved) */
     LARGE_INTEGER q, f;
     QueryPerformanceCounter(&q);
     QueryPerformanceFrequency(&f);
     const long long now = q.QuadPart;
+    if (wake) {
+        if (now - s_last_present_qpc < f.QuadPart / 4) return;   /* (its next frame runs the hook) */
+        if (s_shown_fi >= FRAME_COUNT && !held) return;          /* (nothing shown yet to draw over) */
+        InterlockedExchange(&s_overlay_wake, 0);
+    }
     long long vblank = 0;
     const long long period = refresh_period(now, f.QuadPart, &vblank);
-    if (vblank && vblank <= now) {
+    if (wake) {
+        /* (at once: the game has not presented for a quarter of a second) */
+    } else if (vblank && vblank <= now) {
         /* Late in a refresh that has no frame yet: a frame the game presents
          * earlier in it shows instead, and this one still makes the vblank. */
         const long long last_vblank = vblank + (now - vblank) / period * period;
@@ -13141,7 +13172,10 @@ void rsx_d3d12_overlay_tick(void)
     } else if (now - s_last_present_qpc < period) {
         return;
     }
-    if (present_queued() == 1) return;   /* (presenting now would wait for it) */
+    /* (presenting now would wait for it, and hold up the game's next frame;
+     * a game that has stopped has none, and a window the compositor is not
+     * showing never takes it) */
+    if (now - s_game_frame_qpc < f.QuadPart / 4 && present_queued() == 1) return;
 
     /* The held frame into the game's buffer for this index (cleared by the
      * next batch anyway), then into the window's as for any frame. */
@@ -13149,6 +13183,16 @@ void rsx_d3d12_overlay_tick(void)
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
+    if (!held) {
+        /* The last frame shown is still in its render target: a frame index
+         * moves only at a Present, so every batch since has drawn into the
+         * other one. */
+        hold_copy(s_shown_fi);
+        if (!s_hold_valid) {
+            cl->lpVtbl->Close(cl);
+            return;
+        }
+    }
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -13166,6 +13210,7 @@ void rsx_d3d12_overlay_tick(void)
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
     blit_to_window(fi);
+    s_shown_fi = fi;
     cl->lpVtbl->Close(cl);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
@@ -13393,6 +13438,7 @@ int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay) { (void)overlay; }
 void rsx_d3d12_overlay_repaint(int on) { (void)on; }
+void rsx_d3d12_overlay_wake(void) {}
 void rsx_d3d12_overlay_tick(void) {}
 void*    rsx_d3d12_device(void) { return NULL; }
 void*    rsx_d3d12_queue(void) { return NULL; }
