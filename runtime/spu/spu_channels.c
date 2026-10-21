@@ -452,17 +452,23 @@ typedef struct {
 static spu_mfc_slot s_mfc_slots[SPU_MAX_CONTEXTS];
 static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 
-static mfc_engine* mfc_for(spu_context* ctx)
+/* Every channel access asks, a few million times a second on Demon's Souls'
+ * image 2, and almost always from the SPU's own thread: remember the last slot
+ * this thread found. It still has to be ctx's -- a released context can come
+ * back in another slot -- and a slot has one owner. The check is inline; the
+ * search and the claim are not, so the callers stay small. */
+static SPU_TLS int t_mfc_slot = -1;
+static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx);
+static inline mfc_engine* mfc_for(spu_context* ctx)
 {
-    /* Every channel access asks, a few million times a second on Demon's
-     * Souls' image 2, and almost always from the SPU's own thread: remember
-     * the last slot this thread found. It still has to be ctx's -- a released
-     * context can come back in another slot -- and a slot has one owner. */
-    static SPU_TLS int t_slot = -1;
-    { const int s = t_slot;
-      if (s >= 0 && s_mfc_slots[s].ctx == ctx) return &s_mfc_slots[s].mfc; }
+    const int s = t_mfc_slot;
+    if (s >= 0 && s_mfc_slots[s].ctx == ctx) return &s_mfc_slots[s].mfc;
+    return mfc_for_slow(ctx);
+}
+static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx)
+{
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx) { t_slot = i; return &s_mfc_slots[i].mfc; }
+        if (s_mfc_slots[i].ctx == ctx) { t_mfc_slot = i; return &s_mfc_slots[i].mfc; }
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
@@ -1443,7 +1449,12 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
         case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
         case MFC_Cmd:
-            if (mfc_is_plain_xfer(v)) { mfc_submit(mfc_for(ctx), ctx, v); return; }
+            if (mfc_is_plain_xfer(v)) {
+                /* The fast transfer here, the rest of mfc_submit behind a call. */
+                mfc_engine* e = mfc_for(ctx);
+                if (mfc_fast_xfer(e, ctx, v) < 0) mfc_submit(e, ctx, v);
+                return;
+            }
             if ((v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD) && spu_atomic_lean(ctx, v)) return;
             break;
         case MFC_WrTagUpdate:
@@ -1461,6 +1472,37 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         }
     }
     spu_wrch_full(ctx, channel, value);
+}
+
+/* spu_wrch for the native hooks, with the value as a word: they write
+ * immediates (il), the same in every slot. A u128 argument is passed through
+ * a copy on the caller's stack, and that gives each hook a /GS cookie check.
+ * The transfer and the tag update are answered here as spu_wrch answers
+ * them; the rest goes to spu_wrch with the quadword the hook's il makes. */
+static SPU_NOINLINE void spu_wrch_word_slow(spu_context* ctx, uint32_t channel, uint32_t v)
+{
+    u128 q;
+    q._u32[0] = q._u32[1] = q._u32[2] = q._u32[3] = v;
+    spu_wrch(ctx, channel, q);
+}
+void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t v)
+{
+    if (!spu_ch_diag()) {
+        if (channel == MFC_Cmd && mfc_is_plain_xfer(v)) {
+            mfc_engine* e = mfc_for(ctx);
+            if (mfc_fast_xfer(e, ctx, v) < 0) mfc_submit(e, ctx, v);
+            return;
+        }
+        if (channel == MFC_WrTagUpdate) {
+            ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
+            if (v != 0 && (ctx->event_mask & 0x1u)) {   /* as spu_wrch_full */
+                __atomic_fetch_or(&ctx->event_status, 0x1u, __ATOMIC_SEQ_CST);
+                spu_ch_wake(ctx);
+            }
+            return;
+        }
+    }
+    spu_wrch_word_slow(ctx, channel, v);
 }
 
 static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
@@ -2349,12 +2391,16 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
  * keeps in its own data can be lifted. A body larger than one DMA arrives as
  * consecutive GETs (contiguous EA and LS); those are appended to the same
  * file. One file per source EA: ovl_<ea>.bin. */
-static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
+/* Out of line, with the gate in spu_overlay_note_get: inlined, its path
+ * buffers gave that function (every GET) a /GS cookie check. */
+static int s_ovl_dump_on = -1;
+static SPU_NOINLINE void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
 {
-    static int s_on = -1; static char s_dir[400]; static uint32_t s_lsa = 0x5000;
+    int s_on = s_ovl_dump_on; static char s_dir[400]; static uint32_t s_lsa = 0x5000;
     if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e;
         if (s_on) { snprintf(s_dir, sizeof s_dir, "%s", e);
-                    char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } } }
+                    char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } }
+        s_ovl_dump_on = s_on; }
     if (!s_on) return;
     static uint32_t s_seen[256]; static unsigned s_n;
     static SPU_TLS uint32_t t_src, t_next_ea, t_next_lsa;
@@ -2398,7 +2444,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
-    spu_ovl_dump(ctx, ea, lsa, ls, size);
+    if (s_ovl_dump_on) spu_ovl_dump(ctx, ea, lsa, ls, size);
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
