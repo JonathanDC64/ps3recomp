@@ -139,12 +139,16 @@ static float rsx_aspect(void)
 #include <glob.h>
 #endif
 
-/* Between a directory and a file in it (the shader cache's paths). */
-#ifdef _WIN32
-#define RSX_PATH_SEP "\\"
-#else
-#define RSX_PATH_SEP "/"
-#endif
+/* Paths are joined with '/' on every host (Windows takes it too); one that
+ * comes from the host may hold either separator. */
+static char* rsx_path_last_sep(char* path)
+{
+    char* fwd = strrchr(path, '/');
+    char* back = strrchr(path, '\\');
+    if (!fwd) return back;
+    if (!back) return fwd;
+    return fwd > back ? fwd : back;
+}
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -3259,8 +3263,8 @@ static const char* shader_cache_dir(void)
         else {
             char exe[MAX_PATH];
             DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-            char* slash = (n && n < sizeof exe) ? strrchr(exe, RSX_PATH_SEP[0]) : NULL;
-            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s" RSX_PATH_SEP "shader_cache", exe); }
+            char* slash = (n && n < sizeof exe) ? rsx_path_last_sep(exe) : NULL;
+            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s/shader_cache", exe); }
             else snprintf(dir, sizeof dir, "shader_cache");
         }
         if (dir[0]) CreateDirectoryA(dir, NULL);
@@ -3312,7 +3316,7 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
     char path[MAX_PATH + 64]; path[0] = 0;
     const char* dir = shader_cache_dir();
     if (dir[0]) {
-        snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", dir, profile,
+        snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", dir, profile,
                  (unsigned long long)shader_key(src, n, profile));
         if ((*out = shader_cache_load(path)) != NULL) { if (perf_on()) s_perf_sc_hits++; return S_OK; }
     }
@@ -3408,7 +3412,7 @@ static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
 }
 static void pso_path(char* out, size_t n, const char* leaf)
 {
-    snprintf(out, n, "%s" RSX_PATH_SEP "%s", shader_cache_dir(), leaf);
+    snprintf(out, n, "%s/%s", shader_cache_dir(), leaf);
 }
 /* Through a temporary name and a rename, so a crash or a second process never
  * leaves a half-written file under the real name. */
@@ -3583,7 +3587,7 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
         *ls[i] = (u32)sh[i]->BytecodeLength;
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)*hs[i]);
+        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)*hs[i]);
         if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES &&
             !pso_write_file(bp, sh[i]->pShaderBytecode, sh[i]->BytecodeLength))
             return;
@@ -3612,7 +3616,7 @@ static int pso_prebuild_one(const pso_rec* r)
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)hs[i]);
+        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)hs[i]);
         blob[i] = pso_read_file(bp, &len[i]);
         if (!blob[i] || (u32)len[i] != ls[i] ||
             fnv_bytes(14695981039346656037ull, blob[i], (size_t)len[i]) != hs[i])
@@ -3631,7 +3635,7 @@ static int pso_prebuild_one(const pso_rec* r)
     if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
             s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
         WCHAR name[20];
-        _snwprintf(name, 20, L"%016llx", (unsigned long long)r->name);
+        swprintf(name, 20, L"%016llx", (unsigned long long)r->name);
         AcquireSRWLockExclusive(&s_pso_lib_lock);
         if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso)))
             InterlockedIncrement(&s_pso_lib_new);
@@ -3694,7 +3698,7 @@ static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
             s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
     const u64 key = pso_desc_key(pd);
     WCHAR name[20];
-    _snwprintf(name, 20, L"%016llx", (unsigned long long)key);
+    swprintf(name, 20, L"%016llx", (unsigned long long)key);
     AcquireSRWLockExclusive(&s_pso_lib_lock);
     HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
                      &IID_ID3D12PipelineState, (void**)out);
@@ -4307,7 +4311,7 @@ static void fpv_load(void)
     s_fpv_loaded = 1;
     if (!shader_cache_dir()[0]) return;
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "r");
     if (!f) return;
     unsigned h, e, c, d;
@@ -4322,7 +4326,7 @@ static void fpv_note(const u8* ucode, u32 exp32, u32 cube, u32 d2c)
     if (!shader_cache_dir()[0] || fpv_find(hash, exp32, cube, d2c)) return;
     fpv_add(hash, exp32, cube, d2c);
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "a");
     if (f) { fprintf(f, "%08x %x %x %x\n", hash, exp32, cube, d2c); fclose(f); }
 }
@@ -5131,7 +5135,7 @@ static struct {
 } s_tcj = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT };   /* gen..n under lk */
 /* The workers' counters, each on its own cache line. */
 typedef struct { volatile LONG v; char pad[60]; } TcjCounter;
-static __declspec(align(64)) TcjCounter s_tcj_ctr[2];
+static _Alignas(64) TcjCounter s_tcj_ctr[2];
 #define s_tcj_next (s_tcj_ctr[0].v)   /* the next job to take */
 #define s_tcj_busy (s_tcj_ctr[1].v)   /* workers inside the job loop */
 
@@ -7295,7 +7299,7 @@ static void wb_conv_row(u8* d, const u8* s, u32 n, int kind)
         u32 v; memcpy(&v, s + (u64)i * 4, 4); v = (EXPR); memcpy(d + (u64)i * 4, &v, 4); }
     if (kind == 0)      WB_LOOP((v << 8) | (v >> 24))
     else if (kind == 1) WB_LOOP(((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu))
-    else                WB_LOOP(_byteswap_ulong(v))
+    else                WB_LOOP(__builtin_bswap32(v))
     #undef WB_LOOP
 }
 
@@ -11373,7 +11377,7 @@ static u32 s_vpj_vis_n;
  * `next` and count into `done` while the FIFO thread publishes into `pub`,
  * and on one line every publish waited for the workers' writes. */
 typedef struct { volatile LONG v; char pad[60]; } VPJCounter;
-static __declspec(align(64)) VPJCounter s_vpj_ctr[4];
+static _Alignas(64) VPJCounter s_vpj_ctr[4];
 #define s_vpj_pub      (s_vpj_ctr[0].v)   /* jobs the workers may take */
 #define s_vpj_next     (s_vpj_ctr[1].v)
 #define s_vpj_done     (s_vpj_ctr[2].v)
@@ -12341,7 +12345,7 @@ static u32 vf_resolve(const rsx_fetch_slot* sl, u64 a, u64 b)
  * compares) was 16% of that thread. Once the FIFO thread is on the frame's
  * path, as it is at ~105 fps, this is worth 100.2 -> 106.2 fps. Checked
  * against the general loop over 6.8 million draws with no difference. */
-static __forceinline u32 vf_strip_list_w(const u8* src, const int w16, u32 count,
+static inline __attribute__((always_inline)) u32 vf_strip_list_w(const u8* src, const int w16, u32 count,
                                          const int restart, const u32 ridx, u32* pm,
                                          u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
 {
@@ -12397,12 +12401,12 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
 #include <emmintrin.h>
 #endif
 #define VF_CUT 0xFFFFFFFFu
-static __forceinline u32 vf_ix(const u8* src, const int w16, u32 k)
+static inline __attribute__((always_inline)) u32 vf_ix(const u8* src, const int w16, u32 k)
 {
     if (w16) { u16 v; memcpy(&v, src + (u64)k * 2, 2); return __builtin_bswap16(v); }
     u32 v; memcpy(&v, src + (u64)k * 4, 4); return __builtin_bswap32(v);
 }
-static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 count,
+static inline __attribute__((always_inline)) u32 vf_strip_native_w(const u8* src, const int w16, u32 count,
                                            const int restart, const u32 ridx, u32* pm,
                                            u32* pp0, u32* pp1, u32* ib, u32* plo, u32* phi)
 {
@@ -12444,8 +12448,8 @@ static __forceinline u32 vf_strip_native_w(const u8* src, const int w16, u32 cou
             vhi = _mm_max_epi16(vhi, _mm_xor_si128(_mm_andnot_si128(c, v), bias));
             real = _mm_or_si128(real, _mm_xor_si128(c, _mm_set1_epi32(-1)));
             const int mk = _mm_movemask_epi8(c);
-            if (mk) { unsigned long top; _BitScanReverse(&top, (unsigned long)mk);
-                      r = k + (u32)(top >> 1) + 1; }
+            if (mk) { const u32 top = 31u - (u32)__builtin_clz((unsigned)mk);   /* the highest set bit */
+                      r = k + (top >> 1) + 1; }
         }
         if (_mm_movemask_epi8(real)) {
             u16 l8[8], h8[8];
@@ -13852,7 +13856,7 @@ int rsx_d3d12_shader_cache_put(int fragment, const char* hlsl)
     const char* profile = fragment ? "ps_5_0" : "vs_5_0";
     if (!shader_cache_dir()[0] || !hlsl) return 0;
     char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", shader_cache_dir(), profile,
+    snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", shader_cache_dir(), profile,
              (unsigned long long)shader_key(hlsl, strlen(hlsl), profile));
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return 1;
     ID3DBlob* b = NULL; ID3DBlob* e = NULL;

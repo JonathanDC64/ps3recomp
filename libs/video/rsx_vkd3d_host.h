@@ -41,19 +41,6 @@ extern "C" {
 
 typedef void* HWND;
 
-/* The MSVC spellings the backend uses. */
-#define _snwprintf      swprintf
-#define _byteswap_ulong __builtin_bswap32
-#define __forceinline   inline __attribute__((always_inline))
-#define __declspec(x)   RSX__DECLSPEC_##x
-#define RSX__DECLSPEC_align(n) __attribute__((aligned(n)))
-static inline unsigned char _BitScanReverse(unsigned long* index, unsigned long mask)
-{
-    if (!mask) return 0;
-    *index = (unsigned long)(sizeof mask * 8 - 1) - (unsigned long)__builtin_clzl(mask);
-    return 1;
-}
-
 /* The device comes from rsx_vkd3d_dxgi.c rather than vkd3d-utils, whose own
  * fences signal vkd3d-utils events: the backend waits on win32_compat events,
  * and the device needs the window's Vulkan surface extensions. The adapter is
