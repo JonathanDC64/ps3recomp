@@ -217,6 +217,11 @@ void cellPad_set_host_hold(int hold);
 void cellPad_host_mouse_buttons(unsigned mask);
 void cellPad_host_mouse_wheel(int notches);
 
+/* A key or mouse button is held now, by its Windows virtual-key code (VK_LBUTTON to VK_XBUTTON2 for the mouse), read
+ * the way the keyboard pad reads keys: for the title's window code, such as a wrapper UI that waits for every key to
+ * be let go. 0 in a build without host input. */
+int cellPad_host_key_down(int vk);
+
 /* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
  * and the other bindings of the same inputs do not. */
 void cellPad_host_set_menu(int open);
