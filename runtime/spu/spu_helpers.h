@@ -117,21 +117,24 @@ static inline u128 spu_mpy(u128 a, u128 b)  { u128 r; for(int i=0;i<4;i++) r._s3
 static inline u128 spu_mpya(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[i*2]*(int32_t)b._s16[i*2]+c._s32[i]; return r; }
 /* sfx: extended subtract rb-ra-1+carry; carry-in = low bit of old rt (RT is 3rd src). */
 static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
-/* FI decodes the base and step fields produced by the hardware estimate
- * instructions; its second operand is not an ordinary reciprocal float. */
+/* FI refines a frest/frsqest estimate in b with the fraction bits of a. It
+ * works on the bit fields as the hardware does (RPCS3's approximate mode, the
+ * one it runs Demon's Souls with): base fraction minus step times y, one
+ * exponent down if that goes negative. An estimate of 1/0 or 1/sqrt(0) has
+ * the all-ones exponent; the result is then the largest finite float, as the
+ * SPU's 1/0 is, instead of the Inf/NaN a float decode of those bits gives on
+ * x86, so a later multiply by zero still gives zero. */
 static inline u128 spu_fi(u128 a, u128 b) {
     u128 r;
     for (int i = 0; i < 4; i++) {
-        uint32_t rb = b._u32[i];
-        uint32_t ra = a._u32[i];
-        uint32_t exp = (rb >> 23) & 0xFFu;
-        uint32_t base_bits = rb & 0xFFFFFC00u;
-        float base; memcpy(&base, &base_bits, sizeof base);
-        uint32_t step_frac = rb & 0x3FFu;
-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
-        if (base < 0.0f) step = -step;
-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
-        r._f32[i] = base - step * y;
+        const uint32_t rb = b._u32[i], ra = a._u32[i];
+        const uint32_t base = (rb & 0x007FFC00u) << 9;
+        const uint32_t ymul = (rb & 0x3FFu) * (ra & 0x7FFFFu);
+        const uint32_t adj = ymul > base ? 1u : 0u;
+        const uint32_t bnew = (base - ymul) >> (9u - adj);
+        uint32_t expo = (rb & 0xFF800000u) - (adj << 23);
+        if ((expo & 0x7F800000u) == 0x7F800000u) expo = (expo & 0x80000000u) | 0x7F7FFFFFu;
+        r._u32[i] = expo | (bnew & 0x007FFFFFu);
     }
     return r;
 }
@@ -315,7 +318,15 @@ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
 
 /* ---- single-precision float (4 lanes) ---- */
 static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]+b._f32[i]; return r; }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-b._f32[i]; return r; }
+/* Approximate xfloat as RPCS3 does it: the SPU has no Inf or NaN, so a product
+ * with a zero operand is zero (fm) and an fma with a zero multiplier gives the
+ * addend; fs, fms and fnms clamp an infinite operand to the largest float. */
+static inline float spu_clamp_smax(float v) {
+    uint32_t u; memcpy(&u, &v, 4);
+    if ((u & 0x7FFFFFFFu) == 0x7F800000u) { u = (u & 0x80000000u) | 0x7F7FFFFFu; memcpy(&v, &u, 4); }
+    return v;
+}
+static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-spu_clamp_smax(b._f32[i]); return r; }
 
 /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
  * The canonical immediates 173 and 155 are identity conversions. */
@@ -327,7 +338,7 @@ static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]*b._f32[i]; return r; }
+static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?0.0f:a._f32[i]*b._f32[i]; return r; }
 /* Fused multiply-add. Without an FMA unit (__FMA__ unset), fmaf is the CRT
  * software routine (~3% of an SPU-heavy profile). The float product is exact
  * in double (24+24 bits < 53), so double mul+add then one rounding matches
@@ -338,9 +349,9 @@ static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[
 #else
 #define SPU__FMA(a, b, c) ((float)((double)(a) * (double)(b) + (double)(c)))
 #endif
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(a._f32[i], b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(a._f32[i], b._f32[i], -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(a._f32[i], -b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?c._f32[i]:SPU__FMA(a._f32[i], b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), spu_clamp_smax(b._f32[i]), -c._f32[i]); return r; }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), -spu_clamp_smax(b._f32[i]), c._f32[i]); return r; }
 static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
 static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
 

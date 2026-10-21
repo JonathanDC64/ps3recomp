@@ -36,6 +36,18 @@ int main(void)
     r=spu_fi(a,spu_frsqest(a));
     r=spu_fma(spu_fnms(spu_fm(a,r),r,one),spu_fm(r,half),r);
     for(int i=0;i<4;++i) CHECK(fabsf(r._f32[i]*sqrtf(a._f32[i])-1.0f)<2e-6f);
+    /* 1/0: the refined estimate is the largest finite float (no Inf/NaN on the
+     * SPU), and a multiply by zero gives zero (RPCS3's approximate xfloat). */
+    a=spu_zero(); a._f32[1]=-0.0f;
+    r=spu_fi(a,spu_frest(a));
+    CHECK(r._u32[0]==0x7F7FFFFFu && r._u32[1]==0xFF7FFFFFu);
+    r=spu_fm(r,spu_zero()); CHECK(r._f32[0]==0.0f && r._f32[1]==0.0f);
+    r=spu_fi(a,spu_frsqest(a)); CHECK(r._u32[0]==0x7F7FFFFFu);
+    u128 inf=spu_splat_u32(0x7F800000u), two=one; for(int i=0;i<4;++i) two._f32[i]=2.0f;
+    r=spu_fm(inf,spu_zero()); CHECK(r._f32[0]==0.0f);
+    r=spu_fma(inf,spu_zero(),two); CHECK(r._f32[0]==2.0f);
+    r=spu_fnms(inf,spu_zero(),two); CHECK(r._f32[0]==2.0f);
+    r=spu_fs(two,inf); CHECK(r._u32[0]==0xFF7FFFFFu);
     printf("SPU numeric semantics: %d passed, %d failed\n",passed,failed);
     return failed?1:0;
 }
