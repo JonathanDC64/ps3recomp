@@ -319,11 +319,12 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
                                  uint64_t a5, uint64_t a6, uint64_t a7)
 { ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7); }
 
-/* RSX present backend. D3D12 on Windows, Metal on Apple, and the null
- * backend's headless software path anywhere else -- the same selection
- * runtime/host/host_posix.c makes, so the ticker below is backend-agnostic
- * and a POSIX host gets a frame clock instead of no clock at all. */
-#if defined(_WIN32)
+/* RSX present backend. D3D12 on Windows (and on vkd3d off it, with
+ * PS3RECOMP_RSX_D3D12_VKD3D), Metal on Apple, and the null backend's headless
+ * software path anywhere else -- the same selection runtime/host/host_posix.c
+ * makes, so the ticker below is backend-agnostic and a POSIX host gets a
+ * frame clock instead of no clock at all. */
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);

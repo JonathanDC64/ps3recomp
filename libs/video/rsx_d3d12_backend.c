@@ -12,9 +12,12 @@
  * This file is C with COM calls (D3D12 is a COM API).
  * We use the C interface (__uuidof not available in C, so we
  * define GUIDs manually).
+ *
+ * Off Windows (PS3RECOMP_RSX_D3D12_VKD3D) the same code runs on vkd3d, Wine's
+ * D3D12 on Vulkan, in an SDL window: rsx_vkd3d_host.h.
  */
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
 
 #include <time.h>
 #include "ps3emu/ps3_knob.h"
@@ -105,6 +108,7 @@ static float rsx_aspect(void)
     return a;
 }
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -127,6 +131,20 @@ static float rsx_aspect(void)
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "wtsapi32.lib")
+#else
+#define RSX_VKD3D_DEFINE_GUIDS   /* the interface GUIDs live in this file */
+#include "rsx_vkd3d_host.h"
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_vulkan.h>
+#include <glob.h>
+#endif
+
+/* Between a directory and a file in it (the shader cache's paths). */
+#ifdef _WIN32
+#define RSX_PATH_SEP "\\"
+#else
+#define RSX_PATH_SEP "/"
+#endif
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -764,7 +782,7 @@ static double s_lock_sx = 0.0, s_lock_sy = 0.0;
 static u32    s_lock_n  = 0;
 
 /* ---------------------------------------------------------------------------
- * Win32 window
+ * The window: Win32, or SDL off Windows
  * -----------------------------------------------------------------------*/
 
 /* The Windows session is locked. Behind the lock screen DWM holds each back
@@ -775,6 +793,7 @@ static u32    s_lock_n  = 0;
  * at the flip. */
 static volatile LONG s_session_locked;
 
+#ifdef _WIN32
 static void session_lock_init(HWND hwnd)
 {
     WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
@@ -790,6 +809,9 @@ static void session_lock_init(HWND hwnd)
     if (s_session_locked)
         fprintf(stderr, "[D3D12] session locked: rendering without presenting until unlock%c", 10);
 }
+#else
+static void session_lock_init(HWND hwnd) { (void)hwnd; }   /* (Windows only) */
+#endif
 
 /* rsx_d3d12_set_overlay. Set from one thread, read by the window and render
  * threads: the hooks are swapped in whole and then flagged. */
@@ -803,6 +825,7 @@ static volatile long     s_overlay_wake;      /* rsx_d3d12_overlay_wake */
  * frames (swap_resize). 0 until the first WM_SIZE. */
 static volatile LONG s_win_req;
 
+#ifdef _WIN32
 /* Borderless fullscreen (Alt+Enter, rsx_d3d12_set_borderless): the window
  * covers its monitor, no frame. A window, not exclusive fullscreen, so alt-tab
  * and the overlay behave as windowed. Window-thread state. */
@@ -1066,6 +1089,178 @@ static HWND open_window(u32 width, u32 height, const char* title)
     CloseHandle(t);
     return s_d3d.hwnd;
 }
+
+#else /* SDL */
+
+/* The window is SDL's, made by a thread of its own that then waits on its
+ * events, as the Win32 one pumps its messages. Other threads change it by
+ * posting that thread an event (win_post): a title, borderless on or off, or
+ * the close at shutdown. */
+static SDL_Window* s_sdl_window;
+static Uint32      s_sdl_mail;            /* the event type win_post sends (SDL_RegisterEvents) */
+enum { WIN_MAIL_TITLE, WIN_MAIL_BORDERLESS, WIN_MAIL_CLOSE };
+static SRWLOCK     s_win_title_lock;
+static char        s_win_title[320];
+static volatile LONG s_refresh_hz;        /* the window's display, 0 until known */
+
+/* Borderless fullscreen (Alt+Enter, rsx_d3d12_set_borderless): SDL's desktop
+ * fullscreen, the window covering its display. Window-thread state. */
+static int s_borderless;
+
+static void win_post(int what, int arg)
+{
+    if (!s_sdl_mail) return;
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = s_sdl_mail;
+    e.user.code = what;
+    e.user.data1 = (void*)(intptr_t)arg;
+    SDL_PushEvent(&e);
+}
+
+static void win_set_title(const char* t)
+{
+    AcquireSRWLockExclusive(&s_win_title_lock);
+    snprintf(s_win_title, sizeof s_win_title, "%s", t);
+    ReleaseSRWLockExclusive(&s_win_title_lock);
+    win_post(WIN_MAIL_TITLE, 0);
+}
+
+static void set_borderless(HWND hwnd, int on)
+{
+    if (!!on == s_borderless) return;
+    SDL_SetWindowFullscreen((SDL_Window*)hwnd, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    s_borderless = !!on;
+}
+
+/* The drawable's size for swap_resize, as WM_SIZE gives it on Windows. */
+static void win_size_note(void)
+{
+    int w = 0, h = 0;
+    SDL_Vulkan_GetDrawableSize(s_sdl_window, &w, &h);
+    if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000)
+        InterlockedExchange(&s_win_req, (LONG)(((u32)w << 16) | (u32)h));
+}
+
+static void win_refresh_note(void)
+{
+    SDL_DisplayMode m;
+    const int d = SDL_GetWindowDisplayIndex(s_sdl_window);
+    if (d >= 0 && SDL_GetCurrentDisplayMode(d, &m) == 0 && m.refresh_rate > 20 && m.refresh_rate < 1000)
+        InterlockedExchange(&s_refresh_hz, (LONG)m.refresh_rate);
+}
+
+/* The hot keys d3d12_wndproc takes, and nothing else (the keyboard pad reads
+ * the keys on its own). */
+static void win_key(const SDL_KeyboardEvent* k)
+{
+    if (ps3_no_user_input()) return;
+    const SDL_Keycode c = k->keysym.sym;
+    if (c == SDLK_RETURN && (k->keysym.mod & KMOD_ALT)) {
+        if (!k->repeat) set_borderless(s_sdl_window, !s_borderless);
+        return;
+    }
+    if (c == SDLK_ESCAPE && !s_overlay_on) s_d3d.window_closed = 1;
+    if (k->repeat) return;
+    if (c == SDLK_F9) {
+        extern void cellGcm_replay_hotkey(void);
+        cellGcm_replay_hotkey();
+    }
+    if (c == SDLK_F11) InterlockedIncrement(&g_rsx_prof_toggle);   /* profile start/stop */
+    if (c == SDLK_F10) s_hotshot_arm = 1;                           /* see s_hotshot_left */
+}
+
+/* Its first size is the title's, made smaller (same shape) if it would not
+ * fit the primary display's usable area. */
+static SDL_Window* create_window(u32 width, u32 height, const char* title)
+{
+    if (rsx_aspect() > 0.0f) width = (u32)((float)height * rsx_aspect() + 0.5f);   /* the shape the frame is shown at */
+    int cw = (int)width, ch = (int)height;
+    SDL_Rect area;
+    if (SDL_GetDisplayUsableBounds(0, &area) == 0 && area.w > 0 && area.h > 0 && (cw > area.w || ch > area.h)) {
+        if ((long long)area.w * ch < (long long)area.h * cw) { ch = (int)((long long)ch * area.w / cw); cw = area.w; }
+        else { cw = (int)((long long)cw * area.h / ch); ch = area.h; }
+    }
+    /* PS3_NO_USER_INPUT=1 (ps3_knob.h): the window does not take the focus
+     * when it opens, so the user's typing stays where it was. */
+    if (ps3_no_user_input()) SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
+    SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", SDL_WINDOWPOS_CENTERED,
+                                     SDL_WINDOWPOS_CENTERED, cw, ch,
+                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (w) SDL_SetWindowMinimumSize(w, 640, 360);   /* below that an overlay's text overlaps */
+    return w;
+}
+
+typedef struct { u32 w, h; const char* title; HANDLE ready; } window_thread_args;
+
+static DWORD WINAPI window_thread(LPVOID p)
+{
+    window_thread_args* a = (window_thread_args*)p;
+    SDL_Window* w = NULL;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        printf("[D3D12] SDL video init failed: %s\n", SDL_GetError());
+    } else {
+        s_sdl_mail = SDL_RegisterEvents(1);
+        if (s_sdl_mail == (Uint32)-1) s_sdl_mail = 0;
+        w = create_window(a->w, a->h, a->title);
+        if (!w) printf("[D3D12] SDL_CreateWindow failed: %s\n", SDL_GetError());
+    }
+    s_sdl_window = w;
+    s_d3d.hwnd = w;
+    if (w) {
+        win_size_note();
+        win_refresh_note();
+    }
+    SetEvent(a->ready);   /* `a` is the creator's: not touched after this */
+    if (!w) return 0;
+    /* Closing (the window's close button, or Escape) only flags it: the swap
+     * chain still presents to this window until the backend shuts down and
+     * posts WIN_MAIL_CLOSE, so the window is hidden until then. */
+    SDL_Event e;
+    while (SDL_WaitEvent(&e)) {
+        if (e.type == SDL_QUIT) {
+            s_d3d.window_closed = 1;
+        } else if (e.type == SDL_WINDOWEVENT) {
+            const Uint8 ev = e.window.event;
+            if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
+            else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
+            else if (ev == SDL_WINDOWEVENT_CLOSE) s_d3d.window_closed = 1;
+        } else if (e.type == SDL_KEYDOWN) {
+            win_key(&e.key);
+        } else if (s_sdl_mail && e.type == s_sdl_mail) {
+            if (e.user.code == WIN_MAIL_CLOSE) break;
+            if (e.user.code == WIN_MAIL_BORDERLESS) set_borderless(w, (int)(intptr_t)e.user.data1);
+            if (e.user.code == WIN_MAIL_TITLE) {
+                char t[sizeof s_win_title];
+                AcquireSRWLockExclusive(&s_win_title_lock);
+                memcpy(t, s_win_title, sizeof t);
+                ReleaseSRWLockExclusive(&s_win_title_lock);
+                SDL_SetWindowTitle(w, t);
+            }
+        }
+        if (s_d3d.window_closed && (SDL_GetWindowFlags(w) & SDL_WINDOW_SHOWN)) SDL_HideWindow(w);
+    }
+    *(volatile int*)&s_d3d.window_closed = 1;
+    s_sdl_window = NULL;
+    SDL_DestroyWindow(w);
+    return 0;
+}
+
+static HWND open_window(u32 width, u32 height, const char* title)
+{
+    window_thread_args a = {width, height, title, CreateEventA(NULL, TRUE, FALSE, NULL)};
+    HANDLE t = a.ready ? CreateThread(NULL, 0, window_thread, &a, 0, NULL) : NULL;
+    if (!t) {
+        if (a.ready) CloseHandle(a.ready);
+        return NULL;
+    }
+    WaitForSingleObject(a.ready, INFINITE);
+    CloseHandle(a.ready);
+    CloseHandle(t);
+    return s_d3d.hwnd;
+}
+
+#endif /* _WIN32 */
 
 /* The swap chain's buffers and their RTVs (init and after ResizeBuffers). */
 static int swap_buffers_get(void)
@@ -2856,8 +3051,8 @@ static const char* shader_cache_dir(void)
         else {
             char exe[MAX_PATH];
             DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-            char* slash = (n && n < sizeof exe) ? strrchr(exe, '\\') : NULL;
-            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s\\shader_cache", exe); }
+            char* slash = (n && n < sizeof exe) ? strrchr(exe, RSX_PATH_SEP[0]) : NULL;
+            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s" RSX_PATH_SEP "shader_cache", exe); }
             else snprintf(dir, sizeof dir, "shader_cache");
         }
         if (dir[0]) CreateDirectoryA(dir, NULL);
@@ -2909,7 +3104,7 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
     char path[MAX_PATH + 64]; path[0] = 0;
     const char* dir = shader_cache_dir();
     if (dir[0]) {
-        snprintf(path, sizeof path, "%s\\%s_%016llx.dxbc", dir, profile,
+        snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", dir, profile,
                  (unsigned long long)shader_key(src, n, profile));
         if ((*out = shader_cache_load(path)) != NULL) { if (perf_on()) s_perf_sc_hits++; return S_OK; }
     }
@@ -3005,7 +3200,7 @@ static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
 }
 static void pso_path(char* out, size_t n, const char* leaf)
 {
-    snprintf(out, n, "%s\\%s", shader_cache_dir(), leaf);
+    snprintf(out, n, "%s" RSX_PATH_SEP "%s", shader_cache_dir(), leaf);
 }
 /* Through a temporary name and a rename, so a crash or a second process never
  * leaves a half-written file under the real name. */
@@ -3180,7 +3375,7 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
         *ls[i] = (u32)sh[i]->BytecodeLength;
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s\\%016llx.dxbc", dir, (unsigned long long)*hs[i]);
+        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)*hs[i]);
         if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES &&
             !pso_write_file(bp, sh[i]->pShaderBytecode, sh[i]->BytecodeLength))
             return;
@@ -3209,7 +3404,7 @@ static int pso_prebuild_one(const pso_rec* r)
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s\\%016llx.dxbc", dir, (unsigned long long)hs[i]);
+        snprintf(bp, sizeof bp, "%s" RSX_PATH_SEP "%016llx.dxbc", dir, (unsigned long long)hs[i]);
         blob[i] = pso_read_file(bp, &len[i]);
         if (!blob[i] || (u32)len[i] != ls[i] ||
             fnv_bytes(14695981039346656037ull, blob[i], (size_t)len[i]) != hs[i])
@@ -3904,7 +4099,7 @@ static void fpv_load(void)
     s_fpv_loaded = 1;
     if (!shader_cache_dir()[0]) return;
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s\\fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "r");
     if (!f) return;
     unsigned h, e, c, d;
@@ -3919,7 +4114,7 @@ static void fpv_note(const u8* ucode, u32 exp32, u32 cube, u32 d2c)
     if (!shader_cache_dir()[0] || fpv_find(hash, exp32, cube, d2c)) return;
     fpv_add(hash, exp32, cube, d2c);
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s\\fp_variants.txt", shader_cache_dir());
+    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "fp_variants.txt", shader_cache_dir());
     FILE* f = fopen(path, "a");
     if (f) { fprintf(f, "%08x %x %x %x\n", hash, exp32, cube, d2c); fclose(f); }
 }
@@ -8082,10 +8277,21 @@ void rsx_prof_title(const char* note)
 {
     static char base[256];
     if (!s_d3d.hwnd) return;
+#ifdef _WIN32
     if (!base[0]) GetWindowTextA(s_d3d.hwnd, base, sizeof base);
+#else
+    if (!base[0]) {
+        extern char g_rsx_title_base[128];
+        snprintf(base, sizeof base, "%s", g_rsx_title_base);
+    }
+#endif
     char t[320];
     snprintf(t, sizeof t, "%s%s", base, note);
+#ifdef _WIN32
     SetWindowTextA(s_d3d.hwnd, t);
+#else
+    win_set_title(t);
+#endif
 }
 static void frame_log(long long q0, long long q1)
 {
@@ -9984,9 +10190,16 @@ skip_dump_consider: ;
             s_hotshot_burst++;
             snprintf(probe, sizeof probe, "%s%sshot_%03d_00_d*.bmp", hd ? hd : "", hd ? "/" : "",
                      s_hotshot_burst);
+#ifdef _WIN32
             WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(probe, &fd);
             if (fh == INVALID_HANDLE_VALUE) break;
             FindClose(fh);
+#else
+            glob_t g;
+            const int found = glob(probe, 0, NULL, &g) == 0 && g.gl_pathc > 0;
+            globfree(&g);
+            if (!found) break;
+#endif
         } while (s_hotshot_burst < 999);
         s_hotshot_n = 0;
         s_hotshot_left = n > 0 ? n : 12;
@@ -10283,7 +10496,11 @@ skip_dump_consider: ;
                      g_rsx_title_base,
                      s_tframes * 1000.0 / (double)(tnow - s_tt0),
                      s_dbg_last_draws, s_d3d.width, s_d3d.height);
+#ifdef _WIN32
             SetWindowTextA(s_d3d.hwnd, tb);
+#else
+            win_set_title(tb);
+#endif
             /* GCM_RATES=1: the same once-a-second sample on stderr, beside
              * the FIFO flip words decoded and how far RSX label 255 moved --
              * the fence a title like Demon's Souls paces its frames on. */
@@ -13058,10 +13275,14 @@ void rsx_d3d12_backend_shutdown(void)
     /* A window belongs to the thread that made it: the window thread
      * destroys its own and then leaves its message loop. */
     InterlockedExchange(&s_overlay_on, 0);   /* (its device is gone; and this close must not ask first) */
+#ifdef _WIN32
     if (s_d3d.hwnd) {
         if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
         else DestroyWindow(s_d3d.hwnd);
     }
+#else
+    if (s_d3d.hwnd) win_post(WIN_MAIL_CLOSE, 0);
+#endif
 
     rsx_set_backend(NULL);
     s_d3d.initialized = 0;
@@ -13083,6 +13304,7 @@ void rsx_d3d12_overlay_wake(void)
  * counter ticks. DWM's timing, read again every quarter second (the window
  * can move to another display); without it the window's display mode gives
  * the period and *vblank is 0 (unknown). */
+#ifdef _WIN32
 static long long refresh_period(long long now, long long freq, long long* vblank)
 {
     static long long period, vb, read_at;
@@ -13125,6 +13347,15 @@ static long long refresh_period(long long now, long long freq, long long* vblank
     *vblank = vb;
     return period;
 }
+#else
+static long long refresh_period(long long now, long long freq, long long* vblank)
+{
+    (void)now;
+    const LONG hz = s_refresh_hz;   /* the window's display (window thread, win_refresh_note) */
+    *vblank = 0;
+    return hz ? freq / hz : freq / 60;
+}
+#endif
 
 /* Is a frame presented and not yet shown? 1 / 0, or -1 when the swap
  * chain's statistics cannot say. */
@@ -13231,10 +13462,14 @@ void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay)
 }
 void rsx_d3d12_set_borderless(int on)
 {
+#ifdef _WIN32
     if (s_d3d.hwnd) {
         if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_RSX_BORDERLESS, (WPARAM)!!on, 0);
         else set_borderless(s_d3d.hwnd, on);
     }
+#else
+    if (s_d3d.hwnd) win_post(WIN_MAIL_BORDERLESS, !!on);
+#endif
 }
 int      rsx_d3d12_borderless(void)   { return s_borderless; }
 void*    rsx_d3d12_device(void)       { return s_d3d.device; }
@@ -13246,6 +13481,7 @@ unsigned rsx_d3d12_back_buffer_format(void) { return (unsigned)DXGI_FORMAT_R8G8B
 
 int rsx_d3d12_backend_pump_messages(void)
 {
+#ifdef _WIN32
     MSG msg;
     if (s_window_thread) return s_d3d.window_closed ? -1 : 0;   /* the window thread pumps */
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -13253,7 +13489,8 @@ int rsx_d3d12_backend_pump_messages(void)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
-    return s_d3d.window_closed ? -1 : 0;
+#endif
+    return s_d3d.window_closed ? -1 : 0;   /* (off Windows the window thread waits on SDL's events) */
 }
 
 void rsx_d3d12_backend_present(void)
@@ -13390,7 +13627,7 @@ int rsx_d3d12_shader_cache_put(int fragment, const char* hlsl)
     const char* profile = fragment ? "ps_5_0" : "vs_5_0";
     if (!shader_cache_dir()[0] || !hlsl) return 0;
     char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s\\%s_%016llx.dxbc", shader_cache_dir(), profile,
+    snprintf(path, sizeof path, "%s" RSX_PATH_SEP "%s_%016llx.dxbc", shader_cache_dir(), profile,
              (unsigned long long)shader_key(hlsl, strlen(hlsl), profile));
     if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return 1;
     ID3DBlob* b = NULL; ID3DBlob* e = NULL;
@@ -13420,7 +13657,7 @@ int rsx_d3d12_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int m
     return n;
 }
 
-#else /* !_WIN32 */
+#else /* neither Windows nor PS3RECOMP_RSX_D3D12_VKD3D */
 
 #include <ps3emu/ps3types.h>   /* u32 (header includes above are inside the _WIN32 guard) */
 #include <stdio.h>
@@ -13449,4 +13686,4 @@ unsigned rsx_d3d12_back_buffer_format(void) { return 0; }
 void     rsx_d3d12_set_borderless(int on) { (void)on; }
 int      rsx_d3d12_borderless(void) { return 0; }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || PS3RECOMP_RSX_D3D12_VKD3D */

@@ -183,6 +183,23 @@ if(APPLE)
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
+# The D3D12 RSX backend off Windows: the same rsx_d3d12_backend.c on vkd3d
+# (Wine's D3D12 on Vulkan) in an SDL window, with the DXGI it uses supplied by
+# rsx_vkd3d_dxgi.c (see libs/video/rsx_vkd3d_host.h). vkd3d is found through
+# pkg-config (libvkd3d, libvkd3d-utils); the Vulkan headers come with it.
+option(PS3RECOMP_RSX_D3D12_VKD3D "Build the D3D12 RSX backend on vkd3d (Linux)" OFF)
+if(PS3RECOMP_RSX_D3D12_VKD3D)
+    if(WIN32 OR APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_D3D12_VKD3D is for Linux (Windows has D3D12 itself)")
+    endif()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PS3RECOMP_VKD3D REQUIRED IMPORTED_TARGET libvkd3d libvkd3d-utils)
+    # PUBLIC: the boot harness selects its backend on this definition.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_D3D12_VKD3D)
+    target_link_libraries(ps3recomp_runtime PUBLIC PkgConfig::PS3RECOMP_VKD3D)
+    message(STATUS "  D3D12:        RSX backend on vkd3d ${PS3RECOMP_VKD3D_libvkd3d_VERSION}")
+endif()
+
 if(PS3RECOMP_RSX_VULKAN)
     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
     # PUBLIC: ps3recomp_host selects its backend on this definition.
