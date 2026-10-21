@@ -76,6 +76,7 @@ extern int g_spu_ch_diag;
 extern unsigned g_spu_ch_diag_gen;
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t value);
 int  spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea);
 
 #define RING_LINE_LS  0x13480u   /* the control line's copy (GETLLAR target) */
@@ -127,60 +128,73 @@ RING_INLINE int ring_fetch(spu_context* ctx)
     /* The live put. Empty ring: the lifted code GETLLARs and waits. */
     if (!known && be32_at(vm_base + line_ea) == state._u32[0]) return 0;
 
+    /* The registers are worked out in locals and only stored: a value stored
+     * into ctx->gpr a word at a time and read back whole cannot be forwarded
+     * from the store buffer, and the fetch did that a few times a command. */
     /* 0x4618-0x4690: wrch ch69 (no channel), event mask, GETLLAR. */
+    const u128 r52 = spu_il(208);
+    const u128 r55 = spu_rotqbyi(old_line, 8);
+    const u128 r54 = spu_shlqbyi(r55, 4);
     r[58] = spu_il(0);
     r[57] = spu_il(1024);
     ctx->event_mask = 1024;
     r[56] = old_line;
-    r[55] = spu_rotqbyi(r[56], 8);
-    r[54] = spu_shlqbyi(r[55], 4);
-    r[52] = spu_il(208);
-    r[53] = spu_ori(r[52], 0);
+    r[55] = r55;
+    r[54] = r54;
+    r[52] = r52;
+    r[53] = spu_ori(r52, 0);
     /* The GETLLAR and the unchanged PUTLLC at 0x46BC, together. */
     if (known) {
         if (ctx->resv_valid) __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
         ctx->atomic_stat = 0;
-    } else if (!spu_llar_noop_commit(ctx, r[82]._u32[0], r[54]._u32[0])) return 0;
+    } else if (!spu_llar_noop_commit(ctx, RING_LINE_LS, r54._u32[0])) return 0;
     r[5] = spu_il(0);
-    r[6] = spu_ori(r[52], 0);
     /* 0x4694: the compare (not equal: the live put was read above, and the
      * copy is as new as that). */
-    r[4] = spu_ls_read128(ctx, RING_LINE_LS);
+    const u128 r4 = spu_ls_read128(ctx, RING_LINE_LS);
+    const u128 r8 = spu_rotqbyi(r4, 8);
+    r[4] = r4;
     r[63] = state;
-    r[61] = spu_ceq(r[4], r[63]);
-    r[8] = spu_rotqbyi(r[4], 8);
-    r[14] = spu_shlqbyi(r[8], 4);
+    r[61] = spu_ceq(r4, state);
+    r[8] = r8;
+    r[14] = spu_shlqbyi(r8, 4);
     r[6] = spu_il(180);
-    r[2] = spu_make_preferred_u32(ctx->atomic_stat);
     /* 0x46C4-0x4700: GET the command's 128 bytes, wait for tag 0. */
+    const u128 r10 = spu_ori(r[85], 0);
+    const u128 r13 = spu_andi(state, -128);
     r[76] = state;
-    r[10] = spu_ori(r[85], 0);
-    r[13] = spu_andi(r[76], -128);
+    r[10] = r10;
+    r[13] = r13;
     r[3] = spu_il(128);
-    r[2] = spu_il(0);
     r[81] = spu_il(64);
-    ctx->mfc_lsa = r[10]._u32[0];
-    ctx->mfc_eal = r[13]._u32[0];
+    ctx->mfc_lsa = r10._u32[0];
+    ctx->mfc_eal = r13._u32[0];
     ctx->mfc_size = 128;
     ctx->mfc_tag = 0;
-    spu_wrch(ctx, MFC_Cmd, r[81]);
+    spu_wrch_word(ctx, MFC_Cmd, 64);
     r[79] = spu_il(1);
     ctx->mfc_tag_mask = 1;
     r[78] = spu_il(2);
-    spu_wrch(ctx, MFC_WrTagUpdate, r[78]);
+    spu_wrch_word(ctx, MFC_WrTagUpdate, 2);
     r[2] = spu_make_preferred_u32(ctx->mfc_tag_status);
     /* 0x4704-0x472C: copy the command out, get += 16. */
-    r[73] = spu_ls_read128(ctx, RING_STATE_LS);
+    const u128 r73 = spu_ls_read128(ctx, RING_STATE_LS);
+    const u128 r75 = spu_andi(state, 127);
+    const u128 r74 = spu_cwd(r[1], 0);
+    const u128 r71 = spu_ls_read128(ctx, r75._u32[0] + r[85]._u32[0]);
+    const u128 r72 = spu_ai(r73, 16);
+    const u128 r70 = spu_shufb(r72, r73, r74);
+    r[73] = r73;
     r[5] = spu_il(16);
     r[4] = spu_ila(RING_STATE_LS);
-    r[75] = spu_andi(r[76], 127);
-    r[74] = spu_cwd(r[1], 0);
-    r[71] = spu_ls_read128(ctx, r[75]._u32[0] + r[85]._u32[0]);
-    r[72] = spu_ai(r[73], 16);
-    r[70] = spu_shufb(r[72], r[73], r[74]);
-    spu_ls_write128(ctx, RING_CMD_LS, r[71]);
-    r[3] = spu_rotqbyi(r[70], 8);
-    spu_ls_write128(ctx, RING_STATE_LS, r[70]);
+    r[75] = r75;
+    r[74] = r74;
+    r[71] = r71;
+    r[72] = r72;
+    r[70] = r70;
+    spu_ls_write128(ctx, RING_CMD_LS, r71);
+    r[3] = spu_rotqbyi(r70, 8);
+    spu_ls_write128(ctx, RING_STATE_LS, r70);
     return 1;
 }
 

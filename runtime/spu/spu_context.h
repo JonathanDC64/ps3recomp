@@ -634,13 +634,13 @@ SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-SPU_LS_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
+SPU_LS_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, uint32_t word0)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
         if (g_wws_code_probe < 6) {
             g_wws_code_probe++;
-            uint32_t codeLsa = val._u32[0];
+            uint32_t codeLsa = word0;
             #define _RD32(o) (((uint32_t)ctx->ls[o]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)| \
                               ((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
             uint32_t loadJob = _RD32(0x12D0), nextLoad = _RD32(0x12C0), runJob = _RD32(0x12E0);
@@ -688,11 +688,16 @@ SPU_LS_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const ui
 }
 
 /* After the store, so the watch prints the new bytes. */
-SPU_LS_COLD void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, u128 val, const uint8_t* p)
+/* The probes get the stored bytes, not the quadword: a u128 argument is a
+ * copy on the caller's stack, and in every function that inlines
+ * spu_ls_write128 -- each lifted region among them -- that copy brought a /GS
+ * cookie check with it. */
+SPU_LS_COLD void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
     const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
     if ((d & SPU_LSDBG_WWS) && lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
+        spu_ls_write_probe_pre(ctx, lsa, ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                                         ((uint32_t)p[2] << 8) | p[3]);
     if (d & SPU_LSDBG_WATCH)
         spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                           ctx->gpr[0]._u32[0] & SPU_LS_MASK);
@@ -725,7 +730,7 @@ SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
     }
 #endif
     if (__builtin_expect(g_spu_ls_dbg != 0, 0))
-        spu_ls_write_dbg(ctx, lsa, val, p);
+        spu_ls_write_dbg(ctx, lsa, p);
 }
 
 /* ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@
 
 extern int g_spu_ch_diag;
 extern unsigned g_spu_ch_diag_gen;
-void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t value);   /* spu_wrch, an il value */
 
 static int native_put_on(void)
 {
@@ -60,9 +60,9 @@ int spu_hook_put_wait(spu_context* ctx)
     ctx->mfc_eal = eal;
     ctx->mfc_size = size;
     ctx->mfc_tag = 0;
-    spu_wrch(ctx, MFC_Cmd, spu_il(32));          /* PUT */
+    spu_wrch_word(ctx, MFC_Cmd, 32);             /* PUT */
     ctx->mfc_tag_mask = 1;
-    spu_wrch(ctx, MFC_WrTagUpdate, spu_il(1));   /* ANY: waits for tag 0 */
+    spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
     r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
     return 1;
 }

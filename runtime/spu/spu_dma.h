@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <stdio.h>
 #include "../platform/win32_compat.h"
+#if defined(_M_X64) || defined(__SSE2__)
+#include <emmintrin.h>   /* mfc_copy */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -138,6 +141,9 @@ typedef struct mfc_engine {
 
     /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
     uint32_t    tag_completed;
+
+    /* mfc_repeat_check: the last transfer and how many times in a row. */
+    uint32_t    rep_ea, rep_lsa, rep_n;
 } mfc_engine;
 
 /* External: pointer to host mapping of PS3 main memory.
@@ -1007,30 +1013,72 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  * the lean path's included: fed only what the lean path leaves to the full
  * one, a harmless DMA that comes round now and then reads as 256 in a row
  * (Demon's Souls' image 2 was halted that way, at its EA-0 transfer). */
-static inline void mfc_repeat_check(spu_context* spu, uint32_t ea32, uint32_t lsa)
+static MFC_NOINLINE uint32_t mfc_repeat_limit(void)
 {
-    /* Per thread: these were shared by every SPU thread, so each DMA wrote a
-     * line the other SPUs' DMAs wrote too, and a run of identical transfers
-     * was counted across SPUs that had nothing to do with one another. */
-#ifdef _WIN32
-    static __declspec(thread) uint32_t s_last_ea, s_last_lsa, s_rep;
-#else
-    static __thread uint32_t s_last_ea, s_last_lsa, s_rep;
-#endif
-    static uint32_t s_limit = 0;
-    if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                    s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u; }
-    if (ea32 == s_last_ea && lsa == s_last_lsa) {
-        if (++s_rep >= s_limit) {
-            s_rep = 0;   /* re-arm: the chain may run this job again */
-            extern void spu_halt(spu_context*);
-            fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                    "transfers to ea=0x%08X -- halting the SPU%c",
-                    spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit, ea32, 10);
-            fflush(stderr);
-            spu_halt(spu);
+    const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
+    return e ? (uint32_t)strtoul(e, 0, 0) : 256u;
+}
+static MFC_NOINLINE void mfc_repeat_halt(spu_context* spu, uint32_t ea32, uint32_t limit)
+{
+    extern void spu_halt(spu_context*);
+    fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
+            "transfers to ea=0x%08X -- halting the SPU%c",
+            spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, limit, ea32, 10);
+    fflush(stderr);
+    spu_halt(spu);
+}
+/* The count is the engine's, and so the context's: it used to be shared by
+ * every SPU thread, so each DMA wrote a line the other SPUs' DMAs wrote too,
+ * and a run of identical transfers was counted across SPUs that had nothing
+ * to do with one another. (Then it was per thread, which is the same thing
+ * for a context, at three TLS lookups a transfer.) */
+static inline void mfc_repeat_check(mfc_engine* mfc, spu_context* spu, uint32_t ea32, uint32_t lsa)
+{
+    static uint32_t s_limit;
+    static int s_limit_read;
+    if (ea32 == mfc->rep_ea && lsa == mfc->rep_lsa) {
+        if (!s_limit_read) { s_limit = mfc_repeat_limit(); s_limit_read = 1; }
+        if (++mfc->rep_n >= s_limit) {
+            mfc->rep_n = 0;   /* re-arm: the chain may run this job again */
+            mfc_repeat_halt(spu, ea32, s_limit);
         }
-    } else { s_last_ea = ea32; s_last_lsa = lsa; s_rep = 0; }
+    } else { mfc->rep_ea = ea32; mfc->rep_lsa = lsa; mfc->rep_n = 0; }
+}
+
+/* The copy of a fast-path transfer. Nearly all of them are a few whole
+ * quadwords (image 2: 16-byte state PUTs and 128-byte ring lines), which a
+ * call to memcpy spends more on choosing a strategy for than on copying.
+ * Guest memory can change under the copy either way; 16-byte loads and
+ * stores tear no less than memcpy's. (No byte array for the quadword: one
+ * gives the function a /GS cookie check.) */
+static inline void mfc_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
+{
+    if (size <= 256 && !(size & 15)) {
+        for (uint32_t i = 0; i < size; i += 16) {
+#if defined(_M_X64) || defined(__SSE2__)
+            _mm_storeu_si128((__m128i*)(dst + i), _mm_loadu_si128((const __m128i*)(src + i)));
+#else
+            uint64_t a, b;
+            memcpy(&a, src + i, 8); memcpy(&b, src + i + 8, 8);
+            memcpy(dst + i, &a, 8); memcpy(dst + i + 8, &b, 8);
+#endif
+        }
+        return;
+    }
+    memcpy(dst, src, size);
+}
+
+/* spu_coh_is_reserved, inline: the PUT fast path asks once per 128-byte line.
+ * The same two loads, from the flag and the bitmap spu_coherency.c exports
+ * (the flag has a cache line of its own there; the declaration names its
+ * first member, as ppu_loader.cpp's does). */
+extern unsigned char g_spu_coh_bitmap[];
+extern struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
+static inline int mfc_coh_reserved(uint32_t addr)
+{
+    if (!*(volatile int*)&g_spu_coh_armed_line.v) return 0;
+    const uint32_t line = addr >> 7;
+    return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1083,12 +1131,14 @@ static inline int mfc_is_plain_xfer(uint32_t cmd)
     return cmd == 0x40 || cmd == 0x41 || cmd == 0x42 ||   /* GET, GETB, GETF */
            cmd == 0x20 || cmd == 0x21 || cmd == 0x22;     /* PUT, PUTB, PUTF */
 }
-/* 1 = done, with the result in *rc; 0 = take the full path. */
-static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd, int* rc)
+/* The result (0) when done; -1 = take the full path. (A result through a
+ * pointer would put a local's address in every caller, and a /GS cookie
+ * check with it.) */
+static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     extern uint32_t g_barrier_sync_watch;
     if (!mfc_is_plain_xfer(cmd) || spu->policy_mode || g_barrier_sync_watch || mfc_diag())
-        return 0;
+        return -1;
     const uint32_t lsa_raw = spu->mfc_lsa;
     const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     const uint32_t ea32 = (uint32_t)ea;
@@ -1100,19 +1150,18 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
         (uint64_t)lsa + size > (uint64_t)SPU_LS_SIZE ||
         spu->image_id == 22 || spu->image_id == 23 ||
         !mfc_ea_range_committed(ea, size))
-        return 0;
-    mfc_repeat_check(spu, ea32, lsa_raw);
+        return -1;
+    mfc_repeat_check(mfc, spu, ea32, lsa_raw);
     mfc->tag_completed &= ~(1u << tag);
     t_spu_xfers++;
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + ea32;
     if (cmd & 0x40) {
-        memcpy(ls_ptr, ea_ptr, size);
+        mfc_copy(ls_ptr, ea_ptr, size);
         { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
           spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
     } else {
         /* The PUT coherence of mfc_do_transfer: see the comment there. */
-        extern int  spu_coh_is_reserved(uint32_t);
         extern void spu_coh_notify_write_except(uint32_t, const void*);
         extern void spu_lockline_lock_ea(uint32_t, uint32_t);
         extern void spu_lockline_unlock_ea(uint32_t, uint32_t);
@@ -1120,21 +1169,21 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
         const uint32_t a1 = (ea32 + size - 1u) & ~127u;
         int span_reserved = 0;
         for (uint32_t a = a0; ; a += 128u) {
-            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (mfc_coh_reserved(a)) { span_reserved = 1; break; }
             if (a == a1) break;
         }
         if (span_reserved) {
             spu_lockline_lock_ea(a0, a1 - a0 + 128u);
             memcpy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (mfc_coh_reserved(a)) spu_coh_notify_write_except(a, spu);
                 if (a == a1) break;
             }
             spu_lockline_unlock_ea(a0, a1 - a0 + 128u);
         } else {
-            memcpy(ea_ptr, ls_ptr, size);
+            mfc_copy(ea_ptr, ls_ptr, size);
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) {
+                if (mfc_coh_reserved(a)) {
                     spu_lockline_lock_ea(a, 128u);
                     spu_coh_notify_write_except(a, spu);
                     spu_lockline_unlock_ea(a, 128u);
@@ -1151,8 +1200,7 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
     }
     if (!(spu->list_stall_mask & (1u << tag)))
         mfc->tag_completed |= (1u << tag);
-    *rc = 0;
-    return 1;
+    return 0;
 }
 
 /*
@@ -1161,7 +1209,7 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd,
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
-    { int rc; if (mfc_fast_xfer(mfc, spu, cmd, &rc)) return rc; }
+    { const int rc = mfc_fast_xfer(mfc, spu, cmd); if (rc >= 0) return rc; }
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
@@ -1473,7 +1521,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * pages on demand the counter never advanced and a spinning job simply hung
      * the chain walker instead. Count repeats whether or not the transfer
      * succeeds, and halt at a known pc rather than hanging silently. */
-    mfc_repeat_check(spu, (uint32_t)ea, lsa);
+    mfc_repeat_check(mfc, spu, (uint32_t)ea, lsa);
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
