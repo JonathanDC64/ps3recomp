@@ -15,7 +15,9 @@
  *   - vm_base, set once from the host (the guest space is reserved before the
  *     load and never moves);
  *   - g_extra_symtab, which a lifted system PRX's glue fills; the host copies
- *     it after running that glue.
+ *     it after running that glue;
+ *   - in a freestanding module (PS3_GAME_FREESTANDING), a jump thunk per C
+ *     library function (PS3_GAME_HOST_CRT_FUNCS) into the host's C runtime.
  *
  * Compiled with PS3_GAME_MODULE defined and without PS3_GAME_SPLIT.
  */
@@ -45,6 +47,18 @@ static void** const s_host_slots[PS3_GH_COUNT] = { PS3_GAME_HOST_FUNCS(PS3_GM_SL
 PS3_GAME_HOST_FUNCS(PS3_GM_THUNK_DECL_)
 #define PS3_GM_THUNK_ADDR_(n) (void*)&n,
 static void* const s_host_thunks[PS3_GH_COUNT] = { PS3_GAME_HOST_FUNCS(PS3_GM_THUNK_ADDR_) };
+
+/* --- C library functions (freestanding module): a slot and a thunk each --- */
+#ifdef PS3_GAME_FREESTANDING
+#define PS3_GM_CRT_SLOT_(n, h) void* ps3_gt_##n;
+PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_SLOT_)
+#define PS3_GM_CRT_THUNK_(n, h) PS3_GAME_THUNK(n)
+PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_THUNK_)
+#define PS3_GM_CRT_SLOT_ADDR_(n, h) &ps3_gt_##n,
+static void** const s_crt_slots[PS3_GC_COUNT] = { PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_SLOT_ADDR_) };
+extern unsigned int _tls_index;   /* game_libc.c; the loader writes this module's TLS slot */
+int ps3_game_libc_run_ctors(void);   /* game_libc.c: the C++ dynamic initialisers, if any */
+#endif
 
 /* --- Globals the lifted code reads -------------------------------------- */
 /* Initial values as the runtime defines them (spu_drain.c, spu_channels.c,
@@ -79,10 +93,26 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game)
 {
     if (!host || !game) return 1;
     if (host->abi != PS3_GAME_ABI || host->size != sizeof(ps3_host_api)) {
+#ifndef PS3_GAME_FREESTANDING   /* (a freestanding module cannot print yet; the host reports it) */
         fprintf(stderr, "[game] host ABI %u/%u, module %u/%u: refusing to run%c",
                 host->abi, host->size, PS3_GAME_ABI, (unsigned)sizeof(ps3_host_api), 10);
+#endif
         return 2;
     }
+#ifdef PS3_GAME_FREESTANDING
+    /* The C library first: everything below may print. A missing one cannot
+     * be printed, so the host reports the code. */
+    for (int i = 0; i < PS3_GC_COUNT; i++) {
+        if (!host->crt[i]) return 3;
+        *s_crt_slots[i] = host->crt[i];
+    }
+    if (_tls_index == PS3_GAME_TLS_INDEX_UNSET) {
+        fprintf(stderr, "[game] the loader did not set up this module's thread-locals "
+                        "(it needs a TLS directory and an import table): refusing to run%c", 10);
+        return 5;
+    }
+    ps3_game_libc_run_ctors();
+#endif
     for (int i = 0; i < PS3_GH_COUNT; i++) {
         if (!host->fn[i]) {
             fprintf(stderr, "[game] host function %d missing%c", i, 10);

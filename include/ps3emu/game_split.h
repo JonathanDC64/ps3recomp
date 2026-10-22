@@ -59,8 +59,9 @@ extern int*           ps3_split_coh_armed;
  * until the module loads. */
 extern volatile unsigned* ps3_split_game_env_gen;
 
-/* The lift's function table, in the module. Not declared here: ppu_recomp.h
- * and lv2_register.c declare it with their own entry types, and those
+/* The lift's function table, in the module. Not declared here:
+ * ps3emu/ppu_lift.h (the fixed part of the lift's ppu_recomp.h) and
+ * lv2_register.c declare it with their own entry types, and those
  * declarations become declarations of these pointers (game_host.c). */
 #define function_table        (*ps3_split_p_function_table)
 #define function_table_count  (*ps3_split_p_function_table_count)

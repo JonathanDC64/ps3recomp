@@ -2,9 +2,9 @@
  * ps3recomp - the thread-local storage qualifier, on its own.
  *
  * PPU_THREAD_LOCAL is defined in three places that must agree: here,
- * ppu_context.h, and the lifter's HEADER_PREAMBLE (tools/ppu_lifter.py) which
- * bakes it into every generated ppu_recomp.h. The #ifndef makes including any
- * combination harmless.
+ * ppu_context.h, and include/ps3emu/ppu_lift.h, the fixed part of every
+ * generated ppu_recomp.h (a lift made before that header has the same text
+ * inline). The #ifndef makes including any combination harmless.
  *
  * It lives in its own header because the boot scaffold and the loader need the
  * QUALIFIER but must not pull in a second definition of `ppu_context`: a port

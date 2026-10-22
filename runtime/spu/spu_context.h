@@ -845,10 +845,12 @@ static inline int spu_channel_has_data(const spu_channel* ch)
  * SPU_RET. Hooks below are STUBS for now (spu_drain.c) -- lockstep/fltrec land
  * in later milestones.
  * -----------------------------------------------------------------------*/
+#ifndef SPU_THREAD_LOCAL   /* a freestanding game module sets it: ps3emu/game_freestanding.h */
 #if defined(_MSC_VER)
 #  define SPU_THREAD_LOCAL __declspec(thread)
 #else
 #  define SPU_THREAD_LOCAL __thread
+#endif
 #endif
 
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted

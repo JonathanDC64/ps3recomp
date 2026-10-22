@@ -192,7 +192,9 @@ def main() -> int:
     driver = os.path.join(work, "driver.cpp")
     open(driver, "w").write(gen_driver(meta))
     exe = os.path.join(work, "lifttest.exe")
+    # The lift's header includes ps3emu/ppu_lift.h, from ps3recomp's include/.
     sh([args.host_cxx, "-std=c++17", "-O1", "-w", "-I", lifted,
+        "-I", os.path.join(os.path.dirname(HERE), "include"),
         os.path.join(lifted, "ppu_recomp.c"), driver, "-o", exe])
     out = subprocess.run([exe], capture_output=True, text=True)
     print(out.stdout, end="")

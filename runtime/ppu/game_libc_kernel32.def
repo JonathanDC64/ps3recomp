@@ -1,0 +1,6 @@
+; The freestanding game module's one import (runtime/ppu/game_libc.c). The
+; build makes its import library from this file with `lld-link /lib /def:`,
+; so it needs no Windows SDK.
+LIBRARY kernel32.dll
+EXPORTS
+    GetCurrentThreadId

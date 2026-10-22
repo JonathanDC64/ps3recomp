@@ -16,7 +16,7 @@
  *
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
-#include "ppu_recomp.h"   /* ppu_context */
+#include "ps3emu/ppu_lift.h"   /* ppu_context */
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ppu_waits.h"     /* console waits */

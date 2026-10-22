@@ -10,12 +10,13 @@ is exactly the shape of a claim that rots: docs/BUILDING.md advertised macOS as
 "Full support" for months while the tree did not compile there at all, and it
 took CI to find out.
 
-This script closes that hole without needing a game. It synthesises a stub
-ppu_recomp.h from the lifter's OWN HEADER_PREAMBLE -- the same string
-ppu_lifter.py writes into the real header, imported rather than copied, so the
-stub cannot drift from what games actually get -- and compiles the scaffold
-against it. What it proves is that every declaration the scaffold reaches for
-exists on this platform. It does not link, and it cannot run anything.
+This script closes that hole without needing a game. The scaffold's sources
+include the fixed part of the lift's header, include/ps3emu/ppu_lift.h, and
+the template's main.cpp includes a stub ppu_recomp.h that the lifter itself
+writes -- the header of a lift with no functions, made rather than copied, so
+the stub cannot drift from what games actually get. It compiles the scaffold
+against those. What it proves is that every declaration the scaffold reaches
+for exists on this platform. It does not link, and it cannot run anything.
 
 It is a ratchet, not a pass/fail gate, because the POSIX port is not finished:
 the baseline in ppu_scaffold_baseline.json records how many errors each file
@@ -48,9 +49,9 @@ BASELINE = os.path.join(ROOT, "tools", "ppu_scaffold_baseline.json")
 # The scaffold translation units.
 #
 # boot_main.cpp used to be excluded here on the grounds that it needed the
-# per-game SPU recomp header too. It does not -- ppu_recomp.h is the only
-# generated header it wants, and the stub covers that. Leaving it out meant
-# the file the frame clock lives in was the one file nothing checked.
+# per-game SPU recomp header too. It does not -- it wants no generated header
+# at all now, only the fixed ps3emu/ppu_lift.h. Leaving it out meant the file
+# the frame clock lives in was the one file nothing checked.
 #
 # templates/project/main.cpp is here for the same reason: it is a runner built
 # against the same generated header, and it is the file a port starts from. CI
@@ -78,20 +79,22 @@ INCLUDE_DIRS = [
 
 
 def stub_header() -> str:
-    """The lifter's real header preamble, plus the few externs the generated
-    header carries that the scaffold calls into.
+    """The header the lifter writes for a lift with no functions, plus the few
+    externs the scaffold calls into.
 
-    Imported from ppu_lifter.py rather than copied: if the ppu_context layout
-    changes, this stub changes with it and the check keeps testing the truth.
-    PPU_THREAD_LOCAL arrives the same way, now that it lives in the header
-    rather than the generated source -- so this check also verifies the
+    Made by ppu_lifter.py rather than copied: it includes the fixed header
+    (include/ps3emu/ppu_lift.h), as a real lift's does, so if the ppu_context
+    layout changes, this stub changes with it and the check keeps testing the
+    truth. The scaffold's own sources include that fixed header directly; the
+    stub is what the template's main.cpp, which includes ppu_recomp.h, sees.
+    PPU_THREAD_LOCAL lives there too -- so this check also verifies the
     scaffold and the lifted code agree on how to spell thread-local.
     """
     spec = importlib.util.spec_from_file_location(
         "ppu_lifter", os.path.join(ROOT, "tools", "ppu_lifter.py"))
     lifter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(lifter)
-    return lifter.HEADER_PREAMBLE + (
+    return lifter.PPULifter().emit_header() + (
         '\n#ifdef __cplusplus\nextern "C" {\n#endif\n'
         "void ppu_recomp_register(void);\n"
         '#ifdef __cplusplus\n}\n#endif\n'

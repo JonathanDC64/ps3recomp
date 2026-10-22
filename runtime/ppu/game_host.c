@@ -15,8 +15,12 @@
  *
  * This file declares the runtime functions as void(void) only to take their
  * addresses, so it must not include the headers that declare them properly.
+ * The C library functions a freestanding module calls (PS3_GAME_HOST_CRT_FUNCS)
+ * are this exe's own, declared by the C runtime's headers.
  */
 #if defined(PS3_GAME_SPLIT) && defined(_WIN32)
+#include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +40,18 @@
 /* The runtime functions, by address. */
 #define PS3_GH_DECL_(n) extern void n(void);
 PS3_GAME_HOST_FUNCS(PS3_GH_DECL_)
+
+/* The UCRT's fprintf is inline in <stdio.h>, so a freestanding module's
+ * fprintf thunk comes here. A jump thunk leaves the variable arguments as the
+ * caller passed them. */
+static int ps3_gh_fprintf(FILE* stream, const char* format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    const int r = vfprintf(stream, format, ap);
+    va_end(ap);
+    return r;
+}
 
 /* The title's own functions by name; the title defines the strong one. */
 void* ps3_game_title_fn(const char* name) __attribute__((weak));
@@ -112,6 +128,11 @@ int ps3_game_load(void)
 #define PS3_GH_FILL_(n) host.fn[PS3_GH_##n] = (void*)&n;
     PS3_GAME_HOST_FUNCS(PS3_GH_FILL_)
     host.title_fn = ps3_game_title_fn;
+    /* getenv is boot_main's cached one, the lookup a single exe's lifted code
+     * makes: with /MD, &getenv reads the import slot boot_main defines; with
+     * a static runtime, getenv is boot_main's own function. */
+#define PS3_GH_CRT_FILL_(n, h) host.crt[PS3_GC_##n] = (void*)&h;
+    PS3_GAME_HOST_CRT_FUNCS(PS3_GH_CRT_FILL_)
 
     ps3_game_api game;
     memset(&game, 0, sizeof game);

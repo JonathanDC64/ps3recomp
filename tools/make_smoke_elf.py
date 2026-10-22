@@ -31,9 +31,10 @@ them, with their NIDs already in the source.
 address map, which is the reason they come from the same script: the OPD in the
 image and the func_XXXXXXXX names the source defines have to name the same
 guest addresses, and a script that owns both cannot get them out of step. The
-header's preamble is imported from ppu_lifter.py rather than copied, the way
-tools/check_ppu_scaffold.py does it, so it is the real lifted ABI and not a
-lookalike that can drift from it.
+header's fixed part comes from ppu_lifter.py rather than being copied, the way
+tools/check_ppu_scaffold.py does it (the line that includes
+include/ps3emu/ppu_lift.h), so it is the real lifted ABI and not a lookalike
+that can drift from it.
 
   python tools/make_smoke_elf.py --out build/smoke/smoke.elf \
                                  --header build/smoke/ppu_recomp.h
@@ -177,19 +178,22 @@ def build_elf() -> bytes:
 
 
 def build_header() -> str:
-    """HEADER_PREAMBLE plus this image's forward declarations.
+    """The lifter's header for a lift with no functions, plus this image's
+    forward declarations.
 
-    Imported from the lifter rather than copied, exactly as
-    tools/check_ppu_scaffold.py does: the smoke title compiles against the same
-    ppu_context, PPU_THREAD_LOCAL and function-table declarations a real port
-    gets, so a change to the lifted ABI reaches this title too.
+    Made by the lifter rather than copied, exactly as
+    tools/check_ppu_scaffold.py does: it includes the fixed header
+    (include/ps3emu/ppu_lift.h) the way a real lift's does, so the smoke title
+    compiles against the same ppu_context, PPU_THREAD_LOCAL and function-table
+    declarations a real port gets, and a change to the lifted ABI reaches this
+    title too.
     """
     spec = importlib.util.spec_from_file_location(
         "ppu_lifter", os.path.join(ROOT, "tools", "ppu_lifter.py"))
     lifter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(lifter)
 
-    lines = [lifter.HEADER_PREAMBLE]
+    lines = [lifter.PPULifter().emit_header()]
     lines.append("/* The smoke title's guest functions, named the way the lifter")
     lines.append(" * names them: func_<guest address>. Written by "
                  "tools/make_smoke_elf.py")

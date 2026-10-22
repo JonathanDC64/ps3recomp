@@ -33,8 +33,8 @@
 
 #include "ppu_waits.h"   /* console waits table */
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
-#include "ppu_recomp.h"
-#include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+#include "ps3emu/ppu_lift.h"   /* ppu_context, the vm_* prototypes, function_table: the lift's fixed part */
+#include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
@@ -978,7 +978,7 @@ static void resv_check_reg(ppu_context* self)
     fflush(stderr);
 }
 
-/* stwcx./stdcx. store-conditional (see ppu_recomp.h). Under the reservation lock:
+/* stwcx./stdcx. store-conditional (see ps3emu/ppu_lift.h). Under the reservation lock:
  * re-validate the caller's reservation (broken by any concurrent committer),
  * CAS iff the big-endian word still equals `expected`, and on success break every
  * other thread's reservation on that word so their stwcx retries. */
@@ -1973,7 +1973,7 @@ static VM_HOOK_BODY uint64_t vm_read64_full(uint64_t a, void* ra) { if (vm_oob((
  * VM_READ_FULL=1 forces the full accessors for every load. */
 static unsigned g_rd_gen;
 static int g_rd_full = 1;
-/* The inline fast paths in the lifted code (ppu_recomp.h): an access at ea
+/* The inline fast paths in the lifted code (ps3emu/ppu_lift.h): an access at ea
  * is a plain load or store when ea - 0x10000 < the limit -- below the raw-SPU
  * window, above the null page -- and is not the one special read below, and,
  * for a store, its line is not SPU-reserved. Everything else, and everything
@@ -2413,7 +2413,7 @@ extern "C" void ydkj_memmove_0036FA74(ppu_context* ctx)
     /* r3 (dst) is preserved as the return value. */
 }
 
-/* Bridge the lifter-emitted function_table[] (declared in ppu_recomp.h) into the
+/* Bridge the lifter-emitted function_table[] (declared in ps3emu/ppu_lift.h) into the
  * address->function hash map. The host boot harness calls this once at startup. */
 extern "C" void ppu_recomp_register(void)
 {
