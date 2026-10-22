@@ -4129,8 +4129,9 @@ static void rcap_finish(void)
 /* F9 in the game window (cellGcm_replay_hotkey, from the backend's window
  * procedure) captures the next frame to RSX_HOTKEY_DIR/cap_NNN.rcap (default
  * directory "rsx_hotkey", relative to the working directory), numbered from
- * the first number not already in that directory. For a person playing to
- * grab the frame that looks wrong. */
+ * the first number not already in that directory. For a developer to grab
+ * the frame that looks wrong: the key works only with RSX_DEV_HOTKEYS=1
+ * (ps3_knob.h). */
 static volatile LONG s_rcap_hotkey, s_rcap_hotkey_done;
 /* RSX_HOTKEY_FRAMES=n (default 1) makes F9 capture n consecutive frames, as
  * cap_NNN_00.rcap .. cap_NNN_<n-1>.rcap, for flicker that only shows from one

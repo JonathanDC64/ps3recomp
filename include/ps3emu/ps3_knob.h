@@ -60,3 +60,15 @@ static inline int ps3_no_user_input(void)
     PS3_KNOB(on, ps3_env_int("PS3_NO_USER_INPUT", 0) != 0);
     return on;
 }
+
+/* RSX_DEV_HOTKEYS=1: the developer hot keys in the game's window -- F9 (a
+ * frame capture for rsx_replay), F10 (a burst of screenshots) and F11 (a
+ * profile session start or stop). 0 or unset, the default: a player's build
+ * ignores those keys. A port turns it on for its developer builds and test
+ * scripts. */
+static inline int ps3_dev_hotkeys(void)
+{
+    static int on = 0;
+    PS3_KNOB(on, ps3_env_int("RSX_DEV_HOTKEYS", 0) != 0);
+    return on;
+}
