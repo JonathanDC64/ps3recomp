@@ -97,9 +97,11 @@ void     ps3_title_prework(void) {}
 /* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
  * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
  * environment lock and scans every variable each time: profiled at ~30% of
- * GH3's main PPU thread and ~35% of the RSX thread in gameplay. Defining the
- * import slot here (an object in the link beats the import library's lazy
- * definition) routes every dllimport'ed getenv call through this cache.
+ * GH3's main PPU thread and ~35% of the RSX thread in gameplay. With the DLL
+ * C runtime (/MD), defining the import slot here (an object in the link beats
+ * the import library's lazy definition) routes every dllimport'ed getenv call
+ * through this cache; with the static one (/MT) getenv itself is defined here
+ * (see the end of the namespace).
  * Only the debug console changes the environment after startup, through
  * cached_setenv below; otherwise a value is looked up once and the pointer
  * stays valid forever. Reads are lock-free:
@@ -198,7 +200,16 @@ void cached_setenv(const char* name, const char* value)
     ps3_env_bump();   /* PS3_KNOB statics re-read on their next use */
 }
 }
+#ifdef _DLL
 extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
+#else
+/* The static Visual C++ runtime (/MT, as in a host exe linked with the hybrid
+ * CRT): getenv calls are plain calls, and the import slot would collide with
+ * ucrt.lib's (lld-link: duplicate symbol __declspec(dllimport) getenv). So the
+ * function goes here instead, and ucrt.lib's getenv is never linked.
+ * cached_getenv reads the OS's copy, so this does not loop. */
+extern "C" char* __cdecl getenv(const char* name) { return cached_getenv(name); }
+#endif
 extern "C" void ps3_setenv(const char* name, const char* value) { cached_setenv(name, value); }
 
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
