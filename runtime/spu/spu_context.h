@@ -856,8 +856,11 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 void spu_indirect_branch(spu_context* ctx);
 
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
- * spu_context is pinned to one host thread for its lifetime. */
+ * spu_context is pinned to one host thread for its lifetime. (In a split
+ * build's host, a macro reaches the game module's: ps3emu/game_split.h.) */
+#ifndef PS3_GAME_SPLIT
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+#endif
 
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every

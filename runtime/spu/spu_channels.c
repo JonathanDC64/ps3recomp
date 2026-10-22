@@ -95,7 +95,11 @@ void spu_taskset_line_committed(uint32_t line);
 /* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
  * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
 #define SPU_WATCH_MAX 4
+#ifndef PS3_GAME_SPLIT
 int g_spu_ls_watch_n = -1;
+#else
+PS3_SPLIT_DEFINE(int, g_spu_ls_watch_n, -1);   /* the game module's once it loads */
+#endif
 static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
 unsigned* spu_ls_watch_list(int* out_n)
 {
@@ -1259,8 +1263,13 @@ static void spu_rate_tick(spu_context* ctx)
 /* Channel diagnostics that must see every access: SPU_CHHIST (both
  * directions), SPU_POLLTRACE. While neither is set, spu_wrch and
  * spu_rdch answer the plain MFC parameter channels themselves. */
+#ifndef PS3_GAME_SPLIT
 int g_spu_ch_diag;               /* spu_wrch_latch (spu_context.h) reads both */
 unsigned g_spu_ch_diag_gen = ~0u;
+#else
+PS3_SPLIT_DEFINE(int, g_spu_ch_diag, 0);   /* the game module's once it loads */
+PS3_SPLIT_DEFINE(unsigned, g_spu_ch_diag_gen, ~0u);
+#endif
 static SPU_NOINLINE int spu_ch_diag_load(void)
 {
     g_spu_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
@@ -2324,7 +2333,11 @@ static struct { uint32_t entry; int image_id; } s_task_entry[SPU_TASK_ENTRY_MAX]
 static int s_task_entry_count = 0;
 /* Task entries and task ELFs registered: while there are none, the dispatch
  * never adopts a resident task (spu_bi_switch_on relies on that). */
+#ifndef PS3_GAME_SPLIT
 int g_spu_task_regs = 0;
+#else
+PS3_SPLIT_DEFINE(int, g_spu_task_regs, 0);   /* the game module's once it loads */
+#endif
 void spu_taskset_register_task_entry(uint32_t entry, int image_id)
 {
     g_spu_task_regs++;

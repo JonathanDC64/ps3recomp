@@ -1072,6 +1072,7 @@ static inline void mfc_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
  * The same two loads, from the flag and the bitmap spu_coherency.c exports
  * (the flag has a cache line of its own there; the declaration names its
  * first member, as ppu_loader.cpp's does). */
+#ifndef PS3_GAME_SPLIT
 extern unsigned char g_spu_coh_bitmap[];
 extern struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
 static inline int mfc_coh_reserved(uint32_t addr)
@@ -1080,6 +1081,14 @@ static inline int mfc_coh_reserved(uint32_t addr)
     const uint32_t line = addr >> 7;
     return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
 }
+#else   /* split build: the game module's bitmap and flag (ps3emu/game_split.h) */
+static inline int mfc_coh_reserved(uint32_t addr)
+{
+    if (!*(volatile int*)ps3_split_coh_armed) return 0;
+    const uint32_t line = addr >> 7;
+    return (ps3_split_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * The common DMA, without the diagnostics.

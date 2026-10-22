@@ -784,6 +784,7 @@ extern "C" int  spu_coh_is_reserved(uint32_t addr);
  * Demon's Souls' HighGraphics thread). Same two loads, from the bitmap and
  * the armed flag spu_coherency.c exports; the flag has a cache line of its
  * own there, so the declaration only has to name its first member. */
+#ifndef PS3_GAME_SPLIT
 extern "C" unsigned char g_spu_coh_bitmap[];
 extern "C" struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
 static inline int spu_coh_reserved_fast(uint32_t addr)
@@ -792,6 +793,14 @@ static inline int spu_coh_reserved_fast(uint32_t addr)
     const uint32_t line = addr >> 7;
     return (g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
 }
+#else   /* split build: the game module's bitmap and flag (ps3emu/game_split.h) */
+static inline int spu_coh_reserved_fast(uint32_t addr)
+{
+    if (!*(volatile int*)ps3_split_coh_armed) return 0;
+    const uint32_t line = addr >> 7;
+    return (ps3_split_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+}
+#endif
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_lockline_lock_ea(uint32_t ea, uint32_t len);
@@ -2276,8 +2285,11 @@ void flow_lookup_alloc(unsigned int p) {
     else      fprintf(stderr, "[alloc-tag] garbage obj 0x%08X is in NO live alloc -> use-after-free or pool/untracked\n", p);
 }
 
-/* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
+/* Cross-fragment trampoline pointer (matches the lifted header's TLS decl).
+ * A split build's is the game module's (ps3emu/game_split.h). */
+#ifndef PS3_GAME_SPLIT
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+#endif
 
 /* Per-thread active guest context, for the crash handler to report the guest PC
  * (ctx->pc, updated by lifted code at block boundaries) of a host AV. */

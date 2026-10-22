@@ -2294,6 +2294,11 @@ int main(int argc, char** argv)
     ppu_vm_size = 0;   /* full 32-bit space backed, as on Windows */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+#ifdef PS3_GAME_SPLIT
+    /* The lifted code is a DLL (ps3emu/game_module.h): load it before anything
+     * reads the function table, once vm_base is set. */
+    if (ps3_game_load() != 0) { printf("game module load failed\n"); return 1; }
+#endif
 
     uint32_t entry = ppu_load_elf(elf);
     if (!entry) { printf("load failed\n"); return 1; }
@@ -2337,7 +2342,11 @@ int main(int argc, char** argv)
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_title_options_init(); /* title options (weak no-op by default) */
     fprintf(stderr,"[boot-dbg] after ppu_recomp_register; before ps3_load_prx_modules\n"); fflush(stderr);
+#ifndef PS3_GAME_SPLIT
     ps3_load_prx_modules();  /* real system PRX (libsre) -> guest RAM + exports */
+#else
+    ps3_game_load_prx_modules();   /* the same, from the game module */
+#endif
     fprintf(stderr,"[boot-dbg] after prx; before ppu_hle_init\n"); fflush(stderr);
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
     ppu_sysprx_register();   /* boot-critical CRT (sys_initialize_tls, ...) */
