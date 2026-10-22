@@ -175,7 +175,8 @@ testing an alternate runtime tree with `PS3RECOMP_TREE_ROOT`.
 ### Checking the PPU boot scaffold
 
 `runtime/ppu/` is the one part of the runtime no CMake target builds. Those
-files `#include "ppu_recomp.h"`, which the lifter generates per game, so
+files are compiled per game, beside a lift (they include `ps3emu/ppu_lift.h`,
+the fixed part of the `ppu_recomp.h` the lifter generates per game), so
 `CMakeLists.txt` excludes them from the library and they are only ever
 compiled inside somebody's game port — historically, on Windows.
 
@@ -185,8 +186,8 @@ python tools/check_ppu_scaffold.py --verbose  # show the diagnostics
 python tools/check_ppu_scaffold.py --update   # re-record after improving it
 ```
 
-It synthesises a stub `ppu_recomp.h` from the lifter's own `HEADER_PREAMBLE`
-— imported from `ppu_lifter.py`, not copied, so it cannot drift from what
+It has the lifter write a stub `ppu_recomp.h`, the header of a lift with no
+functions — made by `ppu_lifter.py`, not copied, so it cannot drift from what
 games really get — and compiles the scaffold against it. It does not link and
 runs nothing; it proves only that every declaration the scaffold reaches for
 exists on this platform.
@@ -327,9 +328,9 @@ unset unless you are specifically working on that engine.
 
 `runtime/ppu/` and `runtime/host/` are deliberately excluded from
 `ps3recomp_runtime` (see the `list(FILTER ...)` in the root `CMakeLists.txt`).
-They `#include` the lifter-generated `ppu_recomp.h`, which only exists once you
-have lifted a specific title, so they are compiled **into your game target**
-rather than into the shared library. `templates/project/CMakeLists.txt` shows the arrangement.
+They are built beside the lifter-generated code of a specific title (they
+include `ps3emu/ppu_lift.h`, the fixed part of its `ppu_recomp.h`), so they are
+compiled **into your game target** rather than into the shared library. `templates/project/CMakeLists.txt` shows the arrangement.
 
 ---
 

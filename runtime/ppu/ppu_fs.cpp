@@ -13,7 +13,7 @@
  * Context-aware HLE: guest pointers (path, buffers, out params) are read/written
  * through vm_base in big-endian.
  */
-#include "ppu_recomp.h"      /* ppu_context */
+#include "ps3emu/ppu_lift.h"   /* ppu_context */
 #include "ps3emu/ps3_knob.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */

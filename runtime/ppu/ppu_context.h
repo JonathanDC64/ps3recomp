@@ -17,11 +17,11 @@
 extern "C" {
 #endif
 
-/* Thread-local storage qualifier. Defined identically in the lifter's
- * HEADER_PREAMBLE (tools/ppu_lifter.py), which this header is already kept
- * in sync with -- code reaches one or the other depending on whether it
- * built against a generated ppu_recomp.h. The #ifndef makes including both
- * harmless. */
+/* Thread-local storage qualifier. Defined identically in
+ * include/ps3emu/ppu_lift.h, the fixed part of every lift's ppu_recomp.h,
+ * which this header is already kept in sync with -- code reaches one or the
+ * other depending on whether it built against that header. The #ifndef makes
+ * including both harmless. */
 #ifndef PPU_THREAD_LOCAL
 #  ifdef _MSC_VER
 #    define PPU_THREAD_LOCAL __declspec(thread)
@@ -130,9 +130,9 @@ static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
 }
 
 /* The whole register as the guest sees it (mfcr) and back (mtcr): CR0 is
- * bits 31:28 of the packed value, CR7 bits 3:0. The lifter's generated
- * ppu_recomp.h defines these two and the field get/set above, for host
- * code built against it (a port's insn hooks). */
+ * bits 31:28 of the packed value, CR7 bits 3:0. include/ps3emu/ppu_lift.h
+ * (the fixed part of a lift's ppu_recomp.h) defines these two and the field
+ * get/set above, for host code built against it (a port's insn hooks). */
 #ifndef PPU_CR_PACK_DEFINED
 #define PPU_CR_PACK_DEFINED
 static inline uint32_t ppu_cr_pack(const ppu_context* ctx)

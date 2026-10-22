@@ -9,8 +9,8 @@
  * threads, the frame clock and the RSX backend had never once run together.
  *
  * This file is what a lift produces, written by hand. It obeys the lifter's
- * ABI exactly -- ppu_recomp.h (generated from ppu_lifter.py's own
- * HEADER_PREAMBLE by tools/make_smoke_elf.py), one
+ * ABI exactly -- ppu_recomp.h (written by tools/make_smoke_elf.py the way
+ * ppu_lifter.py writes one, including ps3emu/ppu_lift.h), one
  * `void func_<guest addr>(ppu_context*)` per guest function, a sentinel-
  * terminated function_table[] the runtime registers -- so everything it
  * touches is reached the way a real title reaches it:

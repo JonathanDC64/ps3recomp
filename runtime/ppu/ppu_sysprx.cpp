@@ -10,7 +10,7 @@
  * NIDs are computed from the names (ps3_compute_nid), so this stays correct
  * without hand-written NID literals.
  */
-#include "ppu_recomp.h"     /* ppu_context */
+#include "ps3emu/ppu_lift.h"   /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include "ps3emu/ps3_net.h" /* ps3_net_online */
 #include <stdint.h>

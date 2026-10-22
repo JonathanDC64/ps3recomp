@@ -147,7 +147,8 @@ invocation. That output-splitting is the main scaling task.
 | `tools/gen_hle_nids.py` | generate NID→handler table from HLE sources |
 | `runtime/ppu/ppu_loader.cpp` | runtime loader: image load, mem, registry, dispatch |
 | `runtime/ppu/ppu_hle.cpp` | NID→HLE dispatch + PPC ABI adapter |
-| `runtime/ppu/ppu_context.h` | `ppu_context` (also emitted into `ppu_recomp.h`) |
+| `include/ps3emu/ppu_lift.h` | the fixed part of every `ppu_recomp.h`, which includes it; the boot scaffold and a port's own code include it instead of a lift's header |
+| `runtime/ppu/ppu_context.h` | `ppu_context` (also in `include/ps3emu/ppu_lift.h`) |
 | `runtime/ppu/tests/test_loader.cpp` | loader smoke test (real EBOOT) |
 | `runtime/ppu/tests/test_hle*.cpp` | HLE adapter + real-library integration tests |
 | `runtime/ppu/tests/boot_main.cpp` | integrated first-boot harness |

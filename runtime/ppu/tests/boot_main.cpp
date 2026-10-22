@@ -22,17 +22,17 @@
  * is what proves this path runs at all on POSIX.
  */
 #include <stdarg.h>
-#include "ppu_recomp.h"
+#include "ps3emu/ppu_lift.h"     /* ppu_context, function_table: the lift's fixed part */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
 /* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
- * a generated ppu_recomp.h already declares. Ports generated before the
- * qualifier existed do not define it, so the scaffold must carry its own
- * reachable definition. */
+ * ps3emu/ppu_lift.h already declares. The fixed header defines the qualifier
+ * too; the #ifndef in both makes the pair harmless. */
 #include "../ppu_tls.h"
 #include "../../platform/win32_compat.h"      /* Sleep, GetTickCount64, threads on POSIX */
 #include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
-/* The lifted ppu_recomp.h already defines `struct ppu_context` (identical to
- * runtime/ppu/ppu_context.h by design -- "keep the two in sync"). A syscall
+/* ps3emu/ppu_lift.h already defines `struct ppu_context` (the same layout as
+ * runtime/ppu/ppu_context.h by design -- "keep the two in sync"; the vector
+ * registers' type differs, so the two cannot be one definition). A syscall
  * header included later (sys_ppu_thread.h -> lv2_syscall_table.h -> ppu_context.h)
  * would redefine it, so claim ppu_context.h's guard now: this TU has the struct,
  * and boot_main uses none of that header's PPU_CR or XER bit macros. */

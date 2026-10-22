@@ -111,9 +111,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
 #  - test harnesses (runtime/*/tests/*): they have their own main() and #include
 #    per-game generated headers (spu_recomp.h) that a plain library build lacks.
 #  - the PPU boot scaffold (runtime/ppu/, runtime/host/): these are compiled
-#    per-game against the lifter-generated ppu_recomp.h (and the game's RSX/D3D12
-#    backend), not as part of the game-agnostic runtime library. See
-#    docs/PPU_RECOMP.md.
+#    per-game against the fixed part of the lifter's header (ps3emu/ppu_lift.h)
+#    and the game's RSX/D3D12 backend, not as part of the game-agnostic runtime
+#    library. See docs/PPU_RECOMP.md.
 #  - spu_dispatch_mt.c: the musttail SPU indirect-branch fast path. It uses
 #    __attribute__((musttail)), which MSVC cannot parse, and it must be compiled
 #    *inside the game build* by clang so the tail call is guaranteed -- a plain
@@ -539,17 +539,16 @@ endif()
 # ---------------------------------------------------------------------------
 # The one target that LINKS AND RUNS the PPU boot scaffold. runtime/ppu/ is the
 # game-agnostic boot path every port is built on, and nothing here has ever
-# built it: it #includes the lifter's per-game ppu_recomp.h, so
-# tools/check_ppu_scaffold.py compiles it against a stub header and stops
-# there. Compiling is not running, and on POSIX the loader, the NID bridge, the
-# lv2 syscalls, guest threads, the frame clock and the RSX backend had never
-# once run together.
+# built it: it needs a lift beside it, so tools/check_ppu_scaffold.py compiles
+# it against a stub header and stops there. Compiling is not running, and on
+# POSIX the loader, the NID bridge, the lv2 syscalls, guest threads, the frame
+# clock and the RSX backend had never once run together.
 #
 # runtime/ppu/tests/smoke/ supplies what was missing: a hand-written program in
 # the lifter's ABI, and tools/make_smoke_elf.py writes both the PPU ELF it is
-# loaded from and the ppu_recomp.h it compiles against -- the header from
-# ppu_lifter.py's own HEADER_PREAMBLE, so the synthetic title cannot drift away
-# from the ABI a real one gets.
+# loaded from and the ppu_recomp.h it compiles against -- the header
+# ppu_lifter.py itself writes, which includes the fixed ps3emu/ppu_lift.h, so
+# the synthetic title cannot drift away from the ABI a real one gets.
 #
 # The HLE NID table is generated exactly as a port generates it, so the smoke
 # title's firmware imports resolve through the same bridge a game's do.
@@ -568,6 +567,7 @@ if(UNIX)
                     --header "${SMOKE_GEN}/ppu_recomp.h"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/ppu_lifter.py"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/include/ps3emu/ppu_lift.h"
             COMMENT "Generating the smoke title's image and ppu_recomp.h")
 
         add_custom_command(
