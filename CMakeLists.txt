@@ -26,7 +26,7 @@ option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 # ---------------------------------------------------------------------------
 
 # HLE library sources
-file(GLOB_RECURSE HLE_SOURCES
+file(GLOB_RECURSE HLE_SOURCES CONFIGURE_DEPENDS
     "libs/system/*.c"
     "libs/filesystem/*.c"
     "libs/input/*.c"
@@ -82,12 +82,12 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.c
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/codec/sail_movie.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
-file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
+file(GLOB AT3_SOURCES CONFIGURE_DEPENDS "third_party/at3_standalone/*.cpp")
 set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${AT3_SOURCES})
 
 # Runtime core (syscalls, PPU, SPU, memory)
-file(GLOB_RECURSE RUNTIME_SOURCES
+file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
     "runtime/*.c"
     "runtime/*.cpp"
 )
