@@ -21,6 +21,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 
+# The static Visual C++ runtime (/MT) for every target here, in place of the DLL one
+# (/MD), for a host exe linked with the "hybrid" CRT: the Visual C++ runtime and the
+# C++ library linked into the exe, and the C library taken from the UCRT that
+# Windows 10 and 11 include (ucrt.lib in place of libucrt.lib, at the exe's link).
+# Such an exe cannot link this library's C++ objects if they were built /MD (the
+# STL's RuntimeLibrary check), so the library has to match it. Off: /MD, as before.
+option(PS3RECOMP_STATIC_CRT "Build with the static Visual C++ runtime (/MT), for a hybrid-CRT host exe" OFF)
+if(PS3RECOMP_STATIC_CRT)
+    if(NOT MSVC)
+        message(FATAL_ERROR "PS3RECOMP_STATIC_CRT is for clang-cl on Windows")
+    endif()
+    # cmake_minimum_required(3.20) sets CMP0091 to NEW, so this is the
+    # MSVC_RUNTIME_LIBRARY of every target made after it.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
