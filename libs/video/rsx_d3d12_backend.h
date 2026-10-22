@@ -36,7 +36,8 @@ extern "C" {
 
 /* Initialize the D3D12 backend.
  * Creates a Win32 window, D3D12 device, swap chain, and registers
- * as the active rsx_backend.
+ * as the active rsx_backend. RSX_MAXIMIZED=1 (default 0): the window
+ * opens maximized (create_window in rsx_d3d12_backend.c).
  * Returns 0 on success, -1 on failure. */
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title);
 
@@ -122,8 +123,8 @@ void     rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long l
 void*    rsx_d3d12_back_buffer(unsigned index);
 unsigned rsx_d3d12_back_buffer_count(void);
 unsigned rsx_d3d12_back_buffer_format(void);
-/* Borderless fullscreen on the window's monitor (1) or the window as it was
- * (0). Alt+Enter toggles it too. Any thread. */
+/* Borderless fullscreen on the window's monitor (1) or the window as it was,
+ * maximized or not (0). Alt+Enter toggles it too. Any thread. */
 void     rsx_d3d12_set_borderless(int on);
 int      rsx_d3d12_borderless(void);
 
