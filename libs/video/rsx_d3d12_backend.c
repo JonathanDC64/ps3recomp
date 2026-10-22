@@ -920,19 +920,19 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
-        if (wp == VK_F9 && !(lp & (1 << 30))) {   /* not auto-repeat */
+        if (wp == VK_F9 && !(lp & (1 << 30)) && ps3_dev_hotkeys()) {   /* not auto-repeat */
             extern void cellGcm_replay_hotkey(void);
             cellGcm_replay_hotkey();
         }
-        if (wp == VK_F11 && !(lp & (1 << 30)))    /* profile start/stop */
+        if (wp == VK_F11 && !(lp & (1 << 30)) && ps3_dev_hotkeys())    /* profile start/stop */
             InterlockedIncrement(&g_rsx_prof_toggle);
         return 0;
     case WM_SYSKEYDOWN:
         /* F10 is the menu key: Windows sends it as WM_SYSKEYDOWN, never
-         * WM_KEYDOWN. Handled here, it also stops the window entering menu
-         * mode. */
+         * WM_KEYDOWN. Handled here, also with the developer keys off, it
+         * stops the window entering menu mode. */
         if (wp == VK_F10) {
-            if (!(lp & (1 << 30))) s_hotshot_arm = 1;   /* see s_hotshot_left */
+            if (!(lp & (1 << 30)) && ps3_dev_hotkeys()) s_hotshot_arm = 1;   /* see s_hotshot_left */
             return 0;
         }
         break;
@@ -1358,7 +1358,7 @@ static void win_key(const SDL_KeyboardEvent* k)
     if (ps3_no_user_input()) return;
     const SDL_Keycode c = k->keysym.sym;
     if (c == SDLK_ESCAPE && !s_overlay_on) s_d3d.window_closed = 1;
-    if (k->repeat) return;
+    if (k->repeat || !ps3_dev_hotkeys()) return;   /* the developer keys below */
     if (c == SDLK_F9) {
         extern void cellGcm_replay_hotkey(void);
         cellGcm_replay_hotkey();
