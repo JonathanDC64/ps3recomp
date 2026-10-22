@@ -832,20 +832,30 @@ static volatile LONG s_win_req;
 #ifdef _WIN32
 /* Borderless fullscreen (Alt+Enter, rsx_d3d12_set_borderless): the window
  * covers its monitor, no frame. A window, not exclusive fullscreen, so alt-tab
- * and the overlay behave as windowed. Window-thread state. */
+ * and the overlay behave as windowed. Window-thread state.
+ * A maximized window is restored before its rect and style are saved, and
+ * maximized again after they are put back. So the fullscreen window is never
+ * a maximized one (Windows puts a maximized window back in the work area when
+ * the taskbar or the display changes), and leaving gives the window as it
+ * was: maximized, or at the user's own size. (Not Get/SetWindowPlacement: the
+ * window would still have to be restored first, and the saved rect and style
+ * already cover the rest.) */
 #define WM_RSX_BORDERLESS (WM_APP + 0x52)
 static int   s_borderless;
 static RECT  s_windowed_rect;
 static LONG  s_windowed_style;
+static int   s_windowed_maximized;
 
 static void set_borderless(HWND hwnd, int on)
 {
     if (!!on == s_borderless) return;
     if (on) {
         MONITORINFO mi = {sizeof mi};
+        if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;   /* where it is now */
+        s_windowed_maximized = IsZoomed(hwnd) != 0;
+        if (s_windowed_maximized) ShowWindow(hwnd, ps3_no_user_input() ? SW_SHOWNOACTIVATE : SW_RESTORE);
         GetWindowRect(hwnd, &s_windowed_rect);
         s_windowed_style = GetWindowLongA(hwnd, GWL_STYLE);
-        if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
         SetWindowLongA(hwnd, GWL_STYLE, (s_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -855,6 +865,7 @@ static void set_borderless(HWND hwnd, int on)
         SetWindowPos(hwnd, NULL, s_windowed_rect.left, s_windowed_rect.top,
                      s_windowed_rect.right - s_windowed_rect.left, s_windowed_rect.bottom - s_windowed_rect.top,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_NOZORDER | (ps3_no_user_input() ? SWP_NOACTIVATE : 0));
+        if (s_windowed_maximized) ShowWindow(hwnd, SW_MAXIMIZE);   /* that rect becomes its restored size */
     }
     s_borderless = !!on;
 }
@@ -987,6 +998,9 @@ static void dark_title(HWND hwnd)
     if (set_attr) set_attr(hwnd, 20, &on, sizeof on);
 }
 
+/* RSX_MAXIMIZED=1 (default 0; read once, here): the window opens maximized,
+ * and the centred size below is the one it restores to. Not with
+ * PS3_NO_USER_INPUT=1: a window shown maximized always takes the focus. */
 static HWND create_window(u32 width, u32 height, const char* title)
 {
     WNDCLASSEXA wc = {0};
@@ -1036,6 +1050,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
      * it opens or when it is clicked, so the user's typing stays where it was.
      * It still shows, keeps its taskbar button and presents as usual. */
     const int no_user_input = ps3_no_user_input();
+    const int maximized = ps3_env_int("RSX_MAXIMIZED", 0) && !no_user_input;
     HWND hwnd = CreateWindowExA(
         no_user_input ? WS_EX_NOACTIVATE | WS_EX_APPWINDOW : 0, "ps3recomp_d3d12",
         title ? title : "ps3recomp (D3D12)",
@@ -1045,7 +1060,7 @@ static HWND create_window(u32 width, u32 height, const char* title)
         NULL, NULL, GetModuleHandle(NULL), NULL);
     if (hwnd) {   /* the title bar's colour before the window first shows */
         dark_title(hwnd);
-        ShowWindow(hwnd, no_user_input ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
+        ShowWindow(hwnd, maximized ? SW_SHOWMAXIMIZED : no_user_input ? SW_SHOWNOACTIVATE : SW_SHOWNORMAL);
     }
     return hwnd;
 }
@@ -1368,7 +1383,10 @@ static void win_key(const SDL_KeyboardEvent* k)
 }
 
 /* Its first size is the title's, made smaller (same shape) if it would not
- * fit the primary display's usable area. */
+ * fit the primary display's usable area. RSX_MAXIMIZED=1 (default 0; read
+ * once, here): it opens maximized, that size the one it restores to; not with
+ * PS3_NO_USER_INPUT=1, as on Windows. The window manager may maximize it only
+ * after it shows: the SIZE_CHANGED that follows resizes the swap chain. */
 static SDL_Window* create_window(u32 width, u32 height, const char* title)
 {
     if (rsx_aspect() > 0.0f) width = (u32)((float)height * rsx_aspect() + 0.5f);   /* the shape the frame is shown at */
@@ -1384,9 +1402,10 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
     /* The close button is the window's close event alone (the overlay can ask first); SDL_QUIT is then only a
      * signal (Ctrl+C, SIGTERM), which closes at once. */
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    const Uint32 maximized = ps3_env_int("RSX_MAXIMIZED", 0) && !ps3_no_user_input() ? SDL_WINDOW_MAXIMIZED : 0;
     SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", SDL_WINDOWPOS_CENTERED,
                                      SDL_WINDOWPOS_CENTERED, cw, ch,
-                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | maximized);
     if (w) SDL_SetWindowMinimumSize(w, 640, 360);   /* below that an overlay's text overlaps */
     return w;
 }
