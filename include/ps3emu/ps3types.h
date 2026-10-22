@@ -69,8 +69,12 @@ typedef u32  sys_memory_container_t;
 
 /* ---------------------------------------------------------------------------
  * C++ types (be_t, vm::ptr)
+ *
+ * Not in a freestanding game module (PS3_GAME_FREESTANDING,
+ * ps3emu/game_freestanding.h), which has no C++ library: its C++ sources
+ * (the SPU workload table) include this header only for the C types.
  * -----------------------------------------------------------------------*/
-#ifdef __cplusplus
+#if defined(__cplusplus) && !defined(PS3_GAME_FREESTANDING)
 
 #include "endian.h"
 #include <type_traits>
@@ -236,5 +240,5 @@ using bptr = ptr<be_t<T>>;
 
 } /* namespace vm */
 
-#endif /* __cplusplus */
+#endif /* __cplusplus && !PS3_GAME_FREESTANDING */
 #endif /* PS3EMU_PS3TYPES_H */

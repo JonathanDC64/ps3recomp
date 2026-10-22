@@ -18,6 +18,13 @@
  *
  * The host (runtime/ppu/game_host.c) loads the DLL, passes a ps3_host_api to
  * its one export and gets a ps3_game_api back. Both sides check abi and size.
+ *
+ * A freestanding module (PS3_GAME_FREESTANDING, ps3emu/game_freestanding.h)
+ * has no C runtime of its own. It reaches the host's for the few C library
+ * functions its sources call (PS3_GAME_HOST_CRT_FUNCS), through jump thunks
+ * like the runtime's; runtime/ppu/game_libc.c defines the rest (memcpy and
+ * friends, _fltused, the TLS directory). The host always passes the list; a
+ * module with a C runtime of its own ignores it.
  */
 #ifndef PS3EMU_GAME_MODULE_H
 #define PS3EMU_GAME_MODULE_H
@@ -28,7 +35,7 @@
 extern "C" {
 #endif
 
-#define PS3_GAME_ABI 1
+#define PS3_GAME_ABI 2
 
 /* The runtime functions the lifted code calls by name, in slot order. A new
  * one goes at the end, with PS3_GAME_ABI raised. */
@@ -48,6 +55,27 @@ extern "C" {
 #define PS3_GAME_HOST_FN_INDEX_(n) PS3_GH_##n,
 enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
 
+/* The C library functions a freestanding module calls by name, in slot order:
+ * X(the name in the module, the host's function). The host passes its own C
+ * runtime's, so a FILE* or a getenv result is the host's, and the math gives
+ * the same bits as in a single exe (sqrt and sqrtf are only called when the
+ * inline instruction's result is a NaN: the errno path). The UCRT's fprintf
+ * is inline in its header, so the host passes a function of its own
+ * (game_host.c). fputc, fputs and fwrite are what the compiler rewrites some
+ * fprintf calls into. A new one goes at the end, with PS3_GAME_ABI raised. */
+#define PS3_GAME_HOST_CRT_FUNCS(X)                                               \
+    X(fma, fma) X(sqrt, sqrt) X(sqrtf, sqrtf) X(ldexp, ldexp) X(exp2, exp2)      \
+    X(getenv, getenv) X(atoi, atoi) X(strtoul, strtoul)                          \
+    X(__acrt_iob_func, __acrt_iob_func) X(fprintf, ps3_gh_fprintf)               \
+    X(fputc, fputc) X(fputs, fputs) X(fwrite, fwrite) X(fflush, fflush)
+
+#define PS3_GAME_HOST_CRT_INDEX_(n, h) PS3_GC_##n,
+enum { PS3_GAME_HOST_CRT_FUNCS(PS3_GAME_HOST_CRT_INDEX_) PS3_GC_COUNT };
+
+/* A freestanding module's _tls_index before the loader writes it
+ * (runtime/ppu/game_libc.c). */
+#define PS3_GAME_TLS_INDEX_UNSET 0xFFFFFFFFu
+
 typedef struct ps3_host_api {
     uint32_t abi;                  /* PS3_GAME_ABI */
     uint32_t size;                 /* sizeof(ps3_host_api) */
@@ -57,6 +85,7 @@ typedef struct ps3_host_api {
     /* The title's own functions the lifted code calls (instruction hooks,
      * function overrides), by name; 0 when the host has no such function. */
     void*    (*title_fn)(const char* name);
+    void*    crt[PS3_GC_COUNT];    /* PS3_GAME_HOST_CRT_FUNCS, in order */
 } ps3_host_api;
 
 typedef struct ps3_game_api {
