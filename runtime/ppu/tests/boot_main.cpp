@@ -1214,6 +1214,40 @@ static void dbg_cpu(unsigned sec)
     }
 }
 
+/* profimg's raw mode: every sample's stack (function starts, leaf first),
+ * kept in a buffer allocated before sampling -- nothing that can take a lock
+ * runs while a thread is suspended -- and written out afterwards. */
+enum { PROF_RAW_DEPTH = 24 };
+struct ProfRaw { uint32_t tid, depth; uint64_t key[PROF_RAW_DEPTH]; };
+static ProfRaw* s_prof_raw;
+static unsigned s_prof_raw_n, s_prof_raw_cap;
+
+/* One sample of a suspended thread into the four tables. */
+static void prof_sample(HANDLE h, uintptr_t exe, int by_rip, DWORD tid = 0)
+{
+    CONTEXT c; c.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(h, &c)) return;
+    uint64_t seen[24]; int ns = 0, got = 0;
+    ProfRaw* raw = s_prof_raw && s_prof_raw_n < s_prof_raw_cap ? &s_prof_raw[s_prof_raw_n++] : NULL;
+    if (raw) { raw->tid = (uint32_t)tid; raw->depth = 0; }
+    for (int d = 0; d < 24 && c.Rip; d++) {
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+        uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
+        if (raw && d < PROF_RAW_DEPTH) raw->key[raw->depth++] = key;
+        if (d == 0) { prof_hit(0, key); if (by_rip) prof_hit(3, c.Rip); }
+        /* first exe frame of a sample whose leaf is in a DLL: who called out */
+        if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
+        int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
+        if (!dup) { seen[ns++] = key; prof_hit(1, key); }
+        if (!rf) break;                       /* leaf without unwind data: stop */
+        void* hd; DWORD64 ef;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
+    }
+}
+
+static void prof_print(unsigned samples, int by_rip);
+
 static void dbg_prof(DWORD tid, unsigned sec, int by_rip)
 {
     /* Suspending ourselves never resumes: the console would hang for good. */
@@ -1226,29 +1260,87 @@ static void dbg_prof(DWORD tid, unsigned sec, int by_rip)
     const ULONGLONG end = GetTickCount64() + sec * 1000ull;
     while (GetTickCount64() < end) {
         if (SuspendThread(h) == (DWORD)-1) break;
-        CONTEXT c; c.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(h, &c)) {
-            samples++;
-            uint64_t seen[24]; int ns = 0, got = 0;
-            for (int d = 0; d < 24 && c.Rip; d++) {
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
-                uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
-                if (d == 0) { prof_hit(0, key); if (by_rip) prof_hit(3, c.Rip); }
-                /* first exe frame of a sample whose leaf is in a DLL: who called out */
-                if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
-                int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
-                if (!dup) { seen[ns++] = key; prof_hit(1, key); }
-                if (!rf) break;                       /* leaf without unwind data: stop */
-                void* hd; DWORD64 ef;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
-            }
-        }
+        prof_sample(h, exe, by_rip);
+        samples++;
         ResumeThread(h);
         Sleep(1);
     }
     CloseHandle(h);
     dbg_printf("  prof tid %lu: %u samples over %us%c", (unsigned long)tid, samples, sec, 10);
+    prof_print(samples, by_rip);
+}
+
+/* "profimg <image> [sec]": as prof, but over every host thread while it runs
+ * one SPURS task image (spu_workload.c publishes each thread's), so the pool
+ * threads' other images stay out of it. Each round looks at every thread and
+ * samples the ones in the image, then sleeps 1 ms. */
+extern "C" volatile unsigned char g_spu_thread_image[1024];
+static void dbg_profimg(int image, unsigned sec, int by_rip, const char* raw_path)
+{
+    enum { MAXT = 256 };
+    static HANDLE hs[MAXT]; static DWORD ids[MAXT]; static unsigned per[MAXT];
+    int nt = 0;
+    const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof te;
+    if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || nt >= MAXT) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                  FALSE, te.th32ThreadID);
+            if (h) { hs[nt] = h; ids[nt] = te.th32ThreadID; per[nt] = 0; nt++; }
+        } while (Thread32Next(snap, &te));
+    }
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+    memset(s_prof_key, 0, sizeof s_prof_key); memset(s_prof_ct, 0, sizeof s_prof_ct);
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
+    unsigned samples = 0, rounds = 0;
+    if (raw_path) {
+        s_prof_raw_cap = 4000u * (sec ? sec : 1) * 8u;
+        s_prof_raw = (ProfRaw*)calloc(s_prof_raw_cap, sizeof(ProfRaw));
+        s_prof_raw_n = 0;
+    }
+    const ULONGLONG end = GetTickCount64() + sec * 1000ull;
+    while (GetTickCount64() < end) {
+        rounds++;
+        for (int i = 0; i < nt; i++) {
+            volatile unsigned char* slot = &g_spu_thread_image[(ids[i] >> 2) & 1023u];
+            if (*slot != image) continue;
+            if (SuspendThread(hs[i]) == (DWORD)-1) continue;
+            if (*slot == image) { prof_sample(hs[i], exe, by_rip, ids[i]); samples++; per[i]++; }
+            ResumeThread(hs[i]);
+        }
+        Sleep(1);
+    }
+    dbg_printf("  profimg %d: %u samples in %u rounds over %us (%.2f threads in the image on average)%c",
+               image, samples, rounds, sec, rounds ? (double)samples / rounds : 0.0, 10);
+    for (int i = 0; i < nt; i++) {
+        if (per[i]) dbg_printf("    tid %lu: %u%c", (unsigned long)ids[i], per[i], 10);
+        CloseHandle(hs[i]);
+    }
+    if (s_prof_raw) {
+        /* One line per sample: the thread, then each frame's function start
+         * (exe frames as rva, others as absolute addresses with an x). */
+        FILE* f = fopen(raw_path, "a");
+        for (unsigned k = 0; f && k < s_prof_raw_n; k++) {
+            fprintf(f, "%u", s_prof_raw[k].tid);
+            for (uint32_t d = 0; d < s_prof_raw[k].depth; d++) {
+                const uint64_t a = s_prof_raw[k].key[d];
+                if ((uintptr_t)(a - exe) < 0x40000000u) fprintf(f, " %llX", (unsigned long long)(a - exe));
+                else fprintf(f, " x%llX", (unsigned long long)a);
+            }
+            fputc(10, f);
+        }
+        if (f) fclose(f);
+        dbg_printf("  %u stacks -> %s%c", s_prof_raw_n, raw_path, 10);
+        free(s_prof_raw); s_prof_raw = NULL;
+    }
+    prof_print(samples, by_rip);
+}
+
+static void prof_print(unsigned samples, int by_rip)
+{
+    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
     for (int tab = 0; tab < (by_rip ? 4 : 3); tab++) {
         static const char* tn[4] = { "exclusive", "inclusive", "exe caller of DLL leaf",
                                      "exclusive by address" };
@@ -1447,6 +1539,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  gstacks [n]      guest shadow stack of every thread, n frames%c", 10);
             dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  profrip <tid> [s] the same, plus the hottest instruction addresses%c", 10);
+            dbg_printf("  profimg <image> [s] [rip] [raw] every host thread while it runs that SPURS task image (raw: stacks to <console>.stacks)%c", 10);
             dbg_printf("  affin <tid> <hexmask> pin a host thread to those logical CPUs (0 = the process mask)%c", 10);
             dbg_printf("  cpu [s]          CPU per host thread over s seconds: app/os(spin, yield)/dll split%c", 10);
             dbg_printf("  waits [s] [rows] time per guest thread inside each syscall/HLE call (+r3) over s seconds%c", 10);
@@ -1598,6 +1691,10 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if ((!strcmp(verb, "prof") || !strcmp(verb, "profrip")) &&
                    sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5, !strcmp(verb, "profrip"));
+        } else if (!strcmp(verb, "profimg") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
+            char rawp[MAX_PATH + 8];
+            snprintf(rawp, sizeof rawp, "%s.stacks", path);
+            dbg_profimg((int)a, b ? b : 5, strstr(cmd, "rip") != NULL, strstr(cmd, "raw") ? rawp : NULL);
         } else if (!strcmp(verb, "affin") && sscanf(cmd, "%*s %u %x", &a, &b) == 2) {
             /* affin <host tid> <mask>: where a thread runs, for placement
              * experiments (a producer and its consumer on one core's two SMT

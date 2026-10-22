@@ -501,6 +501,17 @@ static SPU_WL_TLS uint32_t t_dispatch_ts, t_dispatch_id;
 static SPU_WL_TLS int t_dispatch_valid;
 /* The image this task thread runs, for spu_hist entries made below it. */
 static SPU_WL_TLS int t_hist_image;
+
+/* The SPURS task image each host thread is running (0: none), by thread id,
+ * for the debug console's `profimg`, which samples only the threads running
+ * one image: the pool threads run many images, so a profile of one thread is
+ * not a profile of one image. Written at a task's start and end; a slot two
+ * threads share by chance is at worst a sample in the wrong image. */
+volatile unsigned char g_spu_thread_image[1024];
+static void spu_thread_image_set(int image)
+{
+    g_spu_thread_image[((unsigned)GetCurrentThreadId() >> 2) & 1023u] = (unsigned char)image;
+}
 void spu_workload_set_dispatch_task(uint32_t taskset_ea, uint32_t taskid)
 {
     t_dispatch_ts = taskset_ea; t_dispatch_id = taskid; t_dispatch_valid = 1;
@@ -724,6 +735,7 @@ static void spu_async_run(spu_async_job* j)
     }
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     spu_hist('S', j->image_id, j->taskset_ea, j->taskid, j->args_ea);
+    spu_thread_image_set(j->image_id);
     TS_TRACE(j->taskset_ea, "task %u running image=%d\n", j->taskid, j->image_id);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -1193,6 +1205,7 @@ static void spu_async_run(spu_async_job* j)
     }
     spu_taskset_job_end(j->taskset_ea, j->taskid);
     spu_hist('X', j->image_id, j->taskset_ea, j->taskid, 0);
+    spu_thread_image_set(0);
     free(j);
 }
 
