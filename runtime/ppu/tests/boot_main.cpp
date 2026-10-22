@@ -79,6 +79,22 @@ void     ps3_title_options_init(void) {}
  * overlay can show progress meanwhile. Weak default is a no-op. */
 void     ps3_title_prework(void) __attribute__((weak));
 void     ps3_title_prework(void) {}
+/* Optional hook: the title decides how this start goes, before main reads its
+ * arguments. It may change argc/argv (supply the ELF, say) and the environment
+ * (ps3_setenv). Returns PS3_LAUNCH_BOOT to boot the game, PS3_LAUNCH_WINDOW for
+ * the window alone (below), or a status of 0 or more to exit with at once.
+ * Weak default: boot. */
+enum { PS3_LAUNCH_BOOT = -1, PS3_LAUNCH_WINDOW = -2 };
+int      ps3_title_launch(int* argc, char*** argv) __attribute__((weak));
+int      ps3_title_launch(int*, char***) { return PS3_LAUNCH_BOOT; }
+/* Optional hook: with the window alone, the title's own init, in place of
+ * ps3_title_options_init, before the present thread opens the window. That
+ * thread then draws the title's overlay with no guest frame (as it does before
+ * the first flip) until the window closes: no game module, ELF, HLE or guest
+ * thread, so no game code, SPU or audio runs. A title's own screens before the
+ * game (setup, say) live there. Weak default is a no-op. */
+void     ps3_title_window_only_init(void) __attribute__((weak));
+void     ps3_title_window_only_init(void) {}
 }
 
 #include <string.h>
@@ -388,6 +404,7 @@ extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
 extern "C" uint32_t cellGcmResolveIO(uint32_t offset);
 
 static int s_rsx_live = 0;   /* live engine selected AND up */
+static int s_window_only = 0;   /* PS3_LAUNCH_WINDOW: the present thread alone, no guest */
 
 /* Resolve (location, offset) to host memory for the engine. location 0 is RSX
  * local VRAM, 1 is main/IO memory; the engine promises its callers the whole
@@ -662,6 +679,20 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     long long tick_qpc = qpf.QuadPart * 1000 / vblank_rate_mhz();
     long long next_tick = qpc.QuadPart;
     for (;;) {
+        /* The window alone: every pass presents (no flip ever comes), paced by
+         * Present under vsync. Without vsync (or with presents off) a pass is
+         * only the 1 ms wait below, so a pass that took under 2 ms sleeps 4 more:
+         * the overlay at most ~200 frames a second, not a core spent drawing it. */
+        if (s_window_only) {
+            static LARGE_INTEGER s_pass;
+            LARGE_INTEGER t;
+            QueryPerformanceCounter(&t);
+            if (s_pass.QuadPart && (t.QuadPart - s_pass.QuadPart) * 1000 < qpf.QuadPart * 2) {
+                Sleep(4);
+                QueryPerformanceCounter(&t);
+            }
+            s_pass = t;
+        }
         tick_qpc = qpf.QuadPart * 1000 / vblank_rate_mhz();   /* ps3_vblank_set_mhz */
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
@@ -2208,8 +2239,31 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 }
 #endif
 
+/* PS3_PIDFILE=<path>: append this process id, so a test script can stop
+ * the instances it started without touching any other copy running.
+ * EXIT_AFTER_MS=<n>: a hard stop for test runs, from inside the process,
+ * so a probe does not need an external timeout to end. */
+static void start_test_stops(void)
+{
+    if (const char* pf = getenv("PS3_PIDFILE")) {
+        if (FILE* f = fopen(pf, "a")) { fprintf(f, "%lu\n", (unsigned long)GetCurrentProcessId()); fclose(f); }
+    }
+    if (const char* e = getenv("EXIT_AFTER_MS")) {
+        static DWORD s_after; s_after = (DWORD)atoi(e);
+        CloseHandle(CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+            Sleep(s_after);
+            ps3_exit_now("EXIT_AFTER_MS");
+            Sleep(INFINITE);
+            return 0; }, NULL, 0, NULL));
+    }
+}
+
 int main(int argc, char** argv)
 {
+    /* The title first: it may supply the ELF, want the window alone, or end here. */
+    const int launch = ps3_title_launch(&argc, &argv);
+    if (launch >= 0) return launch;
+    s_window_only = launch == PS3_LAUNCH_WINDOW;
     /* <PPU ELF> [--username NAME] [--psnr host[:port]], flags in any order. */
     const char* elf = NULL;
     const char* username = NULL;
@@ -2223,11 +2277,11 @@ int main(int argc, char** argv)
         if (eq) *flag = eq + 1;
         else if (i + 1 < argc) *flag = argv[++i];
     }
-    if (!elf) {
+    if (!elf && !s_window_only) {
         printf("usage: %s <PPU ELF> [--username NAME] [--psnr host[:port]]\n", argv[0]);
         return 2;
     }
-    np_psnr_setup(username, psnr);
+    if (!s_window_only) np_psnr_setup(username, psnr);
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -2305,6 +2359,15 @@ int main(int argc, char** argv)
     ppu_vm_size = 0;   /* full 32-bit space backed, as on Windows */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+    if (s_window_only) {
+        /* The window alone (ps3_title_launch): the title's init, then only the
+         * present thread, which ends the process when the window closes. The
+         * guest space stays reserved, as that thread finds it before a boot. */
+        ps3_title_window_only_init();
+        CreateThread(NULL, 4u * 1024 * 1024, vblank_ticker, NULL, 0, NULL);
+        start_test_stops();
+        for (;;) Sleep(INFINITE);
+    }
 #ifdef PS3_GAME_SPLIT
     /* The lifted code is a DLL (ps3emu/game_module.h): load it before anything
      * reads the function table, once vm_base is set. */
@@ -2418,21 +2481,7 @@ int main(int argc, char** argv)
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
     if (g_ds_register_shadow_hook) g_ds_register_shadow_hook(1);
-    /* PS3_PIDFILE=<path>: append this process id, so a test script can stop
-     * the instances it started without touching any other copy running. */
-    if (const char* pf = getenv("PS3_PIDFILE")) {
-        if (FILE* f = fopen(pf, "a")) { fprintf(f, "%lu\n", (unsigned long)GetCurrentProcessId()); fclose(f); }
-    }
-    /* EXIT_AFTER_MS=<n>: a hard stop for test runs, from inside the process,
-     * so a probe does not need an external timeout to end. */
-    if (const char* e = getenv("EXIT_AFTER_MS")) {
-        static DWORD s_after; s_after = (DWORD)atoi(e);
-        CloseHandle(CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-            Sleep(s_after);
-            ps3_exit_now("EXIT_AFTER_MS");
-            Sleep(INFINITE);
-            return 0; }, NULL, 0, NULL));
-    }
+    start_test_stops();
     int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     /* A guest that called sys_process_exit never reaches this line: that path
