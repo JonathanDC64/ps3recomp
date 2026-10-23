@@ -147,6 +147,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
 
+      # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
+      # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
+      # source, on an SDAT the test makes with edat.c's own AES.
+      - name: Run the EDAT path test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_paths libs/filesystem/tests/test_edat_paths.c
+          /tmp/test_edat_paths
+
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler

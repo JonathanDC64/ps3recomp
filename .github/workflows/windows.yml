@@ -155,6 +155,16 @@ jobs:
           .\test_np_nat.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
+      # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
+      # source, on an SDAT the test makes with edat.c's own AES.
+      - name: Run the EDAT path test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/filesystem /Fe:test_edat_paths.exe libs/filesystem/tests/test_edat_paths.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_edat_paths.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       # sync_stress has always been the Windows-native suite; now that its
