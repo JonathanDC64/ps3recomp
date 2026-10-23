@@ -550,18 +550,22 @@ int spu_hook_ring_post(spu_context* ctx)
     return ring_post_run(ctx, NULL) == POST_OK;
 }
 
-/* ---- SPU_NATIVE_LOOP: commands 7 and 8 without leaving the fetch ---------
+/* ---- SPU_NATIVE_LOOP: the common commands without leaving the fetch ------
  *
- * The two commands are four in five the ring carries in the Palace (8 alone
+ * Commands 7 and 8 are four in five the ring carries in the Palace (8 alone
  * is two in three): 7 stores a word into the state block and ORs a byte pick
  * from the table at 0x12D60 into the dirty quadword, 8 stores a word and sets
- * a dirty quadword to {1, 1, 1, 1}. Neither moves data by DMA or calls out.
+ * a dirty quadword to {1, 1, 1, 1}. 12 stores a 16-byte record into the
+ * state block. 10, 11, 13, 17 and 18 GET 16 to 128 bytes from an EA in the
+ * command into the state block, through the GET-and-wait helper at 0xC4D8,
+ * and 10 then sets a dirty quadword as 8 does. Together they are nineteen in
+ * twenty commands there.
  * For each, the lifted loop still calls 0xC358 to PUT the state (a call
  * bracket around spu_hook_put_wait), decodes the command, branches through
- * the table, runs the handler's thirty-odd instructions against registers in
- * memory, calls 0x3C90 (spu_hook_ring_post) and branches back to 0x4618, the
- * fetch. With the loop on, the fetch block does those steps itself and goes
- * on to the next command:
+ * the table, runs the handler against registers in memory, calls 0x3C90
+ * (spu_hook_ring_post) and branches back to 0x4618, the fetch. With the loop
+ * on, the fetch block does those steps itself and goes on to the next
+ * command:
  *     0x4730  the call bracket and spu_hook_put_wait, as the lifted call runs
  *             them (r0 = the link, the hook's stack stores and channel
  *             accesses, pc, drain_ret_pc and the image id after the return);
@@ -569,19 +573,26 @@ int spu_hook_ring_post(spu_context* ctx)
  *             volatile and dead at the handler's end -- see below);
  *     handler the lifted instructions in their order, with the volatile
  *             registers kept in locals: the same local-store reads and
- *             writes, r80 (command 7) and r81 = r83 & 255, r5 = the command;
+ *             writes, r80 (commands 7 and 12) and r81 = r83 & 255, r5 = the
+ *             command. A GET is the call bracket and 0xC4D8's main case as
+ *             the lifted code runs them: the link at sp + 0x10 and the back
+ *             chain at sp - 0x20, the latches, the GET on tag 0 and its wait,
+ *             r0 read back from sp + 0x10;
  *     0x4808  spu_hook_ring_post;
  *     0x4818  r81 == 0, back to 0x4618: the fetch block again.
- * plus ctx->steps for the three region branches the lifted path takes.
+ * plus ctx->steps for the region branches the lifted path takes (three, six
+ * or seven).
  *
  * Every condition that would take the lifted path off this course is checked
  * before the command's first side effect, and any of them leaves the command
  * to the lifted code from 0x4730, with the fetch's registers written as
- * always: a command other than 7 and 8; r83 & 255 != 0 (the loop would end);
- * a put_wait or post case the hooks leave to the lifted code (state EA not
- * 16-byte aligned; the frame; the local buffer at its limit, a segment
- * switch); a handler store into the ring's own quadwords 0x13300-0x135FF or
- * the frame (sp - 0x100 to sp + 0x20), which those steps read; and whatever a
+ * always: another command; r83 & 255 != 0 (the loop would end); a put_wait
+ * or post case the hooks leave to the lifted code (state EA not 16-byte
+ * aligned; the frame; the local buffer at its limit, a segment switch); a GET
+ * 0xC4D8 would halt on (LSA or EA not 16-byte aligned) or that runs off the
+ * end of local store; a handler store or GET into the ring's own quadwords
+ * 0x13300-0x135FF or the frame (sp - 0x100 to sp + 0x20), which those steps
+ * read; and whatever a
  * region branch would hand to the trampoline -- the slow-goto knobs, the
  * lockstep scheduler, a PM flow trace, a pending interrupt -- or an LS or
  * channel diagnostic, a knob change, the post check or the histogram.
@@ -591,14 +602,16 @@ int spu_hook_ring_post(spu_context* ctx)
  * one it reads before reading it (the same rule spu_hook_put_wait already
  * relies on). So the handlers' scratch values stay in host locals, and what
  * reaches ctx is what can be read later: r0 and r2-r8, r29, r30 from the
- * hooks, r5 and r81 from the handler, r80 from command 7.
+ * hooks, r5 and r81 from the handler, r80 from commands 7 and 12.
  *
  * SPU_NATIVE_LOOP (live): 1 (default) on; 0 off, for A/B; 2 checks: every
  * SPU_NATIVE_LOOP_EVERY-th command it would run (default 256) runs lifted
  * instead, against a prediction made on a copy of local store, and the next
  * fetch compares all of local store outside the frame and the segment
  * quadword, and r80 and r81 ([ring-loop] lines; a mismatch turns the loop off
- * on that thread for the session). */
+ * on that thread for the session). A GET's prediction copies the guest bytes
+ * when the command is sampled, so a source the PPU rewrites in the moment
+ * between would read as a mismatch. */
 int spu_hook_put_wait(spu_context* ctx);
 
 #define RING_DIRTY_PTR_LS 0x133A0u   /* word 0: the dirty block */
@@ -615,6 +628,14 @@ static int native_loop_every(void)
     static int n = -1;
     PS3_KNOB(n, ps3_env_int("SPU_NATIVE_LOOP_EVERY", 256));
     return n > 0 ? n : 1;
+}
+/* SPU_NATIVE_LOOP_V2 (live): 1 (default) the loop runs commands 10-13, 17
+ * and 18 too; 0 only 7 and 8, as before, so one exe A/Bs the two. */
+static int native_loop_v2(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_NATIVE_LOOP_V2", 1));
+    return on;
 }
 
 /* spu_ls_read128 / write128 on any copy of local store (no probes: the loop
@@ -636,25 +657,90 @@ RING_INLINE void lsq_put(uint8_t* ls, uint32_t lsa, u128 v)
     }
 }
 
-/* The two quadwords a handler stores to, worked out from local store as it
- * is before the command (the handlers read only 0x13560, 0x13390 and 0x133A0
- * besides their targets and the table, and the targets are checked to miss
- * those three). */
-RING_INLINE void loop_targets(const uint8_t* ls, unsigned cmd, uint32_t* a1, uint32_t* a2)
+/* One command, worked out from local store as it is before the command: the
+ * handlers read only 0x13560, 0x13390 and 0x133A0 besides their own targets
+ * and the table, and the targets are checked to miss those. */
+typedef struct loop_plan {
+    unsigned cmd;
+    unsigned steps;              /* region branches of the lifted path */
+    uint32_t tgt[4];             /* the quadwords the handler stores to */
+    int ntgt;
+    int get;                     /* a GET through 0xC4D8 */
+    uint32_t get_lsa, get_eah, get_eal, get_size, get_link;
+} loop_plan;
+
+/* The arguments 10, 11, 13, 17 and 18 pass 0xC4D8: r3 = the LSA, r4 = the EA
+ * (words 0-1), r5 = the size; lifted, 0x4AA0 and 0x4AF0. */
+RING_INLINE void loop_get_args(const uint8_t* ls, unsigned cmd, loop_plan* p)
+{
+    const u128 c = lsq(ls, RING_CMD_LS);
+    const u128 st = lsq(ls, RING_STATE_PTR_LS);
+    u128 r3, r4, r5;
+    if (cmd == 10u) {
+        r5 = spu_il(32);
+        const u128 r2 = spu_rotqbyi(c, 4);
+        const u128 r78 = spu_rotqbyi(c, 8);
+        const u128 r77 = spu_shli(r2, 5);
+        r4 = spu_rotqmbyi(r78, -4);
+        const u128 r75 = spu_ai(r77, 240);
+        r3 = spu_a(r75, st);
+        p->get_link = 0x4AD0;
+    } else {
+        const int off = cmd == 11u ? 10192 : cmd == 13u ? 1136 : cmd == 17u ? 1152 : 1184;
+        r5 = spu_il(cmd == 11u ? 128 : cmd == 13u ? 16 : cmd == 17u ? 32 : 48);
+        r3 = spu_a(st, spu_il(off));
+        r4 = spu_rotqmbyi(spu_rotqbyi(c, 4), -4);
+        p->get_link = 0x4AFC;
+    }
+    p->get_lsa = r3._u32[0];
+    p->get_eah = r4._u32[0];
+    p->get_eal = spu_shlqbyi(r4, 4)._u32[0];
+    p->get_size = r5._u32[0];
+}
+
+RING_INLINE uint32_t loop_dirty_target(const uint8_t* ls)   /* 0x4A08's store */
+{
+    const uint32_t w1 = lsq(ls, RING_CMD_LS)._u32[1];
+    return (w1 & 16u) + lsq(ls, RING_DIRTY_PTR_LS)._u32[0] + 16u;
+}
+
+/* 0, or the plan for the command at 0x13560. */
+RING_INLINE int loop_plan_cmd(const uint8_t* ls, unsigned cmd, loop_plan* p)
 {
     const u128 c = lsq(ls, RING_CMD_LS);
     const uint32_t w1 = c._u32[1], w2 = c._u32[2];
     const uint32_t state = lsq(ls, RING_STATE_PTR_LS)._u32[0];
-    const uint32_t dirty = lsq(ls, RING_DIRTY_PTR_LS)._u32[0];
-    if (cmd == 7u) {
-        *a1 = 4u * w1 + state + 10320u;
-        *a2 = dirty;
-    } else {
-        *a1 = 4u * (24u * w1 + w2) + state + 10672u;
-        *a2 = (w1 & 16u) + dirty + 16u;
+    p->cmd = cmd;
+    p->get = 0;
+    switch (cmd) {
+    case 7:
+        p->tgt[0] = 4u * w1 + state + 10320u;
+        p->tgt[1] = lsq(ls, RING_DIRTY_PTR_LS)._u32[0];
+        p->ntgt = 2; p->steps = 3;
+        break;
+    case 8:
+        p->tgt[0] = 4u * (24u * w1 + w2) + state + 10672u;
+        p->tgt[1] = loop_dirty_target(ls);
+        p->ntgt = 2; p->steps = 3;
+        break;
+    case 12: {
+        const uint32_t r16 = 16u * ((w1 >> 24) & 255u) + state;
+        p->tgt[0] = r16 + 890u; p->tgt[1] = r16 + 888u; p->tgt[2] = r16 + 0x370u; p->tgt[3] = r16 + 884u;
+        p->ntgt = 4; p->steps = 3;
+        break;
     }
-    *a1 &= SPU_LS_MASK & ~0xFu;
-    *a2 &= SPU_LS_MASK & ~0xFu;
+    case 10: case 11: case 13: case 17: case 18:
+        loop_get_args(ls, cmd, p);
+        p->get = 1;
+        p->ntgt = 0;
+        if (cmd == 10u) p->tgt[p->ntgt++] = loop_dirty_target(ls);
+        p->steps = cmd == 11u ? 6 : 7;
+        break;
+    default:
+        return 0;
+    }
+    for (int i = 0; i < p->ntgt; i++) p->tgt[i] &= SPU_LS_MASK & ~0xFu;
+    return 1;
 }
 
 /* 0x4958: command 7, the lifted instructions in order. Returns r80. */
@@ -684,6 +770,58 @@ RING_INLINE u128 loop_cmd7(uint8_t* ls)
     return r80;
 }
 
+/* 0x4A08: the dirty quadword = {1, 1, 1, 1} (the end of 8 and 10). */
+RING_INLINE void loop_4a08(uint8_t* ls)
+{
+    const u128 r10 = spu_il(1);
+    const u128 r11 = lsq(ls, RING_CMD_LS);
+    const u128 r8 = lsq(ls, RING_DIRTY_PTR_LS);
+    const u128 r9 = spu_rotqbyi(r11, 4);
+    const u128 r14 = spu_ai(r8, 16);
+    const u128 r6 = spu_andi(r9, 16);
+    const u128 r13 = spu_a(r6, r14);
+    lsq_put(ls, r13._u32[0], r10);
+}
+
+/* 0x4B08: command 12. Returns r80. */
+RING_INLINE u128 loop_cmd12(uint8_t* ls)
+{
+    const u128 r80 = spu_il(890);
+    const u128 r41 = lsq(ls, RING_CMD_LS);
+    const u128 r26 = spu_il(888);
+    const u128 r36 = lsq(ls, RING_STATE_PTR_LS);
+    const u128 r15 = spu_il(884);
+    const u128 r40 = spu_rotqbyi(r41, 1);
+    const u128 r37 = spu_rotqbyi(r41, 2);
+    const u128 r38 = spu_andi(r40, 255);
+    const u128 r33 = spu_andi(r37, 255);
+    const u128 r35 = spu_shli(r38, 4);
+    const u128 r16 = spu_a(r35, r36);
+    const u128 r32 = lsq(ls, r16._u32[0] + r80._u32[0]);
+    const u128 r34 = spu_chd(r16, 10);
+    const u128 r29 = spu_chd(r16, 8);
+    const u128 r24 = spu_cwd(r16, 0);
+    const u128 r20 = spu_cwd(r16, 4);
+    const u128 r31 = spu_shufb(r33, r32, r34);
+    lsq_put(ls, r16._u32[0] + r80._u32[0], r31);
+    const u128 r30 = lsq(ls, RING_CMD_LS);
+    const u128 r27 = lsq(ls, r16._u32[0] + r26._u32[0]);
+    const u128 r28 = spu_rotqbyi(r30, 4);
+    const u128 r7 = spu_shufb(r28, r27, r29);
+    lsq_put(ls, r16._u32[0] + r26._u32[0], r7);
+    const u128 r25 = lsq(ls, RING_CMD_LS);
+    const u128 r4 = lsq(ls, r16._u32[0] + 0x370);
+    const u128 r23 = spu_rotqbyi(r25, 8);
+    const u128 r22 = spu_shufb(r23, r4, r24);
+    lsq_put(ls, r16._u32[0] + 0x370, r22);
+    const u128 r21 = lsq(ls, RING_CMD_LS);
+    const u128 r18 = lsq(ls, r16._u32[0] + r15._u32[0]);
+    const u128 r19 = spu_rotqbyi(r21, 12);
+    const u128 r17 = spu_shufb(r19, r18, r20);
+    lsq_put(ls, r16._u32[0] + r15._u32[0], r17);
+    return r80;
+}
+
 /* 0x49C0, then 0x4A08: command 8. */
 RING_INLINE void loop_cmd8(uint8_t* ls)
 {
@@ -703,14 +841,7 @@ RING_INLINE void loop_cmd8(uint8_t* ls)
     const u128 r56 = spu_cwx(r52, r51);
     const u128 r53 = spu_shufb(r55, r54, r56);
     lsq_put(ls, r52._u32[0] + r51._u32[0], r53);
-    const u128 r10 = spu_il(1);
-    const u128 r11 = lsq(ls, RING_CMD_LS);
-    const u128 r8 = lsq(ls, RING_DIRTY_PTR_LS);
-    const u128 r9 = spu_rotqbyi(r11, 4);
-    const u128 r14 = spu_ai(r8, 16);
-    const u128 r6 = spu_andi(r9, 16);
-    const u128 r13 = spu_a(r6, r14);
-    lsq_put(ls, r13._u32[0], r10);
+    loop_4a08(ls);
 }
 
 /* A store target that misses the ring's quadwords and the frame. */
@@ -743,12 +874,12 @@ RING_INLINE int loop_yield(const spu_context* ctx, unsigned gen)
 }
 
 /* The command at 0x13560 (fetched, the lifted code about to go on at 0x4730)
- * can run here: 7 or 8, and every check above. */
-RING_INLINE int loop_case_ok(const spu_context* ctx, unsigned* cmd_out)
+ * can run here: one of the commands above, and every check. */
+RING_INLINE int loop_case_ok(const spu_context* ctx, loop_plan* p)
 {
     const uint8_t* ls = ctx->ls;
-    const unsigned cmd = ls[RING_CMD_LS + 3];
-    if (cmd != 7u && cmd != 8u) return 0;
+    if (!loop_plan_cmd(ls, ls[RING_CMD_LS + 3], p)) return 0;
+    if (p->cmd != 7u && p->cmd != 8u && !native_loop_v2()) return 0;
     const u128* r = ctx->gpr;
     if ((r[83]._u32[0] & 255u) != 0) return 0;
     /* put_wait's case: r3 = the state's EA, r4 = 0x13400, r5 = 16. */
@@ -759,21 +890,69 @@ RING_INLINE int loop_case_ok(const spu_context* ctx, unsigned* cmd_out)
     if (sp - 0x100u < RING_DESC_LS + 16u && sp + 0x20u > RING_SEG_LS) return 0;
     const u128 d = lsq(ls, RING_DESC_LS);
     if (!(d._u32[1] > d._u32[2])) return 0;
-    uint32_t a1, a2;
-    loop_targets(ls, cmd, &a1, &a2);
-    if (!loop_target_ok(a1, sp) || !loop_target_ok(a2, sp)) return 0;
-    *cmd_out = cmd;
+    for (int i = 0; i < p->ntgt; i++)
+        if (!loop_target_ok(p->tgt[i], sp)) return 0;
+    if (p->get) {
+        /* 0xC4D8's main case (it halts on a misaligned one), inside local
+         * store, every quadword it fills clear of the ring and the frame. */
+        const uint32_t lsa = p->get_lsa & SPU_LS_MASK, size = p->get_size;
+        if ((p->get_lsa & 15u) || (p->get_eal & 15u) || lsa + size > SPU_LS_SIZE) return 0;
+        for (uint32_t a = lsa; a < lsa + size; a += 16)
+            if (!loop_target_ok(a, sp)) return 0;
+    }
     return 1;
 }
 
-RING_NOINLINE void loop_check_start(spu_context* ctx, unsigned cmd)
+/* The command's local-store effects on any copy (ctx->ls when run, the check
+ * mode's prediction otherwise) except a GET, which the caller does. Returns
+ * r80 as the command leaves it. */
+RING_INLINE u128 loop_cmd_ls(uint8_t* ls, unsigned cmd, u128 r80)
+{
+    switch (cmd) {
+    case 7: return loop_cmd7(ls);
+    case 8: loop_cmd8(ls); break;
+    case 12: return loop_cmd12(ls);
+    case 10: loop_4a08(ls); break;       /* after its GET */
+    default: break;
+    }
+    return r80;
+}
+
+/* A brsl to 0xC4D8 and its main case, as the lifted code runs them (r0 = the
+ * link is set by the caller, as the brsl sets it). */
+RING_INLINE void loop_get_wait(spu_context* ctx, const loop_plan* p)
+{
+    u128* r = ctx->gpr;
+    const int32_t si = (int32_t)ctx->image_id;
+    ctx->host_depth++;
+    const uint32_t sp = r[1]._u32[0];
+    spu_ls_write128(ctx, sp + 0x10, r[0]);
+    spu_ls_write128(ctx, sp - 0x20, r[1]);
+    ctx->mfc_lsa = p->get_lsa;
+    ctx->mfc_eah = p->get_eah;
+    ctx->mfc_eal = p->get_eal;
+    ctx->mfc_size = p->get_size;
+    ctx->mfc_tag = 0;
+    spu_wrch_word(ctx, MFC_Cmd, 64);             /* GET */
+    ctx->mfc_tag_mask = 1;
+    spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
+    r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
+    r[0] = spu_ls_read128(ctx, sp + 0x10);
+    ctx->pc = r[0]._u32[0];                      /* SPU_RET */
+    ctx->drain_ret_pc = 0;                       /* spu_call_done */
+    ctx->host_depth--;
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : si;
+}
+
+RING_NOINLINE void loop_check_start(spu_context* ctx, const loop_plan* p)
 {
     loop_check* k = &t_loop;
+    if (p->get && (p->get_eah || p->get_eal < 0x10000u)) return;   /* not the GET fast path */
     if (!k->ls && !(k->ls = (uint8_t*)malloc(SPU_LS_SIZE))) return;
     memcpy(k->ls, ctx->ls, SPU_LS_SIZE);
-    if (cmd == 7u) k->r80 = loop_cmd7(k->ls);
-    else { loop_cmd8(k->ls); k->r80 = ctx->gpr[80]; }
-    k->cmd = cmd;
+    if (p->get) memcpy(k->ls + (p->get_lsa & SPU_LS_MASK), vm_base + p->get_eal, p->get_size);
+    k->r80 = loop_cmd_ls(k->ls, p->cmd, ctx->gpr[80]);
+    k->cmd = p->cmd;
     k->sp = ctx->gpr[1]._u32[0];
     k->pending = 1;
 }
@@ -822,11 +1001,11 @@ RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
 {
     const unsigned gen = ps3_env_gen;
     for (;;) {
-        unsigned cmd;
-        if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &cmd))
+        loop_plan p;
+        if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &p))
             return 1;
         if (mode == 2) {
-            if (++t_loop_count % (unsigned)native_loop_every() == 0) loop_check_start(ctx, cmd);
+            if (++t_loop_count % (unsigned)native_loop_every() == 0) loop_check_start(ctx, &p);
             return 1;
         }
         u128* r = ctx->gpr;
@@ -840,14 +1019,17 @@ RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
         ctx->host_depth--;
         ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : si;
         /* 0x4734-0x4758 and the handler. */
-        if (cmd == 7u) r[80] = loop_cmd7(ctx->ls);
-        else loop_cmd8(ctx->ls);
         r[81] = spu_andi(r[83], 255);
+        if (p.get) {
+            r[0] = spu_link(p.get_link);
+            loop_get_wait(ctx, &p);
+        }
+        r[80] = loop_cmd_ls(ctx->ls, p.cmd, r[80]);
         r[5] = spu_ls_read128(ctx, RING_CMD_LS);
-        ctx->steps += 2;
+        ctx->steps += p.steps - 1;
         /* 0x4808 */
         if (ring_post_run(ctx, NULL) != POST_OK) {   /* cannot happen: loop_case_ok checked its cases */
-            fprintf(stderr, "[ring-loop] spu=%u post refused after cmd %u\n", ctx->spu_id, cmd);
+            fprintf(stderr, "[ring-loop] spu=%u post refused after cmd %u\n", ctx->spu_id, p.cmd);
             fflush(stderr);
             abort();
         }
