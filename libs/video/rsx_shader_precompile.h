@@ -24,7 +24,11 @@
  *   - once more per alternative unit it samples, on top of the conventions
  *     (alts: "1=d2c", a unit only some programs bind a depth surface to);
  *   - with every variant earlier runs recorded for it (fp_variants.txt in the
- *     cache), which covers whatever the rules above do not.
+ *     cache), which covers whatever the rules above do not;
+ *   - for a program queued with RSX_PRECOMPILE_2D, each of the above once more
+ *     with the sprite-edge clamp that draws without a depth test use on a
+ *     scaled target (RSX_SCALE above 100: HUD, menus, post passes). The clamp
+ *     takes the scale from the draw's constants, so these serve every scale.
  *
  * Decompiling is not thread-safe with draws: run it before the title draws.
  * Windows only (the D3D12 backend's cache); elsewhere every call is a no-op.
@@ -47,6 +51,13 @@ int rsx_shader_precompile_kinds(const char* units, const char* alts);
  * profile sce_vp_rsx 0x1B5B or sce_fp_rsx 0x1B5C at offset 0); the bytes are
  * copied. Anything else is counted as skipped. Before _start only. */
 void rsx_shader_precompile_add(const char* name, const uint8_t* cg, size_t n);
+
+/* The same, with what the title knows of the program's draws:
+ * RSX_PRECOMPILE_2D, it draws this fragment program without a depth test
+ * (its HUD, menus, post passes), so its sprite-edge-clamp forms are built
+ * too. Ignored for a vertex program. */
+#define RSX_PRECOMPILE_2D 1u
+void rsx_shader_precompile_add_flags(const char* name, const uint8_t* cg, size_t n, unsigned flags);
 
 /* Decompile the queued programs on one thread and compile their shaders on
  * `threads` more (<= 0: one per logical processor, at most 64). Returns 0 if
