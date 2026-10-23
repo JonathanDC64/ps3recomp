@@ -13715,6 +13715,24 @@ int rsx_d3d12_display_refresh_mhz(void)
     return p ? (int)((f.QuadPart * 1000 + p / 2) / p) : 0;
 }
 
+int rsx_d3d12_display_mode_mhz(void)
+{
+    LARGE_INTEGER f, q;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    return display_hz_cached(q.QuadPart, f.QuadPart) * 1000;
+}
+
+int rsx_d3d12_display_shown_mhz(void)
+{
+    LARGE_INTEGER f, q;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    const long long sp = s_disp_period, sat = s_disp_at;
+    if (!sp || q.QuadPart - sat >= 2 * f.QuadPart) return 0;
+    return (int)((f.QuadPart * 1000 + sp / 2) / sp);
+}
+
 /* Is a frame presented and not yet shown? 1 / 0, or -1 when the swap
  * chain's statistics cannot say. */
 static int present_queued(void)
@@ -14063,5 +14081,7 @@ void     rsx_d3d12_set_borderless(int on) { (void)on; }
 int      rsx_d3d12_borderless(void) { return 0; }
 long long rsx_d3d12_display_timing(long long* vblank) { *vblank = 0; return 0; }
 int      rsx_d3d12_display_refresh_mhz(void) { return 0; }
+int      rsx_d3d12_display_mode_mhz(void) { return 0; }
+int      rsx_d3d12_display_shown_mhz(void) { return 0; }
 
 #endif /* _WIN32 || PS3RECOMP_RSX_D3D12_VKD3D */

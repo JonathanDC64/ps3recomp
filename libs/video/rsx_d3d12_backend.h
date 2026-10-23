@@ -138,6 +138,16 @@ int      rsx_d3d12_borderless(void);
  * the same refresh in millihertz. */
 long long rsx_d3d12_display_timing(long long* vblank);
 int      rsx_d3d12_display_refresh_mhz(void);
+/* rsx_d3d12_display_mode_mhz: the window's display mode alone, in
+ * millihertz (whole Hz: 143.9 Hz reads 143000 or 144000), 0 when not
+ * known; the most a variable refresh rate display refreshes.
+ * rsx_d3d12_display_shown_mhz: how often the swap chain's statistics saw
+ * the display refresh over the last second or more, 0 when they cannot
+ * say. On a fixed refresh that is the mode's rate whatever the frames do;
+ * on a display that follows the frames (G-Sync, FreeSync) it is their
+ * rate. Any thread. */
+int      rsx_d3d12_display_mode_mhz(void);
+int      rsx_d3d12_display_shown_mhz(void);
 
 /* Shader disk cache (PS3_SHADER_CACHE, default shader_cache beside the exe),
  * for filling it before a title runs (tools: rsx_shader_precompile).
