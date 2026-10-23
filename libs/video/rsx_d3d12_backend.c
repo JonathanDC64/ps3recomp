@@ -2603,6 +2603,17 @@ static int init_d3d12(u32 width, u32 height)
         bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_RANGE nr = {0,0};
 
+        /* RSX_VP_BUFFERS=0: none of the four per-frame buffers below (about
+         * 1.2 GB of upload memory at the defaults), for a process that runs no
+         * game and draws only its overlay, such as a title's setup screens
+         * while a compile beside them needs the memory. Only a frame with
+         * guest draws uses them: a game started this way skips render_frame's
+         * vertex-program pass, so it draws none of its geometry. */
+        if (!ps3_env_int("RSX_VP_BUFFERS", 1)) {
+            fprintf(stderr, "[VPVB] no vertex-program buffers (RSX_VP_BUFFERS=0)%c", 10);
+            goto vp_buffers_done;
+        }
+
         /* VP_VB_VERTS=<n>: start the buffer at n vertices rather than
          * MAX_VERTICES, for a title known to need more (it grows on demand,
          * but the growth costs a frame; see vp_vb_grow). */
@@ -2658,6 +2669,7 @@ static int init_d3d12(u32 width, u32 height)
               s_d3d.vf_buf->lpVtbl->Map(s_d3d.vf_buf, 0, &nr, &s_d3d.vf_mapped);
           else s_vf_cap = 0; }
 
+    vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
                (void*)s_d3d.vp_root_sig, (void*)s_d3d.vp_vb, (void*)s_d3d.vp_cb);
     }
@@ -9665,7 +9677,9 @@ rtt_dump_done:;
             fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
                     s_d3d.draw_count, nvp, nclr, any,
                     (void*)vpso, (void*)s_d3d.vp_root_sig); } }
-        if (any && vpso) {
+        /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
+         * allocation failed. The pass is skipped rather than faulting.) */
+        if (any && vpso && s_d3d.vp_vb && s_d3d.vp_cb) {
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
             s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
