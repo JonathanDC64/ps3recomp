@@ -423,6 +423,7 @@ typedef struct {
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     u32 uvclamp;            /* dr_uvclamp: the target's RSX_SCALE percent, 0 = off (PSO key) */
     ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
+    int pending;            /* psj: in this frame's batch, pso not built yet */
     int next;               /* vp_fp_find: next entry in this fp_addr's bucket */
 } VPFPEntry;
 /* Guest-FP PSO cache. 16 entries thrashed badly: this title needs far more
@@ -3392,11 +3393,12 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
  * but skips the startup build. */
 static ID3D12PipelineLibrary* s_pso_lib;
 static void*         s_pso_lib_blob;        /* the library reads from this while it lives */
-static SRWLOCK       s_pso_lib_lock = SRWLOCK_INIT;   /* Load/Store; the manifest */
+static SRWLOCK       s_pso_lib_lock = SRWLOCK_INIT;   /* Load/Store */
 static volatile LONG s_pso_lib_new;         /* pipelines stored since the last save */
 static volatile LONG s_pso_lib_saving;
 static u32           s_pso_lib_quiet;       /* presents since the last store */
-static u32           s_pso_lib_hits, s_pso_lib_live;   /* draws: loaded / compiled */
+static volatile LONG s_pso_lib_hits, s_pso_lib_live;   /* draws: loaded / compiled */
+static SRWLOCK       s_pso_man_lock = SRWLOCK_INIT;   /* the manifest's names and file (pso_manifest_write) */
 
 #define PSO_REC_MAGIC 0x314F5350u           /* "PSO1" */
 typedef struct {
@@ -3573,7 +3575,7 @@ static void pso_lib_save(void)
                 pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
                 InterlockedExchangeAdd(&s_pso_lib_new, -pending);
                 printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
-                       (unsigned long)(n >> 10), recs, s_pso_lib_hits, s_pso_lib_live);
+                       (unsigned long)(n >> 10), recs, (unsigned)s_pso_lib_hits, (unsigned)s_pso_lib_live);
             }
             return;
         }
@@ -3587,53 +3589,133 @@ static DWORD WINAPI pso_lib_save_thread(LPVOID unused)
     InterlockedExchange(&s_pso_lib_saving, 0);
     return 0;
 }
-/* Keep a pipeline's description and shaders so a later startup can build it. */
+/* Keep a pipeline's description and shaders so a later startup can build it.
+ * The record and copies of its two shaders go to a thread of its own, which
+ * writes them (pso_blobs/, pso_manifest.bin): where the pipeline was built,
+ * on the render thread or one of psj's workers, no file is touched, and
+ * psj's workers do not wait on each other's writes. A record still queued
+ * when the game closes is written by rsx_d3d12_backend_shutdown
+ * (pso_manifest_flush). One that is lost only means a later startup does
+ * not build that pipeline ahead: the library still has it. */
+typedef struct PsoManItem {
+    struct PsoManItem* next;
+    pso_rec r;
+    void* sh[2];                        /* VS, PS */
+} PsoManItem;
+static struct {
+    SRWLOCK            lk;
+    CONDITION_VARIABLE cv;
+    PsoManItem        *head, *tail;
+    int                started;
+} s_pso_manq = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT };
+
+static void pso_manifest_write(PsoManItem* it)
+{
+    pso_rec* r = &it->r;
+    const u64 hs[2] = { r->vs_hash, r->ps_hash };
+    const u32 ls[2] = { r->vs_len, r->ps_len };
+    char dir[MAX_PATH + 32];
+    pso_path(dir, sizeof dir, "pso_blobs");
+    CreateDirectoryA(dir, NULL);
+    for (int i = 0; i < 2; i++) {
+        char bp[MAX_PATH + 64];
+        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)hs[i]);
+        if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES && !pso_write_file(bp, it->sh[i], ls[i]))
+            return;
+    }
+    char mp[MAX_PATH + 32];
+    pso_path(mp, sizeof mp, "pso_manifest.bin");
+    AcquireSRWLockExclusive(&s_pso_man_lock);
+    if (!pso_names_has(r->name)) {
+        FILE* f = fopen(mp, "ab");
+        if (f) {
+            if (fwrite(r, sizeof *r, 1, f) == 1) { pso_names_add(r->name); s_pso_man_n++; }
+            fclose(f);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_pso_man_lock);
+}
+
+static PsoManItem* pso_manifest_pop(int wait)
+{
+    AcquireSRWLockExclusive(&s_pso_manq.lk);
+    while (wait && !s_pso_manq.head)
+        SleepConditionVariableSRW(&s_pso_manq.cv, &s_pso_manq.lk, INFINITE, 0);
+    PsoManItem* it = s_pso_manq.head;
+    if (it) {
+        s_pso_manq.head = it->next;
+        if (!s_pso_manq.head) s_pso_manq.tail = NULL;
+    }
+    ReleaseSRWLockExclusive(&s_pso_manq.lk);
+    return it;
+}
+
+static void pso_manifest_done(PsoManItem* it)
+{
+    pso_manifest_write(it);
+    free(it->sh[0]); free(it->sh[1]); free(it);
+}
+
+static DWORD WINAPI pso_manifest_thread(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    for (;;) pso_manifest_done(pso_manifest_pop(1));
+}
+
+static void pso_manifest_flush(void)
+{
+    for (PsoManItem* it; (it = pso_manifest_pop(0)) != NULL; ) pso_manifest_done(it);
+}
+
 static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
 {
     if (pd->DS.pShaderBytecode || pd->HS.pShaderBytecode || pd->GS.pShaderBytecode ||
         !pd->VS.pShaderBytecode || !pd->PS.pShaderBytecode || pd->InputLayout.NumElements > 16 ||
         pd->StreamOutput.NumEntries)
         return;
-    pso_rec r;
-    memset(&r, 0, sizeof r);
-    r.magic = PSO_REC_MAGIC; r.size = sizeof r; r.name = name;
-    memcpy(&r.desc, pd, sizeof r.desc);
-    r.desc.pRootSignature = NULL;
-    r.desc.VS.pShaderBytecode = r.desc.PS.pShaderBytecode = NULL;
-    r.desc.InputLayout.pInputElementDescs = NULL;
-    r.desc.CachedPSO.pCachedBlob = NULL; r.desc.CachedPSO.CachedBlobSizeInBytes = 0;
-    r.nel = pd->InputLayout.NumElements;
-    for (u32 i = 0; i < r.nel; i++) {
-        r.el[i].e = pd->InputLayout.pInputElementDescs[i];
-        snprintf(r.el[i].sem, sizeof r.el[i].sem, "%s", r.el[i].e.SemanticName);
-        r.el[i].e.SemanticName = NULL;
+    PsoManItem* it = (PsoManItem*)calloc(1, sizeof *it);
+    if (!it) return;
+    pso_rec* r = &it->r;
+    r->magic = PSO_REC_MAGIC; r->size = sizeof *r; r->name = name;
+    memcpy(&r->desc, pd, sizeof r->desc);
+    r->desc.pRootSignature = NULL;
+    r->desc.VS.pShaderBytecode = r->desc.PS.pShaderBytecode = NULL;
+    r->desc.InputLayout.pInputElementDescs = NULL;
+    r->desc.CachedPSO.pCachedBlob = NULL; r->desc.CachedPSO.CachedBlobSizeInBytes = 0;
+    r->nel = pd->InputLayout.NumElements;
+    for (u32 i = 0; i < r->nel; i++) {
+        r->el[i].e = pd->InputLayout.pInputElementDescs[i];
+        snprintf(r->el[i].sem, sizeof r->el[i].sem, "%s", r->el[i].e.SemanticName);
+        r->el[i].e.SemanticName = NULL;
     }
     const D3D12_SHADER_BYTECODE* sh[2] = { &pd->VS, &pd->PS };
-    u64* hs[2] = { &r.vs_hash, &r.ps_hash };
-    u32* ls[2] = { &r.vs_len, &r.ps_len };
-    char dir[MAX_PATH + 32];
-    pso_path(dir, sizeof dir, "pso_blobs");
-    CreateDirectoryA(dir, NULL);
+    u64* hs[2] = { &r->vs_hash, &r->ps_hash };
+    u32* ls[2] = { &r->vs_len, &r->ps_len };
     for (int i = 0; i < 2; i++) {
         *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
         *ls[i] = (u32)sh[i]->BytecodeLength;
-        char bp[MAX_PATH + 64];
-        snprintf(bp, sizeof bp, "%s/%016llx.dxbc", dir, (unsigned long long)*hs[i]);
-        if (GetFileAttributesA(bp) == INVALID_FILE_ATTRIBUTES &&
-            !pso_write_file(bp, sh[i]->pShaderBytecode, sh[i]->BytecodeLength))
-            return;
+        it->sh[i] = malloc(sh[i]->BytecodeLength ? sh[i]->BytecodeLength : 1);
+        if (!it->sh[i]) { free(it->sh[0]); free(it); return; }
+        memcpy(it->sh[i], sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
     }
-    char mp[MAX_PATH + 32];
-    pso_path(mp, sizeof mp, "pso_manifest.bin");
-    AcquireSRWLockExclusive(&s_pso_lib_lock);
-    if (!pso_names_has(name)) {
-        FILE* f = fopen(mp, "ab");
-        if (f) {
-            if (fwrite(&r, sizeof r, 1, f) == 1) { pso_names_add(name); s_pso_man_n++; }
-            fclose(f);
+    AcquireSRWLockExclusive(&s_pso_manq.lk);
+    if (s_pso_manq.tail) s_pso_manq.tail->next = it; else s_pso_manq.head = it;
+    s_pso_manq.tail = it;
+    int start = 0;
+    if (!s_pso_manq.started) { s_pso_manq.started = 1; start = 1; }
+    ReleaseSRWLockExclusive(&s_pso_manq.lk);
+    WakeConditionVariable(&s_pso_manq.cv);
+    if (start) {
+        HANDLE h = CreateThread(NULL, 0, pso_manifest_thread, NULL, 0, NULL);
+        if (h) CloseHandle(h);
+        else {   /* no thread: write here, as before */
+            AcquireSRWLockExclusive(&s_pso_manq.lk);
+            s_pso_manq.started = 0;
+            ReleaseSRWLockExclusive(&s_pso_manq.lk);
+            pso_manifest_flush();
         }
     }
-    ReleaseSRWLockExclusive(&s_pso_lib_lock);
 }
 /* One startup build: the record's shaders from pso_blobs, its description
  * back together, and its name checked against the rebuilt description. */
@@ -3734,9 +3816,9 @@ static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
     HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
                      &IID_ID3D12PipelineState, (void**)out);
     ReleaseSRWLockExclusive(&s_pso_lib_lock);
-    if (SUCCEEDED(hr)) { s_pso_lib_hits++; return S_OK; }
+    if (SUCCEEDED(hr)) { InterlockedIncrement(&s_pso_lib_hits); return S_OK; }
     *out = NULL;
-    s_pso_lib_live++;
+    InterlockedIncrement(&s_pso_lib_live);
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
         s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
     if (SUCCEEDED(hr)) {
@@ -4146,6 +4228,173 @@ static VPFPEntry* vp_fp_find(const VPFPEntry* k)
             return q;
     }
     return NULL;
+}
+
+/* PSO_THREADS=<n> (live; default half the processors less one, at most 7;
+ * 0 = off): the pipelines a frame's draw pre-pass finds missing are built on
+ * n worker threads and the render thread together, at the end of the
+ * pre-pass (psj_finish), instead of one after another as each draw asks. A
+ * miss costs about 2 ms on a PC whose driver has seen the shaders (7-20 ms
+ * when it has not), and on a first start a camera turn brings tens at once:
+ * 32 in one Tutorial frame took 55 ms in a row. The frames are the same,
+ * since every pipeline exists before the draw loop records anything either
+ * way; only the wait is shorter. The decompile and the shader cache stay on
+ * the render thread (guest memory, static buffers); the workers build the
+ * pipeline, load it from the library or store it there, and add it to the
+ * manifest (pso_create_cached). */
+#define PSJ_MAX 256
+#define PSJ_THREADS_MAX 15
+typedef struct {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
+    D3D12_INPUT_ELEMENT_DESC il[16];
+    ID3DBlob *vs, *ps, *gs;             /* held until psj_finish */
+    int entry;                          /* its VPFPEntry */
+    ID3D12PipelineState* pso;
+} PsjJob;
+static PsjJob s_psj[PSJ_MAX];
+static int s_psj_n;                     /* jobs this frame (render thread) */
+static int s_psj_defer;                 /* set during the draw pre-pass */
+static int s_psj_last = -1;             /* vp_get_fp_pso: the pending entry it returned NULL for */
+static struct { u32 draw; int entry; } s_psj_fix[MAX_DRAWS];   /* draws to fill in */
+static int s_psj_fix_n;
+static struct {
+    SRWLOCK            lk;
+    CONDITION_VARIABLE cv;              /* workers: a new batch */
+    CONDITION_VARIABLE done;            /* the render thread: the last job is built */
+    u32                gen;             /* one per batch */
+    LONG               n;               /* jobs; 0 while they are rewritten */
+    int                want, started;
+} s_psjp = { SRWLOCK_INIT, CONDITION_VARIABLE_INIT, CONDITION_VARIABLE_INIT };   /* gen..want under lk */
+static volatile LONG s_psj_next, s_psj_left, s_psj_busy;
+
+static int psj_threads(void)
+{
+    static int want = -2;
+    PS3_KNOB(want, ps3_env_int("PSO_THREADS", -1));
+    if (want >= 0) return want < PSJ_THREADS_MAX ? want : PSJ_THREADS_MAX;
+    static int dflt = -1;
+    if (dflt < 0) {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        dflt = (int)si.dwNumberOfProcessors / 2 - 1;
+        if (dflt < 1) dflt = 1;
+        if (dflt > 7) dflt = 7;
+    }
+    return dflt;
+}
+
+/* Builds jobs from the batch of n until none is left. */
+static void psj_take(LONG n)
+{
+    for (LONG i; (i = InterlockedIncrement(&s_psj_next) - 1) < n; ) {
+        PsjJob* j = &s_psj[i];
+        if (FAILED(pso_create_cached(&j->pd, &j->pso))) j->pso = NULL;
+        if (InterlockedDecrement(&s_psj_left) == 0) {
+            AcquireSRWLockExclusive(&s_psjp.lk);   /* the render thread waits or has not looked yet */
+            ReleaseSRWLockExclusive(&s_psjp.lk);
+            WakeAllConditionVariable(&s_psjp.done);
+        }
+    }
+}
+
+static DWORD WINAPI psj_worker(LPVOID arg)
+{
+    const int me = (int)(intptr_t)arg;
+    u32 seen = 0;
+    for (;;) {
+        AcquireSRWLockExclusive(&s_psjp.lk);
+        while (s_psjp.gen == seen)
+            SleepConditionVariableSRW(&s_psjp.cv, &s_psjp.lk, INFINITE, 0);
+        seen = s_psjp.gen;
+        const LONG n = me < s_psjp.want ? s_psjp.n : 0;
+        InterlockedIncrement(&s_psj_busy);   /* under lk: see psj_finish */
+        ReleaseSRWLockExclusive(&s_psjp.lk);
+        if (n) psj_take(n);
+        InterlockedDecrement(&s_psj_busy);
+    }
+}
+
+/* vp_get_fp_pso in the pre-pass, on a miss: the key goes into the cache as
+ * pending and the pipeline into this frame's batch, which takes the caller's
+ * reference to ps. The entry's index, or -1 (full: build it now). */
+static int psj_add(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const D3D12_INPUT_ELEMENT_DESC* il,
+                   ID3DBlob* vs, ID3DBlob* ps, ID3DBlob* gs, const VPFPEntry* key)
+{
+    if (s_psj_n >= PSJ_MAX) return -1;
+    const int at = s_d3d.vp_fp_n;
+    VPFPEntry e = *key;
+    e.pso = NULL; e.pending = 1;
+    vp_fp_insert(&e);
+    if (s_d3d.vp_fp_n != at + 1) return -1;   /* the cache could not grow */
+    PsjJob* j = &s_psj[s_psj_n++];
+    j->pd = *pd;
+    memcpy(j->il, il, sizeof j->il);
+    j->pd.InputLayout.pInputElementDescs = j->il;
+    j->vs = vs; vs->lpVtbl->AddRef(vs);
+    j->ps = ps;
+    j->gs = gs; if (gs) gs->lpVtbl->AddRef(gs);
+    j->entry = at;
+    j->pso = NULL;
+    return at;
+}
+
+/* End of the draw pre-pass: build the batch, then give its pipelines to
+ * their cache entries and to the draws that asked for them. */
+static void psj_finish(void)
+{
+    const LONG n = s_psj_n;
+    if (!n) { s_psj_fix_n = 0; return; }
+    const double t0 = perf_now();
+    int use = psj_threads();
+    if (use > n - 1) use = n - 1;           /* the render thread builds one too */
+    while (s_psjp.started < use) {
+        HANDLE h = CreateThread(NULL, 0, psj_worker, (LPVOID)(intptr_t)s_psjp.started, 0, NULL);
+        if (!h) break;
+        CloseHandle(h);
+        s_psjp.started++;
+    }
+    if (use > s_psjp.started) use = s_psjp.started;
+    /* The last batch's workers are done building, but one may still be in
+     * its job loop, and one that wakes late must find no jobs: a worker
+     * raises busy under lk, as it reads n. */
+    AcquireSRWLockExclusive(&s_psjp.lk);
+    s_psjp.n = 0;
+    ReleaseSRWLockExclusive(&s_psjp.lk);
+    while (s_psj_busy) YieldProcessor();
+    s_psj_next = 0;
+    s_psj_left = n;
+    AcquireSRWLockExclusive(&s_psjp.lk);
+    s_psjp.want = use; s_psjp.n = n; s_psjp.gen++;
+    ReleaseSRWLockExclusive(&s_psjp.lk);
+    if (use > 0) WakeAllConditionVariable(&s_psjp.cv);
+    psj_take(n);
+    AcquireSRWLockExclusive(&s_psjp.lk);
+    while (s_psj_left > 0) SleepConditionVariableSRW(&s_psjp.done, &s_psjp.lk, INFINITE, 0);
+    ReleaseSRWLockExclusive(&s_psjp.lk);
+    int failed = 0;
+    for (LONG i = 0; i < n; i++) {
+        PsjJob* j = &s_psj[i];
+        VPFPEntry* e = &s_d3d.vp_fp[j->entry];
+        e->pso = j->pso;
+        e->pending = 0;
+        if (!j->pso) {
+            static int said = 0;
+            failed++;
+            if (said < 16 && ++said) printf("[FP] PSO FAIL (fp=0x%08X)\n", e->fp_addr);
+        }
+        j->vs->lpVtbl->Release(j->vs);
+        j->ps->lpVtbl->Release(j->ps);
+        if (j->gs) j->gs->lpVtbl->Release(j->gs);
+    }
+    for (int k = 0; k < s_psj_fix_n; k++)
+        s_d3d.draws[s_psj_fix[k].draw].pso = s_d3d.vp_fp[s_psj_fix[k].entry].pso;
+    const double ms = (perf_now() - t0) * 1000.0;
+    if (perf_on()) { s_perf_cpso += ms / 1000.0; s_perf_cpso_n += (int)n; }
+    { static int said = 0;
+      if (said < 3 && ++said)
+          printf("[D3D12] %ld missing pipelines built on %d threads in %.1f ms%s (PSO_THREADS)\n",
+                 (long)n, use + 1, ms, failed ? ", some failed" : ""); }
+    s_psj_n = 0;
+    s_psj_fix_n = 0;
 }
 
 /* The debug rewrites below (FP_ONE, FP_SHOW, FP_IDCOLOR, FP_TEX, FP_KILL) edit
@@ -4573,6 +4822,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
                                           u32 depth, u32 cube_mask, u32 d2c_mask, u32 uvclamp)
 {
+    s_psj_last = -1;
     vp_pso_knobs_check();
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -4622,7 +4872,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
     key.d2c_mask = d2c_mask; key.uvclamp = uvclamp;
     key.pso = NULL;
-    { const VPFPEntry* hit = vp_fp_find(&key); if (hit) return hit->pso; }
+    { const VPFPEntry* hit = vp_fp_find(&key);
+      if (hit) {
+          if (hit->pending) s_psj_last = (int)(hit - s_d3d.vp_fp);
+          return hit->pso;
+      } }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
      * entry for the same program. "the cache misses" is not actionable; "it
@@ -4944,6 +5198,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                   pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } }
     pd.SampleDesc.Count = 1;
 
+    /* In the draw pre-pass: built with the frame's other missing pipelines
+     * (psj_finish), which has pb from here. */
+    if (s_psj_defer && (s_psj_last = psj_add(&pd, il, vsb, pb, gsb, &key)) >= 0) return NULL;
     ID3D12PipelineState* pso = NULL;
     const double cp_t0 = perf_on() ? perf_now() : 0.0;
     hr = pso_create_cached(&pd, &pso);
@@ -9254,6 +9511,7 @@ rtt_dump_done:;
     late_check();
     double _pre0 = perf_on() ? perf_now() : 0.0;
     tcj_dispatch();
+    s_psj_defer = psj_threads() > 0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
@@ -9502,10 +9760,17 @@ rtt_dump_done:;
                                     dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                     _cmask, dr->d2c_mask, dr_uvclamp(dr));
             dr->pso_serial = s_rf_serial;
+            if (s_psj_last >= 0) {   /* filled in by psj_finish */
+                s_psj_fix[s_psj_fix_n].draw = _d;
+                s_psj_fix[s_psj_fix_n].entry = s_psj_last;
+                s_psj_fix_n++;
+            }
         }
         if (perf_on()) { const double _pt = perf_now() - _ps0; s_perf_pso += _pt;
                          if (s_perf_pso_miss != _pm0) s_perf_pmiss += _pt; }
     }
+    s_psj_defer = 0;
+    psj_finish();
     drawprint_batch();
     RF_CP(4); rf_pp_snap(s_rf_pp, s_rf_ppn);
 
@@ -13479,6 +13744,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_pso_lib) {
         InterlockedExchange(&s_pso_pre_abort, 1);
         while (s_pso_lib_saving || s_pso_pre_live) Sleep(1);
+        pso_manifest_flush();
         if (s_pso_lib_new) pso_lib_save();
     }
 
