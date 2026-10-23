@@ -1803,12 +1803,55 @@ static void hold_frame(u32 fi)
     hold_copy(fi);
 }
 
+/* The window's display, for rsx_d3d12_display_timing: its refresh period and
+ * the time of one of its vblanks, in performance counter ticks. The swap
+ * chain's statistics give both for the display the frames reach. After a
+ * present, at most every 100 ms: the vblank the last frame shown went up at,
+ * and, over a second or more of those, the period. */
+static volatile long long s_disp_period, s_disp_vblank, s_disp_at;
+static void display_note(long long now)
+{
+    static long long freq, last, base_q;
+    static UINT base_c;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    if (now - last < freq / 10) return;
+    last = now;
+    DXGI_FRAME_STATISTICS fs;
+    memset(&fs, 0, sizeof fs);
+    if (FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)) ||
+        !fs.SyncQPCTime.QuadPart || !fs.SyncRefreshCount)
+        return;
+    const long long q = fs.SyncQPCTime.QuadPart;
+    const UINT c = fs.SyncRefreshCount;
+    if (!base_q || c < base_c || q < base_q) {   /* (the first, or the statistics started over) */
+        base_q = q;
+        base_c = c;
+    } else if (q - base_q >= freq && c > base_c) {
+        const long long p = (q - base_q) / (long long)(c - base_c);
+        if (p >= freq / 1000 && p <= freq / 20) InterlockedExchange64(&s_disp_period, p);
+        base_q = q;
+        base_c = c;
+    }
+    InterlockedExchange64(&s_disp_vblank, q);
+    InterlockedExchange64(&s_disp_at, now);
+}
+
 /* Present, at the refresh or (RSX_VSYNC=0, live, default 1) at once with
  * tearing, so the title's own vblank is the frame limit and a game set above
  * the display's rate is not held to it. Without tearing support (swap chain
  * creation above) a sync interval of 0 would still be paced at the refresh
- * by the compositor, so it presents with vsync and says so once. */
-static void swap_present(void)
+ * by the compositor, so it presents with vsync and says so once.
+ * RSX_VSYNC=2 to 4 holds each frame that many refreshes at least: a title
+ * whose frames come every n refreshes (ps3_vblank_lock_display) shows each
+ * for n, and one that comes a little late moves the frames after it a
+ * refresh later instead of being shown for n + 1 refreshes while the next is
+ * shown for n - 1. A repaint (game_frame 0: the overlay over a held frame)
+ * waits one refresh at most, so the overlay keeps the display's rate. */
+static void swap_present(int game_frame)
 {
     static int vsync = -1;
     PS3_KNOB(vsync, ps3_env_int("RSX_VSYNC", 1));
@@ -1817,10 +1860,12 @@ static void swap_present(void)
         if (!said++) printf("[D3D12] RSX_VSYNC=0: tearing is not supported on this system; presenting with vsync\n");
     }
     const int tear = !vsync && s_d3d.tearing;
-    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, tear ? 0 : 1, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
+    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     s_last_present_qpc = q.QuadPart;
+    display_note(q.QuadPart);
 }
 
 static void wait_for_gpu(void);
@@ -10713,7 +10758,7 @@ skip_dump_consider: ;
                           s_d3d.win_w, s_d3d.win_h);
       }
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
-          swap_present();
+          swap_present(1);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
       if (s_present_this_frame) pso_lib_tick();
@@ -13545,62 +13590,130 @@ void rsx_d3d12_overlay_wake(void)
     InterlockedExchange(&s_overlay_wake, 1);
 }
 
+/* DWM's timing: the composition's refresh period and the time of its last
+ * vblank, in performance counter ticks; 0 when it cannot say. The window's
+ * display mode: its refresh in whole Hz (143.9 Hz reads 143 or 144), 0 when
+ * not known. Any thread. */
+#ifdef _WIN32
+static long long dwm_timing(long long freq, long long* vblank)
+{
+    typedef HRESULT (WINAPI *timing_fn)(HWND, DWM_TIMING_INFO*);
+    static timing_fn volatile timing;
+    static volatile LONG state;   /* 0 = not loaded yet, 1 = loaded, -1 = missing */
+    if (!state) {
+        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        timing = dwm ? (timing_fn)(void*)GetProcAddress(dwm, "DwmGetCompositionTimingInfo") : NULL;
+        InterlockedExchange(&state, timing ? 1 : -1);
+    }
+    *vblank = 0;
+    if (state < 0) return 0;
+    DWM_TIMING_INFO ti;
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize = sizeof ti;
+    if (FAILED(timing(NULL, &ti)) || ti.qpcRefreshPeriod < (QPC_TIME)(freq / 1000) ||
+        ti.qpcRefreshPeriod > (QPC_TIME)(freq / 20))
+        return 0;
+    *vblank = (long long)ti.qpcVBlank;
+    return (long long)ti.qpcRefreshPeriod;
+}
+
+static int display_mode_hz(void)
+{
+    if (!s_d3d.hwnd) return 0;
+    MONITORINFOEXW mi;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    DEVMODEW dm;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (GetMonitorInfoW(MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO*)&mi) &&
+        EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 20 &&
+        dm.dmDisplayFrequency < 1000)
+        return (int)dm.dmDisplayFrequency;
+    return 0;
+}
+#else
+static int display_mode_hz(void)
+{
+    return (int)s_refresh_hz;   /* (window thread, win_refresh_note) */
+}
+#endif
+
 /* The display's refresh: its period and the time of a vblank, in performance
  * counter ticks. DWM's timing, read again every quarter second (the window
  * can move to another display); without it the window's display mode gives
- * the period and *vblank is 0 (unknown). */
-#ifdef _WIN32
+ * the period and *vblank is 0 (unknown). Render thread. */
 static long long refresh_period(long long now, long long freq, long long* vblank)
 {
     static long long period, vb, read_at;
-    static int dwm_state;   /* 0 = not loaded yet, 1 = loaded, -1 = missing */
-    typedef HRESULT (WINAPI *timing_fn)(HWND, DWM_TIMING_INFO*);
-    static timing_fn timing;
     if (!period || now - read_at >= freq / 4) {
         read_at = now;
-        if (!dwm_state) {
-            HMODULE dwm = LoadLibraryA("dwmapi.dll");
-            timing = dwm ? (timing_fn)(void*)GetProcAddress(dwm, "DwmGetCompositionTimingInfo") : NULL;
-            dwm_state = timing ? 1 : -1;
-        }
-        long long p = 0;
         vb = 0;
-        if (timing) {
-            DWM_TIMING_INFO ti;
-            memset(&ti, 0, sizeof ti);
-            ti.cbSize = sizeof ti;
-            if (SUCCEEDED(timing(NULL, &ti)) && ti.qpcRefreshPeriod >= (QPC_TIME)(freq / 1000) &&
-                ti.qpcRefreshPeriod <= (QPC_TIME)(freq / 20)) {
-                p = (long long)ti.qpcRefreshPeriod;
-                vb = (long long)ti.qpcVBlank;
-            }
-        }
-        if (!p && s_d3d.hwnd) {
-            MONITORINFOEXW mi;
-            memset(&mi, 0, sizeof mi);
-            mi.cbSize = sizeof mi;
-            DEVMODEW dm;
-            memset(&dm, 0, sizeof dm);
-            dm.dmSize = sizeof dm;
-            if (GetMonitorInfoW(MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO*)&mi) &&
-                EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 20 &&
-                dm.dmDisplayFrequency < 1000)
-                p = freq / (long long)dm.dmDisplayFrequency;
+        long long p = 0;
+#ifdef _WIN32
+        p = dwm_timing(freq, &vb);
+#endif
+        if (!p) {
+            const int hz = display_mode_hz();
+            if (hz) p = freq / hz;
         }
         period = p ? p : freq / 60;
     }
     *vblank = vb;
     return period;
 }
-#else
-static long long refresh_period(long long now, long long freq, long long* vblank)
+
+/* For rsx_d3d12_display_timing: the window's display mode in Hz, read again
+ * every half second (the window can move to another display). */
+static int display_hz_cached(long long now, long long freq)
 {
-    (void)now;
-    const LONG hz = s_refresh_hz;   /* the window's display (window thread, win_refresh_note) */
-    *vblank = 0;
-    return hz ? freq / hz : freq / 60;
+    static volatile long long at;
+    static volatile LONG hz;
+    if (!at || now - at >= freq / 2) {
+        InterlockedExchange(&hz, (LONG)display_mode_hz());
+        InterlockedExchange64(&at, now);
+    }
+    return (int)hz;
 }
+
+static int period_near(long long p, long long nominal)
+{
+    const long long d = p > nominal ? p - nominal : nominal - p;
+    return d * 1000 <= nominal * 15;   /* 1.5%: the mode's whole Hz against the real rate */
+}
+
+long long rsx_d3d12_display_timing(long long* vblank)
+{
+    LARGE_INTEGER f, q;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    const int hz = display_hz_cached(q.QuadPart, f.QuadPart);
+    const long long nominal = hz ? f.QuadPart / hz : 0;
+    const long long sp = s_disp_period, svb = s_disp_vblank, sat = s_disp_at;
+    if (sp && svb && q.QuadPart - sat < 2 * f.QuadPart && (!nominal || period_near(sp, nominal))) {
+        *vblank = svb;
+        return sp;
+    }
+#ifdef _WIN32
+    long long dvb = 0;
+    const long long dp = dwm_timing(f.QuadPart, &dvb);
+    if (dp && (!nominal || period_near(dp, nominal))) {
+        *vblank = dvb;
+        return dp;
+    }
 #endif
+    *vblank = 0;
+    return nominal;
+}
+
+int rsx_d3d12_display_refresh_mhz(void)
+{
+    long long vb;
+    const long long p = rsx_d3d12_display_timing(&vb);
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return p ? (int)((f.QuadPart * 1000 + p / 2) / p) : 0;
+}
 
 /* Is a frame presented and not yet shown? 1 / 0, or -1 when the swap
  * chain's statistics cannot say. */
@@ -13691,7 +13804,7 @@ void rsx_d3d12_overlay_tick(void)
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
     s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[fi], fi, s_d3d.win_w, s_d3d.win_h);
-    swap_present();
+    swap_present(0);
     s_repaints++;
     move_to_next_frame();
     swap_resize();
@@ -13948,5 +14061,7 @@ unsigned rsx_d3d12_back_buffer_count(void) { return 0; }
 unsigned rsx_d3d12_back_buffer_format(void) { return 0; }
 void     rsx_d3d12_set_borderless(int on) { (void)on; }
 int      rsx_d3d12_borderless(void) { return 0; }
+long long rsx_d3d12_display_timing(long long* vblank) { *vblank = 0; return 0; }
+int      rsx_d3d12_display_refresh_mhz(void) { return 0; }
 
 #endif /* _WIN32 || PS3RECOMP_RSX_D3D12_VKD3D */
