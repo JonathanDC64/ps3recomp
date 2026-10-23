@@ -312,6 +312,7 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
+const char* cellGame_get_app_ver(void) { return s_app_ver; }
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)

@@ -170,6 +170,23 @@ const char* rsx_d3d12_shader_cache_path(void);
  * Returns how many were written to out (at most max). */
 int rsx_d3d12_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max);
 
+/* The pipeline index (described in the .c): rows of the pipelines a title
+ * asks for, recorded into the cache and built ahead from the port's list.
+ * rsx_d3d12_pso_index_game: the game and its version (TITLE_ID-APP_VER)
+ * for the file of recorded rows; before the title draws.
+ * rsx_d3d12_program_hash64: a row's fingerprint of a program, from its
+ * ucode as a Cg binary holds it (fragment 1 for a fragment program).
+ * rsx_d3d12_pso_index_add: a row to build, with the cache keys of its two
+ * shader texts (rsx_d3d12_shader_key of what rsx_d3d12_shader_hlsl makes;
+ * in the cache by the time the list ends); rsx_d3d12_pso_index_ready: the
+ * end of the list (hash: the list's, 0 if it was cut short). Any thread. */
+void rsx_d3d12_pso_index_game(const char* game);
+u64  rsx_d3d12_program_hash64(int fragment, const u8* ucode, u32 ucode_len);
+u64  rsx_d3d12_shader_key(int fragment, const char* hlsl);
+void rsx_d3d12_pso_index_add(int vs_fetch, u64 vs_key, int clamp, u64 ps_key,
+                             u32 blend, int nrt, u32 rtfmt, u32 cmask, u32 cull, u32 depth);
+void rsx_d3d12_pso_index_ready(u64 hash);
+
 #ifdef __cplusplus
 }
 #endif

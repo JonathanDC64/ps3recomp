@@ -191,4 +191,6 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
 /* Kept from this tree (see the .c) -- used by rsx_d3d12_backend.c. */
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
 u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
+/* The same bytes as FNV-1a 64: the pipeline index's fingerprint (rsx_d3d12_backend.c). */
+u64 rsx_fp_code_hash64(const u8* ucode, u32 max_bytes);
 #endif /* PS3RECOMP_RSX_FP_DECOMPILER_H */

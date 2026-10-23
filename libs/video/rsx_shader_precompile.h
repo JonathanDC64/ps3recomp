@@ -59,6 +59,21 @@ void rsx_shader_precompile_add(const char* name, const uint8_t* cg, size_t n);
 #define RSX_PRECOMPILE_2D 1u
 void rsx_shader_precompile_add_flags(const char* name, const uint8_t* cg, size_t n, unsigned flags);
 
+/* The pipeline index: the pipelines a title is known to ask for, as text,
+ * one row a line (rsx_d3d12_backend.c describes a row; '#' lines are
+ * skipped). After the queued programs, the decompile thread finds each
+ * row's two programs among them by their fingerprints
+ * (rsx_d3d12_program_hash64), makes their shader texts as a draw does,
+ * has the compile threads put those in the cache, and hands the row to the
+ * D3D12 backend, which builds the pipelines in the background once the
+ * title runs. index_only: only that, the programs themselves are not built
+ * (the cache is up to date). Before _start; returns the rows read. */
+int rsx_shader_precompile_index(const char* rows, size_t len, int index_only);
+
+/* 1 when the backend has built every row of this index into the cache's
+ * pipeline library (pso_index.built in the cache holds its hash). */
+int rsx_shader_precompile_index_built(const char* rows, size_t len);
+
 /* Decompile the queued programs on one thread and compile their shaders on
  * `threads` more (<= 0: one per logical processor, at most 64). Returns 0 if
  * it started; -1 if the cache is off (PS3_SHADER_CACHE=0) or nothing is
@@ -78,6 +93,8 @@ typedef struct rsx_shader_precompile_stats {
     int      cancelled;
     int      threads;
     double   seconds;        /* since _start (until the end, once finished) */
+    unsigned index_rows;     /* pipeline index rows read (_index) */
+    unsigned index_found;    /* of those, with both programs among the queued ones */
 } rsx_shader_precompile_stats;
 void rsx_shader_precompile_get(rsx_shader_precompile_stats* st);
 

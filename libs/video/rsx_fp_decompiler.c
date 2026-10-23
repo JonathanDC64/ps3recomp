@@ -1356,6 +1356,25 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
     return h;
 }
 
+u64 rsx_fp_code_hash64(const u8* ucode, u32 max_bytes)
+{
+    u64 h = 14695981039346656037ull;
+    if (!ucode) return h;
+    u32 off = 0;
+    while (off + 16 <= max_bytes) {
+        u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 1099511628211ull; }
+        off += 16;
+        if (fp_instruction_has_constant(w1, w2, w3))
+            off += 16;                   /* skip the constant, do not hash it */
+        if (w0 & FP_END) break;
+    }
+    return h;
+}
+
 /* Scale texel-space coordinates to the 0..1 range HLSL sampling expects.
  *
  * An RSX texture whose format carries RSX_TEX_FMT_UNNORM (0x40) is addressed in
