@@ -1866,6 +1866,7 @@ static void swap_resize(void)
  * -----------------------------------------------------------------------*/
 
 static void pso_lib_open(void);   /* pipeline library, defined with the shader cache */
+static void shader_cache_warm(void);   /* the shader cache read ahead, defined with it */
 static u64 s_vp_root_hash;        /* vp_root_sig's serialized bytes, part of every pipeline's name */
 static u64 fnv_bytes(u64 h, const void* p, size_t n)
 {
@@ -2046,6 +2047,7 @@ static int init_d3d12(u32 width, u32 height)
     }
 
     pso_lib_open();
+    shader_cache_warm();
 
     /* Create command queue */
     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
@@ -3370,6 +3372,98 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
     }
     return hr;
 }
+
+/* PS3_SHADER_CACHE_WARM=<n> (default 4; 0 = off): at startup, n threads read
+ * every program in the shader cache once, in the background. Windows'
+ * antivirus scans a file the first time it is opened after it was written:
+ * about 3 ms for one of these, against 0.07 ms after, and the scan is
+ * remembered across runs. Setup's shader pass writes some 3,600 just before
+ * a first start, so a first walk opened each for the first time when a draw
+ * needed it, on the render thread for a pixel program and the FIFO thread
+ * for a vertex program: 520 ms of lookups for 189 new pipelines in a
+ * Tutorial walk, up to 54 ms for one. On four threads the read takes about
+ * 2 s while the game boots. Off Windows there is no such scan, and nothing
+ * is read ahead. */
+#ifdef _WIN32
+static struct {
+    char (*names)[64];
+    LONG n;
+    volatile LONG next, live;
+    int threads;
+    double t0;
+    char dir[MAX_PATH];
+} s_scw;
+static void shader_cache_warm_files(void)
+{
+    char path[MAX_PATH + 80];
+    u8 buf[16 * 1024];   /* (the programs are a few KB) */
+    for (LONG i; (i = InterlockedIncrement(&s_scw.next) - 1) < s_scw.n; ) {
+        snprintf(path, sizeof path, "%s/%s", s_scw.dir, s_scw.names[i]);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        while (fread(buf, 1, sizeof buf, f) == sizeof buf) {}
+        fclose(f);
+    }
+    if (InterlockedDecrement(&s_scw.live) == 0) {
+        printf("[D3D12] shader cache: %ld files read ahead in %.0f ms on %d threads (PS3_SHADER_CACHE_WARM)\n",
+               (long)s_scw.n, 1000.0 * (perf_now() - s_scw.t0), s_scw.threads);
+        free(s_scw.names);
+        s_scw.names = NULL;
+    }
+}
+static DWORD WINAPI shader_cache_warm_worker(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    shader_cache_warm_files();
+    return 0;
+}
+/* The first thread lists the files, starts the others and reads too. */
+static DWORD WINAPI shader_cache_warm_lister(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    char pat[MAX_PATH + 16];
+    snprintf(pat, sizeof pat, "%s/*.dxbc", s_scw.dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LONG cap = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || strlen(fd.cFileName) >= 64) continue;
+        if (s_scw.n == cap) {
+            const LONG c = cap ? cap * 2 : 4096;
+            char (*g)[64] = (char (*)[64])realloc(s_scw.names, (size_t)c * 64);
+            if (!g) break;
+            s_scw.names = g; cap = c;
+        }
+        memcpy(s_scw.names[s_scw.n++], fd.cFileName, strlen(fd.cFileName) + 1);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (!s_scw.n) { free(s_scw.names); s_scw.names = NULL; return 0; }
+    s_scw.t0 = perf_now();
+    s_scw.live = s_scw.threads;
+    for (int t = 1; t < s_scw.threads; t++) {
+        HANDLE w = CreateThread(NULL, 0, shader_cache_warm_worker, NULL, 0, NULL);
+        if (w) CloseHandle(w); else InterlockedDecrement(&s_scw.live);
+    }
+    shader_cache_warm_files();
+    return 0;
+}
+static void shader_cache_warm(void)
+{
+    static int once = 0;
+    const char* dir = shader_cache_dir();
+    int nt = ps3_env_int("PS3_SHADER_CACHE_WARM", 4);
+    if (once++ || !dir[0] || nt <= 0) return;
+    s_scw.threads = nt > 16 ? 16 : nt;
+    snprintf(s_scw.dir, sizeof s_scw.dir, "%s", dir);
+    HANDLE h = CreateThread(NULL, 0, shader_cache_warm_lister, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#else
+static void shader_cache_warm(void) {}
+#endif
 
 /* Driver pipelines on disk. The .dxbc cache above saves FXC, but every new
  * PSO still has the driver compile DXBC to GPU code: 0.1 ms when the driver's
