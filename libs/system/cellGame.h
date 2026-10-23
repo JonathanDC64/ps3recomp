@@ -133,6 +133,8 @@ void cellGame_init_from_paramsfo(const char* sfo_path);
 /* Central title-id accessor (so other modules don't hardcode placeholders). */
 const char* cellGame_get_title_id(void);
 const char* cellGame_get_title(void);
+/* PARAM.SFO's APP_VER, the game's version ("01.00", also when it was not read). */
+const char* cellGame_get_app_ver(void);
 
 /* Set the game's title string */
 void cellGame_set_title(const char* title);
