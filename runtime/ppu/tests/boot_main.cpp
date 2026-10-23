@@ -356,10 +356,12 @@ extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
 extern "C" void rsx_d3d12_overlay_tick(void);
+extern "C" long long rsx_d3d12_display_timing(long long* vblank);
 #  define rsx_backend_init    rsx_d3d12_backend_init
 #  define rsx_backend_present rsx_d3d12_backend_present
 #  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
 #  define rsx_backend_idle    rsx_d3d12_overlay_tick
+#  define rsx_backend_display_timing rsx_d3d12_display_timing
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
@@ -368,6 +370,7 @@ extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_present rsx_metal_backend_present
 #  define rsx_backend_pump    rsx_metal_backend_pump_messages
 #  define rsx_backend_idle()  ((void)0)
+#  define rsx_backend_display_timing(vb) (*(vb) = 0, 0LL)
 #else
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);
@@ -376,6 +379,7 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #  define rsx_backend_present rsx_null_backend_present
 #  define rsx_backend_pump    rsx_null_backend_pump_messages
 #  define rsx_backend_idle()  ((void)0)
+#  define rsx_backend_display_timing(vb) (*(vb) = 0, 0LL)
 #endif
 extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
 extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
@@ -576,6 +580,23 @@ static int vblank_rate_mhz(void)
     return env > 1000 ? env : 59940;
 }
 
+/* ps3_vblank_lock_display(n): from the next tick, a vblank every n of the
+ * display's refreshes, on its vblanks (n from 1 to 8; 0 goes back to the
+ * rate above). The clock's timer drifts against the display: a title with a
+ * frame every n refreshes then has one shown for n + 1 refreshes and the
+ * next for n - 1 each time its frames cross a refresh, and a timer that
+ * wakes a little early or late near one does it for a run of frames. On the
+ * display's own vblanks every frame keeps the same place in its refresh.
+ * While the backend cannot say when the display's vblanks are, the clock
+ * keeps the display's period and its own phase; while it cannot say the
+ * period either, the rate above (a title sets it to the display's rate over n
+ * too). Thread-safe; GCM_VBLANK_THREAD=0 (the ticker's ticks) ignores it. */
+static std::atomic<int> s_vblank_lock{0};
+extern "C" void ps3_vblank_lock_display(int n)
+{
+    s_vblank_lock.store(n < 0 ? 0 : n > 8 ? 8 : n, std::memory_order_relaxed);
+}
+
 static DWORD WINAPI vblank_clock(LPVOID)
 {
     if (uint32_t sp = sys_ppu_thread_alloc_host_stack(0x10000u)) ppu_guest_call_set_stack(sp);
@@ -593,16 +614,36 @@ static DWORD WINAPI vblank_clock(LPVOID)
     int vblank_mhz = vblank_rate_mhz();
     long long tick_qpc = qpf.QuadPart * 1000 / vblank_mhz;
     long long next_tick = qpc.QuadPart + tick_qpc;
+    int lock = 0;              /* ps3_vblank_lock_display's n as applied */
+    long long lock_said = 0;   /* the display period last logged */
     fprintf(stderr, "[vblank] clock thread at %.3f Hz%c", vblank_mhz / 1000.0, 10);
     for (;;) {
         QueryPerformanceCounter(&qpc);
         const int m = vblank_rate_mhz();
-        if (m != vblank_mhz) {
+        const int n = s_vblank_lock.load(std::memory_order_relaxed);
+        long long vb = 0;
+        const long long period = n ? rsx_backend_display_timing(&vb) : 0;
+        const long long want = period ? period * n : qpf.QuadPart * 1000 / m;
+        if (want != tick_qpc || m != vblank_mhz || n != lock) {
             /* The next tick is one new period after the last one. */
-            next_tick += qpf.QuadPart * 1000 / m - tick_qpc;
+            next_tick += want - tick_qpc;
+            tick_qpc = want;
+            if (n != lock || (period && (period > lock_said ? period - lock_said : lock_said - period) * 200 > period)) {
+                if (period) fprintf(stderr, "[vblank] clock on the display's vblanks: every %d of %.3f Hz%c", n,
+                                    (double)qpf.QuadPart / (double)period, 10);
+                else fprintf(stderr, "[vblank] clock now at %.3f Hz%s%c", m / 1000.0,
+                             n ? " (the display's timing is not known yet)" : "", 10);
+                lock_said = period;
+            } else if (!period && m != vblank_mhz) {
+                fprintf(stderr, "[vblank] clock now at %.3f Hz%c", m / 1000.0, 10);
+            }
             vblank_mhz = m;
-            tick_qpc = qpf.QuadPart * 1000 / m;
-            fprintf(stderr, "[vblank] clock now at %.3f Hz%c", m / 1000.0, 10);
+            lock = n;
+        }
+        if (period && vb) {
+            /* On the display's grid: the nearest of its vblanks to the tick due. */
+            const long long d = next_tick - vb + period / 2;
+            next_tick = vb + (d >= 0 ? d / period : -((-d + period - 1) / period)) * period;
         }
         long long wait_qpc = next_tick - qpc.QuadPart;
         if (wait_qpc > 0) {

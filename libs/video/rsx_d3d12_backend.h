@@ -127,6 +127,27 @@ unsigned rsx_d3d12_back_buffer_format(void);
  * maximized or not (0). Alt+Enter toggles it too. Any thread. */
 void     rsx_d3d12_set_borderless(int on);
 int      rsx_d3d12_borderless(void);
+/* The display the window is on: its refresh period in performance counter
+ * ticks (0 when not known) and, in *vblank, the time of one of its vblanks
+ * (0 when only the period is known). From the swap chain's statistics, the
+ * display the frames reach, while they agree with the window's display mode
+ * (within 1.5%; under a variable refresh rate they are the frames' times);
+ * else DWM's timing, if it agrees; else the mode alone. For a vblank clock
+ * that keeps step with the display (boot_main.cpp's ps3_vblank_lock_display)
+ * and a title's frame pacing. Any thread. rsx_d3d12_display_refresh_mhz is
+ * the same refresh in millihertz. */
+long long rsx_d3d12_display_timing(long long* vblank);
+int      rsx_d3d12_display_refresh_mhz(void);
+/* rsx_d3d12_display_mode_mhz: the window's display mode alone, in
+ * millihertz (whole Hz: 143.9 Hz reads 143000 or 144000), 0 when not
+ * known; the most a variable refresh rate display refreshes.
+ * rsx_d3d12_display_shown_mhz: how often the swap chain's statistics saw
+ * the display refresh over the last second or more, 0 when they cannot
+ * say. On a fixed refresh that is the mode's rate whatever the frames do;
+ * on a display that follows the frames (G-Sync, FreeSync) it is their
+ * rate. Any thread. */
+int      rsx_d3d12_display_mode_mhz(void);
+int      rsx_d3d12_display_shown_mhz(void);
 
 /* Shader disk cache (PS3_SHADER_CACHE, default shader_cache beside the exe),
  * for filling it before a title runs (tools: rsx_shader_precompile).
