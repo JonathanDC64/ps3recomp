@@ -43,7 +43,10 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 int pad_hid_sony_poll(PadHidSonyState* out, int max) { (void)out; (void)max; return 0; }
+int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak) { (void)slot; (void)strong; (void)weak; return 0; }
 
 #define EA 0x1000u
 

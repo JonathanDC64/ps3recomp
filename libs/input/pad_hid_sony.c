@@ -25,6 +25,24 @@
  * The reader parses each report into the pad's state under a lock and
  * cellPad's poll copies it out.
  *
+ * Vibration (pad_hid_sony_rumble, from cellPad's vibration thread) writes
+ * the pad's output report on a second, overlapped handle: the reader's is
+ * synchronous and stays in ReadFile, and a write on it would wait behind
+ * that read. The reports set the motors alone (as Linux hid-playstation and
+ * SDL lay them out; offsets from the report id):
+ *   DualShock 4 USB 0x05: [1] flags 0x01 (motors), [4] small (right, weak),
+ *     [5] large (left, strong)
+ *   DualShock 4 BT 0x11: [1] 0xC4 (HID, CRC, 4 ms reports), then as USB
+ *     two bytes on: [3] flags, [6] small, [7] large
+ *   DualSense USB 0x02: [1] 0x03 (rumble the old way, haptics off), [3]
+ *     small, [4] large, [39] 0x04 (the rumble emulation newer firmware
+ *     wants)
+ *   DualSense BT 0x31: [1] sequence << 4, [2] 0x10, then as USB two bytes
+ *     on
+ *   Bluetooth: a CRC-32 of 0xA2 and bytes 0-73 at 74-77, little-endian.
+ * Over Bluetooth the first such report also switches the pad to its full
+ * input reports (DualShock 4 0x11, DualSense 0x31), which sony_parse reads.
+ *
  * Knobs: PAD_NO_HID=1 turns it off (if Steam Input already presents the pad
  * as XInput, the game would otherwise see it twice). PAD_HID_DEADZONE
  * (default 20, of 128, RPCS3's 40/255) is the sticks' radial deadzone -- a
@@ -64,6 +82,14 @@ typedef struct {
     SRWLOCK         lock;
     PadHidSonyState st;
     int             have;      /* a report has been parsed */
+    /* Vibration: the write handle (NULL when the pad takes none) and its
+     * event, under wlock; the output report's length; the DualSense's
+     * Bluetooth sequence number. */
+    SRWLOCK         wlock;
+    HANDLE          wh, wev;
+    USHORT          out_len;
+    unsigned        seq;
+    int             said;      /* a failed write was logged */
 } SonyDev;
 
 static SonyDev s_dev[PAD_HID_SONY_MAX];
@@ -148,6 +174,11 @@ static unsigned __stdcall sony_reader(void* arg)
         if (got) sony_parse(d, buf, got);
     }
     fprintf(stderr, "[cellPad] %s disconnected (HID)\n", d->kind == KIND_DS5 ? "DualSense" : "DualShock 4");
+    AcquireSRWLockExclusive(&d->wlock);
+    if (d->wh) CloseHandle(d->wh);
+    if (d->wev) CloseHandle(d->wev);
+    d->wh = d->wev = NULL;
+    ReleaseSRWLockExclusive(&d->wlock);
     CloseHandle(d->h);
     AcquireSRWLockExclusive(&d->lock);
     d->have = 0; d->h = NULL; d->path[0] = 0;
@@ -189,11 +220,14 @@ static void sony_scan(void)
         if (h == INVALID_HANDLE_VALUE)
             h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (h == INVALID_HANDLE_VALUE) continue;
-        USHORT in_len = 0;
+        USHORT in_len = 0, out_len = 0;
         PHIDP_PREPARSED_DATA pp;
         if (HidD_GetPreparsedData(h, &pp)) {
             HIDP_CAPS caps;
-            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS) in_len = caps.InputReportByteLength;
+            if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS) {
+                in_len = caps.InputReportByteLength;
+                out_len = caps.OutputReportByteLength;
+            }
             HidD_FreePreparsedData(pp);
         }
         int slot = -1;
@@ -204,13 +238,30 @@ static void sony_scan(void)
         SonyDev* d = &s_dev[slot];
         d->h = h; d->kind = kind; d->in_len = in_len; d->have = 0;
         wcscpy(d->path, path);
+        /* The write handle, if the pad takes output reports this long. */
+        uint8_t probe[1024];
+        d->out_len = out_len;
+        d->seq = 0;
+        d->said = 0;
+        d->wh = d->wev = NULL;
+        if (out_len <= sizeof probe &&
+            pad_hid_sony_rumble_report(kind == KIND_DS5, in_len > 64, 0, 0, 0, probe, out_len)) {
+            HANDLE w = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                   FILE_FLAG_OVERLAPPED, NULL);
+            HANDLE e = w != INVALID_HANDLE_VALUE ? CreateEventW(NULL, TRUE, FALSE, NULL) : NULL;
+            if (e) { d->wh = w; d->wev = e; }
+            else if (w != INVALID_HANDLE_VALUE) CloseHandle(w);
+        }
         HANDLE t = (HANDLE)_beginthreadex(NULL, 0, sony_reader, d, 0, NULL);
-        if (!t) { CloseHandle(h); d->path[0] = 0; InterlockedExchange(&d->used, 0); continue; }
+        if (!t) {
+            if (d->wh) { CloseHandle(d->wh); CloseHandle(d->wev); d->wh = d->wev = NULL; }
+            CloseHandle(h); d->path[0] = 0; InterlockedExchange(&d->used, 0); continue;
+        }
         SetThreadDescription(t, L"cellPad HID reader");
         CloseHandle(t);
-        fprintf(stderr, "[cellPad] %s connected (HID %s, PID %04X) as HID pad %d\n",
+        fprintf(stderr, "[cellPad] %s connected (HID %s, PID %04X) as HID pad %d%s\n",
                 kind == KIND_DS5 ? "DualSense" : "DualShock 4",
-                in_len > 64 ? "Bluetooth" : "USB", at.ProductID, slot);
+                in_len > 64 ? "Bluetooth" : "USB", at.ProductID, slot, d->wh ? "" : ", no vibration");
     }
     SetupDiDestroyDeviceInfoList(set);
 }
@@ -228,7 +279,10 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
     PS3_KNOB(off, getenv("PAD_NO_HID") && getenv("PAD_NO_HID")[0] != '0' ? 1 : 0);
     if (off) return 0;
     if (InterlockedCompareExchange(&s_started, 1, 0) == 0) {
-        for (int i = 0; i < PAD_HID_SONY_MAX; i++) InitializeSRWLock(&s_dev[i].lock);
+        for (int i = 0; i < PAD_HID_SONY_MAX; i++) {
+            InitializeSRWLock(&s_dev[i].lock);
+            InitializeSRWLock(&s_dev[i].wlock);
+        }
         HANDLE t = (HANDLE)_beginthreadex(NULL, 0, sony_scanner, NULL, 0, NULL);
         if (t) { SetThreadDescription(t, L"cellPad HID scan"); CloseHandle(t); }
     }
@@ -236,10 +290,94 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
     for (int i = 0; i < PAD_HID_SONY_MAX && n < max; i++) {
         if (!s_dev[i].used) continue;
         AcquireSRWLockShared(&s_dev[i].lock);
-        if (s_dev[i].have) out[n++] = s_dev[i].st;
+        if (s_dev[i].have) {
+            out[n] = s_dev[i].st;
+            out[n++].slot = (uint8_t)i;
+        }
         ReleaseSRWLockShared(&s_dev[i].lock);
     }
     return n;
 }
 
+int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak)
+{
+    if (slot < 0 || slot >= PAD_HID_SONY_MAX || !s_started) return 0;
+    SonyDev* d = &s_dev[slot];
+    uint8_t r[1024];
+    int ok = 0;
+    AcquireSRWLockExclusive(&d->wlock);
+    if (d->used && d->wh && d->out_len <= sizeof r &&
+        pad_hid_sony_rumble_report(d->kind == KIND_DS5, d->in_len > 64, d->seq, strong, weak, r, d->out_len)) {
+        d->seq = (d->seq + 1) & 15;
+        /* (overlapped, so a pad that stops answering costs 200 ms, not the thread) */
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
+        ov.hEvent = d->wev;
+        ResetEvent(d->wev);
+        DWORD put = 0, err = 0;
+        if (WriteFile(d->wh, r, d->out_len, NULL, &ov)) {
+            ok = GetOverlappedResult(d->wh, &ov, &put, FALSE);
+        } else if ((err = GetLastError()) == ERROR_IO_PENDING) {
+            if (WaitForSingleObject(d->wev, 200) != WAIT_OBJECT_0) CancelIoEx(d->wh, &ov);
+            ok = GetOverlappedResult(d->wh, &ov, &put, TRUE);
+        }
+        if (!ok && !d->said++) {
+            if (!err) err = GetLastError();
+            fprintf(stderr, "[cellPad] HID pad %d: vibration not sent (error %lu)\n", slot, (unsigned long)err);
+        }
+    }
+    ReleaseSRWLockExclusive(&d->wlock);
+    return ok;
+}
+
 #endif /* _WIN32 */
+
+/* The reports, on every host (the tests build them anywhere). */
+#include "pad_hid_sony.h"
+#include <string.h>
+
+/* CRC-32 (IEEE, reflected), as zlib's crc32: crc starts at 0. */
+static uint32_t sony_crc32(uint32_t crc, const uint8_t* p, size_t n)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+size_t pad_hid_sony_rumble_report(int ds5, int bt, unsigned seq, uint8_t strong, uint8_t weak, uint8_t* out,
+                                  size_t n)
+{
+    const size_t need = bt ? 78 : ds5 ? 48 : 32;
+    if (n < need) return 0;
+    memset(out, 0, n);
+    const size_t c = bt ? 3 : 1;   /* where the common part starts */
+    if (ds5) {
+        out[0] = bt ? 0x31 : 0x02;
+        if (bt) {
+            out[1] = (uint8_t)((seq & 15u) << 4);
+            out[2] = 0x10;
+        }
+        out[c + 0] = 0x03;    /* rumble the old way, haptics off */
+        out[c + 2] = weak;
+        out[c + 3] = strong;
+        out[c + 38] = 0x04;   /* the newer rumble emulation */
+    } else {
+        out[0] = bt ? 0x11 : 0x05;
+        if (bt) out[1] = 0xC4;   /* HID, CRC, input reports every 4 ms */
+        out[c + 0] = 0x01;    /* the motors only */
+        out[c + 3] = weak;
+        out[c + 4] = strong;
+    }
+    if (bt) {
+        static const uint8_t seed = 0xA2;
+        const uint32_t crc = sony_crc32(sony_crc32(0, &seed, 1), out, 74);
+        out[74] = (uint8_t)crc;
+        out[75] = (uint8_t)(crc >> 8);
+        out[76] = (uint8_t)(crc >> 16);
+        out[77] = (uint8_t)(crc >> 24);
+    }
+    return need;
+}
