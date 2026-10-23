@@ -86,6 +86,12 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 static volatile long s_host_hold;   /* cellPad_set_host_hold */
+/* Where each host port's vibration goes (the vibration thread, below): what
+ * the poll found on the port. s_poll_dev is the poll's own copy, published
+ * once a sweep is done, so the thread never sees a port empty mid-sweep. */
+enum { RUMBLE_NONE = 0, RUMBLE_XINPUT = 1, RUMBLE_SDL = 2, RUMBLE_HID = 0x10 /* | the HID pad's slot */ };
+static long          s_poll_dev[PAD_MAX_HOST_PORTS];
+static volatile long s_rumble_dev[PAD_MAX_HOST_PORTS];
 
 /* Host mouse input and the menu layer for the keyboard pad (cellPad_host_mouse_buttons, _mouse_wheel, _set_menu),
  * and the buttons a wheel notch presses now, up and down (pad_poll_keyboard works them out from PAD_KEYS). */
@@ -682,10 +688,12 @@ static void pad_poll_xinput(void)
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
+            s_poll_dev[i] = RUMBLE_NONE;
             continue;
         }
 
         s_host_state[i].connected = 1;
+        s_poll_dev[i] = RUMBLE_XINPUT;
         XINPUT_GAMEPAD* gp = &state.Gamepad;
 
         /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
@@ -743,6 +751,7 @@ static void pad_poll_hid(void)
         hs->analog_rx  = hid[k].rx; hs->analog_ry = hid[k].ry;
         hs->trigger_l2 = hid[k].l2; hs->trigger_r2 = hid[k].r2;
         pad_press_from_buttons(hs);
+        s_poll_dev[i] = RUMBLE_HID | hid[k].slot;
     }
 }
 
@@ -831,6 +840,7 @@ static void pad_poll_sdl2(void)
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc || !SDL_GameControllerGetAttached(gc)) {
             s_host_state[i].connected = 0;
+            s_poll_dev[i] = RUMBLE_NONE;
             if (gc) {
                 SDL_LockJoysticks();   /* (pad_hid_sony_poll reads the list from another thread) */
                 SDL_GameControllerClose(gc);
@@ -841,6 +851,7 @@ static void pad_poll_sdl2(void)
         }
 
         s_host_state[i].connected = 1;
+        s_poll_dev[i] = RUMBLE_SDL;
         pad_sdl_read(gc, &s_host_state[i]);
     }
 }
@@ -863,6 +874,7 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
         out[n].lx = hs.analog_lx; out[n].ly = hs.analog_ly;
         out[n].rx = hs.analog_rx; out[n].ry = hs.analog_ry;
         out[n].l2 = hs.trigger_l2; out[n].r2 = hs.trigger_r2;
+        out[n].slot = (uint8_t)i;
         n++;
     }
     SDL_UnlockJoysticks();
@@ -997,6 +1009,7 @@ static void pad_poll_none(void)
         memset(hs, 0, sizeof *hs);
         hs->connected = i == 0;
         hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+        s_poll_dev[i] = RUMBLE_NONE;
     }
     static int said = 0;
     if (!said) {
@@ -1004,6 +1017,12 @@ static void pad_poll_none(void)
         printf("[cellPad] PS3_NO_USER_INPUT: no pad or key of the user's is read; scripted input only\n");
         fflush(stdout);
     }
+}
+
+static void pad_publish_devices(void)
+{
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_rumble_dev[i] != s_poll_dev[i]) InterlockedExchange(&s_rumble_dev[i], s_poll_dev[i]);
 }
 
 static void pad_poll_backend(void)
@@ -1021,6 +1040,7 @@ static void pad_poll_backend(void)
 
     if (ps3_no_user_input()) {   /* (nothing for the host hold to hold) */
         pad_poll_none();
+        pad_publish_devices();
         return;
     }
 #if PAD_BACKEND_XINPUT
@@ -1029,6 +1049,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    pad_publish_devices();
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
 #if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
     pad_poll_keyboard();
@@ -1833,6 +1854,138 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
     return CELL_OK;
 }
 
+/* ---------------------------------------------------------------------------
+ * Vibration (cellPadSetActDirect)
+ *
+ * A game sets a pad's two motors: motor[0] the small one, on (anything but 0)
+ * or off, and motor[1] the large one, 0-255. A DualShock 3's large motor does
+ * not turn at 63 or less, so a game tuned on one sends low values for still:
+ * the large value goes through that threshold and is spread over the rest of
+ * the range, and the small motor runs at full speed while it is on (as RPCS3
+ * maps them). Demon's Souls sends the small motor 1 for on, which as 1/255 of
+ * full speed was never felt.
+ *
+ * A thread of its own sends the motors to the pads, so a slow write (a Sony
+ * pad's Bluetooth report) never holds a game thread: on a change, at most
+ * every 20 ms; again every 300 ms while they run (an SDL rumble has a length,
+ * and a pad that lost a report gets the next); off when the game has not set
+ * them for 3 s (a game that stopped calling), when cellPad ends and at exit.
+ * Port i goes to XInput user i, else the Sony HID pad on that port
+ * (pad_poll_hid); with SDL, to controller i.
+ *
+ * PAD_RUMBLE=0 (live) keeps every pad still. PS3_NO_USER_INPUT=1 opens no pad
+ * of the user's, so nothing is sent; PAD_RUMBLE_TRACE=1 logs each change the
+ * game asks for either way.
+ * -----------------------------------------------------------------------*/
+static volatile long s_rumble_want[PAD_MAX_HOST_PORTS];   /* large << 8 | small, as sent */
+static volatile unsigned long long s_rumble_at[PAD_MAX_HOST_PORTS];   /* the game's last set (pad_now_ms) */
+static long s_rumble_sent[PAD_MAX_HOST_PORTS], s_rumble_sent_dev[PAD_MAX_HOST_PORTS];   /* the thread's */
+static HANDLE s_rumble_wake;
+static volatile long s_rumble_started, s_rumble_exit;
+
+static unsigned rumble_large(unsigned v)
+{
+    return v <= 63 ? 0 : (v - 63) * 255 / 192;
+}
+
+static int rumble_on(void)
+{
+    static int on = 1;
+    PS3_KNOB(on, ps3_env_int("PAD_RUMBLE", 1));
+    return on != 0;
+}
+
+static void rumble_send(long dev, int port, long want)
+{
+    const unsigned strong = (unsigned)(want >> 8) & 0xFFu, weak = (unsigned)want & 0xFFu;
+#if PAD_BACKEND_XINPUT
+    if (dev == RUMBLE_XINPUT) {
+        XINPUT_VIBRATION v;
+        v.wLeftMotorSpeed = (WORD)(strong * 257);   /* the low-frequency, strong motor */
+        v.wRightMotorSpeed = (WORD)(weak * 257);
+        XInputSetState((DWORD)port, &v);
+    } else if (dev & RUMBLE_HID) {
+        pad_hid_sony_rumble((int)(dev & 0xF), (uint8_t)strong, (uint8_t)weak);
+    }
+#elif PAD_BACKEND_SDL2
+    if (dev == RUMBLE_SDL) {
+        SDL_LockJoysticks();   /* (the poll closes a controller under it) */
+        if (s_sdl_controllers[port])
+            SDL_GameControllerRumble(s_sdl_controllers[port], (Uint16)(strong * 257), (Uint16)(weak * 257), 500);
+        SDL_UnlockJoysticks();
+    }
+#else
+    (void)dev; (void)port; (void)strong; (void)weak;
+#endif
+}
+
+static DWORD WINAPI rumble_thread(LPVOID arg)
+{
+    (void)arg;
+    unsigned long long sent_at[PAD_MAX_HOST_PORTS] = {0};
+    for (;;) {
+        const unsigned long long now = pad_now_ms();
+        const int on = rumble_on() && s_pad_initialized && !s_rumble_exit;
+        int busy = 0;
+        for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+            const long dev = s_rumble_dev[i];
+            long want = s_rumble_want[i];
+            if (!on || now - s_rumble_at[i] > 3000) want = 0;
+            if (dev != s_rumble_sent_dev[i]) {   /* another pad on the port, or none */
+                if (s_rumble_sent[i] && s_rumble_sent_dev[i]) rumble_send(s_rumble_sent_dev[i], i, 0);
+                s_rumble_sent[i] = 0;
+                s_rumble_sent_dev[i] = dev;
+                sent_at[i] = 0;
+            }
+            if (!dev) continue;
+            const unsigned long long since = now - sent_at[i];
+            if (want != s_rumble_sent[i] ? since >= 20 : want && since >= 300) {
+                rumble_send(dev, i, want);
+                s_rumble_sent[i] = want;
+                sent_at[i] = now;
+            }
+            /* (the game's ask counts while it is fresh, so PAD_RUMBLE=1 brings it back at once) */
+            if (s_rumble_sent[i] || (s_rumble_want[i] && now - s_rumble_at[i] <= 3000)) busy = 1;
+        }
+        WaitForSingleObject(s_rumble_wake, busy ? 10 : 1000);
+    }
+    return 0;
+}
+
+/* At exit: the motors off (a pad keeps the last report it got). */
+static void rumble_atexit(void)
+{
+    InterlockedExchange(&s_rumble_exit, 1);
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        if (s_rumble_sent[i] && s_rumble_sent_dev[i]) rumble_send(s_rumble_sent_dev[i], i, 0);
+}
+
+static void rumble_set(u32 port, unsigned weak, unsigned strong)
+{
+    const long want = (long)(rumble_large(strong) << 8 | (weak ? 255u : 0u));
+    s_rumble_at[port] = pad_now_ms();
+    static int trace = -1, calls = 0;
+    PS3_KNOB(trace, ps3_env_int("PAD_RUMBLE_TRACE", 0));
+    if (trace && !calls++) {   /* (the first call, the motors still or not) */
+        printf("[cellPad] vibration: the game's first set, port %u: small %u large %u\n", port, weak, strong);
+        fflush(stdout);
+    }
+    if (want == s_rumble_want[port]) return;
+    if (trace) {
+        printf("[cellPad] vibration, port %u: small %u large %u -> small %ld large %ld%s\n", port, weak, strong,
+               want & 0xFF, want >> 8, !rumble_on() ? " (PAD_RUMBLE=0)" : ps3_no_user_input() ? " (no pads open)" : "");
+        fflush(stdout);
+    }
+    InterlockedExchange(&s_rumble_want[port], want);
+    if (InterlockedCompareExchange(&s_rumble_started, 1, 0) == 0) {
+        s_rumble_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        atexit(rumble_atexit);
+        HANDLE t = CreateThread(NULL, 0, rumble_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    if (s_rumble_wake) SetEvent(s_rumble_wake);
+}
+
 s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 {
     if (!s_pad_initialized)
@@ -1842,28 +1995,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     param = GUEST_PTR(param, CellPadActParam*);
-
-#if PAD_BACKEND_XINPUT
-    /* Map to XInput vibration */
-    if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
-        XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
-        XInputSetState((DWORD)port_no, &vib);
-    }
-#endif
-
-#if PAD_BACKEND_SDL2
-    if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
-        SDL_GameControllerRumble(
-            s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
-            100 /* duration ms */
-        );
-    }
-#endif
-
+    if (port_no < PAD_MAX_HOST_PORTS)
+        rumble_set(port_no, param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL], param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE]);
     return CELL_OK;
 }
 
