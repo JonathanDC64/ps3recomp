@@ -3537,6 +3537,7 @@ static void*         s_pso_lib_blob;        /* the library reads from this while
 static SRWLOCK       s_pso_lib_lock = SRWLOCK_INIT;   /* Load/Store */
 static volatile LONG s_pso_lib_new;         /* pipelines stored since the last save */
 static volatile LONG s_pso_lib_saving;
+static volatile LONG s_pso_man_pending;     /* manifest records queued or being written */
 static u32           s_pso_lib_quiet;       /* presents since the last store */
 static volatile LONG s_pso_lib_hits, s_pso_lib_live;   /* draws: loaded / compiled */
 static SRWLOCK       s_pso_man_lock = SRWLOCK_INIT;   /* the manifest's names and file (pso_manifest_write) */
@@ -3555,7 +3556,7 @@ static u32           s_pso_man_read;
 static u64*          s_pso_names;           /* open-addressed set of record names */
 static u32           s_pso_names_cap, s_pso_names_n;
 static u32           s_pso_lib_have;        /* records the loaded library holds */
-static volatile LONG s_pso_pre_next, s_pso_pre_live, s_pso_pre_built, s_pso_pre_abort;
+static volatile LONG s_pso_pre_next, s_pso_pre_live, s_pso_pre_built, s_pso_pre_had, s_pso_pre_abort;
 static int           s_pso_pre_started;
 static double        s_pso_pre_t0;
 
@@ -3709,8 +3710,8 @@ static void pso_index_tick(void);
 static void pso_index_build_start(void);
 /* Serialize can fail when a pipeline is stored between sizing and writing;
  * the next attempt sizes again. pso_library.n follows the library, so after a
- * crash between the two it only undercounts, and the next startup rebuilds a
- * few pipelines the library already had. */
+ * crash between the two it only undercounts, and the next startup's build
+ * finds those pipelines in the library (pso_prebuild_one). */
 static void pso_lib_save(void)
 {
     for (int tries = 0; tries < 3; tries++) {
@@ -3811,6 +3812,7 @@ static void pso_manifest_done(PsoManItem* it)
 {
     pso_manifest_write(it);
     free(it->sh[0]); free(it->sh[1]); free(it);
+    InterlockedDecrement(&s_pso_man_pending);
 }
 
 static DWORD WINAPI pso_manifest_thread(LPVOID unused)
@@ -3856,6 +3858,7 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         if (!it->sh[i]) { free(it->sh[0]); free(it); return; }
         memcpy(it->sh[i], sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
     }
+    InterlockedIncrement(&s_pso_man_pending);
     AcquireSRWLockExclusive(&s_pso_manq.lk);
     if (s_pso_manq.tail) s_pso_manq.tail->next = it; else s_pso_manq.head = it;
     s_pso_manq.tail = it;
@@ -3874,8 +3877,31 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         }
     }
 }
+/* Store a pipeline under its name, unless the library has that name. Storing
+ * a name the library held (from the file, or stored by another thread in the
+ * meantime) made the library's next Serialize read past a buffer in
+ * D3D12Core (seen 2026-10-23), so the name is looked up first, under the
+ * same lock. 1 if stored. */
+static int pso_lib_store(const WCHAR* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+                         ID3D12PipelineState* pso)
+{
+    ID3D12PipelineState* had = NULL;
+    int stored = 0;
+    AcquireSRWLockExclusive(&s_pso_lib_lock);
+    if (SUCCEEDED(s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
+                      &IID_ID3D12PipelineState, (void**)&had)))
+        had->lpVtbl->Release(had);
+    else if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso))) {
+        InterlockedIncrement(&s_pso_lib_new);
+        stored = 1;
+    }
+    ReleaseSRWLockExclusive(&s_pso_lib_lock);
+    return stored;
+}
+
 /* One startup build: the record's shaders from pso_blobs, its description
- * back together, and its name checked against the rebuilt description. */
+ * back together, and its name checked against the rebuilt description.
+ * 1: built, 2: the library had it, 0: not built. */
 static int pso_prebuild_one(const pso_rec* r)
 {
     char dir[MAX_PATH + 32];
@@ -3901,15 +3927,21 @@ static int pso_prebuild_one(const pso_rec* r)
     for (u32 i = 0; i < r->nel && i < 16; i++) { il[i] = r->el[i].e; il[i].SemanticName = r->el[i].sem; }
     pd.InputLayout.pInputElementDescs = r->nel ? il : NULL;
     if (pso_desc_key(&pd) != r->name) goto out;   /* another build's layout, or a stale root signature */
+    WCHAR name[20];
+    swprintf(name, 20, L"%016llx", (unsigned long long)r->name);
     ID3D12PipelineState* pso = NULL;
+    /* A record pso_library.n does not count may be in the library already:
+     * one stored while the library was being saved, or a crash between the
+     * two files. It is loaded then, not built. */
+    AcquireSRWLockExclusive(&s_pso_lib_lock);
+    const HRESULT lh = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, &pd,
+                           &IID_ID3D12PipelineState, (void**)&pso);
+    ReleaseSRWLockExclusive(&s_pso_lib_lock);
+    if (SUCCEEDED(lh)) { pso->lpVtbl->Release(pso); ok = 2; goto out; }
+    pso = NULL;
     if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
             s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
-        WCHAR name[20];
-        swprintf(name, 20, L"%016llx", (unsigned long long)r->name);
-        AcquireSRWLockExclusive(&s_pso_lib_lock);
-        if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso)))
-            InterlockedIncrement(&s_pso_lib_new);
-        ReleaseSRWLockExclusive(&s_pso_lib_lock);
+        pso_lib_store(name, &pd, pso);
         pso->lpVtbl->Release(pso);
         ok = 1;
     }
@@ -3924,17 +3956,20 @@ static DWORD WINAPI pso_prebuild_thread(LPVOID unused)
     for (;;) {
         const u32 i = s_pso_lib_have + (u32)(InterlockedIncrement(&s_pso_pre_next) - 1);
         if (i >= s_pso_man_read || s_pso_pre_abort) break;
-        if (pso_prebuild_one(&s_pso_man[i])) InterlockedIncrement(&s_pso_pre_built);
+        const int r = pso_prebuild_one(&s_pso_man[i]);
+        if (r) InterlockedIncrement(r == 2 ? &s_pso_pre_had : &s_pso_pre_built);
     }
     if (InterlockedDecrement(&s_pso_pre_live) == 0)
-        printf("[D3D12] pipeline prebuild: %ld of %u built in %.0f ms\n", s_pso_pre_built,
-               s_pso_man_read - s_pso_lib_have, 1000.0 * (perf_now() - s_pso_pre_t0));
+        printf("[D3D12] pipeline prebuild: %ld of %u built, %ld there already, in %.0f ms\n",
+               s_pso_pre_built, s_pso_man_read - s_pso_lib_have, s_pso_pre_had,
+               1000.0 * (perf_now() - s_pso_pre_t0));
     return 0;
 }
 /* Once per present, on the render thread. Starts the startup build once the
  * root signature exists, then the pipeline index's, and saves in the
- * background once those builds are done and a burst of new pipelines has
- * settled (120 presents with none, or 256 pending). */
+ * background once those builds are done, the manifest has every record
+ * queued so far (pso_library.n counts its records), and a burst of new
+ * pipelines has settled (120 presents with none, or 256 pending). */
 static void pso_lib_tick(void)
 {
     if (!s_pso_lib) return;
@@ -3956,7 +3991,7 @@ static void pso_lib_tick(void)
      * library by then, and the index builds only what is not. */
     if (s_pso_pre_started && !s_pso_pre_live) pso_index_build_start();
     pso_index_tick();
-    if (!s_pso_lib_new || s_pso_lib_saving || s_pso_pre_live || s_pxb_live) return;
+    if (!s_pso_lib_new || s_pso_lib_saving || s_pso_pre_live || s_pxb_live || s_pso_man_pending) return;
     if (++s_pso_lib_quiet < 120 && s_pso_lib_new < 256) return;
     if (InterlockedCompareExchange(&s_pso_lib_saving, 1, 0) == 0) {
         HANDLE t = CreateThread(NULL, 0, pso_lib_save_thread, NULL, 0, NULL);
@@ -3983,10 +4018,7 @@ static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
         s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
     if (SUCCEEDED(hr)) {
-        AcquireSRWLockExclusive(&s_pso_lib_lock);
-        const HRESULT st = s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, *out);
-        ReleaseSRWLockExclusive(&s_pso_lib_lock);
-        if (SUCCEEDED(st)) { InterlockedIncrement(&s_pso_lib_new); s_pso_lib_quiet = 0; }
+        if (pso_lib_store(name, pd, *out)) s_pso_lib_quiet = 0;
         pso_manifest_add(key, pd);
     }
     return hr;
@@ -5340,10 +5372,7 @@ static int pxi_build_one(const PxiItem* it, ID3DBlob* gs)
                 pso = NULL;
                 if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
                         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
-                    AcquireSRWLockExclusive(&s_pso_lib_lock);
-                    if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso)))
-                        InterlockedIncrement(&s_pso_lib_new);
-                    ReleaseSRWLockExclusive(&s_pso_lib_lock);
+                    pso_lib_store(name, &pd, pso);
                     pso_manifest_add(key, &pd);
                     r = 1;
                 }
