@@ -42,9 +42,17 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  *
  * Returns host_path unchanged when it is not an EDAT, or when decryption fails (the
  * caller then opens the original and the guest reports its own error -- better than
- * an open() failure it cannot attribute). Otherwise returns a cache path, written
- * into `buf`. The cache lives beside the source as "<name>.dec" and is reused while
- * it is newer than the source. Set PS3_EDAT=0 to disable the whole path. */
+ * an open() failure it cannot attribute). Otherwise returns a path written into
+ * `buf`:
+ *   - with PS3_EDAT_PLAIN=<folder>, the player's own decrypted copy when that folder
+ *     has one: at the file's path below PS3_VFS_ROOT, named "<name>.unedat" (RPCS3's
+ *     Decrypt PS3 Binaries' name), of the size the header gives. Nothing is
+ *     decrypted or written then.
+ *   - else a cache of the runtime's own decryption: beside the source as
+ *     "<name>.dec", or, with PS3_EDAT_CACHE=<folder>, in that folder as
+ *     "<name>.<hash of the source's path>.dec" (the game folder is then only read).
+ *     It is reused while it is newer than the source.
+ * Set PS3_EDAT=0 to disable the whole path. */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap);
 
 /* Self-check of the AES-128 and AES-CMAC primitives against the FIPS-197 and
