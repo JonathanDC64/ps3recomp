@@ -421,7 +421,7 @@ typedef struct {
                              * and a 2D variant of the same program are different
                              * pipelines and must not share a cache entry. */
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
-    u32 uvclamp;            /* dr_uvclamp: the target's RSX_SCALE percent, 0 = off (PSO key) */
+    u32 uvclamp;            /* 1 with the sprite-edge clamp (dr_uvclamp), else 0 (PSO key) */
     ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
     int next;               /* vp_fp_find: next entry in this fp_addr's bucket */
 } VPFPEntry;
@@ -4459,7 +4459,12 @@ static u32 fp_units_at(u32 off)
  * pixel in texture units is half the coordinate's change over one guest pixel:
  * fwidth over a host pixel times the scale. A quad split into two triangles
  * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
- * untouched. RSX_SCALE_UVCLAMP=0 turns it off. */
+ * untouched. RSX_SCALE_UVCLAMP=0 turns it off.
+ *
+ * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
+ * not in its text: one shader and one pipeline serve every scale, so a
+ * precompile at any scale (rsx_shader_precompile, RSX_PRECOMPILE_2D) builds the
+ * shader a scaled draw looks up, and a change of scale compiles nothing. */
 static u32 dr_uvclamp(const D3D12DrawRecord* dr)
 {
     static int en = -1;
@@ -4526,9 +4531,9 @@ static ID3DBlob* uvclamp_gs(void)
 /* The pixel-shader half of the above, on a translated program's HLSL: the
  * bounds as inputs after TEXCOORD9 (declared here if the program did not read
  * it, so the inputs line up with the geometry shader's outputs), and the clamp
- * at the top of main. Returns 0, leaving hlsl as it was, if an anchor is
- * missing or the buffer is too small. */
-static int fp_inject_uvclamp(char* hlsl, size_t cap, u32 pct)
+ * at the top of main, half the scale from rsx_alphatest.w. Returns 0, leaving
+ * hlsl as it was, if an anchor is missing or the buffer is too small. */
+static int fp_inject_uvclamp(char* hlsl, size_t cap)
 {
     static const char tc7[] =
         "float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n";
@@ -4550,7 +4555,7 @@ static int fp_inject_uvclamp(char* hlsl, size_t cap, u32 pct)
         "    nointerpolation float4 uvb6:UVBOUND6; nointerpolation float4 uvb7:UVBOUND7;\n",
         has9 ? "" : "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
     char code[2048];
-    int n = snprintf(code, sizeof code, "\n    { const float k = %u.0 / 200.0;   /* half the scale: half a guest pixel, in host pixels */\n", pct);
+    int n = snprintf(code, sizeof code, "\n    { const float k = rsx_alphatest.w;   /* half the scale: half a guest pixel, in host pixels */\n");
     for (int i = 0; i < 8; i++)
         n += snprintf(code + n, sizeof code - (size_t)n,
             "      { const float2 h = k * fwidth(input.tc%d.xy);"
@@ -4620,7 +4625,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.gen = s_d3d.vp_gen; key.blend = blend; key.nrt = nrt;
     key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
-    key.d2c_mask = d2c_mask; key.uvclamp = uvclamp;
+    key.d2c_mask = d2c_mask; key.uvclamp = uvclamp != 0;
     key.pso = NULL;
     { const VPFPEntry* hit = vp_fp_find(&key); if (hit) return hit->pso; }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -4843,7 +4848,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
           }
       } }
     ID3DBlob* gsb = uvclamp ? uvclamp_gs() : NULL;
-    if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl, uvclamp)) gsb = NULL;
+    if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb = NULL;
     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
     HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
     if (FAILED(hr) || !pb) {
@@ -6227,7 +6232,10 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
          * has no fixed alpha test; guest FPs discard on it dynamically
          * (wave's colour wheel is a disc via alpha test -- without it the
-         * palette drew as an opaque square). */
+         * palette drew as an opaque square). w: half the RSX_SCALE factor,
+         * for the sprite-edge clamp (fp_inject_uvclamp); a shader without
+         * the clamp never reads it. */
+        const float half_scale = (float)rsx_scale_pct() / 200.0f;
         static int noat = -1;   /* knobs: this runs for every draw */
         PS3_KNOB(noat, getenv("NO_ALPHATEST") ? 1 : 0);
         if (dr && !noat) {
@@ -6239,10 +6247,10 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             at[0] = (float)((dr->alpha_ctl >> 16) & 1u);
             at[1] = (float)(dr->alpha_ctl & 0xFFu) / 255.0f;
             at[2] = (float)((dr->alpha_ctl >> 8) & 0x07u);
-            at[3] = 0.0f;
+            at[3] = half_scale;
         } else {
             float* at = &ts[FPCB_ALPHA * 4];
-            at[0] = 0.0f; at[1] = 0.0f; at[2] = 7.0f; at[3] = 0.0f;
+            at[0] = 0.0f; at[1] = 0.0f; at[2] = 7.0f; at[3] = half_scale;
         }
 
         /* fp_k[]: the program's inline fragment constants, re-read from the
@@ -13854,14 +13862,17 @@ int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_s
     extern u32 rsx_vp_program_size_instrs(const u8*, u32);
     extern void rsx_vp_set_branch_base(u32);
     if (!ucode || !out || cap < 2) return 0;
-    if (fragment == 1) {
+    if (fragment == 1 || fragment == 3) {
         /* The decompiler may read up to RSX_FP_MAX_BYTES, as it does from
          * guest memory; give it a zero tail. */
         u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
         if (!buf) return 0;
         memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-        const int n = fp_build_hlsl(buf, exp32, cube_mask, d2c_mask, out, cap, 0, 0);
+        int n = fp_build_hlsl(buf, exp32, cube_mask, d2c_mask, out, cap, 0, 0);
         free(buf);
+        /* 3: as a draw without a depth test on a scaled target has it (the
+         * sprite-edge clamp, vp_get_fp_pso). */
+        if (fragment == 3 && n > 0 && !fp_inject_uvclamp(out, cap)) n = 0;
         return n;
     }
     /* The binary holds big-endian words; rsx_state keeps the words

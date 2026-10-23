@@ -35,7 +35,7 @@ static Kinds s_conv;
 static Kinds s_alt[16];
 static int   s_nalt;
 
-typedef struct { char* name; uint8_t* data; size_t n; } Program;
+typedef struct { char* name; uint8_t* data; size_t n; unsigned flags; } Program;
 static Program* s_progs;
 static unsigned s_nprogs, s_progcap;
 
@@ -139,12 +139,20 @@ static void queue(const char* name, int fragment, const uint8_t* uc, uint32_t us
         s_jobs = j2;
         s_jobcap = cap;
     }
-    s_jobs[s_njobs].fragment = fragment == 1;
+    s_jobs[s_njobs].fragment = fragment == 1 || fragment == 3;
     s_jobs[s_njobs].hlsl = hlsl;
     s_jobs[s_njobs].name = name;
     s_njobs++;
     ReleaseSRWLockExclusive(&s_lock);
     WakeConditionVariable(&s_cv);
+}
+
+/* One fragment-program variant, and its sprite-edge-clamp form for a program
+ * drawn in 2D (RSX_PRECOMPILE_2D). */
+static void queue_fp(const Program* p, const uint8_t* uc, uint32_t usz, uint32_t exp32, uint32_t cube, uint32_t d2c)
+{
+    queue(p->name, 1, uc, usz, 0, exp32, cube, d2c);
+    if (p->flags & RSX_PRECOMPILE_2D) queue(p->name, 3, uc, usz, 0, exp32, cube, d2c);
 }
 
 /* One Cg binary: queue the HLSL texts a draw would compile for it. */
@@ -171,22 +179,26 @@ static void add_program(const Program* p)
     }
     const uint32_t exp32 = b[prog + 19] ? 0 : 1;   /* CgBinaryFragmentProgram.outputFromH0 */
     const uint32_t used = rsx_fp_texture_units(uc, usz);
-    queue(p->name, 1, uc, usz, 0, exp32, 0, 0);
+    queue_fp(p, uc, usz, exp32, 0, 0);
     const uint32_t cc = s_conv.cube & (used | used << 16), cd = s_conv.d2c & used;
-    queue(p->name, 1, uc, usz, 0, exp32, cc, cd);
+    queue_fp(p, uc, usz, exp32, cc, cd);
     for (int i = 0; i < s_nalt; i++)
         if ((s_alt[i].cube & (used | used << 16)) || (s_alt[i].d2c & used)) {
             /* The alternative replaces whatever the convention made that unit. */
             const uint32_t u = (s_alt[i].cube | s_alt[i].cube >> 16 | s_alt[i].d2c) & 0xFFFFu;
-            queue(p->name, 1, uc, usz, 0, exp32,
-                  (cc & ~(u | u << 16)) | s_alt[i].cube, (cd & ~u) | s_alt[i].d2c);
+            queue_fp(p, uc, usz, exp32, (cc & ~(u | u << 16)) | s_alt[i].cube, (cd & ~u) | s_alt[i].d2c);
         }
     uint32_t v[MAX_VARIANTS * 3];
     const int nv = rsx_d3d12_shader_fp_variants(uc, usz, v, MAX_VARIANTS);
-    for (int i = 0; i < nv; i++) queue(p->name, 1, uc, usz, 0, v[i * 3], v[i * 3 + 1], v[i * 3 + 2]);
+    for (int i = 0; i < nv; i++) queue_fp(p, uc, usz, v[i * 3], v[i * 3 + 1], v[i * 3 + 2]);
 }
 
 void rsx_shader_precompile_add(const char* name, const uint8_t* cg, size_t n)
+{
+    rsx_shader_precompile_add_flags(name, cg, n, 0);
+}
+
+void rsx_shader_precompile_add_flags(const char* name, const uint8_t* cg, size_t n, unsigned flags)
 {
     if (s_nhandles) return;   /* started */
     if (s_nprogs == s_progcap) {
@@ -202,6 +214,7 @@ void rsx_shader_precompile_add(const char* name, const uint8_t* cg, size_t n)
     if (!p->data || !p->name) { free(p->data); free(p->name); return; }
     memcpy(p->data, cg, n);
     p->n = n;
+    p->flags = flags;
     s_nprogs++;
 }
 
@@ -321,6 +334,10 @@ void rsx_shader_precompile_wait(void)
 
 int  rsx_shader_precompile_kinds(const char* units, const char* alts) { (void)units; (void)alts; return 1; }
 void rsx_shader_precompile_add(const char* name, const uint8_t* cg, size_t n) { (void)name; (void)cg; (void)n; }
+void rsx_shader_precompile_add_flags(const char* name, const uint8_t* cg, size_t n, unsigned flags)
+{
+    (void)name; (void)cg; (void)n; (void)flags;
+}
 int  rsx_shader_precompile_start(int threads) { (void)threads; return -1; }
 void rsx_shader_precompile_get(rsx_shader_precompile_stats* st) { if (st) { static const rsx_shader_precompile_stats z; *st = z; } }
 float rsx_shader_precompile_fraction(void) { return 1.0f; }
