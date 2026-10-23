@@ -2816,8 +2816,17 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * the backend had to guess where each frame ended (half-drawn frames,
      * without the HUD or the post chain, whenever the game hitched). libgcm
      * writes its 8-byte flip command there, so the title has room for our
-     * 4-byte marker. */
-    const int past_end = cb_on && cur >= end;
+     * 4-byte marker.
+     *
+     * A context seen past end once is such a title for good. Demon's Souls'
+     * current is not always past end at a flip: at 138 fps about one flip in
+     * 2,000 came in the last 4 KB before it, took the immediate path, and the
+     * walker, with no flip in the stream, put that frame and the next into one
+     * present (twice the draws, a frame shown two refreshes). libgcm writes its
+     * flip there too. A title that never runs past end is unchanged. */
+    static u32 s_own_ring_ctx = 0;
+    if (cb_on && cur >= end) s_own_ring_ctx = ctx;
+    const int past_end = cb_on && (cur >= end || ctx == s_own_ring_ctx);
     /* Never near the end: those bytes are the title's reserve before its
      * ring wraps, and the recycle above keys on them. */
     if (!past_end && cur + 8 + GCM_RECYCLE_SLACK > end) return 0;
