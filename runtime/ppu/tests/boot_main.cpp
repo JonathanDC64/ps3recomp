@@ -258,16 +258,21 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
     fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=ydkj_boot.exe 0x%llX)\n",
             (void*)mod, (unsigned long long)((char*)er->ExceptionAddress - (char*)mod),
             (unsigned long long)((char*)er->ExceptionAddress - (char*)mod));
-    /* Host call stack (RVAs) so the lifted caller can be symbolized. */
-    void* frames[24];
-    USHORT n = RtlCaptureStackBackTrace(0, 24, frames, NULL);
+    /* Host call stack (RVAs) so the lifted caller can be symbolized. Every
+     * frame, with the module its RVA is in: a fault in a system DLL
+     * (ucrtbase's memcpy, a driver) is found from its callers, which are in
+     * other modules. */
+    void* frames[32];
+    USHORT n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
     for (USHORT i = 0; i < n; i++) {
         HMODULE m = NULL;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m);
-        if (m == mod)
-            fprintf(stderr, "[CRASH]   #%-2u rva=0x%llX\n", i,
-                    (unsigned long long)((char*)frames[i] - (char*)m));
+        char path[MAX_PATH] = "?";
+        if (m) GetModuleFileNameA(m, path, sizeof path);
+        const char* name = strrchr(path, '\\');
+        fprintf(stderr, "[CRASH]   #%-2u rva=0x%llX %s\n", i,
+                (unsigned long long)((char*)frames[i] - (char*)m), name ? name + 1 : path);
     }
     fflush(stderr);
     return EXCEPTION_EXECUTE_HANDLER;
