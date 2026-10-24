@@ -268,6 +268,7 @@ static inline void ppu_lvrx(void* d, const uint8_t* m, uint32_t sh) {
     _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)m), idx));
 }
 #else
+#include <math.h>   /* signbit, sqrtf: the loops below, wherever this block is copied */
 static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c) {
     const uint8_t* pa = (const uint8_t*)a; const uint8_t* pb = (const uint8_t*)b; const uint8_t* pc = (const uint8_t*)c;
     uint8_t tmp[16];
