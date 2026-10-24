@@ -5548,6 +5548,15 @@ static int fp_hdr_sat_units(char* hlsl, size_t cap, u32 mask)
     return k;
 }
 
+/* A fragment program's text in HDR variant hdrv (dr_hdrv), as vp_get_fp_pso
+ * makes it; the pipeline index's build (rsx_shader_precompile.c) makes its
+ * rows' texts with it too. Returns how many clamps or samples it changed. */
+int rsx_d3d12_shader_hdr(char* hlsl, u32 cap, u32 hdrv)
+{
+    if (!hlsl || !hdrv) return 0;
+    return (hdrv & HDRV_SAT) ? fp_hdr_sat_units(hlsl, cap, hdrv & ~HDRV_SAT) : fp_hdr_unclamp(hlsl, cap, hdrv);
+}
+
 /* At a batch's start, before any target is made: the targets promoted in this
  * batch, as the last batch found them. */
 static void hdr_batch_start(void)
@@ -5740,7 +5749,7 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
  * (until the list changes, or a new library removes the file: pso_lib_open).
  *
  * A row, tab-separated, in hex:
- *   vp vstart vfetch fp exp32 cube d2c clamp blend nrt rtfmt cmask cull depth
+ *   vp vstart vfetch fp exp32 cube d2c clamp blend nrt rtfmt cmask cull depth [hdrv]
  * vp: FNV-1a 64 of the vertex program's words up to its END instruction, as
  *   the transform program store holds them (little-endian); vstart: the
  *   transform program start it was decompiled at; vfetch: 1 for the fetch
@@ -5748,8 +5757,11 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
  * fp: rsx_fp_code_hash64 (the instructions without their inline constants);
  *   exp32, cube, d2c: as fp_build_hlsl takes them, the masks cut to the units
  *   the program samples; clamp: 1 for the sprite-edge clamp form.
- * The rest are vp_get_fp_pso's arguments. A program whose constants are in
- * its text (s_fp_baked) is not recorded.
+ * The rest are vp_get_fp_pso's arguments. hdrv, only in a row with HDR on
+ * (RSX_HDR), when it is not 0: the program's HDR variant (dr_hdrv), a read
+ * clamp's mask cut to the units the program samples. A row without it builds
+ * the plain text, as every row did before the field.
+ * A program whose constants are in its text (s_fp_baked) is not recorded.
  * PS3_PSO_INDEX=0 turns recording and building off. */
 static int pso_index_on(void)
 {
@@ -5818,17 +5830,20 @@ static void pxr_load(void)
 }
 
 static void pso_index_note(const VPVSEntry* vs, const u8* fp_ucode, int exp32, u32 cube, u32 d2c, int clamp,
-                           u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth)
+                           u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth, u32 hdrv)
 {
     if (!pso_index_on() || !vs->code64 || s_fp_baked || !shader_cache_dir()[0]) return;
     const u32 used = rsx_fp_texture_units(fp_ucode, RSX_FP_MAX_BYTES);
     cube &= used | (used << 16); d2c &= used;
+    if ((hdrv & HDRV_SAT) && !(hdrv & used)) hdrv = 0;   /* no promoted target sampled: the plain text */
+    else if (hdrv & HDRV_SAT) hdrv &= HDRV_SAT | used;
     char row[192];
-    const int n = snprintf(row, sizeof row, "%016llx\t%x\t%d\t%016llx\t%d\t%x\t%x\t%d\t%x\t%d\t%x\t%x\t%x\t%x",
-                           (unsigned long long)vs->code64, vs->start, vs->fetch ? 1 : 0,
-                           (unsigned long long)rsx_fp_code_hash64(fp_ucode, RSX_FP_MAX_BYTES),
-                           exp32 ? 1 : 0, cube, d2c, clamp ? 1 : 0, blend, nrt, (u32)rtfmt, cmask & 0xFu,
-                           cull, depth);
+    int n = snprintf(row, sizeof row, "%016llx\t%x\t%d\t%016llx\t%d\t%x\t%x\t%d\t%x\t%d\t%x\t%x\t%x\t%x",
+                     (unsigned long long)vs->code64, vs->start, vs->fetch ? 1 : 0,
+                     (unsigned long long)rsx_fp_code_hash64(fp_ucode, RSX_FP_MAX_BYTES),
+                     exp32 ? 1 : 0, cube, d2c, clamp ? 1 : 0, blend, nrt, (u32)rtfmt, cmask & 0xFu,
+                     cull, depth);
+    if (n > 0 && n < (int)sizeof row && hdrv) n += snprintf(row + n, sizeof row - (size_t)n, "\t%x", hdrv);
     if (n <= 0 || n >= (int)sizeof row) return;
     AcquireSRWLockExclusive(&s_pxr_lock);
     if (!s_pxr_loaded) pxr_load();
@@ -6315,8 +6330,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb = NULL;
     if (hdrv) {
         const int sat = (hdrv & HDRV_SAT) != 0;
-        const int k = sat ? fp_hdr_sat_units(hlsl, sizeof hlsl, hdrv & ~HDRV_SAT)
-                          : fp_hdr_unclamp(hlsl, sizeof hlsl, hdrv);
+        const int k = rsx_d3d12_shader_hdr(hlsl, sizeof hlsl, hdrv);
         static int said;
         if (said < 16 && ++said) printf("[D3D12] HDR: fp 0x%X's variant, %d %s\n", fp_addr, k,
                                         sat ? (k == 1 ? "sample clamped" : "samples clamped")
@@ -6342,7 +6356,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                blend, nrt, rtfmt, cmask, cull, depth);
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)   /* a row for the pipeline index */
         pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask, gsb != NULL,
-                       blend, nrt, rtfmt, cmask, cull, depth);
+                       blend, nrt, rtfmt, cmask, cull, depth, hdrv);
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */

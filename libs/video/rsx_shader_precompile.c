@@ -17,6 +17,7 @@
 int rsx_d3d12_shader_hlsl(int fragment, const uint8_t* ucode, uint32_t ucode_len,
                           uint32_t vp_start_slot, int exp32, uint32_t cube_mask,
                           uint32_t d2c_mask, char* out, uint32_t cap);
+int rsx_d3d12_shader_hdr(char* hlsl, uint32_t cap, uint32_t hdrv);
 int rsx_d3d12_shader_cache_put(int fragment, const char* hlsl);
 const char* rsx_d3d12_shader_cache_path(void);
 int rsx_d3d12_shader_fp_variants(const uint8_t* ucode, uint32_t ucode_len, uint32_t* out, int max);
@@ -61,6 +62,7 @@ static volatile LONG s_prog_done, s_skipped, s_bad, s_dups;
 typedef struct {
     uint64_t vp, fp;
     uint32_t vstart, vfetch, exp32, cube, d2c, clamp, blend, nrt, rtfmt, cmask, cull, depth;
+    uint32_t hdrv;   /* the 15th field, 0 when the row has none */
 } IndexRow;
 static IndexRow* s_rows;
 static unsigned  s_nrows, s_rows_found;
@@ -306,11 +308,12 @@ static FormKey* form_slot(uint64_t form)
 }
 
 /* The cache key of one program's text in one form (rsx_d3d12_shader_hlsl's
- * kind and kinds), made and queued for the compile threads the first time;
- * 0 if it cannot be made. */
-static uint64_t form_key(const Program* p, int kind, uint32_t exp32, uint32_t cube, uint32_t d2c, char* buf)
+ * kind and kinds, and an HDR variant: rsx_d3d12_shader_hdr), made and queued
+ * for the compile threads the first time; 0 if it cannot be made. */
+static uint64_t form_key(const Program* p, int kind, uint32_t exp32, uint32_t cube, uint32_t d2c, uint32_t hdrv,
+                         char* buf)
 {
-    const uint32_t f[5] = { (uint32_t)(p - s_progs), (uint32_t)kind, exp32, cube, d2c };
+    const uint32_t f[6] = { (uint32_t)(p - s_progs), (uint32_t)kind, exp32, cube, d2c, hdrv };
     uint64_t form = text_hash((const char*)f, sizeof f);
     if (!form) form = 1;
     FormKey* slot = form_slot(form);
@@ -319,6 +322,7 @@ static uint64_t form_key(const Program* p, int kind, uint32_t exp32, uint32_t cu
     uint64_t key = 0;
     if (cg_ucode(p, &uc, &usz, &fragment) &&
         rsx_d3d12_shader_hlsl(kind, uc, usz, 0, (int)exp32, cube, d2c, buf, HLSL_CAP) > 0) {
+        if (hdrv) rsx_d3d12_shader_hdr(buf, HLSL_CAP, hdrv);
         key = rsx_d3d12_shader_key(kind == 1 || kind == 3, buf);
         char* c = _strdup(buf);
         if (c) push_job(p->name, kind == 1 || kind == 3, c);
@@ -331,8 +335,10 @@ static uint64_t form_key(const Program* p, int kind, uint32_t exp32, uint32_t cu
  * fingerprints, and their texts as a draw makes them (vp_get_vs_mode,
  * vp_get_fp_pso): the vertex program at branch base 0, as the draw
  * decompiles it; the fragment program with the row's kinds, in the clamp
- * form if the row has it. The texts go to the compile threads, so the cache
- * has them, and the row to the backend. */
+ * form if the row has it, and in its HDR variant if it has one. The texts go
+ * to the compile threads, so the cache has them, and the row to the backend.
+ * A pipeline is found by its description (the library), so a variant needs
+ * nothing from the backend beyond its text. */
 static void index_resolve(void)
 {
     ProgPrint* t = (ProgPrint*)malloc(sizeof(ProgPrint) * (s_nprogs ? s_nprogs : 1));
@@ -353,8 +359,8 @@ static void index_resolve(void)
         const Program* vp = print_find(t, nt, w->vp, 0);
         const Program* fp = print_find(t, nt, w->fp, 1);
         if (!vp || !fp) continue;
-        const uint64_t vk = form_key(vp, w->vfetch ? 2 : 0, 0, 0, 0, buf);
-        const uint64_t pk = vk ? form_key(fp, w->clamp ? 3 : 1, w->exp32, w->cube, w->d2c, buf) : 0;
+        const uint64_t vk = form_key(vp, w->vfetch ? 2 : 0, 0, 0, 0, 0, buf);
+        const uint64_t pk = vk ? form_key(fp, w->clamp ? 3 : 1, w->exp32, w->cube, w->d2c, w->hdrv, buf) : 0;
         if (!pk) continue;
         rsx_d3d12_pso_index_add((int)w->vfetch, vk, (int)w->clamp, pk, w->blend, (int)w->nrt, w->rtfmt,
                                 w->cmask, w->cull, w->depth);
@@ -381,9 +387,9 @@ int rsx_shader_precompile_index(const char* rows, size_t len, int index_only)
             IndexRow w;
             unsigned long long vp, fp;
             memset(&w, 0, sizeof w);
-            if (sscanf(line, "%llx %x %x %llx %x %x %x %x %x %x %x %x %x %x", &vp, &w.vstart, &w.vfetch, &fp,
+            if (sscanf(line, "%llx %x %x %llx %x %x %x %x %x %x %x %x %x %x %x", &vp, &w.vstart, &w.vfetch, &fp,
                        &w.exp32, &w.cube, &w.d2c, &w.clamp, &w.blend, &w.nrt, &w.rtfmt, &w.cmask, &w.cull,
-                       &w.depth) == 14) {
+                       &w.depth, &w.hdrv) >= 14) {   /* hdrv: an optional 15th field */
                 w.vp = vp; w.fp = fp;
                 if (s_nrows == cap) {
                     const unsigned c = cap ? cap * 2 : 1024;
