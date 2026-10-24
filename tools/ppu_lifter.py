@@ -211,6 +211,99 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
     for (int i = 0; i < 4; i++) { uint32_t b = ppu_vbswap32(in[i]); memcpy(p + i*4, &b, 4); }
 }
 
+/* vperm, vsldoi, vmaxfp, vminfp, vrsqrtefp, lvlx and lvrx. Byte i of a vector
+ * register is guest byte i, so x86 byte lanes are the guest's: vperm is two
+ * pshufb and a blend, vsldoi one palignr, lvlx/lvrx one pshufb; the float
+ * ones swap each lane like ppu_vldf4. Lifted as the loops below (kept for
+ * hosts without SSE4.1), vperm was about 100 x86 instructions and vsldoi a
+ * store-forwarding stall through a temporary on the stack.
+ * tools/test_ppu_vmx_helpers.py checks each helper against its loop. */
+#if !defined(PPU_VMX_NO_SSE41) && (defined(__SSE4_1__) || (defined(_M_X64) && !defined(__clang__)))
+#include <smmintrin.h>
+#define PPU_VMX_SSE41 1  /* which path this build took (the test checks it) */
+static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c) {
+    const __m128i A = _mm_loadu_si128((const __m128i*)a), B = _mm_loadu_si128((const __m128i*)b);
+    const __m128i idx = _mm_and_si128(_mm_loadu_si128((const __m128i*)c), _mm_set1_epi8(0x1F));
+    /* pshufb takes the low 4 bits (bit 7 is clear: a byte, not a zero); bit 4, moved to bit 7, picks vB */
+    _mm_storeu_si128((__m128i*)d, _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx),
+                                                  _mm_slli_epi16(idx, 3)));
+}
+/* sh is the instruction's literal: bytes sh..sh+15 of vA||vB */
+#define PPU_VSLDOI(d, a, b, sh) _mm_storeu_si128((__m128i*)(d), _mm_alignr_epi8(_mm_loadu_si128((const __m128i*)(b)), _mm_loadu_si128((const __m128i*)(a)), (sh)))
+static inline __m128 ppu_vld_ps(const void* p) {
+    return _mm_castsi128_ps(_mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)p),
+                                             _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3)));
+}
+static inline void ppu_vst_ps(void* p, __m128 v) {
+    _mm_storeu_si128((__m128i*)p, _mm_shuffle_epi8(_mm_castps_si128(v),
+                                                   _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3)));
+}
+/* A NaN operand gives itself quieted (vA's first); of equal operands a max
+ * takes the AND of their bits (+0 over -0), a min the OR (-0 over +0). */
+static inline void ppu_vmaxfp(void* d, const void* a, const void* b) {
+    const __m128 A = ppu_vld_ps(a), B = ppu_vld_ps(b);
+    __m128 r = _mm_blendv_ps(_mm_max_ps(A, B), _mm_and_ps(A, B), _mm_cmpeq_ps(A, B));
+    r = _mm_blendv_ps(r, _mm_add_ps(B, B), _mm_cmpunord_ps(B, B));
+    ppu_vst_ps(d, _mm_blendv_ps(r, _mm_add_ps(A, A), _mm_cmpunord_ps(A, A)));
+}
+static inline void ppu_vminfp(void* d, const void* a, const void* b) {
+    const __m128 A = ppu_vld_ps(a), B = ppu_vld_ps(b);
+    __m128 r = _mm_blendv_ps(_mm_min_ps(A, B), _mm_or_ps(A, B), _mm_cmpeq_ps(A, B));
+    r = _mm_blendv_ps(r, _mm_add_ps(B, B), _mm_cmpunord_ps(B, B));
+    ppu_vst_ps(d, _mm_blendv_ps(r, _mm_add_ps(A, A), _mm_cmpunord_ps(A, A)));
+}
+static inline void ppu_vrsqrtefp(void* d, const void* b) {
+    ppu_vst_ps(d, _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(ppu_vld_ps(b))));
+}
+/* m is the aligned quadword at ea & ~15, sh = ea & 15; pshufb gives a zero
+ * for an index with bit 7 set (lvlx: past the end, lvrx: before the start) */
+static inline void ppu_lvlx(void* d, const uint8_t* m, uint32_t sh) {
+    __m128i idx = _mm_add_epi8(_mm_set1_epi8((char)sh), _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    idx = _mm_or_si128(idx, _mm_cmpgt_epi8(idx, _mm_set1_epi8(15)));
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)m), idx));
+}
+static inline void ppu_lvrx(void* d, const uint8_t* m, uint32_t sh) {
+    const __m128i idx = _mm_add_epi8(_mm_set1_epi8((char)(sh - 16)),
+                                     _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+    _mm_storeu_si128((__m128i*)d, _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)m), idx));
+}
+#else
+static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c) {
+    const uint8_t* pa = (const uint8_t*)a; const uint8_t* pb = (const uint8_t*)b; const uint8_t* pc = (const uint8_t*)c;
+    uint8_t tmp[16];
+    for (int i = 0; i < 16; i++) { uint8_t sel = pc[i] & 0x1F; tmp[i] = (sel < 16) ? pa[sel] : pb[sel - 16]; }
+    memcpy(d, tmp, 16);
+}
+#define PPU_VSLDOI(d, a, b, sh) do { uint8_t _t[32]; memcpy(_t, (a), 16); memcpy(_t + 16, (b), 16); memcpy((d), _t + (sh), 16); } while (0)
+static inline void ppu_vmaxfp(void* d, const void* va, const void* vb) {
+    float a[4], b[4], r[4]; ppu_vldf4(va, a); ppu_vldf4(vb, b);
+    for (int i = 0; i < 4; i++)
+        r[i] = (a[i] != a[i]) ? a[i] + a[i] : (b[i] != b[i]) ? b[i] + b[i] :
+               ((a[i] > b[i]) ? a[i] : (b[i] > a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i]));
+    ppu_vstf4(d, r);
+}
+static inline void ppu_vminfp(void* d, const void* va, const void* vb) {
+    float a[4], b[4], r[4]; ppu_vldf4(va, a); ppu_vldf4(vb, b);
+    for (int i = 0; i < 4; i++)
+        r[i] = (a[i] != a[i]) ? a[i] + a[i] : (b[i] != b[i]) ? b[i] + b[i] :
+               ((a[i] < b[i]) ? a[i] : (b[i] < a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i]));
+    ppu_vstf4(d, r);
+}
+static inline void ppu_vrsqrtefp(void* d, const void* vb) {
+    float b[4], r[4]; ppu_vldf4(vb, b);
+    for (int i = 0; i < 4; i++) r[i] = 1.0f / sqrtf(b[i]);
+    ppu_vstf4(d, r);
+}
+static inline void ppu_lvlx(void* d, const uint8_t* m, uint32_t sh) {
+    uint8_t* p = (uint8_t*)d;
+    for (int i = 0; i < 16; i++) p[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0;
+}
+static inline void ppu_lvrx(void* d, const uint8_t* m, uint32_t sh) {
+    uint8_t* p = (uint8_t*)d;
+    for (int i = 0; i < 16; i++) p[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0;
+}
+#endif
+
 /* The guest timebase (mftb/mftbu): one global monotonic clock scaled to the
  * PS3's 79.8 MHz, provided by the runtime (runtime/syscalls/sys_timer.c). */
 #ifdef __cplusplus
@@ -2260,27 +2353,21 @@ class PPULifter:
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
         # zero-fills the right; lvrx is the mirror (fills the right end). lvlxl
-        # is lvlx with a cache hint (same data). Byte-loop matches the raw-byte
-        # convention used by vperm/lvsl.
+        # is lvlx with a cache hint (same data). ppu_lvlx/ppu_lvrx (the
+        # preamble) work on the raw bytes, the convention vperm/lvsl use.
         if mn == "lvlx" or mn == "lvlxl":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0; }}")
+                    f"ppu_lvlx(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
         if mn == "lvrx" or mn == "lvrxl":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
+                    f"ppu_lvrx(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
         if mn == "lvebx" or mn == "lvehx" or mn == "lvewx":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -2326,15 +2413,8 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ uint8_t* a = (uint8_t*)&ctx->vr[{va}]; "
-                    f"uint8_t* b = (uint8_t*)&ctx->vr[{vb}]; "
-                    f"uint8_t* c = (uint8_t*)&ctx->vr[{vc}]; "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"uint8_t tmp[16]; "
-                    f"for (int i = 0; i < 16; i++) {{ "
-                    f"uint8_t sel = c[i] & 0x1F; "
-                    f"tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }} "
-                    f"memcpy(d, tmp, 16); }}")
+            # vD byte i = (vA||vB)[vC byte i & 0x1F] (ppu_vperm, the preamble)
+            return f"ppu_vperm(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
         # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
         if mn == "vspltw":
@@ -2474,10 +2554,9 @@ class PPULifter:
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
-            sh = int(ops[3])  # numeric shift count (disasm emits plain number)
-            return (f"{{ uint8_t tmp[32]; "
-                    f"memcpy(tmp, &ctx->vr[{va}], 16); memcpy(tmp+16, &ctx->vr[{vb}], 16); "
-                    f"memcpy(&ctx->vr[{vd}], tmp + {sh}, 16); }}")
+            sh = int(ops[3]) & 15  # numeric shift count (disasm emits plain number); a 4-bit field
+            # bytes sh..sh+15 of vA||vB (PPU_VSLDOI, the preamble: palignr takes sh as a literal)
+            return f"PPU_VSLDOI(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], {sh});"
 
         # VMX integer multiply-accumulate
         if mn == "vmsumshm":
@@ -2646,14 +2725,9 @@ class PPULifter:
             # lists it then could not undo -- freeing stack memory into the
             # heap. VMX: a NaN operand gives that NaN, quieted (vA first); for
             # equal operands max prefers +0 and min prefers -0.
+            # (ppu_vmaxfp/ppu_vminfp, the preamble, keep these rules lane for lane)
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            if mn == "vmaxfp":
-                pick = "(a[i]>b[i]) ? a[i] : (b[i]>a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i])"
-            else:
-                pick = "(a[i]<b[i]) ? a[i] : (b[i]<a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i])"
-            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ({pick}); "
-                    f"ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_{mn}(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
         if mn in ("vspltisb", "vspltish", "vspltisw"):
@@ -2679,8 +2753,8 @@ class PPULifter:
 
         if mn == "vrsqrtefp":
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])  # vB = last operand (vmx_vx emits vD, vA, vB)
-            return (f"{{ float b[4],d[4]; ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i]=1.0f/sqrtf(b[i]); ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            # 1/sqrt in each lane, rounded once each (ppu_vrsqrtefp, the preamble)
+            return f"ppu_vrsqrtefp(&ctx->vr[{vd}], &ctx->vr[{vb}]);"
 
         if mn == "vrfim":  # round to FP integer toward -inf (floor); vrfim is vD,vB
             vd, vb = int(ops[0][1:]), int(ops[-1][1:])
