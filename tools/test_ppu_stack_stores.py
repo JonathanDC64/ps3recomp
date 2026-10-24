@@ -83,7 +83,7 @@ DRIVER = r"""
 static uint8_t g_mem[0x10000];   /* guest 0xD0000000 .. 0xD000FFFF */
 static int g_slow, g_fail, g_pass;
 extern "C" {
-uint8_t* vm_base = (uint8_t*)((uintptr_t)g_mem - 0xD0000000u);
+uint8_t* vm_base;   /* set in main: macOS's linker cannot relocate a pointer that far outside g_mem */
 unsigned g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;   /* 0: every other store calls */
 unsigned char g_spu_coh_bitmap[16];
 #ifndef PPU_VM_NO_INLINE
@@ -107,6 +107,7 @@ static void store(int w, uint64_t a, uint64_t v) {
     }
 }
 int main(void) {
+    vm_base = (uint8_t*)((uintptr_t)g_mem - 0xD0000000u);
     const unsigned LIM = 0x8000u;   /* any limit: the runtime's is 0x0FFF0000 */
     /* address, direct with the limit on */
     const struct { uint64_t a; int direct; } at[] = {
