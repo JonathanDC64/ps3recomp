@@ -10093,7 +10093,10 @@ static void rsx_scale_apply(void)
  *      target or a depth surface. The pass runs right after it. The HUD comes
  *      after: Demon's Souls draws it blended, into T, after its post chain.
  * The pass filters a copy of T (off_rt_snapshot) back into T, RGB only: alpha
- * can hold data (Demon's Souls keeps its depth-of-field mask there).
+ * can hold data (Demon's Souls keeps its depth-of-field mask there). T is
+ * RGBA8, or FP16 while HDR keeps the game's highlights in it (RSX_HDR,
+ * RSX_HDR_SCENE_FP): the pass has a pipeline for each, and the filter works
+ * on values above 1 as it does below.
  *
  * RSX_AA_BEFORE_FP=<fp>[,<fp>...]: run the pass before the first draw with one
  * of these fragment programs (SET_SHADER_PROGRAM values in hex, as the F9 draw
@@ -10120,12 +10123,13 @@ static int knob_aa_at_present(void) { static int v = -1; PS3_KNOB(v, aa_at_prese
 enum { AA_RUN, AA_NO_COPY, AA_SMALL, AA_FORMAT, AA_NO_SCENE, AA_NO_POST };
 static const char* const s_aa_why[] = {
     "", "no display copy", "the display copy's source is small",
-    "the scene target is not RGBA8", "no 3D scene", "no post pass before the display copy",
+    "the scene target is neither RGBA8 nor FP16", "no 3D scene", "no post pass before the display copy",
 };
 
 static struct {
     ID3D12RootSignature*  rs;
     ID3D12PipelineState*  pso;
+    ID3D12PipelineState*  pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
     ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
     u32                   disp_w, disp_h;
@@ -10212,6 +10216,10 @@ static int aa_ready(void)
         pd.SampleDesc.Count = 1;
         hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
             &IID_ID3D12PipelineState, (void**)&s_aa.pso);
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;   /* without it, FP16 targets go unfiltered */
+        if (SUCCEEDED(hr) && FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
+                &IID_ID3D12PipelineState, (void**)&s_aa.pso16)))
+            s_aa.pso16 = NULL;
     }
     if (vb) vb->lpVtbl->Release(vb);
     if (pb) pb->lpVtbl->Release(pb);
@@ -10225,15 +10233,16 @@ static int aa_ready(void)
     return 1;
 }
 
-/* One pass: src (an RGBA8 copy of the target, in PIXEL_SHADER_RESOURCE)
- * filtered into the target behind rtv, w x h, in RENDER_TARGET. Binds its own
- * root signature, pipeline, target, viewport and topology; the shader-visible
- * heap must be srv_heap. The backend waits for the GPU before each batch, so
- * the one descriptor at AA_SRV_SLOT is free to rewrite. */
-static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+/* One pass: src (a copy of the target in format fmt, RGBA8 or FP16, in
+ * PIXEL_SHADER_RESOURCE) filtered into the target behind rtv, w x h, in
+ * RENDER_TARGET. Binds its own root signature, pipeline, target, viewport and
+ * topology; the shader-visible heap must be srv_heap. The backend waits for
+ * the GPU before each batch, so the one descriptor at AA_SRV_SLOT is free to
+ * rewrite. */
+static void aa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    srv_write(AA_SRV_SLOT, src, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    srv_write(AA_SRV_SLOT, src, fmt, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g);
     g.ptr += (u64)AA_SRV_SLOT * s_d3d.srv_inc;
@@ -10244,7 +10253,7 @@ static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w,
     cl->lpVtbl->RSSetViewports(cl, 1, &vp);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_aa.rs);
-    cl->lpVtbl->SetPipelineState(cl, s_aa.pso);
+    cl->lpVtbl->SetPipelineState(cl, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -10256,11 +10265,13 @@ static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w,
 static int aa_run_rt(int t)
 {
     OffRT* r = &s_d3d.off_rt[t];
-    if (!aa_ready() || !r->res || r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) return 0;
+    if (!aa_ready() || !r->res) return 0;
+    if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && (r->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT || !s_aa.pso16))
+        return 0;
     ID3D12Resource* src = off_rt_snapshot(t);
     if (!src) return 0;
     off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    aa_draw(src, off_rt_rtv(t), r->hw, r->hh);
+    aa_draw(src, (DXGI_FORMAT)r->dxgi, off_rt_rtv(t), r->hw, r->hh);
     return 1;
 }
 
@@ -10309,7 +10320,7 @@ static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     s_aa.disp_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
     cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, heaps);
-    aa_draw(s_aa.disp, rtv, w, h);
+    aa_draw(s_aa.disp, DXGI_FORMAT_R8G8B8A8_UNORM, rtv, w, h);
 }
 
 /* Where this batch's pass goes (see the top of this section): returns T's
@@ -10335,7 +10346,9 @@ static int aa_pick(u32* before, int* why)
     if (t < 0) { *why = AA_NO_COPY; return -1; }
     const OffRT* T = &s_d3d.off_rt[t];
     if ((u64)T->w * T->h * 4u < (u64)s_d3d.width * s_d3d.height) { *why = AA_SMALL; return -1; }
-    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) { *why = AA_FORMAT; return -1; }
+    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && T->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        *why = AA_FORMAT; return -1;
+    }
     aa_before_fp_load();
     u32 scene = 0;
     int post = -1, named = -1;
@@ -15028,6 +15041,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
     if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
+    if (s_aa.pso16) s_aa.pso16->lpVtbl->Release(s_aa.pso16);
     if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
     if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
     memset(&s_aa, 0, sizeof s_aa);
