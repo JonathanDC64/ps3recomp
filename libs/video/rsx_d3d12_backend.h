@@ -123,6 +123,12 @@ void     rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long l
 void*    rsx_d3d12_back_buffer(unsigned index);
 unsigned rsx_d3d12_back_buffer_count(void);
 unsigned rsx_d3d12_back_buffer_format(void);
+/* HDR output (RSX_HDR): nonzero while the back buffers are FP16 scRGB
+ * (linear, 1.0 = 80 nits; rsx_d3d12_back_buffer_format says so too). Then
+ * *ui_scale is what the overlay multiplies its decoded colours by, for its
+ * white to sit at the game's paper white, and *srgb how to decode them: 1 the
+ * sRGB curve, 0 gamma 2.2. 0 (and *ui_scale 1) with RGBA8 back buffers. */
+int      rsx_d3d12_hdr(float* ui_scale, int* srgb);
 /* Borderless fullscreen on the window's monitor (1) or the window as it was,
  * maximized or not (0). Alt+Enter toggles it too. Any thread. */
 void     rsx_d3d12_set_borderless(int on);
