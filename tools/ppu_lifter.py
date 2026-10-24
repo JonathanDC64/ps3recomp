@@ -411,6 +411,11 @@ _CS_REST_RE = re.compile(
 # is scratch, so a later load from it is NOT a callee-save restore.
 _CS_ANY_STORE_RE = re.compile(
     r'vm_write(?:8|16|32|64)\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+),')
+# A store with base r1 (a frame save or a spill) is written out as
+# vm_write*_stk (ps3emu/ppu_lift.h), which stores an address in the stack
+# region without the SPU-reservation test. Applied in _function_def_lines,
+# so the frame analyses here keep seeing the plain form.
+_STK_STORE_RE = re.compile(r'\bvm_write(8|16|32|64)\(ctx->gpr\[1\] \+ ')
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -3533,6 +3538,7 @@ class PPULifter:
         lines.append(f"void {func.name}(ppu_context* ctx) {{")
         lines.append(f"    DS_FRAME(0x{func.start_addr:08X});")
         for bline in func.body_lines:
+            bline = _STK_STORE_RE.sub(r"vm_write\1_stk(ctx->gpr[1] + ", bline)
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional

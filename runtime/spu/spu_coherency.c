@@ -255,6 +255,26 @@ int* ps3_split_coh_armed = &s_coh_armed_host.v;
 #define s_coh_armed (*ps3_split_coh_armed)
 #endif
 
+/* The lifted code's stack-store limit (vm_write*_stk, ps3emu/ppu_lift.h):
+ * the word after the armed flag on its line, here and in a game module
+ * (game_module.c), so the module needs no new export. Stores with base r1 to
+ * an address below 0xD0000000 + the limit skip the reservation test. It
+ * follows the store limit (spu_coh_stk_eval), and is 0 for good once an SPU
+ * reserves a line in the stack region: those stores then take the full path.
+ * A store that read the limit just before that first stack reservation can
+ * miss its one event, as any store can at the first GETLLAR (above). */
+#define SPU_COH_STK_LIM 0x0FFF0000u   /* the stack region, 0xD0000000 up, less its last 64 KB */
+static int s_coh_stack_resv;   /* an SPU has reserved a stack line */
+static void spu_coh_set_stk(unsigned v) { __atomic_store_n((unsigned*)&s_coh_armed + 1, v, __ATOMIC_SEQ_CST); }
+void spu_coh_stk_eval(int allow)
+{
+    /* Set, then look again: a first stack reservation between the two would
+     * be overwritten. Both sides store, then load, all seq_cst, so at least
+     * one of them sees the other's store. */
+    spu_coh_set_stk(allow && !__atomic_load_n(&s_coh_stack_resv, __ATOMIC_SEQ_CST) ? SPU_COH_STK_LIM : 0u);
+    if (allow && __atomic_load_n(&s_coh_stack_resv, __ATOMIC_SEQ_CST)) spu_coh_set_stk(0);
+}
+
 /* The SPU contexts that have reserved a line. Sized to match the MFC engine
  * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
 #define SPU_COH_MAX_CTX 8
@@ -296,6 +316,15 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * every core that reads them. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     const unsigned char bit = (unsigned char)(1u << (line & 7));
+    /* A line in the stack region: the stack stores stop skipping the test
+     * before the bit below is set (its atomic is the fence). */
+    if ((ea >> 28) == 0xDu && !__atomic_load_n(&s_coh_stack_resv, __ATOMIC_ACQUIRE)) {
+        const int first = !__atomic_exchange_n(&s_coh_stack_resv, 1, __ATOMIC_SEQ_CST);
+        spu_coh_set_stk(0);
+        if (first)
+            fprintf(stderr, "[coh] an SPU reserved stack line 0x%08X: stack stores take the full path from now on\n",
+                    ea & ~127u);
+    }
     /* Atomic: the caller holds only its own line's stripe, and eight lines
      * share a bitmap byte. A lost bit would leave a reserved line that PPU
      * stores do not see. */

@@ -70,6 +70,10 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);
 
+/* Set the lifted code's stack-store limit (vm_write*_stk): on when `allow`
+ * (the store limit is on) and no SPU has reserved a stack line, else off. */
+void spu_coh_stk_eval(int allow);
+
 /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
  * whose live reservation covers it, drop that reservation, and wake the host
  * thread in case it is parked in `rdch SPU_RdEventStat`.
