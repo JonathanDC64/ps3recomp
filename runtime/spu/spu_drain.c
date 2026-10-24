@@ -65,12 +65,20 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+#if defined(_MSC_VER)
+#define SPU_DRAIN_NOINLINE __declspec(noinline)
+#else
+#define SPU_DRAIN_NOINLINE __attribute__((noinline))
+#endif
+
 /* The per-step check runs on every trampoline hop -- ~12 million a second
  * in Demon's Souls' HighGraphics ring consumer -- so the common case is kept
  * to what every step needs: the recent-pc ring, the stack-reset entries and
  * the job-end test. The trace and drain knobs below it go through one cached
  * flag (re-read when the console changes the environment), and only a set
- * knob or an armed PM flow trace takes the full path. */
+ * knob or an armed PM flow trace takes the full path. The knob read, the full
+ * path and the job-end report are out of line: inlined into the check, they
+ * made it a function of its own that saved six registers on every hop. */
 extern unsigned g_spu_stack_reset_n;   /* spu_channels.c */
 extern volatile int g_yz_lockstep_on;  /* spu_lockstep.c; < 0 = not resolved yet */
 static int      s_step_diag, s_step_no_ls0;
@@ -90,7 +98,7 @@ volatile int g_spu_bi_switch = 0;
 #else
 PS3_SPLIT_DEFINE(volatile int, g_spu_bi_switch, 0);   /* the game module's once it loads */
 #endif
-static void spu_step_diag_load(void)
+static SPU_DRAIN_NOINLINE void spu_step_diag_load(void)
 {
     { const char* e = getenv("SPU_BI_SWITCH"); g_spu_bi_switch = !(e && e[0] == '0'); }
     s_step_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
@@ -101,7 +109,16 @@ static void spu_step_diag_load(void)
                       getenv("SPU_PCHIST");
     s_step_diag_gen = ps3_env_gen;
 }
-static void spu_task_launch_check_full(spu_context* ctx, void* fn);
+static SPU_DRAIN_NOINLINE void spu_task_launch_check_full(spu_context* ctx, void* fn);
+/* As in the full path: a job branching back to LS 0 has finished. */
+static SPU_DRAIN_NOINLINE void spu_step_ls0_end(spu_context* ctx)
+{
+    static int _n = 0;
+    if (_n < 8 && ++_n)
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete%c",
+                ctx->image_id, 10);
+    spu_halt(ctx);
+}
 static inline void spu_step_check(spu_context* ctx, void* fn)
 {
     if (s_step_diag_gen != ps3_env_gen) spu_step_diag_load();
@@ -112,15 +129,9 @@ static inline void spu_step_check(spu_context* ctx, void* fn)
         extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     }
-    /* As in the full path: a job branching back to LS 0 has finished. */
     if (!s_step_no_ls0 && ctx->steps++ && pc == 0 &&
-        !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (_n < 8 && ++_n)
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete%c",
-                    ctx->image_id, 10);
-        spu_halt(ctx);
-    }
+        !ctx->policy_mode && ctx->image_id > 0)
+        spu_step_ls0_end(ctx);
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
@@ -128,7 +139,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     spu_step_check(ctx, fn);
 }
 
-static void spu_task_launch_check_full(spu_context* ctx, void* fn)
+static SPU_DRAIN_NOINLINE void spu_task_launch_check_full(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -402,12 +413,6 @@ void (*spu_take_interrupt(spu_context* ctx,
                   js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
     return spu_indirect_branch;
 }
-
-#if defined(_MSC_VER)
-#define SPU_DRAIN_NOINLINE __declspec(noinline)
-#else
-#define SPU_DRAIN_NOINLINE __attribute__((noinline))
-#endif
 
 /* Ring of recent drain sites, one per thread. When the depth trips, the useful
  * question is not "where are we" but "what cycle got us here" -- one pc names
