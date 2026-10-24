@@ -12198,14 +12198,19 @@ static void read_vp_vertex_c(const rsx_state* state, u32 vi, VPSlot* out16)
  * A queued vertex is read from guest memory later than the FIFO reached the
  * draw, so everything the title can observe of the RSX's progress waits for
  * the queue first (vpj_sync, g_rsx_sync_hook): labels, semaphores, reports,
- * the reference, the 2D engine's writes, `get`, and the frame's render. */
+ * the reference, the 2D engine's writes, `get`, and the frame's render.
+ *
+ * The GPU fetch path's span copies (vf_copy) go to the same queue, as jobs of
+ * no vertices, under the same rule. */
 typedef struct {
-    rsx_fetch_plan plan;     /* copied: the FIFO moves on before it is used */
+    u32 n;                   /* vertices; 0: a span copy, clen bytes from guest csrc to cdst */
+    u32 clen, csrc;
+    u8* cdst;
     const u32* vis;          /* guest vertex indices, n of them */
-    u32 n;
     VPSlot* out;             /* n vertices of VP_VERT_STRIDE */
+    rsx_fetch_plan plan;     /* copied: the FIFO moves on before it is used */
 } VPJob;
-#define VPJ_JOBS 4096u
+#define VPJ_JOBS 8192u
 #define VPJ_VIS  (1u << 20)
 static VPJob* s_vpj;
 static u32* s_vpj_vis;
@@ -12231,6 +12236,11 @@ static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 static void vpj_run(LONG j)
 {
     const VPJob* J = &s_vpj[j];
+    if (!J->n) {
+        extern uint8_t* vm_base;
+        memcpy(J->cdst, vm_base + J->csrc, J->clen);
+        return;
+    }
     float tmp[16][4];
     memcpy(tmp, J->plan.konst, sizeof tmp);
     for (u32 i = 0; i < J->n; i++) {
@@ -12334,6 +12344,12 @@ static int vpj_room(u32 nv)
     if (s_vpj_q >= (LONG)VPJ_JOBS || s_vpj_vis_n + nv > VPJ_VIS) vpj_sync();
     return 1;
 }
+static u32 vpj_batch(void)
+{
+    static int batch = -1;
+    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
+    return (u32)batch;
+}
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
     VPJob* J = &s_vpj[s_vpj_q];
@@ -12341,10 +12357,31 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
     s_vpj_q++;
-    static int batch = -1;
-    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
     s_vpj_qv += n;
-    if (s_vpj_qv >= (u32)batch) vpj_publish();
+    if (s_vpj_qv >= vpj_batch()) vpj_publish();
+}
+/* The GPU fetch path's span copies, about 29 MB a frame at Demon's Souls'
+ * deep Palace and a sixth of the FIFO thread, as jobs for the vertex worker
+ * (VF_COPY_WORKER, default 1; 0 copies on the FIFO thread, as before). A copy
+ * that continues the last queued one, as a draw appending to its descriptor's
+ * span does, extends that job. Each 256 bytes count as a vertex for
+ * VPJ_BATCH. */
+static void vf_copy(u8* dst, u32 src, u32 len)
+{
+    extern uint8_t* vm_base;
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VF_COPY_WORKER", 1));
+    if (!on || vpj_threads() <= 0) { memcpy(dst, vm_base + src, len); return; }
+    /* Not published yet, so no worker has taken it. */
+    VPJob* P = s_vpj_q > s_vpj_pub ? &s_vpj[s_vpj_q - 1] : NULL;
+    if (P && !P->n && P->cdst + P->clen == dst && P->csrc + P->clen == src) P->clen += len;
+    else {
+        if (s_vpj_q >= (LONG)VPJ_JOBS) vpj_sync();
+        VPJob* J = &s_vpj[s_vpj_q++];
+        J->n = 0; J->clen = len; J->csrc = src; J->cdst = dst;
+    }
+    s_vpj_qv += len >> 8;
+    if (s_vpj_qv >= vpj_batch()) vpj_publish();
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
@@ -13412,8 +13449,8 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 const u32 j = s_fx.nsp - 1;
                 const u32 g1 = (ng1 + 3u) & ~3u, add = g1 - s_fx.g1[j];
                 if ((u64)s_vf_off + add <= s_vf_cap) {
-                    memcpy((u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + s_vf_off,
-                           vm_base + s_fx.g1[j], add);
+                    vf_copy((u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + s_vf_off,
+                            s_fx.g1[j], add);
                     s_vf_off += add; s_fx.end = s_vf_off; s_fx.g1[j] = g1;
                     s_vf_stat[2]++;
                 } else ok = 0;
@@ -13441,7 +13478,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
             for (u32 j = 0; j < nsp; j++) {
-                memcpy(base + r, vm_base + g0[j], g1[j] - g0[j]);
+                vf_copy(base + r, g0[j], g1[j] - g0[j]);
                 s_fx.g0[j] = g0[j]; s_fx.g1[j] = g1[j]; s_fx.r0[j] = r;
                 r += g1[j] - g0[j];
             }
