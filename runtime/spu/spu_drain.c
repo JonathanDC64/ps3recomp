@@ -403,25 +403,29 @@ void (*spu_take_interrupt(spu_context* ctx,
     return spu_indirect_branch;
 }
 
-/* See the declaration in spu_context.h. */
-void spu_depth_guard(spu_context* ctx)
+#if defined(_MSC_VER)
+#define SPU_DRAIN_NOINLINE __declspec(noinline)
+#else
+#define SPU_DRAIN_NOINLINE __attribute__((noinline))
+#endif
+
+/* Ring of recent drain sites, one per thread. When the depth trips, the useful
+ * question is not "where are we" but "what cycle got us here" -- one pc names
+ * a point, a ring names the loop. Shared by all SPU threads, it was a cache
+ * line every thread wrote on each lifted call, and it mixed their loops. */
+enum { SPU_DEPTH_RING = 24 };
+static _Thread_local uint32_t t_depth_ring[SPU_DEPTH_RING];
+static _Thread_local uint32_t t_depth_n;
+
+/* Out of line: inlined, the getenv and the prints made every guard call save
+ * six registers. */
+static SPU_DRAIN_NOINLINE uint32_t spu_depth_max_load(void)
 {
-    static uint32_t s_max = 0;
-    if (!s_max) {
-        const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
-    }
-
-    /* Ring of recent drain sites. When the depth trips, the useful question is
-     * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
-    enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
-
-    if (ctx->host_depth < s_max) return;
+    const char* e = getenv("SPU_HOST_DEPTH_MAX");
+    return e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+}
+static SPU_DRAIN_NOINLINE void spu_depth_trip(spu_context* ctx)
+{
     static int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
@@ -430,13 +434,24 @@ void spu_depth_guard(spu_context* ctx)
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
         fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
-        for (uint32_t k = start; k < s_n; k++)
-            fprintf(stderr, " %05X", s_ring[k % RING]);
+        const uint32_t n = t_depth_n;
+        uint32_t start = (n > SPU_DEPTH_RING) ? (n - SPU_DEPTH_RING) : 0;
+        for (uint32_t k = start; k < n; k++)
+            fprintf(stderr, " %05X", t_depth_ring[k % SPU_DEPTH_RING]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
+}
+
+/* See the declaration in spu_context.h. */
+void spu_depth_guard(spu_context* ctx)
+{
+    static uint32_t s_max = 0;
+    if (!s_max) s_max = spu_depth_max_load();
+    t_depth_ring[t_depth_n % SPU_DEPTH_RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+    t_depth_n++;
+    if (ctx->host_depth >= s_max) spu_depth_trip(ctx);
 }
 
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
