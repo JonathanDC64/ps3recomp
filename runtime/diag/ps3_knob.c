@@ -17,9 +17,10 @@ PS3_SPLIT_DEFINE(unsigned, g_vm_inl_rd_hole, 0);
 volatile unsigned* ps3_split_game_env_gen;
 #endif
 
+void spu_coh_stk_eval(int allow);   /* runtime/spu/spu_coherency.c */
 void ps3_env_bump(void)
 {
-    g_vm_inl_rd_lim = 0; g_vm_inl_wr_lim = 0;
+    g_vm_inl_rd_lim = 0; g_vm_inl_wr_lim = 0; spu_coh_stk_eval(0);
     ps3_env_gen++;   /* only the debug console writes it */
 #ifdef PS3_GAME_SPLIT
     if (ps3_split_game_env_gen) *ps3_split_game_env_gen = ps3_env_gen;   /* the module's copy */

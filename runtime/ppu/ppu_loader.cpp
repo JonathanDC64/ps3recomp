@@ -780,13 +780,14 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * work was posted. spu_coh_is_reserved reads a global that stays zero until an
  * SPU reserves its first line, so an ordinary store pays one branch. */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
+extern "C" void spu_coh_stk_eval(int allow);
 /* spu_coh_is_reserved, inline: it was a call on every guest store (~3% of
  * Demon's Souls' HighGraphics thread). Same two loads, from the bitmap and
  * the armed flag spu_coherency.c exports; the flag has a cache line of its
  * own there, so the declaration only has to name its first member. */
 #ifndef PS3_GAME_SPLIT
 extern "C" unsigned char g_spu_coh_bitmap[];
-extern "C" struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
+extern "C" struct spu_coh_armed_line_t { int v; unsigned stk_lim; } g_spu_coh_armed_line;
 static inline int spu_coh_reserved_fast(uint32_t addr)
 {
     if (!*(volatile int*)&g_spu_coh_armed_line.v) return 0;
@@ -1458,7 +1459,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     { static int sweep = -1;
       if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
       if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
-                   g_vm_inl_wr_lim = 0;   /* the sweep must see every store */
+                   g_vm_inl_wr_lim = 0; spu_coh_stk_eval(0);   /* the sweep must see every store */
                    g_null_sweep_tid = g_active_ctx
                                     ? (unsigned)g_active_ctx->thread_id : 0u; } }
     { static long n = 0;
@@ -2218,6 +2219,7 @@ static VM_HOOK_BODY void vm_inl_wr_eval(void)
     if (s_gen != ps3_env_gen) { s_env = getenv("PT") || getenv("SPU_ATOM_EA"); s_gen = ps3_env_gen; }
     g_vm_inl_wr_lim = (!s_env && ppu_vm_size == 0 && !g_wval_armed && !g_wwatch_armed &&
                        !g_barrier_sync_watch && !g_null_sweep_hi) ? VM_INL_LIM : 0;
+    spu_coh_stk_eval(g_vm_inl_wr_lim != 0);   /* the stack stores' limit follows it */
 }
 #define VM_INL_WR_EVAL() do { if (!g_vm_inl_wr_lim) vm_inl_wr_eval(); } while (0)
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;

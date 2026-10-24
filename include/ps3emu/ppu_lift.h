@@ -172,7 +172,7 @@ extern "C" {
 extern uint8_t* vm_base;
 extern unsigned g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
 extern unsigned char g_spu_coh_bitmap[];
-extern struct spu_coh_armed_line_t { int v; } g_spu_coh_armed_line;
+extern struct spu_coh_armed_line_t { int v; unsigned stk_lim; } g_spu_coh_armed_line;
 #ifdef __cplusplus
 }
 #endif
@@ -252,6 +252,52 @@ static inline void vm_write64_inl(uint64_t a, uint64_t val)
 #define vm_write16(a, v) vm_write16_inl((a), (v))
 #define vm_write32(a, v) vm_write32_inl((a), (v))
 #define vm_write64(a, v) vm_write64_inl((a), (v))
+/* Stores with base r1, frame saves and spills (the lifter writes them as
+ * vm_write*_stk; two thirds of Demon's Souls' lifted stores): an address in
+ * the stack region, 0xD0000000 up, is stored straight away while it is below
+ * the stack limit, the word after the armed flag. The runtime keeps the limit
+ * (spu_coh_stk_eval): 0 while the store limit is 0, and for good once an SPU
+ * reserves a line in the stack region, so these stores skip only a
+ * reservation test that cannot hit. Any other address takes the path above. */
+static inline int vm_inl_stk(uint32_t ea)
+{
+    return ea - 0xD0000000u < *(volatile unsigned*)&g_spu_coh_armed_line.stk_lim;
+}
+static inline void vm_write8_stk(uint64_t a, uint8_t val)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_inl_stk(ea), 1)) { vm_base[ea] = val; return; }
+    vm_write8_inl(a, val);
+}
+static inline void vm_write16_stk(uint64_t a, uint16_t val)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_inl_stk(ea), 1)) {
+        const uint16_t v = __builtin_bswap16(val); memcpy(vm_base + ea, &v, 2); return;
+    }
+    vm_write16_inl(a, val);
+}
+static inline void vm_write32_stk(uint64_t a, uint32_t val)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_inl_stk(ea), 1)) {
+        const uint32_t v = __builtin_bswap32(val); memcpy(vm_base + ea, &v, 4); return;
+    }
+    vm_write32_inl(a, val);
+}
+static inline void vm_write64_stk(uint64_t a, uint64_t val)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_inl_stk(ea), 1)) {
+        const uint64_t v = __builtin_bswap64(val); memcpy(vm_base + ea, &v, 8); return;
+    }
+    vm_write64_inl(a, val);
+}
+#else
+#define vm_write8_stk(a, v)  vm_write8((a), (v))
+#define vm_write16_stk(a, v) vm_write16((a), (v))
+#define vm_write32_stk(a, v) vm_write32((a), (v))
+#define vm_write64_stk(a, v) vm_write64((a), (v))
 #endif
 
 /* Syscall handler */
