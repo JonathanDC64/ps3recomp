@@ -172,6 +172,10 @@ static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
 static int s_cache_mounted = 0;
 
+/* Set by the filesystem layer (runtime/ppu/ppu_fs.cpp) at startup: empties a /dev_hdd1 guest directory on the
+ * host. NULL when that layer is not linked; the mount then leaves the host files alone. */
+void (*g_syscache_clear_hook)(const char* guest_dir) = NULL;
+
 static void (*s_disc_change_cb)(void*) = NULL;
 static void* s_disc_change_arg = NULL;
 
@@ -442,6 +446,13 @@ s32 cellSysCacheMount(char* param)
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
     vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
+
+    /* The return value tells the title its cache was cleared, so clear it. The PS3 does at a mount whose id is
+     * empty (Demon's Souls) or names another cache, and the title then trusts every file it finds there. A copy
+     * that a closed session left half written was read back as good data: Demon's Souls' load into 1-1 never
+     * ended (issue #171). Nothing here records a cache id or a session that ended cleanly, so every mount clears. */
+    if (g_syscache_clear_hook)
+        g_syscache_clear_hook(s_cache_path);
 
     return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
 }

@@ -24,6 +24,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <filesystem>                   /* before the Win32 stand-in, which pulls in <windows.h> */
+#include <system_error>
+#include <vector>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
@@ -832,8 +835,38 @@ static void cellFsAioRead(ppu_context* ctx)
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
+/* cellSysCacheMount's clear (libs/system/cellSysutil.c): removes everything in a /dev_hdd1/cache guest directory
+ * on the host and keeps the directory. Only that directory: a path that could climb out of it is refused. A file
+ * still open elsewhere (a second copy of the game on the same tree) stays where it is. */
+extern "C" void (*g_syscache_clear_hook)(const char* guest_dir);
+static void fs_clear_syscache(const char* guest_dir)
+{
+    if (!guest_dir || strncmp(guest_dir, "/dev_hdd1/cache", 15) != 0 || strstr(guest_dir, "..") ||
+        strchr(guest_dir, '\\') || strchr(guest_dir, ':'))
+        return;
+    char host[1100];
+    host_path(host, sizeof host, guest_dir);
+    namespace sfs = std::filesystem;
+    std::error_code ec;
+    std::vector<sfs::path> items;
+    for (sfs::directory_iterator it(sfs::path(host), ec), end; !ec && it != end; it.increment(ec))
+        items.push_back(it->path());
+    uintmax_t removed = 0;
+    unsigned kept = 0;
+    for (const sfs::path& p : items) {
+        std::error_code e2;
+        const uintmax_t n = sfs::remove_all(p, e2);
+        if (e2) kept++;
+        else removed += n;
+    }
+    if (!items.empty())
+        fprintf(stderr, "[fs] system cache %s cleared: %llu files and folders removed%s\n", guest_dir,
+                (unsigned long long)removed, kept ? ", some still in use kept" : "");
+}
+
 extern "C" void ppu_fs_register(void)
 {
+    g_syscache_clear_hook = fs_clear_syscache;
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
     /* Register by the literal import NID: LBP imports 0xB1840B53 for
      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match
