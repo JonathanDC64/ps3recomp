@@ -144,6 +144,9 @@ s32 cellSysutilDisableBgmPlaybackEx(void);
 s32 cellSysCacheMount(char* cachePath);
 s32 cellSysCacheClear(void);
 
+/* Empties a /dev_hdd1 guest directory on the host; set by the filesystem layer (runtime/ppu/ppu_fs.cpp). */
+extern void (*g_syscache_clear_hook)(const char* guest_dir);
+
 /* ---------------------------------------------------------------------------
  * Disc game check
  * -----------------------------------------------------------------------*/
