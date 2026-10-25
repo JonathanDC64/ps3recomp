@@ -197,15 +197,18 @@ static int s_sdl_inited = 0;
 
 #if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
 /* One stick, -32768..32767 per axis with down positive, through the radial
- * deadzone (pad_stick.h). PAD_STICK_DEADZONE (of 32767, default 7849, as
- * XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE and RPCS3) and PAD_STICK_ANTI_DEADZONE
- * (percent, default 13, RPCS3's). */
+ * deadzone and squircling (pad_stick.h). PAD_STICK_DEADZONE (of 32767,
+ * default 7849, as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE and RPCS3),
+ * PAD_STICK_ANTI_DEADZONE (percent, default 13, RPCS3's) and
+ * PAD_STICK_SQUIRCLE (RPCS3's squircling factor, default 8000, 0 off). */
 static void pad_host_stick_to_u8(int x, int y, u8* out_x, u8* out_y)
 {
-    static int d = -1, a = -1;
+    static int d = -1, a = -1, q = -1;
     PS3_KNOB(d, ps3_env_int("PAD_STICK_DEADZONE", 7849));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
-    pad_stick_to_u8(x / 32767.0f, y / 32767.0f, d / 32767.0f, a / 100.0f, out_x, out_y);
+    PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));
+    pad_stick_to_u8(x / 32767.0f, y / 32767.0f, d / 32767.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f,
+                    out_x, out_y);
 }
 #endif
 

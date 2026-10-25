@@ -46,8 +46,9 @@
  * Knobs: PAD_NO_HID=1 turns it off (if Steam Input already presents the pad
  * as XInput, the game would otherwise see it twice). PAD_HID_DEADZONE
  * (default 20, of 128, RPCS3's 40/255) is the sticks' radial deadzone -- a
- * DualSense at rest sits a few counts off 128 -- and PAD_STICK_ANTI_DEADZONE
- * (percent, default 13) the output at its edge; see pad_stick.h.
+ * DualSense at rest sits a few counts off 128 -- PAD_STICK_ANTI_DEADZONE
+ * (percent, default 13) the output at its edge, and PAD_STICK_SQUIRCLE
+ * (default 8000, 0 off) RPCS3's squircling; see pad_stick.h.
  */
 #ifdef _WIN32
 
@@ -105,13 +106,15 @@ static int sony_kind(USHORT vid, USHORT pid)
     }
 }
 
-/* One stick's raw bytes (centre 128) through the radial deadzone. */
+/* One stick's raw bytes (centre 128) through the radial deadzone and squircling. */
 static void stick(uint8_t rx, uint8_t ry, uint8_t* x, uint8_t* y)
 {
-    static int d = -1, a = -1;
+    static int d = -1, a = -1, q = -1;
     PS3_KNOB(d, ps3_env_int("PAD_HID_DEADZONE", 20));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
-    pad_stick_to_u8((rx - 128) / 127.0f, (ry - 128) / 127.0f, d / 128.0f, a / 100.0f, x, y);
+    PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));
+    pad_stick_to_u8((rx - 128) / 127.0f, (ry - 128) / 127.0f, d / 128.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f,
+                    x, y);
 }
 
 static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
