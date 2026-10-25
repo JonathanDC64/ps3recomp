@@ -90,6 +90,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setenv("PS3_NET_ONLINE", "1", 1);   /* cellHttp connects only online */
+    setenv("PS3_NET_LAN", "1", 1);      /* and to a server on this PC only in a local setup */
     vm_base = calloc(1, MEM);
     ppu_vm_size = MEM;
     strcpy((char*)vm_base + 0x100, "http");
