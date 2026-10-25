@@ -1003,6 +1003,7 @@ extern "C" void spu_taskset_ppu_committed(uint32_t ea);
 
 extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 {
+    ea = (uint32_t)ea;   /* the guest's 32-bit address space, as every other access path cuts it */
     uint32_t exp_raw = __builtin_bswap32(expected);
     uint32_t new_raw = __builtin_bswap32(val);
     if (resv_off())
@@ -1095,6 +1096,7 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
 }
 extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
 {
+    ea = (uint32_t)ea;   /* (as above) */
     uint64_t exp_raw = __builtin_bswap64(expected);
     uint64_t new_raw = __builtin_bswap64(val);
     if (resv_off())
