@@ -165,10 +165,14 @@ int      rsx_d3d12_display_shown_mhz(void);
  * vertex program in fetch form, reading its vertex arrays itself, as the
  * draws the GPU fetch path records use) and returns its instruction count,
  * <= 0 on failure. Not thread-safe.
+ * rsx_d3d12_shader_hdr turns a fragment program's text into its HDR variant
+ * hdrv (a pipeline index row's field) in place; returns how many clamps or
+ * samples it changed.
  * rsx_d3d12_shader_cache_put compiles that text into the cache: 1 = already
  * there, 2 = compiled, 0 = failed. Thread-safe. */
 int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
                           int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap);
+int rsx_d3d12_shader_hdr(char* hlsl, u32 cap, u32 hdrv);
 int rsx_d3d12_shader_cache_put(int fragment, const char* hlsl);
 const char* rsx_d3d12_shader_cache_path(void);
 /* Variants (exp32, cube mask, d2c mask: 3 words each) that earlier runs

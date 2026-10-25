@@ -5548,6 +5548,15 @@ static int fp_hdr_sat_units(char* hlsl, size_t cap, u32 mask)
     return k;
 }
 
+/* A fragment program's text in HDR variant hdrv (dr_hdrv), as vp_get_fp_pso
+ * makes it; the pipeline index's build (rsx_shader_precompile.c) makes its
+ * rows' texts with it too. Returns how many clamps or samples it changed. */
+int rsx_d3d12_shader_hdr(char* hlsl, u32 cap, u32 hdrv)
+{
+    if (!hlsl || !hdrv) return 0;
+    return (hdrv & HDRV_SAT) ? fp_hdr_sat_units(hlsl, cap, hdrv & ~HDRV_SAT) : fp_hdr_unclamp(hlsl, cap, hdrv);
+}
+
 /* At a batch's start, before any target is made: the targets promoted in this
  * batch, as the last batch found them. */
 static void hdr_batch_start(void)
@@ -5740,7 +5749,7 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
  * (until the list changes, or a new library removes the file: pso_lib_open).
  *
  * A row, tab-separated, in hex:
- *   vp vstart vfetch fp exp32 cube d2c clamp blend nrt rtfmt cmask cull depth
+ *   vp vstart vfetch fp exp32 cube d2c clamp blend nrt rtfmt cmask cull depth [hdrv]
  * vp: FNV-1a 64 of the vertex program's words up to its END instruction, as
  *   the transform program store holds them (little-endian); vstart: the
  *   transform program start it was decompiled at; vfetch: 1 for the fetch
@@ -5748,8 +5757,11 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
  * fp: rsx_fp_code_hash64 (the instructions without their inline constants);
  *   exp32, cube, d2c: as fp_build_hlsl takes them, the masks cut to the units
  *   the program samples; clamp: 1 for the sprite-edge clamp form.
- * The rest are vp_get_fp_pso's arguments. A program whose constants are in
- * its text (s_fp_baked) is not recorded.
+ * The rest are vp_get_fp_pso's arguments. hdrv, only in a row with HDR on
+ * (RSX_HDR), when it is not 0: the program's HDR variant (dr_hdrv), a read
+ * clamp's mask cut to the units the program samples. A row without it builds
+ * the plain text, as every row did before the field.
+ * A program whose constants are in its text (s_fp_baked) is not recorded.
  * PS3_PSO_INDEX=0 turns recording and building off. */
 static int pso_index_on(void)
 {
@@ -5818,17 +5830,20 @@ static void pxr_load(void)
 }
 
 static void pso_index_note(const VPVSEntry* vs, const u8* fp_ucode, int exp32, u32 cube, u32 d2c, int clamp,
-                           u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth)
+                           u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth, u32 hdrv)
 {
     if (!pso_index_on() || !vs->code64 || s_fp_baked || !shader_cache_dir()[0]) return;
     const u32 used = rsx_fp_texture_units(fp_ucode, RSX_FP_MAX_BYTES);
     cube &= used | (used << 16); d2c &= used;
+    if ((hdrv & HDRV_SAT) && !(hdrv & used)) hdrv = 0;   /* no promoted target sampled: the plain text */
+    else if (hdrv & HDRV_SAT) hdrv &= HDRV_SAT | used;
     char row[192];
-    const int n = snprintf(row, sizeof row, "%016llx\t%x\t%d\t%016llx\t%d\t%x\t%x\t%d\t%x\t%d\t%x\t%x\t%x\t%x",
-                           (unsigned long long)vs->code64, vs->start, vs->fetch ? 1 : 0,
-                           (unsigned long long)rsx_fp_code_hash64(fp_ucode, RSX_FP_MAX_BYTES),
-                           exp32 ? 1 : 0, cube, d2c, clamp ? 1 : 0, blend, nrt, (u32)rtfmt, cmask & 0xFu,
-                           cull, depth);
+    int n = snprintf(row, sizeof row, "%016llx\t%x\t%d\t%016llx\t%d\t%x\t%x\t%d\t%x\t%d\t%x\t%x\t%x\t%x",
+                     (unsigned long long)vs->code64, vs->start, vs->fetch ? 1 : 0,
+                     (unsigned long long)rsx_fp_code_hash64(fp_ucode, RSX_FP_MAX_BYTES),
+                     exp32 ? 1 : 0, cube, d2c, clamp ? 1 : 0, blend, nrt, (u32)rtfmt, cmask & 0xFu,
+                     cull, depth);
+    if (n > 0 && n < (int)sizeof row && hdrv) n += snprintf(row + n, sizeof row - (size_t)n, "\t%x", hdrv);
     if (n <= 0 || n >= (int)sizeof row) return;
     AcquireSRWLockExclusive(&s_pxr_lock);
     if (!s_pxr_loaded) pxr_load();
@@ -6315,8 +6330,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb = NULL;
     if (hdrv) {
         const int sat = (hdrv & HDRV_SAT) != 0;
-        const int k = sat ? fp_hdr_sat_units(hlsl, sizeof hlsl, hdrv & ~HDRV_SAT)
-                          : fp_hdr_unclamp(hlsl, sizeof hlsl, hdrv);
+        const int k = rsx_d3d12_shader_hdr(hlsl, sizeof hlsl, hdrv);
         static int said;
         if (said < 16 && ++said) printf("[D3D12] HDR: fp 0x%X's variant, %d %s\n", fp_addr, k,
                                         sat ? (k == 1 ? "sample clamped" : "samples clamped")
@@ -6342,7 +6356,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                blend, nrt, rtfmt, cmask, cull, depth);
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)   /* a row for the pipeline index */
         pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask, gsb != NULL,
-                       blend, nrt, rtfmt, cmask, cull, depth);
+                       blend, nrt, rtfmt, cmask, cull, depth, hdrv);
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */
@@ -10079,7 +10093,10 @@ static void rsx_scale_apply(void)
  *      target or a depth surface. The pass runs right after it. The HUD comes
  *      after: Demon's Souls draws it blended, into T, after its post chain.
  * The pass filters a copy of T (off_rt_snapshot) back into T, RGB only: alpha
- * can hold data (Demon's Souls keeps its depth-of-field mask there).
+ * can hold data (Demon's Souls keeps its depth-of-field mask there). T is
+ * RGBA8, or FP16 while HDR keeps the game's highlights in it (RSX_HDR,
+ * RSX_HDR_SCENE_FP): the pass has a pipeline for each, and the filter works
+ * on values above 1 as it does below.
  *
  * RSX_AA_BEFORE_FP=<fp>[,<fp>...]: run the pass before the first draw with one
  * of these fragment programs (SET_SHADER_PROGRAM values in hex, as the F9 draw
@@ -10106,12 +10123,13 @@ static int knob_aa_at_present(void) { static int v = -1; PS3_KNOB(v, aa_at_prese
 enum { AA_RUN, AA_NO_COPY, AA_SMALL, AA_FORMAT, AA_NO_SCENE, AA_NO_POST };
 static const char* const s_aa_why[] = {
     "", "no display copy", "the display copy's source is small",
-    "the scene target is not RGBA8", "no 3D scene", "no post pass before the display copy",
+    "the scene target is neither RGBA8 nor FP16", "no 3D scene", "no post pass before the display copy",
 };
 
 static struct {
     ID3D12RootSignature*  rs;
     ID3D12PipelineState*  pso;
+    ID3D12PipelineState*  pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
     ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
     u32                   disp_w, disp_h;
@@ -10198,6 +10216,10 @@ static int aa_ready(void)
         pd.SampleDesc.Count = 1;
         hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
             &IID_ID3D12PipelineState, (void**)&s_aa.pso);
+        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;   /* without it, FP16 targets go unfiltered */
+        if (SUCCEEDED(hr) && FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
+                &IID_ID3D12PipelineState, (void**)&s_aa.pso16)))
+            s_aa.pso16 = NULL;
     }
     if (vb) vb->lpVtbl->Release(vb);
     if (pb) pb->lpVtbl->Release(pb);
@@ -10211,15 +10233,16 @@ static int aa_ready(void)
     return 1;
 }
 
-/* One pass: src (an RGBA8 copy of the target, in PIXEL_SHADER_RESOURCE)
- * filtered into the target behind rtv, w x h, in RENDER_TARGET. Binds its own
- * root signature, pipeline, target, viewport and topology; the shader-visible
- * heap must be srv_heap. The backend waits for the GPU before each batch, so
- * the one descriptor at AA_SRV_SLOT is free to rewrite. */
-static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+/* One pass: src (a copy of the target in format fmt, RGBA8 or FP16, in
+ * PIXEL_SHADER_RESOURCE) filtered into the target behind rtv, w x h, in
+ * RENDER_TARGET. Binds its own root signature, pipeline, target, viewport and
+ * topology; the shader-visible heap must be srv_heap. The backend waits for
+ * the GPU before each batch, so the one descriptor at AA_SRV_SLOT is free to
+ * rewrite. */
+static void aa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    srv_write(AA_SRV_SLOT, src, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    srv_write(AA_SRV_SLOT, src, fmt, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g);
     g.ptr += (u64)AA_SRV_SLOT * s_d3d.srv_inc;
@@ -10230,7 +10253,7 @@ static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w,
     cl->lpVtbl->RSSetViewports(cl, 1, &vp);
     cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_aa.rs);
-    cl->lpVtbl->SetPipelineState(cl, s_aa.pso);
+    cl->lpVtbl->SetPipelineState(cl, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -10242,11 +10265,13 @@ static void aa_draw(ID3D12Resource* src, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w,
 static int aa_run_rt(int t)
 {
     OffRT* r = &s_d3d.off_rt[t];
-    if (!aa_ready() || !r->res || r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) return 0;
+    if (!aa_ready() || !r->res) return 0;
+    if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && (r->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT || !s_aa.pso16))
+        return 0;
     ID3D12Resource* src = off_rt_snapshot(t);
     if (!src) return 0;
     off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    aa_draw(src, off_rt_rtv(t), r->hw, r->hh);
+    aa_draw(src, (DXGI_FORMAT)r->dxgi, off_rt_rtv(t), r->hw, r->hh);
     return 1;
 }
 
@@ -10295,7 +10320,7 @@ static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     s_aa.disp_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
     cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, heaps);
-    aa_draw(s_aa.disp, rtv, w, h);
+    aa_draw(s_aa.disp, DXGI_FORMAT_R8G8B8A8_UNORM, rtv, w, h);
 }
 
 /* Where this batch's pass goes (see the top of this section): returns T's
@@ -10321,7 +10346,9 @@ static int aa_pick(u32* before, int* why)
     if (t < 0) { *why = AA_NO_COPY; return -1; }
     const OffRT* T = &s_d3d.off_rt[t];
     if ((u64)T->w * T->h * 4u < (u64)s_d3d.width * s_d3d.height) { *why = AA_SMALL; return -1; }
-    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) { *why = AA_FORMAT; return -1; }
+    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && T->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        *why = AA_FORMAT; return -1;
+    }
     aa_before_fp_load();
     u32 scene = 0;
     int post = -1, named = -1;
@@ -15014,6 +15041,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
     if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
+    if (s_aa.pso16) s_aa.pso16->lpVtbl->Release(s_aa.pso16);
     if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
     if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
     memset(&s_aa, 0, sizeof s_aa);
