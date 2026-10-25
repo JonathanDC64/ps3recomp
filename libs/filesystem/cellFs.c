@@ -8,6 +8,7 @@
 #include "cellFs.h"
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
+#include "ps3emu/vfs_path.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -125,6 +126,12 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 
     if (!ps3_path || !host_buf || buf_size == 0)
         return -1;
+
+    /* A path that leaves the virtual file system has no mapping (vfs_path.h). */
+    char clean[1024];
+    if (!ps3_vfs_guest_path(ps3_path, clean, sizeof clean, "cellFs"))
+        return -1;
+    ps3_path = clean;
 
     /* Find longest matching prefix */
     int best = -1;

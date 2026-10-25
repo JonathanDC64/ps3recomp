@@ -5,6 +5,7 @@
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
+#include "ps3emu/vfs_path.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,15 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
+    /* Every branch below works on the cleaned path; one that leaves the
+     * virtual file system goes where every file call fails (vfs_path.h). */
+    char clean[1024];
+    if (!ps3_vfs_guest_path(ps3_path, clean, sizeof clean, "sys_fs")) {
+        snprintf(host_path, (size_t)host_path_size, "%s", PS3_VFS_REFUSED_PATH);
+        return;
+    }
+    ps3_path = clean;
+
     /* Lazily adopt PS3_VFS_ROOT if the root is still the default ".", so this
      * sys_fs layer points at the same place as the cellFs layer (ppu_vfs_root). */
     if (g_sys_fs_root[0] == '.' && g_sys_fs_root[1] == '\0') {

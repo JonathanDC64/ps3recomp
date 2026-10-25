@@ -72,6 +72,8 @@ jobs:
           /tmp/test_dialog_callbacks
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_fixed.c                 -Wl,-dead_strip -o /tmp/test_savedata_fixed
           /tmp/test_savedata_fixed
+          clang -std=gnu17 -I include                 libs/system/tests/test_savedata_io.c                    -Wl,-dead_strip -o /tmp/test_savedata_io
+          /tmp/test_savedata_io
 
       - name: Run self-contained SPU helper tests
         run: |
@@ -138,6 +140,14 @@ jobs:
         run: |
           clang -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_paths libs/filesystem/tests/test_edat_paths.c
           /tmp/test_edat_paths
+
+      # Every guest path passes the same checks before it becomes a host path
+      # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control
+      # characters or Windows device names.
+      - name: Run the guest path test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_vfs_path libs/filesystem/tests/test_vfs_path.c
+          /tmp/test_vfs_path
 
       # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
       # backend and asserts the presented pixel matches the guest clear colour.

@@ -179,6 +179,16 @@ jobs:
           .\test_edat_paths.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # Every guest path passes the same checks before it becomes a host path
+      # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control
+      # characters or Windows device names.
+      - name: Run the guest path test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_vfs_path.exe libs/filesystem/tests/test_vfs_path.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_vfs_path.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
       # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
       - name: Run the stick conversion test

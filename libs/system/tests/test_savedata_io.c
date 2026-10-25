@@ -92,6 +92,18 @@ int main(void)
     assert(step == 3);
     assert(memcmp(vm_base + 0x500, payload, sizeof(payload)) == 0);
     assert(memcmp(vm_base + 0x600, payload, sizeof(payload)) == 0);
+    /* A name that is not one plain directory is refused before any callback
+     * runs, and nothing is made (the rmdir of root below needs it empty). */
+    static const char* const bad[] = { "..", "../TEST00000", "A/B", "A\\B", "NUL", "X:Y", "", "." };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        strcpy((char*)vm_base + 0xB00, bad[i]);
+        step = 99;
+        assert(cellSaveDataAutoSave2(0, (void*)0xB00, 0, (void*)0x200, (void*)0x900,
+                                     (void*)0xA00, 0, (void*)7) == CELL_SAVEDATA_ERROR_PARAM);
+        assert(cellSaveDataAutoLoad2(0, (void*)0xB00, 0, (void*)0x200, (void*)0x900,
+                                     (void*)0xA00, 0, (void*)7) == CELL_SAVEDATA_ERROR_PARAM);
+        assert(step == 99);
+    }
     assert(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00000/ICON0.PNG", root); assert(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00000/PARAM.SFO", root); assert(unlink(path) == 0);

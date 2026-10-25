@@ -7,6 +7,7 @@
 
 #include "cellSaveData.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/vfs_path.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
 #include <stdio.h>
@@ -80,6 +81,15 @@ static void ensure_dirs(const char* path)
         }
     }
     HOST_MKDIR(tmp);
+}
+
+/* A save directory name the title gives: one name that fits, no separators,
+ * no ".." and nothing Windows keeps for devices (vfs_path.h). Every mode
+ * checks it before its name becomes a path. */
+static int save_dir_name_ok(const char* dirName)
+{
+    return dirName && strnlen(dirName, CELL_SAVEDATA_DIRNAME_SIZE) < CELL_SAVEDATA_DIRNAME_SIZE &&
+           ps3_vfs_name_ok(dirName);
 }
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
@@ -674,7 +684,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     default: return CELL_SAVEDATA_ERROR_PARAM;
     }
     if (!name || !name[0] || strnlen(name, CELL_SAVEDATA_FILENAME_SIZE) == CELL_SAVEDATA_FILENAME_SIZE ||
-        strchr(name, '/') || strchr(name, '\\') || !strcmp(name, ".") || !strcmp(name, "..") ||
+        !ps3_vfs_name_ok(name) ||
         (set->fileOperation != CELL_SAVEDATA_FILEOP_DELETE && !set->fileBuf))
         return CELL_SAVEDATA_ERROR_PARAM;
     char file_path[1024];
@@ -838,7 +848,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
 {
-    if (!dirName || !funcStat)
+    if (!save_dir_name_ok(dirName) || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
     char save_path[1024];
@@ -1170,8 +1180,7 @@ static s32 savedata_fixed(int is_save, CellSaveDataSetList* setList,
         SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set no dirName, or an out-of-range option");
     const char* name = (const char*)vm_base + selected;
     size_t len = strnlen(name, CELL_SAVEDATA_DIRNAME_SIZE);
-    if (!len || len == CELL_SAVEDATA_DIRNAME_SIZE || strchr(name, '/') ||
-        strchr(name, '\\') || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+    if (!save_dir_name_ok(name))
         SAVEDATA_REJECT(CELL_SAVEDATA_ERROR_PARAM, "funcFixed set an unusable dirName");
     /* The selected string may be inside callback scratch, reused by funcStat. */
     char directory[CELL_SAVEDATA_DIRNAME_SIZE];
@@ -1260,7 +1269,7 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     printf("[cellSaveData] AutoLoad2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
 
-    if (!dirName || !setBuf || !funcStat)
+    if (!save_dir_name_ok(dirName) || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
     /* funcStat is the GAME's guest-OPD address. Marshal StatGet/Set/CB
@@ -1366,7 +1375,7 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
     (void)errDialog; (void)funcFile; (void)container;
     printf("[cellSaveData] AutoSave(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
-    if (!dirName || !setBuf || !funcStat)
+    if (!save_dir_name_ok(dirName) || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
     /* This used to return CELL_OK WITHOUT running funcStat -- the game believed
@@ -1401,7 +1410,7 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
     (void)container;
     printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
-    if (!dirName || !setBuf || !funcStat)
+    if (!save_dir_name_ok(dirName) || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
     char save_path[1024];
