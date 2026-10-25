@@ -116,8 +116,18 @@ jobs:
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
           /tmp/test_http_loopback
+
+      # The sign-in to a server that has one: the key, the challenge and its
+      # work, the session on cellHttp's requests to that server only. Then
+      # what the player is told when psnr refuses co-op.
+      - name: Run the sign-in tests
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          /tmp/test_net_signin
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_psnr_notice libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          /tmp/test_np_psnr_notice
 
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
       # big-endian units, the byte count returned.
@@ -137,14 +147,14 @@ jobs:
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
           /tmp/test_np_identity
 
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
           /tmp/test_np_nat
 
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
