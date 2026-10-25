@@ -23,16 +23,16 @@ typedef struct _iobuf FILE;
 #define EOF (-1)
 #endif
 
-FILE*  __cdecl __acrt_iob_func(unsigned index);
+FILE*  __acrt_iob_func(unsigned index);
 #define stdin  (__acrt_iob_func(0))
 #define stdout (__acrt_iob_func(1))
 #define stderr (__acrt_iob_func(2))
 
-int    __cdecl fprintf(FILE* stream, const char* format, ...);
-int    __cdecl fputc(int c, FILE* stream);
-int    __cdecl fputs(const char* s, FILE* stream);
-size_t __cdecl fwrite(const void* buffer, size_t size, size_t count, FILE* stream);
-int    __cdecl fflush(FILE* stream);
+int    fprintf(FILE* stream, const char* format, ...);
+int    fputc(int c, FILE* stream);
+int    fputs(const char* s, FILE* stream);
+size_t fwrite(const void* buffer, size_t size, size_t count, FILE* stream);
+int    fflush(FILE* stream);
 
 #ifdef __cplusplus
 }

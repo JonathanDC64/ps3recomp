@@ -298,4 +298,4 @@ void ps3_game_load_prx_modules(void)
     g_extra_symtab       = *s_game.extra_symtab;
     g_extra_symtab_count = *s_game.extra_symtab_count;
 }
-#endif /* PS3_GAME_SPLIT && _WIN32 */
+#endif /* PS3_GAME_SPLIT */

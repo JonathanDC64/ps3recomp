@@ -38,10 +38,13 @@
  *   - PPU_FENCE as the compiler's __atomic_thread_fence, which is what
  *     libstdc++'s std::atomic_thread_fence and clang's <stdatomic.h> both
  *     are, so the fences compile as in the single Linux exe;
- *   - __cdecl as nothing, for game_libc/'s declarations (a Windows keyword);
  *   - hidden visibility for every name declared or defined after it: see
  *     game_module.h. The module's one export, the title's init, says
  *     visibility("default") itself.
+ *
+ * The fences are the one thing spelled per platform: each is the lowering of
+ * that platform's own standard library, so the module's code is the single
+ * exe's there.
  */
 #ifndef PS3EMU_GAME_FREESTANDING_H
 #define PS3EMU_GAME_FREESTANDING_H
@@ -58,7 +61,6 @@
 #define SPU_THREAD_LOCAL __thread
 
 #ifndef _WIN32
-#define __cdecl
 #pragma GCC visibility push(hidden)
 #define PPU_FENCE(o) __atomic_thread_fence(PS3_GFS_ORDER_##o)
 #define PS3_GFS_ORDER_relaxed __ATOMIC_RELAXED

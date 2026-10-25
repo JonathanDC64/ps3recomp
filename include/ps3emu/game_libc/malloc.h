@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-void* __cdecl _aligned_malloc(size_t size, size_t alignment);
-void  __cdecl _aligned_free(void* block);
+void* _aligned_malloc(size_t size, size_t alignment);
+void  _aligned_free(void* block);
 
 #ifdef __cplusplus
 }

@@ -20,16 +20,16 @@
 extern "C" {
 #endif
 
-char*              __cdecl getenv(const char* name);
-int                __cdecl atoi(const char* s);
-unsigned long      __cdecl strtoul(const char* s, char** end, int base);
+char*              getenv(const char* name);
+int                atoi(const char* s);
+unsigned long      strtoul(const char* s, char** end, int base);
 
-unsigned short     __cdecl _byteswap_ushort(unsigned short v);
-unsigned long      __cdecl _byteswap_ulong(unsigned long v);
-unsigned long long __cdecl _byteswap_uint64(unsigned long long v);
+unsigned short     _byteswap_ushort(unsigned short v);
+unsigned long      _byteswap_ulong(unsigned long v);
+unsigned long long _byteswap_uint64(unsigned long long v);
 
-void*              __cdecl malloc(size_t size);
-void               __cdecl free(void* block);
+void*              malloc(size_t size);
+void               free(void* block);
 
 #ifdef __cplusplus
 }
