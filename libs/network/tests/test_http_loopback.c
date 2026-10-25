@@ -47,7 +47,7 @@ static void env(const char* k, const char* v)
 /* Guest layout */
 enum { SCHEME = 0x100, HOST = 0x110, OTHER = 0x130, USER = 0x150, PATH = 0x160, METHOD = 0x1A0,
        HNAME = 0x1B0, HVALUE = 0x1C0, URI = 0x200, CLIENT = 0x300, TRANS = 0x304, SENT = 0x308,
-       RECVD = 0x30C, BODY = 0x400, RBUF = 0x800 };
+       RECVD = 0x30C, BODY = 0x400, RBUF = 0x800, XNAME = 0x1000, XVALUE = 0x1100 };
 
 static void put_str(u32 ea, const char* s) { strcpy((char*)vm_base + ea, s); }
 
@@ -206,6 +206,35 @@ int main(void)
             http_closesocket(c);
         }
         env("PS3_HTTP_HEADER", "");
+    }
+
+    /* A header the title adds is one line: a line break in it, or a colon in
+     * its name, is refused. */
+    {
+        const char* xn = (const char*)(uintptr_t)XNAME;
+        const char* xv = (const char*)(uintptr_t)XVALUE;
+        t = new_trans(client, HOST, port);
+        put_str(XNAME, "X-Two");
+        put_str(XVALUE, "a\r\nX-Evil: b");
+        assert((u32)cellHttpAddRequestHeader(t, xn, xv) == CELL_HTTP_ERROR_INVALID_PARAMETER);
+        put_str(XNAME, "X-A: b");
+        put_str(XVALUE, "c");
+        assert((u32)cellHttpAddRequestHeader(t, xn, xv) == CELL_HTTP_ERROR_INVALID_PARAMETER);
+        assert(HTTP_TRANS(t)->custom_header_count == 0);
+        cellHttpDestroyTransaction(t);
+
+        /* More headers than the request head holds: the request is refused,
+         * and the connection it opened closes with nothing sent. */
+        t = new_trans(client, HOST, port);
+        put_str(XNAME, "X-Big");
+        memset(vm_base + XVALUE, 'v', 511);
+        vm_base[XVALUE + 511] = 0;
+        for (int i = 0; i < 9; i++) assert(cellHttpAddRequestHeader(t, xn, xv) == CELL_OK);
+        assert((u32)cellHttpSendRequest(t, NULL, 0, (u32*)(uintptr_t)SENT) == CELL_HTTP_ERROR_INVALID_PARAMETER);
+        cellHttpDestroyTransaction(t);
+        c = accept(l, NULL, NULL);
+        assert(recv(c, req, sizeof req, 0) == 0);
+        http_closesocket(c);
     }
 
     env("PS3_NET_HOSTS", "");

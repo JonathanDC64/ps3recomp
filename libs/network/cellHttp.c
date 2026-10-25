@@ -7,6 +7,7 @@
  */
 
 #include "cellHttp.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -201,6 +202,26 @@ static int http_extra_header(char* name, size_t name_cap, char* value, size_t va
     memcpy(value, v, vl);
     value[vl] = 0;
     return 1;
+}
+
+/* A piece of the request head is one line: no control characters but tab. */
+static int http_one_line(const char* s)
+{
+    for (; *s; s++)
+        if (((unsigned char)*s < 0x20 && *s != '\t') || (unsigned char)*s == 0x7F) return 0;
+    return 1;
+}
+
+/* Append to the request head in buf[cap]. Once something does not fit, *len
+ * is cap or more and stays there: the caller refuses the request. */
+static void http_req_add(char* buf, size_t cap, size_t* len, const char* fmt, ...)
+{
+    if (*len >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *len, cap - *len, fmt, ap);
+    va_end(ap);
+    *len = n < 0 ? cap : *len + (size_t)n;
 }
 
 /* Send all bytes on a socket, handling partial sends. Returns 0 on success. */
@@ -592,10 +613,11 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
 
     /* ---- Format HTTP request ---- */
     char req_buf[4096];
-    int req_len = snprintf(req_buf, sizeof(req_buf),
-                           "%s %s HTTP/1.1\r\n"
-                           "Host: %s\r\n",
-                           t->method, t->path, t->hostname);
+    size_t req_len = 0;
+    http_req_add(req_buf, sizeof req_buf, &req_len,
+                 "%s %s HTTP/1.1\r\n"
+                 "Host: %s\r\n",
+                 t->method, t->path, t->hostname);
 
     /* The client's User-Agent, unless the title added its own; and
      * "Connection: close" when the title turned keep-alive off (this client
@@ -606,25 +628,25 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
             strlen(t->custom_headers[i].name) == 10)
             ua_added = 1;
     if (!ua_added && c->user_agent[0])
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "User-Agent: %s\r\n", c->user_agent);
     if (!c->keep_alive)
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "Connection: close\r\n");
 
     /* Content-Length header if body provided or explicitly set */
     if (size > 0) {
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "Content-Length: %u\r\n", size);
     } else if (t->request_content_length_set) {
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "Content-Length: %llu\r\n",
                             (unsigned long long)t->request_content_length);
     }
 
     /* Append custom headers */
     for (u32 i = 0; i < t->custom_header_count; i++) {
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "%s: %s\r\n",
                             t->custom_headers[i].name,
                             t->custom_headers[i].value);
@@ -640,18 +662,28 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                     strlen(t->custom_headers[i].name) == strlen(xn))
                     dup = 1;
             if (!dup)
-                req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+                http_req_add(req_buf, sizeof req_buf, &req_len,
                                     "%s: %s\r\n", xn, xv);
         }
     }
 
     if (has_session)
-        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+        http_req_add(req_buf, sizeof req_buf, &req_len,
                             "X-DSS-Session: %s\r\n", session);
 
     /* End of headers */
-    req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+    http_req_add(req_buf, sizeof req_buf, &req_len,
                         "\r\n");
+
+    int lines_ok = http_one_line(t->method) && http_one_line(t->path) && http_one_line(t->hostname);
+    for (u32 i = 0; i < t->custom_header_count && lines_ok; i++)
+        lines_ok = http_one_line(t->custom_headers[i].name) && http_one_line(t->custom_headers[i].value);
+    if (req_len >= sizeof req_buf || !lines_ok) {
+        printf("[cellHttp]   Request refused: %s\n", lines_ok ? "its headers do not fit" : "a line break in it");
+        http_closesocket(sock);
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+        return CELL_HTTP_ERROR_INVALID_PARAMETER;
+    }
 
     /* ---- Send header ---- */
     if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
@@ -672,7 +704,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     }
 
     printf("[cellHttp]   Request sent (%d header bytes + %u body bytes)\n",
-           req_len, size);
+           (int)req_len, size);
 
     /* Store socket for recv */
     t->sock           = sock;
@@ -1070,6 +1102,10 @@ s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
     h->name[sizeof(h->name) - 1] = '\0';
     strncpy(h->value, GUEST_PTR(value, const char*), sizeof(h->value) - 1);
     h->value[sizeof(h->value) - 1] = '\0';
+    if (!h->name[0] || strchr(h->name, ':') || !http_one_line(h->name) || !http_one_line(h->value)) {
+        printf("[cellHttp] AddRequestHeader - not one header line, refused\n");
+        return CELL_HTTP_ERROR_INVALID_PARAMETER;
+    }
     t->custom_header_count++;
 
     printf("[cellHttp] AddRequestHeader(trans=%u, '%s: %s')\n",
