@@ -89,12 +89,22 @@ void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
 /* A datagram that arrived on the P2P socket from from_ip:from_port. 1: it was
  * psnr's own (a probe reply, a peer's punch) -- drop it. 0: it's the title's.
  * A datagram a peer sent through the relay is unwrapped in place: len, and
- * the sender, become the peer's payload and address. */
+ * the sender, become the peer's payload and address. With psnr on, 1 too for
+ * a datagram from an address no room member has, and for a relayed one that
+ * did not come from the psnr server. */
 int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port);
 
 /* A peer's P2P endpoint became known (Matching2 member entries): punch toward
  * it a few times. Our own entry is skipped. */
 void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port);
+
+/* That member has left the room (or we have): its datagrams are dropped from
+ * here on. */
+void np_psnr_peer_left(uint32_t user);
+
+/* Connected: 1 and this machine's address on the way to psnr (a co-op peer
+ * on the same network has an address beside it). */
+int np_psnr_local_ip(uint8_t ip[4]);
 
 /* The relay (psnr docs/api.md, "Relay"), when psnr runs with -relay.
  * - A peer that never answered our punches gets our datagrams through the

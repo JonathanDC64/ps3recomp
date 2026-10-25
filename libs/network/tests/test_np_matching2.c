@@ -50,6 +50,7 @@ uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len, np_psnr_r
 void np_psnr_on_push(void (*fn)(const psnr_msg*)) { s_push = fn; }
 void np_psnr_on_tick(void (*fn)(void)) { (void)fn; }
 void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port) { (void)user; (void)ip; (void)port; }
+void np_psnr_peer_left(uint32_t user) { (void)user; }
 
 /* sysutil: remember the last callback queued */
 static u32 s_cb_opd;

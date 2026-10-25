@@ -88,6 +88,8 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
 #define PSNR_UDP_PROBE_LEN 17
 #define PSNR_UDP_PUNCH_LEN 9
 void psnr_server_addr(const psnr_client* c, uint8_t ip[4], uint16_t* port);
+/* This machine's own address on the way to the server. */
+void psnr_local_addr(const psnr_client* c, uint8_t ip[4]);
 void psnr_probe_packet(const psnr_client* c, uint8_t out[PSNR_UDP_PROBE_LEN]);
 void psnr_punch_packet(const psnr_client* c, uint8_t out[PSNR_UDP_PUNCH_LEN]);
 int  psnr_is_control(const void* buf, size_t len);

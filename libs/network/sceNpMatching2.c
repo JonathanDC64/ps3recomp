@@ -596,7 +596,10 @@ static void room_gone(m2_ctx* c)
 {
     cancel_signal(ctx_id(c), 0);
     for (int i = 0; i < c->room.n; i++)
-        if (c->room.m[i].id != c->room.me) signal_member(c, c->room.m[i].id, SIG_EV_Dead);
+        if (c->room.m[i].id != c->room.me) {
+            signal_member(c, c->room.m[i].id, SIG_EV_Dead);
+            np_psnr_peer_left(c->room.m[i].user);   /* their datagrams are dropped from here */
+        }
     c->room.in = 0;
 }
 
@@ -662,6 +665,7 @@ static void on_push(const psnr_msg* m)
         printf("[sceNpMatching2] room %llu: %s left\n", (unsigned long long)r->id, gm->online_id);
         cancel_signal(ctx_id(c), gone);
         signal_member(c, gone, SIG_EV_Dead);
+        np_psnr_peer_left(gm->user);
         member_event(c, gm, ROOM_EV_MemberLeft, CAUSE_LEAVE_ACTION);
         *gm = r->m[--r->n];
         if (owner != r->owner) {
