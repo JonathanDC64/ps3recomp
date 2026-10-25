@@ -101,6 +101,11 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/codec/sail_movie.cpp")
 file(GLOB AT3_SOURCES CONFIGURE_DEPENDS "third_party/at3_standalone/*.cpp")
 set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${AT3_SOURCES})
+# Ed25519 for the network sign-in (libs/network/ps3_net_signin.c): Monocypher,
+# BSD-2-Clause or CC0 (third_party/monocypher -- see its README).
+file(GLOB MONOCYPHER_SOURCES CONFIGURE_DEPENDS "third_party/monocypher/*.c")
+set_source_files_properties(${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+list(APPEND HLE_SOURCES ${MONOCYPHER_SOURCES})
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
