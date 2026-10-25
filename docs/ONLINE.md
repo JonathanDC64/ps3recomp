@@ -59,6 +59,9 @@ knows a player by a key, not just a name. With `PS3_NET_SIGNIN` and
   show the player: `ps3_net_signin_notice()` in `include/ps3emu/ps3_net_signin.h`.
   When psnr refuses co-op, the player is told so too, unless the sign-in itself
   failed: then its own message stays, not replaced by a second one.
+- The server's banners (`GET /dss/v1/banners`, no session) are fetched every
+  5 minutes by a thread of their own, from the host's first call of
+  `ps3_net_signin_banner()`, which hands over each new banner once.
 
 ## Two players on one machine
 

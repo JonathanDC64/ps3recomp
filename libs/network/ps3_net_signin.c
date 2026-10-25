@@ -9,6 +9,8 @@
  *                            "signature"}
  *                           -> {"token": <base64url>, "expires": <RFC 3339>}
  *                              or {"error": <code>, "message": <for the player>}
+ *   GET  /dss/v1/banners    -> {"banners": [{"id", "text", "ends"}]}
+ *                              (no session; for the host to show, once each)
  *
  * The signature is Ed25519 (third_party/monocypher) over those fields, one
  * per line after "DSS session v1". A key the server has not seen also
@@ -446,22 +448,25 @@ static si_sock_t si_dial(const uint8_t ip[4], uint16_t port)
     return s;
 }
 
-/* POST path with a JSON body (may be ""). 0 with the status, the body in
- * out[cap] and the Date header (or "") in date[dcap]; -1 if no address
- * answered or the reply is not HTTP. */
-static int si_http_post(const uint8_t ips[SI_MAX_IPS][4], int nips, const char* host, uint16_t port, const char* path,
-                     const char* body, int* status, char* out, size_t cap, char* date, size_t dcap)
+/* POST path with a JSON body (may be ""), or GET it with body NULL. 0 with
+ * the status, the body in out[cap] and the Date header (or "") in
+ * date[dcap]; -1 if no address answered or the reply is not HTTP. */
+static int si_http(const uint8_t ips[SI_MAX_IPS][4], int nips, const char* host, uint16_t port, const char* path,
+                   const char* body, int* status, char* out, size_t cap, char* date, size_t dcap)
 {
     si_sock_t s = SI_BAD_SOCK;
     for (int i = 0; i < nips && s == SI_BAD_SOCK; i++) s = si_dial(ips[i], port);
     if (s == SI_BAD_SOCK) return -1;
 
     char head[512];
-    size_t blen = strlen(body);
-    int hl = snprintf(head, sizeof head,
-                      "POST %s HTTP/1.0\r\nHost: %s:%u\r\nUser-Agent: ps3recomp\r\nContent-Type: application/json\r\n"
-                      "Content-Length: %u\r\nConnection: close\r\n\r\n",
-                      path, host, (unsigned)port, (unsigned)blen);
+    size_t blen = body ? strlen(body) : 0;
+    int hl = body ? snprintf(head, sizeof head,
+                             "POST %s HTTP/1.0\r\nHost: %s:%u\r\nUser-Agent: ps3recomp\r\n"
+                             "Content-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+                             path, host, (unsigned)port, (unsigned)blen)
+                  : snprintf(head, sizeof head,
+                             "GET %s HTTP/1.0\r\nHost: %s:%u\r\nUser-Agent: ps3recomp\r\nConnection: close\r\n\r\n",
+                             path, host, (unsigned)port);
     int ok = hl > 0 && hl < (int)sizeof head && send(s, head, hl, SI_SEND_FLAGS) == hl;
     for (size_t sent = 0; ok && sent < blen;) {
         int n = send(s, body + sent, (int)(blen - sent), SI_SEND_FLAGS);
@@ -743,7 +748,7 @@ static int si_sign_in(time_t now)
     char date[64];
     for (int attempt = 0; reply && attempt < 3; attempt++) {
         int status;
-        if (si_http_post(ips, nips, host, port, "/dss/v1/challenge", "", &status, reply, SI_REPLY_MAX, date, sizeof date) != 0) {
+        if (si_http(ips, nips, host, port, "/dss/v1/challenge", "", &status, reply, SI_REPLY_MAX, date, sizeof date) != 0) {
             printf("[signin] %s:%u did not answer\n", host, (unsigned)port);
             break;
         }
@@ -779,7 +784,7 @@ static int si_sign_in(time_t now)
                  "{\"name\":\"%s\",\"public_key\":\"%s\",\"client_version\":\"%s\",\"network_version\":%d,"
                  "\"challenge\":\"%s\",\"pow_nonce\":%llu,\"signature\":\"%s\"}",
                  name, pk64, version, nv, ch64, (unsigned long long)nonce, sig64);
-        if (si_http_post(ips, nips, host, port, "/dss/v1/session", body, &status, reply, SI_REPLY_MAX, date, sizeof date) != 0) {
+        if (si_http(ips, nips, host, port, "/dss/v1/session", body, &status, reply, SI_REPLY_MAX, date, sizeof date) != 0) {
             printf("[signin] %s:%u did not answer\n", host, (unsigned)port);
             break;
         }
@@ -841,4 +846,118 @@ void ps3_net_session_drop(void)
     crypto_wipe(si_raw, sizeof si_raw);
     si_end = si_renew = si_retry = 0;
     SI_UNLOCK(si_lock);
+}
+
+/* ---- banners -------------------------------------------------------- */
+
+/* GET /dss/v1/banners on the sign-in server, with no session:
+ *   {"banners": [{"id": n, "text": "...", "ends": <RFC 3339>}]}
+ * at most 4, the oldest first. A thread of their own asks every
+ * SI_BANNER_SECS; each banner goes to the host once. */
+#define SI_BANNER_SECS  300
+#define SI_BANNER_QUEUE 4
+#define SI_BANNER_SEEN  64
+
+static char      si_banner[SI_BANNER_QUEUE][256];   /* (si_slock) fetched, not taken yet; the oldest first */
+static int       si_nbanner;
+static long long si_seen[SI_BANNER_SEEN];           /* (si_slock) the ids queued so far, the newest 64 */
+static int       si_nseen;
+static int       si_banner_started;                 /* (si_slock) the thread runs */
+
+static int si_banner_seen(long long id)
+{
+    for (int i = 0; i < si_nseen && i < SI_BANNER_SEEN; i++)
+        if (si_seen[i] == id) return 1;
+    return 0;
+}
+
+/* One ask: the banners not seen before go into the queue (a full queue
+ * drops the rest until the next ask). 1 if the server gave a list. */
+static int si_banners_fetch(void)
+{
+    char host[256];
+    uint16_t port;
+    uint8_t ips[SI_MAX_IPS][4];
+    int status = 0;
+    if (!ps3_net_signin_enabled()) return 0;
+    const char* addr = getenv("PS3_NET_SIGNIN");
+    if (si_split_address(addr, host, sizeof host, &port) != 0) return 0;
+    int nips = si_server_ips(addr, host, 0, ips);
+    char* reply = nips > 0 ? (char*)malloc(SI_REPLY_MAX) : NULL;
+    if (!reply) return 0;
+    const char* p = NULL;
+    if (si_http(ips, nips, host, port, "/dss/v1/banners", NULL, &status, reply, SI_REPLY_MAX, NULL, 0) == 0 &&
+        status == 200)
+        p = si_js_member(reply, "banners");
+    if (!p || *p != '[') {   /* (none, or a server with no banners: quietly) */
+        free(reply);
+        return 0;
+    }
+    p = si_js_ws(p + 1);
+    while (*p == '{') {
+        long long id = 0;
+        char text[256];
+        int have = si_js_int(p, "id", &id) && si_js_str(p, "text", text, sizeof text) && text[0];
+        if (!(p = si_js_skip(p, 1))) break;
+        if (have) {
+            for (char* c = text; *c; c++)
+                if ((unsigned char)*c < 0x20) *c = ' ';
+            SI_LOCK(si_slock);
+            int fresh = !si_banner_seen(id) && si_nbanner < SI_BANNER_QUEUE;
+            if (fresh) {
+                snprintf(si_banner[si_nbanner++], sizeof si_banner[0], "%s", text);
+                si_seen[si_nseen++ % SI_BANNER_SEEN] = id;
+            }
+            SI_UNLOCK(si_slock);
+            if (fresh) printf("[signin] banner %lld from the server\n", id);
+        }
+        p = si_js_ws(p);
+        if (*p != ',') break;
+        p = si_js_ws(p + 1);
+    }
+    free(reply);
+    return 1;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI si_banner_main(LPVOID arg)
+#else
+static void* si_banner_main(void* arg)
+#endif
+{
+    (void)arg;
+    for (;;) {
+        si_banners_fetch();
+#ifdef _WIN32
+        Sleep(SI_BANNER_SECS * 1000);
+#else
+        sleep(SI_BANNER_SECS);
+#endif
+    }
+    return 0;
+}
+
+int ps3_net_signin_banner(char* out, size_t cap)
+{
+    int start = 0, r = 0;
+    if (!ps3_net_signin_enabled()) return 0;
+    SI_LOCK(si_slock);
+    if (!si_banner_started) start = si_banner_started = 1;
+    if (si_nbanner && cap) {
+        snprintf(out, cap, "%s", si_banner[0]);
+        memmove(si_banner[0], si_banner[1], sizeof si_banner[0] * (size_t)(si_nbanner - 1));
+        si_nbanner--;
+        r = 1;
+    }
+    SI_UNLOCK(si_slock);
+    if (start) {
+#ifdef _WIN32
+        HANDLE th = CreateThread(NULL, 0, si_banner_main, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+#else
+        pthread_t th;
+        if (pthread_create(&th, NULL, si_banner_main, NULL) == 0) pthread_detach(th);
+#endif
+    }
+    return r;
 }
