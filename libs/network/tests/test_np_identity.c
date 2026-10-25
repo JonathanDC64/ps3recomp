@@ -1,12 +1,13 @@
 ﻿/*
  * test_np_identity - the player name np_psnr_setup settles on.
  *
- *   clang-cl /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_np_identity libs/network/tests/test_np_identity.c
+ *   clang-cl /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+ *   cc -std=gnu17 -I include -o test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
  */
 #include "../psnr/psnr.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
+#include "../ps3_net_signin.c"
 
 #include <assert.h>
 

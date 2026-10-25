@@ -3,6 +3,7 @@
  */
 #include "np_psnr.h"
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_locked_offline */
+#include "ps3emu/ps3_net_signin.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -169,15 +170,37 @@ int np_psnr_connect(const char* comm_id)
     char* colon = strrchr(host, ':');
     if (colon) { *colon = 0; port = (uint16_t)atoi(colon + 1); }
 
+    /* With a sign-in (ps3emu/ps3_net_signin.h) HELLO carries the session; a
+     * server that says it has ended gets one new sign-in. */
+    uint8_t session[32];
+    int signed_in = ps3_net_session(NULL, 0, session);
     s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
-                            np_psnr_p2p_port(), &user_id, ip);
+                            np_psnr_p2p_port(), signed_in ? session : NULL, &user_id, ip);
+    if (!s_client && signed_in && psnr_connect_error() == PSNR_E_SIGN_IN) {
+        ps3_net_session_drop();
+        signed_in = ps3_net_session(NULL, 0, session);
+        if (signed_in)
+            s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
+                                    np_psnr_p2p_port(), session, &user_id, ip);
+    }
+    memset(session, 0, sizeof(session));
     s_user_id = user_id;
     UNLOCK();
+    const int err = s_client ? 0 : psnr_connect_error();
+    /* A HELLO with no session because the sign-in itself failed says nothing
+     * more: the sign-in has given its own reason (a ban, maintenance), which
+     * a second notice would replace before it is shown. */
+    if ((err == PSNR_E_SIGN_IN && (signed_in || !ps3_net_signin_enabled())) || err == PSNR_E_NOT_YOUR_NAME)
+        ps3_net_signin_post_notice("Co-op is not available: the matchmaking server did not accept this sign-in.");
+    else if (err == PSNR_E_REFUSED)
+        ps3_net_signin_post_notice("Co-op is not available right now.");
     if (s_client)
-        printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u\n",
+        printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u%s\n",
                host, port, np_psnr_online_id(), comm_id, user_id, ip[0], ip[1], ip[2], ip[3],
-               np_psnr_p2p_port());
-    else if (psnr_connect_error() == PSNR_E_NAME_TAKEN)
+               np_psnr_p2p_port(), signed_in ? ", signed in" : "");
+    else if (err >= PSNR_E_SIGN_IN && err <= PSNR_E_REFUSED)
+        printf("[psnr] %s:%u refused the HELLO (error %d) -- NP stays offline\n", host, port, err);
+    else if (err == PSNR_E_NAME_TAKEN)
         printf("[psnr] %s:%u: another player there is already \"%s\" -- pick another "
                "with --username. NP stays offline\n", host, port, np_psnr_online_id());
     else

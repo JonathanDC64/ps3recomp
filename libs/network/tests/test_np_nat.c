@@ -4,12 +4,13 @@
  * that never answers to the relay. The socket is a fake sender that records
  * what goes out.
  *
- *   clang-cl /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_np_nat libs/network/tests/test_np_nat.c
+ *   clang-cl /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+ *   cc -std=gnu17 -I include -o test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
  */
 #include "../psnr/psnr.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
+#include "../ps3_net_signin.c"
 
 #include <assert.h>
 #ifdef _WIN32

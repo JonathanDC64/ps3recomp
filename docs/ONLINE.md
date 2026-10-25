@@ -31,8 +31,34 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_P2P_PORT=n` | The host port this instance's P2P sockets bind, whatever port the title asks for. Default 3658. psnr hands this port to peers. Two instances on one machine need two ports. |
 | `PS3_NP_SIGNALING_DELAY_MS=n` | How long after a member joins that signaling reports them "established". Default 1000. |
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
+| `PS3_NET_SIGNIN=host[:port]` | Sign in to this server before using it (see "Sign-in" below). Port 18000 by default. Needs `PS3_NET_KEY_FILE` too. |
+| `PS3_NET_KEY_FILE=path` | Where the install's sign-in key is kept. Made at the first sign-in, and never written over: losing it loses the name on that server. |
+| `PS3_NET_CLIENT_VERSION=x.y.z` | The build's version, for the server's version gate. Default 0.0.0. |
+| `PS3_NET_NETWORK_VERSION=n` | Which builds play together. Default 1. |
 
 `ps3_net_lock_offline()` (`include/ps3emu/ps3_net.h`) keeps a process offline for good, whatever the variables say later: cellNetCtl, NP, the sys_net host sockets and cellHttp all report no network. A port calls it for sessions that must never reach other players. Called before the title starts, the host sockets are never registered.
+
+## Sign-in
+
+A server with a sign-in (the Demon's Souls Recomp server: its `docs/identity.md`)
+knows a player by a key, not just a name. With `PS3_NET_SIGNIN` and
+`PS3_NET_KEY_FILE` set (`libs/network/ps3_net_signin.c`):
+
+- At the first sign-in the runtime makes an Ed25519 key (Monocypher,
+  `third_party/monocypher`) and writes it to the key file. The first key to sign
+  in with a name owns that name on the server.
+- It asks the server for a challenge, signs it, and gets a session token back.
+  A key the server has not seen also does a short proof of work (SHA-256).
+- cellHttp adds `X-DSS-Session: <token>` to the title's requests to that
+  server's address, and to no other. psnr's HELLO carries the token too; when
+  psnr says it has ended, the runtime signs in once more.
+- The session is renewed before it ends. After a failure there is no new try
+  for a minute. A server that does not answer, or has no sign-in, leaves the
+  title's requests as they were.
+- A refusal's message (a ban, maintenance, an old build) is kept for the host to
+  show the player: `ps3_net_signin_notice()` in `include/ps3emu/ps3_net_signin.h`.
+  When psnr refuses co-op, the player is told so too, unless the sign-in itself
+  failed: then its own message stays, not replaced by a second one.
 
 ## Two players on one machine
 
@@ -57,6 +83,7 @@ stage starts, and the title drops the peer as "not responding". Set
 | cellSysutilAvc2 | Voice chat loads, joins and streams, but carries no audio. |
 | sceNp manager | Reports ONLINE when online with psnr, or online with a player name; fires the manager callback once with that status. |
 | cellNetCtl | Connected only online. The net-start dialog reports `CELL_NET_CTL_ERROR_DIALOG_CANCELED` offline, 0 online. |
+| Sign-in | The key, the challenge and session calls, the session on cellHttp's requests to that server and in psnr's HELLO (see "Sign-in"). |
 | sys_net | P2P sockets map to UDP/TCP on `PS3_NET_P2P_PORT`. Datagram P2P sockets share the port by vport: each datagram carries an 8-byte vport header (`VP01`, destination and source vport), so both peers need a runtime with it. Stream P2P sockets share the port as plain TCP. |
 
 ## How it was verified
