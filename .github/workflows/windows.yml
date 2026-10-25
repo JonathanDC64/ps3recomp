@@ -165,6 +165,15 @@ jobs:
           .\test_edat_paths.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
+      # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
+      - name: Run the stick conversion test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I libs/input /Fe:test_pad_stick.exe libs/input/tests/test_pad_stick.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_pad_stick.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       # sync_stress has always been the Windows-native suite; now that its
