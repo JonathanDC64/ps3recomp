@@ -20,6 +20,15 @@
  *     library function (PS3_GAME_HOST_CRT_FUNCS) into the host's C runtime.
  *
  * Compiled with PS3_GAME_MODULE defined and without PS3_GAME_SPLIT.
+ *
+ * On Linux (an ELF shared object) everything here is hidden, as the forced
+ * include ps3emu/game_freestanding.h makes every name in the module, so the
+ * module's globals are read relative to the instruction pointer and nothing
+ * binds to the host's names. The two trampolines are initial-exec
+ * thread-locals (the module is compiled with -ftls-model=initial-exec): one
+ * %fs-relative access, as cheap as the DLL's. glibc keeps some static TLS
+ * spare for a library opened later; these two pointers take 16 bytes of it,
+ * and if none were left the dlopen would fail with glibc's message.
  */
 #ifndef PS3_GAME_MODULE
 #define PS3_GAME_MODULE 1
@@ -29,8 +38,15 @@
 #include "ps3emu/ps3_knob.h"     /* ps3_env_gen: this module's own copy */
 #include "ps3emu/game_module.h"
 
-#if !defined(_WIN64)
-#error "game_module.c: the split build is Windows x64 only for now"
+#if !defined(_WIN64) && !(defined(__x86_64__) && defined(__ELF__))
+#error "game_module.c: the split build is for Windows x64 and x86-64 Linux"
+#endif
+#ifdef _WIN64
+#define PS3_GM_ALIGN64   __declspec(align(64))
+#define PS3_GM_THREAD    __declspec(thread)
+#else
+#define PS3_GM_ALIGN64   __attribute__((aligned(64)))
+#define PS3_GM_THREAD    __thread
 #endif
 
 /* --- Runtime functions: one slot and one thunk each ----------------------- */
@@ -56,7 +72,9 @@ PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_SLOT_)
 PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_THUNK_)
 #define PS3_GM_CRT_SLOT_ADDR_(n, h) &ps3_gt_##n,
 static void** const s_crt_slots[PS3_GC_COUNT] = { PS3_GAME_HOST_CRT_FUNCS(PS3_GM_CRT_SLOT_ADDR_) };
+#ifdef _WIN64
 extern unsigned int _tls_index;   /* game_libc.c; the loader writes this module's TLS slot */
+#endif
 int ps3_game_libc_run_ctors(void);   /* game_libc.c: the C++ dynamic initialisers, if any */
 #endif
 
@@ -68,7 +86,7 @@ uint8_t*          vm_base;
 unsigned          g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
 unsigned char     g_spu_coh_bitmap[PS3_GM_COH_BITMAP_SZ];
 /* v: the armed flag; stk_lim: the stack stores' limit (ps3emu/ppu_lift.h), the host's to set */
-__declspec(align(64)) struct { int v; unsigned stk_lim; char pad_[64 - 2 * sizeof(int)]; } g_spu_coh_armed_line;
+PS3_GM_ALIGN64 struct { int v; unsigned stk_lim; char pad_[64 - 2 * sizeof(int)]; } g_spu_coh_armed_line;
 volatile int      g_spu_goto_slow = 1;
 volatile int      g_yz_lockstep_on = -1;
 void* volatile    g_pm_flow_ctx = 0;
@@ -81,8 +99,8 @@ const void*       g_extra_symtab;
 uint64_t          g_extra_symtab_count;
 
 /* --- The trampolines ------------------------------------------------------ */
-__declspec(thread) void (*g_trampoline_fn)(void*);
-__declspec(thread) void (*g_spu_trampoline_fn)(void*);   /* (spu_context*) in the runtime */
+PS3_GM_THREAD void (*g_trampoline_fn)(void*);
+PS3_GM_THREAD void (*g_spu_trampoline_fn)(void*);   /* (spu_context*) in the runtime */
 static void** ppu_tramp_slot(void) { return (void**)&g_trampoline_fn; }
 static void** spu_tramp_slot(void) { return (void**)&g_spu_trampoline_fn; }
 
@@ -107,11 +125,13 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game)
         if (!host->crt[i]) return 3;
         *s_crt_slots[i] = host->crt[i];
     }
+#ifdef _WIN64
     if (_tls_index == PS3_GAME_TLS_INDEX_UNSET) {
         fprintf(stderr, "[game] the loader did not set up this module's thread-locals "
                         "(it needs a TLS directory and an import table): refusing to run%c", 10);
         return 5;
     }
+#endif
     ps3_game_libc_run_ctors();
 #endif
     for (int i = 0; i < PS3_GH_COUNT; i++) {

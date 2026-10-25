@@ -27,9 +27,18 @@
  *     Windows 11, 10-22). The import library comes from
  *     game_libc_kernel32.def, so the link needs no Windows SDK.
  *
+ * On Linux (an ELF shared object linked with ld.lld -nostdlib) only the
+ * memory and string functions are needed. Floating point needs no marker, the
+ * dynamic loader sets up the module's thread-locals itself, and there is no
+ * TLS directory or import to add. Static constructors are the one difference
+ * in kind: the dynamic loader runs a module's .init_array at the dlopen,
+ * before ps3_game_module_init fills the C library slots, so one that called
+ * the C library would crash there. The lift has none (docs/84 measured
+ * Windows' objects), so ps3_game_libc_run_ctors has nothing to run.
+ *
  * Compiled only into a freestanding module; elsewhere it is empty.
  */
-#if defined(PS3_GAME_FREESTANDING) && defined(_WIN64)
+#if defined(PS3_GAME_FREESTANDING) && (defined(_WIN64) || (defined(__x86_64__) && defined(__ELF__)))
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -87,6 +96,13 @@ PS3_GL_FN size_t strlen(const char* s)
     return n;
 }
 
+#ifndef _WIN64
+/* ELF: the dynamic loader runs any static constructor itself (see the top). */
+int ps3_game_libc_run_ctors(void)
+{
+    return 0;
+}
+#else
 /* --- Floating point ------------------------------------------------------ */
 int _fltused = 0x9875;   /* the CRT's value; nothing reads it */
 
@@ -140,5 +156,6 @@ const ps3_gl_tls_directory _tls_used = { &_tls_start, &_tls_end, &_tls_index, s_
 #pragma comment(linker, "/include:_tls_used")
 /* The import that makes the loader set up the TLS (see the top). */
 #pragma comment(linker, "/include:__imp_GetCurrentThreadId")
+#endif /* _WIN64 */
 
-#endif /* PS3_GAME_FREESTANDING && _WIN64 */
+#endif /* PS3_GAME_FREESTANDING, Windows x64 or x86-64 ELF */

@@ -25,6 +25,14 @@
  * like the runtime's; runtime/ppu/game_libc.c defines the rest (memcpy and
  * friends, _fltused, the TLS directory). The host always passes the list; a
  * module with a C runtime of its own ignores it.
+ *
+ * The same split builds on x86-64 Linux: the module is an ELF shared object
+ * (des_game.so) that the host opens with dlopen. The ABI, the two lists and
+ * the structs are the same; what differs is in the thunk macro below, the
+ * host's loader (game_host.c) and the module's own pieces (game_module.c,
+ * game_libc.c, game_freestanding.h). There the module is always freestanding:
+ * built with clang's own headers only and no C library, so the player's PC
+ * needs no libc headers to build it.
  */
 #ifndef PS3EMU_GAME_MODULE_H
 #define PS3EMU_GAME_MODULE_H
@@ -62,11 +70,21 @@ enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
  * inline instruction's result is a NaN: the errno path). The UCRT's fprintf
  * is inline in its header, so the host passes a function of its own
  * (game_host.c). fputc, fputs and fwrite are what the compiler rewrites some
- * fprintf calls into. A new one goes at the end, with PS3_GAME_ABI raised. */
+ * fprintf calls into. A new one goes at the end, with PS3_GAME_ABI raised.
+ *
+ * The module's stdin, stdout and stderr are __acrt_iob_func(0, 1, 2), as in
+ * the UCRT (ps3emu/game_libc/stdio.h). glibc's are variables, which a module
+ * with no C library cannot import, so on Linux the host passes
+ * ps3_gh_iob (game_host.c), which returns them. */
+#ifdef _WIN32
+#define PS3_GAME_HOST_IOB __acrt_iob_func
+#else
+#define PS3_GAME_HOST_IOB ps3_gh_iob
+#endif
 #define PS3_GAME_HOST_CRT_FUNCS(X)                                               \
     X(fma, fma) X(sqrt, sqrt) X(sqrtf, sqrtf) X(ldexp, ldexp) X(exp2, exp2)      \
     X(getenv, getenv) X(atoi, atoi) X(strtoul, strtoul)                          \
-    X(__acrt_iob_func, __acrt_iob_func) X(fprintf, ps3_gh_fprintf)               \
+    X(__acrt_iob_func, PS3_GAME_HOST_IOB) X(fprintf, ps3_gh_fprintf)             \
     X(fputc, fputc) X(fputs, fputs) X(fwrite, fwrite) X(fflush, fflush)
 
 #define PS3_GAME_HOST_CRT_INDEX_(n, h) PS3_GC_##n,
@@ -137,12 +155,24 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game);
 /* Module side: a function the lifted code calls by name, defined as a jump
  * through the slot ps3_gt_<name>, which init fills. Module-level assembly,
  * so the thunk does not need the function's prototype. AT&T syntax, said
- * explicitly: clang-cl parses module-level assembly as Intel syntax. */
+ * explicitly: clang-cl parses module-level assembly as Intel syntax.
+ *
+ * On ELF the thunk is hidden, as everything in the module is but its export:
+ * the host defines the same names (the runtime's vm_read32 and the rest), and
+ * a default-visibility one in the module could be bound to the host's
+ * instead. Hidden, the slot is read relative to the instruction pointer, as
+ * in the DLL. */
 #if defined(PS3_GAME_MODULE) && defined(_WIN64)
 #define PS3_GAME_THUNK(name)                                                     \
     __asm__(".att_syntax prefix\n\t.text\n\t.globl " #name "\n"                    \
             "\t.def " #name "; .scl 2; .type 32; .endef\n"                          \
             "\t.p2align 4\n" #name ":\n\tjmpq *ps3_gt_" #name "(%rip)\n");
+#elif defined(PS3_GAME_MODULE) && defined(__x86_64__) && defined(__ELF__)
+#define PS3_GAME_THUNK(name)                                                     \
+    __asm__(".text\n\t.globl " #name "\n\t.hidden " #name "\n"                     \
+            "\t.type " #name ", @function\n"                                        \
+            "\t.p2align 4\n" #name ":\n\tjmpq *ps3_gt_" #name "(%rip)\n"             \
+            "\t.size " #name ", . - " #name "\n");
 #endif
 
 #ifdef __cplusplus

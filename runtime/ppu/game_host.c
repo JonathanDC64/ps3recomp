@@ -17,24 +17,109 @@
  * addresses, so it must not include the headers that declare them properly.
  * The C library functions a freestanding module calls (PS3_GAME_HOST_CRT_FUNCS)
  * are this exe's own, declared by the C runtime's headers.
+ *
+ * Windows loads a DLL, Linux an ELF shared object with dlopen. What differs
+ * is five small functions below (gh_exe_dir, gh_open, gh_symbol, gh_error,
+ * gh_ms); ps3_game_load is the same on both.
  */
-#if defined(PS3_GAME_SPLIT) && defined(_WIN32)
+#if defined(PS3_GAME_SPLIT)
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/game_module.h"
 #include "ps3emu/game_split.h"   /* force-included as well; the guard makes that harmless */
 
 #ifndef PS3_GAME_MODULE_NAME
+#ifdef _WIN32
 #define PS3_GAME_MODULE_NAME "game.dll"
+#else
+#define PS3_GAME_MODULE_NAME "game.so"
+#endif
 #endif
 #ifndef PS3_GAME_MODULE_INIT
 #define PS3_GAME_MODULE_INIT "game_init"
+#endif
+
+/* --- What differs per platform -------------------------------------------- */
+#define PS3_GH_PATH_MAX 4096
+
+#ifdef _WIN32
+/* The exe's folder, with its separator at the end; 0 if unknown. */
+static int gh_exe_dir(char* out, size_t size)
+{
+    char path[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    char* slash = strrchr(path, 92);
+    if (slash) slash[1] = 0; else path[0] = 0;
+    return snprintf(out, size, "%s", path) < (int)size;
+}
+static void* gh_open(const char* path)
+{
+    return (void*)LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+static void* gh_symbol(void* module, const char* name)
+{
+    return (void*)GetProcAddress((HMODULE)module, name);
+}
+/* Why the last gh_open failed. */
+static void gh_error(char* out, size_t size)
+{
+    snprintf(out, size, "error %lu", (unsigned long)GetLastError());
+}
+static uint64_t gh_ms(void)
+{
+    return (uint64_t)GetTickCount64();
+}
+#else
+static int gh_exe_dir(char* out, size_t size)
+{
+    char path[PS3_GH_PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (n <= 0) return 0;
+    path[n] = 0;
+    char* slash = strrchr(path, 47);
+    if (slash) slash[1] = 0; else path[0] = 0;
+    return snprintf(out, size, "%s", path) < (int)size;
+}
+/* RTLD_LOCAL: the module's names stay out of the global scope (it exports
+ * only its init anyway). RTLD_NOW: an unresolved name fails here, not at a
+ * first call in the middle of play. */
+static void* gh_open(const char* path)
+{
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+static void* gh_symbol(void* module, const char* name)
+{
+    return dlsym(module, name);
+}
+static void gh_error(char* out, size_t size)
+{
+    const char* e = dlerror();
+    snprintf(out, size, "%s", e ? e : "unknown error");
+}
+static uint64_t gh_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+/* stdin, stdout and stderr for the module (PS3_GAME_HOST_IOB, game_module.h). */
+static FILE* ps3_gh_iob(unsigned index)
+{
+    return index == 0 ? stdin : index == 1 ? stdout : stderr;
+}
 #endif
 
 /* The runtime functions, by address. */
@@ -77,7 +162,7 @@ static PS3_SPLIT_TLS void* t_ppu_tramp_host;
 static PS3_SPLIT_TLS void* t_spu_tramp_host;
 
 static ps3_game_api s_game;
-static HMODULE      s_module;
+static void*        s_module;
 void* ps3_split_module_spu_indirect_branch;
 
 void** ps3_split_ppu_tramp_init(void)
@@ -97,24 +182,24 @@ extern uint64_t    g_extra_symtab_count;
 
 int ps3_game_load(void)
 {
-    char path[MAX_PATH * 2];
+    char path[PS3_GH_PATH_MAX * 2];
     const char* env = getenv("PS3_GAME_MODULE");
     if (env && *env) {
         snprintf(path, sizeof path, "%s", env);
     } else {
-        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
-        if (n == 0 || n >= MAX_PATH) { fprintf(stderr, "[game-host] no exe path%c", 10); return 1; }
-        char* slash = strrchr(path, 92);
-        snprintf(slash ? slash + 1 : path, sizeof path - (size_t)(slash ? slash + 1 - path : 0),
-                 "%s", PS3_GAME_MODULE_NAME);
+        char dir[PS3_GH_PATH_MAX];
+        if (!gh_exe_dir(dir, sizeof dir)) { fprintf(stderr, "[game-host] no exe path%c", 10); return 1; }
+        snprintf(path, sizeof path, "%s%s", dir, PS3_GAME_MODULE_NAME);
     }
-    const ULONGLONG t0 = GetTickCount64();
-    s_module = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    const uint64_t t0 = gh_ms();
+    s_module = gh_open(path);
     if (!s_module) {
-        fprintf(stderr, "[game-host] cannot load %s (error %lu)%c", path, (unsigned long)GetLastError(), 10);
+        char why[512];
+        gh_error(why, sizeof why);
+        fprintf(stderr, "[game-host] cannot load %s (%s)%c", path, why, 10);
         return 1;
     }
-    ps3_game_init_fn init = (ps3_game_init_fn)(void*)GetProcAddress(s_module, PS3_GAME_MODULE_INIT);
+    ps3_game_init_fn init = (ps3_game_init_fn)gh_symbol(s_module, PS3_GAME_MODULE_INIT);
     if (!init) {
         fprintf(stderr, "[game-host] %s has no %s%c", path, PS3_GAME_MODULE_INIT, 10);
         return 1;
@@ -202,7 +287,7 @@ int ps3_game_load(void)
 
     fprintf(stderr, "[game-host] loaded %s: %llu functions, %llu ms%c", path,
             (unsigned long long)*game.func_table_count,
-            (unsigned long long)(GetTickCount64() - t0), 10);
+            (unsigned long long)(gh_ms() - t0), 10);
     return 0;
 }
 
