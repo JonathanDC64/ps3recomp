@@ -19,27 +19,27 @@
 extern "C" {
 #endif
 
-double __cdecl sqrt(double x);
-float  __cdecl sqrtf(float x);
-double __cdecl fabs(double x);
-float  __cdecl fabsf(float x);
-double __cdecl trunc(double x);
-float  __cdecl truncf(float x);
-double __cdecl floor(double x);
-float  __cdecl floorf(float x);
-double __cdecl ceil(double x);
-float  __cdecl ceilf(float x);
-double __cdecl nearbyint(double x);
-float  __cdecl nearbyintf(float x);
-double __cdecl round(double x);
-float  __cdecl roundf(float x);
-double __cdecl copysign(double x, double y);
-float  __cdecl copysignf(float x, float y);
+double sqrt(double x);
+float  sqrtf(float x);
+double fabs(double x);
+float  fabsf(float x);
+double trunc(double x);
+float  truncf(float x);
+double floor(double x);
+float  floorf(float x);
+double ceil(double x);
+float  ceilf(float x);
+double nearbyint(double x);
+float  nearbyintf(float x);
+double round(double x);
+float  roundf(float x);
+double copysign(double x, double y);
+float  copysignf(float x, float y);
 
-double __cdecl fma(double x, double y, double z);
-float  __cdecl fmaf(float x, float y, float z);   /* spu_helpers.h, only with __FMA__: an instruction */
-double __cdecl ldexp(double x, int e);
-double __cdecl exp2(double x);
+double fma(double x, double y, double z);
+float  fmaf(float x, float y, float z);   /* spu_helpers.h, only with __FMA__: an instruction */
+double ldexp(double x, int e);
+double exp2(double x);
 
 #ifdef __cplusplus
 }

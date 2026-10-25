@@ -420,7 +420,8 @@ endif()
 # them through pointers. Build it in its own build directory, and only the
 # ps3recomp_runtime target there (the host exe's sources, runtime/ppu among
 # them, are the title's to compile, with the same definition and header): the
-# default library is unchanged. Windows (clang-cl) only for now.
+# default library is unchanged. Windows (clang-cl) and x86-64 Linux (clang),
+# where the game is an ELF shared object.
 option(PS3RECOMP_GAME_SPLIT "Build the runtime for a host that loads the game from a DLL" OFF)
 if(PS3RECOMP_GAME_SPLIT)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3_GAME_SPLIT)

@@ -1,6 +1,6 @@
 /*
- * ps3recomp - force-included (/FI) into every source of a freestanding game
- * module (PS3_GAME_FREESTANDING).
+ * ps3recomp - force-included (/FI, -include) into every source of a
+ * freestanding game module (PS3_GAME_FREESTANDING).
  *
  * A freestanding module is the game DLL of a split build (game_module.h)
  * compiled with clang's own headers plus the declarations in
@@ -30,6 +30,21 @@
  * PS3_GAME_FREESTANDING itself also leaves out ps3types.h's C++ part (be_t,
  * vm::ptr, through <type_traits>): the SPU workload table includes it for
  * the C types only.
+ *
+ * On Linux the module is an ELF shared object, compiled with clang
+ * -nostdlibinc (clang's own headers and game_libc/ only) and linked with
+ * ld.lld -nostdlib. There this header sets:
+ *
+ *   - PPU_FENCE as the compiler's __atomic_thread_fence, which is what
+ *     libstdc++'s std::atomic_thread_fence and clang's <stdatomic.h> both
+ *     are, so the fences compile as in the single Linux exe;
+ *   - hidden visibility for every name declared or defined after it: see
+ *     game_module.h. The module's one export, the title's init, says
+ *     visibility("default") itself.
+ *
+ * The fences are the one thing spelled per platform: each is the lowering of
+ * that platform's own standard library, so the module's code is the single
+ * exe's there.
  */
 #ifndef PS3EMU_GAME_FREESTANDING_H
 #define PS3EMU_GAME_FREESTANDING_H
@@ -41,10 +56,21 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <limits.h>
-#include <intrin0.h>   /* clang's: _ReadWriteBarrier (_InterlockedIncrement is a builtin) */
 
 #define PPU_THREAD_LOCAL __thread
 #define SPU_THREAD_LOCAL __thread
+
+#ifndef _WIN32
+#pragma GCC visibility push(hidden)
+#define PPU_FENCE(o) __atomic_thread_fence(PS3_GFS_ORDER_##o)
+#define PS3_GFS_ORDER_relaxed __ATOMIC_RELAXED
+#define PS3_GFS_ORDER_consume __ATOMIC_CONSUME
+#define PS3_GFS_ORDER_acquire __ATOMIC_ACQUIRE
+#define PS3_GFS_ORDER_release __ATOMIC_RELEASE
+#define PS3_GFS_ORDER_acq_rel __ATOMIC_ACQ_REL
+#define PS3_GFS_ORDER_seq_cst __ATOMIC_SEQ_CST
+#else
+#include <intrin0.h>   /* clang's: _ReadWriteBarrier (_InterlockedIncrement is a builtin) */
 
 #define PPU_FENCE(o) PS3_GFS_FENCE_##o()
 #define PS3_GFS_FENCE_relaxed() ((void)0)
@@ -60,5 +86,6 @@ static __inline void ps3_gfs_fence_seq_cst(void)
     (void)_InterlockedIncrement(&guard);
     _ReadWriteBarrier();
 }
+#endif /* _WIN32 */
 
 #endif /* PS3EMU_GAME_FREESTANDING_H */
