@@ -65,9 +65,17 @@ static int gh_exe_dir(char* out, size_t size)
     if (slash) slash[1] = 0; else path[0] = 0;
     return snprintf(out, size, "%s", path) < (int)size;
 }
+/* The module by its full path; what it needs comes from its own folder, the exe's or System32, never from the
+ * working folder or PATH. */
 static void* gh_open(const char* path)
 {
-    return (void*)LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    char full[PS3_GH_PATH_MAX];
+    const DWORD n = GetFullPathNameA(path, (DWORD)sizeof full, full, NULL);
+    if (n == 0 || n >= sizeof full) {
+        if (n) SetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return NULL;
+    }
+    return (void*)LoadLibraryExA(full, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 }
 static void* gh_symbol(void* module, const char* name)
 {
