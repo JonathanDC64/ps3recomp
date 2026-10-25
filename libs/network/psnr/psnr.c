@@ -189,7 +189,7 @@ static int s_connect_error;
 
 psnr_client* psnr_connect(const char* host, uint16_t port,
                           const char* comm_id, const char* online_id, uint16_t p2p_port,
-                          uint32_t* out_user_id, uint8_t out_public_ip[4])
+                          const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4])
 {
     struct addrinfo hints, *res = NULL, *ai;
     char portstr[8];
@@ -239,14 +239,22 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
         if (getsockname(s, (struct sockaddr*)&a, &n) == 0) memcpy(c->local_ip, &a.sin_addr, 4);
     }
 
-    /* HELLO: comm_id [12] | online_id [16] | p2p_port u16 */
-    uint8_t hello[30] = {0};
+    /* HELLO: comm_id [12] | online_id [16] | p2p_port u16 [| session blob] */
+    uint8_t hello[30 + 2 + 32] = {0};
+    uint32_t hello_len = 30;
     strncpy((char*)hello, comm_id, 12);
     strncpy((char*)hello + 12, online_id, 16);
     psnr_put16(hello + 28, p2p_port);
+    if (session) {
+        psnr_put16(hello + 30, 32);
+        memcpy(hello + 32, session, 32);
+        hello_len += 2 + 32;
+    }
     psnr_msg ack;
     s_connect_error = 0;
-    if (psnr_call(c, PSNR_HELLO, hello, sizeof(hello), &ack, 5000) != 1) {
+    int called = psnr_call(c, PSNR_HELLO, hello, hello_len, &ack, 5000);
+    memset(hello, 0, sizeof(hello));
+    if (called != 1) {
         psnr_close(c);
         return NULL;
     }

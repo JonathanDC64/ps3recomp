@@ -25,7 +25,9 @@ import tempfile
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 TESTS = os.path.join(ROOT, "libs", "network", "tests")
-SOURCES = [os.path.join(TESTS, "test_http_response_getters.c")]
+SOURCES = [os.path.join(TESTS, "test_http_response_getters.c"),
+           os.path.join(ROOT, "third_party", "monocypher", "monocypher.c"),
+           os.path.join(ROOT, "third_party", "monocypher", "monocypher-ed25519.c")]
 
 
 def _cc():
@@ -46,7 +48,7 @@ def main():
         cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
                "-o", exe] + SOURCES
         if os.name == "nt":
-            cmd.append("-lws2_32")   # MinGW: Winsock is a separate library
+            cmd += ["-lws2_32", "-lbcrypt"]   # MinGW: Winsock and BCryptGenRandom are separate libraries
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")

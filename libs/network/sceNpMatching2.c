@@ -946,6 +946,7 @@ static s32 psnr_error_to_m2(const psnr_msg* m)
         case PSNR_E_NOT_FOUND:  return (s32)SCE_NP_MATCHING2_SERVER_ERROR_NO_SUCH_ROOM;
         case PSNR_E_ROOM_FULL:  return (s32)SCE_NP_MATCHING2_SERVER_ERROR_ROOM_FULL;
         case PSNR_E_NOT_OWNER:  return (s32)SCE_NP_MATCHING2_SERVER_ERROR_FORBIDDEN;
+        case PSNR_E_NOT_INVITED: return (s32)SCE_NP_MATCHING2_SERVER_ERROR_FORBIDDEN;
         default:                return (s32)SCE_NP_MATCHING2_SERVER_ERROR_BAD_REQUEST;
     }
 }

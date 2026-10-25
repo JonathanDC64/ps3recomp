@@ -12,6 +12,7 @@
 #  include <netinet/in.h>
 #  include <netdb.h>
 #  include <arpa/inet.h>
+#  include <signal.h>
 #endif
 
 #include "ps3emu/ps3_net.h"
@@ -38,7 +39,19 @@ int ps3_net_locked_offline(void)
 int ps3_net_online(void)
 {
     const char* v = getenv("PS3_NET_ONLINE");
-    return !s_locked && v && *v && strcmp(v, "0") != 0;
+    int on = !s_locked && v && *v && strcmp(v, "0") != 0;
+#ifndef _WIN32
+    /* Online, a write to a connection the other end has closed must fail
+     * with EPIPE for the code that made it (sys_net's send, cellHttp, psnr,
+     * the sign-in), not end the process with SIGPIPE. Once, for the whole
+     * process; every network path asks this first. */
+    static volatile int s_no_sigpipe;
+    if (on && !s_no_sigpipe) {
+        s_no_sigpipe = 1;
+        signal(SIGPIPE, SIG_IGN);
+    }
+#endif
+    return on;
 }
 
 /* ---- PS3_NET_HOSTS ---- */

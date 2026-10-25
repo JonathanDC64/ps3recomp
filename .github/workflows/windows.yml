@@ -114,9 +114,23 @@ jobs:
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_http_loopback.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The sign-in to a server that has one: the key, the challenge and its
+      # work, the session on cellHttp's requests to that server only. Then
+      # what the player is told when psnr refuses co-op.
+      - name: Run the sign-in tests
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_signin.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_psnr_notice.exe libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_psnr_notice.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
@@ -141,7 +155,7 @@ jobs:
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_identity.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -150,7 +164,7 @@ jobs:
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_nat.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }

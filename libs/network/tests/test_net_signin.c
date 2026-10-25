@@ -1,0 +1,477 @@
+/*
+ * test_net_signin - the network sign-in (ps3emu/ps3_net_signin.h) against a
+ * loopback server that checks what a Demon's Souls Recomp server checks: the
+ * challenge, the Ed25519 signature, a new key's work. Then the session on
+ * cellHttp's requests, to that server only. Also SHA-256 (FIPS 180-4) and
+ * Ed25519 (RFC 8032) vectors, and the reply parsing. Nothing leaves the PC.
+ *
+ *   clang-cl /I include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+ *   cc -std=gnu17 -I include -o test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c -lpthread
+ */
+#include "../cellHttp.c"
+#include "../ps3_net.c"
+#include "../ps3_net_signin.c"
+
+#include <assert.h>
+#ifndef _WIN32
+#  include <arpa/inet.h>
+#endif
+
+/* ppu_memory.h hooks the runtime supplies; inert here. */
+uint8_t* vm_base;
+int g_resv_store_active = 0;
+uint32_t g_ww_lo = 0, g_ww_hi = 0;
+void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
+void spu_lockline_lock(void) {}
+void spu_lockline_unlock(void) {}
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+void spu_coh_notify_write(uint32_t addr) { (void)addr; }
+void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
+
+static const char* s_name = "Ashen-01";
+const char* np_psnr_online_id(void) { return s_name; }
+
+static void env(const char* k, const char* v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    if (*v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+
+static void hex(const char* h, uint8_t* out, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned v;
+        sscanf(h + 2 * i, "%2x", &v);
+        out[i] = (uint8_t)v;
+    }
+}
+
+static int sha_is(const void* data, size_t len, const char* want)
+{
+    uint8_t h[32], w[32];
+    ps3_sha256(data, len, h);
+    hex(want, w, 32);
+    return !memcmp(h, w, 32);
+}
+
+/* ---- the fake server ------------------------------------------------ */
+
+enum { NORMAL, BANNED, NOT_OURS, BUSY_JSON };
+
+static volatile int s_mode = NORMAL;
+static int      s_bits = 10;
+static uint8_t  s_challenge[32];
+static int      s_challenge_live;
+static uint8_t  s_known[4][32];
+static int      s_nknown;
+static uint8_t  s_issued[32];
+static volatile int s_challenges, s_sessions, s_games;
+static char     s_game_request[4096];
+static volatile int s_stop;
+static http_socket_t s_listen;
+
+static void reply(http_socket_t c, int status, const char* body)
+{
+    char head[256];
+    int n = snprintf(head, sizeof head,
+                     "HTTP/1.1 %d X\r\nDate: Sun, 25 Oct 2026 20:00:00 GMT\r\nContent-Type: application/json\r\n"
+                     "Content-Length: %u\r\nConnection: close\r\n\r\n",
+                     status, (unsigned)strlen(body));
+    send(c, head, n, 0);
+    send(c, body, (int)strlen(body), 0);
+}
+
+static int known(const uint8_t pk[32])
+{
+    for (int i = 0; i < s_nknown; i++)
+        if (!memcmp(s_known[i], pk, 32)) return 1;
+    return 0;
+}
+
+static void session_call(http_socket_t c, const char* body)
+{
+    char name[32], pk64[64], ver[64], ch64[64], sig64[128], msg[512];
+    long long nv = 0, nonce = 0;
+    uint8_t pk[32], sig[64], ch[32];
+    assert(si_js_str(body, "name", name, sizeof name) && si_js_str(body, "public_key", pk64, sizeof pk64) &&
+           si_js_str(body, "client_version", ver, sizeof ver) && si_js_str(body, "challenge", ch64, sizeof ch64) &&
+           si_js_str(body, "signature", sig64, sizeof sig64) && si_js_int(body, "network_version", &nv) &&
+           si_js_int(body, "pow_nonce", &nonce));
+    assert(si_b64_decode(pk64, pk, 32, 0) == 0 && si_b64_decode(sig64, sig, 64, 0) == 0 && si_b64_decode(ch64, ch, 32, 0) == 0);
+    assert(!strcmp(name, s_name) && !strcmp(ver, "0.2.0") && nv == 3);
+    if (!s_challenge_live || memcmp(ch, s_challenge, 32)) {   /* a challenge works once */
+        reply(c, 401, "{\"error\":\"challenge\",\"message\":\"get a new challenge\"}");
+        return;
+    }
+    s_challenge_live = 0;
+    int ml = snprintf(msg, sizeof msg, "DSS session v1\n%s\n%s\n%s\n%s\n%lld\n%lld", ch64, name, pk64, ver, nv, nonce);
+    assert(crypto_ed25519_check(sig, pk, (const uint8_t*)msg, (size_t)ml) == 0);
+    if (s_mode == BANNED) {
+        reply(c, 403, "{\"error\":\"banned\",\"message\":\"This account is banned (case 12).\",\"case\":12}");
+        return;
+    }
+    if (!known(pk)) {
+        uint8_t in[72], h[32];
+        memcpy(in, ch, 32);
+        memcpy(in + 32, pk, 32);
+        for (int i = 0; i < 8; i++) in[64 + i] = (uint8_t)((uint64_t)nonce >> (56 - 8 * i));
+        ps3_sha256(in, sizeof in, h);
+        if (si_zero_bits(h) < s_bits) {
+            char r[96];
+            snprintf(r, sizeof r, "{\"error\":\"work\",\"message\":\"do the work\",\"pow_bits\":%d}", s_bits);
+            reply(c, 401, r);
+            return;
+        }
+        memcpy(s_known[s_nknown++ % 4], pk, 32);
+    }
+    char tok[48], r[256];
+    si_random_bytes(s_issued, 32);
+    si_b64_encode(s_issued, 32, tok, 1);
+    snprintf(r, sizeof r, "{\"token\":\"%s\",\"expires\":\"2026-10-26T20:00:00Z\",\"name\":\"%s\"}", tok, name);
+    reply(c, 200, r);
+}
+
+static void serve_one(http_socket_t c)
+{
+    char buf[8192];
+    int n = 0;
+    for (;;) {
+        int r = recv(c, buf + n, (int)sizeof buf - 1 - n, 0);
+        if (r <= 0) break;
+        n += r;
+        buf[n] = 0;
+        char* end = strstr(buf, "\r\n\r\n");
+        if (!end) continue;
+        const char* cl = strstr(buf, "Content-Length: ");
+        int want = cl ? atoi(cl + 16) : 0;
+        if (n - (int)(end + 4 - buf) >= want) break;
+    }
+    buf[n] = 0;
+    char* body = strstr(buf, "\r\n\r\n");
+    body = body ? body + 4 : buf + n;
+    if (s_mode == NOT_OURS) {
+        const char* page = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 9\r\n\r\nnot found";
+        send(c, page, (int)strlen(page), 0);
+    } else if (!strncmp(buf, "POST /dss/v1/challenge ", 23)) {
+        s_challenges++;
+        if (s_mode == BUSY_JSON) {
+            reply(c, 503, "{\"error\":\"maintenance\",\"message\":\"The server is in maintenance.\"}");
+        } else {
+            char ch64[48], r[128];
+            si_random_bytes(s_challenge, 32);
+            s_challenge_live = 1;
+            si_b64_encode(s_challenge, 32, ch64, 0);
+            snprintf(r, sizeof r, "{\"challenge\":\"%s\",\"pow_bits\":%d,\"expires_in\":120}", ch64, s_bits);
+            reply(c, 200, r);
+        }
+    } else if (!strncmp(buf, "POST /dss/v1/session ", 21)) {
+        s_sessions++;
+        session_call(c, body);
+    } else {
+        snprintf(s_game_request, sizeof s_game_request, "%s", buf);   /* before the count the test waits on */
+        s_games++;
+        reply(c, 200, "ok");
+    }
+    si_close(c);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI server_main(void* arg)
+#else
+static void* server_main(void* arg)
+#endif
+{
+    (void)arg;
+    while (!s_stop) {
+        http_socket_t c = accept(s_listen, NULL, NULL);
+        if (c == HTTP_INVALID_SOCKET) break;
+        serve_one(c);
+    }
+    return 0;
+}
+
+/* ---- cellHttp's side ------------------------------------------------ */
+
+enum { SCHEME = 0x100, HOST = 0x110, PATH = 0x160, METHOD = 0x1A0, URI = 0x200, CLIENT = 0x300, TRANS = 0x304,
+       SENT = 0x308 };
+
+static void put_str(u32 ea, const char* s) { strcpy((char*)vm_base + ea, s); }
+
+/* A POST through cellHttp to game.test:port; 1 if it reached the server. */
+static int game_request(u16 port)
+{
+    vm_write32(URI + 0, SCHEME);
+    vm_write32(URI + 4, HOST);
+    vm_write32(URI + 8, 0);
+    vm_write32(URI + 12, 0);
+    vm_write32(URI + 16, PATH);
+    vm_write32(URI + 20, port);
+    vm_write32(URI + 24, 0);
+    assert(cellHttpCreateTransaction((CellHttpTransId*)(uintptr_t)TRANS, vm_read32(CLIENT),
+                                     (const char*)(uintptr_t)METHOD, (const CellHttpUri*)(uintptr_t)URI) == CELL_OK);
+    CellHttpTransId t = vm_read32(TRANS);
+    int before = s_games;
+    s32 r = cellHttpSendRequest(t, NULL, 0, (u32*)(uintptr_t)SENT);
+    for (int i = 0; i < 500 && s_games == before; i++) {   /* the server thread records it */
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    cellHttpDestroyTransaction(t);
+    return r == CELL_OK && s_games > before;
+}
+
+static long file_size(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+int main(void)
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    /* SHA-256: FIPS 180-4's examples, and a message across the length's block. */
+    assert(sha_is("", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    assert(sha_is("abc", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    assert(sha_is("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+                  "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+    {
+        char* a = (char*)malloc(1000000);
+        memset(a, 'a', 1000000);
+        ps3_sha256_ctx c;
+        uint8_t h[32], w[32];
+        ps3_sha256_init(&c);
+        for (int i = 0; i < 1000000; i += 999) ps3_sha256_update(&c, a + i, i + 999 <= 1000000 ? 999 : 1000000 - i);
+        ps3_sha256_final(&c, h);
+        hex("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0", w, 32);
+        assert(!memcmp(h, w, 32));
+        free(a);
+    }
+
+    /* Ed25519: RFC 8032 section 7.1, tests 1 and 2. */
+    {
+        static const struct { const char *seed, *pub, *msg, *sig; } v[] = {
+            {"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"},
+            {"4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+             "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+             "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"},
+        };
+        for (int i = 0; i < 2; i++) {
+            uint8_t seed[32], sk[64], pk[32], want_pk[32], msg[1], sig[64], want_sig[64];
+            size_t ml = strlen(v[i].msg) / 2;
+            hex(v[i].seed, seed, 32);
+            hex(v[i].pub, want_pk, 32);
+            hex(v[i].msg, msg, ml);
+            hex(v[i].sig, want_sig, 64);
+            crypto_ed25519_key_pair(sk, pk, seed);
+            assert(!memcmp(pk, want_pk, 32));
+            crypto_ed25519_sign(sig, sk, msg, ml);
+            assert(!memcmp(sig, want_sig, 64));
+            assert(crypto_ed25519_check(sig, pk, msg, ml) == 0);
+            sig[5] ^= 1;
+            assert(crypto_ed25519_check(sig, pk, msg, ml) != 0);
+        }
+    }
+
+    /* Base64 both ways, and text that does not hold the asked length. */
+    {
+        uint8_t in[32], back[32];
+        char t[64];
+        for (int i = 0; i < 32; i++) in[i] = (uint8_t)(i * 37 + 250);
+        si_b64_encode(in, 32, t, 0);
+        assert(strlen(t) == 44 && t[43] == '=' && si_b64_decode(t, back, 32, 0) == 0 && !memcmp(in, back, 32));
+        si_b64_encode(in, 32, t, 1);
+        assert(strlen(t) == 43 && !strchr(t, '=') && !strchr(t, '+') && !strchr(t, '/'));
+        assert(si_b64_decode(t, back, 32, 1) == 0 && !memcmp(in, back, 32));
+        assert(si_b64_decode(t, back, 32, 0) != 0 || !strpbrk(t, "-_"));
+        assert(si_b64_decode("AAAA", back, 32, 0) != 0 && si_b64_decode("", back, 32, 1) != 0);
+        si_b64_encode((const uint8_t*)"f", 1, t, 0);
+        assert(!strcmp(t, "Zg=="));
+    }
+
+    /* Replies: members at the top level only, escapes, nesting, bad text. */
+    {
+        char s[64];
+        long long n = 0;
+        const char* j = "{\"message\":\"say \\\"token\\\": x\",\"nested\":{\"token\":\"inner\"},\"list\":[1,{\"a\":\"b\"},null],"
+                        "\"token\":\"outer\",\"n\":-42,\"t\":true,\"u\":\"caf\\u00e9 \\ud83d\\ude00\"}";
+        assert(si_js_str(j, "token", s, sizeof s) && !strcmp(s, "outer"));
+        assert(si_js_str(j, "message", s, sizeof s) && !strcmp(s, "say \"token\": x"));
+        assert(si_js_int(j, "n", &n) && n == -42);
+        assert(si_js_str(j, "u", s, sizeof s) && !strcmp(s, "caf\xC3\xA9 \xF0\x9F\x98\x80"));
+        assert(!si_js_str(j, "missing", s, sizeof s) && !si_js_str(j, "n", s, sizeof s) && !si_js_int(j, "token", &n));
+        assert(!si_js_str("{\"token\":\"no end", "token", s, sizeof s));
+        assert(!si_js_str("[\"token\",\"x\"]", "token", s, sizeof s));
+        assert(!si_js_str("{\"a\":tru,\"token\":\"x\"}", "token", s, sizeof s));
+        assert(si_js_str("{\"token\":\"abcdefghij\"}", "token", s, 5) && !strcmp(s, "abcd"));   /* cut to fit */
+        assert(!si_js_member("not json", "a") && !si_js_member("", "a"));
+    }
+
+    /* Times */
+    assert(si_parse_rfc3339("1970-01-01T00:00:00Z") == 0);
+    assert(si_parse_rfc3339("2026-10-26T20:00:00Z") == 1793044800LL);
+    assert(si_parse_rfc3339("2026-10-26T22:00:00.123+02:00") == 1793044800LL);
+    assert(si_parse_rfc3339("2026-10-26 20:00:00") == -1 && si_parse_rfc3339("garbage") == -1);
+    assert(si_parse_http_date("Sun, 25 Oct 2026 20:00:00 GMT") == 1793044800LL - 86400);
+    assert(si_parse_http_date("Sun, 25 Foo 2026 20:00:00 GMT") == -1);
+
+    /* The work: a nonce the check agrees with. */
+    {
+        uint8_t ch[32] = {1}, pk[32] = {2}, in[72], h[32];
+        uint64_t nonce = 0;
+        assert(si_do_work(ch, pk, 12, &nonce) == 0);
+        memcpy(in, ch, 32);
+        memcpy(in + 32, pk, 32);
+        for (int i = 0; i < 8; i++) in[64 + i] = (uint8_t)(nonce >> (56 - 8 * i));
+        ps3_sha256(in, 72, h);
+        assert(si_zero_bits(h) >= 12);
+    }
+
+    /* ---- end to end on loopback ---- */
+    vm_base = (uint8_t*)calloc(1, 65536);
+    put_str(SCHEME, "http");
+    put_str(HOST, "game.test");
+    put_str(PATH, "/demons-souls-us/ss.info");
+    put_str(METHOD, "POST");
+    assert(cellHttpInit(NULL, 0) == CELL_OK);   /* starts Winsock */
+    assert(cellHttpCreateClient((CellHttpClientId*)(uintptr_t)CLIENT) == CELL_OK);
+
+    s_listen = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof a;
+    assert(bind(s_listen, (struct sockaddr*)&a, sizeof a) == 0 && listen(s_listen, 8) == 0);
+    assert(getsockname(s_listen, (struct sockaddr*)&a, &al) == 0);
+    u16 port = ntohs(a.sin_port);
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, server_main, NULL, 0, NULL);
+    assert(th);
+#else
+    pthread_t th;
+    assert(pthread_create(&th, NULL, server_main, NULL) == 0);
+#endif
+
+    char key[512], addr[64], notice[256], tok[64];
+    uint8_t raw[32];
+#ifdef _WIN32
+    char tmp[MAX_PATH];
+    GetTempPathA(sizeof tmp, tmp);
+    snprintf(key, sizeof key, "%stest_net_signin_%lu.key", tmp, (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(key, sizeof key, "/tmp/test_net_signin_%ld.key", (long)getpid());
+#endif
+    remove(key);   /* (this run's own file) */
+    snprintf(addr, sizeof addr, "127.0.0.1:%u", port);
+
+    /* Off without the knobs, or offline. */
+    env("PS3_NET_ONLINE", "1");
+    env("PS3_NET_HOSTS", "game.test=127.0.0.1");
+    assert(!ps3_net_signin_enabled() && !ps3_net_session(tok, sizeof tok, raw));
+    assert(game_request(port) && !strstr(s_game_request, "X-DSS-Session"));
+    env("PS3_NET_SIGNIN", addr);
+    env("PS3_NET_KEY_FILE", key);
+    env("PS3_NET_CLIENT_VERSION", "0.2.0");
+    env("PS3_NET_NETWORK_VERSION", "3");
+    env("PS3_NET_ONLINE", "");
+    assert(!ps3_net_signin_enabled() && !ps3_net_session(tok, sizeof tok, raw) && s_challenges == 0);
+    env("PS3_NET_ONLINE", "1");
+
+    /* A new key: made, written, and it does the work at once. */
+    assert(ps3_net_session(tok, sizeof tok, raw));
+    assert(file_size(key) == 32 && s_challenges == 1 && s_sessions == 1 && !memcmp(raw, s_issued, 32));
+    assert(si_end - time(NULL) > 86400 - 60 && si_end - time(NULL) <= 86400);   /* 24 hours by the server's clock */
+    assert(ps3_net_signin_server((const uint8_t*)"\x7f\x00\x00\x01") && !ps3_net_signin_server((const uint8_t*)"\x0a\x00\x00\x01"));
+
+    /* Kept until it is near its end: no new calls. */
+    assert(ps3_net_session(tok, sizeof tok, NULL) && s_sessions == 1);
+
+    /* The game's requests to that server carry it. */
+    assert(game_request(port));
+    {
+        char want[96];
+        snprintf(want, sizeof want, "\r\nX-DSS-Session: %s\r\n", tok);
+        assert(strstr(s_game_request, want));
+    }
+
+    /* Signing in again with a known key: no work. */
+    ps3_net_session_drop();
+    assert(ps3_net_session(NULL, 0, raw) && s_sessions == 2 && !memcmp(raw, s_issued, 32));
+
+    /* A server that does not know the key asks for the work, and gets it. */
+    s_nknown = 0;
+    ps3_net_session_drop();
+    assert(ps3_net_session(NULL, 0, raw) && s_challenges == 4 && s_sessions == 4 && s_nknown == 1);
+    assert(!ps3_net_signin_notice(notice, sizeof notice));
+
+    /* A refusal: no session, the server's message once, then no new try for a while. */
+    s_mode = BANNED;
+    ps3_net_session_drop();
+    assert(!ps3_net_session(tok, sizeof tok, raw));
+    assert(ps3_net_signin_notice(notice, sizeof notice) && !strcmp(notice, "This account is banned (case 12)."));
+    assert(!ps3_net_signin_notice(notice, sizeof notice));
+    int calls = s_challenges;
+    assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == calls);
+    s_games = 0;
+    assert(game_request(port) && !strstr(s_game_request, "X-DSS-Session"));   /* the request goes without one */
+
+    /* Maintenance at the challenge: its message. */
+    s_mode = BUSY_JSON;
+    ps3_net_session_drop();
+    assert(!ps3_net_session(tok, sizeof tok, raw));
+    assert(ps3_net_signin_notice(notice, sizeof notice) && strstr(notice, "maintenance"));
+
+    /* A server with no sign-in, and none at all: quietly none. */
+    s_mode = NOT_OURS;
+    ps3_net_session_drop();
+    assert(!ps3_net_session(tok, sizeof tok, raw) && !ps3_net_signin_notice(notice, sizeof notice));
+    env("PS3_NET_SIGNIN", "127.0.0.1:1");
+    ps3_net_session_drop();
+    assert(!ps3_net_session(tok, sizeof tok, raw) && !ps3_net_signin_notice(notice, sizeof notice));
+
+    /* Another server's address gets no header and no sign-in. */
+    s_mode = NORMAL;
+    env("PS3_NET_SIGNIN", "10.255.255.1");
+    ps3_net_session_drop();
+    calls = s_challenges;
+    assert(game_request(port) && !strstr(s_game_request, "X-DSS-Session") && s_challenges == calls);
+
+    /* A key file that is not a key is left alone. */
+    env("PS3_NET_SIGNIN", addr);
+    {
+        FILE* f = fopen(key, "wb");
+        fwrite("short", 1, 5, f);
+        fclose(f);
+    }
+    ps3_net_session_drop();
+    assert(!ps3_net_session(tok, sizeof tok, raw) && file_size(key) == 5);
+    assert(ps3_net_signin_notice(notice, sizeof notice) && strstr(notice, "key"));
+
+    /* A name the server's rules refuse is not sent. */
+    remove(key);
+    s_name = "x";
+    ps3_net_session_drop();
+    calls = s_challenges;
+    assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == calls && file_size(key) == -1);
+
+    s_stop = 1;
+    si_close(s_listen);
+    remove(key);
+    printf("test_net_signin: OK\n");
+    return 0;
+}

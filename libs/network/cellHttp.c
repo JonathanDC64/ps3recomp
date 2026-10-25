@@ -12,6 +12,7 @@
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_resolve */
+#include "ps3emu/ps3_net_signin.h"   /* the session header */
 #include "ps3emu/endian.h"    /* ps3_bswap32 */
 
 /* ---------------------------------------------------------------------------
@@ -561,6 +562,12 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
     }
 
+    /* The sign-in's session (ps3emu/ps3_net_signin.h), for its server only;
+     * taken before connecting, as signing in can take a moment. */
+    char session[64];
+    int has_session = ps3_net_signin_server((const uint8_t*)&addr.sin_addr) &&
+                      ps3_net_session(session, sizeof session, NULL);
+
     /* ---- Create socket and connect ---- */
     http_socket_t sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == HTTP_INVALID_SOCKET) {
@@ -637,6 +644,10 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                                     "%s: %s\r\n", xn, xv);
         }
     }
+
+    if (has_session)
+        req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,
+                            "X-DSS-Session: %s\r\n", session);
 
     /* End of headers */
     req_len += snprintf(req_buf + req_len, sizeof(req_buf) - (u32)req_len,

@@ -49,7 +49,12 @@ enum {
 enum {
     PSNR_E_BAD_REQUEST = 1, PSNR_E_NOT_FOUND = 2, PSNR_E_ROOM_FULL = 3,
     PSNR_E_NOT_OWNER = 4, PSNR_E_NOT_IN_ROOM = 5, PSNR_E_LIMIT = 6, PSNR_E_NO_HELLO = 7,
-    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9
+    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9,
+    /* a server with sign-in (the Demon's Souls Recomp server's docs/psnr/api.md) */
+    PSNR_E_SIGN_IN = 10,       /* HELLO: no session, or one that has ended */
+    PSNR_E_NOT_YOUR_NAME = 11, /* HELLO: the session is another name's */
+    PSNR_E_REFUSED = 12,       /* HELLO: the player may not play now (maintenance, an old build, a restriction) */
+    PSNR_E_NOT_INVITED = 13    /* JOIN_ROOM: no member of the room invited the player */
 };
 
 typedef struct psnr_client psnr_client;
@@ -65,11 +70,12 @@ typedef struct {
 
 /* Connect and say HELLO. comm_id is the title's NP communication ID
  * ("NPWR00860_00"), online_id the player's name, p2p_port the UDP port the
- * title takes peer traffic on (0 if none). Fills the id the server assigned
- * and the address it sees this client at. NULL on failure. */
+ * title takes peer traffic on (0 if none), session the sign-in's 32-byte
+ * token (ps3emu/ps3_net_signin.h) or NULL for none. Fills the id the server
+ * assigned and the address it sees this client at. NULL on failure. */
 psnr_client* psnr_connect(const char* host, uint16_t port,
                           const char* comm_id, const char* online_id, uint16_t p2p_port,
-                          uint32_t* out_user_id, uint8_t out_public_ip[4]);
+                          const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4]);
 
 /* NAT traversal (docs/api.md, "UDP"). The caller owns the P2P socket; these
  * build and read the packets it exchanges. Every one starts with "PSNR".
