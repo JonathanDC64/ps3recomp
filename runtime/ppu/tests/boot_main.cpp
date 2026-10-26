@@ -2306,6 +2306,11 @@ static void start_test_stops(void)
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    /* A DLL loaded by name comes from this program's folder or System32 only, never from the working folder or
+     * PATH. First, before the title can load anything. */
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+#endif
     /* The title first: it may supply the ELF, want the window alone, or end here. */
     const int launch = ps3_title_launch(&argc, &argv);
     if (launch >= 0) return launch;

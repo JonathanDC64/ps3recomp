@@ -1007,7 +1007,7 @@ static int dpi_aware(void)
 static void dark_title(HWND hwnd)
 {
     if (!ps3_env_int("RSX_DARK_TITLE", 1)) return;
-    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    HMODULE dwm = LoadLibraryExA("dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);   /* (Windows' own only) */
     dwm_attr_fn set_attr = dwm ? (dwm_attr_fn)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute") : NULL;
     const BOOL on = TRUE;
     if (set_attr) set_attr(hwnd, 20, &on, sizeof on);
@@ -15088,7 +15088,7 @@ static long long dwm_timing(long long freq, long long* vblank)
     static timing_fn volatile timing;
     static volatile LONG state;   /* 0 = not loaded yet, 1 = loaded, -1 = missing */
     if (!state) {
-        HMODULE dwm = LoadLibraryA("dwmapi.dll");
+        HMODULE dwm = LoadLibraryExA("dwmapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);   /* (Windows' own only) */
         timing = dwm ? (timing_fn)(void*)GetProcAddress(dwm, "DwmGetCompositionTimingInfo") : NULL;
         InterlockedExchange(&state, timing ? 1 : -1);
     }
