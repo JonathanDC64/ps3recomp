@@ -12317,6 +12317,33 @@ static int blink_dbg(void)
     return v;
 }
 
+/* A flip whose batch has no display draw keeps the batch until the composite
+ * that ends it arrives (below). A batch that has run out of room never gets
+ * it: the full draw table or vertex buffer drops the display copy as well,
+ * render_frame (the only place that empties the batch and grows the buffer)
+ * never runs again, and the picture stops for good while the game plays on
+ * (the symptom of DemonsSoulsRecomp#205). Such a batch is drawn at the flip
+ * without a present, as the ticker draws offscreen-only work, so the next
+ * frame starts empty. */
+static u32 s_nodisp_run;   /* flips in a row with draws but no display draw */
+static void flip_without_display(void)
+{
+    if (!s_d3d.initialized || !s_d3d.draw_count) return;
+    { static u32 said = 0;
+      if (++s_nodisp_run == 300 && said < 10 && ++said)
+          fprintf(stderr, "[D3D12] 300 flips in a row with no display draw (%u draws, %llu of %u vertices)%c",
+                  s_d3d.draw_count, (unsigned long long)s_vp_want, s_vp_cap, 10); }
+    if (s_d3d.draw_count < MAX_DRAWS && s_vp_want <= s_vp_cap
+        && s_d3d.vb_offset + 6 * VERTEX_STRIDE <= MAX_VERTICES * VERTEX_STRIDE) return;
+    { static int n = 0;
+      if (n < 20 && ++n)
+          fprintf(stderr, "[D3D12] a batch with no display draw is full (%u draws, %llu of %u vertices):"
+                  " drawn without a present%c", s_d3d.draw_count, (unsigned long long)s_vp_want, s_vp_cap, 10); }
+    s_present_this_frame = 0;
+    render_frame();
+    s_present_this_frame = 1;
+}
+
 static void d3d12_present(void* ud, u32 buffer_id)
 {
     (void)ud;
@@ -12339,8 +12366,11 @@ static void d3d12_present(void* ud, u32 buffer_id)
             break;
         }
 
-    if (s_d3d.initialized && flip_has_display)
+    if (s_d3d.initialized && flip_has_display) {
+        s_nodisp_run = 0;
         render_frame();
+    }
+    else if (!flip_has_display) flip_without_display();
     if (flip_has_display) s_pc_flip_render++; else s_pc_flip_nodisp++;
 
     /* FPS tracking */
@@ -12439,13 +12469,15 @@ static void d3d12_fifo_flip(void)
     if (!present_at_flip_on() || !s_d3d.initialized) { s_fifo_flip_present = 0; return; }
     s_fifo_flip_present = 1;
     /* Same display gate as the other presents: offscreen pass work alone
-     * keeps accumulating until its composite arrives. */
+     * keeps accumulating until its composite arrives, unless the batch is
+     * full (flip_without_display). */
     int has_display = 0;
     for (u32 i = 0; i < s_d3d.draw_count && i < MAX_DRAWS; i++)
         if (!s_d3d.draws[i].is_clear && s_d3d.draws[i].rt_off == 0) { has_display = 1; break; }
-    if (!has_display) { s_pc_flip_nodisp++; return; }
+    if (!has_display) { s_pc_flip_nodisp++; flip_without_display(); return; }
     if (blink_dbg())
         printf("[FLIP] presenting %u draws at the title's flip%c", s_d3d.draw_count, 10);
+    s_nodisp_run = 0;
     render_frame();
     s_pc_flip_render++;
     s_clear_presents++;   /* framed presents are on: the ticker stays out */
