@@ -462,20 +462,38 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
  * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
  * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
  * the ELF EA at +0x14 and the context save EA at +0x1C. */
-#define TS_TRACK 32
+/* This table and s_ts_life below keep one entry per taskset EA for good (an
+ * entry is never cleared, so the entries in use are always the first ones), and
+ * a taskset at an EA neither has room for is not tracked at all. 32 was too few:
+ * Demon's Souls allocates its tasksets at some 30-35 heap addresses, reused for
+ * the rest of the session, and a session that reached a 33rd left that taskset's
+ * tasks parked after its shutdown (issue #202). */
+#define TS_TRACK 256
 static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
 static volatile LONG s_ts_lock;
 /* The lines s_ts_run holds, as a 256-way filter on the line address (set,
  * never cleared, like the entries): spu_taskset_line_written runs for every
  * committed SPU lock-line and looks in s_ts_run only on a hit. */
 static volatile uint8_t s_ts_lines[256];
+/* A full table, once (ts_lock held). */
+static void ts_table_full(const char* table, uint32_t taskset_ea)
+{
+    static int said;
+    if (said) return;
+    said = 1;
+    fprintf(stderr, "[spu_workload] the taskset %s table is full: taskset 0x%08X and later ones are not "
+            "tracked, so shutdown does not stop their waiting tasks and join does not wait for them\n",
+            table, taskset_ea);
+}
 static uint8_t* ts_running(uint32_t taskset_ea)
 {
-    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
-    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) {
+    int i = 0;
+    for (; i < TS_TRACK && s_ts_run[i].ea; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
+    if (i < TS_TRACK) {
         s_ts_lines[(taskset_ea >> 7) & 255u] = 1;   /* before the entry: see above */
         s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running;
     }
+    ts_table_full("running", taskset_ea);
     return NULL;
 }
 static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
@@ -530,16 +548,17 @@ void spu_workload_set_dispatch_task(uint32_t taskset_ea, uint32_t taskid)
  * Every task thread records the generation it was started under. Shutdown (and
  * a re-create at the same EA) bumps the generation; a task that waits under an
  * older generation is stopped instead of resumed. */
-#define TS_LIFE_MAX 32
+#define TS_LIFE_MAX 256   /* as TS_TRACK: see there */
 static struct { uint32_t ea; volatile LONG gen; volatile LONG live; uint64_t ids; uint32_t htid[64]; } s_ts_life[TS_LIFE_MAX];
 static SPU_WL_TLS uint32_t t_job_ts;
 static SPU_WL_TLS LONG t_job_gen;
 
 static int ts_life_idx(uint32_t taskset_ea)   /* ts_lock held */
 {
-    for (int i = 0; i < TS_LIFE_MAX; i++) if (s_ts_life[i].ea == taskset_ea) return i;
-    for (int i = 0; i < TS_LIFE_MAX; i++)
-        if (!s_ts_life[i].ea) { s_ts_life[i].ea = taskset_ea; return i; }
+    int i = 0;
+    for (; i < TS_LIFE_MAX && s_ts_life[i].ea; i++) if (s_ts_life[i].ea == taskset_ea) return i;
+    if (i < TS_LIFE_MAX) { s_ts_life[i].ea = taskset_ea; return i; }
+    ts_table_full("lifetime", taskset_ea);
     return -1;
 }
 
@@ -557,7 +576,7 @@ static LONG spu_taskset_gen(uint32_t taskset_ea)
 static LONG spu_taskset_gen_peek(uint32_t taskset_ea)
 {
     if (!taskset_ea) return 0;
-    for (int i = 0; i < TS_LIFE_MAX; i++)
+    for (int i = 0; i < TS_LIFE_MAX && s_ts_life[i].ea; i++)
         if (s_ts_life[i].ea == taskset_ea) return s_ts_life[i].gen;
     return 0;
 }
@@ -700,7 +719,7 @@ static void spu_taskset_line_written(uint32_t line_ea)
     extern uint8_t* vm_base;
     if (!s_ts_lines[(line_ea >> 7) & 255u]) return;
     int known = 0;
-    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == line_ea) { known = 1; break; }
+    for (int i = 0; i < TS_TRACK && s_ts_run[i].ea; i++) if (s_ts_run[i].ea == line_ea) { known = 1; break; }
     if (!known || !vm_base) return;
     uint8_t* ts = vm_base + line_ea;
     uint64_t p[2];
