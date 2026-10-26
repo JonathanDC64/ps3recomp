@@ -112,11 +112,29 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
 
+      # mbedTLS (third_party/mbedtls) as a static library, once, for the
+      # network tests below: they include ps3_tls.c, the TLS to the online
+      # server.
+      - name: Build mbedTLS for the network tests
+        run: |
+          mkdir -p /tmp/mbedtls
+          cd /tmp/mbedtls
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -w -c -I "$GITHUB_WORKSPACE/third_party/mbedtls/include" "$GITHUB_WORKSPACE"/third_party/mbedtls/library/*.c
+          ar rcs /tmp/libmbedtls.a /tmp/mbedtls/*.o
+
+      # TLS to the online server (ps3_tls.c) on loopback with test
+      # certificates: the built-in roots, the certificate and name checks,
+      # a server that isn't TLS, timeouts, large transfers.
+      - name: Run the TLS test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_net_tls libs/network/tests/test_net_tls.c /tmp/libmbedtls.a -lpthread
+          /tmp/test_net_tls
+
       # cellHttp end to end on loopback: guest pointers, the network gate, and
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_http_loopback
 
       # The sign-in to a server that has one: the key, the challenge and its
@@ -124,9 +142,9 @@ jobs:
       # what the player is told when psnr refuses co-op.
       - name: Run the sign-in tests
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_net_signin
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_psnr_notice libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_psnr_notice libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_psnr_notice
 
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
@@ -147,14 +165,14 @@ jobs:
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_identity
 
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_nat
 
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
