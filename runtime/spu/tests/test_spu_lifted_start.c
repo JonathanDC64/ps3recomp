@@ -755,6 +755,78 @@ static void test_nonzero_link_return(void)
     free(ctx);
 }
 
+/* A `stop` the SPU does not resume from, inside a call. The lifter ends the
+ * function there with a plain return and leaves the pc where the function
+ * began, so the call's drain finds no return and a lifted entry at the pc,
+ * and resumed it: the same stop, again, for good. That was Demon's Souls
+ * issue #202 (image 1's inflater at 0x4690, its `stop 0` bad-data exit, under
+ * a call returning to 0x7AE8); the addresses here sit below the taskset task
+ * region so the dispatch does not look for a task image. Without the drain's
+ * check this test does not fail, it spins, hence the alarm. */
+static int stop_runs, resumed_runs, caller_went_on;
+static void stops_at_entry(spu_context* ctx)    /* a lifted `stop 0` */
+{
+    ++stop_runs;
+    ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+}
+static void returns_to_entry(spu_context* ctx) { ctx->pc = 0x1900; }   /* SPU_RET, r0 = 0x1900 */
+static void returns_to_caller(spu_context* ctx) { ++resumed_runs; ctx->pc = 0x2AE8; }
+static void caller_branches_to(spu_context* ctx, uint32_t pc, void (*fn)(spu_context*))
+{
+    ctx->host_depth = 5;
+    ctx->pc = pc;
+    g_spu_trampoline_fn = fn;   /* `br pc` inside the callee */
+    spu_drain_call(ctx, 0x2AE8);
+    caller_went_on = 1;
+}
+static void caller_of_stop(spu_context* ctx) { caller_branches_to(ctx, 0x1690, stops_at_entry); }
+static void caller_of_resume(spu_context* ctx) { caller_branches_to(ctx, 0x1800, returns_to_entry); }
+static void stop_spin_alarm(int sig)
+{
+    static const char msg[] =
+        "  FAIL: a lifted `stop` inside a call is run again and again (issue #202)\n"
+        "SPU lifted thread-group start: FAILED\n";
+    ssize_t ignored = write(2, msg, sizeof(msg) - 1);
+    (void)ignored; (void)sig;
+    _exit(1);
+}
+static void test_stop_inside_call(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate stop-in-call context"); return; }
+    spu_context_init(ctx, 0);
+    spu_begin_image(91);
+    spu_register_function(0x1690, stops_at_entry);
+    spu_register_function(0x1800, returns_to_entry);
+    spu_register_function(0x1900, returns_to_caller);
+    spu_begin_image(0);
+    ctx->image_id = 91;
+    signal(SIGALRM, stop_spin_alarm);
+    alarm(10);
+
+    stop_runs = 0; caller_went_on = 0;
+    int halted = spu_run_with_halt(caller_of_stop, ctx);
+    check(halted, "a stop inside a call ends the program");
+    check(stop_runs == 2, "the stopped function is not resumed past one retry");
+    check(!caller_went_on, "the caller does not go on after the program ended");
+    check(!g_spu_trampoline_fn, "the stop leaves no pending continuation");
+
+    /* The resume this must not break: a callee whose tail returned to a lifted
+     * entry with no host frame runs on in the drain until it reaches the
+     * return pc -- even with a stop's status still set from earlier. */
+    resumed_runs = 0; caller_went_on = 0;
+    ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+    halted = spu_run_with_halt(caller_of_resume, ctx);
+    check(!halted && resumed_runs == 1 && caller_went_on,
+          "a callee that returns to a lifted entry still runs on to the return pc");
+    check(ctx->pc == 0x2AE8, "the resumed call ends at its return pc");
+
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    g_spu_trampoline_fn = 0;
+    free(ctx);
+}
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -770,6 +842,7 @@ int main(void)
     test_taskset_resume_stack();
     test_alternate_link_return();
     test_nonzero_link_return();
+    test_stop_inside_call();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
