@@ -72,6 +72,11 @@ static int      s_nknown;
 static uint8_t  s_issued[32];
 static volatile int s_challenges, s_sessions, s_games, s_banner_gets;
 static const char* volatile s_banners = "{\"banners\":[]}";
+static const char* volatile s_players = "{\"days\":30,\"players\":[]}";
+static volatile int s_post_status = 200;
+static const char* volatile s_post_reply = "{\"ok\":true}";
+static volatile int s_stale_once, s_player_calls;
+static char     s_player_post[512];
 static char     s_game_request[4096];
 static volatile int s_stop;
 static http_socket_t s_listen;
@@ -173,6 +178,20 @@ static void serve_one(http_socket_t c)
     } else if (!strncmp(buf, "POST /dss/v1/session ", 21)) {
         s_sessions++;
         session_call(c, body);
+    } else if (!strncmp(buf, "GET /dss/v1/players ", 20) || !strncmp(buf, "POST /dss/v1/players/", 21)) {
+        char tok[48], want[96];
+        si_b64_encode(s_issued, 32, tok, 1);
+        snprintf(want, sizeof want, "\r\nX-DSS-Session: %s\r\n", tok);
+        if (s_stale_once || !strstr(buf, want)) {   /* a session the server no longer takes */
+            s_stale_once = 0;
+            reply(c, 401, "{\"error\":\"session\",\"message\":\"Sign in again.\"}");
+        } else if (buf[0] == 'G') {
+            reply(c, 200, s_players);
+        } else {
+            snprintf(s_player_post, sizeof s_player_post, "%s %s", strstr(buf, "/report ") ? "report" : "block", body);
+            reply(c, s_post_status, s_post_reply);
+        }
+        s_player_calls++;
     } else if (!strncmp(buf, "GET /dss/v1/banners ", 20)) {
         assert(!strstr(buf, "X-DSS-Session"));
         s_banner_gets++;
@@ -231,6 +250,34 @@ static int game_request(u16 port)
     }
     cellHttpDestroyTransaction(t);
     return r == CELL_OK && s_games > before;
+}
+
+static void nap(void)
+{
+#ifdef _WIN32
+    Sleep(10);
+#else
+    usleep(10000);
+#endif
+}
+
+/* Waits for the players thread's next list after `seen`; its state. */
+static int next_list(unsigned seen)
+{
+    unsigned serial = seen;
+    int state = -1;
+    for (int i = 0; i < 500 && serial == seen; i++) {
+        nap();
+        ps3_net_players(NULL, 0, &state, NULL, &serial, NULL, 0);
+    }
+    assert(serial != seen);
+    return state;
+}
+
+/* Waits for the outcome of a block or report: *ok, and the line in out. */
+static void next_result(int* ok, char* out, size_t cap)
+{
+    for (int i = 0; i < 500 && !ps3_net_players_result(ok, out, cap); i++) nap();
 }
 
 static long file_size(const char* path)
@@ -442,6 +489,70 @@ int main(void)
     s_banners = "{\"banners\":[]}";
     assert(si_banners_fetch() && !ps3_net_signin_banner(notice, sizeof notice));
 
+    /* Players met: the list, a block, a report, each with the session. */
+    {
+        ps3_net_player pl[4];
+        int state = -1, days = 0, ok = -1;
+        unsigned seen = 0;
+        char line[256];
+        ps3_net_players(NULL, 0, &state, NULL, &seen, NULL, 0);
+        assert(state == PS3_NET_PLAYERS_NONE);
+        s_players = "{\"days\":30,\"players\":["
+                    "{\"name\":\"Biorr\",\"fingerprint\":\"a1b2c3d4e5f60718\",\"met\":\"invasion\",\"host\":true,"
+                    "\"at\":\"2026-10-26T20:00:00.25Z\",\"blocked\":false,\"reported\":false,\"reportable\":true},"
+                    "{\"name\":\"Garl\",\"fingerprint\":\"0011223344556677\",\"met\":\"\",\"host\":false,"
+                    "\"at\":\"2026-10-25T20:00:00Z\",\"blocked\":true,\"reported\":true,\"reportable\":false}]}";
+        assert(ps3_net_players_refresh() == 0);
+        assert(next_list(seen) == PS3_NET_PLAYERS_READY);
+        int n = ps3_net_players(pl, 4, &state, &days, &seen, line, sizeof line);
+        assert(n == 2 && days == 30 && !line[0]);
+        assert(!strcmp(pl[0].name, "Biorr") && !strcmp(pl[0].fingerprint, "a1b2c3d4e5f60718") &&
+               !strcmp(pl[0].met, "invasion") && pl[0].host && pl[0].at == 1793044800LL && !pl[0].blocked &&
+               !pl[0].reported && pl[0].reportable);
+        assert(!strcmp(pl[1].name, "Garl") && !pl[1].met[0] && !pl[1].host && pl[1].blocked && pl[1].reported &&
+               !pl[1].reportable && pl[1].at == 1793044800LL - 86400);
+        assert(ps3_net_players(pl, 1, NULL, NULL, NULL, NULL, 0) == 1);
+
+        /* A block: the body, the line for the player, and the list again. */
+        assert(ps3_net_player_block("Biorr", 1) == 0);
+        next_result(&ok, line, sizeof line);
+        assert(ok == 1 && !strcmp(line, "Blocked Biorr. You won't meet them online again."));
+        assert(!strcmp(s_player_post, "block {\"name\":\"Biorr\",\"blocked\":true}"));
+        assert(next_list(seen) == PS3_NET_PLAYERS_READY);
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, NULL, 0);
+
+        /* Not sent: an unknown reason, a name the server's rules refuse. */
+        assert(ps3_net_player_report("Biorr", "rude") == -1 && ps3_net_player_report("bad name", "other") == -1);
+        assert(ps3_net_player_block("x\"y", 1) == -1);
+
+        /* A refusal: the server's words. */
+        s_post_status = 409;
+        s_post_reply = "{\"error\":\"reported\",\"message\":\"You reported this player today already.\"}";
+        assert(ps3_net_player_report("Biorr", "cheating") == 0);
+        next_result(&ok, line, sizeof line);
+        assert(ok == 0 && !strcmp(line, "You reported this player today already."));
+        assert(!strcmp(s_player_post, "report {\"name\":\"Biorr\",\"reason\":\"cheating\"}"));
+        assert(next_list(seen) == PS3_NET_PLAYERS_READY);
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, NULL, 0);
+        s_post_status = 200;
+        s_post_reply = "{\"ok\":true}";
+
+        /* A session the server no longer takes: signed in again, once. */
+        int sessions = s_sessions;
+        s_stale_once = 1;
+        assert(ps3_net_players_refresh() == 0);
+        assert(next_list(seen) == PS3_NET_PLAYERS_READY && s_sessions == sessions + 1);
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, NULL, 0);
+
+        /* A reply that is not a list: failed, with a line for the player. */
+        s_players = "{\"error\":\"server\",\"message\":\"The server could not do that now.\"}";
+        assert(ps3_net_players_refresh() == 0);
+        assert(next_list(seen) == PS3_NET_PLAYERS_FAILED);
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, line, sizeof line);
+        assert(!strcmp(line, "The server could not do that now."));
+        s_players = "{\"days\":30,\"players\":[]}";
+    }
+
     /* A refusal: no session, the server's message once, then no new try for a while. */
     s_mode = BANNED;
     ps3_net_session_drop();
@@ -452,6 +563,15 @@ int main(void)
     assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == calls);
     s_games = 0;
     assert(game_request(port) && !strstr(s_game_request, "X-DSS-Session"));   /* the request goes without one */
+    {   /* and the players list says why there is none */
+        unsigned seen = 0;
+        char line[256];
+        int before = s_player_calls;
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, NULL, 0);
+        assert(ps3_net_players_refresh() == 0 && next_list(seen) == PS3_NET_PLAYERS_FAILED);
+        ps3_net_players(NULL, 0, NULL, NULL, NULL, line, sizeof line);
+        assert(strstr(line, "Not signed in") && s_player_calls == before);
+    }
 
     /* Maintenance at the challenge: its message. */
     s_mode = BUSY_JSON;
