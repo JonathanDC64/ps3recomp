@@ -475,6 +475,9 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
+    /* The pc the resume below last re-entered, and the hops run since. */
+    uint32_t resumed_at = ~0u;
+    unsigned hops = 0;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
@@ -520,6 +523,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                     continue;
                 }
             }
+            hops++;
             fn(ctx);
         }
         if ((ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
@@ -530,7 +534,31 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             uint32_t pc = ctx->pc & SPU_LS_MASK;
             spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
             if (!fn) fn = spu_lookup(pc, ctx->image_id);
+            /* A `stop` the SPU does not resume from (spu_lifter.py: anything but
+             * a serviced lv2 code) ends its lifted function with a plain return:
+             * nothing queued, the pc left where the function began. At the top
+             * level that ends the run. Inside a call it ended the chain here,
+             * and the resume below ran the same function again, and again: the
+             * task never ended and its host thread spun at 100% for the rest of
+             * the session (Demon's Souls issue #202: ten such threads on a
+             * 12-thread CPU, all in image 1's inflater, whose `stop 0` at
+             * 0x4690 is its bad-data exit). Real hardware stops the SPU there.
+             * So when one resume ran a single function that stopped and left
+             * the pc where the resume put it, end the program: spu_halt returns
+             * to spu_run_with_halt, as a task's EXIT does. */
+            if (fn && pc == resumed_at && hops == 1 &&
+                ctx->status == SPU_STATUS_STOPPED_BY_STOP) {
+                { static int _n = 0; if (_n < 8 && ++_n)
+                    fprintf(stderr, "[spu] img=%d stopped (stop 0x%X) in lifted code at 0x%05X, %d calls deep: "
+                            "the program ends there\n", ctx->image_id, ctx->stop_code, pc,
+                            (int)ctx->host_depth); }
+                SPU_DRAIN_POP_IRQ();
+                spu_halt(ctx);
+                return;
+            }
             if (fn) {
+                resumed_at = pc;
+                hops = 0;
                 { static int _n = 0; if (_n < 8 && ++_n)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
