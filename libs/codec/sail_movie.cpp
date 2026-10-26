@@ -3,21 +3,21 @@
  *
  * One thread per open movie reads the program stream a 2048-byte pack at a
  * time:
- *   - video (PES 0xE0, MPEG-2) goes to the host's MPEG-2 decoder: Media
- *     Foundation's (msmpeg2vdec, part of Windows) on Windows, FFmpeg's
- *     libavcodec elsewhere (loaded at run time, ffmpeg_runtime.h). Decoded
- *     4:2:0 pictures are converted to the guest's 32-bit layout (BT.709,
- *     limited range) and queued, a few frames deep -- the thread waits while
- *     the queue is full;
+ *   - video (PES 0xE0, MPEG-2) goes to an MPEG-2 decoder: FFmpeg's libavcodec,
+ *     loaded at run time (ffmpeg_runtime.h), in a build with
+ *     PS3RECOMP_FFMPEG_RUNTIME; on Windows, Media Foundation's when FFmpeg's
+ *     cannot be loaded (or the build has none). Decoded 4:2:0 pictures are
+ *     converted to the guest's 32-bit layout (BT.709, limited range) and
+ *     queued, a few frames deep -- the thread waits while the queue is full;
  *   - LPCM (private stream 1, sub-stream 0x40|ch: one id byte, three header
  *     bytes, then 16-bit big-endian interleaved samples) is converted to float
  *     into a ring of a few seconds; if the title stops pulling audio the
  *     oldest samples are dropped rather than stalling the video.
  * Frame n is due n * fps_den / fps_num seconds after sail_movie_start.
  *
- * Only the decoder differs by host (open_decoder, feed_video, drain_decoder,
- * close_decoder below); the demuxer, the audio, the queue and the clock are
- * the same everywhere.
+ * Only the decoder differs (video_open, video_feed, video_drain, video_close
+ * below pick FFmpeg's or Media Foundation's for each movie); the demuxer, the
+ * audio, the queue and the clock are the same everywhere.
  *
  * PAMF header (as cellPamf.c reads it): header size and data size in 2048-
  * byte units at 0x08 / 0x0C, stream count at 0x87, 48-byte stream headers
@@ -31,7 +31,8 @@
 
 #if defined(_WIN32)
 #define SAIL_MOVIE_MF 1
-#elif defined(PS3RECOMP_FFMPEG_RUNTIME)
+#endif
+#if defined(PS3RECOMP_FFMPEG_RUNTIME)
 #define SAIL_MOVIE_FFMPEG 1
 #endif
 
@@ -60,7 +61,8 @@
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
-#else
+#endif
+#ifdef SAIL_MOVIE_FFMPEG
 #include "ffmpeg_runtime.h"
 #endif
 
@@ -86,25 +88,29 @@ struct Picture {
 
 #ifdef SAIL_MOVIE_MF
 template <class T> void release(T*& p) { if (p) { p->Release(); p = nullptr; } }
+#endif
+
+enum class Decoder { none, ffmpeg, mf };
 
 struct VideoDecoder {
+    Decoder     in_use = Decoder::none;
+#ifdef SAIL_MOVIE_MF
     bool        com = false;            /* COM and Media Foundation started on the thread */
     IMFTransform* mft = nullptr;
     bool        provides = false;
     DWORD       out_cb = 0;
     UINT32      out_w = 0, out_h = 0;
     LONG        out_stride = 0;
-};
-#else
-struct VideoDecoder {
+#endif
+#ifdef SAIL_MOVIE_FFMPEG
     const PS3FFmpeg* ff = nullptr;
     AVCodecContext* ctx = nullptr;
     AVCodecParserContext* parser = nullptr;
     AVPacket*   pkt = nullptr;
     AVFrame*    frame = nullptr;
     bool        warned = false;         /* an unexpected picture layout was reported */
-};
 #endif
+};
 
 } // namespace
 
@@ -448,12 +454,16 @@ void close_decoder(SailMovie* m)
     }
 }
 
-#else  /* SAIL_MOVIE_FFMPEG */
+#endif  /* SAIL_MOVIE_MF */
 
-/* Off Windows the decoder is FFmpeg's, loaded at run time. Without it (not
- * installed, another major version, PS3RECOMP_FFMPEG=0) a movie with video
- * is not opened, and ends at once as it did before FFmpeg was used here. */
-bool video_decoder_present()
+#ifdef SAIL_MOVIE_FFMPEG
+
+/* FFmpeg's decoder, loaded at run time. Off Windows it is the only one:
+ * without it (not installed, another major version, PS3RECOMP_FFMPEG=0) a
+ * movie with video is not opened, and ends at once as it did before FFmpeg
+ * was used here. */
+#ifndef SAIL_MOVIE_MF
+bool ff_video_decoder_present()
 {
     const PS3FFmpeg* ff = ps3_ffmpeg_get();
     if (ff && ff->avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO)) return true;
@@ -461,8 +471,9 @@ bool video_decoder_present()
             ff ? "has none" : "was not loaded", 10);
     return false;
 }
+#endif
 
-void close_decoder(SailMovie* m)
+void ff_close_decoder(SailMovie* m)
 {
     VideoDecoder& d = m->dec;
     if (!d.ff) return;
@@ -470,10 +481,12 @@ void close_decoder(SailMovie* m)
     if (d.ctx) d.ff->avcodec_free_context(&d.ctx);
     if (d.pkt) d.ff->av_packet_free(&d.pkt);
     if (d.frame) d.ff->av_frame_free(&d.frame);
-    d = VideoDecoder{};
+    d.ff = nullptr;
+    d.parser = nullptr;
+    d.warned = false;
 }
 
-bool open_decoder(SailMovie* m)
+bool ff_open_decoder(SailMovie* m)
 {
     VideoDecoder& d = m->dec;
     d.ff = ps3_ffmpeg_get();
@@ -485,7 +498,7 @@ bool open_decoder(SailMovie* m)
     d.frame = d.ff->av_frame_alloc();
     if (!d.ctx || !d.parser || !d.pkt || !d.frame || d.ff->avcodec_open2(d.ctx, c, nullptr) < 0) {
         fprintf(stderr, "[sail_movie] FFmpeg's MPEG-2 decoder did not open%c", 10);
-        close_decoder(m);
+        ff_close_decoder(m);
         return false;
     }
     return true;
@@ -544,19 +557,92 @@ void parse(SailMovie* m, const uint8_t* p, size_t n)
     }
 }
 
-void feed_video(SailMovie* m, const uint8_t* p, size_t n)
+void ff_feed_video(SailMovie* m, const uint8_t* p, size_t n)
 {
     if (m->dec.ctx && n) parse(m, p, n);
 }
 
-void drain_decoder(SailMovie* m)
+void ff_drain_decoder(SailMovie* m)
 {
     if (!m->dec.ctx) return;
     parse(m, nullptr, 0);
     decode(m, nullptr, 0);
 }
 
+#endif  /* SAIL_MOVIE_FFMPEG */
+
+/* ---- the decoder in use ------------------------------------------------ */
+
+/* Whether a movie with video can open at all. On Windows, Media Foundation's
+ * answer (yes: its decoder is looked for on the movie's own thread). */
+bool video_present()
+{
+#if defined(SAIL_MOVIE_MF)
+    return video_decoder_present();
+#else
+    return ff_video_decoder_present();
 #endif
+}
+
+/* FFmpeg's decoder where the build has it and it loads (on Windows it ships
+ * beside the program), else Media Foundation's. FFmpeg's plays the same on
+ * every PC; Windows' own MPEG-2 decoder needs an extension from the
+ * Microsoft Store. PS3RECOMP_FFMPEG=0 skips FFmpeg. */
+bool video_open(SailMovie* m)
+{
+    VideoDecoder& d = m->dec;
+#ifdef SAIL_MOVIE_FFMPEG
+    if (ff_open_decoder(m)) {
+        d.in_use = Decoder::ffmpeg;
+        return true;
+    }
+#endif
+#ifdef SAIL_MOVIE_MF
+#ifdef SAIL_MOVIE_FFMPEG
+    { static bool said = false;
+      if (!said) { said = true;
+          fprintf(stderr, "[sail_movie] no FFmpeg decoder: Windows' own (Media Foundation) instead%c", 10); } }
+#endif
+    if (open_decoder(m)) {
+        d.in_use = Decoder::mf;
+        return true;
+    }
+#endif
+    return false;
+}
+
+void video_feed(SailMovie* m, const uint8_t* p, size_t n)
+{
+#ifdef SAIL_MOVIE_FFMPEG
+    if (m->dec.in_use == Decoder::ffmpeg) ff_feed_video(m, p, n);
+#endif
+#ifdef SAIL_MOVIE_MF
+    if (m->dec.in_use == Decoder::mf) feed_video(m, p, n);
+#endif
+}
+
+void video_drain(SailMovie* m)
+{
+#ifdef SAIL_MOVIE_FFMPEG
+    if (m->dec.in_use == Decoder::ffmpeg) ff_drain_decoder(m);
+#endif
+#ifdef SAIL_MOVIE_MF
+    if (m->dec.in_use == Decoder::mf) drain_decoder(m);
+#endif
+}
+
+/* Both, whichever was used: a decoder that failed to open may have left
+ * something started (Media Foundation's COM, FFmpeg's context). */
+void video_close(SailMovie* m)
+{
+#ifdef SAIL_MOVIE_FFMPEG
+    ff_close_decoder(m);
+#endif
+#ifdef SAIL_MOVIE_MF
+    close_decoder(m);
+#endif
+    m->dec.in_use = Decoder::none;
+}
 
 /* ---- audio ------------------------------------------------------------ */
 
@@ -616,7 +702,7 @@ void feed_lpcm(SailMovie* m, const uint8_t* p, size_t n)
 
 void demux(SailMovie* m)
 {
-    if (m->has_video && !open_decoder(m)) m->has_video = false;
+    if (m->has_video && !video_open(m)) m->has_video = false;
 
     seek_to(m->f, m->data_off);
     uint8_t pack[0x800];
@@ -638,12 +724,12 @@ void demux(SailMovie* m)
             if (hl > len) continue;
             const uint8_t* pl = body + hl;
             const size_t pn = len - hl;
-            if (sid == 0xE0 && m->has_video) feed_video(m, pl, pn);
+            if (sid == 0xE0 && m->has_video) video_feed(m, pl, pn);
             else if (sid == 0xBD && pn > 4 && (int)pl[0] == m->lpcm_sub) feed_lpcm(m, pl + 4, pn - 4);
         }
     }
-    if (m->has_video && !m->stop) drain_decoder(m);
-    close_decoder(m);
+    if (m->has_video && !m->stop) video_drain(m);
+    video_close(m);
     {
         std::lock_guard<std::mutex> lk(m->mu);
         m->demux_done = true;
@@ -660,7 +746,7 @@ extern "C" SailMovie* sail_movie_open(const char* host_path, int coding)
     SailMovie* m = new SailMovie();
     m->f = f;
     m->coding = coding;
-    if (!read_header(m) || (!m->has_video && m->lpcm_sub < 0) || (m->has_video && !video_decoder_present())) {
+    if (!read_header(m) || (!m->has_video && m->lpcm_sub < 0) || (m->has_video && !video_present())) {
         fclose(f);
         delete m;
         return nullptr;
