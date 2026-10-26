@@ -74,6 +74,12 @@ knows a player by a key, not just a name. With `PS3_NET_SIGNIN` and
   polls `ps3_net_players()` for the list and `ps3_net_players_result()` for the
   line to show after a block or report. A session the server no longer takes
   signs in again, once.
+- `ps3_net_player_erase()` deletes what the server keeps about the player
+  (`POST /dss/v1/players/erase`), on the same thread. The run goes offline for
+  good first (`ps3_net_lock_offline()`), then the call goes with the session it
+  had: a sign-in after the deletion would claim the name again and start a new
+  record. The host polls `ps3_net_erase_result()` for the outcome, and turns
+  online off for the next start.
 
 ## TLS
 

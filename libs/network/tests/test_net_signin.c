@@ -210,7 +210,8 @@ static void serve_one(http_socket_t c)
         } else if (buf[0] == 'G') {
             reply(c, 200, s_players);
         } else {
-            snprintf(s_player_post, sizeof s_player_post, "%s %s", strstr(buf, "/report ") ? "report" : "block", body);
+            snprintf(s_player_post, sizeof s_player_post, "%s %s",
+                     strstr(buf, "/report ") ? "report" : strstr(buf, "/erase ") ? "erase" : "block", body);
             reply(c, s_post_status, s_post_reply);
         }
         s_player_calls++;
@@ -690,6 +691,28 @@ int main(void)
     ps3_net_session_drop();
     calls = s_challenges;
     assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == calls && file_size(key) == -1);
+
+    /* Deleting one's data: the call goes with the session, the run is
+     * offline after it, and nothing signs in again. (Last: the lock is for
+     * the rest of the run.) */
+    s_name = "Ashen-01";
+    ps3_net_session_drop();
+    assert(ps3_net_session(tok, sizeof tok, raw));
+    {
+        int ok = -1, kept = -1;
+        char line[256];
+        s_post_status = 200;
+        s_post_reply = "{\"ok\":true,\"kept\":true}";
+        assert(ps3_net_player_erase() == 0);
+        for (int i = 0; i < 500 && !ps3_net_erase_result(&ok, &kept, line, sizeof line); i++) nap();
+        assert(ok == 1 && kept == 1 && strstr(line, "deleted") && strstr(line, "name stays"));
+        assert(!strcmp(s_player_post, "erase {}"));
+        assert(!ps3_net_erase_result(&ok, &kept, line, sizeof line));   /* (once) */
+        calls = s_challenges;
+        assert(ps3_net_locked_offline() && !ps3_net_signin_enabled());
+        assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == calls);
+        assert(ps3_net_player_erase() == -1 && ps3_net_players_refresh() == -1);
+    }
 
     s_stop = 1;
     si_close(s_listen);

@@ -11,7 +11,7 @@
  *                              or {"error": <code>, "message": <for the player>}
  *   GET  /dss/v1/banners    -> {"banners": [{"id", "text", "ends"}]}
  *                              (no session; for the host to show, once each)
- *   GET  /dss/v1/players, POST /dss/v1/players/block, /report
+ *   GET  /dss/v1/players, POST /dss/v1/players/block, /report, /erase
  *                           (with the session; its docs/social.md: below)
  *
  * The signature is Ed25519 (third_party/monocypher) over those fields, one
@@ -1009,10 +1009,12 @@ int ps3_net_signin_banner(char* out, size_t cap)
  *                                   "blocked", "reported", "reportable"}]}
  *   POST /dss/v1/players/block  {"name", "blocked"} -> {"ok": true} or {"error", "message"}
  *   POST /dss/v1/players/report {"name", "reason"}  -> the same
+ *   POST /dss/v1/players/erase  {}                  -> {"ok": true, "kept": false} or the same refusal
  * A thread of their own does one at a time: the waiting action first, then
- * the list. The host polls ps3_net_players and ps3_net_players_result. */
+ * the list (none after an erase). The host polls ps3_net_players,
+ * ps3_net_players_result and ps3_net_erase_result. */
 
-enum { SI_ACT_NONE, SI_ACT_BLOCK, SI_ACT_UNBLOCK, SI_ACT_REPORT };
+enum { SI_ACT_NONE, SI_ACT_BLOCK, SI_ACT_UNBLOCK, SI_ACT_REPORT, SI_ACT_ERASE };
 
 static ps3_net_player si_pl[PS3_NET_PLAYERS_MAX];   /* (si_slock) the latest list */
 static int      si_npl, si_pl_days, si_pl_state;
@@ -1024,6 +1026,8 @@ static int      si_act;                     /* (si_slock) the waiting action, SI
 static char     si_act_name[24], si_act_reason[16];
 static char     si_res[256];                /* (si_slock) the last action's outcome, not taken yet */
 static int      si_res_new, si_res_ok;
+static char     si_er[256];                 /* (si_slock) the erase's outcome, not taken yet */
+static int      si_er_new, si_er_ok, si_er_kept;
 
 static int si_js_bool(const char* js, const char* key)
 {
@@ -1163,6 +1167,51 @@ static void si_players_act(int act, const char* name, const char* reason)
     free(reply);
 }
 
+/* The player's own data, deleted on the server. The run goes offline
+ * first (ps3_net_lock_offline): once the server has deleted the player, a
+ * sign-in from this run (a game request whose session ended would make one)
+ * would claim the name again and start a new record. So the session is
+ * taken, the run locked, then the call made with it; if the call fails, the
+ * run stays offline and the next start can ask again. */
+static void si_erase(void)
+{
+    char host[256], tok[64], line[256];
+    uint16_t port;
+    uint8_t ips[SI_MAX_IPS][4];
+    int status = 0, r = -2, ok = 0, kept = 0;
+    const char* addr = getenv("PS3_NET_SIGNIN");
+    char* reply = (char*)malloc(SI_REPLY_MAX);
+    if (!reply) return;
+    reply[0] = 0;
+    if (ps3_net_signin_enabled() && si_split_address(addr, host, sizeof host, &port) == 0 &&
+        ps3_net_session(tok, sizeof tok, NULL)) {
+        ps3_net_lock_offline();
+        int nips = si_server_ips(addr, host, 0, ips);
+        r = si_http(ips, nips, host, port, "/dss/v1/players/erase", "{}", &status, reply, SI_REPLY_MAX, NULL, 0, tok);
+        crypto_wipe(tok, sizeof tok);
+        ps3_net_session_drop();
+    }
+    ok = r == 0 && status == 200 && si_js_bool(reply, "ok");
+    kept = ok && si_js_bool(reply, "kept");
+    if (!ok) {
+        char why[200];
+        si_why(r, status, reply, why, sizeof why);
+        snprintf(line, sizeof line, "%s%s", why, r == -2 ? "" : " Online play is off until the game starts again.");
+    } else if (kept)
+        snprintf(line, sizeof line, "Your data on the online server was deleted. Your name stays there, with the "
+                                    "restriction on record.");
+    else
+        snprintf(line, sizeof line, "Your data on the online server was deleted.");
+    SI_LOCK(si_slock);
+    snprintf(si_er, sizeof si_er, "%s", line);
+    si_er_ok = ok;
+    si_er_kept = kept;
+    si_er_new = 1;
+    SI_UNLOCK(si_slock);
+    printf("[signin] erase: %s%s\n", ok ? "done" : line, kept ? " (the name stays with a case)" : "");
+    free(reply);
+}
+
 #ifdef _WIN32
 static DWORD WINAPI si_players_main(LPVOID arg)
 #else
@@ -1181,6 +1230,10 @@ static void* si_players_main(void* arg)
         if (!list) si_pl_busy = 0;
         SI_UNLOCK(si_slock);
         if (!list) break;
+        if (act == SI_ACT_ERASE) {   /* (no list after it: the run is offline) */
+            si_erase();
+            continue;
+        }
         if (act != SI_ACT_NONE) si_players_act(act, name, reason);
         si_players_fetch();   /* (after an action too: its row changed) */
     }
@@ -1259,6 +1312,37 @@ int ps3_net_player_report(const char* name, const char* reason)
 {
     if (!reason || (strcmp(reason, "cheating") && strcmp(reason, "name") && strcmp(reason, "other"))) return -1;
     return si_players_queue(SI_ACT_REPORT, name, reason);
+}
+
+int ps3_net_player_erase(void)
+{
+    if (!ps3_net_signin_enabled()) return -1;
+    SI_LOCK(si_slock);
+    if (si_act != SI_ACT_NONE) {
+        SI_UNLOCK(si_slock);
+        return -1;
+    }
+    si_act = SI_ACT_ERASE;
+    si_act_name[0] = si_act_reason[0] = 0;
+    int start = si_players_wake_locked();
+    SI_UNLOCK(si_slock);
+    if (start) si_players_start();
+    return 0;
+}
+
+int ps3_net_erase_result(int* ok, int* kept, char* out, size_t cap)
+{
+    int r = 0;
+    SI_LOCK(si_slock);
+    if (si_er_new) {
+        if (ok) *ok = si_er_ok;
+        if (kept) *kept = si_er_kept;
+        if (out && cap) snprintf(out, cap, "%s", si_er);
+        si_er_new = 0;
+        r = 1;
+    }
+    SI_UNLOCK(si_slock);
+    return r;
 }
 
 int ps3_net_players_result(int* ok, char* out, size_t cap)
