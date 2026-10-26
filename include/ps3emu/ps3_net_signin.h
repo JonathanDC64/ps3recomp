@@ -92,6 +92,19 @@ int ps3_net_player_report(const char* name, const char* reason);
  * player in out[cap], else 0. */
 int ps3_net_players_result(int* ok, char* out, size_t cap);
 
+/* Deletes what the online server keeps about this player (the server's
+ * docs/social.md, POST /dss/v1/players/erase), on the same thread as the
+ * blocks and reports. The run goes offline for good first
+ * (ps3_net_lock_offline), so nothing in it signs in again and starts a new
+ * record; the host turns online off for the next start. 0 when queued; -1
+ * with the sign-in off, or another call still waiting. */
+int ps3_net_player_erase(void);
+
+/* The erase's outcome, once: 1 with *ok, *kept (the name stays on the server
+ * with a restriction on record) and a line for the player in out[cap], else
+ * 0. */
+int ps3_net_erase_result(int* ok, int* kept, char* out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif
