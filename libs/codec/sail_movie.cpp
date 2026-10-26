@@ -273,6 +273,31 @@ bool set_output_type(SailMovie* m)
     }
 }
 
+/* What activating Windows' own MPEG-2 decoder ("Microsoft MPEG Video Decoder
+ * MFT") returns without its licence, which the Microsoft Store's free MPEG-2
+ * Video Extension brings: SL_E_LICENSE_FILE_NOT_INSTALLED (slerror.h). */
+constexpr HRESULT kDecoderNotLicensed = (HRESULT)0xC004F011L;
+
+/* One listed decoder, started and given the stream: S_OK with d.mft set, or
+ * why not, with d.mft left empty. */
+HRESULT start_decoder(SailMovie* m, IMFActivate* act)
+{
+    VideoDecoder& d = m->dec;
+    HRESULT hr = act->ActivateObject(IID_PPV_ARGS(&d.mft));
+    if (FAILED(hr)) return hr;
+    IMFMediaType* t = nullptr;
+    MFCreateMediaType(&t);
+    t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_MPEG2);
+    MFSetAttributeSize(t, MF_MT_FRAME_SIZE, (UINT32)m->info.width, (UINT32)m->info.height);
+    MFSetAttributeRatio(t, MF_MT_FRAME_RATE, (UINT32)m->info.fps_num, (UINT32)m->info.fps_den);
+    hr = d.mft->SetInputType(0, t, 0);
+    t->Release();
+    if (SUCCEEDED(hr) && !set_output_type(m)) hr = MF_E_INVALIDMEDIATYPE;
+    if (FAILED(hr)) release(d.mft);
+    return hr;
+}
+
 bool open_decoder(SailMovie* m)
 {
     VideoDecoder& d = m->dec;
@@ -288,22 +313,28 @@ bool open_decoder(SailMovie* m)
         fprintf(stderr, "[sail_movie] no MPEG-2 video decoder on this system%c", 10);
         return false;
     }
-    HRESULT hr = acts[0]->ActivateObject(IID_PPV_ARGS(&d.mft));
+    /* The first decoder that starts and takes the stream. A listed one can
+     * fail to start: Windows' own does without its licence. That used to end
+     * here without a word, and every movie played with no picture and ended
+     * after a moment (Demon's Souls issue #202, "cutscenes skipped"). */
+    bool unlicensed = false;
+    for (UINT32 i = 0; i < n && !d.mft; i++) {
+        const HRESULT hr = start_decoder(m, acts[i]);
+        if (SUCCEEDED(hr)) break;
+        WCHAR* name = nullptr;
+        UINT32 len = 0;
+        acts[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &len);
+        fprintf(stderr, "[sail_movie] MPEG-2 decoder \"%ls\" could not be used (0x%08lX)%c",
+                name ? name : L"?", (unsigned long)hr, 10);
+        CoTaskMemFree(name);
+        unlicensed |= hr == kDecoderNotLicensed;
+    }
     for (UINT32 i = 0; i < n; i++) acts[i]->Release();
     CoTaskMemFree(acts);
-    if (FAILED(hr)) return false;
-
-    IMFMediaType* t = nullptr;
-    MFCreateMediaType(&t);
-    t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_MPEG2);
-    MFSetAttributeSize(t, MF_MT_FRAME_SIZE, (UINT32)m->info.width, (UINT32)m->info.height);
-    MFSetAttributeRatio(t, MF_MT_FRAME_RATE, (UINT32)m->info.fps_num, (UINT32)m->info.fps_den);
-    hr = d.mft->SetInputType(0, t, 0);
-    t->Release();
-    if (FAILED(hr) || !set_output_type(m)) {
-        fprintf(stderr, "[sail_movie] MPEG-2 decoder refused the stream (0x%08lX)%c", (unsigned long)hr, 10);
-        release(d.mft);
+    if (!d.mft) {
+        if (unlicensed)
+            fprintf(stderr, "[sail_movie] Windows' MPEG-2 decoder needs the free MPEG-2 Video Extension from "
+                    "the Microsoft Store; without it the movies have no picture and end early%c", 10);
         return false;
     }
     d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);

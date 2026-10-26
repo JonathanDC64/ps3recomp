@@ -72,7 +72,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | cellGifDec | GIF Decode | **Complete** | Header parsing + stb_image decode |
 | cellJpgEnc | JPEG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
 | cellPngEnc | PNG Encode | **Complete** | Handle management, encode returns NOT_SUPPORTED (needs stb_image_write) |
-| cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause; PAMF movies (MPEG-2 video, LPCM) played through Media Foundation on Windows and FFmpeg loaded at run time elsewhere (`libs/codec/sail_movie.cpp`); other streams finish at once |
+| cellSail | Media Player | **Complete** | Player lifecycle/state machine, open/start/stop/pause; PAMF movies (MPEG-2 video, LPCM) played through Media Foundation on Windows and FFmpeg loaded at run time elsewhere (`libs/codec/sail_movie.cpp`); other streams finish at once. On Windows, Windows' own MPEG-2 decoder works only with the free MPEG-2 Video Extension from the Microsoft Store; without a working decoder a movie has no picture and ends early, and the log says why |
 | cellAtrac | ATRAC3plus | Partial | All-data-on-memory decode of ATRAC3plus RIFF files with looping, through FFmpeg loaded at run time. No streaming, no plain ATRAC3 |
 | cellAdecAtrac3p | ATRAC3+ Decode | Partial | Open/close/decode/reset, mono/stereo, 44.1/48kHz; outputs silence (2048 samples/frame). Real ATRAC3plus is in cellAtrac |
 | cellAdecCelp8 | CELP8 Decode | **Complete** | CELP8 voice codec — open/close/decode/reset, outputs silence (160 samples/frame @ 8kHz mono), multiple bitrate modes |
