@@ -445,8 +445,16 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  *     scan followed by a store, and two threads that scanned before either
  *     stored both took the same slot and then shared one engine's queue and tag
  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
+ *
+ * Contexts that live on a stack (a SPURS job's, an async worker's) give their
+ * slot back when they end, as threads do. Before that, every one that did a DMA
+ * kept its slot: Demon's Souls filled the 8 within seconds, and every context
+ * after that shared the fallback engine, and took the claim lock on every
+ * channel access. 64 slots leave room for every SPU thread, kernel and worker
+ * that runs at once; a lookup only scans them when its thread's cached slot
+ * misses.
  * ===========================================================================*/
-#define SPU_MAX_CONTEXTS 8
+#define SPU_MAX_CONTEXTS 64
 
 typedef struct {
     spu_context* volatile ctx;
@@ -518,11 +526,41 @@ static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx)
 void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
+    /* Only this thread puts ctx in a slot, so a scan without the lock that
+     * does not find it is final: a job that never did a DMA skips the lock. */
+    int in = 0;
+    for (int i = 0; i < SPU_MAX_CONTEXTS && !in; i++) in = s_mfc_slots[i].ctx == ctx;
+    if (!in) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         if (s_mfc_slots[i].ctx != ctx) continue;
         s_mfc_slots[i].ctx = NULL;
         break;
+    }
+    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+}
+
+/* Give back every slot whose context lies in [lo, hi): a host thread's stack,
+ * after a job it ran has returned. The job paths release their own context;
+ * this catches one that returns some other way, as spu_coh_forget_range does
+ * for the lock-line set, and says so. */
+void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+{
+    int any = 0;
+    for (int i = 0; i < SPU_MAX_CONTEXTS && !any; i++) {
+        const uintptr_t c = (uintptr_t)s_mfc_slots[i].ctx;
+        any = c >= lo && c < hi;
+    }
+    if (!any) return;
+    AcquireSRWLockExclusive(&s_mfc_claim_lock);
+    for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
+        const uintptr_t c = (uintptr_t)s_mfc_slots[i].ctx;
+        if (c < lo || c >= hi) continue;
+        static int n = 0;
+        if (n < 16 && ++n)
+            fprintf(stderr, "[SPU] MFC slot of ctx %p (img=%d) given back after its job%c",
+                    (void*)c, s_mfc_slots[i].ctx->image_id, 10);
+        s_mfc_slots[i].ctx = NULL;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }

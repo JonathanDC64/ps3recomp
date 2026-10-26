@@ -399,6 +399,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
+    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }   /* and its MFC slot */
     free(ls);
     return 0;
 }
