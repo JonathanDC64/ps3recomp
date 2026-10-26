@@ -106,6 +106,12 @@ list(APPEND HLE_SOURCES ${AT3_SOURCES})
 file(GLOB MONOCYPHER_SOURCES CONFIGURE_DEPENDS "third_party/monocypher/*.c")
 set_source_files_properties(${MONOCYPHER_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${MONOCYPHER_SOURCES})
+# TLS on the links to the online server (libs/network/ps3_tls.c): mbedTLS 3.6
+# LTS with its default configuration, Apache-2.0 (third_party/mbedtls -- see
+# its README.txt).
+file(GLOB MBEDTLS_SOURCES CONFIGURE_DEPENDS "third_party/mbedtls/library/*.c")
+set_source_files_properties(${MBEDTLS_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+list(APPEND HLE_SOURCES ${MBEDTLS_SOURCES})
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
@@ -152,6 +158,7 @@ target_include_directories(ps3recomp_runtime PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/font"
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/misc"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mbedtls/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 

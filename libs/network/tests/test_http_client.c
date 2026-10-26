@@ -15,13 +15,14 @@
  *   caller's pool behind a CellHttpUri of guest pointers.
  * Loopback only; nothing leaves the PC.
  *
- *   clang-cl /I include /Fe:test_http_client.exe libs/network/tests/test_http_client.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_http_client libs/network/tests/test_http_client.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+ *   clang-cl /I include /I third_party/mbedtls/include /Fe:test_http_client.exe libs/network/tests/test_http_client.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
+ *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_http_client libs/network/tests/test_http_client.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c libmbedtls.a
  */
 #include "../cellHttp.c"
 #include "../cellHttpUtil.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"
+#include "../ps3_tls.c"
 
 /* The sign-in's name (np_psnr.c has the real one); the sign-in is off here. */
 const char* np_psnr_online_id(void) { return "PS3Player"; }

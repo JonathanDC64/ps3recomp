@@ -16,6 +16,7 @@ Usage:
     python3 tools/test_http_response_getters.py
 """
 
+import glob
 import os
 import shutil
 import subprocess
@@ -25,9 +26,11 @@ import tempfile
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 TESTS = os.path.join(ROOT, "libs", "network", "tests")
+MBEDTLS = os.path.join(ROOT, "third_party", "mbedtls")   # (TLS: libs/network/ps3_tls.c)
 SOURCES = [os.path.join(TESTS, "test_http_response_getters.c"),
            os.path.join(ROOT, "third_party", "monocypher", "monocypher.c"),
-           os.path.join(ROOT, "third_party", "monocypher", "monocypher-ed25519.c")]
+           os.path.join(ROOT, "third_party", "monocypher", "monocypher-ed25519.c")] + \
+          sorted(glob.glob(os.path.join(MBEDTLS, "library", "*.c")))
 
 
 def _cc():
@@ -46,7 +49,7 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         exe = os.path.join(td, "test_http_response_getters")
         cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
-               "-o", exe] + SOURCES
+               "-I" + os.path.join(MBEDTLS, "include"), "-o", exe] + SOURCES
         if os.name == "nt":
             cmd += ["-lws2_32", "-lbcrypt"]   # MinGW: Winsock and BCryptGenRandom are separate libraries
         r = subprocess.run(cmd, capture_output=True, text=True)

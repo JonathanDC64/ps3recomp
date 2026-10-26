@@ -3,14 +3,18 @@
  * loopback server that checks what a Demon's Souls Recomp server checks: the
  * challenge, the Ed25519 signature, a new key's work. Then the session on
  * cellHttp's requests, to that server only. Also SHA-256 (FIPS 180-4) and
- * Ed25519 (RFC 8032) vectors, and the reply parsing. Nothing leaves the PC.
+ * Ed25519 (RFC 8032) vectors, and the reply parsing. Then all of it over
+ * TLS (ps3emu/ps3_tls.h), and a server without it. Nothing leaves the PC.
  *
- *   clang-cl /I include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c -lpthread
+ *   clang-cl /I include /I third_party/mbedtls/include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
+ *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c libmbedtls.a -lpthread
+ * (mbedtls.lib / libmbedtls.a: the .c files of third_party/mbedtls/library, compiled once)
  */
 #include "../cellHttp.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"
+#include "../ps3_tls.c"
+#include "tls_test_server.h"
 
 #include <assert.h>
 #ifndef _WIN32
@@ -80,6 +84,21 @@ static char     s_player_post[512];
 static char     s_game_request[4096];
 static volatile int s_stop;
 static http_socket_t s_listen;
+static volatile int s_tls;          /* the server speaks TLS (tls_test_server.h) */
+static volatile int s_tls_conns;    /* connections it took over TLS */
+static volatile int s_tls_hellos;   /* TLS hellos a server without TLS was sent (and dropped) */
+static ps3_tls* s_conn_tls;         /* the connection being served (one server thread) */
+
+static void c_send(http_socket_t c, const char* p, int n)
+{
+    if (s_conn_tls) ps3_tls_send_all(s_conn_tls, p, (size_t)n, 3000);
+    else send(c, p, n, 0);
+}
+
+static int c_recv(http_socket_t c, char* p, int n)
+{
+    return s_conn_tls ? ps3_tls_recv(s_conn_tls, p, (size_t)n, 3000) : recv(c, p, n, 0);
+}
 
 static void reply(http_socket_t c, int status, const char* body)
 {
@@ -88,8 +107,8 @@ static void reply(http_socket_t c, int status, const char* body)
                      "HTTP/1.1 %d X\r\nDate: Sun, 25 Oct 2026 20:00:00 GMT\r\nContent-Type: application/json\r\n"
                      "Content-Length: %u\r\nConnection: close\r\n\r\n",
                      status, (unsigned)strlen(body));
-    send(c, head, n, 0);
-    send(c, body, (int)strlen(body), 0);
+    c_send(c, head, n);
+    c_send(c, body, (int)strlen(body));
 }
 
 static int known(const uint8_t pk[32])
@@ -147,10 +166,11 @@ static void serve_one(http_socket_t c)
     char buf[8192];
     int n = 0;
     for (;;) {
-        int r = recv(c, buf + n, (int)sizeof buf - 1 - n, 0);
+        int r = c_recv(c, buf + n, (int)sizeof buf - 1 - n);
         if (r <= 0) break;
         n += r;
         buf[n] = 0;
+        if ((unsigned char)buf[0] == 0x16) break;   /* a TLS hello */
         char* end = strstr(buf, "\r\n\r\n");
         if (!end) continue;
         const char* cl = strstr(buf, "Content-Length: ");
@@ -160,9 +180,11 @@ static void serve_one(http_socket_t c)
     buf[n] = 0;
     char* body = strstr(buf, "\r\n\r\n");
     body = body ? body + 4 : buf + n;
-    if (s_mode == NOT_OURS) {
+    if (n > 0 && (unsigned char)buf[0] == 0x16) {   /* TLS, which this server doesn't speak: nothing to read */
+        s_tls_hellos++;
+    } else if (s_mode == NOT_OURS) {
         const char* page = "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 9\r\n\r\nnot found";
-        send(c, page, (int)strlen(page), 0);
+        c_send(c, page, (int)strlen(page));
     } else if (!strncmp(buf, "POST /dss/v1/challenge ", 23)) {
         s_challenges++;
         if (s_mode == BUSY_JSON) {
@@ -201,6 +223,8 @@ static void serve_one(http_socket_t c)
         s_games++;
         reply(c, 200, "ok");
     }
+    ps3_tls_close(s_conn_tls);
+    s_conn_tls = NULL;
     si_close(c);
 }
 
@@ -214,6 +238,14 @@ static void* server_main(void* arg)
     while (!s_stop) {
         http_socket_t c = accept(s_listen, NULL, NULL);
         if (c == HTTP_INVALID_SOCKET) break;
+        if (s_tls) {
+            s_conn_tls = tts_accept((intptr_t)c, TTS_OURS, 3000);
+            if (!s_conn_tls) {
+                si_close(c);
+                continue;
+            }
+            s_tls_conns++;
+        }
         serve_one(c);
     }
     return 0;
@@ -241,7 +273,7 @@ static int game_request(u16 port)
     CellHttpTransId t = vm_read32(TRANS);
     int before = s_games;
     s32 r = cellHttpSendRequest(t, NULL, 0, (u32*)(uintptr_t)SENT);
-    for (int i = 0; i < 500 && s_games == before; i++) {   /* the server thread records it */
+    for (int i = 0; i < 500 && s_games == before && r == CELL_OK; i++) {   /* the server thread records it */
 #ifdef _WIN32
         Sleep(10);
 #else
@@ -551,6 +583,52 @@ int main(void)
         ps3_net_players(NULL, 0, NULL, NULL, &seen, line, sizeof line);
         assert(!strcmp(line, "The server could not do that now."));
         s_players = "{\"days\":30,\"players\":[]}";
+    }
+
+    /* Over TLS (ps3emu/ps3_tls.h): the sign-in, the players calls and the
+     * game's requests to that server; checked by name, then by address (the
+     * test certificate has both). A server without TLS then gets no request,
+     * only hellos, and the player hears it once. */
+    {
+        char ca[600];
+        snprintf(ca, sizeof ca, "%s.ca.pem", key);
+        tts_write_ca(ca);
+        env("PS3_NET_CA_FILE", ca);
+        env("PS3_NET_TLS", "dss.test");
+        s_tls = 1;
+        int sessions = s_sessions, conns = s_tls_conns;
+        ps3_net_session_drop();
+        assert(ps3_net_session(tok, sizeof tok, raw) && s_sessions == sessions + 1 && !memcmp(raw, s_issued, 32));
+        assert(s_tls_conns == conns + 2);   /* the challenge and the session */
+        assert(game_request(port) && s_tls_conns == conns + 3);
+        {
+            char want[96];
+            snprintf(want, sizeof want, "\r\nX-DSS-Session: %s\r\n", tok);
+            assert(strstr(s_game_request, want));
+        }
+        unsigned seen = 0;
+        ps3_net_players(NULL, 0, NULL, NULL, &seen, NULL, 0);
+        assert(ps3_net_players_refresh() == 0 && next_list(seen) == PS3_NET_PLAYERS_READY);
+        assert(s_tls_conns == conns + 4);
+
+        env("PS3_NET_TLS", "1");   /* the name is PS3_NET_SIGNIN's host: 127.0.0.1 */
+        ps3_net_session_drop();
+        assert(ps3_net_session(tok, sizeof tok, raw) && s_sessions == sessions + 2);
+
+        s_tls = 0;
+        int challenges = s_challenges, games = s_games, hellos = s_tls_hellos;
+        ps3_net_session_drop();
+        assert(!ps3_net_session(tok, sizeof tok, raw) && s_challenges == challenges);
+        assert(ps3_net_signin_notice(notice, sizeof notice) && strstr(notice, "securely"));
+        assert(!game_request(port) && s_games == games);
+        for (int i = 0; i < 500 && s_tls_hellos < hellos + 2; i++) nap();
+        assert(s_tls_hellos == hellos + 2);
+        assert(!ps3_net_signin_notice(notice, sizeof notice));   /* (once) */
+
+        env("PS3_NET_TLS", "");
+        remove(ca);
+        ps3_net_session_drop();
+        assert(ps3_net_session(tok, sizeof tok, raw));   /* plain again */
     }
 
     /* A refusal: no session, the server's message once, then no new try for a while. */

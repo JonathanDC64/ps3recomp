@@ -110,11 +110,32 @@ jobs:
           .\test_sys_net.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # mbedTLS (third_party/mbedtls) as a static library, once, for the
+      # network tests below: they include ps3_tls.c, the TLS to the online
+      # server.
+      - name: Build mbedTLS for the network tests
+        run: |
+          New-Item -ItemType Directory -Force mbedtls_obj | Out-Null
+          clang-cl /nologo /c /O2 /W0 /D_CRT_SECURE_NO_WARNINGS /I third_party/mbedtls/include /Fo:mbedtls_obj\ (Get-ChildItem third_party/mbedtls/library/*.c).FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          lib /nologo /out:mbedtls.lib (Get-ChildItem mbedtls_obj\*.obj).FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # TLS to the online server (ps3_tls.c) on loopback with test
+      # certificates: the built-in roots, the certificate and name checks,
+      # a server that isn't TLS, timeouts, large transfers.
+      - name: Run the TLS test
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_net_tls.exe libs/network/tests/test_net_tls.c mbedtls.lib ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_tls.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # cellHttp end to end on loopback: guest pointers, the network gate, and
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_http_loopback.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -124,11 +145,11 @@ jobs:
       # what the player is told when psnr refuses co-op.
       - name: Run the sign-in tests
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_net_signin.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_psnr_notice.exe libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_psnr_notice.exe libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_psnr_notice.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -155,7 +176,7 @@ jobs:
       # and PSN's online ID rules.
       - name: Run the player-name test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_identity.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -164,7 +185,7 @@ jobs:
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_np_nat.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }

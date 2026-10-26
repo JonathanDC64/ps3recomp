@@ -14,6 +14,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_resolve */
 #include "ps3emu/ps3_net_signin.h"   /* the session header */
+#include "ps3emu/ps3_tls.h"   /* TLS to that server */
 #include "ps3emu/endian.h"    /* ps3_bswap32 */
 
 /* ---------------------------------------------------------------------------
@@ -94,6 +95,7 @@ typedef struct {
 
     /* Socket and recv state */
     http_socket_t        sock;
+    ps3_tls*             tls;              /* TLS on sock (the sign-in server's, PS3_NET_TLS), or NULL */
     int                  headers_parsed;
     u32                  body_received;
     int                  conn_close;       /* server sent Connection: close */
@@ -158,6 +160,8 @@ static void http_apply_timeout(http_socket_t sock, int send, u32 usec)
 /* Close the socket in a transaction slot if open, reset state. */
 static void http_close_slot_socket(HttpTransSlot* t)
 {
+    ps3_tls_close(t->tls);
+    t->tls = NULL;
     if (t->sock != HTTP_INVALID_SOCKET) {
         http_closesocket(t->sock);
         t->sock = HTTP_INVALID_SOCKET;
@@ -224,9 +228,18 @@ static void http_req_add(char* buf, size_t cap, size_t* len, const char* fmt, ..
     *len = n < 0 ? cap : *len + (size_t)n;
 }
 
-/* Send all bytes on a socket, handling partial sends. Returns 0 on success. */
-static int http_send_all(http_socket_t sock, const char* data, u32 len)
+/* A client timeout (microseconds) for the TLS calls, which wait themselves:
+ * 0 (none set) is a minute. */
+static int http_tls_ms(u32 usec)
 {
+    return usec ? (int)(usec / 1000 ? usec / 1000 : 1) : 60000;
+}
+
+/* Send all bytes on a socket (over tls when set), handling partial sends.
+ * Returns 0 on success. */
+static int http_send_all(http_socket_t sock, ps3_tls* tls, u32 timeout_usec, const char* data, u32 len)
+{
+    if (tls) return ps3_tls_send_all(tls, data, len, http_tls_ms(timeout_usec));
     u32 total = 0;
     while (total < len) {
         int n = send(sock, data + total, (int)(len - total), 0);
@@ -611,6 +624,21 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
 
     printf("[cellHttp]   Connected to %s:%u\n", t->hostname, t->port);
 
+    /* TLS to the sign-in server when PS3_NET_TLS says it speaks it
+     * (ps3emu/ps3_tls.h); then nothing goes to it without. */
+    ps3_tls* tls = NULL;
+    if (ps3_tls_enabled() && ps3_net_signin_server((const uint8_t*)&addr.sin_addr)) {
+        char name[256], why[256] = "no server name (PS3_NET_TLS, PS3_NET_SIGNIN)";
+        if (ps3_tls_server_name(name, sizeof name) == 0)
+            tls = ps3_tls_connect((intptr_t)sock, name, http_tls_ms(c->connect_timeout), why, sizeof why);
+        if (!tls) {
+            printf("[cellHttp]   no secure connection to %s:%u: %s\n", t->hostname, t->port, why);
+            http_closesocket(sock);
+            if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+            return CELL_HTTP_ERROR_CONNECTION_FAILED;
+        }
+    }
+
     /* ---- Format HTTP request ---- */
     char req_buf[4096];
     size_t req_len = 0;
@@ -680,14 +708,16 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         lines_ok = http_one_line(t->custom_headers[i].name) && http_one_line(t->custom_headers[i].value);
     if (req_len >= sizeof req_buf || !lines_ok) {
         printf("[cellHttp]   Request refused: %s\n", lines_ok ? "its headers do not fit" : "a line break in it");
+        ps3_tls_close(tls);
         http_closesocket(sock);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_INVALID_PARAMETER;
     }
 
     /* ---- Send header ---- */
-    if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
+    if (http_send_all(sock, tls, c->send_timeout, req_buf, (u32)req_len) != 0) {
         printf("[cellHttp]   Failed to send request headers\n");
+        ps3_tls_close(tls);
         http_closesocket(sock);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_SEND_FAILED;
@@ -695,19 +725,21 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
 
     /* ---- Send body if provided ---- */
     if (buf && size > 0) {
-        if (http_send_all(sock, GUEST_PTR(buf, const char*), size) != 0) {
+        if (http_send_all(sock, tls, c->send_timeout, GUEST_PTR(buf, const char*), size) != 0) {
             printf("[cellHttp]   Failed to send request body\n");
+            ps3_tls_close(tls);
             http_closesocket(sock);
             if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
             return CELL_HTTP_ERROR_SEND_FAILED;
         }
     }
 
-    printf("[cellHttp]   Request sent (%d header bytes + %u body bytes)\n",
-           (int)req_len, size);
+    printf("[cellHttp]   Request sent (%d header bytes + %u body bytes)%s\n",
+           (int)req_len, size, tls ? " over TLS" : "");
 
     /* Store socket for recv */
     t->sock           = sock;
+    t->tls            = tls;
     t->headers_parsed = 0;
     t->body_received  = 0;
     t->hdr_buf_len    = 0;
@@ -719,6 +751,14 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
         vm_write32((u32)(uintptr_t)sent, (u32)size);
 
     return CELL_OK;
+}
+
+/* recv() on the transaction's connection, over TLS when it has it: bytes,
+ * 0 at its end, < 0 on an error. */
+static int http_recv(HttpTransSlot* t, char* p, int n)
+{
+    if (t->tls) return ps3_tls_recv(t->tls, p, (size_t)n, http_tls_ms(HTTP_CLIENT(t->client)->recv_timeout));
+    return recv(t->sock, p, n, 0);
 }
 
 s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
@@ -752,8 +792,8 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
 
         /* Read until we find \r\n\r\n */
         while (t->hdr_buf_len < HTTP_HDR_BUF_SIZE - 1) {
-            int n = recv(t->sock, t->hdr_buf + t->hdr_buf_len,
-                         (int)(HTTP_HDR_BUF_SIZE - 1 - t->hdr_buf_len), 0);
+            int n = http_recv(t, t->hdr_buf + t->hdr_buf_len,
+                              (int)(HTTP_HDR_BUF_SIZE - 1 - t->hdr_buf_len));
             if (n <= 0) {
                 printf("[cellHttp]   recv() failed during header read (n=%d)\n", n);
                 http_close_slot_socket(t);
@@ -841,7 +881,7 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         /* buf is a guest address (the overflow copy above already translates
          * it); recv() into the raw value wrote to the host address of the same
          * number whenever a body outgrew the header read. */
-        int n = recv(t->sock, GUEST_PTR(buf, char*) + filled, (int)want, 0);
+        int n = http_recv(t, GUEST_PTR(buf, char*) + filled, (int)want);
         if (n < 0) {
             /* Error - if we already have some data, return it */
             if (filled > 0)
@@ -1221,7 +1261,7 @@ s32 cellHttpClientPollConnections(CellHttpClientId clientId, CellHttpTransId* tr
         HttpTransSlot* t = &s_transactions[i];
         if (!t->in_use || t->client != clientId || t->aborted || t->sock == HTTP_INVALID_SOCKET)
             continue;
-        if (t->body_overflow_len > 0) {
+        if (t->body_overflow_len > 0 || (t->tls && ps3_tls_pending(t->tls))) {
             vm_write32((u32)(uintptr_t)transId, i + 1);
             return CELL_OK;
         }
