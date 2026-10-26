@@ -44,6 +44,8 @@ int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t ip[4], uint16_t* port)
 }
 int     np_psnr_p2p_route(const void* b, uint32_t l, const uint8_t ip[4], uint16_t p) { (void)b; (void)l; (void)ip; (void)p; return 0; }
 int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t p) { (void)ip; (void)p; return -2; }
+static uint8_t s_near[4];   /* our address toward psnr, when set */
+int     np_psnr_local_ip(uint8_t ip[4]) { memcpy(ip, s_near, 4); return s_near[0] != 0; }
 
 static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
@@ -128,6 +130,21 @@ int main(void)
     assert(s_reg[0].nid == 0x9C056962u);   /* "socket", as nid_database.py has it */
 
     const uint32_t LOOP = 0x7F000001u;
+
+    /* A local address only in a local setup: with none, a send or a connect
+     * to one is refused before anything goes out. The rest of the test talks
+     * over loopback, so it is one (PS3_NET_LAN=1). */
+    {
+        int32_t u = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        int32_t t = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_STREAM, 0);
+        put_sockaddr(ADDR_B, 0xC0A80101u, 9);   /* 192.168.1.1 */
+        memcpy(vm_base + BUF, "x", 1);
+        assert(call("sendto", u, BUF, 1, 0, ADDR_B, 16) < 0 && errno_cell() == SYS_NET_EHOSTUNREACH);
+        assert(C3("connect", t, ADDR_B, 16) < 0 && errno_cell() == SYS_NET_ECONNREFUSED);
+        assert(C1("socketclose", u) == 0);
+        assert(C1("socketclose", t) == 0);
+    }
+    env("PS3_NET_LAN", "1");
 
     /* UDP: bind A to an ephemeral port, send from B, poll, receive. */
     int32_t a = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);

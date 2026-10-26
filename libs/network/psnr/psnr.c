@@ -276,6 +276,11 @@ void psnr_server_addr(const psnr_client* c, uint8_t ip[4], uint16_t* port)
     *port = c->server_port;
 }
 
+void psnr_local_addr(const psnr_client* c, uint8_t ip[4])
+{
+    memcpy(ip, c->local_ip, 4);
+}
+
 void psnr_probe_packet(const psnr_client* c, uint8_t out[PSNR_UDP_PROBE_LEN])
 {
     memcpy(out, "PSNR", 4);

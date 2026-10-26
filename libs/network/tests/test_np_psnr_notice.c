@@ -3,8 +3,10 @@
  * (ps3_net_signin_notice): that co-op is not available, unless the sign-in
  * itself did not work. Then the sign-in has given its own reason (a ban,
  * maintenance) or, with its server out of reach, stays quiet, and a second
- * notice from co-op would only replace the first before it is shown. A
- * loopback psnr that answers every HELLO with an error. Nothing leaves the PC.
+ * notice from co-op would only replace the first before it is shown. Also:
+ * a run locked offline (developer cheats) ends its open session. A loopback
+ * psnr that answers each HELLO with an error or a welcome. Nothing leaves
+ * the PC.
  *
  *   clang-cl /I include /Fe:test_np_psnr_notice.exe libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_np_psnr_notice libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c -lpthread
@@ -35,6 +37,7 @@ static void env(const char* k, const char* v)
 static sock_t s_listen = BAD_SOCK;
 static uint32_t s_error;
 static int s_hello_len;   /* the last HELLO's body: 30 bytes, 64 with a session */
+static volatile int s_hangups;   /* connections the client has closed */
 
 #ifdef _WIN32
 static DWORD WINAPI psnr_main(LPVOID arg)
@@ -52,14 +55,23 @@ static void* psnr_main(void* arg)
                (k = recv(c, (char*)in + have, (int)sizeof in - have, 0)) > 0)
             have += k;
         if (have >= 7) {
-            uint8_t out[11];
+            uint8_t out[15];
             s_hello_len = psnr_get16(in + 1) - 4;
-            out[0] = PSNR_ERROR;
-            psnr_put16(out + 1, 8);
             memcpy(out + 3, in + 3, 4);   /* the request id */
-            psnr_put32(out + 7, s_error);
-            send(c, (const char*)out, sizeof out, 0);
+            if (s_error) {
+                out[0] = PSNR_ERROR;
+                psnr_put16(out + 1, 8);
+                psnr_put32(out + 7, s_error);
+                send(c, (const char*)out, 11, 0);
+            } else {   /* welcome: user 7, seen from 127.0.0.1 */
+                out[0] = PSNR_HELLO_ACK;
+                psnr_put16(out + 1, 12);
+                psnr_put32(out + 7, 7);
+                memcpy(out + 11, "\x7f\x00\x00\x01", 4);
+                send(c, (const char*)out, 15, 0);
+            }
             while (recv(c, (char*)in, sizeof in, 0) > 0) {}   /* until the client hangs up */
+            s_hangups++;
         }
         sock_close(c);
     }
@@ -142,6 +154,27 @@ int main(void)
     assert(hello(PSNR_E_SIGN_IN) == -1 && psnr_connect_error() == PSNR_E_SIGN_IN && s_hello_len == 30);
     assert(!ps3_net_signin_notice(notice, sizeof notice));
     remove(key);
+
+    /* Locked offline (developer cheats): an open session ends at the next
+     * pump, and no new one starts. Last: the lock lasts the whole run. */
+    env("PS3_NET_SIGNIN", "");
+    env("PS3_NET_KEY_FILE", "");
+    assert(hello(0) == 0 && np_psnr_connected());
+    int hangups = s_hangups;
+    np_psnr_pump();
+    assert(np_psnr_connected());   /* (not locked: still open) */
+    ps3_net_lock_offline();
+    np_psnr_pump();
+    assert(!np_psnr_connected());
+    for (int i = 0; i < 500 && s_hangups == hangups; i++) {   /* the server sees it close */
+#ifdef _WIN32
+        Sleep(10);
+#else
+        usleep(10000);
+#endif
+    }
+    assert(s_hangups == hangups + 1);
+    assert(hello(0) == -1);
 
     printf("test_np_psnr_notice: all passed\n");
     return 0;

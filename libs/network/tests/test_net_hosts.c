@@ -85,11 +85,39 @@ int main(void)
     env("PS3_NET_ONLINE", "0");
     assert(!ps3_net_online() && !*resolve("127.0.0.1"));
 
-    /* Online with no map: the OS resolver, as before. */
+    /* Online with no map: the OS resolver, as before, but a local address
+     * only in a local setup (here PS3_NET_LAN=1). */
     env("PS3_NET_ONLINE", "1");
     assert(ps3_net_online());
+    assert(!*resolve("127.0.0.1") && !*resolve("localhost") && !*resolve("192.168.1.1"));
+    env("PS3_NET_LAN", "1");
     assert(!strcmp(resolve("127.0.0.1"), "127.0.0.1"));
     assert(!strcmp(resolve("localhost"), "127.0.0.1"));
+    env("PS3_NET_LAN", "");
+    assert(!strcmp(resolve("203.0.113.9"), "203.0.113.9"));   /* an internet address: either way */
+
+    /* A map to a server on the internet: an address on the player's own
+     * network that the server hands out is refused; an internet one passes.
+     * psnr on this PC makes it a local setup again. */
+    env("PS3_NET_HOSTS", "game.test=203.0.113.5");
+    assert(!strcmp(resolve("game.test"), "203.0.113.5"));
+    assert(!*resolve("192.168.1.1") && !*resolve("127.0.0.1") && !*resolve("169.254.0.1") && !*resolve("10.0.0.8"));
+    assert(!strcmp(resolve("198.51.100.7"), "198.51.100.7"));
+    {
+        static const uint8_t pub[4] = { 203, 0, 113, 5 }, lan[4] = { 192, 168, 1, 20 }, lan2[4] = { 192, 168, 2, 20 },
+                             me[4] = { 192, 168, 1, 10 }, bcast[4] = { 192, 168, 1, 255 },
+                             p172a[4] = { 172, 31, 0, 1 }, p172b[4] = { 172, 32, 0, 1 },
+                             cgn[4] = { 100, 64, 0, 1 }, notcgn[4] = { 100, 128, 0, 1 }, mcast[4] = { 224, 0, 0, 1 };
+        assert(!ps3_net_ip_local(pub) && ps3_net_ip_local(lan) && ps3_net_ip_local(p172a) && !ps3_net_ip_local(p172b));
+        assert(ps3_net_ip_local(cgn) && !ps3_net_ip_local(notcgn) && ps3_net_ip_local(mcast));
+        assert(ps3_net_ip_allowed(pub, NULL, "test") && !ps3_net_ip_allowed(lan, NULL, "test"));
+        /* A co-op peer beside us on our own network passes; another network's does not. */
+        assert(ps3_net_ip_allowed(lan, me, "test") && !ps3_net_ip_allowed(lan2, me, "test"));
+        assert(!ps3_net_ip_allowed(bcast, me, "test") && !ps3_net_ip_allowed(mcast, me, "test"));
+    }
+    env("PSNR_SERVER", "127.0.0.1:36100");
+    assert(!strcmp(resolve("127.0.0.1"), "127.0.0.1"));
+    env("PSNR_SERVER", "");
 
     /* With a map: listed names go where it says (a literal, or a name that is
      * then resolved), and every other name fails closed -- even one the OS

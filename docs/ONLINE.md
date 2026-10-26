@@ -35,8 +35,11 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_KEY_FILE=path` | Where the install's sign-in key is kept. Made at the first sign-in, and never written over: losing it loses the name on that server. |
 | `PS3_NET_CLIENT_VERSION=x.y.z` | The build's version, for the server's version gate. Default 0.0.0. |
 | `PS3_NET_NETWORK_VERSION=n` | Which builds play together. Default 1. |
+| `PS3_NET_LAN=1` | Allow local addresses (this PC, the home network, link-local) for every server and peer. Without it, a local address is used only when a server this run was pointed at (`PS3_NET_HOSTS`, `PSNR_SERVER`, `PS3_NET_SIGNIN`) is on one itself, or when a co-op peer is on the same /24 as this machine; other local addresses are refused, and the first refusal of each is logged. |
 
 `ps3_net_lock_offline()` (`include/ps3emu/ps3_net.h`) keeps a process offline for good, whatever the variables say later: cellNetCtl, NP, the sys_net host sockets and cellHttp all report no network. A port calls it for sessions that must never reach other players. Called before the title starts, the host sockets are never registered.
+
+Peers: datagrams reach the title only from members of its current psnr room, at the addresses psnr gave them; datagrams that psnr relays are accepted only from the psnr server itself. Addresses the title is handed (by its servers, through DNS or by psnr) follow the local-address rule of `PS3_NET_LAN` above; an address in `PS3_NET_HOSTS` is always used as written.
 
 ## Sign-in
 

@@ -165,6 +165,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_paths libs/filesystem/tests/test_edat_paths.c
           /tmp/test_edat_paths
 
+      # Every guest path passes the same checks before it becomes a host path
+      # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control
+      # characters or Windows device names.
+      - name: Run the guest path test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_vfs_path libs/filesystem/tests/test_vfs_path.c
+          /tmp/test_vfs_path
+
       # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
       # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
       - name: Run the stick conversion test

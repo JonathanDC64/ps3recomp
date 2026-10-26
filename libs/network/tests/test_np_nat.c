@@ -132,9 +132,40 @@ int main(void)
     assert(len == 3 && !memcmp(buf, "hey", 3) && !memcmp(got, sym, 4) && gport == 50000);
 
     /* A relayed datagram from someone we don't know is dropped. */
+    memcpy(got, srv, 4);
+    gport = 36100;
     len = 12;
     memcpy(buf, "PSNR\x03\x00\x00\x00\x63" "who", 12);
     assert(np_psnr_p2p_filter(buf, &len, got, &gport) == 1);
+
+    /* So is one that did not come from the psnr server, though it names a
+     * member. */
+    memcpy(got, cone, 4);
+    gport = 40001;
+    len = 12;
+    memcpy(buf, "PSNR\x03\x00\x00\x00\x0b" "hey", 12);
+    assert(np_psnr_p2p_filter(buf, &len, got, &gport) == 1);
+
+    /* With psnr on, title data comes from the room's members only: an address
+     * none of them has is dropped; a member's from another port passes. */
+    {
+        const uint8_t stranger[4] = { 192, 0, 2, 66 };
+#ifdef _WIN32
+        _putenv_s("PS3_NET_ONLINE", "1");
+        _putenv_s("PSNR_SERVER", "10.99.0.10:36100");
+#else
+        setenv("PS3_NET_ONLINE", "1", 1);
+        setenv("PSNR_SERVER", "10.99.0.10:36100", 1);
+#endif
+        p = 40001;
+        len = 4;
+        memcpy(buf, "game", 4);
+        assert(np_psnr_p2p_filter(buf, &len, (uint8_t*)stranger, &p) == 1);
+        p = 41234;
+        len = 4;
+        memcpy(buf, "game", 4);
+        assert(np_psnr_p2p_filter(buf, &len, (uint8_t*)cone, &p) == 0 && len == 4);
+    }
 
     /* ROUTE: streams to user 11 go through the relay; to 9 they don't. */
     uint8_t route[13] = { 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 11, 1 };
@@ -150,6 +181,18 @@ int main(void)
     sleep_ms(PUNCH_MS + 10);
     nat_tick();
     assert(s_nsent == before);
+
+    /* Members who leave are strangers from then on. */
+    np_psnr_peer_left(9);
+    np_psnr_peer_left(13);
+    p = 40001;
+    len = 4;
+    memcpy(buf, "game", 4);
+    assert(np_psnr_p2p_filter(buf, &len, (uint8_t*)cone, &p) == 1);
+    p = 50000;
+    len = 4;
+    memcpy(buf, "game", 4);
+    assert(np_psnr_p2p_filter(buf, &len, (uint8_t*)sym, &p) == 0);   /* (user 11 is still in the room) */
 
     printf("test_np_nat: all passed\n");
     return 0;

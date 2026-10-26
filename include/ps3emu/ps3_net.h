@@ -37,10 +37,25 @@ int ps3_net_hosts_lookup(const char* map, const char* host, char* addr, size_t c
 
 /* A guest host name to an IPv4 address in network order: offline fails; with
  * PS3_NET_HOSTS set only listed names (and IPv4 literals) resolve; otherwise
- * the OS resolver.
+ * the OS resolver. A name PS3_NET_HOSTS does not map that comes to a local
+ * address fails too, unless ps3_net_ip_allowed allows it.
  * 0 on success, -1 if the name does not resolve. The caller has started
  * Winsock. */
 int ps3_net_resolve(const char* host, uint8_t ip[4]);
+
+/* An IPv4 address (network order) that is not on the internet: this host
+ * (0/8, 127/8), private (10/8, 172.16/12, 192.168/16), link-local
+ * (169.254/16), shared (100.64/10), multicast and above (224/3). */
+int ps3_net_ip_local(const uint8_t ip[4]);
+
+/* The title may reach ip: any internet address; a local one only when the
+ * setup is local -- PS3_NET_LAN=1, or a server this run was pointed at
+ * (PS3_NET_HOSTS's addresses, PSNR_SERVER, PS3_NET_SIGNIN) is on a local
+ * address itself -- or when it is on the same /24 as own (this machine's
+ * address on the way to psnr: a co-op peer on the same network; may be
+ * NULL). So a server cannot aim the title at the player's own network. A
+ * refusal is logged once per address, with `what`. */
+int ps3_net_ip_allowed(const uint8_t ip[4], const uint8_t own[4], const char* what);
 
 #ifdef __cplusplus
 }

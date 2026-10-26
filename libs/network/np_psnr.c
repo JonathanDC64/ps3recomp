@@ -303,6 +303,43 @@ void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)
     s_stream_sink = fn;
 }
 
+/* A room member has this address (any port: a member behind some routers
+ * sends from a port psnr did not see). Under LOCK. */
+static int peer_ip_known(const uint8_t ip[4])
+{
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (s_peers[i].user && !memcmp(s_peers[i].ip, ip, 4)) return 1;
+    return 0;
+}
+
+int np_psnr_local_ip(uint8_t ip[4])
+{
+    LOCK();
+    int have = s_client != NULL;
+    if (have) psnr_local_addr(s_client, ip);
+    UNLOCK();
+    return have;
+}
+
+void np_psnr_peer_left(uint32_t user)
+{
+    if (!user) return;
+    LOCK();
+    struct peer* p = peer_by_user(user);
+    if (p) memset(p, 0, sizeof(*p));
+    UNLOCK();
+}
+
+/* Says so for the first few dropped datagrams only. */
+static void dropped(const char* why, const uint8_t ip[4], uint16_t port)
+{
+    static int said;
+    if (said >= 8) return;
+    said++;
+    printf("[psnr] dropped a datagram from %u.%u.%u.%u:%u: %s%s\n", ip[0], ip[1], ip[2], ip[3], port, why,
+           said == 8 ? " (no more of these lines)" : "");
+}
+
 int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port)
 {
     uint8_t ip[4];
@@ -313,17 +350,33 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
     int drop = 1;
 
     if (!psnr_is_control(buf, *len)) {
+        /* With psnr, P2P traffic comes from the room's members only. */
+        const int rooms = np_psnr_enabled();
         LOCK();
         struct peer* p = peer_at(from_ip, *from_port);
         if (p) p->heard_at = nat_now_ms();   /* the direct path works */
+        const int member = p || peer_ip_known(from_ip);
         UNLOCK();
+        if (rooms && !member) {
+            dropped("not a member of the room", from_ip, *from_port);
+            return 1;
+        }
         return 0;
     }
     if (psnr_relay_unwrap(buf, *len, &from, &payload, &plen)) {
         /* The peer's datagram, through the relay: the title gets it as if
-         * it came from the peer's usual address. */
+         * it came from the peer's usual address. Only psnr itself relays. */
         LOCK();
-        struct peer* p = peer_by_user(from);
+        uint8_t sip[4] = {0};
+        uint16_t sport = 0;
+        if (s_client) psnr_server_addr(s_client, sip, &sport);
+        const int from_server = s_client && sport == *from_port && !memcmp(sip, from_ip, 4);
+        struct peer* p = from_server && from ? peer_by_user(from) : NULL;   /* (user 0 is a free slot) */
+        if (!from_server) {
+            UNLOCK();
+            dropped("a relayed one, not from the psnr server", from_ip, *from_port);
+            return 1;
+        }
         if (p) {
             memmove(buf, payload, plen);
             *len = (uint32_t)plen;
@@ -486,10 +539,13 @@ void np_psnr_pump(void)
         void* user = NULL;
         LOCK();
         if (!s_client) { UNLOCK(); return; }
-        int r = psnr_poll(s_client, &m);
+        /* Locked offline (ps3_net_lock_offline: developer cheats in use): the
+         * session ends here, as if the connection were lost. */
+        const int locked = ps3_net_locked_offline();
+        int r = locked ? -1 : psnr_poll(s_client, &m);
         if (r < 0) {
             /* Gone: fail every outstanding request so no title waits forever. */
-            printf("[psnr] connection lost\n");
+            printf("[psnr] %s\n", locked ? "closed: the network is locked offline" : "connection lost");
             psnr_close(s_client);
             s_client = NULL;
             psnr_msg dead;

@@ -572,10 +572,21 @@ static int32_t p2p_bind_dgram(int32_t s, uint16_t vport)
 
 /* A DGRAM_P2P send: the vport header in front, out of the P2P port (or
  * psnr's relay). Returns the payload's length or a host error. */
+/* The title may send to this address: ps3_net_ip_allowed, with our own
+ * address toward psnr for a co-op peer on the same network. */
+static int reachable(const struct sockaddr_in* a)
+{
+    uint8_t own[4];
+    int have = np_psnr_local_ip(own);
+    return ps3_net_ip_allowed((const uint8_t*)&a->sin_addr, have ? own : NULL, "sys_net");
+}
+
 static int32_t p2p_send_dgram(int32_t s, const void* buf, uint32_t len,
                               const struct sockaddr_in* to, uint16_t to_vport)
 {
     uint8_t small[1536];
+    if (len > P2P_MAX_DGRAM - P2P_HDR) return fail(SYS_NET_EMSGSIZE);   /* (more than one datagram holds) */
+    if (!reachable(to)) return fail(SYS_NET_EHOSTUNREACH);
     uint8_t* f = (len + P2P_HDR <= sizeof(small)) ? small : (uint8_t*)malloc(len + P2P_HDR);
     if (!f) return fail(SYS_NET_ENOMEM);
     memcpy(f, P2P_MAGIC, 4);
@@ -600,6 +611,7 @@ static int32_t p2p_send_dgram(int32_t s, const void* buf, uint32_t len,
 static int32_t p2p_recv_dgram(int32_t s, uint32_t buf_ea, uint32_t len, int32_t flags,
                               uint32_t from_ea, uint32_t fromlen_ea)
 {
+    if (len > P2P_MAX_DGRAM) len = P2P_MAX_DGRAM;   /* (no datagram is longer) */
     uint8_t* tmp = (uint8_t*)malloc(len + P2P_FWD);
     if (!tmp) return fail(SYS_NET_ENOMEM);
     int n;
@@ -804,6 +816,7 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
 
     char ip[16];
     printf("[sys_net] connect(%d, %s:%u)\n", s, ip_str(&a.sin_addr, ip), ntohs(a.sin_port));
+    if (!reachable(&a)) return fail(SYS_NET_ECONNREFUSED);
     if (s_sockets[s].p2p && s_sockets[s].stream) {
         /* A peer that can't take a direct connection (behind its router):
          * the stream goes through psnr's relay, and its socket replaces
@@ -908,6 +921,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (read_sockaddr(EA(to), &a)) return fail(SYS_NET_EINVAL);
     if (p2p_dgram_bound(s))
         return p2p_send_dgram(s, GUEST_PTR(EA(buf), const char*), len, &a, vm_read16(EA(to) + 8));
+    if (!reachable(&a)) return fail(SYS_NET_EHOSTUNREACH);
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */

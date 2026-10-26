@@ -15,6 +15,7 @@
  */
 #include "ps3emu/ppu_lift.h"   /* ppu_context */
 #include "ps3emu/ps3_knob.h"
+#include "ps3emu/vfs_path.h"
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
@@ -97,6 +98,14 @@ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
 {
+    /* Every branch below works on the cleaned path; one that leaves the
+     * virtual file system goes where every file call fails (vfs_path.h). */
+    char clean[1024];
+    if (!ps3_vfs_guest_path(guest, clean, sizeof clean, "cellFs")) {
+        snprintf(out, cap, "%s", PS3_VFS_REFUSED_PATH);
+        return;
+    }
+    guest = clean;
     const char* rel = guest;
     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
