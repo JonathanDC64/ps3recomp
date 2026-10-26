@@ -668,15 +668,15 @@ static void on_push(const psnr_msg* m)
         np_psnr_peer_left(gm->user);
         member_event(c, gm, ROOM_EV_MemberLeft, CAUSE_LEAVE_ACTION);
         *gm = r->m[--r->n];
+        /* The owner left: psnr has handed the room on. As on RPCN, the
+         * members see it only in the member data (the owner flag), with no
+         * RoomOwnerChanged event: titles take the owner's MemberLeft as the
+         * end of the session, and the event told the one left that it now
+         * runs it. */
         if (owner != r->owner) {
-            /* SceNpMatching2RoomOwnerUpdateInfo { u16 prev; u16 new; u8 cause; pad; optData } */
-            rb_t img = {0};
-            u32 o = rb_alloc(&img, 28, 4);
-            rb_16(&img, o, r->owner);
-            rb_16(&img, o + 2, owner);
-            rb_8(&img, o + 4, CAUSE_LEAVE_ACTION);
+            printf("[sceNpMatching2] room %llu: member %u is the owner now\n",
+                   (unsigned long long)r->id, owner);
             r->owner = owner;
-            room_event(c, ROOM_EV_RoomOwnerChanged, &img);
         }
         break;
     }
@@ -1103,9 +1103,9 @@ static void on_joined(void* user, const psnr_msg* m)
         return;
     }
     m2_room* r = &c->room;
-    printf("[sceNpMatching2] %s room %llu as member %u (%d/%u)\n",
+    printf("[sceNpMatching2] %s room %llu as member %u (%d/%u, flags 0x%08X)\n",
            op->event == EV_CreateJoinRoom ? "created" : "joined",
-           (unsigned long long)r->id, r->me, r->n, r->max);
+           (unsigned long long)r->id, r->me, r->n, r->max, r->flags);
     rb_t img = {0};
     u32 o = rb_alloc(&img, 4, 8);
     rb_ptr(&img, o, rb_room_internal(&img, r));
