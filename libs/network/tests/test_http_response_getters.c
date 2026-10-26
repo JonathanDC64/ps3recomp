@@ -1,7 +1,8 @@
 /*
  * test_http_response_getters - cellHttpResponseGetStatusCode,
- * cellHttpResponseGetContentLength, cellHttpResponseGetAllHeaders, and a
- * body larger than the header read through cellHttpRecvResponse.
+ * cellHttpResponseGetContentLength, cellHttpResponseGetAllHeaders, a
+ * body larger than the header read through cellHttpRecvResponse, and a
+ * chunked body (Transfer-Encoding: chunked), good, malformed and cut short.
  *
  * A loopback listener answers each request. The getters are called after
  * cellHttpSendRequest and before the first cellHttpRecvResponse, as titles
@@ -183,6 +184,65 @@ int main(void)
         s32 r = cellHttpResponseGetContentLength(t2, (u64*)(uintptr_t)U64OUT);
         CHECK((u32)r == 0x80710017u, "no Content-Length: 0x%08X (want 0x80710017)", (u32)r);
         cellHttpDestroyTransaction(t2);
+    }
+
+    /* 3: Transfer-Encoding: chunked on a connection that stays open (net/http's answers over 2 KiB). The first
+     * chunk (with an extension) comes with the headers, the rest after they were read: a 3000-byte chunk whose size
+     * line is split across two sends, then the last chunk and a trailer. Read 1000 bytes at a time, it ends by its
+     * framing, not by the connection. */
+    {
+        CellHttpTransId t3;
+        cfd = send_request(&t3);
+        CHECK(cfd >= 0, "request 3 sent and accepted");
+        send_str(cfd, "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\n\r\n"
+                      "1a;part=1\r\nABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+        if (cellHttpResponseGetContentLength) {
+            s32 r = cellHttpResponseGetContentLength(t3, (u64*)(uintptr_t)U64OUT);
+            CHECK((u32)r == 0x80710017u, "chunked: no Content-Length (0x%08X)", (u32)r);
+        }
+        cellHttpRecvResponse(t3, NULL, 0, NULL);
+        send_str(cfd, "B");
+        send_str(cfd, "B8\r\n");
+        send(cfd, body, BODY_LEN, 0);
+        send_str(cfd, "\r\n0\r\nX-Trailer: 1\r\n\r\n");
+        char want[26 + BODY_LEN];
+        memcpy(want, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 26);
+        memcpy(want + 26, body, BODY_LEN);
+        u32 got3 = 0, calls = 0, n = 0;
+        s32 r = CELL_OK;
+        for (; calls < 16; calls++) {
+            u32 ask = sizeof want - got3 < 1000 ? (u32)(sizeof want - got3) : 1000;
+            r = cellHttpRecvResponse(t3, (void*)(uintptr_t)(BODY + got3), ask ? ask : 1000, (u32*)(uintptr_t)U32OUT);
+            n = vm_read32(U32OUT);
+            if (r != CELL_OK || n == 0) break;
+            got3 += n;
+        }
+        CHECK(r == CELL_OK && n == 0 && got3 == sizeof want && memcmp(vm_base + BODY, want, sizeof want) == 0,
+              "chunked body: %u of %u bytes, then the end (r=0x%08X)", got3, (u32)sizeof want, (u32)r);
+        close(cfd);
+        cellHttpDestroyTransaction(t3);
+    }
+
+    /* 4: a chunk size that is not one fails the body. 5: a body cut short gives what came, then fails. */
+    {
+        CellHttpTransId t4;
+        cfd = send_request(&t4);
+        send_str(cfd, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nnot a size\r\n");
+        close(cfd);
+        s32 r = cellHttpRecvResponse(t4, (void*)(uintptr_t)BODY, 100, (u32*)(uintptr_t)U32OUT);
+        CHECK(r == CELL_HTTP_ERROR_RECV_FAILED && vm_read32(U32OUT) == 0, "bad chunk size fails (0x%08X)", (u32)r);
+        cellHttpDestroyTransaction(t4);
+
+        CellHttpTransId t5;
+        cfd = send_request(&t5);
+        send_str(cfd, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc");
+        close(cfd);
+        r = cellHttpRecvResponse(t5, (void*)(uintptr_t)BODY, 100, (u32*)(uintptr_t)U32OUT);
+        u32 n5 = vm_read32(U32OUT);
+        s32 r2 = cellHttpRecvResponse(t5, (void*)(uintptr_t)BODY, 100, (u32*)(uintptr_t)U32OUT);
+        CHECK(r == CELL_OK && n5 == 3 && r2 == CELL_HTTP_ERROR_RECV_FAILED,
+              "cut short: %u bytes, then 0x%08X", n5, (u32)r2);
+        cellHttpDestroyTransaction(t5);
     }
 
     cellHttpDestroyClient(client);
