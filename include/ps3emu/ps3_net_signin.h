@@ -53,6 +53,45 @@ void ps3_net_signin_post_notice(const char* text);
  * the server every 5 minutes. For the host's UI, from its frame hook. */
 int ps3_net_signin_banner(char* out, size_t cap);
 
+/* ---- players met, blocks and reports (the server's docs/social.md) ----
+ * For the host's Players page. Each call returns at once: a thread of their
+ * own talks to the sign-in server, with the session. */
+
+#define PS3_NET_PLAYERS_MAX 100
+
+typedef struct ps3_net_player {
+    char name[20];          /* the online name */
+    char fingerprint[20];   /* their key's: 16 hex digits */
+    char met[12];           /* "help", "invasion", "monk"; "" for one blocked and not met lately */
+    int  host;              /* the meeting was in this player's world (they came in) */
+    long long at;           /* seconds since 1970 UTC: the meeting, or for met "" the block; -1 unknown */
+    int  blocked;           /* this player blocks them */
+    int  reported;          /* this player reported them in the last day */
+    int  reportable;        /* they may be reported now */
+} ps3_net_player;
+
+enum { PS3_NET_PLAYERS_NONE, PS3_NET_PLAYERS_ASKING, PS3_NET_PLAYERS_READY, PS3_NET_PLAYERS_FAILED };
+
+/* Asks the server for the list again. 0, or -1 with no sign-in. */
+int ps3_net_players_refresh(void);
+
+/* The list as last fetched: up to max rows into out, and how many. *state is
+ * a PS3_NET_PLAYERS_* (FAILED: why, for the player, in msg[mcap]), *days how
+ * far back the list goes, *serial counts the answers so far (the host
+ * redraws when it changes). Any pointer may be NULL. */
+int ps3_net_players(ps3_net_player* out, int max, int* state, int* days, unsigned* serial, char* msg, size_t mcap);
+
+/* Blocks (blocked 1) or unblocks a player, or reports one for "cheating",
+ * "name" (an offensive name) or "other"; the list is asked again after. 0
+ * when it is on its way; -1 with no sign-in, a name that is not an online
+ * name, an unknown reason, or another block or report still waiting. */
+int ps3_net_player_block(const char* name, int blocked);
+int ps3_net_player_report(const char* name, const char* reason);
+
+/* The last block's or report's outcome, once: 1 with *ok and a line for the
+ * player in out[cap], else 0. */
+int ps3_net_players_result(int* ok, char* out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

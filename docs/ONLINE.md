@@ -65,6 +65,13 @@ knows a player by a key, not just a name. With `PS3_NET_SIGNIN` and
 - The server's banners (`GET /dss/v1/banners`, no session) are fetched every
   5 minutes by a thread of their own, from the host's first call of
   `ps3_net_signin_banner()`, which hands over each new banner once.
+- The players met lately, blocks and reports (the server's `docs/social.md`)
+  are for the host's own page: `ps3_net_players_refresh()` asks for the list,
+  `ps3_net_player_block()` and `ps3_net_player_report()` send one change, and a
+  thread of their own makes the calls, with the session, one at a time. The host
+  polls `ps3_net_players()` for the list and `ps3_net_players_result()` for the
+  line to show after a block or report. A session the server no longer takes
+  signs in again, once.
 
 ## Two players on one machine
 
