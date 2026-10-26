@@ -107,7 +107,19 @@ typedef struct {
     /* Leftover body bytes that arrived with the header read */
     char*                body_overflow;
     u32                  body_overflow_len;
+
+    /* Transfer-Encoding: chunked: the body is decoded as it is read (http_recv_chunked) */
+    int                  chunked;
+    int                  ch_state;         /* CH_SIZE ... CH_FAILED */
+    u64                  ch_left;          /* bytes left in the current chunk */
+    char                 ch_line[80];      /* the start of the size or trailer line being read */
+    u32                  ch_line_len;      /* that line's length so far */
+    char                 ch_raw[2048];     /* the body as it came, before decoding */
+    u32                  ch_pos, ch_len;
 } HttpTransSlot;
+
+enum { CH_SIZE, CH_DATA, CH_DATA_END, CH_TRAILER, CH_DONE, CH_FAILED };
+#define HTTP_CHUNK_LINE_MAX 4096           /* a size line with its extensions, or a trailer line */
 
 static HttpClientSlot s_clients[CELL_HTTP_MAX_CLIENTS];
 static HttpTransSlot  s_transactions[CELL_HTTP_MAX_TRANSACTIONS];
@@ -176,6 +188,7 @@ static void http_close_slot_socket(HttpTransSlot* t)
         t->body_overflow = NULL;
     }
     t->body_overflow_len = 0;
+    t->chunked = 0;
 }
 
 /* PS3_HTTP_HEADER="Name: value": one more header on every request, for a
@@ -324,6 +337,28 @@ static int http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
         t->content_length_known = 1;
         printf("[cellHttp]   Content-Length: %llu\n",
                (unsigned long long)t->content_length);
+    }
+
+    /* Transfer-Encoding: chunked (net/http sends any answer over 2 KiB so): the body comes in chunks, decoded as it is
+     * read, and a Content-Length beside it does not count (RFC 9112 6.3). Only that header's own line is looked at. */
+    t->chunked = 0;
+    const char* te = http_strcasestr(term_buf, "\ntransfer-encoding:");
+    if (te) {
+        char v[128];
+        const char* eol = strchr(te + 1, '\n');
+        size_t n = eol ? (size_t)(eol - te) : strlen(te);
+        if (n >= sizeof v) n = sizeof v - 1;
+        memcpy(v, te, n);
+        v[n] = '\0';
+        if (http_strcasestr(v, "chunked")) {
+            t->chunked = 1;
+            t->content_length_known = 0;
+            t->ch_state = CH_SIZE;
+            t->ch_left = 0;
+            t->ch_line_len = 0;
+            t->ch_pos = t->ch_len = 0;
+            printf("[cellHttp]   Transfer-Encoding: chunked\n");
+        }
     }
 
     /* Connection: close */
@@ -761,6 +796,100 @@ static int http_recv(HttpTransSlot* t, char* p, int n)
     return recv(t->sock, p, n, 0);
 }
 
+/* The chunked decoder's input: the body bytes that came with the headers, then the connection's. 1 when ch_raw has
+ * some, 0 at the end of the connection, < 0 on an error. */
+static int chunk_fill(HttpTransSlot* t)
+{
+    if (t->ch_pos < t->ch_len) return 1;
+    t->ch_pos = t->ch_len = 0;
+    if (t->body_overflow_len) {
+        u32 n = t->body_overflow_len < sizeof t->ch_raw ? t->body_overflow_len : (u32)sizeof t->ch_raw;
+        memcpy(t->ch_raw, t->body_overflow, n);
+        t->body_overflow_len -= n;
+        memmove(t->body_overflow, t->body_overflow + n, t->body_overflow_len);
+        t->ch_len = n;
+        return 1;
+    }
+    int n = http_recv(t, t->ch_raw, (int)sizeof t->ch_raw);
+    if (n <= 0) return n;
+    t->ch_len = (u32)n;
+    return 1;
+}
+
+/* One line of the chunked framing (a chunk size, the end of a chunk's data, or a trailer), without its CR LF. The
+ * start goes to ch_line; a longer line counts on but is cut there (only a size and its extensions, or a trailer we
+ * skip). 1 when the line is complete; < 0 when the body ended or failed first, or the line runs past
+ * HTTP_CHUNK_LINE_MAX. */
+static int chunk_line(HttpTransSlot* t)
+{
+    for (;;) {
+        int f = chunk_fill(t);
+        if (f <= 0) return f < 0 ? f : -1;
+        char c = t->ch_raw[t->ch_pos++];
+        if (c == '\n') {
+            u32 n = t->ch_line_len < sizeof t->ch_line ? t->ch_line_len : (u32)sizeof t->ch_line - 1;
+            if (n && t->ch_line[n - 1] == '\r') n--;
+            t->ch_line[n] = '\0';
+            t->ch_line_len = 0;
+            return 1;
+        }
+        if (++t->ch_line_len > HTTP_CHUNK_LINE_MAX) return -1;
+        if (t->ch_line_len < sizeof t->ch_line) t->ch_line[t->ch_line_len - 1] = c;
+    }
+}
+
+/* A chunked body into dst, up to size bytes: the chunks' data in order, the framing left out. Stops at the last
+ * chunk and its trailers (then every call gives 0 bytes, the end, as with a Content-Length). A malformed or cut
+ * framing fails the transaction's body. */
+static s32 http_recv_chunked(HttpTransSlot* t, char* dst, u32 size, u32* got)
+{
+    u32 filled = 0;
+    while (filled < size && t->ch_state != CH_DONE && t->ch_state != CH_FAILED) {
+        if (t->ch_state == CH_SIZE) {
+            if (chunk_line(t) <= 0) goto bad;
+            const char* s = t->ch_line;
+            u64 v = 0;
+            int digits = 0;
+            while (*s == ' ' || *s == '\t') s++;
+            for (;; s++, digits++) {
+                int d = (*s >= '0' && *s <= '9') ? *s - '0' : (*s >= 'a' && *s <= 'f') ? *s - 'a' + 10
+                      : (*s >= 'A' && *s <= 'F') ? *s - 'A' + 10 : -1;
+                if (d < 0) break;
+                v = v * 16 + (u64)d;
+                if (v > 0xFFFFFFFFull - t->body_received) goto bad;   /* (body_received is 32-bit) */
+            }
+            while (*s == ' ' || *s == '\t') s++;
+            if (!digits || (*s && *s != ';')) goto bad;
+            t->ch_left = v;
+            t->ch_state = v ? CH_DATA : CH_TRAILER;
+        } else if (t->ch_state == CH_DATA) {
+            if (chunk_fill(t) <= 0) goto bad;
+            u32 n = t->ch_len - t->ch_pos;
+            if (n > t->ch_left) n = (u32)t->ch_left;
+            if (n > size - filled) n = size - filled;
+            memcpy(dst + filled, t->ch_raw + t->ch_pos, n);
+            t->ch_pos += n;
+            t->ch_left -= n;
+            t->body_received += n;
+            filled += n;
+            if (!t->ch_left) t->ch_state = CH_DATA_END;
+        } else if (t->ch_state == CH_DATA_END) {
+            if (chunk_line(t) <= 0 || t->ch_line[0]) goto bad;     /* the CR LF after a chunk's data */
+            t->ch_state = CH_SIZE;
+        } else {                                                 /* CH_TRAILER: lines up to an empty one */
+            if (chunk_line(t) <= 0) goto bad;
+            if (!t->ch_line[0]) t->ch_state = CH_DONE;
+        }
+    }
+    *got = filled;
+    return CELL_OK;
+bad:
+    printf("[cellHttp]   chunked body: malformed or cut short after %u bytes\n", t->body_received);
+    t->ch_state = CH_FAILED;
+    *got = filled;
+    return filled ? CELL_OK : CELL_HTTP_ERROR_RECV_FAILED;
+}
+
 s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
                          u32* received)
 {
@@ -827,6 +956,14 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
     if (!buf || size == 0) {
         if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
         return CELL_OK;
+    }
+
+    if (t->chunked) {
+        u32 got = 0;
+        s32 r = t->ch_state == CH_FAILED ? CELL_HTTP_ERROR_RECV_FAILED
+                                         : http_recv_chunked(t, GUEST_PTR(buf, char*), size, &got);
+        if (received) vm_write32((u32)(uintptr_t)received, got);
+        return r;
     }
 
     /* Check if we've already received all expected body bytes */
