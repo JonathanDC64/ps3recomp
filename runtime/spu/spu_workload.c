@@ -1258,11 +1258,13 @@ static int s_aw_idle_n;
 static void spu_async_run_one(spu_async_job* j)
 {
     spu_async_run(j);
-    /* Nothing on this stack may stay in the lock-line reserver set: the
-     * job's stack-local contexts are gone once it returns. */
+    /* Nothing on this stack may stay in the lock-line reserver set or hold an
+     * MFC slot: the job's stack-local contexts are gone once it returns. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+      extern void spu_mfc_forget_range(uintptr_t, uintptr_t);
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
 }
 
 /* Take an idle worker off the list, or NULL. */
