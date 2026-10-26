@@ -343,6 +343,65 @@ static void test_block_stores(void)
 }
 
 /* ===========================================================================
+ * More reserving contexts than the old 8-slot table held (with g_spu_a and
+ * g_spu_b from the tests above, 22). Demon's Souls has about 19.
+ * ===========================================================================*/
+#define N_MANY 20
+static spu_context g_many[N_MANY];   /* 256 KB of local store each: not on the stack */
+
+static void test_many_contexts(void)
+{
+    const uint32_t LINE_E = 0x00041000u;   /* lines E .. E + 19 * 128, reserved by nobody above */
+    for (int i = 0; i < N_MANY; i++) spu_reset(&g_many[i], 0x100u + (uint32_t)i);
+
+    TEST("twenty contexts on one line all lose it to a PPU store, and all wake");
+    for (int i = 0; i < N_MANY; i++) spu_getllar(&g_many[i], LINE_E);
+    g_wakes = 0;
+    vm_write32(LINE_E + 4, 0xA5A5A5A5u);
+    int lost = 0;
+    for (int i = 0; i < N_MANY; i++)
+        lost += !g_many[i].resv_valid && (g_many[i].event_status & SPU_EVENT_LR);
+    CHECK(lost == N_MANY);
+    CHECK(g_wakes == N_MANY);
+
+    TEST("twenty contexts on twenty lines: a store breaks and wakes only its line's");
+    for (int i = 0; i < N_MANY; i++) {
+        g_many[i].event_status = 0;
+        spu_getllar(&g_many[i], LINE_E + 128u * (uint32_t)i);
+    }
+    g_wakes = 0;
+    vm_write32(LINE_E + 128u * 13 + 8, 1u);
+    int kept = 0;
+    for (int i = 0; i < N_MANY; i++) kept += g_many[i].resv_valid;
+    CHECK(g_many[13].resv_valid == 0);
+    CHECK_EQ_U32(g_many[13].event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(kept == N_MANY - 1);
+    CHECK(g_wakes == 1);
+
+    TEST("the last context to register is woken too");
+    g_wakes = 0;
+    vm_write32(LINE_E + 128u * (N_MANY - 1), 2u);
+    CHECK(g_many[N_MANY - 1].resv_valid == 0);
+    CHECK(g_wakes == 1);
+
+    TEST("a context that unregistered is left alone");
+    spu_coh_unregister(&g_many[7]);
+    g_wakes = 0;
+    vm_write32(LINE_E + 128u * 7, 3u);
+    CHECK(g_many[7].resv_valid == 1);
+    CHECK(g_wakes == 0);
+
+    TEST("a context that takes the freed slot again is woken");
+    spu_getllar(&g_many[7], LINE_E + 128u * 7);
+    g_wakes = 0;
+    vm_write32(LINE_E + 128u * 7, 4u);
+    CHECK(g_many[7].resv_valid == 0);
+    CHECK(g_wakes == 1);
+
+    for (int i = 0; i < N_MANY; i++) spu_coh_unregister(&g_many[i]);
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
 int main(void)
@@ -353,6 +412,7 @@ int main(void)
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    test_many_contexts();
 
     printf("\nSPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);
