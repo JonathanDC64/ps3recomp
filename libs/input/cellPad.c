@@ -681,6 +681,34 @@ static void pad_poll_keyboard(void)
 int cellPad_host_key_down(int vk) { (void)vk; return 0; }   /* (no host input in this build) */
 #endif /* PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2 */
 
+/* PAD_FOCUS_ONLY=1: the user's pads count only while a window of this process
+ * is in front, as its keys always do. Two copies of a title on one machine can
+ * then share one controller: it drives whichever copy is in front. Off by
+ * default, so a pad keeps driving a title in the background. 1 when the pads
+ * are held at rest for that reason now. */
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
+static int pad_background_hold(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("PAD_FOCUS_ONLY", 0) != 0);
+    static int said = 0;
+    if (on && !said) {
+        said = 1;
+        printf("[cellPad] PAD_FOCUS_ONLY: the controllers count only while this window is in front\n");
+        fflush(stdout);
+    }
+    return on && !pad_host_window_focused();
+}
+#else
+static int pad_background_hold(void) { return 0; }
+#endif
+
+/* cellPad.h */
+int cellPad_host_pads_on(void)
+{
+    return !ps3_no_user_input() && !pad_background_hold();
+}
+
 #if PAD_BACKEND_XINPUT
 static void pad_poll_xinput(void)
 {
@@ -1057,7 +1085,7 @@ static void pad_poll_backend(void)
 #if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
     pad_poll_keyboard();
 #endif
-    if (s_host_hold)
+    if (s_host_hold || pad_background_hold())
         for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
             PadHostState* hs = &s_host_state[i];
             const int connected = hs->connected;
@@ -1928,7 +1956,7 @@ static DWORD WINAPI rumble_thread(LPVOID arg)
     unsigned long long sent_at[PAD_MAX_HOST_PORTS] = {0};
     for (;;) {
         const unsigned long long now = pad_now_ms();
-        const int on = rumble_on() && s_pad_initialized && !s_rumble_exit;
+        const int on = rumble_on() && s_pad_initialized && !s_rumble_exit && !pad_background_hold();
         int busy = 0;
         for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
             const long dev = s_rumble_dev[i];
