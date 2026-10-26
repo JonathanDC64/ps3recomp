@@ -12456,6 +12456,8 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
  * on when the PPU's immediate flip landed relative to the walker: whenever
  * Demon's Souls hitched, a frame went out without its post chain and HUD. */
 static int s_fifo_flip_present;
+static u32 s_fifo_flip_req;   /* cellGcm_flip_request_count() at the last flip in the stream */
+static int s_flips_outside;   /* display clears present: the flips are outside the stream */
 
 static int present_at_flip_on(void)
 {
@@ -12468,6 +12470,12 @@ static void d3d12_fifo_flip(void)
 {
     if (!present_at_flip_on() || !s_d3d.initialized) { s_fifo_flip_present = 0; return; }
     s_fifo_flip_present = 1;
+    { extern unsigned cellGcm_flip_request_count(void); s_fifo_flip_req = cellGcm_flip_request_count(); }
+    if (s_flips_outside) {
+        s_flips_outside = 0;
+        static int n = 0;
+        if (n < 10 && ++n) fprintf(stderr, "[D3D12] flips are in the command stream again%c", 10);
+    }
     /* Same display gate as the other presents: offscreen pass work alone
      * keeps accumulating until its composite arrives, unless the batch is
      * full (flip_without_display). */
@@ -12491,7 +12499,23 @@ static void d3d12_fifo_flip(void)
 static void d3d12_clear_display(const float cc[4])
 {
     memcpy(s_d3d.clear_color, cc, 4 * sizeof(float));
-    if (s_fifo_flip_present && present_at_flip_on()) return;   /* the flip ends the frame */
+    /* The flip ends the frame, while the title's flips are in the command
+     * stream. A flip made outside it (an immediate cellGcmSetFlipCommand, or
+     * one with no room in the buffer) never reaches d3d12_fifo_flip, and with
+     * only those nothing would present again: the picture would stop while
+     * the game plays on. From three such flips in a row, display clears end
+     * the frame again, until a flip in the stream arrives. */
+    if (s_fifo_flip_present && present_at_flip_on()) {
+        extern unsigned cellGcm_flip_request_count(void);
+        if (cellGcm_flip_request_count() - s_fifo_flip_req < 3) return;
+        if (!s_flips_outside) {
+            s_flips_outside = 1;
+            static int n = 0;
+            if (n < 10 && ++n)
+                fprintf(stderr, "[D3D12] %u flips outside the command stream since the last one in it:"
+                        " presenting at display clears%c", cellGcm_flip_request_count() - s_fifo_flip_req, 10);
+        }
+    }
 
     /* A DISPLAY clear marks the start of a new visible frame. If a completed
      * frame is still accumulated (the drain gulped across a frame boundary --
