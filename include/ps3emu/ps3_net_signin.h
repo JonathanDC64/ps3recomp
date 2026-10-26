@@ -47,6 +47,12 @@ int ps3_net_signin_notice(char* out, size_t cap);
 /* Queue a message for ps3_net_signin_notice (for psnr's refusals). */
 void ps3_net_signin_post_notice(const char* text);
 
+/* The server's banners (GET /dss/v1/banners on the sign-in server; no
+ * session needed): 1 and the next new one's text in out[cap], else 0. Each
+ * banner comes once. Never blocks: the first call starts a thread that asks
+ * the server every 5 minutes. For the host's UI, from its frame hook. */
+int ps3_net_signin_banner(char* out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

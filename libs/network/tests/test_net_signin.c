@@ -70,7 +70,8 @@ static int      s_challenge_live;
 static uint8_t  s_known[4][32];
 static int      s_nknown;
 static uint8_t  s_issued[32];
-static volatile int s_challenges, s_sessions, s_games;
+static volatile int s_challenges, s_sessions, s_games, s_banner_gets;
+static const char* volatile s_banners = "{\"banners\":[]}";
 static char     s_game_request[4096];
 static volatile int s_stop;
 static http_socket_t s_listen;
@@ -172,6 +173,10 @@ static void serve_one(http_socket_t c)
     } else if (!strncmp(buf, "POST /dss/v1/session ", 21)) {
         s_sessions++;
         session_call(c, body);
+    } else if (!strncmp(buf, "GET /dss/v1/banners ", 20)) {
+        assert(!strstr(buf, "X-DSS-Session"));
+        s_banner_gets++;
+        reply(c, 200, s_banners);
     } else {
         snprintf(s_game_request, sizeof s_game_request, "%s", buf);   /* before the count the test waits on */
         s_games++;
@@ -383,6 +388,7 @@ int main(void)
     env("PS3_NET_ONLINE", "1");
     env("PS3_NET_HOSTS", "game.test=127.0.0.1");
     assert(!ps3_net_signin_enabled() && !ps3_net_session(tok, sizeof tok, raw));
+    assert(!ps3_net_signin_banner(notice, sizeof notice) && !si_banner_started);
     assert(game_request(port) && !strstr(s_game_request, "X-DSS-Session"));
     env("PS3_NET_SIGNIN", addr);
     env("PS3_NET_KEY_FILE", key);
@@ -419,6 +425,23 @@ int main(void)
     assert(ps3_net_session(NULL, 0, raw) && s_challenges == 4 && s_sessions == 4 && s_nknown == 1);
     assert(!ps3_net_signin_notice(notice, sizeof notice));
 
+    /* Banners: each new one once, the oldest first, control characters made
+     * spaces. The ask goes without the session. */
+    si_banner_started = 1;   /* (no thread here: the test asks itself) */
+    assert(!ps3_net_signin_banner(notice, sizeof notice));
+    s_banners = "{\"banners\":[{\"id\":3,\"text\":\"Servers restart at 20:00 UTC.\"},"
+                "{\"id\":4,\"text\":\"Two\\nlines\",\"ends\":\"2026-10-26T20:00:00Z\"}]}";
+    assert(si_banners_fetch() && s_banner_gets == 1);
+    assert(ps3_net_signin_banner(notice, sizeof notice) && !strcmp(notice, "Servers restart at 20:00 UTC."));
+    assert(ps3_net_signin_banner(notice, sizeof notice) && !strcmp(notice, "Two lines"));
+    assert(!ps3_net_signin_banner(notice, sizeof notice));
+    s_banners = "{\"banners\":[{\"id\":4,\"text\":\"Two\\nlines\"},{\"id\":5,\"text\":\"New\"}]}";
+    assert(si_banners_fetch() && s_banner_gets == 2);
+    assert(ps3_net_signin_banner(notice, sizeof notice) && !strcmp(notice, "New"));
+    assert(!ps3_net_signin_banner(notice, sizeof notice));
+    s_banners = "{\"banners\":[]}";
+    assert(si_banners_fetch() && !ps3_net_signin_banner(notice, sizeof notice));
+
     /* A refusal: no session, the server's message once, then no new try for a while. */
     s_mode = BANNED;
     ps3_net_session_drop();
@@ -440,6 +463,7 @@ int main(void)
     s_mode = NOT_OURS;
     ps3_net_session_drop();
     assert(!ps3_net_session(tok, sizeof tok, raw) && !ps3_net_signin_notice(notice, sizeof notice));
+    assert(!si_banners_fetch() && !ps3_net_signin_banner(notice, sizeof notice));
     env("PS3_NET_SIGNIN", "127.0.0.1:1");
     ps3_net_session_drop();
     assert(!ps3_net_session(tok, sizeof tok, raw) && !ps3_net_signin_notice(notice, sizeof notice));
