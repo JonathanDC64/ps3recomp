@@ -10,8 +10,8 @@
  * The getters are declared weak so a build without them still runs and
  * reports them missing (POSIX; on Windows they are plain declarations).
  *
- *   cc -std=gnu17 -I include -o test_http_response_getters libs/network/tests/test_http_response_getters.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
- *   clang-cl /I include /Fe:test_http_response_getters.exe libs/network/tests/test_http_response_getters.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
+ *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_http_response_getters libs/network/tests/test_http_response_getters.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c libmbedtls.a
+ *   clang-cl /I include /I third_party/mbedtls/include /Fe:test_http_response_getters.exe libs/network/tests/test_http_response_getters.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
  * Driven by tools/test_http_response_getters.py.
  */
 #include "../cellHttp.h"
@@ -23,6 +23,7 @@ s32 cellHttpResponseGetAllHeaders(CellHttpTransId, void*, u32*, void*, u32, u32*
 #include "../cellHttp.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"
+#include "../ps3_tls.c"
 
 /* The sign-in's name (np_psnr.c has the real one); the sign-in is off here. */
 const char* np_psnr_online_id(void) { return "PS3Player"; }

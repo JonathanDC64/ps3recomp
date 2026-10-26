@@ -4,6 +4,7 @@
  * them out one at a time.
  */
 #include "psnr.h"
+#include "ps3emu/ps3_tls.h"   /* ps3recomp: the connection over TLS when PS3_NET_TLS is set */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,7 @@ typedef struct node { psnr_msg m; struct node* next; } node;
 
 struct psnr_client {
     sock_t   s;
+    ps3_tls* tls;         /* TLS on s, or NULL */
     uint32_t next_req;
     uint8_t* rx;          /* bytes received, not yet framed */
     size_t   rx_len, rx_cap;
@@ -74,6 +76,11 @@ struct psnr_client {
 
 static int send_all(psnr_client* c, const uint8_t* p, size_t n)
 {
+    if (c->tls) {
+        if (ps3_tls_send_all(c->tls, p, n, 30000) != 0) { c->dead = 1; return -1; }
+        c->last_send = time(NULL);
+        return 0;
+    }
     while (n) {
         int k = send(c->s, (const char*)p, (int)n, 0);
         if (k < 0) {
@@ -110,9 +117,16 @@ static int pump(psnr_client* c)
             c->rx_cap = c->rx_cap ? c->rx_cap * 2 : 8192;
             c->rx = (uint8_t*)realloc(c->rx, c->rx_cap);
         }
-        int k = recv(c->s, (char*)c->rx + c->rx_len, (int)(c->rx_cap - c->rx_len), 0);
-        if (k == 0 || (k < 0 && !WOULD_BLOCK())) { c->dead = 1; break; }
-        if (k < 0) break;
+        int k;
+        if (c->tls) {
+            k = ps3_tls_recv(c->tls, c->rx + c->rx_len, c->rx_cap - c->rx_len, 0);
+            if (k == PS3_TLS_AGAIN) break;
+            if (k <= 0) { c->dead = 1; break; }
+        } else {
+            k = recv(c->s, (char*)c->rx + c->rx_len, (int)(c->rx_cap - c->rx_len), 0);
+            if (k == 0 || (k < 0 && !WOULD_BLOCK())) { c->dead = 1; break; }
+            if (k < 0) break;
+        }
         c->rx_len += (size_t)k;
     }
 
@@ -195,6 +209,7 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     char portstr[8];
     sock_t s = BAD_SOCK;
 
+    s_connect_error = 0;   /* (this attempt's, also when it ends before the HELLO) */
 #ifdef _WIN32
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -224,8 +239,24 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
 #endif
 
+    /* ps3recomp: with PS3_NET_TLS (ps3emu/ps3_tls.h) this connection, which
+     * carries the session, goes over TLS or not at all. The relay streams
+     * (stream_leg) carry players' traffic and stay as they are. */
+    ps3_tls* tls = NULL;
+    if (ps3_tls_enabled()) {
+        char name[256], why[256] = "no server name (PS3_NET_TLS, PS3_NET_SIGNIN)";
+        if (ps3_tls_server_name(name, sizeof name) == 0)
+            tls = ps3_tls_connect((intptr_t)s, name, 5000, why, sizeof why);
+        if (!tls) {
+            printf("[psnr] no secure connection to %s:%u: %s\n", host, (unsigned)port, why);
+            sock_close(s);
+            return NULL;
+        }
+    }
+
     psnr_client* c = (psnr_client*)calloc(1, sizeof(psnr_client));
     c->s = s;
+    c->tls = tls;
     {   /* UDP goes to the same server address and port; the local end is
          * this machine's address on the way to the server, for peers on the
          * same network. */
@@ -421,6 +452,7 @@ void psnr_close(psnr_client* c)
 {
     psnr_msg m;
     if (!c) return;
+    ps3_tls_close(c->tls);
     sock_close(c->s);
     c->dead = 1;
     while (take(c, &m, 0)) psnr_msg_free(&m);

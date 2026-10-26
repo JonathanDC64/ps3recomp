@@ -65,6 +65,7 @@ static pthread_mutex_t si_slock = PTHREAD_MUTEX_INITIALIZER;
 
 #include "ps3emu/ps3_net.h"
 #include "ps3emu/ps3_net_signin.h"
+#include "ps3emu/ps3_tls.h"
 #include "ps3emu/sha256.h"
 #include "../../third_party/monocypher/monocypher.h"
 #include "../../third_party/monocypher/monocypher-ed25519.h"
@@ -450,16 +451,50 @@ static si_sock_t si_dial(const uint8_t ip[4], uint16_t port)
     return s;
 }
 
+static int si_tls_told;   /* (si_slock) the player heard that TLS failed: once a run */
+
+/* All n bytes, over TLS when tls is set. 0, or -1. */
+static int si_send_all(si_sock_t s, ps3_tls* tls, const char* p, size_t n)
+{
+    if (tls) return ps3_tls_send_all(tls, p, n, SI_IO_MS);
+    for (size_t sent = 0; sent < n;) {
+        int k = send(s, p + sent, (int)(n - sent), SI_SEND_FLAGS);
+        if (k <= 0) return -1;
+        sent += (size_t)k;
+    }
+    return 0;
+}
+
 /* POST path with a JSON body (may be ""), or GET it with body NULL, with
- * the session token when session is not NULL. 0 with the status, the body
- * in out[cap] and the Date header (or "") in date[dcap]; -1 if no address
- * answered or the reply is not HTTP. */
+ * the session token when session is not NULL. Over TLS when PS3_NET_TLS
+ * says so (ps3emu/ps3_tls.h), and then never without it. 0 with the status,
+ * the body in out[cap] and the Date header (or "") in date[dcap]; -1 if no
+ * address answered, TLS failed or the reply is not HTTP. */
 static int si_http(const uint8_t ips[SI_MAX_IPS][4], int nips, const char* host, uint16_t port, const char* path,
                    const char* body, int* status, char* out, size_t cap, char* date, size_t dcap, const char* session)
 {
     si_sock_t s = SI_BAD_SOCK;
     for (int i = 0; i < nips && s == SI_BAD_SOCK; i++) s = si_dial(ips[i], port);
     if (s == SI_BAD_SOCK) return -1;
+
+    ps3_tls* tls = NULL;
+    if (ps3_tls_enabled()) {
+        char name[256], why[256] = "no server name (PS3_NET_TLS, PS3_NET_SIGNIN)";
+        if (ps3_tls_server_name(name, sizeof name) == 0)
+            tls = ps3_tls_connect((intptr_t)s, name, SI_CONNECT_MS, why, sizeof why);
+        if (!tls) {
+            printf("[signin] no secure connection to %s:%u: %s\n", host, (unsigned)port, why);
+            SI_LOCK(si_slock);
+            int tell = !si_tls_told;
+            si_tls_told = 1;
+            SI_UNLOCK(si_slock);
+            if (tell)
+                ps3_net_signin_post_notice("Could not connect securely to the online server, so online play is off "
+                                           "for now.");
+            si_close(s);
+            return -1;
+        }
+    }
 
     char head[640], sess[96] = "";
     size_t blen = body ? strlen(body) : 0;
@@ -471,22 +506,21 @@ static int si_http(const uint8_t ips[SI_MAX_IPS][4], int nips, const char* host,
                   : snprintf(head, sizeof head,
                              "GET %s HTTP/1.0\r\nHost: %s:%u\r\nUser-Agent: ps3recomp\r\n%sConnection: close\r\n\r\n",
                              path, host, (unsigned)port, sess);
-    int ok = hl > 0 && hl < (int)sizeof head && send(s, head, hl, SI_SEND_FLAGS) == hl;
+    int ok = hl > 0 && hl < (int)sizeof head && si_send_all(s, tls, head, (size_t)hl) == 0;
     crypto_wipe(sess, sizeof sess);
     crypto_wipe(head, sizeof head);
-    for (size_t sent = 0; ok && sent < blen;) {
-        int n = send(s, body + sent, (int)(blen - sent), SI_SEND_FLAGS);
-        if (n <= 0) ok = 0; else sent += (size_t)n;
-    }
+    if (ok && blen) ok = si_send_all(s, tls, body, blen) == 0;
     char* buf = ok ? (char*)malloc(SI_REPLY_MAX + 1) : NULL;
     size_t got = 0;
     while (buf) {
         if (got == SI_REPLY_MAX) { free(buf); buf = NULL; break; }   /* too big for these replies */
-        int n = recv(s, buf + got, (int)(SI_REPLY_MAX - got), 0);
+        int n = tls ? ps3_tls_recv(tls, buf + got, SI_REPLY_MAX - got, SI_IO_MS)
+                    : recv(s, buf + got, (int)(SI_REPLY_MAX - got), 0);
         if (n < 0) { free(buf); buf = NULL; break; }
         if (n == 0) break;
         got += (size_t)n;
     }
+    ps3_tls_close(tls);
     si_close(s);
     if (!buf) return -1;
     buf[got] = 0;
@@ -821,8 +855,8 @@ static int si_sign_in(time_t now)
         si_renew = si_end - (time_t)(life / 2 < SI_RENEW_BEFORE_SECS ? life / 2 : SI_RENEW_BEFORE_SECS);
         crypto_wipe(raw, sizeof raw);
         crypto_wipe(tok, sizeof tok);
-        printf("[signin] signed in to %s:%u as \"%s\" for %lld minutes%s\n", host, (unsigned)port, name, life / 60,
-               want_work ? " (a new key)" : "");
+        printf("[signin] signed in to %s:%u as \"%s\" for %lld minutes%s%s\n", host, (unsigned)port, name, life / 60,
+               want_work ? " (a new key)" : "", ps3_tls_enabled() ? ", over TLS" : "");
         result = 0;
         break;
     }

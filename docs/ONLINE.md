@@ -33,6 +33,8 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_TRACE=1` | Log every packet sent, and every packet received (not the empty polls). |
 | `PS3_NET_SIGNIN=host[:port]` | Sign in to this server before using it (see "Sign-in" below). Port 18000 by default. Needs `PS3_NET_KEY_FILE` too. |
 | `PS3_NET_KEY_FILE=path` | Where the install's sign-in key is kept. Made at the first sign-in, and never written over: losing it loses the name on that server. |
+| `PS3_NET_TLS=1` | The sign-in server speaks TLS (see "TLS" below), with a certificate for `PS3_NET_SIGNIN`'s host. `PS3_NET_TLS=<name>` checks for `<name>` instead (a test server reached by its address). |
+| `PS3_NET_CA_FILE=path` | With `PS3_NET_TLS`: trust the roots in this PEM file instead of the built-in ones (a test server's own). |
 | `PS3_NET_CLIENT_VERSION=x.y.z` | The build's version, for the server's version gate. Default 0.0.0. |
 | `PS3_NET_NETWORK_VERSION=n` | Which builds play together. Default 1. |
 | `PS3_NET_LAN=1` | Allow local addresses (this PC, the home network, link-local) for every server and peer. Without it, a local address is used only when a server this run was pointed at (`PS3_NET_HOSTS`, `PSNR_SERVER`, `PS3_NET_SIGNIN`) is on one itself, or when a co-op peer is on the same /24 as this machine; other local addresses are refused, and the first refusal of each is logged. |
@@ -73,6 +75,31 @@ knows a player by a key, not just a name. With `PS3_NET_SIGNIN` and
   line to show after a block or report. A session the server no longer takes
   signs in again, once.
 
+## TLS
+
+With `PS3_NET_TLS` (`libs/network/ps3_tls.c`, with mbedTLS 3.6 LTS in
+`third_party/mbedtls`), these go over TLS and check the server's certificate:
+
+- the sign-in's calls (`/dss/v1/*`: challenge, session, banners, players);
+- the title's cellHttp requests to the sign-in server's address (the same
+  requests that carry the session);
+- psnr's connection (HELLO and everything after it).
+
+The certificate must chain to one of the roots built in, Let's Encrypt's four
+(ISRG Root X1 and X2, Root YE and YR), or to `PS3_NET_CA_FILE`'s, and carry the
+server's name; TLS 1.2 is the oldest version taken. The system's own store is
+not used, so the check is the same on every platform.
+
+What can't go over TLS doesn't go: a failed handshake is a failed connection,
+and the reason is logged (`[signin] no secure connection to ...`). The sign-in
+leaves a notice for the host to show once: "Could not connect securely to the
+online server, so online play is off for now." psnr's relay streams and the
+P2P traffic between players stay as they are, as on a PS3 and on RPCS3.
+
+mbedTLS's default configuration has no threads of its own, so every call into
+it is made under one lock. Sockets are non-blocking while TLS runs on them,
+and the waits happen outside the lock.
+
 ## Two players on one machine
 
 ```
@@ -97,6 +124,7 @@ stage starts, and the title drops the peer as "not responding". Set
 | sceNp manager | Reports ONLINE when online with psnr, or online with a player name; fires the manager callback once with that status. |
 | cellNetCtl | Connected only online. The net-start dialog reports `CELL_NET_CTL_ERROR_DIALOG_CANCELED` offline, 0 online. |
 | Sign-in | The key, the challenge and session calls, the session on cellHttp's requests to that server and in psnr's HELLO (see "Sign-in"). |
+| TLS | The sign-in calls, cellHttp's requests to the sign-in server and psnr's connection, with the certificate checked (see "TLS"). |
 | sys_net | P2P sockets map to UDP/TCP on `PS3_NET_P2P_PORT`. Datagram P2P sockets share the port by vport: each datagram carries an 8-byte vport header (`VP01`, destination and source vport), so both peers need a runtime with it. Stream P2P sockets share the port as plain TCP. |
 
 ## How it was verified
@@ -120,7 +148,11 @@ Tests: `libs/network/tests/test_np_matching2.c` covers response relocation,
 attribute packing and the room structures a title reads. `test_sys_net.c`
 covers sockets over loopback, including a P2P bind and receive, two datagram P2P
 sockets on different vports sharing the port, and two P2P stream sockets
-sharing the port with the peer seeing that port on accept.
+sharing the port with the peer seeing that port on accept. `test_net_tls.c`
+covers TLS on loopback with test certificates: the built-in roots, a wrong
+name, an unknown CA, a server without TLS, timeouts and large transfers;
+`test_net_signin.c` and `test_np_psnr_notice.c` run the sign-in, the title's
+requests and psnr over TLS, and against a server that has none.
 
 What it took to get the lobby up, each of which a title will hit:
 - **RoomMemberDataInternal layout.** userInfo is at +4 and memberId at +56,

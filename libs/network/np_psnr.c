@@ -4,6 +4,7 @@
 #include "np_psnr.h"
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_locked_offline */
 #include "ps3emu/ps3_net_signin.h"
+#include "ps3emu/ps3_tls.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,9 +196,9 @@ int np_psnr_connect(const char* comm_id)
     else if (err == PSNR_E_REFUSED)
         ps3_net_signin_post_notice("Co-op is not available right now.");
     if (s_client)
-        printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u%s\n",
+        printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u%s%s\n",
                host, port, np_psnr_online_id(), comm_id, user_id, ip[0], ip[1], ip[2], ip[3],
-               np_psnr_p2p_port(), signed_in ? ", signed in" : "");
+               np_psnr_p2p_port(), signed_in ? ", signed in" : "", ps3_tls_enabled() ? ", over TLS" : "");
     else if (err >= PSNR_E_SIGN_IN && err <= PSNR_E_REFUSED)
         printf("[psnr] %s:%u refused the HELLO (error %d) -- NP stays offline\n", host, port, err);
     else if (err == PSNR_E_NAME_TAKEN)

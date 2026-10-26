@@ -5,13 +5,14 @@
  * and the online switch may be set after main ran (a title's options hook),
  * and ps3_net_lock_offline overrides them all. No server is contacted.
  *
- *   clang-cl /I include /Fe:test_np_signin.exe libs/network/tests/test_np_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_np_signin libs/network/tests/test_np_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
+ *   clang-cl /I include /I third_party/mbedtls/include /Fe:test_np_signin.exe libs/network/tests/test_np_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
+ *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_np_signin libs/network/tests/test_np_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c libmbedtls.a
  */
 #include "../psnr/psnr.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"
+#include "../ps3_tls.c"
 #include "../sceNp.c"
 
 #include <assert.h>
