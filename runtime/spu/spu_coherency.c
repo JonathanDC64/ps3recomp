@@ -23,6 +23,9 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>   /* spu_coh_hint_match */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -275,10 +278,31 @@ void spu_coh_stk_eval(int allow)
     if (allow && __atomic_load_n(&s_coh_stack_resv, __ATOMIC_SEQ_CST)) spu_coh_set_stk(0);
 }
 
-/* The SPU contexts that have reserved a line. Sized to match the MFC engine
- * registry in spu_channels.c, which is the ceiling on live SPU contexts. */
-#define SPU_COH_MAX_CTX 8
+/* The SPU contexts that have reserved a line. A context left out gets no
+ * lock-line wake: its GETLLAR idle wait sleeps the full 2 ms and an Lr event
+ * wait its 10 ms re-poll. With 8 slots Demon's Souls left contexts out all
+ * the time. About 19 of its contexts reserve lines: one per SPURS and
+ * async-worker thread (each job's context is a stack local at the same
+ * address on its thread) and the long-lived ones. In 90 s at the Palace,
+ * 16.7 million GETLLARs came from contexts outside the table, most of them
+ * polling image 7's line 0x477FD980. */
+#define SPU_COH_MAX_CTX 64
 static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
+
+/* Slots [0, s_coh_used) have been claimed at some time, and every walk of the
+ * table stops there, so a walk costs the contexts in use, not the table's
+ * size. Raised (never lowered) by the claim before it writes the slot's hint,
+ * so a notifier that sees the hint (below) also sees the slot in range. */
+static SPU_COH_LINE(int) s_coh_used;
+
+static inline int spu_coh_used(void) { return __atomic_load_n(&s_coh_used.v, __ATOMIC_ACQUIRE); }
+
+static void spu_coh_used_raise(int n)
+{
+    int u = __atomic_load_n(&s_coh_used.v, __ATOMIC_RELAXED);
+    while (u < n && !__atomic_compare_exchange_n(&s_coh_used.v, &u, n, 0,
+                                                 __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {}
+}
 
 /* The line (ea & ~127) each slot's context reserved last, so a notify passes
  * over the contexts whose reservation is on another line without reading
@@ -293,15 +317,53 @@ static spu_context* s_coh_ctxs[SPU_COH_MAX_CTX];
  * notifier holds the line's stripe, so it sees the hint of every reservation
  * it has to break, by the argument that makes it see resv_valid (see
  * spu_coh_notify_write). A hint is never cleared: a stale one names a line
- * whose context then fails the full check, as before. On a cache line of its
- * own, as it changes only when a context moves to another line. */
-typedef uint32_t spu_coh_hint_t[SPU_COH_MAX_CTX];
-static SPU_COH_LINE(spu_coh_hint_t) s_coh_hint;
+ * whose context then fails the full check, as before. 256 bytes on cache
+ * lines of their own, as a hint changes only when a context moves to another
+ * line. */
+typedef struct { uint32_t v[SPU_COH_MAX_CTX]; } spu_coh_hint_t;
+#if defined(_MSC_VER)
+static __declspec(align(64)) spu_coh_hint_t s_coh_hint;
+#else
+static spu_coh_hint_t s_coh_hint __attribute__((aligned(64)));
+#endif
 
 static void spu_coh_hint_set(int i, uint32_t line_ea)
 {
     if (__atomic_load_n(&s_coh_hint.v[i], __ATOMIC_RELAXED) != line_ea)
         __atomic_store_n(&s_coh_hint.v[i], line_ea, __ATOMIC_RELAXED);
+}
+
+/* The slots in [0, n) whose hint is `line`, one bit each. On x86-64 four
+ * hints go to one SSE2 compare, so a notify over Demon's Souls' ~19 used
+ * slots costs fewer instructions than the old loop over eight. The 16-byte
+ * load reads each 4-byte hint whole, and x86 keeps it after the load of
+ * s_coh_used. SPU_COH_HINT=0 in the callers takes every used slot. */
+static inline uint64_t spu_coh_hint_match(uint32_t line, int n)
+{
+    uint64_t m = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    const __m128i want = _mm_set1_epi32((int)line);
+    for (int i = 0; i < n; i += 4) {
+        const __m128i h = _mm_load_si128((const __m128i*)&s_coh_hint.v[i]);
+        m |= (uint64_t)(unsigned)_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(h, want))) << i;
+    }
+    if (n < 64) m &= (1ull << n) - 1;   /* the last group's slots past n */
+#else
+    for (int i = 0; i < n; i++)
+        if (__atomic_load_n(&s_coh_hint.v[i], __ATOMIC_RELAXED) == line) m |= 1ull << i;
+#endif
+    return m;
+}
+
+static inline uint64_t spu_coh_slots(int n) { return n < 64 ? (1ull << n) - 1 : ~0ull; }
+
+static inline int spu_coh_ctz(uint64_t m)
+{
+#if defined(_MSC_VER)
+    unsigned long i; _BitScanForward64(&i, m); return (int)i;
+#else
+    return __builtin_ctzll(m);
+#endif
 }
 
 unsigned long g_spu_lr_raise = 0;
@@ -340,9 +402,11 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * slot registered a context a second time below its own entry. Unregister
      * cleared one; the other dangled once the context's stack was gone, and
      * spu_coh_notify_write faulted on it. The slot found or claimed takes
-     * the line's hint before the caller sets resv_valid. */
+     * the line's hint before the caller sets resv_valid. ctx's own entry is
+     * below s_coh_used, which its own claim raised. */
     const uint32_t line_ea = ea & ~127u;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+    const int used = spu_coh_used();
+    for (int i = 0; i < used; i++)
         if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) {
             spu_coh_hint_set(i, line_ea);
             return;
@@ -355,6 +419,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
             if (__atomic_compare_exchange_n(&s_coh_ctxs[i], &expect, ctx, 0,
                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ||
                 expect == ctx) {
+                spu_coh_used_raise(i + 1);
                 spu_coh_hint_set(i, line_ea);
                 return;
             }
@@ -392,11 +457,12 @@ void spu_coh_unregister(spu_context* ctx)
      * A context only ever enters the table from its own thread's GETLLAR,
      * and this runs on that thread, so a context not in it now cannot be
      * added under us: most jobs never reserve a line and skip the 64 locks. */
+    const int used = spu_coh_used();
     int in = 0;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) if (s_coh_ctxs[i] == ctx) in = 1;
+    for (int i = 0; i < used; i++) if (s_coh_ctxs[i] == ctx) in = 1;
     if (!in) return;
     spu_lockline_lock();
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+    for (int i = 0; i < used; i++)
         if (s_coh_ctxs[i] == ctx) s_coh_ctxs[i] = NULL;
     spu_lockline_unlock();
 }
@@ -410,7 +476,7 @@ void spu_coh_unregister(spu_context* ctx)
 void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 {
     spu_lockline_lock();
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
+    for (int i = 0, used = spu_coh_used(); i < used; i++) {
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
@@ -440,11 +506,28 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
+/* SPU_COH_HINT=0 (live): a notify checks every used slot, not only the ones
+ * whose hint is its line. */
+static int spu_coh_hint_on(void)
+{
+    static int s_hint = -1;
+    PS3_KNOB(s_hint, ps3_env_int("SPU_COH_HINT", 1));
+    return s_hint;
+}
+
+/* The used slots a store to `line` has to look at. The caller holds the
+ * line's stripe (spu_coh_notify_write says why the hints are then enough). */
+static inline uint64_t spu_coh_notify_slots(uint32_t line)
+{
+    const int used = spu_coh_used();
+    return spu_coh_hint_on() ? spu_coh_hint_match(line, used) : spu_coh_slots(used);
+}
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
-        spu_context* c = s_coh_ctxs[i];
+    for (uint64_t m = spu_coh_notify_slots(line); m; m &= m - 1) {
+        spu_context* c = s_coh_ctxs[spu_coh_ctz(m)];
         if (!c || (const void*)c == self) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
@@ -495,11 +578,8 @@ void spu_coh_notify_write(uint32_t ea)
      * store reads as one that landed after it. A reservation whose GETLLAR
      * this store overlaps redoes its read under the stripe and sees the
      * store. SPU_COH_HINT=0 (live) checks every context, as before. */
-    static int s_hint = -1;
-    PS3_KNOB(s_hint, ps3_env_int("SPU_COH_HINT", 1));
-    for (int i = 0; i < SPU_COH_MAX_CTX; i++) {
-        if (s_hint && __atomic_load_n(&s_coh_hint.v[i], __ATOMIC_RELAXED) != line) continue;
-        spu_context* c = s_coh_ctxs[i];
+    for (uint64_t m = spu_coh_notify_slots(line); m; m &= m - 1) {
+        spu_context* c = s_coh_ctxs[spu_coh_ctz(m)];
         if (!c) continue;
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             __atomic_fetch_or(&c->event_status, SPU_EVENT_LR, __ATOMIC_SEQ_CST);   /* the SPU acks without the lock */
