@@ -14,10 +14,13 @@
  *     the RGBA and the ARGB layout;
  *   - the LPCM samples, across the odd splits;
  *   - the end of the stream.
+ * A movie with sound and no picture plays its sound in full: 6 s of it, more
+ * than the reader's 4 s ring, taken as fast as the test can.
  *
  *   test_sail_movie play <dir>        play a movie written to <dir>
  *   test_sail_movie nodecoder <dir>   with PS3RECOMP_FFMPEG=0: a movie with
  *                                     video does not open (it ends at once)
+ *   test_sail_movie sound <dir>       a movie with only an LPCM track
  */
 #include "sail_movie.h"
 
@@ -41,6 +44,7 @@ namespace {
 const int kW = 64, kH = 48;          /* four by three macroblocks */
 const int kFrames = 10;
 const int kAudioFrames = 18 * 256;   /* whole 256-frame pulls, as Demon's Souls' mixer asks */
+const int kSoundOnlyFrames = 1125 * 256;   /* 6 s at 48 kHz */
 const int kLpcmSub = 0x40;
 
 /* Limited-range Y'CbCr: red, green, blue, yellow, cyan, magenta, white, grey. */
@@ -126,10 +130,11 @@ std::vector<uint8_t> pack(uint8_t sid, const uint8_t* payload, size_t n)
     return p;
 }
 
-bool write_movie(const std::string& path)
+/* audio_frames of stereo LPCM, with the video track or without one. */
+bool write_movie(const std::string& path, bool video = true, int audio_frames = kAudioFrames)
 {
-    const std::vector<uint8_t> es = encode();
-    if (es.empty()) return false;
+    const std::vector<uint8_t> es = video ? encode() : std::vector<uint8_t>();
+    if (video && es.empty()) return false;
     std::vector<std::vector<uint8_t>> packs;
 
     /* Video, cut at sizes that have nothing to do with where pictures end
@@ -146,7 +151,7 @@ bool write_movie(const std::string& path)
     /* LPCM: big-endian 16-bit stereo behind the 4-byte sub-stream header,
      * in payloads of odd and even lengths, a pack after every video pack. */
     std::vector<uint8_t> pcm;
-    for (int k = 0; k < kAudioFrames * 2; k++) {
+    for (int k = 0; k < audio_frames * 2; k++) {
         const uint16_t s = (uint16_t)sample(k);
         pcm.push_back((uint8_t)(s >> 8));
         pcm.push_back((uint8_t)s);
@@ -171,13 +176,15 @@ bool write_movie(const std::string& path)
     memcpy(h, "PAMF", 4);
     be32(h + 0x08, 1);                        /* header: one 2048-byte unit */
     be32(h + 0x0C, (unsigned)all.size());     /* data: one unit per pack */
-    h[0x87] = 2;
-    uint8_t* v = h + 0x88;                    /* M2V: 29.97 fps, the exact size */
-    v[0] = 0x02;
-    v[16 + 2] = 4;
-    be16(v + 16 + 12, kW);
-    be16(v + 16 + 14, kH);
-    uint8_t* a = h + 0x88 + 48;               /* LPCM: 2 ch, 48 kHz, 16-bit */
+    h[0x87] = video ? 2 : 1;
+    if (video) {
+        uint8_t* v = h + 0x88;                /* M2V: 29.97 fps, the exact size */
+        v[0] = 0x02;
+        v[16 + 2] = 4;
+        be16(v + 16 + 12, kW);
+        be16(v + 16 + 14, kH);
+    }
+    uint8_t* a = h + 0x88 + (video ? 48 : 0); /* LPCM: 2 ch, 48 kHz, 16-bit */
     a[0] = 0x80;
     a[5] = kLpcmSub;
     a[16 + 2] = 2;
@@ -246,14 +253,56 @@ void play(const std::string& path, int coding)
     printf("%s: %d frames, %d samples\n", name, next, audio_k);
 }
 
+/* No picture: nothing paces the reader but the sound taken. Every sample is
+ * handed out once, in order, and the end comes after the last. */
+void play_sound_only(const std::string& path)
+{
+    SailMovie* m = sail_movie_open(path.c_str(), SAIL_MOVIE_RGBA);
+    CHECK(m, "sound only: the movie did not open");
+    if (!m) return;
+    SailMovieInfo info;
+    sail_movie_info(m, &info);
+    CHECK(info.width == 0 && info.height == 0, "sound only: size %dx%d", info.width, info.height);
+    CHECK(info.channels == 2 && info.rate == 48000, "sound only: audio %d ch at %d", info.channels, info.rate);
+    sail_movie_start(m);
+    /* The sound is taken from a moment later on, as a title's mixer does: a
+     * reader that ran ahead would have dropped the start by then. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::vector<float> pcm(256 * 2);
+    int audio_k = 0, audio_bad = 0, first_bad = -1;
+    bool aeos = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!aeos && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10)) {
+        int e2 = 0;
+        if (sail_movie_audio(m, pcm.data(), 256, 0, &e2) == 256) {
+            for (int i = 0; i < 512; i++, audio_k++)
+                if (pcm[(size_t)i] != sample(audio_k) / 32768.0f && audio_bad++ == 0) first_bad = audio_k;
+        } else if (!e2) {
+            std::this_thread::yield();
+        }
+        aeos = aeos || e2;
+    }
+    int no = -1, veos = 0;
+    sail_movie_video(m, nullptr, 0, &no, &veos);
+    CHECK(aeos, "sound only: the sound never ended");
+    CHECK(veos, "sound only: the stream did not end with its sound");
+    CHECK(audio_k == kSoundOnlyFrames * 2, "sound only: %d samples handed out, %d expected", audio_k,
+          kSoundOnlyFrames * 2);
+    CHECK(audio_bad == 0, "sound only: %d samples differ from the source, the first at %d", audio_bad, first_bad);
+    sail_movie_close(m);
+    printf("sound only: %d samples\n", audio_k);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) { printf("usage: test_sail_movie play|nodecoder <dir>\n"); return 2; }
-    const std::string mode = argv[1], path = std::string(argv[2]) + "/sail_movie_test.pam";
-    if (!write_movie(path)) return 1;
-    if (mode == "play") {
+    if (argc < 3) { printf("usage: test_sail_movie play|nodecoder|sound <dir>\n"); return 2; }
+    const std::string mode = argv[1], path = std::string(argv[2]) + "/sail_movie_test_" + mode + ".pam";
+    if (!write_movie(path, mode != "sound", mode == "sound" ? kSoundOnlyFrames : kAudioFrames)) return 1;
+    if (mode == "sound") {
+        play_sound_only(path);
+    } else if (mode == "play") {
         play(path, SAIL_MOVIE_RGBA);
         play(path, SAIL_MOVIE_ARGB);
     } else if (mode == "nodecoder") {

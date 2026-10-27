@@ -12,7 +12,8 @@
  *   - LPCM (private stream 1, sub-stream 0x40|ch: one id byte, three header
  *     bytes, then 16-bit big-endian interleaved samples) is converted to float
  *     into a ring of a few seconds; if the title stops pulling audio the
- *     oldest samples are dropped rather than stalling the video.
+ *     oldest samples are dropped rather than stalling the video. With no
+ *     picture, the reader waits for the title to take the sound instead.
  * Frame n is due n * fps_den / fps_num seconds after sail_movie_start.
  *
  * Only the decoder differs (video_open, video_feed, video_drain, video_close
@@ -120,7 +121,7 @@ struct SailMovie {
     int         coding = SAIL_MOVIE_ARGB;
     SailMovieInfo info{};
     int         lpcm_sub = -1;          /* private_stream_id of the LPCM track */
-    bool        has_video = false;
+    std::atomic<bool> has_video{false};  /* the reader clears it when no decoder opens */
 
     std::thread th;
     std::atomic<bool> stop{false};
@@ -340,7 +341,7 @@ bool open_decoder(SailMovie* m)
     if (!d.mft) {
         if (unlicensed)
             fprintf(stderr, "[sail_movie] Windows' MPEG-2 decoder needs the free MPEG-2 Video Extension from "
-                    "the Microsoft Store; without it the movies have no picture and end early%c", 10);
+                    "the Microsoft Store; without it the movies have no picture (their sound still plays)%c", 10);
         return false;
     }
     d.mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -672,7 +673,7 @@ void feed_lpcm(SailMovie* m, const uint8_t* p, size_t n)
 {
     const int ch = m->src_ch, out_ch = m->info.channels;
     if (ch <= 0 || ch > 8) return;
-    std::lock_guard<std::mutex> lk(m->mu);
+    std::unique_lock<std::mutex> lk(m->mu);
     const size_t cap = m->aring.size();
     /* The PCM runs on across PES packets: a payload can end in the middle
      * of a sample (odd length), and its other byte opens the next one. Each
@@ -685,6 +686,16 @@ void feed_lpcm(SailMovie* m, const uint8_t* p, size_t n)
         m->a_half = -1;
         if (m->a_fill < ch) continue;
         m->a_fill = 0;
+        /* With no picture (no decoder, or no video track) nothing else paces
+         * the reader, so it waits for the title to take the sound. Dropping
+         * instead read the whole file at once and kept its last 4 s, mostly
+         * the quiet end: each movie ended 4 s in with next to no sound, and
+         * Demon's Souls went from a black advert to a black title and back
+         * (issue #202, "no audio and a black screen after the logos"). */
+        if (!m->has_video) {
+            m->cv.wait(lk, [&] { return m->stop || m->a_cnt + (size_t)out_ch <= cap; });
+            if (m->stop) return;
+        }
         /* Full (the title stopped pulling sound): drop the oldest whole
          * frame -- a single sample would swap the channels from then on. */
         if (m->a_cnt + (size_t)out_ch > cap) {
@@ -839,6 +850,7 @@ extern "C" int sail_movie_audio(SailMovie* m, float* dst, int frames, int big_en
     m->a_rd = (m->a_rd + want) % cap;
     m->a_cnt -= want;
     m->tone_pos += (size_t)frames;
+    if (!m->has_video) m->cv.notify_all();   /* the reader waits for room (feed_lpcm) */
     return frames;
 }
 
