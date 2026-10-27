@@ -1,0 +1,274 @@
+# Makes the FFmpeg download for Windows builds of the runtime: libavcodec with only the MPEG-2 video decoder and
+# its parser, and libavutil, with their headers. The movies (cellSail, and cellVdec's MPEG-2) decode through them
+# when the runtime is built with PS3RECOMP_FFMPEG_RUNTIME; without them, Windows' own decoder needs the Microsoft
+# Store's MPEG-2 Video Extension. Started by hand only: Actions > FFmpeg archive > Run workflow. It never
+# publishes anything: the release must already exist as a draft, and it stays one until the maintainer
+# publishes it.
+#
+#   1. check: the draft release exists and does not have these files yet (fails in seconds on a wrong tag).
+#   2. build (Linux): FFmpeg's release tarball, its size and SHA-256 checked, built with mingw-w64 the way
+#      DemonsSoulsRecomp's host.yml builds it for des_host.exe: the same configure options, LGPL 2.1 or later,
+#      Windows' own threads, GCC's runtime linked in. The DLLs may import only Windows' own DLLs. Packed with the
+#      headers and the licence files as ffmpeg-win64-<FFmpeg version>-<package revision>.zip.
+#   3. smoke (Windows): unpacks the zip, builds libs/codec/ffmpeg_runtime.c and .github/scripts/ffmpeg_smoke.c
+#      with clang-cl against its headers, puts the DLLs beside the test as a game build has them, and opens the
+#      MPEG-2 decoder and parser through ps3_ffmpeg_get(), as the runtime does when a movie starts.
+#   4. upload: the zip, its JSON (size, SHA-256, URL) and FFmpeg's source tarball (LGPL: the source beside the
+#      binaries) to the draft release. The job summary has the size, the SHA-256 and the URL to pin.
+#
+# Actions are pinned by commit SHA.
+name: FFmpeg archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'The draft release to attach to, by its tag name (for example ffmpeg-8.1.3-1)'
+        required: true
+        type: string
+      package_revision:
+        description: 'Our package revision for this FFmpeg version: the 1 in 8.1.3-1'
+        required: true
+        default: '1'
+        type: string
+      upload:
+        description: 'Upload to the draft release (off: build, check and report only)'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-archive-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  # FFmpeg's release tarball of tag n8.1.3 (commit 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7, a signed tag), the
+  # same archive and checks as DemonsSoulsRecomp's host.yml.
+  FFMPEG_VERSION: 8.1.3
+  FFMPEG_SIZE: '11732036'
+  FFMPEG_SHA256: 7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+
+jobs:
+  prepare:
+    name: Inputs and the draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write   # a draft release is only visible to a token that can write
+    outputs:
+      asset: ${{ steps.names.outputs.asset }}
+      asset_json: ${{ steps.names.outputs.asset_json }}
+      source: ${{ steps.names.outputs.source }}
+      version: ${{ steps.names.outputs.version }}
+    steps:
+      - name: Names
+        id: names
+        env:
+          TAG: ${{ inputs.release_tag }}
+          REV: ${{ inputs.package_revision }}
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || { echo "::error::release_tag '$TAG' is not a plain tag name"; exit 1; }
+          [[ "$REV" =~ ^[1-9][0-9]*$ ]] || { echo "::error::package_revision '$REV' must be a whole number from 1"; exit 1; }
+          version="$FFMPEG_VERSION-$REV"
+          {
+            echo "version=$version"
+            echo "asset=ffmpeg-win64-$version.zip"
+            echo "asset_json=ffmpeg-win64-$version.json"
+            echo "source=ffmpeg-$FFMPEG_VERSION.tar.xz"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: The release is a draft without this package
+        if: inputs.upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ steps.names.outputs.asset }}
+          ASSET_JSON: ${{ steps.names.outputs.asset_json }}
+        run: |
+          # gh's own --jq, so the step needs no jq. $TAG passed the check above.
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .draft")
+          if [ -z "$draft" ]; then
+            echo "::error::There is no release for $TAG. Make the draft first: gh release create $TAG --draft --title \"...\" --notes \"...\""
+            exit 1
+          fi
+          if [ "$draft" != "true" ]; then
+            echo "::error::The release for $TAG is published (or there are two). This job only adds to one draft."
+            exit 1
+          fi
+          names=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .assets[].name")
+          for a in "$ASSET" "$ASSET_JSON"; do
+            if printf '%s\n' "$names" | grep -Fxq -- "$a"; then
+              echo "::error::The draft for $TAG already has $a. A changed package needs a new package_revision."
+              exit 1
+            fi
+          done
+
+  build:
+    name: Build and pack (mingw-w64)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-win64
+      ASSET: ${{ needs.prepare.outputs.asset }}
+      ASSET_JSON: ${{ needs.prepare.outputs.asset_json }}
+      SOURCE: ${{ needs.prepare.outputs.source }}
+      PKG_VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Install the cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 nasm zip
+          x86_64-w64-mingw32-gcc-win32 --version | head -n 1
+
+      # host.yml's options: --disable-everything, then the decoder and the parser, for mingw32, with the win32
+      # thread model's compiler.
+      - name: Build FFmpeg
+        run: |
+          mkdir -p dist
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 --retry-all-errors -o "$SOURCE" "https://ffmpeg.org/releases/$SOURCE"
+          [ "$(stat -c %s "$SOURCE")" = "$FFMPEG_SIZE" ] || { echo "::error::$SOURCE has the wrong size"; exit 1; }
+          echo "$FFMPEG_SHA256  $SOURCE" | sha256sum -c -
+          cp "$SOURCE" "$GITHUB_WORKSPACE/dist/"
+          tar xf "$SOURCE"
+          cd "ffmpeg-$FFMPEG_VERSION"
+          opts=(--enable-shared --disable-static --disable-programs --disable-doc --disable-autodetect
+                --disable-network --disable-everything --disable-avdevice --disable-avformat --disable-avfilter
+                --disable-swscale --disable-swresample --enable-decoder=mpeg2video --enable-parser=mpegvideo)
+          cross=(--enable-cross-compile --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32-
+                 --cc=x86_64-w64-mingw32-gcc-win32 --enable-w32threads --extra-ldflags=-static-libgcc)
+          ./configure --prefix="$FFMPEG_DIR" "${opts[@]}" "${cross[@]}" | tee configure.txt
+          grep -qx 'License: LGPL version 2.1 or later' configure.txt \
+            || { echo "::error::FFmpeg is not configured as LGPL 2.1 or later"; exit 1; }
+          make -s -j"$(nproc)"
+          make -s install
+          mkdir -p "$FFMPEG_DIR/share/licenses/ffmpeg"
+          cp COPYING.LGPLv2.1 LICENSE.md CREDITS "$FFMPEG_DIR/share/licenses/ffmpeg/"
+          {
+            echo "FFmpeg $FFMPEG_VERSION, unchanged: libavcodec and libavutil, LGPL 2.1 or later."
+            echo "Source: $SOURCE on this release's page, the same archive as"
+            echo "https://ffmpeg.org/releases/$SOURCE (SHA-256 $FFMPEG_SHA256)."
+            echo "Configured with: ./configure ${opts[*]} ${cross[*]}"
+            echo "You may replace these DLLs with your own build of the same major versions."
+          } > "$FFMPEG_DIR/share/licenses/ffmpeg/README.txt"
+
+      # What players' PCs must have for the DLLs to load: Windows' own DLLs and avutil, nothing else (a
+      # libwinpthread-1.dll or libgcc_s_*.dll here would be missing on every player's PC).
+      - name: What the DLLs import
+        run: |
+          ls -la "$FFMPEG_DIR/bin"
+          bad=0
+          for dll in "$FFMPEG_DIR"/bin/avcodec-*.dll "$FFMPEG_DIR"/bin/avutil-*.dll; do
+            [ -f "$dll" ] || { echo "::error::no $(basename "$dll")"; bad=1; continue; }
+            echo "$(basename "$dll"):"
+            for imp in $(x86_64-w64-mingw32-objdump -p "$dll" | sed -n 's/^[[:space:]]*DLL Name: //p'); do
+              case "${imp,,}" in
+                kernel32.dll|msvcrt.dll|bcrypt.dll|advapi32.dll|user32.dll|avutil-*.dll) echo "  $imp" ;;
+                *) echo "::error::$(basename "$dll") imports $imp, which players do not have"; bad=1 ;;
+              esac
+            done
+          done
+          exit $bad
+
+      # Only what a build needs: the headers, the two DLLs and the licence files (no import libraries: the runtime
+      # opens the DLLs itself). Fixed dates and a sorted list, so the same build packs the same bytes.
+      - name: Pack
+        run: |
+          cd "$FFMPEG_DIR"
+          files=$( { find include -type f; ls bin/avcodec-*.dll bin/avutil-*.dll; find share/licenses/ffmpeg -type f; } | LC_ALL=C sort)
+          printf '%s\n' "$files" | xargs touch -h -d '2026-01-01 00:00:00 UTC'
+          printf '%s\n' "$files" | TZ=UTC zip -X -D -9 -q "$GITHUB_WORKSPACE/dist/$ASSET" -@
+          cd "$GITHUB_WORKSPACE/dist"
+          size=$(stat -c %s "$ASSET")
+          sha=$(sha256sum "$ASSET" | cut -d' ' -f1)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ASSET"
+          printf '{\n  "name": "ffmpeg-win64",\n  "version": "%s",\n  "url": "%s",\n  "size": %s,\n  "sha256": "%s"\n}\n' \
+            "$PKG_VERSION" "$url" "$size" "$sha" > "$ASSET_JSON"
+          cat "$ASSET_JSON"
+          unzip -l "$ASSET"
+          {
+            echo "### $ASSET"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Size | $size bytes |"
+            echo "| SHA-256 | \`$sha\` |"
+            echo "| URL | $url |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-archive
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke:
+    name: The DLLs load on Windows
+    needs: [prepare, build]
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ffmpeg-archive
+          path: dist
+
+      - name: Build and run the check
+        shell: pwsh
+        env:
+          ASSET: ${{ needs.prepare.outputs.asset }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -Path "dist/$env:ASSET" -DestinationPath pkg
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          Copy-Item pkg/bin/*.dll smoke/
+          clang-cl /nologo /W3 /O2 /D_CRT_SECURE_NO_WARNINGS /DPS3RECOMP_FFMPEG_RUNTIME /Ilibs/codec /Ipkg/include `
+            .github/scripts/ffmpeg_smoke.c libs/codec/ffmpeg_runtime.c /Fesmoke/ffmpeg_smoke.exe /Fosmoke/
+          if ($LASTEXITCODE -ne 0) { throw "clang-cl failed" }
+          Push-Location smoke
+          ./ffmpeg_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "the check failed" }
+          Pop-Location
+
+  upload:
+    name: Upload to the draft release
+    needs: [prepare, build, smoke]
+    if: inputs.upload
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # to upload to the draft release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ffmpeg-archive
+          path: dist
+
+      # The source tarball is the same for every package revision of this FFmpeg version, so it goes up once.
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ needs.prepare.outputs.asset }}
+          ASSET_JSON: ${{ needs.prepare.outputs.asset_json }}
+          SOURCE: ${{ needs.prepare.outputs.source }}
+        run: |
+          files=("dist/$ASSET" "dist/$ASSET_JSON")
+          names=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                    --jq ".[] | select(.tag_name == \"$TAG\") | .assets[].name")
+          printf '%s\n' "$names" | grep -Fxq -- "$SOURCE" || files+=("dist/$SOURCE")
+          gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY"
+          echo "Uploaded to the draft $TAG: ${files[*]}" >> "$GITHUB_STEP_SUMMARY"
