@@ -41,6 +41,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -58,7 +59,7 @@
 #include <mfidl.h>
 #include <mftransform.h>
 #include <mferror.h>
-#pragma comment(lib, "mfplat.lib")
+/* (no mfplat.lib: its functions are looked up at run time, mf_load below) */
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #endif
@@ -251,6 +252,47 @@ void queue_frame(SailMovie* m, std::vector<uint8_t> px)
 
 #ifdef SAIL_MOVIE_MF
 
+/* Media Foundation's functions, looked up at run time rather than imported.
+ * Windows' N editions have no Media Foundation unless the Media Feature Pack
+ * is installed, and an import of MFPlat.DLL would stop the whole program
+ * from starting there. Without it, FFmpeg's decoder still shows the movies
+ * when its DLLs are beside the program; otherwise they play their sound
+ * alone. */
+struct MfPlat {
+    decltype(&MFStartup) startup = nullptr;
+    decltype(&MFShutdown) shutdown = nullptr;
+    decltype(&MFTEnumEx) enum_ex = nullptr;
+    decltype(&MFCreateMediaType) create_media_type = nullptr;
+    decltype(&MFCreateSample) create_sample = nullptr;
+    decltype(&MFCreateMemoryBuffer) create_memory_buffer = nullptr;
+};
+MfPlat g_mf;
+
+template <class F> bool mf_find(HMODULE dll, F& fn, const char* name)
+{
+    fn = reinterpret_cast<F>(reinterpret_cast<uintptr_t>(GetProcAddress(dll, name)));
+    return fn != nullptr;
+}
+
+/* Loads mfplat.dll from System32 the first time; false (said once) when
+ * this PC has none. */
+bool mf_load()
+{
+    static const bool loaded = [] {
+        HMODULE dll = LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const bool all = dll && mf_find(dll, g_mf.startup, "MFStartup") &&
+                         mf_find(dll, g_mf.shutdown, "MFShutdown") && mf_find(dll, g_mf.enum_ex, "MFTEnumEx") &&
+                         mf_find(dll, g_mf.create_media_type, "MFCreateMediaType") &&
+                         mf_find(dll, g_mf.create_sample, "MFCreateSample") &&
+                         mf_find(dll, g_mf.create_memory_buffer, "MFCreateMemoryBuffer");
+        if (!all)
+            fprintf(stderr, "[sail_movie] no Media Foundation on this PC (a Windows N edition needs the Media "
+                    "Feature Pack), so no MPEG-2 decoder of Windows' own%c", 10);
+        return all;
+    }();
+    return loaded;
+}
+
 /* Media Foundation's decoder is looked for on the movie's thread (it needs
  * COM there); without one the movie plays its sound alone. */
 bool video_decoder_present() { return true; }
@@ -292,7 +334,7 @@ HRESULT start_decoder(SailMovie* m, IMFActivate* act)
     HRESULT hr = act->ActivateObject(IID_PPV_ARGS(&d.mft));
     if (FAILED(hr)) return hr;
     IMFMediaType* t = nullptr;
-    MFCreateMediaType(&t);
+    g_mf.create_media_type(&t);
     t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_MPEG2);
     MFSetAttributeSize(t, MF_MT_FRAME_SIZE, (UINT32)m->info.width, (UINT32)m->info.height);
@@ -307,13 +349,14 @@ HRESULT start_decoder(SailMovie* m, IMFActivate* act)
 bool open_decoder(SailMovie* m)
 {
     VideoDecoder& d = m->dec;
+    if (!mf_load()) return false;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    g_mf.startup(MF_VERSION, MFSTARTUP_NOSOCKET);
     d.com = true;
     MFT_REGISTER_TYPE_INFO in = { MFMediaType_Video, MFVideoFormat_MPEG2 };
     IMFActivate** acts = nullptr;
     UINT32 n = 0;
-    if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+    if (FAILED(g_mf.enum_ex(MFT_CATEGORY_VIDEO_DECODER,
                          MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
                          &in, nullptr, &acts, &n)) || n == 0) {
         fprintf(stderr, "[sail_movie] no MPEG-2 video decoder on this system%c", 10);
@@ -387,8 +430,8 @@ void pump_output(SailMovie* m)
         IMFSample* mine = nullptr;
         if (!d.provides) {
             IMFMediaBuffer* buf = nullptr;
-            MFCreateSample(&mine);
-            MFCreateMemoryBuffer(d.out_cb ? d.out_cb : (DWORD)(d.out_w * d.out_h * 2), &buf);
+            g_mf.create_sample(&mine);
+            g_mf.create_memory_buffer(d.out_cb ? d.out_cb : (DWORD)(d.out_w * d.out_h * 2), &buf);
             mine->AddBuffer(buf);
             buf->Release();
             ob.pSample = mine;
@@ -415,8 +458,8 @@ void feed_video(SailMovie* m, const uint8_t* p, size_t n)
     if (!d.mft || !n) return;
     IMFSample* s = nullptr;
     IMFMediaBuffer* b = nullptr;
-    MFCreateSample(&s);
-    MFCreateMemoryBuffer((DWORD)n, &b);
+    g_mf.create_sample(&s);
+    g_mf.create_memory_buffer((DWORD)n, &b);
     BYTE* dst = nullptr;
     b->Lock(&dst, nullptr, nullptr);
     memcpy(dst, p, n);
@@ -448,7 +491,7 @@ void close_decoder(SailMovie* m)
     VideoDecoder& d = m->dec;
     release(d.mft);
     if (d.com) {
-        MFShutdown();
+        g_mf.shutdown();
         CoUninitialize();
         d.com = false;
     }
