@@ -57,6 +57,7 @@
  * opens the optional window. Same include style as those two. */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */
 
 #include <dlfcn.h>
 #include <stddef.h>
@@ -1651,6 +1652,7 @@ static void vk_window_open(const char* title)
         vk_window_drop(why);
         return;
     }
+    rsx_window_icon_sdl(s_vk.window);   /* the game's own icon (rsx_window_icon.h) */
     unsigned n = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {

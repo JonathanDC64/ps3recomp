@@ -138,6 +138,7 @@ static float rsx_aspect(void)
 #include <SDL2/SDL_vulkan.h>
 #include <glob.h>
 #endif
+#include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */
 
 /* Paths are joined with '/' on every host (Windows takes it too); one that
  * comes from the host may hold either separator. */
@@ -1013,26 +1014,74 @@ static void dark_title(HWND hwnd)
     if (set_attr) set_attr(hwnd, 20, &on, sizeof on);
 }
 
+/* The game's icon (rsx_window_icon.h) as a size x size icon, or NULL. */
+static HICON game_icon(int size)
+{
+    if (size <= 0 || size > 256) return NULL;
+    uint8_t* rgba = (uint8_t*)malloc((size_t)size * (size_t)size * 4);
+    void* mask_bits = calloc((size_t)((size + 15) / 16 * 2), (size_t)size);   /* 1 bit a pixel, rows of whole WORDs */
+    HICON icon = NULL;
+    if (rgba && mask_bits && rsx_window_icon(size, rgba)) {
+        BITMAPV5HEADER bh = {0};
+        bh.bV5Size = sizeof bh;
+        bh.bV5Width = size;
+        bh.bV5Height = -size;   /* top-down */
+        bh.bV5Planes = 1;
+        bh.bV5BitCount = 32;
+        bh.bV5Compression = BI_BITFIELDS;
+        bh.bV5RedMask = 0x00FF0000;
+        bh.bV5GreenMask = 0x0000FF00;
+        bh.bV5BlueMask = 0x000000FF;
+        bh.bV5AlphaMask = 0xFF000000;
+        void* bits = NULL;
+        HDC dc = GetDC(NULL);
+        HBITMAP color = CreateDIBSection(dc, (BITMAPINFO*)&bh, DIB_RGB_COLORS, &bits, NULL, 0);
+        ReleaseDC(NULL, dc);
+        HBITMAP mask = CreateBitmap(size, size, 1, 1, mask_bits);   /* unused with alpha, but required */
+        if (color && mask && bits) {
+            uint8_t* d = (uint8_t*)bits;
+            for (int k = 0; k < size * size; k++) {   /* RGBA -> BGRA, straight alpha as icons take it */
+                d[4 * k + 0] = rgba[4 * k + 2];
+                d[4 * k + 1] = rgba[4 * k + 1];
+                d[4 * k + 2] = rgba[4 * k + 0];
+                d[4 * k + 3] = rgba[4 * k + 3];
+            }
+            ICONINFO ii = {TRUE, 0, 0, mask, color};
+            icon = CreateIconIndirect(&ii);
+        }
+        if (color) DeleteObject(color);
+        if (mask) DeleteObject(mask);
+    }
+    free(rgba);
+    free(mask_bits);
+    return icon;
+}
+
 /* RSX_MAXIMIZED=1 (default 0; read once, here): the window opens maximized,
  * and the centred size below is the one it restores to. Not with
  * PS3_NO_USER_INPUT=1: a window shown maximized always takes the focus. */
 static HWND create_window(u32 width, u32 height, const char* title)
 {
+    const int dpi = dpi_aware();
     WNDCLASSEXA wc = {0};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = d3d12_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    /* The title's icon when its exe carries one as icon resource 1 (NULL, the
-     * system's default, otherwise). */
+    /* The title's icon when its exe carries one as icon resource 1; when it
+     * has none, the game's own from its ICON0.PNG (rsx_window_icon.h); NULL,
+     * the system's default, without either. */
     wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
     wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    if (!wc.hIcon) {
+        wc.hIcon = game_icon(MulDiv(32, dpi, 96));
+        wc.hIconSm = game_icon(MulDiv(16, dpi, 96));
+    }
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 
-    const int dpi = dpi_aware();
     if (rsx_aspect() > 0.0f) width = (u32)((float)height * rsx_aspect() + 0.5f);   /* the shape the frame is shown at */
     int cw = MulDiv((int)width, dpi, 96), ch = MulDiv((int)height, dpi, 96);
     /* Centred in the primary display's work area, and made smaller (same
@@ -1422,6 +1471,7 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
                                      SDL_WINDOWPOS_CENTERED, cw, ch,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | maximized);
     if (w) SDL_SetWindowMinimumSize(w, 640, 360);   /* below that an overlay's text overlaps */
+    rsx_window_icon_sdl(w);   /* the game's own icon (rsx_window_icon.h) */
     return w;
 }
 
