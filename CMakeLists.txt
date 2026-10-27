@@ -244,8 +244,23 @@ endif()
 # PS3RECOMP_FFMPEG=0 -- keeps the callback-only decoders. FFmpeg stays a
 # separate, user-supplied LGPL library. See libs/codec/ffmpeg_runtime.h.
 option(PS3RECOMP_FFMPEG_RUNTIME "Decode media through FFmpeg loaded at run time (needs the FFmpeg headers)" OFF)
+# On Windows, with the option off, the pinned FFmpeg download turns it on (cmake/ffmpeg_download.cmake): its
+# headers for the build, its DLLs in <build>/ffmpeg-win64/bin for the game to put beside its executable.
+if(WIN32 AND NOT PS3RECOMP_FFMPEG_RUNTIME)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ffmpeg_download.cmake")
+    if(PS3RECOMP_FFMPEG_DOWNLOAD)
+        ps3recomp_ffmpeg_download(_ps3_ff_include _ps3_ff_bin)
+        if(_ps3_ff_include)
+            set(PS3RECOMP_FFMPEG_RUNTIME ON)
+            set(PS3RECOMP_FFMPEG_INCLUDE_DIR "${_ps3_ff_include}")
+            message(STATUS "  FFmpeg:       downloaded; its DLLs are in ${_ps3_ff_bin}")
+        endif()
+    endif()
+endif()
 if(PS3RECOMP_FFMPEG_RUNTIME)
-    find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+    if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
+        find_path(PS3RECOMP_FFMPEG_INCLUDE_DIR libavcodec/avcodec.h)
+    endif()
     if(NOT PS3RECOMP_FFMPEG_INCLUDE_DIR)
         message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
             "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "

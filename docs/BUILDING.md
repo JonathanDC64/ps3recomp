@@ -130,16 +130,32 @@ cmake --install build --prefix /usr/local
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
 | `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
-| `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
+| `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2; cellSail's movies) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded) |
+| `PS3RECOMP_FFMPEG_DOWNLOAD` | `ON` | Windows, with `PS3RECOMP_FFMPEG_RUNTIME` off: download the pinned FFmpeg build and turn it on -- see [FFmpeg](#ffmpeg-run-time-loaded) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
 
-### FFmpeg (run-time loaded, opt-in)
+### FFmpeg (run-time loaded)
 
 ```bash
 # Headers only -- Debian/Ubuntu: libavcodec-dev, Fedora: ffmpeg-free-devel
 cmake -S . -B build -G Ninja -DPS3RECOMP_FFMPEG_RUNTIME=ON
 ```
+
+**On Windows** the build fetches FFmpeg by itself. When `PS3RECOMP_FFMPEG_RUNTIME` is off, the configure step
+downloads the pinned `ffmpeg-win64` zip from this repository's releases (`cmake/ffmpeg_download.cmake`; made by
+`.github/workflows/ffmpeg-archive.yml`). It holds FFmpeg's MPEG-2 video decoder and parser, LGPL 2.1 or later, as
+`avcodec-*.dll` and `avutil-*.dll`, with the headers. The configure step checks the zip's SHA-256, unpacks it to
+`build/ffmpeg-win64`, and turns `PS3RECOMP_FFMPEG_RUNTIME` on. A game build copies `build/ffmpeg-win64/bin/*.dll`
+beside its executable, where the runtime looks for them. The movies then decode through FFmpeg, not through
+Windows' own decoder, which needs the Microsoft Store's MPEG-2 Video Extension. The download happens once per build
+directory, and again when the pin changes. A changed `CMakeLists.txt` makes the next build configure again, so a
+pull followed by a build is enough.
+
+With no network, or a file that doesn't match, the configure step warns and goes on without FFmpeg; configure
+again with a network connection to retry.
+`-DPS3RECOMP_FFMPEG_DOWNLOAD=OFF` never downloads. `-DPS3RECOMP_FFMPEG_URL=<url>` with
+`-DPS3RECOMP_FFMPEG_SHA256=<hex>` takes another copy of the file instead: a mirror, or a `file:///` path offline.
 
 FFmpeg is never linked. The first `cellVdecOpen` loads libavcodec and
 libavutil with `dlopen` / `LoadLibrary` and resolves the few functions the
