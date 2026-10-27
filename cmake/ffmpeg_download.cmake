@@ -16,8 +16,8 @@
 #   -DPS3RECOMP_FFMPEG_SHA256=<hex>        it must have this SHA-256. Empty (the default) means the pin, so a
 #                                          new pin reaches existing build directories.
 
-set(PS3RECOMP_FFMPEG_PIN_URL "")
-set(PS3RECOMP_FFMPEG_PIN_SHA256 "")
+set(PS3RECOMP_FFMPEG_PIN_URL "https://github.com/JonathanDC64/ps3recomp/releases/download/ffmpeg-8.1.3-2/ffmpeg-win64-8.1.3-2.zip")
+set(PS3RECOMP_FFMPEG_PIN_SHA256 "3856b83decd350397329b4b0da79913709b880e14b1f281501394caaf38369ac")
 
 option(PS3RECOMP_FFMPEG_DOWNLOAD "Windows: download the pinned FFmpeg build for the movies when no FFmpeg is given" ON)
 set(PS3RECOMP_FFMPEG_URL "" CACHE STRING "Another FFmpeg download than the pinned one (empty: the pin)")
