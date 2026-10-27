@@ -383,7 +383,7 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 - **RPCS3**: a behavioural reference for HLE modules and syscalls. We read what it does and then write our own. No RPCS3 (GPL) code belongs in this tree.
 - **Direct3D 12 / Metal / Vulkan**: RSX graphics translation. D3D12 is the backend that runs games in this tree today. Metal (macOS) and Vulkan (Linux, opt-in, see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)) run guest shaders on the shared draw engine. CI draws with the headless null backend.
 - **SDL2**: input and audio off Windows. `cellPad` and `cellAudio` always use their SDL2 backends on non-Windows hosts, so SDL2 is required there; on Windows they use XInput and WASAPI. SDL2 does no windowing here; each graphics backend makes its own.
-- **FFmpeg** (optional, loaded at run time): video decode for cellVdec and ATRAC3plus for cellAtrac. It is never linked and never vendored.
+- **FFmpeg** (loaded at run time): video decode for cellVdec and cellSail's movies. It is never linked and never vendored. A Windows build downloads a pinned LGPL build with only the MPEG-2 decoder ([docs/BUILDING.md](docs/BUILDING.md#ffmpeg-run-time-loaded)); elsewhere it is the system's.
 
 ## Contributing
 
