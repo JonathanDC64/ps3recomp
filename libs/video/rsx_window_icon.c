@@ -9,7 +9,22 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-#include "../codec/stb_image.h"   /* declarations only: cellPngDec.c holds STB_IMAGE_IMPLEMENTATION */
+/* A private copy of stb_image's PNG decoder, its functions static: this file
+ * then needs nothing else from the runtime, so a small host that links the
+ * window code (ps3recomp_host) does not also pull cellPngDec.c, which holds
+ * the shared copy, and all that it needs. */
+#define STB_IMAGE_STATIC
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#include "../codec/stb_image.h"
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 /* The whole file (at most 16 MB), or NULL. The path is UTF-8, so on Windows it
  * is opened by its UTF-16 name. */
