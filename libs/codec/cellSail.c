@@ -295,7 +295,14 @@ static u32 sail_scratch(int slot)
  * PS3_SAIL_SKIP=<text>[,<text>...]: never play the movies whose path contains
  * one of the texts, and play the rest (a title's option to skip its opening
  * movie, and only that one). A skipped movie ends as soon as it starts, as
- * with PS3_SAIL_MOVIES=0. */
+ * with PS3_SAIL_MOVIES=0.
+ * PS3_SAIL_SKIP_FIRST=<text>[,<text>...]: the same, but only the first time
+ * each such movie opens in a run; it plays when it opens again. A title can
+ * play one movie in two places: Demon's Souls plays its advert after the
+ * logos and again when the title screen is left idle, and its option to skip
+ * the opening movie means the first. Every open counts, listed or not, so a
+ * list set later (from a settings window) skips nothing that already
+ * played. */
 static int sail_path_listed(const char* path, const char* list)
 {
     while (*list) {
@@ -312,11 +319,38 @@ static int sail_path_listed(const char* path, const char* list)
     return 0;
 }
 
+/* Whether this path has opened before in this run (FNV-1a hashes of the
+ * paths; a run's titles open a handful of movies). */
+static SRWLOCK s_opened_lock = SRWLOCK_INIT;
+
+static int sail_opened_before(const char* path)
+{
+    static unsigned long long opened[64];
+    static int n_opened;
+    unsigned long long h = 14695981039346656037ull;
+    for (const char* p = path; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ull;
+    int before = 0;
+    AcquireSRWLockExclusive(&s_opened_lock);
+    for (int i = 0; i < n_opened && !before; i++) before = opened[i] == h;
+    if (!before) {
+        if (n_opened < 64) opened[n_opened++] = h;
+        else before = 1;   /* (full: count it as seen, so it plays) */
+    }
+    ReleaseSRWLockExclusive(&s_opened_lock);
+    return before;
+}
+
 static int sail_movie_wanted(const char* path)
 {
+    const int again = sail_opened_before(path);
     const char* skip = getenv("PS3_SAIL_SKIP");
     if (skip && *skip && sail_path_listed(path, skip)) {
         printf("[cellSail] PS3_SAIL_SKIP: %s skipped\n", path);
+        return 0;
+    }
+    const char* first = getenv("PS3_SAIL_SKIP_FIRST");
+    if (!again && first && *first && sail_path_listed(path, first)) {
+        printf("[cellSail] PS3_SAIL_SKIP_FIRST: %s skipped (its first play)\n", path);
         return 0;
     }
     const char* e = getenv("PS3_SAIL_MOVIES");
