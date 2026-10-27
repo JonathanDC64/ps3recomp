@@ -128,6 +128,12 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define SMOKE_CMD_SIZE      0x00010000u
 #define SMOKE_CLEAR_ARGB    0xFF204060u
 #define SMOKE_FRAMES        3
+/* How long the guest waits for the backend to present a flip, in ms. The
+ * first present includes the backend's start, which takes seconds on a
+ * software GPU: lavapipe on a loaded runner took about 3 s, the guest's
+ * next flip came first, and the two were shown as one present (the verdict
+ * then counted 1 or 2 of 3). A present ends the wait at once. */
+#define SMOKE_PRESENT_WAIT_MS 15000
 
 /* lv2 syscall numbers (runtime/syscalls/lv2_syscall_table.h). Spelled out
  * because a title has no header of ours: it puts the number in r11. */
@@ -559,8 +565,9 @@ void func_00010000(ppu_context* ctx)
          * thread, and presents the latest one: a guest that flips again in
          * that gap gets two flips shown as one present, which a loaded
          * runner showed. A title does not care; the verdict counts presents,
-         * so wait for this one, bounded like the rest. */
-        for (waited = 0; waited < 2000; waited++) {
+         * so wait for this one (SMOKE_PRESENT_WAIT_MS: the first includes the
+         * backend's start). */
+        for (waited = 0; waited < SMOKE_PRESENT_WAIT_MS; waited++) {
             if (ppu_boot_frames_presented() >= (unsigned)frame + 1u) break;
             smoke_usleep(ctx, 1000);
         }
@@ -602,7 +609,7 @@ void func_00010000(ppu_context* ctx)
      * waits above, so the verdict measures the backend and not the race. */
     {
         int waited;
-        for (waited = 0; waited < 2000; waited++) {
+        for (waited = 0; waited < SMOKE_PRESENT_WAIT_MS; waited++) {
             if (ppu_boot_frames_presented() >= (unsigned)SMOKE_FRAMES) break;
             smoke_usleep(ctx, 1000);
         }
