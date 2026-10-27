@@ -113,6 +113,10 @@ void rsx_d3d12_overlay_tick(void);
 /* For the overlay: ID3D12Device*, ID3D12CommandQueue*, HWND, the swap chain's
  * back buffers (ID3D12Resource*, count, DXGI_FORMAT). NULL / 0 before init. */
 void*    rsx_d3d12_device(void);
+/* 0 while the device works; once it is lost (a driver reset, a removed GPU),
+ * GetDeviceRemovedReason's HRESULT, with the QueryPerformanceCounter value of
+ * when it was seen in *qpc (when qpc is not NULL). */
+long     rsx_d3d12_device_lost(long long* qpc);
 void*    rsx_d3d12_queue(void);
 void*    rsx_d3d12_hwnd(void);
 /* Posts a message to the game window's thread, as PostMessage: the window

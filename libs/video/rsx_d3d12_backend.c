@@ -2216,6 +2216,46 @@ static void display_note(long long now)
  * refresh later instead of being shown for n + 1 refreshes while the next is
  * shown for n - 1. A repaint (game_frame 0: the overlay over a held frame)
  * waits one refresh at most, so the overlay keeps the display's rate. */
+static void dred_report(const char* where);
+
+/* The device is lost when the driver resets the GPU (a TDR: Windows' answer
+ * to a GPU that has not finished its work in about 2 s) or the GPU goes away.
+ * Nothing draws from then on while the game plays on: the picture stays on
+ * its last frame (Demon's Souls issue #205) and the overlay can make no
+ * textures. Every fence reads as done at once, so no wait notices it, and
+ * Present's result was never looked at: the only trace was the overlay's.
+ * Said once, with Windows' reason; rsx_d3d12_device_lost() hands the reason
+ * to the host (its problem report). */
+static volatile LONG s_device_lost;      /* GetDeviceRemovedReason, 0 while the device works */
+static volatile LONG64 s_device_lost_qpc;
+
+static const char* removed_reason_text(HRESULT rr)
+{
+    switch ((unsigned long)rr) {
+    case 0x887A0006ul: return "the GPU stopped responding and the driver was reset (DXGI_ERROR_DEVICE_HUNG)";
+    case 0x887A0005ul: return "the GPU was removed or its driver changed (DXGI_ERROR_DEVICE_REMOVED)";
+    case 0x887A0007ul: return "the device was reset after a bad command (DXGI_ERROR_DEVICE_RESET)";
+    case 0x887A0020ul: return "an internal driver error (DXGI_ERROR_DRIVER_INTERNAL_ERROR)";
+    case 0x8007000Eul: return "the GPU ran out of memory (E_OUTOFMEMORY)";
+    default: return "an unknown reason";
+    }
+}
+
+static void check_device(const char* where)
+{
+    if (s_device_lost || !s_d3d.device) return;
+    const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+    if (rr == S_OK) return;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    InterlockedExchange64(&s_device_lost_qpc, q.QuadPart);
+    if (InterlockedCompareExchange(&s_device_lost, (LONG)rr, 0) != 0) return;
+    fprintf(stderr, "[D3D12] the graphics device was lost (seen at %s): %s, 0x%08lX. Nothing more can be"
+            " drawn, so the picture stays as it is; the game needs a restart. D3D12_DRED=1 on the next run"
+            " says where the GPU was.%c", where, removed_reason_text(rr), (unsigned long)rr, 10);
+    dred_report(where);
+}
+
 static void swap_present(int game_frame)
 {
     static int vsync = -1;
@@ -2226,7 +2266,8 @@ static void swap_present(int game_frame)
     }
     const int tear = !vsync && s_d3d.tearing;
     const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
-    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    const HRESULT hr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (FAILED(hr)) check_device("present");
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     s_last_present_qpc = q.QuadPart;
@@ -3205,7 +3246,9 @@ static void move_to_next_frame(void)
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
-    if (s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence) < s_d3d.fence_values[s_d3d.frame_index]) {
+    const u64 done = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
+    if (done == UINT64_MAX) check_device("frame fence");   /* (what a lost device's fences read) */
+    if (done < s_d3d.fence_values[s_d3d.frame_index]) {
         s_d3d.fence->lpVtbl->SetEventOnCompletion(
             s_d3d.fence, s_d3d.fence_values[s_d3d.frame_index], s_d3d.fence_event);
         if (WaitForSingleObject(s_d3d.fence_event, 2000) == WAIT_TIMEOUT) {
@@ -3214,6 +3257,7 @@ static void move_to_next_frame(void)
                    (unsigned long long)s_d3d.fence_values[s_d3d.frame_index],
                    (unsigned long long)s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence),
                    (long)rr);
+            if (rr != S_OK) check_device("frame fence wait");
         }
     }
 
@@ -15393,6 +15437,11 @@ void rsx_d3d12_set_borderless(int on)
 }
 int      rsx_d3d12_borderless(void)   { return s_borderless; }
 void*    rsx_d3d12_device(void)       { return s_d3d.device; }
+long     rsx_d3d12_device_lost(long long* qpc)
+{
+    if (qpc) *qpc = s_device_lost_qpc;
+    return s_device_lost;
+}
 void*    rsx_d3d12_queue(void)        { return s_d3d.cmd_queue; }
 void*    rsx_d3d12_hwnd(void)         { return s_d3d.hwnd; }
 
@@ -15663,6 +15712,7 @@ void rsx_d3d12_overlay_repaint(int on) { (void)on; }
 void rsx_d3d12_overlay_wake(void) {}
 void rsx_d3d12_overlay_tick(void) {}
 void*    rsx_d3d12_device(void) { return NULL; }
+long     rsx_d3d12_device_lost(long long* qpc) { if (qpc) *qpc = 0; return 0; }
 void*    rsx_d3d12_queue(void) { return NULL; }
 void*    rsx_d3d12_hwnd(void) { return NULL; }
 void     rsx_d3d12_post_message(unsigned msg, unsigned long long wp, long long lp) { (void)msg; (void)wp; (void)lp; }
