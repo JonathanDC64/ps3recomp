@@ -3239,6 +3239,25 @@ static void wait_for_gpu(void)
     }
 }
 
+/* RSX_LOSE_DEVICE_AT_FRAME=<n> (a test): the device is removed on purpose
+ * (ID3D12Device5::RemoveDevice) at the n-th frame, as a driver reset would
+ * lose it, to see what follows: the log line, the host's dialog. Read once. */
+static void lose_device_test(void)
+{
+    static int at = -1, frames = 0;
+    if (at < 0) {
+        const char* e = getenv("RSX_LOSE_DEVICE_AT_FRAME");
+        at = e ? atoi(e) : 0;
+    }
+    if (at <= 0 || ++frames != at) return;
+    ID3D12Device5* d5 = NULL;
+    if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device5, (void**)&d5)) && d5) {
+        fprintf(stderr, "[D3D12] RSX_LOSE_DEVICE_AT_FRAME: removing the device at frame %d%c", frames, 10);
+        d5->lpVtbl->RemoveDevice(d5);
+        d5->lpVtbl->Release(d5);
+    }
+}
+
 static void move_to_next_frame(void)
 {
     u64 current_fence = s_d3d.fence_values[s_d3d.frame_index];
@@ -3246,6 +3265,7 @@ static void move_to_next_frame(void)
 
     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
 
+    lose_device_test();
     const u64 done = s_d3d.fence->lpVtbl->GetCompletedValue(s_d3d.fence);
     if (done == UINT64_MAX) check_device("frame fence");   /* (what a lost device's fences read) */
     if (done < s_d3d.fence_values[s_d3d.frame_index]) {
