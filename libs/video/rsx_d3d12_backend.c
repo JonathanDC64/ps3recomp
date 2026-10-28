@@ -2509,8 +2509,20 @@ static int init_d3d12(u32 width, u32 height)
                                              (void**)&ds)) && ds) {
             ds->lpVtbl->SetAutoBreadcrumbsEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
             ds->lpVtbl->SetPageFaultEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
+            const char* text = "";
+#ifdef _WIN32
+            /* DRED 1.2: keep the strings of the per-draw markers (dred_mark). */
+            ID3D12DeviceRemovedExtendedDataSettings1* ds1 = NULL;
+            text = ", without the draws' markers";
+            if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings1,
+                                                 (void**)&ds1)) && ds1) {
+                ds1->lpVtbl->SetBreadcrumbContextEnablement(ds1, D3D12_DRED_ENABLEMENT_FORCED_ON);
+                ds1->lpVtbl->Release(ds1);
+                text = ", with the draws' markers";
+            }
+#endif
             ds->lpVtbl->Release(ds);
-            printf("[D3D12] DRED enabled\n");
+            printf("[D3D12] DRED enabled%s\n", text);
         } else printf("[D3D12] DRED unavailable\n");
     }
 
@@ -3206,6 +3218,64 @@ static int init_d3d12(u32 width, u32 height)
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
+/* One command list of DRED's history: its op count, and for a list the GPU
+ * had not finished, the ops around the first one not done, what came before
+ * it, and (DRED 1.2) the text of the markers dred_mark put before each draw.
+ * ctx: D3D12_DRED_BREADCRUMB_CONTEXT[nctx], or none. */
+static void dred_list(const void* list, u32 count, const UINT* lastp,
+                      const D3D12_AUTO_BREADCRUMB_OP* hist, const void* ctx, u32 nctx)
+{
+    static const char* nm[] = { "SETMARKER","BEGINEVENT","ENDEVENT","DRAWINSTANCED",
+        "DRAWINDEXEDINSTANCED","EXECUTEINDIRECT","DISPATCH","COPYBUFFERREGION",
+        "COPYTEXTUREREGION","COPYRESOURCE","COPYTILES","RESOLVESUBRESOURCE",
+        "CLEARRENDERTARGETVIEW","CLEARUNORDEREDACCESSVIEW","CLEARDEPTHSTENCILVIEW",
+        "RESOURCEBARRIER" };
+    const u32 last = lastp ? *lastp : 0;
+    fprintf(stderr, "[DRED] list %p: %u ops, last completed %u, %u markers%c",
+            list, count, last, nctx, 10);
+    if (last >= count || !hist) return;   /* list finished */
+    /* The text of op k's marker, if it has one. */
+#ifdef _WIN32
+    const D3D12_DRED_BREADCRUMB_CONTEXT* cx = (const D3D12_DRED_BREADCRUMB_CONTEXT*)ctx;
+#define DRED_TEXT_AT(k, out) do { out = NULL; \
+        for (u32 _i = 0; cx && _i < nctx; _i++) \
+            if (cx[_i].BreadcrumbIndex == (k)) { out = cx[_i].pContextString; break; } } while (0)
+#else
+    (void)ctx;
+#define DRED_TEXT_AT(k, out) (out = NULL)
+#endif
+    u32 draws = 0, clears = 0, copies = 0, barriers = 0;
+    for (u32 k = 0; k < last; k++) {
+        const u32 op = (u32)hist[k];
+        if (op == 3 || op == 4) draws++;
+        else if (op >= 12 && op <= 14) clears++;
+        else if (op >= 7 && op <= 11) copies++;
+        else if (op == 15) barriers++;
+    }
+    fprintf(stderr, "[DRED]   done before it: %u draws, %u clears, %u copies, %u barriers%c",
+            draws, clears, copies, barriers, 10);
+    /* The GPU works on several draws at once: the first one not done is
+     * where it stopped, or a draw or two after it. */
+    const u32 a = last > 16 ? last - 16 : 0, b = last + 24 < count ? last + 24 : count;
+    for (u32 k = a; k < b; k++) {
+        const u32 op = (u32)hist[k];
+        const wchar_t* t;
+        DRED_TEXT_AT(k, t);
+        if (t)
+            fprintf(stderr, "[DRED]   %s%5u %s: %ls%c", k == last ? ">>" : "  ", k,
+                    op < sizeof nm / sizeof nm[0] ? nm[op] : "op", t, 10);
+        else
+            fprintf(stderr, "[DRED]   %s%5u %s (%u)%c", k == last ? ">>" : "  ", k,
+                    op < sizeof nm / sizeof nm[0] ? nm[op] : "op", op, 10);
+    }
+    for (u32 k = last + 1; k-- > 0; ) {   /* the marker of the draw not done */
+        const wchar_t* t;
+        DRED_TEXT_AT(k, t);
+        if (t) { fprintf(stderr, "[DRED] the GPU stopped at or just after: %ls%c", t, 10); break; }
+    }
+#undef DRED_TEXT_AT
+}
+
 /* D3D12_DRED=1: on the first device removal, print the reason, the command
  * history around the last completed breadcrumb, and the page-fault address. */
 static void dred_report(const char* where)
@@ -3221,29 +3291,36 @@ static void dred_report(const char* where)
             &IID_ID3D12DeviceRemovedExtendedData, (void**)&d)) || !d) {
         fprintf(stderr, "[DRED] no DRED interface%c", 10); return;
     }
-    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bo = {0};
-    if (SUCCEEDED(d->lpVtbl->GetAutoBreadcrumbsOutput(d, &bo))) {
-        static const char* nm[] = { "SETMARKER","BEGINEVENT","ENDEVENT","DRAWINSTANCED",
-            "DRAWINDEXEDINSTANCED","EXECUTEINDIRECT","DISPATCH","COPYBUFFERREGION",
-            "COPYTEXTUREREGION","COPYRESOURCE","COPYTILES","RESOLVESUBRESOURCE",
-            "CLEARRENDERTARGETVIEW","CLEARUNORDEREDACCESSVIEW","CLEARDEPTHSTENCILVIEW",
-            "RESOURCEBARRIER" };
-        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bo.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
-            u32 last = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
-            fprintf(stderr, "[DRED] list %p: %u ops, last completed %u%c",
-                    (void*)n->pCommandList, n->BreadcrumbCount, last, 10);
-            if (last >= n->BreadcrumbCount) continue;   /* list finished */
-            u32 a = last > 12 ? last - 12 : 0, b = last + 12 < n->BreadcrumbCount ? last + 12 : n->BreadcrumbCount;
-            for (u32 k = a; k < b; k++) {
-                u32 op = (u32)n->pCommandHistory[k];
-                fprintf(stderr, "[DRED]   %s%5u %s (%u)%c", k == last ? ">>" : "  ", k,
-                        op < sizeof nm / sizeof nm[0] ? nm[op] : "op", op, 10);
+    int listed = 0;
+#ifdef _WIN32
+    {   /* DRED 1.2 has the markers' text too. */
+        ID3D12DeviceRemovedExtendedData1* d1 = NULL;
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 bo1 = {0};
+        if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device,
+                &IID_ID3D12DeviceRemovedExtendedData1, (void**)&d1)) && d1) {
+            if (SUCCEEDED(d1->lpVtbl->GetAutoBreadcrumbsOutput1(d1, &bo1))) {
+                listed = 1;
+                fprintf(stderr, "[DRED] version 1.2 output%c", 10);
+                for (const D3D12_AUTO_BREADCRUMB_NODE1* n = bo1.pHeadAutoBreadcrumbNode; n; n = n->pNext)
+                    dred_list((const void*)n->pCommandList, n->BreadcrumbCount, n->pLastBreadcrumbValue,
+                              n->pCommandHistory, n->pBreadcrumbContexts, n->BreadcrumbContextsCount);
             }
+            d1->lpVtbl->Release(d1);
         }
+    }
+#endif
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bo = {0};
+    if (!listed && SUCCEEDED(d->lpVtbl->GetAutoBreadcrumbsOutput(d, &bo))) {
+        for (const D3D12_AUTO_BREADCRUMB_NODE* n = bo.pHeadAutoBreadcrumbNode; n; n = n->pNext)
+            dred_list((const void*)n->pCommandList, n->BreadcrumbCount, n->pLastBreadcrumbValue,
+                      n->pCommandHistory, NULL, 0);
     }
     D3D12_DRED_PAGE_FAULT_OUTPUT po = {0};
     if (SUCCEEDED(d->lpVtbl->GetPageFaultAllocationOutput(d, &po))) {
-        fprintf(stderr, "[DRED] page fault VA 0x%llX%c", (unsigned long long)po.PageFaultVA, 10);
+        if (po.PageFaultVA)
+            fprintf(stderr, "[DRED] page fault VA 0x%llX%c", (unsigned long long)po.PageFaultVA, 10);
+        else
+            fprintf(stderr, "[DRED] page fault VA 0x0 (none recorded)%c", 10);
         for (const D3D12_DRED_ALLOCATION_NODE* a = po.pHeadExistingAllocationNode; a; a = a->pNext)
             fprintf(stderr, "[DRED]   existing alloc type %d %s%c", (int)a->AllocationType,
                     a->ObjectNameA ? a->ObjectNameA : "", 10);
@@ -3287,6 +3364,27 @@ static void wait_for_gpu(void)
                 break;
         }
     }
+}
+
+/* RSX_HANG_GPU_AT_FRAME=<n> (a test): the first indexed draw of the n-th
+ * batch is drawn over and over, about 4G vertices in all, so the GPU takes
+ * far longer than Windows' 2 s and the driver resets it, as it does for a
+ * GPU that hangs; then D3D12_DRED=1 shows what it says of a real hang (a
+ * removed device, as RSX_LOSE_DEVICE_AT_FRAME makes, has no command
+ * history). It resets the adapter: run it on a GPU no display needs
+ * (CELLMARK_IGPU=1). Read once. */
+static UINT hang_test_instances(u32 index_count)
+{
+    static int at = -1, fired = 0;
+    if (at < 0) {
+        const char* e = getenv("RSX_HANG_GPU_AT_FRAME");
+        at = e ? atoi(e) : 0;
+    }
+    if (at <= 0 || fired || s_rf_serial < (u32)at) return 1;
+    fired = 1;
+    const UINT n = 0xFFFFFFFFu / (index_count ? index_count : 1u);
+    fprintf(stderr, "[D3D12] RSX_HANG_GPU_AT_FRAME: a draw %u times over in batch %u%c", n, s_rf_serial, 10);
+    return n;
 }
 
 /* RSX_LOSE_DEVICE_AT_FRAME=<n> (a test): the device is removed on purpose
@@ -7642,6 +7740,66 @@ static u32 late_fp_sum(const D3D12DrawRecord* dr)
     u32 usz;
     return fp_hash_at(foff, &usz) | 1u;
 }
+
+#ifdef _WIN32
+/* D3D12_DRED=1: a marker before each draw. DRED 1.2 keeps its text with the
+ * command history, so dred_report can name the draw the GPU stopped on: its
+ * record, its two programs (the pipeline index's fingerprints, which match
+ * the game's own shader files), its target, depth surface and size, and its
+ * first texture. */
+static u64 dred_fp64(u32 fp_addr)
+{
+    extern uint8_t* vm_base;
+    extern u32 cellGcmResolveLocated(int, u32);
+    extern u64 rsx_fp_code_hash64(const u8*, u32);
+    static struct { u32 off, h; u64 h64; } memo[256];
+    if (!fp_addr) return 0;
+    const u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
+    if (off == 0xFFFFFFFFu) return 0;
+    u32 usz;
+    const u32 h = fp_hash_at(off, &usz);   /* memoized; the 64-bit hash is not */
+    const u32 b = ((off >> 4) * 2654435761u) >> 24;
+    if (memo[b].off != off || memo[b].h != h) {
+        memo[b].off = off; memo[b].h = h;
+        memo[b].h64 = rsx_fp_code_hash64(vm_base + off, RSX_FP_MAX_BYTES);
+    }
+    return memo[b].h64;
+}
+static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecord* dr)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("D3D12_DRED") ? 1 : 0;
+    if (!on) return;
+    const u64 vp = (dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[dr->vs_idx].code64 : 0;
+    char a[256];
+    int n = snprintf(a, sizeof a,
+        "draw %u vp %016llx fp %016llx rt %08X %ux%u z %08X %s %u%s tex0 %08X %ux%u fmt %02X",
+        d, (unsigned long long)vp, (unsigned long long)dred_fp64(dr->fp_addr),
+        dr->rt_off, dr->rt_w, dr->rt_h, dr->zeta,
+        dr->index_count ? "indices" : "vertices",
+        dr->index_count ? dr->index_count : dr->vertex_count, dr->fetch ? " fetch" : "",
+        dr->tex[0].off, dr->tex[0].w, dr->tex[0].h, dr->tex[0].fmt);
+    if (n < 0) return;
+    if (n >= (int)sizeof a) n = (int)sizeof a - 1;
+    /* DRED keeps the text of a marker in the form WinPixEventRuntime gives
+     * SetMarker (metadata 2), not a plain string: a SetMarker event with no
+     * arguments (type 8 at bit 10, no timestamp), a colour, then the text as
+     * an ANSI string (chunk size 8 at bit 55, ANSI at bit 54) packed eight
+     * bytes a word, its zero byte included. */
+    u64 q[3 + 256 / 8 + 1] = {0};
+    q[0] = 0x008ull << 10;
+    q[1] = 0xFF4080C0ull;
+    q[2] = (8ull << 55) | (1ull << 54);
+    memcpy(&q[3], a, (size_t)n + 1);
+    const u32 words = 3 + ((u32)n + 1 + 7) / 8;
+    cl->lpVtbl->SetMarker(cl, 2, q, words * 8u);
+}
+#else
+static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecord* dr)
+{
+    (void)cl; (void)d; (void)dr;
+}
+#endif
 static void late_note(u32 slot, const D3D12DrawRecord* dr)
 {
     if (!late_on() || !dr || slot >= MAX_DRAWS) return;
@@ -11706,9 +11864,11 @@ rtt_dump_done:;
                         s_vp_topo_strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
                                         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 }
+                dred_mark(s_d3d.cmd_list, d, dr);
                 if (dr->index_count)
                     s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
-                        dr->index_count, 1, dr->ib_first, (INT)(dr->vb_byte_offset / 256), 0);
+                        dr->index_count, hang_test_instances(dr->index_count), dr->ib_first,
+                        (INT)(dr->vb_byte_offset / 256), 0);
                 else
                     s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                         dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
