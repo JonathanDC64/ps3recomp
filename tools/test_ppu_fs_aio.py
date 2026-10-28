@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""cellFsAioRead on an fd that plain reads and other threads use too.
+"""cellFsAioRead and cellFsAioWrite on an fd that plain reads and other threads use too.
 
 An AIO read names its own offset and must leave the fd's position alone.
 runtime/ppu/ppu_fs.cpp did a bare seek and read on the fd's FILE*, so the
 next cellFsRead went on from where the AIO stopped, and another thread's
 seek could land between the two. This pulls the AIO section (the HOST_*
-macros through cellFsAioRead) out of ppu_fs.cpp, builds it into a small
+macros through cellFsAioWrite) out of ppu_fs.cpp, builds it into a small
 host program with stand-ins for the rest, and checks:
 
   - a plain read after an AIO read continues from where the plain reads
     were, and the AIO read got the bytes at its offset;
   - 4 threads x 2000 AIO reads on one fd each get their own bytes, and
-    every request has its own id.
+    every request has its own id;
+  - an AIO write puts its bytes at its offset and leaves the position too.
 
 Run: python tools/test_ppu_fs_aio.py
 """
@@ -30,8 +31,8 @@ def aio_section():
     with open(os.path.join(ROOT, "runtime", "ppu", "ppu_fs.cpp"), encoding="utf-8") as f:
         src = f.read().replace("\r\n", "\n")
     i = src.index("#ifdef _WIN32\n#  define HOST_FSEEK64")
-    j = src.index("static void cellFsAioRead(ppu_context* ctx)", i)
-    j = src.index("\n}\n", j) + 3
+    j = src.index("static void cellFsAioWrite(ppu_context* ctx)", i)
+    j = src.index("\n", j) + 1
     return src[i:j]
 
 
@@ -48,6 +49,7 @@ DRIVER = r"""
 struct ppu_context { uint64_t gpr[32]; };
 #define CELL_OK         0
 #define CELL_FS_ENOENT  (-2147418106)
+#define CELL_FS_EIO     (-2147418111)
 #define FS_MAX          64
 static FILE* g_files[FS_MAX];
 static uint8_t* vm_base;
@@ -131,6 +133,28 @@ int main(int argc, char** argv)
     if (dup) { printf("FAIL: %%d request ids repeated or out of range\n", dup); fails++; }
     else printf("ok: every request has its own id\n");
     fclose(g_files[FD]);
+
+    /* An AIO write: its bytes land at its offset, the fd's position stays. */
+    g_files[FD] = fopen(argv[1], "r+b");
+    if (!g_files[FD] || fread(head, 1, sizeof head, g_files[FD]) != sizeof head) { printf("FAIL: reopen\n"); return 1; }
+    const uint32_t req = 0x20000, buf = req + 0x100;
+    for (uint32_t k = 0; k < LEN; k++) vm_base[buf + k] = (uint8_t)~pattern(7000 + k);
+    vm_write32(req + 0x00, FD); vm_write64(req + 0x08, 7000);
+    vm_write32(req + 0x10, buf); vm_write64(req + 0x18, LEN);
+    ppu_context ctx = {};
+    ctx.gpr[3] = req; ctx.gpr[4] = req + 0x40; ctx.gpr[5] = 0;
+    cellFsAioWrite(&ctx);
+    pos_ok = fread(next, 1, sizeof next, g_files[FD]) == sizeof next;
+    for (uint32_t k = 0; pos_ok && k < sizeof next; k++) pos_ok &= next[k] == pattern(100 + k);
+    if (!pos_ok) { printf("FAIL: the plain read after an AIO write did not go on from byte 100\n"); fails++; }
+    fclose(g_files[FD]);
+    FILE* r = fopen(argv[1], "rb");
+    uint8_t back[LEN];
+    int wrote = r && fseek(r, 7000, SEEK_SET) == 0 && fread(back, 1, LEN, r) == LEN;
+    for (uint32_t k = 0; wrote && k < LEN; k++) wrote &= back[k] == (uint8_t)~pattern(7000 + k);
+    if (r) fclose(r);
+    if (!wrote) { printf("FAIL: the AIO write's bytes are not in the file at its offset\n"); fails++; }
+    if (pos_ok && wrote) printf("ok: an AIO write lands at its offset and leaves the fd's position\n");
     return fails ? 1 : 0;
 }
 """
@@ -144,7 +168,7 @@ def builds(tmp, cpp):
         for tool in ("clang-cl", "cl"):
             exe = shutil.which(tool, path=env.get("PATH", ""))
             if exe:
-                return [exe, "/nologo", "/O1", "/EHsc", "/std:c++17", "/Fe" + name + ".exe",
+                return [exe, "/nologo", "/w", "/O1", "/EHsc", "/std:c++17", "/Fe" + name + ".exe",
                         "/Fo" + name + ".obj", cpp], name + ".exe", env
         return None
     cxx = (os.environ.get("CXX") or shutil.which("c++")
