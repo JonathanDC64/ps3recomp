@@ -40,6 +40,9 @@ extern "C" {
 #define CELL_AUDIO_STATUS_READY             1
 #define CELL_AUDIO_STATUS_RUN               2
 
+/* CellAudioPortParam.attr: open the port at param.level, not at 1.0 */
+#define CELL_AUDIO_PORTATTR_INITLEVEL       0x1000ull
+
 /* Audio period in microseconds (~5.333ms for 256 samples @ 48kHz) */
 #define CELL_AUDIO_PERIOD_US                5333
 
@@ -101,6 +104,9 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
 
 /* NID: 0xB8EF8006 */
 s32 cellAudioPortGetStatus(u32 portNum, u32* status);
+
+/* NID: 0x56DFE179 */
+s32 cellAudioSetPortLevel(u32 portNum, float level);
 
 /* NID: 0xE4046AFE */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
