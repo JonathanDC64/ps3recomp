@@ -2283,6 +2283,39 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+/* The 4 GB guest space, reserved with RSX local memory [0xC0000000,
+ * 0xD0000000) as an allocation of its own. The D3D12 backend opens a GPU heap
+ * on that range (OpenExistingHeapFromAddress maps a whole allocation, all of
+ * it committed), so the colour write-back goes straight from the GPU into
+ * guest memory. The addresses are the same either way. Without placeholders
+ * (VirtualAlloc2: Windows 10 1803 and later) it is one reservation, as before,
+ * and the backend stores on the CPU. */
+static uint8_t* vm_reserve(void)
+{
+#ifndef MEM_RESERVE_PLACEHOLDER
+#define MEM_RESERVE_PLACEHOLDER  0x00040000
+#define MEM_REPLACE_PLACEHOLDER  0x00004000
+#define MEM_PRESERVE_PLACEHOLDER 0x00000002
+#endif
+    typedef PVOID (WINAPI *va2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+    const uint64_t lo = 0xC0000000ull, n = 0x10000000ull;
+    va2_fn va2 = (va2_fn)(void*)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2");
+    uint8_t* b = va2 ? (uint8_t*)va2(NULL, NULL, VM_SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                     PAGE_NOACCESS, NULL, 0) : NULL;
+    if (b && VirtualFree(b, lo + n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+        VirtualFree(b, lo, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+        va2(NULL, b, lo, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
+        va2(NULL, b + lo, n, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
+        va2(NULL, b + lo + n, VM_SIZE - lo - n, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
+        return b;
+    if (b) {   /* a step failed: give back the pieces (a base not made yet fails harmlessly) */
+        VirtualFree(b, 0, MEM_RELEASE);
+        VirtualFree(b + lo, 0, MEM_RELEASE);
+        VirtualFree(b + lo + n, 0, MEM_RELEASE);
+    }
+    return (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
+}
 #endif
 
 /* PS3_PIDFILE=<path>: append this process id, so a test script can stop
@@ -2385,7 +2418,7 @@ int main(int argc, char** argv)
     /* Reserve the full 4 GB guest space; pages commit on first touch via the VEH. */
     AddVectoredExceptionHandler(1, guard_report_veh);  /* diagnose 0x80000001 silent deaths */
     AddVectoredExceptionHandler(1, vm_commit_veh);
-    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
+    vm_base = vm_reserve();
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
     /* The same space, read/write with no swap reserved: the kernel backs a page
