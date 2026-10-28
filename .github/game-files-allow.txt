@@ -8,3 +8,5 @@ runtime/spu/tests/out_*/*
 scratch/ppu_conformance.cpp
 # ps3recomp's own application icon.
 packaging/macos/icon_1024.png
+# SMAA's reference shader (iryoku/smaa, MIT), vendored as published for the D3D12 backend's RSX_AA=2 pass.
+third_party/smaa/SMAA.hlsl
