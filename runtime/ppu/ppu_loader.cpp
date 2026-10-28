@@ -4033,10 +4033,17 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * sys_ppu_thread_exit (RPCS3: ppu_free_tls). It used to be a bump allocator
  * that never freed, and titles churn threads: Demon's Souls starts a
  * ChrInsManThread and ChrProxyThreadMan pair on every level load and ends the
- * old pair. Its window holds 31 blocks, so the pair of the fourth load shared
+ * old pair. Its window held 31 blocks, so the pair of the fourth load shared
  * one block, and with it Havok's per-thread allocator (a TLS pointer, no
  * lock). Two ragdoll bodies still in the world were handed out again, and the
- * physics step froze in the game's heap. */
+ * physics step froze in the game's heap.
+ *
+ * A block is the TLS image rounded up to a page, so the 1 MB window holds 255
+ * for a small image (it held 31 when a block also counted the 0x7000 bias;
+ * upstream 088befac). Running out is no less harmful while threads are alive:
+ * besides the shared thread-locals, titles take r13 as a thread's identity
+ * (Demon's Souls' recursive locks compare their owner word with it), so two
+ * threads on one block pass each other's lock. */
 static uint8_t s_tls_used[256];   /* one per block of the window: 1 while a thread holds it */
 
 /* The block this host thread claimed, as its thread pointer (0: none). Kept
@@ -4044,9 +4051,12 @@ static uint8_t s_tls_used[256];   /* one per block of the window: 1 while a thre
  * joiner may already have given the slot to a new thread by then. */
 static PPU_THREAD_LOCAL uint32_t s_tls_mine = 0;
 
+/* r13 = block + 0x7000 is the ABI's bias, not storage: the guest addresses TLS
+ * as r13 - 0x7000 + off with off < memsz (Demon's Souls: 0 to 0x430 in the
+ * lift). So r13 points into a later block, which nothing reads through it. */
 static uint32_t ppu_tls_block_bytes(void)
 {
-    return (g_tls_memsz + 0x7000u + 0xFFFu) & ~0xFFFu;
+    return (g_tls_memsz + 0xFFFu) & ~0xFFFu;
 }
 
 /* How many thread blocks fit above the main one. */
@@ -4311,7 +4321,8 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         if (g_tls_memsz > g_tls_filesz)
             memset(vm_base + PPU_TLS_IMG + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
         ctx.gpr[13] = PPU_TLS_TP;
-        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X)\n", PPU_TLS_IMG, PPU_TLS_TP);
+        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X), %u thread blocks of 0x%X\n",
+                PPU_TLS_IMG, PPU_TLS_TP, ppu_tls_block_count(ppu_tls_block_bytes()), ppu_tls_block_bytes());
     }
     /* Guest command line (argc/argv). The PS3 LV2 loader passes argv[0] = the boot
      * path; ppu_run previously left r3/r4 zeroed, so the guest read a garbage argv[0]
