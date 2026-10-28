@@ -109,6 +109,23 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     return t;
 }
 
+/* 1 while a guest thread of this name is alive (created, not yet exited). The
+ * name is set in sys_ppu_thread_create, before the thread runs, so its creator
+ * already sees it on return. For HLE that needs to know a library's thread is
+ * there (cellAudio and libmixer's _cellsurMixerMain). */
+int ppu_thread_named(const char* name)
+{
+    int found = 0;
+    table_lock();
+    for (int i = 0; i < PPU_THREAD_MAX && !found; i++) {
+        const ppu_thread_info* t = &g_ppu_threads[i];
+        found = (t->state == PPU_THREAD_STATE_RUNNING || t->state == PPU_THREAD_STATE_DETACHED) &&
+                strcmp(t->name, name) == 0;
+    }
+    table_unlock();
+    return found;
+}
+
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
