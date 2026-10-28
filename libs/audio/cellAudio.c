@@ -16,6 +16,8 @@
 #include "ps3emu/ps3_knob.h"
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
+#include "../../runtime/ppu/ppu_context.h"  /* cellAudioSetPortLevel's context handler */
+#include "../../include/ps3emu/nid.h"       /* ps3_compute_nid */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -136,6 +138,8 @@ typedef struct {
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
+    float                level_now;      /* the level the mixer last applied; param.level is
+                                          * where it goes (cellAudioSetPortLevel) */
 } AudioPortSlot;
 
 static int            s_audio_initialized = 0;
@@ -490,9 +494,14 @@ static void audio_mix_one_block(void)
 
         u32 nch    = (u32)port->param.nChannel;
         u32 nblock = (u32)port->param.nBlock;
-        float level = port->param.level;
-        if (level <= 0.0f) level = 1.0f;
-        if (level > 1.0f) level = 1.0f;
+        /* The port's level (cellAudioPortOpen, cellAudioSetPortLevel), 0 to 1. A
+         * change moves across this block, one step a sample, so it does not
+         * click. */
+        float level_to = port->param.level;
+        if (!(level_to >= 0.0f)) level_to = 0.0f;
+        if (level_to > 1.0f) level_to = 1.0f;
+        const float level_from = port->level_now;
+        port->level_now = level_to;
 
         /* AUDIO_WRITEPOS=1: where the game writes relative to the index we
          * publish. Each mix, the blocks that went from cleared to written
@@ -582,6 +591,8 @@ static void audio_mix_one_block(void)
             } } }
 
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+            const float level = level_from == level_to ? level_to
+                : level_from + (level_to - level_from) * (float)(s + 1) / (float)CELL_AUDIO_BLOCK_SAMPLES;
             float left, right;
             if (nch >= 2) {
                 left  = ld_be_f32(&src[s * nch + 0]) * level;
@@ -931,8 +942,14 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     u64 nch  = vm_read64(param_ea + 0);   /* nChannel */
     u64 nblk = vm_read64(param_ea + 8);   /* nBlock   */
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
-           (unsigned long long)nch, (unsigned long long)nblk);
+    u64 attr = vm_read64(param_ea + 16);  /* attr     */
+    float level = 1.0f;                   /* level, used with CELL_AUDIO_PORTATTR_INITLEVEL */
+    if (attr & CELL_AUDIO_PORTATTR_INITLEVEL) {
+        u32 w = vm_read32(param_ea + 24);
+        memcpy(&level, &w, sizeof level);
+    }
+    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu, level %.2f)\n",
+           (unsigned long long)nch, (unsigned long long)nblk, (double)level);
 
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
@@ -962,6 +979,9 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     memset(&port->param, 0, sizeof(port->param));
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
+    port->param.attr     = attr;
+    port->param.level    = level;
+    port->level_now      = level;
     port->read_index  = 0;
     port->write_index = 0;
 
@@ -1297,6 +1317,51 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
     }
 
     return CELL_OK;
+}
+
+/* A port's level from now on, which the mixer moves to across one block. A
+ * negative level leaves it as it is. Unregistered, the call fell to the
+ * unresolved-import default: CELL_OK and no change. Demon's Souls sets it on
+ * the port it mixes into, with libmixer's total level: 0 while a level loads,
+ * then up to 1 in 15 steps. Only going to 0 and back is logged. */
+s32 cellAudioSetPortLevel(u32 portNum, float level)
+{
+    if (!s_audio_initialized)
+        return CELL_AUDIO_ERROR_NOT_INIT;
+
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    mutex_lock(&s_audio_mutex);
+
+    if (!s_ports[portNum].in_use) {
+        mutex_unlock(&s_audio_mutex);
+        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
+    }
+
+    if (level >= 0.0f) {
+        if ((level == 0.0f) != (s_ports[portNum].param.level == 0.0f))
+            printf("[cellAudio] port %u %s\n", portNum, level == 0.0f ? "muted (level 0)" : "unmuted");
+        s_ports[portNum].param.level = level;
+    }
+
+    mutex_unlock(&s_audio_mutex);
+    return CELL_OK;
+}
+
+/* The level comes in f1, which the import table's plain handlers do not
+ * see, so this one takes the context; ppu_sysprx_register registers it. */
+extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+
+static void hle_cellAudioSetPortLevel(ppu_context* ctx)
+{
+    ctx->gpr[3] = (uint64_t)(int64_t)cellAudioSetPortLevel((u32)ctx->gpr[3], (float)ctx->fpr[1]);
+}
+
+void cell_audio_register_ctx(void)
+{
+    ps3_hle_register_ctx(ps3_compute_nid("cellAudioSetPortLevel"), "cellAudioSetPortLevel",
+                         hle_cellAudioSetPortLevel);
 }
 
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice)
