@@ -28,6 +28,7 @@
 #include <filesystem>                   /* before the Win32 stand-in, which pulls in <windows.h> */
 #include <system_error>
 #include <vector>
+#include <atomic>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-resolving host backtrace (ppu_loader.cpp). Must be declared at file scope:
@@ -811,8 +812,14 @@ static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3
  */
 #ifdef _WIN32
 #  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     _ftelli64(f)
+#  define HOST_LOCKFILE(f)    _lock_file(f)
+#  define HOST_UNLOCKFILE(f)  _unlock_file(f)
 #else
 #  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
+#  define HOST_FTELL64(f)     ftello(f)
+#  define HOST_LOCKFILE(f)    flockfile(f)
+#  define HOST_UNLOCKFILE(f)  funlockfile(f)
 #endif
 
 static uint32_t guest_be32(uint32_t a)
@@ -833,7 +840,10 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  * done", which is exactly true here. */
 static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
-static void cellFsAioRead(ppu_context* ctx)
+/* cellFsAioRead and cellFsAioWrite: the same request, the transfer the other
+ * way. A write that was unregistered took the unresolved-NID path, CELL_OK
+ * with nothing written and no completion. */
+static void fs_aio(ppu_context* ctx, bool write)
 {
     uint32_t aio    = (uint32_t)ctx->gpr[3];
     uint32_t id_ptr = (uint32_t)ctx->gpr[4];
@@ -844,7 +854,7 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static int32_t s_next_id = 1;
+    static std::atomic<int32_t> s_next_id{1};   /* submitted from several threads */
     int32_t id = s_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
@@ -853,20 +863,35 @@ static void cellFsAioRead(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
         fs_prefault(buf, size);
-        /* AIO reads are absolute -- they do not disturb the fd's own file
-         * position, and the guest interleaves them freely across threads. */
-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+        /* AIO reads are absolute: they leave the fd's own position alone, and
+         * the guest issues them from several threads on an fd it also reads
+         * plainly. A bare seek + read on the shared FILE* moved the position
+         * (the next cellFsRead went on from where the AIO stopped), and another
+         * thread's seek could land between the two. So hold the stream's lock,
+         * which stdio's own calls take, across the seek, the read and the seek
+         * back. (Upstream 7208d22b.) */
+        FILE* f = g_files[fd];
+        HOST_LOCKFILE(f);
+        const int64_t pos = (int64_t)HOST_FTELL64(f);
         err = CELL_OK;
+        if (HOST_FSEEK64(f, offset) == 0) {
+            n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
+                      : fread(vm_base + buf, 1, (size_t)size, f);
+            if (write && n < size) { clearerr(f); err = CELL_FS_EIO; }   /* e.g. a read-only fd */
+        }
+        if (pos >= 0) HOST_FSEEK64(f, pos);   /* also flushes a write */
+        HOST_UNLOCKFILE(f);
     }
     if (getenv("PS3_FSLOG"))
-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+        fprintf(stderr, "[fs] aio %s id=%d fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
 
     ctx->gpr[3] = CELL_OK;
     if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
+static void cellFsAioRead(ppu_context* ctx)  { fs_aio(ctx, false); }
+static void cellFsAioWrite(ppu_context* ctx) { fs_aio(ctx, true); }
 
 /* cellSysCacheMount's clear (libs/system/cellSysutil.c): removes everything in a /dev_hdd1/cache guest directory
  * on the host and keeps the directory. Only that directory: a path that could climb out of it is refused. A file
@@ -928,5 +953,6 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(0xDB869F20u, "cellFsAioInit",   cellFsAioInit);
     ps3_hle_register_ctx(0x9F951810u, "cellFsAioFinish", cellFsAioFinish);
     ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
+    ps3_hle_register_ctx(0x4CEF342Eu, "cellFsAioWrite",  cellFsAioWrite);
     ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
 }
