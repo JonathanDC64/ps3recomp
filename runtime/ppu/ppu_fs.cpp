@@ -60,6 +60,7 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
+#define CELL_FS_EBADF        (-2147418103)   /* 0x80010009 */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -765,6 +766,29 @@ static void cellFsFsync(ppu_context* ctx)
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
     ctx->gpr[3] = CELL_OK;
 }
+/* The file this layer opened, cut or zero-extended to `size`; its position
+ * stays where it is. Left to libs/filesystem/cellFs.c, whose own table never
+ * holds these descriptors, every call failed with EBADF: Demon's Souls sets
+ * each file it writes to its HDD cache (/dev_hdd1/cache) to its final size,
+ * and on that error it records an I/O error on the file and reports it. */
+#ifdef _WIN32
+#define HOST_FTRUNCATE(f, n) _chsize_s(_fileno(f), (long long)(n))
+#else
+#define HOST_FTRUNCATE(f, n) ftruncate(fileno(f), (off_t)(n))
+#endif
+static void cellFsFtruncate(ppu_context* ctx)
+{
+    int fd = (int)(uint32_t)ctx->gpr[3];
+    uint64_t size = ctx->gpr[4];
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    fflush(g_files[fd]);
+    if (HOST_FTRUNCATE(g_files[fd], size) != 0) {
+        fprintf(stderr, "[fs] ftruncate fd=%d to %llu failed: '%s'\n", fd, (unsigned long long)size, g_fd_path[fd]);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+        return;
+    }
+    ctx->gpr[3] = CELL_OK;
+}
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
@@ -896,6 +920,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsFtruncate"), "cellFsFtruncate", cellFsFtruncate);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
     /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does
