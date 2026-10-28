@@ -30,6 +30,7 @@ extern int      sys_event_queue_push_by_id(uint32_t queue_id,
                                             uint64_t data2,  uint64_t data3);
 extern uint32_t sys_event_find_queue_by_key(uint64_t key);
 extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+extern int      ppu_thread_named(const char* name);   /* runtime/syscalls/sys_ppu_thread.c */
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -1168,6 +1169,19 @@ s32 cellAudioCreateNotifyEventQueue(u32* id, u64* key)
     return CELL_OK;
 }
 
+/* libmixer (a static library: the title's own code) registers its surround
+ * mixer here. cellSurMixerStart passes the key that the mixer's thread,
+ * _cellsurMixerMain, stores just before it creates its queue under that key.
+ * On a PS3 that thread (priority 400) runs before its creator gets to Start.
+ * Here both run at once, so Start can read the key before the thread has
+ * stored it, and passes 0. With key 0 nothing is ever notified: the mixer
+ * never mixes, and the title has no sound for the whole session. Demon's
+ * Souls then has no music, and its NPC lines skip by at once (no voice
+ * stream starts). The thread's key is this one (it takes the next only when a
+ * queue already holds it). The queue is found by key at each notify, so the
+ * key can go in before the queue exists. */
+#define SURMIXER_NOTIFY_KEY 0x8000CAFE02460300ull
+
 s32 cellAudioSetNotifyEventQueue(u64 key)
 {
     printf("[cellAudio] SetNotifyEventQueue(key=0x%llX)\n",
@@ -1175,6 +1189,12 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
+
+    if (key == 0 && ppu_thread_named("_cellsurMixerMain")) {
+        key = SURMIXER_NOTIFY_KEY;
+        printf("[cellAudio] SetNotifyEventQueue: key 0 before _cellsurMixerMain stored its own; using 0x%llX\n",
+               (unsigned long long)key);
+    }
 
     mutex_lock(&s_audio_mutex);
 
