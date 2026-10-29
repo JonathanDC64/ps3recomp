@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#define PS3_GAME_ABI 2
+#define PS3_GAME_ABI 3
 
 /* The runtime functions the lifted code calls by name, in slot order. A new
  * one goes at the end, with PS3_GAME_ABI raised. */
@@ -58,7 +58,7 @@ extern "C" {
     X(spu_register_function) X(spu_workload_register_img) X(spu_ls_watch_slow)   \
     X(spu_hook_ring_fetch) X(spu_hook_put_wait) X(spu_hook_inflate_ls)           \
     X(spu_hook_ring_post) X(spu_hook_state_diff)                                 \
-    X(spu_registering_image) X(spu_bi_switch_verify)
+    X(spu_registering_image) X(spu_bi_switch_verify) X(spu_hook_entry_scan)
 
 #define PS3_GAME_HOST_FN_INDEX_(n) PS3_GH_##n,
 enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
