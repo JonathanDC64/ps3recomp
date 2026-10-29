@@ -1327,6 +1327,18 @@ static SPU_NOINLINE int spu_ch_diag_load(void)
                      getenv("SPU_TAGPROBE")) ? 1 : 0;
     g_spu_mfc_hint = ps3_env_int("SPU_MFC_HINT", 1) != 0;
     g_spu_ch_diag_gen = ps3_env_gen;
+#if !SPU_LS_PROBES
+    /* An LS probe asked for in a build without them (spu_context.h). The
+     * DMA halves of SPU_LS_WATCH and SPU_SMC_WATCH (spu_dma.h) are always
+     * built. */
+    static int s_ls_told;
+    if (!s_ls_told && spu_ls_dbg_env()) {
+        s_ls_told = 1;
+        fprintf(stderr, "[spu] no SPU load/store probes in this build (SPU_LS_PROBES=1, CMake "
+                        "PS3RECOMP_SPU_LS_PROBES=ON): SPU_LS_WATCH and SPU_SMC_WATCH see DMA "
+                        "transfers only, SPU_LS_LOWREAD and SPU_WWS_PROBE nothing\n");
+    }
+#endif
     return g_spu_ch_diag;
 }
 static inline int spu_ch_diag(void)
