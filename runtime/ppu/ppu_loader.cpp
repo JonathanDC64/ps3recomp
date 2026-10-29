@@ -1609,10 +1609,6 @@ static void pt_record(uint32_t addr) {
 }
 static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr[i]==addr) g_pt_live[i]=0; }
 #endif
-/* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
- * write hook can name the virtual method that is running when it writes a value. */
-static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
-static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
 /* PPU_COH_HIST=1: every 2 s, the lines whose plain PPU stores took the
  * lock-line lock, busiest first, with the guest thread and lr of the last
@@ -2747,21 +2743,19 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
 }
 
 /* The call itself, as ps3_indirect_call_impl makes it once the target is a
- * lifted function: the recursion depth, the vcall stack, the call and the
- * tail-call trampolines it leaves behind. */
+ * lifted function: the recursion depth, the call and the tail-call
+ * trampolines it leaves behind. */
 static PPU_THREAD_LOCAL int s_icall_depth = 0;
 static inline void icall_run(ppu_context* ctx, uint32_t addr, ppu_fn fn)
 {
+    (void)addr;
     s_icall_depth++;
-    if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
-    g_vcall_sp++;
     fn(ctx);
     while (g_trampoline_fn) {
         void (*tf)(void*) = g_trampoline_fn;
         g_trampoline_fn = 0;
         tf(ctx);
     }
-    if (g_vcall_sp > 0) g_vcall_sp--;
     s_icall_depth--;
 }
 
@@ -3116,8 +3110,6 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * to the dispatched toc before each link so the chain stays consistent. */
         uint32_t _toc0 = (uint32_t)ctx->gpr[2];
         static int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
-        if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
-        g_vcall_sp++;
         fn(ctx);
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
@@ -3125,7 +3117,6 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
-        if (g_vcall_sp > 0) g_vcall_sp--;
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
