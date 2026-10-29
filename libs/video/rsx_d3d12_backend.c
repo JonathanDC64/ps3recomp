@@ -14906,8 +14906,16 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     if (ni) {
         /* Each array's bytes over [lo,hi]. A range that reaches far more
          * vertices than it has indices copies more than the CPU path
-         * converts: leave it to that path. */
-        if ((u64)hi - lo + 1 > (u64)count * 4 + 256) { s_vf_stat[3]++; return -1; }
+         * converts: leave it to that path. VF_SPARSE (live, default 64):
+         * how many vertices an index may reach. The CPU path writes 256
+         * bytes a vertex and converts every attribute; the copy is the
+         * guest's own bytes, tens a vertex, and the next ranges of the
+         * mesh usually reuse it. At 4, the 256-index ranges of Demon's
+         * Souls's level meshes left 64,000 vertices a frame to the CPU in
+         * the deep Palace; at 64, 10,800. */
+        { static int sx = -1;
+          PS3_KNOB(sx, ps3_env_int("VF_SPARSE", 64));
+          if ((u64)hi - lo + 1 > (u64)count * (u32)sx + 256) { s_vf_stat[3]++; return -1; } }
         u32 sg0[16], sg1[16], sx[16];
         for (u32 k = 0; k < pl.n_on; k++) {
             const rsx_fetch_slot* sl = &pl.on[k];
