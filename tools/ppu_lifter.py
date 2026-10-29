@@ -416,6 +416,51 @@ _CS_ANY_STORE_RE = re.compile(
 # region without the SPU-reservation test. Applied in _function_def_lines,
 # so the frame analyses here keep seeing the plain form.
 _STK_STORE_RE = re.compile(r'\bvm_write(8|16|32|64)\(ctx->gpr\[1\] \+ ')
+# A run of _STK_RUN_MIN or more such lines in a row, each one store of a GPR
+# (a function's frame saves), gets one test for the whole run: vm_stk_run
+# (ps3emu/ppu_lift.h) gives the host address of its lowest byte when every
+# byte it stores would take vm_write*_stk's direct store, and the stores then
+# go through that pointer; otherwise the lines run as they are. Store by store,
+# each one reloads the limit, r1 and vm_base, because the store before it, made
+# through vm_base, may alias any of them.
+_STK_RUN_LINE_RE = re.compile(
+    r'^(\s*)vm_write(8|16|32|64)_stk\(ctx->gpr\[1\] \+ (-?0x[0-9A-Fa-f]+|-?\d+), (ctx->gpr\[\d+\])\);$')
+_STK_RUN_MIN = 3
+
+
+def _stack_store_runs(blines: list[str]) -> list[str]:
+    """blines with each run of stack stores grouped under one test (above)."""
+    out: list[str] = []
+    i = 0
+    while i < len(blines):
+        run = []
+        j = i
+        while j < len(blines):
+            m = _STK_RUN_LINE_RE.match(blines[j])
+            if not m or (run and m.group(1) != run[0][0]):
+                break
+            run.append((m.group(1), int(m.group(2)), int(m.group(3), 0), m.group(4)))
+            j += 1
+        prev = out[-1].strip() if out else ""
+        # Never right after a control line with no braces: it would take the
+        # group as its body where it had only the first store.
+        if len(run) < _STK_RUN_MIN or prev.endswith(")") or prev == "else":
+            out.append(blines[i])
+            i += 1
+            continue
+        ind = run[0][0]
+        lo = min(off for _, _, off, _ in run)
+        hi = max(off + w // 8 for _, w, off, _ in run)
+        lo_s = f"-0x{-lo:X}" if lo < 0 else f"0x{lo:X}"
+        out.append(f"{ind}{{ uint8_t* const _sk = vm_stk_run(ctx->gpr[1] + {lo_s}, {hi - lo});")
+        out.append(f"{ind}  if (__builtin_expect(_sk != 0, 1)) {{")
+        for _, w, off, val in run:
+            out.append(f"{ind}    vm_stk_put{w}(_sk + {off - lo}, {val});")
+        out.append(f"{ind}  }} else {{")
+        out.extend(f"{ind}    {blines[k].strip()}" for k in range(i, j))
+        out.append(f"{ind}  }} }}")
+        i = j
+    return out
 # A primary stack-frame allocation (lifted `stdu r1,-N(r1)`); its presence means
 # the body is a real function/merge, not a pure mid-function tail-entry.
 _FRAME_ALLOC = "ctx->gpr[1] += -0x"
@@ -3537,8 +3582,8 @@ class PPULifter:
             lines.append(f"/* {label} */")
         lines.append(f"void {func.name}(ppu_context* ctx) {{")
         lines.append(f"    DS_FRAME(0x{func.start_addr:08X});")
-        for bline in func.body_lines:
-            bline = _STK_STORE_RE.sub(r"vm_write\1_stk(ctx->gpr[1] + ", bline)
+        blines = [_STK_STORE_RE.sub(r"vm_write\1_stk(ctx->gpr[1] + ", b) for b in func.body_lines]
+        for bline in _stack_store_runs(blines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional

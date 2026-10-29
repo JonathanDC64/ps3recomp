@@ -63,7 +63,48 @@ def check_lifter():
     for r in (11, 21, 5):
         assert f"_stk(ctx->gpr[{r}]" not in out, f"a store through r{r} became a stack store:\n{out}"
         assert f"vm_write32(ctx->gpr[{r}]" in out, f"the store through r{r} is missing:\n{out}"
+    # The four stores after the stdu are one run: bytes 0x10..0x3F of the frame.
+    for want in ("{ uint8_t* const _sk = vm_stk_run(ctx->gpr[1] + 0x10, 48);",
+                 "vm_stk_put64(_sk + 40, ctx->gpr[31]);", "vm_stk_put32(_sk + 0, ctx->gpr[3]);",
+                 "vm_stk_put16(_sk + 4, ctx->gpr[4]);", "vm_stk_put8(_sk + 6, ctx->gpr[5]);"):
+        assert want in out, f"the run is missing {want!r}:\n{out}"
+    assert out.count("vm_stk_run(") == 1, f"want one run:\n{out}"
     print("ok: r1 stores are written as vm_write*_stk, the body and other bases are not")
+
+
+def check_runs():
+    """_stack_store_runs on lines: what makes a run and what ends one."""
+    from ppu_lifter import _stack_store_runs
+    s = ["    vm_write64_stk(ctx->gpr[1] + 0x70, ctx->gpr[16]);",
+         "    vm_write64_stk(ctx->gpr[1] + 0x78, ctx->gpr[17]);",
+         "    vm_write32_stk(ctx->gpr[1] + -0x8, ctx->gpr[18]);"]
+    out = _stack_store_runs(s)
+    assert out[0] == "    { uint8_t* const _sk = vm_stk_run(ctx->gpr[1] + -0x8, 136);", out
+    assert out[1] == "      if (__builtin_expect(_sk != 0, 1)) {", out
+    assert out[2:5] == ["        vm_stk_put64(_sk + 120, ctx->gpr[16]);",
+                        "        vm_stk_put64(_sk + 128, ctx->gpr[17]);",
+                        "        vm_stk_put32(_sk + 0, ctx->gpr[18]);"], out
+    assert out[5] == "      } else {" and out[-1] == "      } }", out
+    assert [l.strip() for l in out[6:9]] == [l.strip() for l in s], out
+    # Two in a row stay as they are; a label, another line or a store of
+    # something else than a GPR ends a run; so does a change of indentation.
+    two = s[:2]
+    assert _stack_store_runs(two) == two
+    cut = [s[0], s[1], "loc_00010010:", s[2]]
+    assert _stack_store_runs(cut) == cut
+    cut = [s[0], "    ctx->gpr[1] += -0x40;", s[1], s[2]]
+    assert _stack_store_runs(cut) == cut
+    cut = [s[0], s[1], "    vm_write64_stk(ctx->gpr[1] + 0x80, tmp);"]
+    assert _stack_store_runs(cut) == cut
+    cut = [s[0], s[1], "        " + s[2].strip()]
+    assert _stack_store_runs(cut) == cut
+    # Never as the body of a control line with no braces.
+    for ctl in ("    if (x)", "    else"):
+        assert _stack_store_runs([ctl] + s) == [ctl] + s
+    # A run of three after other lines, and the lines after it, kept in order.
+    out = _stack_store_runs(["    a;"] + s + ["    b;"])
+    assert out[0] == "    a;" and out[-1] == "    b;" and out.count("      } }") == 1, out
+    print("ok: runs of three or more stack stores share one test; anything else ends a run")
 
 
 DRIVER = r"""
@@ -145,6 +186,42 @@ int main(void) {
                               on ? "on" : "off", g_slow ? "called the accessor" : "stored directly"); }
             }
     }
+    /* A run's one test (vm_stk_run): the host address of its first byte when
+     * all of [ea, ea + span) is below the run limit, else 0. The stack limit
+     * alone does not do it: PPU_STK_RUN=0 leaves the run limit 0. */
+    const struct { uint64_t a; unsigned span; int direct; } run[] = {
+        { 0xD0000000u, 16, 1 }, { 0xD0007FF0u, 16, 1 }, { 0xD0007FF8u, 16, 0 },
+        { 0xD0007FF8u, 8, 1 }, { 0xCFFFFFF8u, 16, 0 }, { 0xD0008000u, 1, 0 }, { 0x1D0000100ull, 64, 1 },
+    };
+    for (int on = 0; on < 4; on++) {
+#ifndef PPU_VM_NO_INLINE
+        g_spu_coh_armed_line.stk_lim = (on & 1) ? LIM : 0u;
+        g_spu_coh_armed_line.stk_run = (on & 2) ? LIM : 0u;
+#endif
+        for (unsigned i = 0; i < sizeof run / sizeof run[0]; i++) {
+#ifdef PPU_VM_NO_INLINE
+            const int want = 0;
+#else
+            const int want = (on & 2) && run[i].direct;
+#endif
+            uint8_t* p = vm_stk_run(run[i].a, run[i].span);
+            const int ok = want ? p == g_mem + ((uint32_t)run[i].a - 0xD0000000u) : p == 0;
+            if (ok) g_pass++;
+            else { g_fail++;
+                   printf("FAIL run of %u at 0x%llX, stack limit %s, run limit %s: %s\n", run[i].span,
+                          (unsigned long long)run[i].a, (on & 1) ? "on" : "off", (on & 2) ? "on" : "off",
+                          p ? "direct" : "store by store"); }
+        }
+    }
+    /* The run's stores: big-endian, the low w bits, as the direct store. */
+    {
+        memset(g_mem, 0xCC, sizeof g_mem);
+        vm_stk_put64(g_mem + 0, 0x0102030405060708ull); vm_stk_put32(g_mem + 8, 0x1112131415161718ull);
+        vm_stk_put16(g_mem + 12, 0x2122u); vm_stk_put8(g_mem + 14, 0x31u);
+        static const uint8_t want[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 0x15, 0x16, 0x17, 0x18, 0x21, 0x22, 0x31, 0xCC };
+        if (memcmp(g_mem, want, 16) == 0) g_pass++;
+        else { g_fail++; printf("FAIL the run's stores left the wrong bytes\n"); }
+    }
     printf("[ppu-stack-stores] %d checks passed, %d FAILED\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
@@ -206,6 +283,7 @@ def check_header():
 
 def main():
     check_lifter()
+    check_runs()
     ok = check_header()
     print("[ppu-stack-stores]", "ok" if ok else "FAILED")
     return 0 if ok else 1

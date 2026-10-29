@@ -172,7 +172,7 @@ extern "C" {
 extern uint8_t* vm_base;
 extern unsigned g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
 extern unsigned char g_spu_coh_bitmap[];
-extern struct spu_coh_armed_line_t { int v; unsigned stk_lim; } g_spu_coh_armed_line;
+extern struct spu_coh_armed_line_t { int v; unsigned stk_lim; unsigned stk_run; } g_spu_coh_armed_line;
 #ifdef __cplusplus
 }
 #endif
@@ -293,12 +293,31 @@ static inline void vm_write64_stk(uint64_t a, uint64_t val)
     }
     vm_write64_inl(a, val);
 }
+/* A run of stack stores the lifter writes under one test (ppu_lifter.py,
+ * _stack_store_runs: a function's frame saves). The host address of ea when
+ * every byte of [ea, ea + span) would take vm_write*_stk's direct store; else
+ * 0, and the run's stores take vm_write*_stk one by one. The limit is the run
+ * limit, the third word on the armed flag's line: the stack limit, or 0 while
+ * PPU_STK_RUN=0 (spu_coh_stk_eval). */
+static inline uint8_t* vm_stk_run(uint64_t a, uint32_t span)
+{
+    const uint32_t ea = (uint32_t)a;
+    const unsigned lim = *(volatile unsigned*)&g_spu_coh_armed_line.stk_run;
+    return ea - 0xD0000000u < lim && ea + span - 1u - 0xD0000000u < lim ? vm_base + ea : (uint8_t*)0;
+}
 #else
 #define vm_write8_stk(a, v)  vm_write8((a), (v))
 #define vm_write16_stk(a, v) vm_write16((a), (v))
 #define vm_write32_stk(a, v) vm_write32((a), (v))
 #define vm_write64_stk(a, v) vm_write64((a), (v))
+static inline uint8_t* vm_stk_run(uint64_t a, uint32_t span) { (void)a; (void)span; return (uint8_t*)0; }
 #endif
+/* The stores of such a run, big-endian, as vm_write*_stk's direct store. */
+#include <string.h>
+static inline void vm_stk_put8(uint8_t* p, uint8_t v)   { *p = v; }
+static inline void vm_stk_put16(uint8_t* p, uint16_t v) { v = __builtin_bswap16(v); memcpy(p, &v, 2); }
+static inline void vm_stk_put32(uint8_t* p, uint32_t v) { v = __builtin_bswap32(v); memcpy(p, &v, 4); }
+static inline void vm_stk_put64(uint8_t* p, uint64_t v) { v = __builtin_bswap64(v); memcpy(p, &v, 8); }
 
 /* Syscall handler */
 #ifdef __cplusplus

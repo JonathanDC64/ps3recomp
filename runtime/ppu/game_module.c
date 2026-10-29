@@ -85,8 +85,8 @@ static int tls_ready(void) { return 1; }
 uint8_t*          vm_base;
 unsigned          g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
 unsigned char     g_spu_coh_bitmap[PS3_GM_COH_BITMAP_SZ];
-/* v: the armed flag; stk_lim: the stack stores' limit (ps3emu/ppu_lift.h), the host's to set */
-__attribute__((aligned(64))) struct { int v; unsigned stk_lim; char pad_[64 - 2 * sizeof(int)]; } g_spu_coh_armed_line;
+/* v: the armed flag; stk_lim, stk_run: the stack stores' limits (ps3emu/ppu_lift.h), the host's to set */
+__attribute__((aligned(64))) struct { int v; unsigned stk_lim, stk_run; char pad_[64 - 3 * sizeof(int)]; } g_spu_coh_armed_line;
 volatile int      g_spu_goto_slow = 1;
 volatile int      g_yz_lockstep_on = -1;
 void* volatile    g_pm_flow_ctx = 0;

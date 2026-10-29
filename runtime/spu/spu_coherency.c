@@ -265,10 +265,19 @@ int* ps3_split_coh_armed = &s_coh_armed_host.v;
  * follows the store limit (spu_coh_stk_eval), and is 0 for good once an SPU
  * reserves a line in the stack region: those stores then take the full path.
  * A store that read the limit just before that first stack reservation can
- * miss its one event, as any store can at the first GETLLAR (above). */
+ * miss its one event, as any store can at the first GETLLAR (above).
+ *
+ * The word after it is the run limit (vm_stk_run): a run of frame saves the
+ * lifter writes under one test stores straight through one pointer while the
+ * run lies below it. The same value, or 0 with PPU_STK_RUN=0 (live), which
+ * sends every run's stores through vm_write*_stk one by one, as before. */
 #define SPU_COH_STK_LIM 0x0FFF0000u   /* the stack region, 0xD0000000 up, less its last 64 KB */
 static int s_coh_stack_resv;   /* an SPU has reserved a stack line */
-static void spu_coh_set_stk(unsigned v) { __atomic_store_n((unsigned*)&s_coh_armed + 1, v, __ATOMIC_SEQ_CST); }
+static void spu_coh_set_stk(unsigned v)
+{
+    __atomic_store_n((unsigned*)&s_coh_armed + 1, v, __ATOMIC_SEQ_CST);
+    __atomic_store_n((unsigned*)&s_coh_armed + 2, ps3_env_int("PPU_STK_RUN", 1) ? v : 0u, __ATOMIC_SEQ_CST);
+}
 void spu_coh_stk_eval(int allow)
 {
     /* Set, then look again: a first stack reservation between the two would
