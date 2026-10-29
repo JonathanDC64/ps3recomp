@@ -270,7 +270,10 @@ int* ps3_split_coh_armed = &s_coh_armed_host.v;
  * The word after it is the run limit (vm_stk_run): a run of frame saves the
  * lifter writes under one test stores straight through one pointer while the
  * run lies below it. The same value, or 0 with PPU_STK_RUN=0 (live), which
- * sends every run's stores through vm_write*_stk one by one, as before. */
+ * sends every run's stores through vm_write*_stk one by one, as before.
+ *
+ * The fourth word lets runs through other base registers (vm_st_run) do the
+ * same: 1 while the store limit is on, 0 with PPU_ST_RUN=0 (live). */
 #define SPU_COH_STK_LIM 0x0FFF0000u   /* the stack region, 0xD0000000 up, less its last 64 KB */
 static int s_coh_stack_resv;   /* an SPU has reserved a stack line */
 static void spu_coh_set_stk(unsigned v)
@@ -285,6 +288,7 @@ void spu_coh_stk_eval(int allow)
      * one of them sees the other's store. */
     spu_coh_set_stk(allow && !__atomic_load_n(&s_coh_stack_resv, __ATOMIC_SEQ_CST) ? SPU_COH_STK_LIM : 0u);
     if (allow && __atomic_load_n(&s_coh_stack_resv, __ATOMIC_SEQ_CST)) spu_coh_set_stk(0);
+    __atomic_store_n((unsigned*)&s_coh_armed + 3, allow && ps3_env_int("PPU_ST_RUN", 1) ? 1u : 0u, __ATOMIC_SEQ_CST);
 }
 
 /* The SPU contexts that have reserved a line. A context left out gets no

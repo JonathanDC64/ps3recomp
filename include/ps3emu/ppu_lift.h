@@ -172,7 +172,7 @@ extern "C" {
 extern uint8_t* vm_base;
 extern unsigned g_vm_inl_rd_lim, g_vm_inl_wr_lim, g_vm_inl_rd_hole;
 extern unsigned char g_spu_coh_bitmap[];
-extern struct spu_coh_armed_line_t { int v; unsigned stk_lim; unsigned stk_run; } g_spu_coh_armed_line;
+extern struct spu_coh_armed_line_t { int v; unsigned stk_lim; unsigned stk_run; unsigned st_run; } g_spu_coh_armed_line;
 #ifdef __cplusplus
 }
 #endif
@@ -305,19 +305,36 @@ static inline uint8_t* vm_stk_run(uint64_t a, uint32_t span)
     const unsigned lim = *(volatile unsigned*)&g_spu_coh_armed_line.stk_run;
     return ea - 0xD0000000u < lim && ea + span - 1u - 0xD0000000u < lim ? vm_base + ea : (uint8_t*)0;
 }
+/* A run of stores through one other base register (a structure filled in),
+ * spanning at most 256 bytes: the host address of ea when every byte of
+ * [ea, ea + span) would take vm_write*_inl's direct store (below the store
+ * limit, no line of it reserved), else 0 and the run's stores take vm_write*
+ * one by one. The fourth word on the armed flag's line is 0 while
+ * PPU_ST_RUN=0 (spu_coh_stk_eval), which does the same. */
+static inline uint8_t* vm_st_run(uint64_t a, uint32_t span)
+{
+    const uint32_t ea = (uint32_t)a, last = ea + span - 1u;
+    if (!(ea - 0x10000u < g_vm_inl_wr_lim && last - 0x10000u < g_vm_inl_wr_lim)) return (uint8_t*)0;
+    if (!*(volatile unsigned*)&g_spu_coh_armed_line.st_run) return (uint8_t*)0;
+    if (*(volatile int*)&g_spu_coh_armed_line.v)
+        for (uint32_t line = ea >> 7; line <= last >> 7; line++)
+            if ((g_spu_coh_bitmap[line >> 3] >> (line & 7)) & 1u) return (uint8_t*)0;
+    return vm_base + ea;
+}
 #else
 #define vm_write8_stk(a, v)  vm_write8((a), (v))
 #define vm_write16_stk(a, v) vm_write16((a), (v))
 #define vm_write32_stk(a, v) vm_write32((a), (v))
 #define vm_write64_stk(a, v) vm_write64((a), (v))
 static inline uint8_t* vm_stk_run(uint64_t a, uint32_t span) { (void)a; (void)span; return (uint8_t*)0; }
+static inline uint8_t* vm_st_run(uint64_t a, uint32_t span)  { (void)a; (void)span; return (uint8_t*)0; }
 #endif
-/* The stores of such a run, big-endian, as vm_write*_stk's direct store. */
+/* The stores of such a run, big-endian, as the direct stores above. */
 #include <string.h>
-static inline void vm_stk_put8(uint8_t* p, uint8_t v)   { *p = v; }
-static inline void vm_stk_put16(uint8_t* p, uint16_t v) { v = __builtin_bswap16(v); memcpy(p, &v, 2); }
-static inline void vm_stk_put32(uint8_t* p, uint32_t v) { v = __builtin_bswap32(v); memcpy(p, &v, 4); }
-static inline void vm_stk_put64(uint8_t* p, uint64_t v) { v = __builtin_bswap64(v); memcpy(p, &v, 8); }
+static inline void vm_run_put8(uint8_t* p, uint8_t v)   { *p = v; }
+static inline void vm_run_put16(uint8_t* p, uint16_t v) { v = __builtin_bswap16(v); memcpy(p, &v, 2); }
+static inline void vm_run_put32(uint8_t* p, uint32_t v) { v = __builtin_bswap32(v); memcpy(p, &v, 4); }
+static inline void vm_run_put64(uint8_t* p, uint64_t v) { v = __builtin_bswap64(v); memcpy(p, &v, 8); }
 
 /* Syscall handler */
 #ifdef __cplusplus
