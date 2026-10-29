@@ -2307,6 +2307,10 @@ typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; ui
 #define SPU_OVL_SRC_MAX 128
 static spu_ovl_src s_ovl_src[SPU_OVL_SRC_MAX];
 static int s_ovl_src_count = 0;
+/* Whether a GET has anything to note (mfc_note_get, spu_dma.h tests it): a
+ * registered source, or SPU_DUMP_OVL. 1 until the first note has read
+ * SPU_DUMP_OVL; a registration sets it again. */
+int g_spu_ovl_note = 1;
 
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
 {
@@ -2315,6 +2319,7 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         s_ovl_src[s_ovl_src_count].has_sig = 0;
         s_ovl_src_count++;
+        g_spu_ovl_note = 1;
     }
 }
 
@@ -2431,6 +2436,7 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
         s_ovl_src_count++;
+        g_spu_ovl_note = 1;
     }
 }
 
@@ -2451,7 +2457,8 @@ static SPU_NOINLINE void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t ls
     if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e;
         if (s_on) { snprintf(s_dir, sizeof s_dir, "%s", e);
                     char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } }
-        s_ovl_dump_on = s_on; }
+        s_ovl_dump_on = s_on;
+        if (!s_on && !s_ovl_src_count) g_spu_ovl_note = 0; }
     if (!s_on) return;
     static uint32_t s_seen[256]; static unsigned s_n;
     static SPU_TLS uint32_t t_src, t_next_ea, t_next_lsa;
