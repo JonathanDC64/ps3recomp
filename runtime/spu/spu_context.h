@@ -411,6 +411,11 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+
+    /* The MFC engine slot this context was last found in, plus 1 (0: none),
+     * for spu_channels.c's mfc_for. Checked against the slot's owner on
+     * every use, so a stale one only costs the lookup it saves. */
+    uint32_t mfc_slot1;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
