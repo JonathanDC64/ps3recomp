@@ -471,6 +471,57 @@ typedef struct ring_post {
     u128 keep[11];               /* r80-r90 come back unchanged */
 } ring_post;
 
+/* SPU_POST_FAST=0 (live): the prologue stores below go through
+ * spu_ls_write128 one table entry at a time, as before. =2 also checks each
+ * slot against the table (post_fast_check). */
+static int post_fast(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_POST_FAST", 1));
+    return on;
+}
+
+/* A quadword into local store as spu_ls_write128 stores it, without its
+ * probe test: for code that runs only while g_spu_ls_dbg is 0. */
+RING_INLINE void ls_put128(uint8_t* ls, uint32_t lsa, u128 v)
+{
+    uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+    const uint32_t w0 = SPU_BSWAP32(v._u32[0]), w1 = SPU_BSWAP32(v._u32[1]);
+    const uint32_t w2 = SPU_BSWAP32(v._u32[2]), w3 = SPU_BSWAP32(v._u32[3]);
+    memcpy(p, &w0, 4); memcpy(p + 4, &w1, 4);
+    memcpy(p + 8, &w2, 4); memcpy(p + 12, &w3, 4);
+}
+
+/* SPU_POST_FAST=2: after the straight stores, each slot against what the
+ * table loop stores there. */
+RING_NOINLINE void post_fast_check(spu_context* ctx, uint32_t sp, u128 link, u128 seg)
+{
+    static unsigned long long n, bad;
+    const u128* r = ctx->gpr;
+    int ok = 1;
+    for (int k = 0; k < 14; k++) {
+        const uint32_t lsa = k < 13 ? sp + (uint32_t)(int32_t)k_post_slot[k] : RING_SEG_LS;
+        const u128 v = k == 13 ? seg : k_post_reg[k] ? r[k_post_reg[k]] : link;
+        uint8_t want[16];
+        for (int i = 0; i < 4; i++) {
+            want[4 * i] = (uint8_t)(v._u32[i] >> 24); want[4 * i + 1] = (uint8_t)(v._u32[i] >> 16);
+            want[4 * i + 2] = (uint8_t)(v._u32[i] >> 8); want[4 * i + 3] = (uint8_t)v._u32[i];
+        }
+        if (memcmp(ctx->ls + (lsa & (SPU_LS_MASK & ~0xFu)), want, 16)) {
+            ok = 0;
+            if (bad < 8)
+                fprintf(stderr, "[ring-post] spu=%u slot %d (LS 0x%05X) differs from the table\n",
+                        ctx->spu_id, k, lsa & SPU_LS_MASK);
+        }
+    }
+    bad += !ok;
+    n++;
+    if ((n & (n - 1)) == 0 && n >= 1024) {
+        fprintf(stderr, "[ring-post] fast stores: %llu checked, %llu differ\n", n, bad);
+        fflush(stderr);
+    }
+}
+
 /* The fast path, or the reason it is not taken (nothing written then). With
  * rec, the result goes there and nothing is written; without, it is applied. */
 RING_INLINE int ring_post_run(spu_context* ctx, ring_post* rec)
@@ -510,9 +561,36 @@ RING_INLINE int ring_post_run(spu_context* ctx, ring_post* rec)
         for (int k = 0; k < 11; k++) rec->keep[k] = r[80 + k];
         return POST_OK;
     }
-    for (int k = 0; k < 13; k++)
-        spu_ls_write128(ctx, sp + (uint32_t)(int32_t)k_post_slot[k], k_post_reg[k] ? r[k_post_reg[k]] : link);
-    spu_ls_write128(ctx, RING_SEG_LS, seg);
+    /* The prologue stores in k_post_slot's order, one statement each. Both
+     * callers run this only while g_spu_ls_dbg is 0 (spu_hook_ring_post's
+     * entry test, ring_loop's loop_yield), so no probe has to see them, and
+     * sp passed the frame checks above, so every slot is in local store. The
+     * loop over the tables went through spu_ls_write128, which reloaded
+     * ctx->ls and tested the probe flag for each of the 13: 3.9% of image 2
+     * in the deep Palace, every command. */
+    const int fast = post_fast();
+    if (fast) {
+        uint8_t* const ls = ctx->ls;
+        ls_put128(ls, sp - 0x20u, r[81]);
+        ls_put128(ls, sp - 0x60u, r[85]);
+        ls_put128(ls, sp - 0x10u, r[80]);
+        ls_put128(ls, sp - 0x30u, r[82]);
+        ls_put128(ls, sp - 0x40u, r[83]);
+        ls_put128(ls, sp - 0x50u, r[84]);
+        ls_put128(ls, sp - 0x80u, r[87]);
+        ls_put128(ls, sp - 0x90u, r[88]);
+        ls_put128(ls, sp + 0x10u, link);
+        ls_put128(ls, sp - 0x70u, r[86]);
+        ls_put128(ls, sp - 0xA0u, r[89]);
+        ls_put128(ls, sp - 0xB0u, r[90]);
+        ls_put128(ls, sp - 0x100u, r[1]);
+        ls_put128(ls, RING_SEG_LS, seg);
+        if (__builtin_expect(fast == 2, 0)) post_fast_check(ctx, sp, link, seg);
+    } else {
+        for (int k = 0; k < 13; k++)
+            spu_ls_write128(ctx, sp + (uint32_t)(int32_t)k_post_slot[k], k_post_reg[k] ? r[k_post_reg[k]] : link);
+        spu_ls_write128(ctx, RING_SEG_LS, seg);
+    }
     r[30] = spu_cwd(spu_ai(r[1], -256), 12);
     r[0] = link;
     r[2] = r2;
