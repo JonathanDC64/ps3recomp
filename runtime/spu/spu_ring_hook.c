@@ -887,6 +887,29 @@ RING_INLINE int loop_plan_cmd(const uint8_t* ls, unsigned cmd, loop_plan* p)
     return 1;
 }
 
+/* A shufb by a cwd / cwx mask stored back where its quadword came from
+ * changes one word: the value's preferred word lands on the word the
+ * address names and the other twelve bytes are stored as they were. So it
+ * is that word's store; chd's is the halfword's. SPU_LOOP_INSERTS=0 (live)
+ * runs the load, the shuffle and the 16-byte store again, as the lifted
+ * instructions do. */
+static int loop_inserts(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_LOOP_INSERTS", 1));
+    return on;
+}
+RING_INLINE void ls_put_word(uint8_t* ls, uint32_t lsa, uint32_t v)
+{
+    uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~3u));
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+RING_INLINE void ls_put_half(uint8_t* ls, uint32_t lsa, uint32_t v)
+{
+    uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~1u));
+    p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v;
+}
+
 /* 0x4958: command 7, the lifted instructions in order. Returns r80. */
 RING_INLINE u128 loop_cmd7(uint8_t* ls)
 {
@@ -901,10 +924,14 @@ RING_INLINE u128 loop_cmd7(uint8_t* ls)
     const u128 r35 = spu_andi(r47, 15);
     const u128 r36 = spu_a(r45, r46);
     const u128 r38 = spu_a(r43, r44);
-    const u128 r40 = lsq(ls, r38._u32[0] + r37._u32[0]);
-    const u128 r42 = spu_cwx(r38, r37);
-    const u128 r39 = spu_shufb(r41, r40, r42);
-    lsq_put(ls, r38._u32[0] + r37._u32[0], r39);
+    if (loop_inserts()) {
+        ls_put_word(ls, r38._u32[0] + r37._u32[0], r41._u32[0]);    /* cwx, shufb */
+    } else {
+        const u128 r40 = lsq(ls, r38._u32[0] + r37._u32[0]);
+        const u128 r42 = spu_cwx(r38, r37);
+        const u128 r39 = spu_shufb(r41, r40, r42);
+        lsq_put(ls, r38._u32[0] + r37._u32[0], r39);
+    }
     const u128 r80 = lsq(ls, RING_DIRTY_PTR_LS);
     const u128 r34 = lsq(ls, r36._u32[0]);
     const u128 r33 = lsq(ls, r80._u32[0]);
@@ -941,6 +968,18 @@ RING_INLINE u128 loop_cmd12(uint8_t* ls)
     const u128 r33 = spu_andi(r37, 255);
     const u128 r35 = spu_shli(r38, 4);
     const u128 r16 = spu_a(r35, r36);
+    if (loop_inserts()) {
+        /* chd 10 / 8 and cwd 0 / 4 at r16, into the quadwords at r16 + 890,
+         * 888, 0x370 and 884: the same low four bits, so those addresses. */
+        const u128 r30 = lsq(ls, RING_CMD_LS);
+        ls_put_half(ls, r16._u32[0] + 890u, r33._u32[0]);
+        ls_put_half(ls, r16._u32[0] + 888u, spu_rotqbyi(r30, 4)._u32[0]);
+        const u128 r25 = lsq(ls, RING_CMD_LS);
+        ls_put_word(ls, r16._u32[0] + 0x370u, spu_rotqbyi(r25, 8)._u32[0]);
+        const u128 r21 = lsq(ls, RING_CMD_LS);
+        ls_put_word(ls, r16._u32[0] + 884u, spu_rotqbyi(r21, 12)._u32[0]);
+        return r80;
+    }
     const u128 r32 = lsq(ls, r16._u32[0] + r80._u32[0]);
     const u128 r34 = spu_chd(r16, 10);
     const u128 r29 = spu_chd(r16, 8);
@@ -981,10 +1020,14 @@ RING_INLINE void loop_cmd8(uint8_t* ls)
     const u128 r59 = spu_a(r60, r61);
     const u128 r57 = spu_shli(r59, 2);
     const u128 r52 = spu_a(r57, r58);
-    const u128 r54 = lsq(ls, r52._u32[0] + r51._u32[0]);
-    const u128 r56 = spu_cwx(r52, r51);
-    const u128 r53 = spu_shufb(r55, r54, r56);
-    lsq_put(ls, r52._u32[0] + r51._u32[0], r53);
+    if (loop_inserts()) {
+        ls_put_word(ls, r52._u32[0] + r51._u32[0], r55._u32[0]);    /* cwx, shufb */
+    } else {
+        const u128 r54 = lsq(ls, r52._u32[0] + r51._u32[0]);
+        const u128 r56 = spu_cwx(r52, r51);
+        const u128 r53 = spu_shufb(r55, r54, r56);
+        lsq_put(ls, r52._u32[0] + r51._u32[0], r53);
+    }
     loop_4a08(ls);
 }
 
