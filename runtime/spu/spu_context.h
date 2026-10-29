@@ -36,8 +36,8 @@ extern "C" {
  * Reusable env-driven LS watchpoint (mini-debugger, no rebuild to retarget).
  *   SPU_LS_WATCH=0x1BE80        watch one 16-byte LS line (reads + writes)
  *   SPU_LS_WATCH=0x1BE80,0x927D80  up to 4 comma-separated addresses
- * Fires from every SPU image's spu_ls_read128/write128. Cheap: one cached
- * compare on the hot path when disabled.
+ * Fires from every SPU image's spu_ls_read128/write128, in a build with
+ * SPU_LS_PROBES=1 (see g_spu_ls_dbg below).
  * -----------------------------------------------------------------------*/
 /* The check sits on every spu_ls_read128/write128, so the disabled case must
  * be one load and a branch: it was a real call (the function-local statics
@@ -520,8 +520,18 @@ SPU_GATE int g_wws_read_probe = 0;
  * per SPU basic block). -1 until the first access reads the environment, then
  * the SPU_LSDBG_* bits of the probes that are on, or 0. Read once: setting a
  * probe takes a restart. SPU_WWS_PROBE=1 turns on the WWS buffer and code
- * probes, which ran for every image-2 policy-module access before. */
-SPU_GATE int g_spu_ls_dbg = -1;
+ * probes, which ran for every image-2 policy-module access before.
+ *
+ * Built only with SPU_LS_PROBES=1 (CMake: PS3RECOMP_SPU_LS_PROBES=ON; a game's
+ * lifted SPU sources need the define as well). Without it the accessors have
+ * no gate and g_spu_ls_dbg stays 0. The gate's test and cold call at every
+ * access were a quarter of the instructions in Demon's Souls' image 2 hot
+ * regions, the call keeping values out of registers around it, and the deep
+ * Palace ran 2.5% faster without them. */
+#ifndef SPU_LS_PROBES
+#  define SPU_LS_PROBES 0
+#endif
+SPU_GATE int g_spu_ls_dbg = SPU_LS_PROBES ? -1 : 0;
 #define SPU_LSDBG_LOWREAD 1
 #define SPU_LSDBG_WATCH   2
 #define SPU_LSDBG_SMC     4
@@ -539,13 +549,21 @@ SPU_GATE int g_spu_ls_dbg = -1;
 #else
 #  define SPU_LS_COLD static __attribute__((noinline, cold))
 #endif
-SPU_LS_COLD int spu_ls_dbg_resolve(void)
+/* The SPU_LSDBG_* bits of the probes the environment asks for. Inline, not
+ * cold: a build without the probes calls it only from spu_channels.c, and an
+ * unused static function draws a warning in every other file. */
+static inline int spu_ls_dbg_env(void)
 {
     const char* w = getenv("SPU_LS_WATCH");
-    const int v = (getenv("SPU_LS_LOWREAD") ? SPU_LSDBG_LOWREAD : 0) |
-                  (w && *w ? SPU_LSDBG_WATCH : 0) |
-                  (getenv("SPU_SMC_WATCH") ? SPU_LSDBG_SMC : 0) |
-                  (getenv("SPU_WWS_PROBE") ? SPU_LSDBG_WWS : 0);
+    return (getenv("SPU_LS_LOWREAD") ? SPU_LSDBG_LOWREAD : 0) |
+           (w && *w ? SPU_LSDBG_WATCH : 0) |
+           (getenv("SPU_SMC_WATCH") ? SPU_LSDBG_SMC : 0) |
+           (getenv("SPU_WWS_PROBE") ? SPU_LSDBG_WWS : 0);
+}
+#if SPU_LS_PROBES
+SPU_LS_COLD int spu_ls_dbg_resolve(void)
+{
+    const int v = spu_ls_dbg_env();
     g_spu_ls_dbg = v;
     return v;
 }
@@ -586,6 +604,7 @@ SPU_LS_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
         }
     }
 }
+#endif /* SPU_LS_PROBES */
 
 /* The LS accessors are forced inline. A --regions body is one C function for
  * a whole stretch of SPU code, and in the biggest ones clang stopped inlining
@@ -598,6 +617,7 @@ SPU_LS_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 #  define SPU_LS_INLINE static inline __attribute__((always_inline))
 #endif
 
+#if SPU_LS_PROBES
 SPU_LS_COLD void spu_ls_read_dbg(const spu_context* ctx, uint32_t lsa)
 {
     const int d = g_spu_ls_dbg < 0 ? spu_ls_dbg_resolve() : g_spu_ls_dbg;
@@ -609,12 +629,15 @@ SPU_LS_COLD void spu_ls_read_dbg(const spu_context* ctx, uint32_t lsa)
                           ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     }
 }
+#endif
 
 SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_PROBES
     if (__builtin_expect(g_spu_ls_dbg != 0, 0))
         spu_ls_read_dbg(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
 #if SPU_LS_FAST
@@ -634,6 +657,7 @@ SPU_LS_INLINE u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
+#if SPU_LS_PROBES
 SPU_LS_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, uint32_t word0)
 {
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
@@ -704,6 +728,7 @@ SPU_LS_COLD void spu_ls_write_dbg(spu_context* ctx, uint32_t lsa, const uint8_t*
     if (d & SPU_LSDBG_SMC)
         spu_ls_write_probe_smc(ctx, lsa, p);
 }
+#endif /* SPU_LS_PROBES */
 
 SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
@@ -729,8 +754,10 @@ SPU_LS_INLINE void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_PROBES
     if (__builtin_expect(g_spu_ls_dbg != 0, 0))
         spu_ls_write_dbg(ctx, lsa, p);
+#endif
 }
 
 /* ---------------------------------------------------------------------------

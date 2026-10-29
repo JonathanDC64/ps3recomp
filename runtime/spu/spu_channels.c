@@ -1313,6 +1313,15 @@ static SPU_NOINLINE int spu_ch_diag_load(void)
     g_spu_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
                      getenv("SPU_TAGPROBE")) ? 1 : 0;
     g_spu_ch_diag_gen = ps3_env_gen;
+#if !SPU_LS_PROBES
+    /* An LS probe asked for in a build without them (spu_context.h). */
+    static int s_ls_told;
+    if (!s_ls_told && spu_ls_dbg_env()) {
+        s_ls_told = 1;
+        fprintf(stderr, "[spu] SPU_LS_WATCH, SPU_LS_LOWREAD, SPU_SMC_WATCH and SPU_WWS_PROBE need a build "
+                        "with SPU_LS_PROBES=1 (CMake PS3RECOMP_SPU_LS_PROBES=ON): ignored\n");
+    }
+#endif
     return g_spu_ch_diag;
 }
 static inline int spu_ch_diag(void)

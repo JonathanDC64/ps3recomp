@@ -37,6 +37,15 @@ if(PS3RECOMP_STATIC_CRT)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# The SPU local-store debug probes (SPU_LS_WATCH, SPU_LS_LOWREAD, SPU_SMC_WATCH,
+# SPU_WWS_PROBE; runtime/spu/spu_context.h). Their gate is a test and a cold call at
+# every local-store access, so they are built only on request. A game that builds its
+# lifted SPU sources itself defines SPU_LS_PROBES=1 for them too.
+option(PS3RECOMP_SPU_LS_PROBES "Build the SPU local-store debug probes (SPU_LS_WATCH and others)" OFF)
+if(PS3RECOMP_SPU_LS_PROBES)
+    add_compile_definitions(SPU_LS_PROBES=1)
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
