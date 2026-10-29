@@ -78,6 +78,7 @@ extern unsigned g_spu_ch_diag_gen;
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t value);
+void spu_wrch_xfer_wait(spu_context* ctx, uint32_t cmd, uint32_t mode);
 int  spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea);
 
 #define RING_LINE_LS  0x13480u   /* the control line's copy (GETLLAR target) */
@@ -131,6 +132,15 @@ typedef struct ring_get_memo {
     unsigned long long n, skipped;
 } ring_get_memo;
 static SPU_THREAD_LOCAL ring_get_memo t_get;
+
+/* SPU_XFER_WAIT (live): 1 (default) issues a transfer and its tag wait as
+ * one spu_wrch_xfer_wait call; 0 as two spu_wrch_word calls, for A/B. */
+RING_INLINE int ring_xfer_wait_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_XFER_WAIT", 1));
+    return on;
+}
 
 static int ring_get_skip_mode(void)
 {
@@ -222,8 +232,16 @@ RING_INLINE int ring_fetch(spu_context* ctx)
         if (skip_mode && m->ctx == ctx && m->next == get && m->ea == blk && m->lsa == lsa &&
             get + 16u <= m->put)
             skip = memcmp(ctx->ls + lsa + (get & 112u), &m->q[(get & 112u) >> 4], 16) == 0;
+        r[79] = spu_il(1);
+        ctx->mfc_tag_mask = 1;
+        r[78] = spu_il(2);
+        if (ring_xfer_wait_on()) {
+            spu_wrch_xfer_wait(ctx, skip ? 0u : 64u, 2);   /* the GET, then wait for all of tag 0 */
+        } else {
+            if (!skip) spu_wrch_word(ctx, MFC_Cmd, 64);
+            spu_wrch_word(ctx, MFC_WrTagUpdate, 2);
+        }
         if (!skip) {
-            spu_wrch_word(ctx, MFC_Cmd, 64);
             if (skip_mode && !(lsa & 15u) && lsa + 128u <= SPU_LS_SIZE) {
                 m->ctx = ctx; m->ea = blk; m->lsa = lsa; m->put = r4._u32[0];
                 memcpy(m->q, ctx->ls + lsa, 128);
@@ -237,10 +255,6 @@ RING_INLINE int ring_fetch(spu_context* ctx)
             if ((++m->n & ((1ull << 22) - 1)) == 0) ring_get_stats(ctx);
         }
     }
-    r[79] = spu_il(1);
-    ctx->mfc_tag_mask = 1;
-    r[78] = spu_il(2);
-    spu_wrch_word(ctx, MFC_WrTagUpdate, 2);
     r[2] = spu_make_preferred_u32(ctx->mfc_tag_status);
     /* 0x4704-0x472C: copy the command out, get += 16. */
     const u128 r73 = spu_ls_read128(ctx, RING_STATE_LS);
@@ -1120,9 +1134,13 @@ RING_INLINE void loop_get_wait(spu_context* ctx, const loop_plan* p)
     ctx->mfc_eal = p->get_eal;
     ctx->mfc_size = p->get_size;
     ctx->mfc_tag = 0;
-    spu_wrch_word(ctx, MFC_Cmd, 64);             /* GET */
     ctx->mfc_tag_mask = 1;
-    spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
+    if (ring_xfer_wait_on()) {
+        spu_wrch_xfer_wait(ctx, 64, 1);          /* GET, then ANY: waits for tag 0 */
+    } else {
+        spu_wrch_word(ctx, MFC_Cmd, 64);         /* GET */
+        spu_wrch_word(ctx, MFC_WrTagUpdate, 1);  /* ANY: waits for tag 0 */
+    }
     r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
     r[0] = spu_ls_read128(ctx, sp + 0x10);
     ctx->pc = r[0]._u32[0];                      /* SPU_RET */

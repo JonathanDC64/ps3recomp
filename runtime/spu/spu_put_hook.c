@@ -32,6 +32,7 @@
 extern int g_spu_ch_diag;
 extern unsigned g_spu_ch_diag_gen;
 void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t value);   /* spu_wrch, an il value */
+void spu_wrch_xfer_wait(spu_context* ctx, uint32_t cmd, uint32_t mode);    /* the PUT and its tag wait */
 
 static int native_put_on(void)
 {
@@ -83,9 +84,16 @@ static int put_wait(spu_context* ctx, int defer)
     ctx->mfc_eal = eal;
     ctx->mfc_size = size;
     ctx->mfc_tag = 0;
-    if (!defer) spu_wrch_word(ctx, MFC_Cmd, 32); /* PUT */
     ctx->mfc_tag_mask = 1;
-    spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
+    /* SPU_XFER_WAIT (live, as spu_ring_hook.c): 0 makes the two calls. */
+    static int one = -1;
+    PS3_KNOB(one, ps3_env_int("SPU_XFER_WAIT", 1));
+    if (one) {
+        spu_wrch_xfer_wait(ctx, defer ? 0u : 32u, 1);   /* PUT, then ANY: waits for tag 0 */
+    } else {
+        if (!defer) spu_wrch_word(ctx, MFC_Cmd, 32);    /* PUT */
+        spu_wrch_word(ctx, MFC_WrTagUpdate, 1);         /* ANY: waits for tag 0 */
+    }
     r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
     return 1;
 }
