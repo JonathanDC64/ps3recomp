@@ -105,6 +105,47 @@ static inline uint32_t be32_at(const uint8_t* p)
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
+/* The fetch GETs the 128 bytes around get for every 16-byte command, so a
+ * block holding eight commands is copied up to eight times, and each copy
+ * pulls back the lines the producer is still writing commands into (its next
+ * store to them then waits for the line, and its sync with it). The commands
+ * before the put that was read ahead of a GET were already in memory when it
+ * copied them, and the producer does not write them again until get has gone
+ * past them, so the next command is skipped when that GET already covered it:
+ *     the same block and LS buffer, and get is the command after the last one
+ *         this fetch took (no ring reset, no command taken elsewhere);
+ *     get + 16 is at or before the put read ahead of that GET (no wrap since);
+ *     the command's quadword in the LS buffer is still what the GET left.
+ * The GET's other quadwords then keep the older copy, as if it had come before
+ * the producer's later stores; the fetch reads only the command's. The tag
+ * wait still goes through the channel, so the tag status is the same.
+ *
+ * SPU_RING_GET_SKIP (live): 1 (default) as above, 0 GETs every command, 2 as
+ * 1 and prints how many were skipped every 2^22 fetches. */
+typedef struct ring_get_memo {
+    const spu_context* ctx;
+    uint32_t ea, lsa;      /* the block last GET, and where it went in local store */
+    uint32_t put;          /* put as read before that GET */
+    uint32_t next;         /* get after the last command the fetch took */
+    u128 q[8];             /* the block as that GET left it in local store */
+    unsigned long long n, skipped;
+} ring_get_memo;
+static SPU_THREAD_LOCAL ring_get_memo t_get;
+
+static int ring_get_skip_mode(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_RING_GET_SKIP", 1));
+    return on;
+}
+
+RING_NOINLINE void ring_get_stats(const spu_context* ctx)
+{
+    fprintf(stderr, "[ring-get] spu=%u %llu fetches, %llu GETs skipped (%.1f%%)\n", ctx->spu_id,
+            t_get.n, t_get.skipped, 100.0 * (double)t_get.skipped / (double)t_get.n);
+    fflush(stderr);
+}
+
 /* The fetch step: 1 when it took a command, 0 runs the lifted code. */
 RING_INLINE int ring_fetch(spu_context* ctx)
 {
@@ -172,7 +213,30 @@ RING_INLINE int ring_fetch(spu_context* ctx)
     ctx->mfc_eal = r13._u32[0];
     ctx->mfc_size = 128;
     ctx->mfc_tag = 0;
-    spu_wrch_word(ctx, MFC_Cmd, 64);
+    {
+        const int skip_mode = ring_get_skip_mode();
+        const uint32_t get = state._u32[0], blk = r13._u32[0];
+        const uint32_t lsa = r10._u32[0] & SPU_LS_MASK;
+        ring_get_memo* m = &t_get;
+        int skip = 0;
+        if (skip_mode && m->ctx == ctx && m->next == get && m->ea == blk && m->lsa == lsa &&
+            get + 16u <= m->put)
+            skip = memcmp(ctx->ls + lsa + (get & 112u), &m->q[(get & 112u) >> 4], 16) == 0;
+        if (!skip) {
+            spu_wrch_word(ctx, MFC_Cmd, 64);
+            if (skip_mode && !(lsa & 15u) && lsa + 128u <= SPU_LS_SIZE) {
+                m->ctx = ctx; m->ea = blk; m->lsa = lsa; m->put = r4._u32[0];
+                memcpy(m->q, ctx->ls + lsa, 128);
+            } else {
+                m->ctx = NULL;
+            }
+        }
+        m->next = get + 16u;
+        if (__builtin_expect(skip_mode == 2, 0)) {
+            m->skipped += (unsigned)skip;
+            if ((++m->n & ((1ull << 22) - 1)) == 0) ring_get_stats(ctx);
+        }
+    }
     r[79] = spu_il(1);
     ctx->mfc_tag_mask = 1;
     r[78] = spu_il(2);
@@ -613,6 +677,8 @@ int spu_hook_ring_post(spu_context* ctx)
  * when the command is sampled, so a source the PPU rewrites in the moment
  * between would read as a mismatch. */
 int spu_hook_put_wait(spu_context* ctx);
+int spu_hook_put_wait_defer(spu_context* ctx);
+void spu_put_flush(spu_context* ctx, uint32_t eah, uint32_t eal, uint32_t lsa, uint32_t size);
 
 #define RING_DIRTY_PTR_LS 0x133A0u   /* word 0: the dirty block */
 #define RING_STATE_PTR_LS 0x13390u   /* word 0: the state block */
@@ -995,15 +1061,45 @@ RING_NOINLINE void loop_check_end(spu_context* ctx)
     }
 }
 
+/* Each command PUTs the consumer's state (get) back to memory, where the
+ * producer reads it before every command it writes, to see whether the ring
+ * is full: one transfer of that line each way per command. Inside the loop
+ * the PUT can wait for the next few commands: what reaches memory is the
+ * newest state, as the last of those PUTs would have written it, only later,
+ * as from a slower consumer. Every way out of the loop PUTs first, so the
+ * producer always sees get before this SPU waits for a command or runs
+ * lifted code, and a full ring still drains: the loop goes on while there
+ * are commands, and PUTs every n-th.
+ *
+ * SPU_RING_PUT_EVERY=<n> (live): PUT the state every n-th command in the
+ * loop (default 16); 1 every command, as the program does. In the deep
+ * Palace the frame rate rose with n up to 16 (+8%) and stayed there to no
+ * limit at all. */
+static int ring_put_every(void)
+{
+    static int n = -1;
+    PS3_KNOB(n, ps3_env_int("SPU_RING_PUT_EVERY", 16));
+    return n;
+}
+typedef struct ring_put_pend { int n; uint32_t eah, eal, lsa, size; } ring_put_pend;
+RING_INLINE void ring_put_out(spu_context* ctx, ring_put_pend* p)
+{
+    if (p->n) { spu_put_flush(ctx, p->eah, p->eal, p->lsa, p->size); p->n = 0; }
+}
+
 /* From the fetch, which just took a command: run the commands it can. 1: the
  * lifted code goes on at 0x4730 with the command at 0x13560; 0: at 0x4618. */
 RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
 {
     const unsigned gen = ps3_env_gen;
+    const int every = ring_put_every();
+    ring_put_pend pend = {0};
     for (;;) {
         loop_plan p;
-        if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &p))
+        if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &p)) {
+            ring_put_out(ctx, &pend);
             return 1;
+        }
         if (mode == 2) {
             if (++t_loop_count % (unsigned)native_loop_every() == 0) loop_check_start(ctx, &p);
             return 1;
@@ -1011,9 +1107,22 @@ RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
         u128* r = ctx->gpr;
         /* 0x4730: brsl to 0xC358, whose entry hook does the PUT. */
         r[0] = spu_link(0x4734);
+        int defer = 0;
+        if (every > 1) {
+            const uint32_t eah = r[3]._u32[0], eal = r[3]._u32[1], lsa = r[4]._u32[0], size = r[5]._u32[0];
+            if (pend.n && (pend.eah != eah || pend.eal != eal || pend.lsa != lsa || pend.size != size))
+                ring_put_out(ctx, &pend);
+            defer = pend.n + 1 < every;
+            pend.eah = eah; pend.eal = eal; pend.lsa = lsa; pend.size = size;
+        }
         const int32_t si = (int32_t)ctx->image_id;
         ctx->host_depth++;
-        if (!spu_hook_put_wait(ctx)) { ctx->host_depth--; return 1; }   /* SPU_NATIVE_PUT=0 */
+        if (!(defer ? spu_hook_put_wait_defer(ctx) : spu_hook_put_wait(ctx))) {   /* SPU_NATIVE_PUT=0 */
+            ctx->host_depth--;
+            ring_put_out(ctx, &pend);
+            return 1;
+        }
+        pend.n = defer ? pend.n + 1 : 0;
         ctx->pc = 0x4734;                                                /* SPU_RET */
         ctx->drain_ret_pc = 0;                                           /* spu_call_done */
         ctx->host_depth--;
@@ -1035,8 +1144,10 @@ RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
         }
         /* 0x4818: r81 == 0, the branch back to 0x4618. */
         ctx->steps++;
-        if (loop_yield(ctx, gen)) return 0;
-        if (!ring_fetch(ctx)) return 0;
+        if (loop_yield(ctx, gen) || !ring_fetch(ctx)) {
+            ring_put_out(ctx, &pend);
+            return 0;
+        }
     }
 }
 
