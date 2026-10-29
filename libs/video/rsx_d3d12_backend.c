@@ -314,6 +314,8 @@ typedef struct {
      * If they differ later, the title put something else there. */
     u32                   gaddr, glen, gsum;
     int                   gsum_ok, gsum_new;
+    u32                   gpu_dst;     /* used == 3: the GPU stored it at this guest address */
+    int                   gpu_check;   /* RSX_WB_GPU=2: the CPU store goes to a scratch copy to compare */
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..20 hold offscreen-RT SRVs */
@@ -8829,12 +8831,13 @@ static u32 rt_guest_bpp(u32 dxgi)
  * later at that offset was filled from it: the Profile List showed coloured
  * noise below its footer, where it draws nothing over a recreated target. */
 static ID3D12RootSignature*  s_down_rs;
-static ID3D12PipelineState*  s_down_pso[4];
-static u32                   s_down_pso_fmt[4];
+static ID3D12PipelineState*  s_down_pso[8];
+static u32                   s_down_pso_fmt[8];   /* format, | 1 << 31 for guest byte order */
 static ID3D12DescriptorHeap* s_down_srv;   /* shader visible, 2 x MAX_OFF_RTS (frame parity) */
 static ID3D12DescriptorHeap* s_down_rtv;
 static ID3DBlob*             s_down_vs;
 static ID3DBlob*             s_down_ps;
+static ID3DBlob*             s_down_ps_argb;   /* A,R,G,B bytes: the guest's A8R8G8B8 */
 
 static int down_init(void)
 {
@@ -8852,9 +8855,17 @@ static int down_init(void)
         "float4 main(float4 p : SV_Position) : SV_Target {\n"
         "    return src.Load(int3(int2(p.xy * ratio), 0));\n"
         "}\n";
+    static const char ps_argb[] =
+        "Texture2D<float4> src : register(t0);\n"
+        "cbuffer K : register(b0) { float2 ratio; };\n"
+        "float4 main(float4 p : SV_Position) : SV_Target {\n"
+        "    return src.Load(int3(int2(p.xy * ratio), 0)).argb;\n"
+        "}\n";
     ID3DBlob* err = NULL;
     if (FAILED(D3DCompile(vs, sizeof vs - 1, "down_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &s_down_vs, &err)) ||
-        FAILED(D3DCompile(ps, sizeof ps - 1, "down_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &s_down_ps, &err))) {
+        FAILED(D3DCompile(ps, sizeof ps - 1, "down_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &s_down_ps, &err)) ||
+        FAILED(D3DCompile(ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, NULL, "main", "ps_5_0", 0, 0,
+                          &s_down_ps_argb, &err))) {
         if (err) { fprintf(stderr, "[D3D12] write-back downscale: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
                    err->lpVtbl->Release(err); }
         return 0;
@@ -8897,19 +8908,21 @@ static int down_init(void)
     return 1;
 }
 
-static ID3D12PipelineState* down_pso(DXGI_FORMAT f)
+static ID3D12PipelineState* down_pso(DXGI_FORMAT f, int argb)
 {
-    for (int i = 0; i < 4; i++)
-        if (s_down_pso[i] && s_down_pso_fmt[i] == (u32)f) return s_down_pso[i];
+    const u32 key = (u32)f | (argb ? 1u << 31 : 0u);
+    for (int i = 0; i < 8; i++)
+        if (s_down_pso[i] && s_down_pso_fmt[i] == key) return s_down_pso[i];
     int slot = -1;
-    for (int i = 0; i < 4; i++) if (!s_down_pso[i]) { slot = i; break; }
+    for (int i = 0; i < 8; i++) if (!s_down_pso[i]) { slot = i; break; }
     if (slot < 0) return NULL;
+    ID3DBlob* const ps = argb ? s_down_ps_argb : s_down_ps;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
     pd.pRootSignature = s_down_rs;
     pd.VS.pShaderBytecode = s_down_vs->lpVtbl->GetBufferPointer(s_down_vs);
     pd.VS.BytecodeLength  = s_down_vs->lpVtbl->GetBufferSize(s_down_vs);
-    pd.PS.pShaderBytecode = s_down_ps->lpVtbl->GetBufferPointer(s_down_ps);
-    pd.PS.BytecodeLength  = s_down_ps->lpVtbl->GetBufferSize(s_down_ps);
+    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
+    pd.PS.BytecodeLength  = ps->lpVtbl->GetBufferSize(ps);
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
@@ -8920,17 +8933,18 @@ static ID3D12PipelineState* down_pso(DXGI_FORMAT f)
     pd.SampleDesc.Count = 1;
     if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
             &IID_ID3D12PipelineState, (void**)&s_down_pso[slot]))) { s_down_pso[slot] = NULL; return NULL; }
-    s_down_pso_fmt[slot] = (u32)f;
+    s_down_pso_fmt[slot] = key;
     return s_down_pso[slot];
 }
 
 /* Draw scaled target i down to its guest size; the copy is left in COPY_SOURCE.
+ * `argb`: in the guest's byte order (an R8G8B8A8 copy holding A,R,G,B).
  * Returns NULL if that cannot be done (the target is then not written back). */
-static ID3D12Resource* off_rt_downscale(int i)
+static ID3D12Resource* off_rt_downscale(int i, int argb)
 {
     OffRT* r = &s_d3d.off_rt[i];
     if (!down_init()) return NULL;
-    ID3D12PipelineState* pso = down_pso((DXGI_FORMAT)r->gdxgi);
+    ID3D12PipelineState* pso = down_pso((DXGI_FORMAT)r->gdxgi, argb);
     if (!pso) return NULL;
     if (r->down && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->gdxgi)) {
         off_rt_defer_release(r->down); r->down = NULL;
@@ -8996,6 +9010,108 @@ static ID3D12Resource* off_rt_downscale(int i)
     return r->down;
 }
 
+/* RSX_WB_GPU (live, default 1; Windows): the write-back of a linear A8R8G8B8
+ * target in RSX local memory goes from the GPU straight into guest memory,
+ * through a heap opened on the guest's own pages: a draw puts the target in
+ * the guest's byte order and a copy puts it in place. The CPU store was 13 MB
+ * a frame in the deep Palace (three 1280x720 targets and a dozen smaller), a
+ * read and a write of every byte on the RSX thread. The boot reserves RSX
+ * local memory as an allocation of its own for this (boot_main.cpp,
+ * vm_reserve); without that, other formats, swizzled targets and offsets the
+ * copy cannot address (512-byte offsets, 256-byte pitches) store on the CPU
+ * as before. 0: every target on the CPU. 2: as 1, and the CPU store is also
+ * made, into a scratch copy, and compared with what the GPU stored (a line
+ * per mismatching target, and a count every 1024 stores). */
+#define WBG_BASE 0xC0000000u   /* RSX local memory (cellGcm's localAddress) */
+#define WBG_SIZE 0x10000000u
+static struct { int state; ID3D12Heap* heap; ID3D12Resource* buf; } s_wbg;   /* state: 0 untried, 1 ready, -1 off */
+static int wbg_mode(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_WB_GPU", 1));
+    return on;
+}
+static int wbg_ready(void)
+{
+    const int on = wbg_mode();
+    if (!on || s_wbg.state < 0) return 0;
+    if (s_wbg.state) return 1;
+    s_wbg.state = -1;
+#ifdef _WIN32
+    extern uint8_t* vm_base;
+    u8* const win = vm_base + WBG_BASE;
+    MEMORY_BASIC_INFORMATION mi;
+    if (!VirtualQuery(win, &mi, sizeof mi) || mi.AllocationBase != (void*)win) {
+        fprintf(stderr, "[D3D12] write-back: RSX local memory is not an allocation of its own; stores on the CPU%c", 10);
+        return 0;
+    }
+    /* The heap maps the whole allocation, so all of it is committed (the guest
+     * sees zeros in pages it never wrote, as it did on first touch). */
+    if (!VirtualAlloc(win, WBG_SIZE, MEM_COMMIT, PAGE_READWRITE)) return 0;
+    ID3D12Device3* d3 = NULL;
+    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device3, (void**)&d3)) || !d3)
+        return 0;
+    HRESULT hr = d3->lpVtbl->OpenExistingHeapFromAddress(d3, win, &IID_ID3D12Heap, (void**)&s_wbg.heap);
+    d3->lpVtbl->Release(d3);
+    if (FAILED(hr) || !s_wbg.heap) {
+        fprintf(stderr, "[D3D12] write-back: no heap on guest memory (0x%08lX); stores on the CPU%c", (long)hr, 10);
+        s_wbg.heap = NULL;
+        return 0;
+    }
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = WBG_SIZE; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+    hr = s_d3d.device->lpVtbl->CreatePlacedResource(s_d3d.device, s_wbg.heap, 0, &bd,
+        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_wbg.buf);
+    if (FAILED(hr) || !s_wbg.buf) {
+        fprintf(stderr, "[D3D12] write-back: no buffer on guest memory (0x%08lX); stores on the CPU%c", (long)hr, 10);
+        s_wbg.buf = NULL; s_wbg.heap->lpVtbl->Release(s_wbg.heap); s_wbg.heap = NULL;
+        return 0;
+    }
+    s_wbg.state = 1;
+    fprintf(stderr, "[D3D12] write-back: from the GPU into guest memory%c", 10);
+    return 1;
+#else
+    return 0;   /* the heap needs RSX local memory as an allocation of its own (Windows placeholders) */
+#endif
+}
+
+/* Target i straight into guest memory, if it can go that way: 1 recorded. */
+static int wbg_record(int i)
+{
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
+    OffRT* r = &s_d3d.off_rt[i];
+    if (r->gdxgi != DXGI_FORMAT_R8G8B8A8_UNORM || ((r->gfmt >> 8) & 0xF) == 2 ||
+        r->gdma == CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER || !wbg_ready()) return 0;
+    { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
+      if (lg) return 0; }   /* the log compares the CPU store's bytes */
+    const u32 gp = r->gpitch, dst = cellGcmResolveLocated(1, r->off);
+    if (dst < WBG_BASE || dst - WBG_BASE >= WBG_SIZE || ((dst - WBG_BASE) & 511u) || (gp & 255u) ||
+        gp < r->w * 4u || gp > 0x10000 || !r->h ||
+        (u64)(dst - WBG_BASE) + (u64)gp * (r->h - 1) + r->w * 4u > WBG_SIZE) return 0;
+    D3D12_RESOURCE_STATES prior = r->st;
+    ID3D12Resource* from = off_rt_downscale(i, 1);
+    if (!from) return 0;
+    D3D12_TEXTURE_COPY_LOCATION to = {0}, src = {0};
+    to.pResource = s_wbg.buf;
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint.Offset = dst - WBG_BASE;
+    to.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+    to.PlacedFootprint.Footprint.Width    = r->w;
+    to.PlacedFootprint.Footprint.Height   = r->h;
+    to.PlacedFootprint.Footprint.Depth    = 1;
+    to.PlacedFootprint.Footprint.RowPitch = gp;
+    src.pResource = from;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &to, 0, 0, 0, &src, NULL);
+    off_rt_transition(i, prior);
+    r->gpu_dst = dst;
+    r->used = 3;   /* stored by the GPU: the store only takes its checksum */
+    return 1;
+}
+
 /* Record the copies (before the frame's command list closes). */
 static void rt_writeback_record(void)
 {
@@ -9003,6 +9119,11 @@ static void rt_writeback_record(void)
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!r->res || !r->used) continue;
+        r->gpu_check = 0;
+        if (wbg_record(i)) {
+            if (wbg_mode() != 2) continue;
+            r->gpu_check = 1;   /* and the CPU store's copy, to compare */
+        }
         /* A scaled target, or a promoted one (HDR), goes through the draw down
          * to the guest's size and format. */
         const int scaled = r->hw != r->w || r->hh != r->h || r->dxgi != r->gdxgi;
@@ -9026,7 +9147,7 @@ static void rt_writeback_record(void)
         }
         D3D12_RESOURCE_STATES prior = r->st;
         ID3D12Resource* from = r->res;
-        if (scaled) { if (!(from = off_rt_downscale(i))) continue; }
+        if (scaled) { if (!(from = off_rt_downscale(i, 0))) continue; }
         else off_rt_transition(i, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
         dst.pResource = r->rb;
@@ -9069,6 +9190,44 @@ static void wb_conv_row(u8* d, const u8* s, u32 n, int kind)
     #undef WB_LOOP
 }
 
+/* RSX_WB_GPU=2: the CPU store of a target the GPU stored, made into a scratch
+ * copy and compared with guest memory. */
+static void wbg_check(OffRT* r)
+{
+    extern uint8_t* vm_base;
+    static u8* tmp; static size_t tmp_n;
+    static unsigned long long n_ok, n_bad;
+    const u32 pitch = (r->w * 4u + 255) & ~255u, gp = r->gpitch, row = r->w * 4u;
+    if (tmp_n < (size_t)row) { free(tmp); tmp = (u8*)malloc(row); tmp_n = tmp ? row : 0; }
+    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * r->h};
+    if (!tmp || FAILED(r->rb->lpVtbl->Map(r->rb, 0, &rr, &mp)) || !mp) return;
+    u32 bad_y = ~0u, bad_x = 0;
+    for (u32 y = 0; y < r->h && bad_y == ~0u; y++) {
+        wb_conv_row(tmp, (const u8*)mp + (u64)y * pitch, r->w, 0);
+        const u8* g = vm_base + r->gpu_dst + (u64)y * gp;
+        if (memcmp(tmp, g, row))
+            for (u32 x = 0; x < row; x++) if (tmp[x] != g[x]) { bad_y = y; bad_x = x; break; }
+    }
+    D3D12_RANGE nw = {0, 0};
+    r->rb->lpVtbl->Unmap(r->rb, 0, &nw);
+    if (bad_y == ~0u) n_ok++;
+    else {
+        n_bad++;
+        static int lines = 0;
+        if (lines < 40 && ++lines) {
+            const u8* g = vm_base + r->gpu_dst + (u64)bad_y * gp + (bad_x & ~3u);
+            const u8* c = tmp + (bad_x & ~3u);
+            fprintf(stderr, "[wb-gpu] 0x%08X %ux%u differs at row %u byte %u: gpu %02X%02X%02X%02X cpu %02X%02X%02X%02X%c",
+                    r->gpu_dst, r->w, r->h, bad_y, bad_x, g[0], g[1], g[2], g[3], c[0], c[1], c[2], c[3], 10);
+        }
+    }
+    if ((n_ok + n_bad) % 1024u == 0)
+        fprintf(stderr, "[wb-gpu] check: %llu targets equal, %llu differ%c", n_ok, n_bad, 10);
+    r->gaddr = r->gpu_dst;
+    r->glen = gp * r->h;
+    r->gsum_new = 1;
+}
+
 /* Store the copies in guest memory (after the GPU finished the frame). */
 static u8* s_wc_shadow; static u32 s_wc_len;   /* RSX_WRITE_COLOR_LOG */
 static void rt_writeback_store(void)
@@ -9078,8 +9237,16 @@ static void rt_writeback_store(void)
     if (!write_color_on() || !vm_base) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
+        if (r->res && r->used == 3) {   /* the GPU stored it (wbg_record) */
+            r->used = 1;
+            r->gaddr = r->gpu_dst;
+            r->glen = r->gpitch * r->h;
+            r->gsum_new = 1;
+            continue;
+        }
         if (!r->res || !r->rb || r->used != 2) continue;
         r->used = 1;
+        if (r->gpu_check) { wbg_check(r); continue; }
         u32 bpp = rt_guest_bpp(r->gdxgi);
         u32 pitch = (r->w * bpp + 255) & ~255u;
         u32 swz = ((r->gfmt >> 8) & 0xF) == 2;
@@ -15654,6 +15821,9 @@ void rsx_d3d12_backend_shutdown(void)
     pso_index_flush();
 
     /* Release D3D12 resources */
+    if (s_wbg.buf)  { s_wbg.buf->lpVtbl->Release(s_wbg.buf);   s_wbg.buf = NULL; }
+    if (s_wbg.heap) { s_wbg.heap->lpVtbl->Release(s_wbg.heap); s_wbg.heap = NULL; }
+    s_wbg.state = -1;
     if (s_d3d.vertex_buffer) {
         s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);
         s_d3d.vertex_buffer->lpVtbl->Release(s_d3d.vertex_buffer);
