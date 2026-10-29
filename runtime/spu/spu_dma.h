@@ -191,6 +191,23 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* Swappable-overlay tracking: a GET from a registered overlay source (by EA
+ * or by content signature) marks that overlay's lifted functions resident
+ * for this context. Called only while there is something to note
+ * (g_spu_ovl_note, spu_channels.c): with no source registered and no
+ * SPU_DUMP_OVL, every GET made the call for nothing, ~0.9% of Demon's Souls'
+ * image 2. SPU_OVL_GATE=0 (live): every GET makes it, as before. Forced
+ * inline, as the LS accessors are: left to clang, mfc_fast_xfer called it,
+ * and the call was 0.4% of image 2. */
+SPU_LS_INLINE void mfc_note_get(spu_context* spu, uint32_t ea, const uint8_t* ls, uint32_t size)
+{
+    extern int g_spu_ovl_note;
+    extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
+    static int gate = -1;
+    PS3_KNOB(gate, ps3_env_int("SPU_OVL_GATE", 1));
+    if (g_spu_ovl_note || !gate) spu_overlay_note_get(spu, ea, ls, size);
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success, -1 on error.
@@ -738,11 +755,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                   fprintf(stderr, "[spu-SMC] img=%d DMA-GET into CODE @0x%05X size=%u ea=0x%08X pc=0x%05X\n",
                           spu->image_id, lsa, size, (uint32_t)ea, (uint32_t)spu->pc & SPU_LS_MASK);
           } }
-        /* Swappable-overlay tracking: a GET from a registered overlay source
-         * (by EA or by content signature) marks that overlay's lifted
-         * functions resident for this context. */
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size); }
+        mfc_note_get(spu, (uint32_t)ea, (const uint8_t*)ls_ptr, size);
         /* SPU_LS_WATCH: a DMA GET landing on a watched LS line is how the PPU
          * delivers commands into the SPU's queue (bypasses spu_ls_write128). */
         { int _n; unsigned* _w = spu_ls_watch_list(&_n);
@@ -1167,8 +1180,7 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint8_t* ea_ptr = vm_base + ea32;
     if (cmd & 0x40) {
         mfc_copy(ls_ptr, ea_ptr, size);
-        { extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
-          spu_overlay_note_get(spu, ea32, (const uint8_t*)ls_ptr, size); }
+        mfc_note_get(spu, ea32, (const uint8_t*)ls_ptr, size);
     } else {
         /* The PUT coherence of mfc_do_transfer: see the comment there. */
         extern void spu_coh_notify_write_except(uint32_t, const void*);
