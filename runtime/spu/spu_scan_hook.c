@@ -25,6 +25,13 @@
  * goes on at 0x7440). When the entry at the head goes to a handler it changes
  * nothing.
  *
+ * On x86-64 each entry's test runs on SSE registers (scan_stop_sse: a load
+ * and a shuffle a quadword, the lift's shufb, word compares), and only the
+ * last skipped entry runs again on the lifted helpers for the registers it
+ * leaves. On the helpers alone every entry built all its registers through
+ * scalar lane loops and a 37-quadword struct, about as slow as the lifted
+ * loop.
+ *
  * It runs the lifted loop instead (returns 0) whenever the lifted loop would
  * leave its region at the next back edge (the knobs and the pending-interrupt
  * test of SPU_RGOTO), a local-store probe is on, or the counter is not below
@@ -32,11 +39,12 @@
  * exit test after the block, as if it had arrived then.
  *
  * SPU_NATIVE_SCAN (live): 1 (default) as above; 0 runs the lifted loop, for
- * A/B; 2 checks: every SPU_NATIVE_SCAN_EVERY-th time (default 64) the
- * skipped entries also run in the SPU interpreter on a copy of the context
- * and its local store, one entry at a time, and every register and the whole
- * local store are compared with the copy's ([spu-scan] lines). A mismatch
- * turns the block off for the session.
+ * A/B; 3 tests every entry on the lifted helpers, for A/B; 2 checks: every
+ * SPU_NATIVE_SCAN_EVERY-th time (default 64) the skipped entries also run in
+ * the SPU interpreter on a copy of the context and its local store, one entry
+ * at a time, and every register and the whole local store are compared with
+ * the copy's ([spu-scan] lines). A mismatch turns the block off for the
+ * session. The check also counts stops at an entry that goes to no handler.
  */
 
 #include <stdio.h>
@@ -135,10 +143,31 @@ static inline int scan_entry(const spu_context* ctx, const scan_consts* k, u128 
     return (t->r9._u32[0] | t->r18._u32[0] | t->r21._u32[0] | t->r22._u32[0] | t->r38._u32[0]) != 0;
 }
 
+/* The registers after n skipped entries: s is the last one's, r34 has every
+ * skipped entry's word compare ored in, and done says the loop has ended. */
+static void scan_leave(spu_context* ctx, const scan_regs* s, uint32_t n, int done, u128 r30, u128 r31, u128 r32,
+                       u128 r34, u128 r36, u128 r37, u128 r39)
+{
+    u128* r = ctx->gpr;
+    r[5] = s->r5;   r[6] = s->r6;   r[7] = s->r7;   r[8] = s->r8;   r[9] = s->r9;
+    r[10] = s->r10; r[11] = s->r11; r[12] = s->r12; r[13] = s->r13; r[14] = s->r14;
+    r[15] = s->r15; r[16] = s->r16; r[17] = s->r17; r[18] = s->r18; r[19] = s->r19;
+    r[20] = s->r20; r[21] = s->r21; r[22] = s->r22; r[23] = s->r23;
+    r[35] = s->r35; r[38] = s->r38; r[45] = s->r45;
+    r[53] = s->r53; r[54] = s->r54; r[55] = s->r55; r[56] = s->r56; r[57] = s->r57;
+    r[58] = s->r58; r[59] = s->r59; r[60] = s->r60; r[61] = s->r61; r[62] = s->r62;
+    r[63] = s->r63; r[64] = s->r64; r[65] = s->r65; r[66] = s->r66; r[67] = s->r67;
+    r[33] = spu_rotmi(s->r35, -16);
+    r[25] = spu_ceqi(r37, 16);
+    r[30] = r30; r[31] = r31; r[32] = r32; r[34] = r34; r[36] = r36; r[37] = r37; r[39] = r39;
+    ctx->steps += done ? n - 1 : n;   /* one SPU_RGOTO per back edge taken */
+}
+
 /* Runs the entries from the head on, stopping at the first that goes to a
- * handler. Returns the entries skipped (0: nothing changed) and sets *done
- * when they were the last ones, so the loop has ended. */
-static uint32_t scan_run(spu_context* ctx, int* done)
+ * handler, every entry on the lifted helpers (SPU_NATIVE_SCAN=3). Returns the
+ * entries skipped (0: nothing changed) and sets *done when they were the last
+ * ones, so the loop has ended. */
+static uint32_t scan_run_u128(spu_context* ctx, int* done)
 {
     u128* r = ctx->gpr;
     *done = 0;
@@ -163,20 +192,126 @@ static uint32_t scan_run(spu_context* ctx, int* done)
         if (r37._u32[0] == SCAN_N) { *done = 1; break; }   /* the brz at 0x743C falls through */
     }
     if (!n) return 0;
-    const scan_regs* s = &t[cur ^ 1];   /* the last entry skipped */
-    r[5] = s->r5;   r[6] = s->r6;   r[7] = s->r7;   r[8] = s->r8;   r[9] = s->r9;
-    r[10] = s->r10; r[11] = s->r11; r[12] = s->r12; r[13] = s->r13; r[14] = s->r14;
-    r[15] = s->r15; r[16] = s->r16; r[17] = s->r17; r[18] = s->r18; r[19] = s->r19;
-    r[20] = s->r20; r[21] = s->r21; r[22] = s->r22; r[23] = s->r23;
-    r[35] = s->r35; r[38] = s->r38; r[45] = s->r45;
-    r[53] = s->r53; r[54] = s->r54; r[55] = s->r55; r[56] = s->r56; r[57] = s->r57;
-    r[58] = s->r58; r[59] = s->r59; r[60] = s->r60; r[61] = s->r61; r[62] = s->r62;
-    r[63] = s->r63; r[64] = s->r64; r[65] = s->r65; r[66] = s->r66; r[67] = s->r67;
-    r[33] = spu_rotmi(s->r35, -16);
-    r[25] = spu_ceqi(r37, 16);
-    r[30] = r30; r[31] = r31; r[32] = r32; r[34] = r34; r[36] = r36; r[37] = r37; r[39] = r39;
-    ctx->steps += *done ? n - 1 : n;   /* one SPU_RGOTO per back edge taken */
+    scan_leave(ctx, &t[cur ^ 1], n, *done, r30, r31, r32, r34, r36, r37, r39);
     return n;
+}
+
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#define SCAN_HAVE_SSE 1
+
+/* spu_ls_read128 as one load and one shuffle: SPU byte P to host byte P^3,
+ * the u128 layout. */
+static inline __m128i scan_q(const uint8_t* ls, uint32_t lsa, __m128i jx3)
+{
+    const uint8_t* p = ls + (lsa & (SPU_LS_MASK & ~0xFu));
+    return _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(const void*)p), jx3);
+}
+
+static inline __m128i scan_shufb(__m128i a, __m128i b, __m128i c)
+{
+    u128 A, B, C;
+    memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+    const u128 r = spu_shufb(A, B, C);
+    __m128i R;
+    memcpy(&R, &r, 16);
+    return R;
+}
+
+typedef struct {
+    __m128i r40, r41, r42, r43, r44;
+} scan_kx;
+
+/* scan_entry's return and its r35, on SSE registers: an entry goes to a
+ * handler when one of its five built quadwords differs from r32's entry
+ * (r9, r18, r21, r38: gb of a word compare's complement is nonzero when any
+ * word differs), or (r22) when r19's preferred word is nonzero and r60 or r62
+ * differs from r19 or r17. */
+static inline int scan_stop_sse(const uint8_t* ls, const scan_kx* k, __m128i jx3, uint32_t a30, uint32_t a31,
+                                uint32_t a32, __m128i* r35)
+{
+    const __m128i r17 = scan_q(ls, a30, jx3);
+    const __m128i r19 = scan_q(ls, a30 + 0x10, jx3);
+    const __m128i r66 = scan_q(ls, a31, jx3);
+    const __m128i q16 = scan_q(ls, a31 + 0x10, jx3);
+    const __m128i q20 = scan_q(ls, a31 + 0x20, jx3);
+    const __m128i r67 = scan_q(ls, a31 + 0x50, jx3);
+    const __m128i r56 = scan_q(ls, a32, jx3);
+    const __m128i r53 = scan_q(ls, a32 + 0x10, jx3);
+    const __m128i r55 = scan_q(ls, a32 + 0x20, jx3);
+    const __m128i r62 = scan_q(ls, a32 + 0x30, jx3);
+    const __m128i r60 = scan_q(ls, a32 + 0x40, jx3);
+    const __m128i r45 = scan_q(ls, a32 + 0x50, jx3);
+    /* r15 = selb(shufb(r66, r67, r40), r17, r42) */
+    const __m128i r15 = _mm_or_si128(_mm_andnot_si128(k->r42, scan_shufb(r66, r67, k->r40)),
+                                     _mm_and_si128(r17, k->r42));
+    /* r16 = shufb(q16, q16 + 4, r41 + shlqbyi(r44 & ~ceqbi(r17, 1), 4)); a
+     * shift by whole words moves host words as it moves SPU words. */
+    const __m128i r63 = _mm_andnot_si128(_mm_cmpeq_epi8(r17, _mm_set1_epi8(1)), k->r44);
+    const __m128i r59 = _mm_add_epi32(k->r41, _mm_srli_si128(r63, 4));
+    const __m128i r16 = scan_shufb(q16, _mm_add_epi32(q16, _mm_set1_epi32(4)), r59);
+    /* r20 = shufb(q20, ~ceqi(r19, 0), r43) */
+    const __m128i r10 = _mm_xor_si128(_mm_cmpeq_epi32(r19, _mm_setzero_si128()), _mm_set1_epi32(-1));
+    const __m128i r20 = scan_shufb(q20, r10, k->r43);
+    /* r33 = shlqbyi(r66, 12) */
+    const __m128i r33 = _mm_srli_si128(r66, 12);
+    *r35 = _mm_cmpeq_epi32(r62, r17);
+    const __m128i d = _mm_or_si128(_mm_or_si128(_mm_xor_si128(r56, r15), _mm_xor_si128(r53, r16)),
+                                   _mm_or_si128(_mm_xor_si128(r55, r20), _mm_xor_si128(r45, r33)));
+    if (!_mm_testz_si128(d, d)) return 1;
+    const __m128i e = _mm_or_si128(_mm_xor_si128(r60, r19), _mm_xor_si128(r62, r17));
+    return _mm_cvtsi128_si32(r19) != 0 && !_mm_testz_si128(e, e);
+}
+
+/* scan_run_u128 with each entry's test on SSE registers; only the last
+ * skipped entry runs again on the lifted helpers, for the registers it
+ * leaves. If that run would go to a handler the two disagree: nothing is
+ * changed and the block is off for the session. */
+static uint32_t scan_run_sse(spu_context* ctx, int* done)
+{
+    u128* r = ctx->gpr;
+    *done = 0;
+    const uint32_t c = r[37]._u32[0];
+    if (c >= SCAN_N) return 0;   /* the lifted loop would run until the counter wraps */
+    scan_kx k;
+    memcpy(&k.r40, &r[40], 16); memcpy(&k.r41, &r[41], 16); memcpy(&k.r42, &r[42], 16);
+    memcpy(&k.r43, &r[43], 16); memcpy(&k.r44, &r[44], 16);
+    const __m128i jx3 = spu_qb_jx3();
+    const uint8_t* ls = ctx->ls;
+    const uint32_t a30 = r[30]._u32[0], a31 = r[31]._u32[0], a32 = r[32]._u32[0];
+    __m128i or34 = _mm_setzero_si128(), r35;
+    uint32_t n = 0;
+    while (c + n < SCAN_N && !scan_stop_sse(ls, &k, jx3, a30 + 32 * n, a31 + 96 * n, a32 + 96 * n, &r35)) {
+        or34 = _mm_or_si128(or34, _mm_srli_epi32(r35, 16));   /* the tail's rotmi(r35, -16) */
+        n++;
+    }
+    if (!n) return 0;
+    const int32_t m = (int32_t)n - 1;
+    const scan_consts kc = { r[40], r[41], r[42], r[43], r[44] };
+    scan_regs t;
+    if (scan_entry(ctx, &kc, spu_ai(r[30], 32 * m), spu_ai(r[31], 96 * m), spu_ai(r[32], 96 * m), &t)) {
+        s_scan_bad = 1;
+        fprintf(stderr, "[spu-scan] MISMATCH: the SSE test skipped an entry that goes to a handler; the block is "
+                "off for the session\n");
+        return 0;
+    }
+    *done = c + n == SCAN_N;
+    u128 o34;
+    memcpy(&o34, &or34, 16);
+    const int32_t a = (int32_t)n;
+    scan_leave(ctx, &t, n, *done, spu_ai(r[30], 32 * a), spu_ai(r[31], 96 * a), spu_ai(r[32], 96 * a),
+               spu_or(r[34], o34), spu_ai(r[36], 32 * a), spu_ai(r[37], a), spu_ai(r[39], 4 * a));
+    return n;
+}
+#endif
+
+static uint32_t scan_run(spu_context* ctx, int* done, int sse)
+{
+#ifdef SCAN_HAVE_SSE
+    if (sse) return scan_run_sse(ctx, done);
+#endif
+    (void)sse;
+    return scan_run_u128(ctx, done);
 }
 
 /* SPU_NATIVE_SCAN=2: the block on the real context, then the same entries in
@@ -186,9 +321,9 @@ static int scan_check(spu_context* ctx)
     static uint8_t* ls_copy;
     static unsigned long long checked, bad;
     int done;
-    if (!ls_copy && !(ls_copy = (uint8_t*)malloc(SPU_LS_SIZE))) return scan_run(ctx, &done) && done;
+    if (!ls_copy && !(ls_copy = (uint8_t*)malloc(SPU_LS_SIZE))) return scan_run(ctx, &done, 1) && done;
     spu_context* c = (spu_context*)malloc(sizeof *c);
-    if (!c) return scan_run(ctx, &done) && done;
+    if (!c) return scan_run(ctx, &done, 1) && done;
     memcpy(c, ctx, sizeof *c);
     memcpy(ls_copy, ctx->ls, SPU_LS_SIZE);
     c->ls = ls_copy;
@@ -196,7 +331,20 @@ static int scan_check(spu_context* ctx)
      * function to rejoin, so it stops only at the stop address (see
      * spu_diff_hook.c). If it stops elsewhere the check is skipped. */
     c->image_id = 0x7FFF;
-    const uint32_t n = scan_run(ctx, &done);
+    const uint32_t n = scan_run(ctx, &done, 1);
+    /* The entry the block stopped at must go to a handler too; a stop there
+     * costs only speed, so the interpreter compare below cannot see it. */
+    if (!done && ctx->gpr[37]._u32[0] < SCAN_N) {
+        static unsigned long long stops, early;
+        const scan_consts k = { ctx->gpr[40], ctx->gpr[41], ctx->gpr[42], ctx->gpr[43], ctx->gpr[44] };
+        scan_regs t;
+        stops++;
+        if (!scan_entry(ctx, &k, ctx->gpr[30], ctx->gpr[31], ctx->gpr[32], &t)) {
+            early++;
+            if ((early & (early - 1)) == 0)
+                fprintf(stderr, "[spu-scan] %llu of %llu stops at an entry that goes to no handler\n", early, stops);
+        }
+    }
     if (!n) {                         /* the lifted loop runs: nothing to compare */
         free(c);
         return 0;
@@ -259,6 +407,6 @@ int spu_hook_entry_scan(spu_context* ctx)
         if (++tick % native_scan_every() == 0) return scan_check(ctx);
     }
     int done;
-    scan_run(ctx, &done);
+    scan_run(ctx, &done, mode != 3);
     return done;
 }
