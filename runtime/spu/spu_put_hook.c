@@ -48,6 +48,9 @@ static int native_put_on(void)
 static int put_wait(spu_context* ctx, int defer);
 
 int spu_hook_put_wait(spu_context* ctx) { return put_wait(ctx, 0); }
+/* For a caller that does put_wait's work itself (spu_ring_hook.c's lazy
+ * loop): whether the hook runs at all. */
+int spu_put_hook_on(void) { return native_put_on(); }
 int spu_hook_put_wait_defer(spu_context* ctx) { return put_wait(ctx, 1); }
 
 /* The PUT a deferred put_wait left out, of the local-store bytes as they are
