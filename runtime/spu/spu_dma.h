@@ -196,8 +196,10 @@ static inline int mfc_is_fence(uint32_t cmd)
  * for this context. Called only while there is something to note
  * (g_spu_ovl_note, spu_channels.c): with no source registered and no
  * SPU_DUMP_OVL, every GET made the call for nothing, ~0.9% of Demon's Souls'
- * image 2. SPU_OVL_GATE=0 (live): every GET makes it, as before. */
-static inline void mfc_note_get(spu_context* spu, uint32_t ea, const uint8_t* ls, uint32_t size)
+ * image 2. SPU_OVL_GATE=0 (live): every GET makes it, as before. Forced
+ * inline, as the LS accessors are: left to clang, mfc_fast_xfer called it,
+ * and the call was 0.4% of image 2. */
+SPU_LS_INLINE void mfc_note_get(spu_context* spu, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     extern int g_spu_ovl_note;
     extern void spu_overlay_note_get(spu_context*, uint32_t, const uint8_t*, uint32_t);
