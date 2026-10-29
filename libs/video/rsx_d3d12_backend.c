@@ -4714,33 +4714,37 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
      * draw. While the store has not been written since, a program start
      * resolves to the slot it resolved to before (if that slot still holds
      * the same program). RSX_VP_MEMO=0 looks it up every time.
-     * RSX_VP_MEMO=2 (the default) keeps two programs per start, each with a
-     * copy of its bytes: when the store was written since, a program whose
-     * bytes are those of the copy (up to its end bit) is still that slot. A
-     * title that switches one start between two programs, or re-sends a
-     * program with a word changed and back, then skips the sizing, the hash
-     * and the cache scan. 1 is the one-entry memo without the copies. */
+     * RSX_VP_MEMO=n (2 to 32, the default 32) keeps the n programs used last
+     * at each start, the most recent first, each with a copy of its bytes:
+     * when the store was written since, a program whose bytes are those of a
+     * copy (up to its end bit) is still that slot. A title that switches one
+     * start between programs, or re-sends a program with a word changed and
+     * back, then skips the sizing, the hash and the cache scan; the least
+     * recently used program makes room. Demon's Souls' deep Palace cycles one
+     * start through up to 32 programs: two missed 10.6% of the lookups, each
+     * miss hashing about 850 bytes a byte at a time (2.7% of the FIFO
+     * thread), eight would miss 3.5% and 32 almost none. 2 is the two-way
+     * memo as it was; 1 is the one-entry memo without the copies. */
     extern u32 g_rsx_vp_ucode_ver;
+    enum { VP_MEMO_MAX = 32 };
     typedef struct { const rsx_state* st; u32 ver, vstart, hash; int idx;
                      u8* code; u32 len, cap; int end; } VsMemo;
-    static VsMemo memo[2][64][2];
-    static u8 memo_next[2][64];
+    static VsMemo memo[2][64][VP_MEMO_MAX];
     static int memo_en = -1;
-    PS3_KNOB(memo_en, ps3_env_int("RSX_VP_MEMO", 2));
+    PS3_KNOB(memo_en, ps3_env_int("RSX_VP_MEMO", VP_MEMO_MAX));
     const int mf = fetch ? 1 : 0, mb = (int)((vstart >> 4) & 63);
     VsMemo* mw = memo[mf][mb];
-    const int ways = memo_en >= 2 ? 2 : 1;
+    const int ways = memo_en >= 2 ? (memo_en < VP_MEMO_MAX ? memo_en : VP_MEMO_MAX) : 1;
     const u32 avail = st->vp_ucode_bytes - vstart;
     if (memo_en) {
         for (int pass = 0; pass < (ways > 1 ? 2 : 1); pass++)
             for (int w = 0; w < ways; w++) {
                 VsMemo* q = &mw[w];
+                if (pass == 0 && q->ver != g_rsx_vp_ucode_ver) continue;
                 if (q->st != st || q->vstart != vstart || q->idx < 0 ||
                     q->idx >= s_d3d.vp_vs_n || s_d3d.vp_vs[q->idx].hash != q->hash)
                     continue;
-                if (pass == 0) {
-                    if (q->ver != g_rsx_vp_ucode_ver) continue;
-                } else {
+                if (pass == 1) {
                     /* !q->len: the one-entry memo wrote this entry and kept
                      * no copy (RSX_VP_MEMO=1, then 2 again, live). Compared
                      * over 0 bytes, it matched any program at this start. */
@@ -4750,11 +4754,16 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                         continue;
                     q->ver = g_rsx_vp_ucode_ver;
                 }
-                memo_next[mf][mb] = (u8)(w ^ 1);
-                return s_d3d.vp_vs[q->idx].vs ? q->idx : -1;
+                const int idx = q->idx;
+                if (w) {   /* to the front */
+                    const VsMemo hit = *q;
+                    memmove(&mw[1], &mw[0], (size_t)w * sizeof *mw);
+                    mw[0] = hit;
+                }
+                return s_d3d.vp_vs[idx].vs ? idx : -1;
             }
     }
-    VsMemo* m = &mw[ways > 1 ? (memo_next[mf][mb] & 1) : 0];
+    VsMemo* m = &mw[ways - 1];   /* the least recently used; its copy's buffer is reused */
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = avail;
     /* Key the program by its own instructions, up to its end bit. The store
@@ -4777,10 +4786,12 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                 }
                 if (m->code && m->cap >= vlen) {
                     memcpy(m->code, vuc, vlen); m->len = vlen; m->end = vend;
+                    const VsMemo e = *m;   /* to the front */
+                    memmove(&mw[1], &mw[0], (size_t)(ways - 1) * sizeof *mw);
+                    mw[0] = e;
                 } else {
                     m->st = NULL;   /* no room for the copy: drop the entry */
                 }
-                memo_next[mf][mb] = (u8)((m - mw) ^ 1);
             }
             return s_d3d.vp_vs[i].vs ? i : -1;
         }
