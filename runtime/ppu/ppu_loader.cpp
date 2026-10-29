@@ -1609,10 +1609,6 @@ static void pt_record(uint32_t addr) {
 }
 static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr[i]==addr) g_pt_live[i]=0; }
 #endif
-/* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
- * write hook can name the virtual method that is running when it writes a value. */
-static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
-static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 
 /* PPU_COH_HIST=1: every 2 s, the lines whose plain PPU stores took the
  * lock-line lock, busiest first, with the guest thread and lr of the last
@@ -2323,19 +2319,28 @@ typedef void (*ppu_fn)(ppu_context*);
 #define PPU_HASH_SIZE (1u << PPU_HASH_BITS)
 #define PPU_HASH_MASK (PPU_HASH_SIZE - 1)
 
-static uint32_t g_addr[PPU_HASH_SIZE];
-static ppu_fn   g_fn[PPU_HASH_SIZE];
+/* A slot holds the guest address and the host function together (16 bytes,
+ * four to a cache line), so a lookup reads one line, where two arrays made it
+ * read two. The home slot is the top PPU_HASH_BITS bits of a * 2654435761
+ * (Fibonacci hashing). The low bits used before are 0 in their two lowest
+ * places for every 4-byte aligned address, so only one slot in four could
+ * be a home: Demon's Souls' 94,017 functions took 1.96 probes a lookup on
+ * average that way, 1.28 now. */
+typedef struct { uint32_t addr; ppu_fn fn; } ppu_fn_slot;
+static ppu_fn_slot g_fslot[PPU_HASH_SIZE];
 static uint32_t g_fn_count = 0;
+static inline uint32_t ppu_fn_home(uint32_t a) { return (a * 2654435761u) >> (32 - PPU_HASH_BITS); }
 
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
     uint32_t a = (uint32_t)addr;
-    uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
+    uint32_t i = ppu_fn_home(a);
     /* Bounded probe: never loop past the whole table. A full table (function
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
-        if (g_fn[i] == nullptr) { g_addr[i] = a; g_fn[i] = fn; g_fn_count++; return; }
-        if (g_addr[i] == a) { g_fn[i] = fn; return; }   /* overwrite */
+        ppu_fn_slot* s = &g_fslot[i];
+        if (s->fn == nullptr) { s->addr = a; s->fn = fn; g_fn_count++; return; }
+        if (s->addr == a) { s->fn = fn; return; }   /* overwrite */
         i = (i + 1) & PPU_HASH_MASK;
     }
     static int warned = 0;
@@ -2358,7 +2363,7 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
      * to be the HLE dispatcher at boot; now it is whoever reads first). */
     static const bool s_built = [] {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
-            if (g_fn[i]) { g_inv[g_inv_n].host = (void*)g_fn[i]; g_inv[g_inv_n].guest = g_addr[i]; g_inv_n++; }
+            if (g_fslot[i].fn) { g_inv[g_inv_n].host = (void*)g_fslot[i].fn; g_inv[g_inv_n].guest = g_fslot[i].addr; g_inv_n++; }
         /* insertion-sort-free: qsort by host ptr */
         qsort(g_inv, g_inv_n, sizeof(g_inv[0]),
               [](const void* a, const void* b) -> int {
@@ -2379,10 +2384,12 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
 
 static ppu_fn ppu_lookup(uint32_t a)
 {
-    uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
+    uint32_t i = ppu_fn_home(a);
     for (uint32_t probes = 0; probes < PPU_HASH_SIZE; probes++) {
-        if (g_fn[i] == nullptr) return nullptr;
-        if (g_addr[i] == a) return g_fn[i];
+        const ppu_fn_slot* s = &g_fslot[i];
+        const ppu_fn fn = s->fn;
+        if (fn == nullptr) return nullptr;
+        if (s->addr == a) return fn;
         i = (i + 1) & PPU_HASH_MASK;
     }
     return nullptr;
@@ -2747,21 +2754,19 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
 }
 
 /* The call itself, as ps3_indirect_call_impl makes it once the target is a
- * lifted function: the recursion depth, the vcall stack, the call and the
- * tail-call trampolines it leaves behind. */
+ * lifted function: the recursion depth, the call and the tail-call
+ * trampolines it leaves behind. */
 static PPU_THREAD_LOCAL int s_icall_depth = 0;
 static inline void icall_run(ppu_context* ctx, uint32_t addr, ppu_fn fn)
 {
+    (void)addr;
     s_icall_depth++;
-    if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
-    g_vcall_sp++;
     fn(ctx);
     while (g_trampoline_fn) {
         void (*tf)(void*) = g_trampoline_fn;
         g_trampoline_fn = 0;
         tf(ctx);
     }
-    if (g_vcall_sp > 0) g_vcall_sp--;
     s_icall_depth--;
 }
 
@@ -3138,8 +3143,6 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * to the dispatched toc before each link so the chain stays consistent. */
         uint32_t _toc0 = (uint32_t)ctx->gpr[2];
         static int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
-        if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
-        g_vcall_sp++;
         fn(ctx);
         while (g_trampoline_fn) {
             void (*tf)(void*) = g_trampoline_fn;
@@ -3147,7 +3150,6 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (_tf) ctx->gpr[2] = _toc0;
             tf(ctx);
         }
-        if (g_vcall_sp > 0) g_vcall_sp--;
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
