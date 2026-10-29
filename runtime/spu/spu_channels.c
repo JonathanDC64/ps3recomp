@@ -453,6 +453,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
  * channel access. 64 slots leave room for every SPU thread, kernel and worker
  * that runs at once; a lookup only scans them when its thread's cached slot
  * misses.
+ *
+ * The context also keeps its slot (mfc_slot1), and mfc_for tries that first:
+ * the thread's cached slot sits behind the thread-local block, three dependent
+ * loads before the owner test, and image 2 asks two or three times a ring
+ * command. SPU_MFC_HINT=0 (live, read with the channel diagnostics) goes
+ * straight to the thread's slot, for A/B.
  * ===========================================================================*/
 #define SPU_MAX_CONTEXTS 64
 
@@ -470,17 +476,24 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
  * back in another slot -- and a slot has one owner. The check is inline; the
  * search and the claim are not, so the callers stay small. */
 static SPU_TLS int t_mfc_slot = -1;
+static int g_spu_mfc_hint = 1;
 static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx);
 static inline mfc_engine* mfc_for(spu_context* ctx)
 {
+    const uint32_t h = ctx->mfc_slot1 - 1u;
+    if (h < SPU_MAX_CONTEXTS && g_spu_mfc_hint && s_mfc_slots[h].ctx == ctx) return &s_mfc_slots[h].mfc;
     const int s = t_mfc_slot;
-    if (s >= 0 && s_mfc_slots[s].ctx == ctx) return &s_mfc_slots[s].mfc;
+    if (s >= 0 && s_mfc_slots[s].ctx == ctx) { ctx->mfc_slot1 = (uint32_t)s + 1u; return &s_mfc_slots[s].mfc; }
     return mfc_for_slow(ctx);
 }
 static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx)
 {
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx) { t_mfc_slot = i; return &s_mfc_slots[i].mfc; }
+        if (s_mfc_slots[i].ctx == ctx) {
+            t_mfc_slot = i;
+            ctx->mfc_slot1 = (uint32_t)i + 1u;
+            return &s_mfc_slots[i].mfc;
+        }
 
     /* No slot yet: take one. The engine is initialized before the slot is
      * published, so it is never visible to anyone in a half-reset state. */
@@ -1312,6 +1325,7 @@ static SPU_NOINLINE int spu_ch_diag_load(void)
 {
     g_spu_ch_diag = (getenv("SPU_CHHIST") || getenv("SPU_POLLTRACE") ||
                      getenv("SPU_TAGPROBE")) ? 1 : 0;
+    g_spu_mfc_hint = ps3_env_int("SPU_MFC_HINT", 1) != 0;
     g_spu_ch_diag_gen = ps3_env_gen;
     return g_spu_ch_diag;
 }
