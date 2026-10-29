@@ -2772,7 +2772,10 @@ static inline void icall_run(ppu_context* ctx, uint32_t addr, ppu_fn fn)
  * set is read again when the console changes a variable (ps3_env_gen). */
 static int g_icall_diag = 1;
 static unsigned g_icall_diag_gen = ~0u;
-static int icall_diag_load(void)
+/* PPU_ICALL_FULL=1 (live): every call through ps3_indirect_call_full, whose
+ * frame the fast path used to pay (an A/B of the split below). */
+static int g_icall_lean = 0;
+static VM_HOOK_BODY int icall_diag_load(void)
 {
     static const char* const names[] = {
         "PPU_CSCHECK", "PS3_ICALL_GATE", "BCTRL_RING", "PS3_BREADCRUMB", "PPU_TOCWATCH",
@@ -2784,12 +2787,17 @@ static int icall_diag_load(void)
     int d = 0;
     for (unsigned i = 0; i < sizeof names / sizeof names[0]; i++)
         if (getenv(names[i])) d = 1;
+    g_icall_lean = getenv("PPU_ICALL_FULL") ? 0 : 1;
     g_icall_diag = d;
     g_icall_diag_gen = gen;
     return d;
 }
 
-extern "C" void ps3_indirect_call(ppu_context* ctx)
+/* Everything but the fast path, out of line. In one function with it, the
+ * fast path paid this part's frame on every call: eight saved registers,
+ * 0x298 bytes of stack and a /GS cookie for `save` below, about 2.9% of
+ * Demon's Souls' HighGraphics, which makes most of the calls. */
+static VM_HOOK_BODY void ps3_indirect_call_full(ppu_context* ctx)
 {
     if ((g_icall_diag_gen == ps3_env_gen ? g_icall_diag : icall_diag_load()) == 0) {
         const uint32_t addr = (uint32_t)ctx->ctr;
@@ -2823,6 +2831,20 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
                               (uint32_t)save[r - 13], (uint32_t)ctx->gpr[r]);
         fprintf(stderr, "%s\n", buf);
     }
+}
+
+extern "C" void ps3_indirect_call(ppu_context* ctx)
+{
+    if ((g_icall_diag_gen == ps3_env_gen ? g_icall_diag : icall_diag_load()) == 0 && g_icall_lean) {
+        const uint32_t addr = (uint32_t)ctx->ctr;
+        const ppu_fn fn = addr ? ppu_lookup(addr) : nullptr;
+        if (fn && s_icall_depth <= 4000) {
+            g_active_ctx = ctx;
+            icall_run(ctx, addr, fn);
+            return;
+        }
+    }
+    ps3_indirect_call_full(ctx);
 }
 
 static void ps3_indirect_call_impl(ppu_context* ctx)
