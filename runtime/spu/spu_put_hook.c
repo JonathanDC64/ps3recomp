@@ -40,7 +40,30 @@ static int native_put_on(void)
     return on;
 }
 
-int spu_hook_put_wait(spu_context* ctx)
+/* put_wait with the PUT itself left to the caller when `defer` is set: the
+ * prologue's stores, the channel latches and the tag wait are as the PUT
+ * leaves them (the transfer is synchronous, so tag 0 reads complete either
+ * way), and the caller issues the PUT later with spu_put_flush. */
+static int put_wait(spu_context* ctx, int defer);
+
+int spu_hook_put_wait(spu_context* ctx) { return put_wait(ctx, 0); }
+int spu_hook_put_wait_defer(spu_context* ctx) { return put_wait(ctx, 1); }
+
+/* The PUT a deferred put_wait left out, of the local-store bytes as they are
+ * now; the channel latches are kept as the program left them. */
+void spu_put_flush(spu_context* ctx, uint32_t eah, uint32_t eal, uint32_t lsa, uint32_t size)
+{
+    const uint32_t l = ctx->mfc_lsa, h = ctx->mfc_eah, e = ctx->mfc_eal, s = ctx->mfc_size, t = ctx->mfc_tag;
+    ctx->mfc_lsa = lsa;
+    ctx->mfc_eah = eah;
+    ctx->mfc_eal = eal;
+    ctx->mfc_size = size;
+    ctx->mfc_tag = 0;
+    spu_wrch_word(ctx, MFC_Cmd, 32);             /* PUT */
+    ctx->mfc_lsa = l; ctx->mfc_eah = h; ctx->mfc_eal = e; ctx->mfc_size = s; ctx->mfc_tag = t;
+}
+
+static int put_wait(spu_context* ctx, int defer)
 {
     if (!native_put_on()) return 0;
     /* The latches are written in place, as spu_wrch_latch writes them; a
@@ -60,7 +83,7 @@ int spu_hook_put_wait(spu_context* ctx)
     ctx->mfc_eal = eal;
     ctx->mfc_size = size;
     ctx->mfc_tag = 0;
-    spu_wrch_word(ctx, MFC_Cmd, 32);             /* PUT */
+    if (!defer) spu_wrch_word(ctx, MFC_Cmd, 32); /* PUT */
     ctx->mfc_tag_mask = 1;
     spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
     r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
