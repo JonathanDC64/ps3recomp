@@ -31,10 +31,12 @@
  * microseconds later, as if it had arrived then.
  *
  * SPU_NATIVE_DIFF (live): 1 (default) as above; 0 runs the lifted loop, for
- * A/B; 2 checks: every SPU_NATIVE_DIFF_EVERY-th time (default 64) the loop
- * also runs in the SPU interpreter on a copy of the context and its local
- * store, and the block's registers and local store are compared with the
- * copy's ([spu-diff] lines). A mismatch turns the block off for the session.
+ * A/B; 3 runs the block's passes through byte copies (diff_pass_fast), as
+ * before the SSE passes (diff_pass_sse); 2 checks the SSE passes: every
+ * SPU_NATIVE_DIFF_EVERY-th time (default 64) the loop also runs in the SPU
+ * interpreter on a copy of the context and its local store, and the block's
+ * registers and local store are compared with the copy's ([spu-diff] lines).
+ * A mismatch turns the block off for the session.
  */
 
 #include <stdio.h>
@@ -105,6 +107,60 @@ static inline void diff_pass_fast(spu_context* ctx, u128* A, u128* B, u128* m56,
     *m56 = n56;
     *m57 = n57;
 }
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+/* The constant c with word 0 cleared when its quadwords were equal (eq):
+ * diff_bit, without the branch. */
+static inline u128 diff_bit_eq(u128 c, unsigned eq)
+{
+    c._u32[0] &= eq ? 0u : ~0u;
+    return c;
+}
+
+/* diff_pass_fast with the sixteen quadwords in SSE registers: the copy above
+ * went through two arrays on the stack, compared each pair with a branch,
+ * and read ctx->ls again before each store (a byte store may change it). ls
+ * is the context's local store, read once by the caller. */
+static inline void diff_pass_sse(uint8_t* ls, u128* A, u128* B, u128* m56, u128* m57,
+                                 const u128* r24, const u128* r25, const u128* r26, const u128* r27)
+{
+    const uint32_t ab = A->_u32[0] - 64u, bb = B->_u32[0] - 64u;
+#define DIFF_AT(base, o) ((__m128i*)(void*)(ls + (((base) + (o)) & SPU_LS_MASK & ~0xFu)))
+    /* Every load of the pass before its stores, as lifted. */
+    const __m128i a0 = _mm_loadu_si128(DIFF_AT(ab, 0x0)),   b0 = _mm_loadu_si128(DIFF_AT(bb, 0x0));
+    const __m128i a1 = _mm_loadu_si128(DIFF_AT(ab, 0x10)),  b1 = _mm_loadu_si128(DIFF_AT(bb, 0x10));
+    const __m128i a2 = _mm_loadu_si128(DIFF_AT(ab, 0x20)),  b2 = _mm_loadu_si128(DIFF_AT(bb, 0x20));
+    const __m128i a3 = _mm_loadu_si128(DIFF_AT(ab, 0x30)),  b3 = _mm_loadu_si128(DIFF_AT(bb, 0x30));
+    const __m128i a4 = _mm_loadu_si128(DIFF_AT(ab, 0x800)), b4 = _mm_loadu_si128(DIFF_AT(bb, 0x800));
+    const __m128i a5 = _mm_loadu_si128(DIFF_AT(ab, 0x810)), b5 = _mm_loadu_si128(DIFF_AT(bb, 0x810));
+    const __m128i a6 = _mm_loadu_si128(DIFF_AT(ab, 0x820)), b6 = _mm_loadu_si128(DIFF_AT(bb, 0x820));
+    const __m128i a7 = _mm_loadu_si128(DIFF_AT(ab, 0x830)), b7 = _mm_loadu_si128(DIFF_AT(bb, 0x830));
+#define DIFF_EQ(x, y) (_mm_movemask_epi8(_mm_cmpeq_epi8((x), (y))) == 0xFFFF)
+    const u128 n56 = spu_or(spu_or(spu_or(diff_bit_eq(*r27, DIFF_EQ(a0, b0)), diff_bit_eq(*r26, DIFF_EQ(a1, b1))),
+                                   spu_rotqmbii(*m56, -4)),
+                            spu_or(diff_bit_eq(*r25, DIFF_EQ(a2, b2)), diff_bit_eq(*r24, DIFF_EQ(a3, b3))));
+    const u128 n57 = spu_or(spu_or(spu_or(diff_bit_eq(*r27, DIFF_EQ(a4, b4)), diff_bit_eq(*r26, DIFF_EQ(a5, b5))),
+                                   spu_rotqmbii(*m57, -4)),
+                            spu_or(diff_bit_eq(*r25, DIFF_EQ(a6, b6)), diff_bit_eq(*r24, DIFF_EQ(a7, b7))));
+#undef DIFF_EQ
+    /* The stores in the lifted order: +0, +0x10, +0x830, +0x20, +0x30, +0x800, +0x810, +0x820. */
+    _mm_storeu_si128(DIFF_AT(ab, 0x0), b0);
+    _mm_storeu_si128(DIFF_AT(ab, 0x10), b1);
+    _mm_storeu_si128(DIFF_AT(ab, 0x830), b7);
+    _mm_storeu_si128(DIFF_AT(ab, 0x20), b2);
+    _mm_storeu_si128(DIFF_AT(ab, 0x30), b3);
+    _mm_storeu_si128(DIFF_AT(ab, 0x800), b4);
+    _mm_storeu_si128(DIFF_AT(ab, 0x810), b5);
+    _mm_storeu_si128(DIFF_AT(ab, 0x820), b6);
+#undef DIFF_AT
+    *A = spu_ai(*A, -64);
+    *B = spu_ai(*B, -64);
+    *m56 = n56;
+    *m57 = n57;
+}
+#define DIFF_HAVE_SSE 1
+#endif
 
 /* The last pass and the instructions after the loop, as lifted (lift lines of
  * region 0x8CB8, 0x8E18-0x8F60), through ctx->gpr. */
@@ -190,7 +246,9 @@ static void diff_pass_last(spu_context* ctx)
     r[8] = spu_ori(r[7], 0);
 }
 
-static int diff_run(spu_context* ctx)
+/* sse: the passes in SSE registers (diff_pass_sse); 0, SPU_NATIVE_DIFF=3, the
+ * byte copies of diff_pass_fast. */
+static int diff_run(spu_context* ctx, int sse)
 {
     u128* r = ctx->gpr;
     const uint32_t n = r[23]._u32[0];
@@ -198,8 +256,16 @@ static int diff_run(spu_context* ctx)
     u128 A = r[22], B = r[67], m56 = r[56], m57 = r[57];
     const u128 c24 = r[24], c25 = r[25], c26 = r[26], c27 = r[27];
     const uint32_t fast = DIFF_PASSES - 1u - n;
+#ifdef DIFF_HAVE_SSE
+    if (sse) {
+        uint8_t* const ls = ctx->ls;
+        for (uint32_t i = 0; i < fast; i++)
+            diff_pass_sse(ls, &A, &B, &m56, &m57, &c24, &c25, &c26, &c27);
+    } else
+#endif
     for (uint32_t i = 0; i < fast; i++)
         diff_pass_fast(ctx, &A, &B, &m56, &m57, &c24, &c25, &c26, &c27);
+    (void)sse;
     r[22] = A;
     r[67] = B;
     r[56] = m56;
@@ -216,9 +282,9 @@ static int diff_check(spu_context* ctx)
 {
     static uint8_t* ls_copy;
     static unsigned long long checked, bad;
-    if (!ls_copy && !(ls_copy = (uint8_t*)malloc(SPU_LS_SIZE))) return diff_run(ctx);
+    if (!ls_copy && !(ls_copy = (uint8_t*)malloc(SPU_LS_SIZE))) return diff_run(ctx, 1);
     spu_context* c = (spu_context*)malloc(sizeof *c);
-    if (!c) return diff_run(ctx);
+    if (!c) return diff_run(ctx, 1);
     memcpy(c, ctx, sizeof *c);
     memcpy(ls_copy, ctx->ls, SPU_LS_SIZE);
     c->ls = ls_copy;
@@ -229,7 +295,7 @@ static int diff_check(spu_context* ctx)
      * check is skipped. */
     c->image_id = 0x7FFF;
     const uint32_t at = spu_interp_run_until(c, DIFF_START, DIFF_END);
-    const int ran = diff_run(ctx);
+    const int ran = diff_run(ctx, 1);
     if (!ran) {                       /* the lifted loop runs: nothing to compare */
         free(c);
         return 0;
@@ -277,5 +343,5 @@ int spu_hook_state_diff(spu_context* ctx)
         static unsigned tick;
         if (++tick % native_diff_every() == 0) return diff_check(ctx);
     }
-    return diff_run(ctx);
+    return diff_run(ctx, mode != 3);
 }
