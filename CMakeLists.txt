@@ -46,6 +46,12 @@ if(PS3RECOMP_SPU_LS_PROBES)
     add_compile_definitions(SPU_LS_PROBES=1)
 endif()
 
+# The portable renderer: a GPU layer (libs/video/gpu) with D3D12 and Vulkan
+# backends, beside today's D3D12 renderer, which stays as it is and stays the
+# default. Off: nothing of it is built and every other object is the same as
+# without the option. On: see "Portable renderer" below.
+option(PS3RECOMP_RSX_HAL "Build the portable renderer (libs/video/gpu) beside today's D3D12 renderer" OFF)
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
@@ -469,6 +475,45 @@ if(PS3RECOMP_GAME_SPLIT)
             -include "${CMAKE_CURRENT_SOURCE_DIR}/include/ps3emu/game_split.h")
     endif()
     message(STATUS "  Game split:   ON (the runtime for a host exe and a game DLL)")
+endif()
+
+# ---------------------------------------------------------------------------
+# Portable renderer (PS3RECOMP_RSX_HAL)
+# ---------------------------------------------------------------------------
+# libs/video/gpu holds the GPU layer: its contract (gpu.h, gpu_cmd_ops.h,
+# gpu_vt_cmd.h) and, as they come, its backends; libs/video/rsxcore will hold
+# the RSX code copied from today's renderer onto it. Their .c files are in the
+# glob above, so each must start with #if defined(PS3RECOMP_RSX_HAL): without
+# the option they compile to nothing and the runtime is today's.
+if(PS3RECOMP_RSX_HAL)
+    # PUBLIC: the host picks the renderer's route on it, and includes gpu.h.
+    target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_HAL=1)
+    target_include_directories(ps3recomp_runtime PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/gpu")
+    # The third-party code the backends build on: declared there, downloaded
+    # only by the sub-options that use it.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/gpu_deps.cmake")
+
+    # The contract test: the three headers from C (C99 where the compiler has
+    # the switch) and from C++, D3D12's numbers and structures, and every
+    # command against gpu_vt_cmd.h.
+    #   cmake --build build --target test_gpu_contract
+    #   ctest --test-dir build -R gpu_contract
+    add_executable(test_gpu_contract
+        libs/video/tests/test_gpu_contract.c
+        libs/video/tests/test_gpu_contract.cpp
+    )
+    target_include_directories(test_gpu_contract PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/gpu"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+    )
+    if(NOT MSVC)   # (clang-cl has no C99 switch; it builds the C half as C17)
+        set_target_properties(test_gpu_contract PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
+        target_compile_options(test_gpu_contract PRIVATE
+            -Wall -Wextra -Wpedantic -Wno-unused-parameter -Werror)
+    endif()
+    enable_testing()
+    add_test(NAME gpu_contract COMMAND test_gpu_contract)
+    message(STATUS "  Renderer:     the portable renderer's GPU layer too (PS3RECOMP_RSX_HAL)")
 endif()
 
 # ---------------------------------------------------------------------------
