@@ -67,6 +67,12 @@ static inline gpu_table gpu_d3d12_wrap_table(D3D12_GPU_DESCRIPTOR_HANDLE h)
 gpu_cmd* gpu_d3d12_cmd_wrap(gpu_device* d, ID3D12GraphicsCommandList* cl);
 void     gpu_d3d12_cmd_unwrap(gpu_device* d, gpu_cmd* c);
 
+/* A swap chain's image i, as gpu_swap_acquire hands back the current one
+ * (none past its buffer count): the old code makes every buffer's RTV, and
+ * hands every buffer to the menu renderer, up front. Valid until the next
+ * gpu_swap_resize or gpu_swap_destroy. */
+gpu_texture gpu_d3d12_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t i);
+
 /* The D3D12 description gpu_pipeline_create builds from desc (pointers into
  * desc and the shaders' code), so the conversion can check it byte for byte
  * against today's (gates G2: pso_manifest.bin). il holds the input layout. */
