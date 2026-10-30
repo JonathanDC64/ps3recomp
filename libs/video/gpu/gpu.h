@@ -70,9 +70,11 @@ typedef struct gpu_cmd gpu_cmd;
 
 /* Handles: 0 is none. The low 24 bits are the slot in the backend's table plus
  * one, the high 8 a generation count that changes each time the slot is
- * reused, so a stale handle is told from the slot's new object (until the
- * count comes round again, 256 reuses on). Wrapped in structs so the compiler
- * tells a texture from a buffer. */
+ * reused, so a stale handle is told from the slot's new object. A slot is
+ * retired before its count comes round again, so a handle names one object
+ * for the device's life: a table entry can be compared by its description
+ * (gpu_table_write_tex). Wrapped in structs so the compiler tells a texture
+ * from a buffer. */
 typedef struct gpu_buffer     { uint32_t id; } gpu_buffer;      /* memory: vertices, constants, uploads, readbacks */
 typedef struct gpu_texture    { uint32_t id; } gpu_texture;     /* 2D image, array or cube, any sample count */
 typedef struct gpu_view       { uint32_t id; } gpu_view;        /* a texture as a colour target, depth target or texture */
@@ -643,7 +645,11 @@ enum {
 enum {
     GPU_DEVICE_LOW_POWER   = 1u << 0,   /* the low-power adapter (CELLMARK_IGPU) */
     GPU_DEVICE_BREADCRUMBS = 1u << 1,   /* crash breadcrumbs and page faults (D3D12_DRED) */
-    GPU_DEVICE_USE_LUID    = 1u << 2    /* the adapter with this luid */
+    GPU_DEVICE_USE_LUID    = 1u << 2,   /* the adapter with this luid */
+    /* The software adapter, for tests and CI: WARP on D3D12
+     * (IDXGIFactory4::EnumWarpAdapter); a CPU device such as lavapipe on
+     * Vulkan (VK_PHYSICAL_DEVICE_TYPE_CPU). */
+    GPU_DEVICE_WARP        = 1u << 3
 };
 typedef struct gpu_device_desc {
     uint32_t flags;       /* GPU_DEVICE_* */
@@ -697,7 +703,9 @@ typedef struct gpu_device_desc {
     X(sampler_get,       R, gpu_sampler,    (gpu_device* d, const gpu_sampler_desc* desc), (d, desc)) \
     /* Tables. The GPU must be done with an entry before it is written. */ \
     X(table_pool_create, R, gpu_table_pool, (gpu_device* d, const gpu_table_pool_desc* desc), (d, desc)) \
-    /* Puts a texture (or, for NULL, an empty entry that reads zero) at index. An entry already \
+    /* Puts a texture at index. An empty entry, which reads zero: srv's texture none (an entry \
+     * of srv's format, dim and mips), or srv NULL (R8G8B8A8_UNORM, 2D, one mip: today's \
+     * per-draw empty slot). A new pool's entries are empty R8_UNORM ones. An entry already \
      * holding this description is left as it is (today's memo). */ \
     X(table_write_tex,   V, void,           (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
     X(table_write_sampler, V, void,         (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
@@ -707,6 +715,10 @@ typedef struct gpu_device_desc {
      * gpu_shader.h's; opaque here. Returns nonzero on success. Thread-safe. */ \
     X(compile_hook,      R, int,            (gpu_device* d, const void* request, void* result), (d, request, result)) \
     X(shader_create,     R, gpu_shader,     (gpu_device* d, const gpu_shader_desc* desc), (d, desc)) \
+    /* Frees a shader's code (today's code drops a blob once its pipeline is built); pipelines \
+     * made from it keep working. Not while a pipeline_create that uses it runs. Vulkan: \
+     * vkDestroyShaderModule. Thread-safe. */ \
+    X(shader_destroy,    V, void,           (gpu_device* d, gpu_shader s), (d, s)) \
     X(layout_create,     R, gpu_layout,     (gpu_device* d, const gpu_layout_desc* desc), (d, desc)) \
     /* A pipeline, from the cache when it has it (then *from_cache = 1; may be NULL). \
      * Thread-safe: the start's pipeline workers call it beside the render thread. */ \
