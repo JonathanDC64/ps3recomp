@@ -4,14 +4,14 @@
  * and text are rsxc_shader.c's (rsxc_vs_locate, rsxc_vs_text, step C3a); the
  * cache, its memo and the dumps are here. */
 
-/* Append a program to the per-draw VS cache. vs NULL records a program that
+/* Append a program to the per-draw VS cache. vs none records a program that
  * failed to decompile or compile, so it is not retried on every draw. */
-static int vp_vs_insert(u32 hash, ID3DBlob* vs, int uses_c03)
+static int vp_vs_insert(u32 hash, gpu_shader vs, int uses_c03)
 {
     if (s_d3d.vp_vs_n >= s_d3d.vp_vs_cap) {
         const int cap = s_d3d.vp_vs_cap ? s_d3d.vp_vs_cap * 2 : VP_VS_CACHE_INIT;
         VPVSEntry* grown = (VPVSEntry*)realloc(s_d3d.vp_vs, sizeof(VPVSEntry) * (size_t)cap);
-        if (!grown) { if (vs) vs->lpVtbl->Release(vs); return -1; }
+        if (!grown) { sc_shader_drop(&vs); return -1; }
         s_d3d.vp_vs = grown; s_d3d.vp_vs_cap = cap;
     }
     const int slot = s_d3d.vp_vs_n++;
@@ -21,7 +21,7 @@ static int vp_vs_insert(u32 hash, ID3DBlob* vs, int uses_c03)
     s_d3d.vp_vs[slot].fetch    = 0;
     s_d3d.vp_vs[slot].code64   = 0;
     s_d3d.vp_vs[slot].start    = 0;
-    return vs ? slot : -1;
+    return GPU_VALID(vs) ? slot : -1;
 }
 
 static int vp_get_vs_mode(const rsx_state* st, int fetch);
@@ -94,7 +94,7 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                     memmove(&mw[1], &mw[0], (size_t)w * sizeof *mw);
                     mw[0] = hit;
                 }
-                return s_d3d.vp_vs[idx].vs ? idx : -1;
+                return GPU_VALID(s_d3d.vp_vs[idx].vs) ? idx : -1;
             }
     }
     VsMemo* m = &mw[ways - 1];   /* the least recently used; its copy's buffer is reused */
@@ -124,7 +124,7 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                     m->st = NULL;   /* no room for the copy: drop the entry */
                 }
             }
-            return s_d3d.vp_vs[i].vs ? i : -1;
+            return GPU_VALID(s_d3d.vp_vs[i].vs) ? i : -1;
         }
 
     static char hlsl[262144];
@@ -134,7 +134,7 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
      * show them too). */
     int uses_c03 = 0;
     int ni = rsxc_vs_text(&vp, fetch, hlsl, sizeof hlsl, &uses_c03);
-    if (ni <= 0) return vp_vs_insert(hash, NULL, 0);
+    if (ni <= 0) return vp_vs_insert(hash, (gpu_shader){0}, 0);
     if (getenv("VP_DUMP")) { static int _d=0; if (_d < 4 && ++_d) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -152,13 +152,11 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                    fclose(f); }
           fprintf(stderr, "[DUCKVP] wrote duck_vp.hlsl (%d instrs)%c", ni, 10);
       } }
-    ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, hlsl, strlen(hlsl), "guest_vp2", NULL, 0, &vb, &e);
-    if (e) e->lpVtbl->Release(e);
+    gpu_shader vb = sc_shader(GPU_SC_VS, hlsl, strlen(hlsl), "guest_vp2", NULL, 0);
     if (perf_on()) s_perf_vs += perf_now() - vs_t0;
-    if (FAILED(hr) || !vb) {
+    if (!GPU_VALID(vb)) {
         static int _e=0; if (_e < 4 && ++_e) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
-        return vp_vs_insert(hash, NULL, 0);
+        return vp_vs_insert(hash, (gpu_shader){0}, 0);
     }
     const int slot = vp_vs_insert(hash, vb, uses_c03);
     if (slot < 0) return -1;

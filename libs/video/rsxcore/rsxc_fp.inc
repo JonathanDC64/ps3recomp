@@ -196,13 +196,16 @@ static VPFPEntry* vp_fp_find(const VPFPEntry* k)
  * way; only the wait is shorter. The decompile and the shader cache stay on
  * the render thread (guest memory, static buffers); the workers build the
  * pipeline, load it from the library or store it there, and add it to the
- * manifest (pso_create_cached). */
+ * manifest (pso_create_cached). Step C3b: a job holds a gpu_pipeline_desc;
+ * its vertex shader (the VS cache's, or vp_vs_shader) and the uvclamp GS are
+ * never freed while a batch builds, and its pixel shader is its own, freed in
+ * psj_finish once the pipeline is made (gpu_pipeline_create is
+ * thread-safe). */
 #define PSJ_MAX 256
 #define PSJ_THREADS_MAX 15
 typedef struct {
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
-    D3D12_INPUT_ELEMENT_DESC il[16];
-    ID3DBlob *vs, *ps, *gs;             /* held until psj_finish */
+    gpu_pipeline_desc pd;
+    gpu_shader ps;                      /* the job's own, freed in psj_finish */
     int entry;                          /* its VPFPEntry */
     ID3D12PipelineState* pso;
 } PsjJob;
@@ -242,7 +245,7 @@ static void psj_take(LONG n)
 {
     for (LONG i; (i = InterlockedIncrement(&s_psj_next) - 1) < n; ) {
         PsjJob* j = &s_psj[i];
-        if (FAILED(pso_create_cached(&j->pd, &j->pso))) j->pso = NULL;
+        j->pso = pso_create_cached(&j->pd);
         if (InterlockedDecrement(&s_psj_left) == 0) {
             AcquireSRWLockExclusive(&s_psjp.lk);   /* the render thread waits or has not looked yet */
             ReleaseSRWLockExclusive(&s_psjp.lk);
@@ -270,9 +273,8 @@ static DWORD WINAPI psj_worker(LPVOID arg)
 
 /* vp_get_fp_pso in the pre-pass, on a miss: the key goes into the cache as
  * pending and the pipeline into this frame's batch, which takes the caller's
- * reference to ps. The entry's index, or -1 (full: build it now). */
-static int psj_add(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const D3D12_INPUT_ELEMENT_DESC* il,
-                   ID3DBlob* vs, ID3DBlob* ps, ID3DBlob* gs, const VPFPEntry* key)
+ * ps (pd's pixel shader). The entry's index, or -1 (full: build it now). */
+static int psj_add(const gpu_pipeline_desc* pd, gpu_shader ps, const VPFPEntry* key)
 {
     if (s_psj_n >= PSJ_MAX) return -1;
     const int at = s_d3d.vp_fp_n;
@@ -282,11 +284,7 @@ static int psj_add(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, const D3D12_INP
     if (s_d3d.vp_fp_n != at + 1) return -1;   /* the cache could not grow */
     PsjJob* j = &s_psj[s_psj_n++];
     j->pd = *pd;
-    memcpy(j->il, il, sizeof j->il);
-    j->pd.InputLayout.pInputElementDescs = j->il;
-    j->vs = vs; vs->lpVtbl->AddRef(vs);
     j->ps = ps;
-    j->gs = gs; if (gs) gs->lpVtbl->AddRef(gs);
     j->entry = at;
     j->pso = NULL;
     return at;
@@ -336,9 +334,7 @@ static void psj_finish(void)
             failed++;
             if (said < 16 && ++said) printf("[FP] PSO FAIL (fp=0x%08X)\n", e->fp_addr);
         }
-        j->vs->lpVtbl->Release(j->vs);
-        j->ps->lpVtbl->Release(j->ps);
-        if (j->gs) j->gs->lpVtbl->Release(j->gs);
+        sc_shader_drop(&j->ps);
     }
     for (int k = 0; k < s_psj_fix_n; k++)
         s_d3d.draws[s_psj_fix[k].draw].pso = s_d3d.vp_fp[s_psj_fix[k].entry].pso;
@@ -440,23 +436,20 @@ static u32 dr_uvclamp(const D3D12DrawRecord* dr)
 }
 
 /* The geometry half: rsxc_uvclamp_gs_hlsl's source, compiled once (gs_5_0,
- * not through the disk cache). The pixel half is fp_inject_uvclamp's
- * (rsxc_fp_inject_uvclamp): the bounds as inputs after TEXCOORD9 and the
- * clamp at the top of main; 0 leaves the text as it was. */
-static ID3DBlob* uvclamp_gs(void)
+ * not through the disk cache) into a shader that is never freed. The pixel
+ * half is fp_inject_uvclamp's (rsxc_fp_inject_uvclamp): the bounds as inputs
+ * after TEXCOORD9 and the clamp at the top of main; 0 leaves the text as it
+ * was. */
+static gpu_shader uvclamp_gs(void)
 {
-    static ID3DBlob* gs = NULL;
+    static gpu_shader gs;
     static int tried = 0;
     if (tried) return gs;
     tried = 1;
     size_t n = 0;
     const char* src = rsxc_uvclamp_gs_hlsl(&n);
-    ID3DBlob* err = NULL;
-    if (FAILED(sc_compile(GPU_SC_GS, src, n, "uvclamp_gs", NULL, GPU_SC_NO_CACHE, &gs, &err))) {
-        if (err) { fprintf(stderr, "[D3D12] RSX_SCALE_UVCLAMP: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
-                   err->lpVtbl->Release(err); }
-        gs = NULL;
-    }
+    gs = sc_shader(GPU_SC_GS, src, n, "uvclamp_gs", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(gs) && t_sc_msg[0]) fprintf(stderr, "[D3D12] RSX_SCALE_UVCLAMP: %s%c", t_sc_msg, 10);
     return gs;
 }
 static int fp_inject_uvclamp(char* hlsl, size_t cap) { return rsxc_fp_inject_uvclamp(hlsl, cap); }

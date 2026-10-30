@@ -21,52 +21,127 @@ static double s_perf_pmiss = 0.0;          /* whole vp_get_fp_pso calls that mis
 static const char* shader_cache_dir(void) { return gpu_sc_cache_dir(); }
 static void shader_cache_warm(void) { gpu_sc_warm(); }
 
-/* TEMPORARY, until the pipeline step makes gpu_shader handles: the core's
- * pipeline code takes bytecode as an ID3DBlob, so the service's bytes are
- * copied into one. */
-static ID3DBlob* sc_d3d_blob(const void* p, size_t n)
+/* A compile on the service's dxbc target: 1 with the bytecode in *out (the
+ * caller's to release, gpu_sc_blob_release), else 0 with the compiler's
+ * message for sc_msg. entry NULL is "main". */
+static __declspec(thread) char t_sc_msg[8192];
+static int sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name,
+                      const char* entry, unsigned flags, gpu_sc_blob* out)
 {
-    ID3DBlob* b = NULL;
-    if (FAILED(D3DCreateBlob((SIZE_T)n, &b)) || !b) return NULL;
-    memcpy(b->lpVtbl->GetBufferPointer(b), p, n);
-    return b;
-}
-
-/* A compile on the service's dxbc target, with D3DCompile's results: the
- * bytecode in *out and, when it fails, the compiler's message in *err (both
- * the caller's to release). entry NULL is "main". */
-static HRESULT sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name,
-                          const char* entry, unsigned flags, ID3DBlob** out, ID3DBlob** err)
-{
-    char msg[8192];
-    gpu_sc_blob b;
-    *out = NULL;
-    if (err) *err = NULL;
     gpu_sc_perf(perf_on());
-    const int r = gpu_sc_compile_entry(GPU_SC_DXBC, stage, src, n, name, entry, flags, &b, msg, sizeof msg);
-    if (r == GPU_SC_OK) {
-        *out = sc_d3d_blob(b.data, b.size);
-        gpu_sc_blob_release(&b);
-        return *out ? S_OK : E_OUTOFMEMORY;
-    }
-    if (err && msg[0]) *err = sc_d3d_blob(msg, strlen(msg) + 1);
-    return E_FAIL;
+    return gpu_sc_compile_entry(GPU_SC_DXBC, stage, src, n, name, entry, flags, out, t_sc_msg,
+                                sizeof t_sc_msg) == GPU_SC_OK;
+}
+/* The message of this thread's last compile that failed, or `none` when the
+ * compiler gave none. */
+static const char* sc_msg(const char* none) { return t_sc_msg[0] ? t_sc_msg : none; }
+
+/* Step C3b: the shaders are the GPU layer's. A compiled program becomes a
+ * gpu_shader (its bytecode copied; the service's blob released), which
+ * pipelines are made from; sc_shader_drop frees it where today's code
+ * released its blob, once its pipelines are made. none on failure. */
+static gpu_shader sc_shader_from(gpu_sc_stage stage, gpu_sc_blob* b)
+{
+    gpu_shader_desc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.stage = stage == GPU_SC_PS ? GPU_STAGE_PS : stage == GPU_SC_GS ? GPU_STAGE_GS : GPU_STAGE_VS;
+    sd.code = GPU_CODE_DXBC;
+    sd.bytes = b->data;
+    sd.size = b->size;
+    const gpu_shader s = gpu_shader_create(s_rc_dev, &sd);
+    gpu_sc_blob_release(b);
+    return s;
+}
+static gpu_shader sc_shader(gpu_sc_stage stage, const char* src, size_t n, const char* name,
+                            const char* entry, unsigned flags)
+{
+    gpu_sc_blob b;
+    if (!sc_compile(stage, src, n, name, entry, flags, &b)) { const gpu_shader none = {0}; return none; }
+    return sc_shader_from(stage, &b);
+}
+static void sc_shader_drop(gpu_shader* s)
+{
+    if (GPU_VALID(*s)) gpu_shader_destroy(s_rc_dev, *s);
+    s->id = 0;
 }
 
 /* A guest program through the cache, by its profile. */
-static HRESULT shader_compile_cached(const char* src, size_t n, const char* name,
-                                     const char* profile, ID3DBlob** out, ID3DBlob** err)
+static gpu_shader shader_compile_cached(const char* src, size_t n, const char* name, const char* profile)
 {
-    return sc_compile(strcmp(profile, "ps_5_0") ? GPU_SC_VS : GPU_SC_PS, src, n, name, NULL, 0, out, err);
+    return sc_shader(strcmp(profile, "ps_5_0") ? GPU_SC_VS : GPU_SC_PS, src, n, name, NULL, 0);
 }
 
-/* The program the cache holds under key K, or NULL (the pipeline index's
+/* The program the cache holds under key K, or none (the pipeline index's
  * build: its rows name programs by key). */
-static ID3DBlob* sc_load(gpu_sc_stage stage, u64 key)
+static gpu_shader sc_load(gpu_sc_stage stage, u64 key)
 {
     gpu_sc_blob b;
-    if (gpu_sc_load(GPU_SC_DXBC, stage, key, &b) != GPU_SC_OK) return NULL;
-    ID3DBlob* d = sc_d3d_blob(b.data, b.size);
-    gpu_sc_blob_release(&b);
-    return d;
+    if (gpu_sc_load(GPU_SC_DXBC, stage, key, &b) != GPU_SC_OK) { const gpu_shader none = {0}; return none; }
+    return sc_shader_from(stage, &b);
+}
+
+/* Step C3b: every pipeline is the GPU layer's, from its library when that
+ * has it (its own file: pso_lib_open). The ID3D12PipelineState* returned is
+ * the handle's value (gpu_pipeline.v), kept by the core for the commands
+ * that bind it natively until steps C6/C7; pipelines live as long as the
+ * device, so it is never released. NULL on failure; *loaded (may be NULL)
+ * says whether it came from the library. Thread-safe. */
+static ID3D12PipelineState* rc_pipeline(const gpu_pipeline_desc* d, uint32_t* loaded)
+{
+    uint32_t fc = 0;
+    const gpu_pipeline p = gpu_pipeline_create(s_rc_dev, d, &fc);
+    if (p.v) InterlockedIncrement(fc ? &s_rc_pipe_loaded : &s_rc_pipe_made);
+    if (loaded) *loaded = p.v ? fc : 0;
+    return (ID3D12PipelineState*)(uintptr_t)p.v;
+}
+
+/* A built-in pass's pipeline (the blit, the output filter, the HDR blit, the
+ * write-back's downscale, FXAA, SMAA): a full-screen triangle without vertex
+ * input or culling, into one colour target of format fmt written with mask,
+ * no depth target, blending off; everything else 0, as today's zeroed
+ * descriptions leave it. depth_clip as each sets it. */
+static void pass_desc(gpu_pipeline_desc* d, gpu_layout layout, gpu_shader vs, gpu_shader ps,
+                      gpu_format fmt, u8 mask, int depth_clip)
+{
+    memset(d, 0, sizeof *d);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    d->layout = layout;
+    d->vs = vs;
+    d->ps = ps;
+    d->topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
+    d->cull = GPU_CULL_NONE;
+    d->depth_clip = depth_clip ? 1 : 0;
+    d->blend.write_mask = mask;
+    d->nrt = 1;
+    d->rt_format[0] = fmt;
+    d->samples = 1;
+    d->sample_mask = UINT_MAX;
+}
+
+/* A layout slot, and the passes' static sampler at s<reg>: filter, clamped
+ * on every axis, every mip, for the pixel shader (today's zeroed
+ * D3D12_STATIC_SAMPLER_DESC with those set). */
+static gpu_layout_slot lay_slot(u8 kind, u8 reg, u8 count, u8 vis)
+{
+    gpu_layout_slot s;
+    s.kind = kind; s.reg = reg; s.count = count; s.visibility = vis;
+    return s;
+}
+static gpu_static_sampler pass_sampler(u32 filter, u32 reg)
+{
+    gpu_static_sampler s;
+    memset(&s, 0, sizeof s);
+    s.desc.filter = filter;
+    s.desc.address_u = s.desc.address_v = s.desc.address_w = GPU_ADDRESS_CLAMP;
+    s.desc.max_lod = GPU_LOD_MAX;
+    s.reg = reg;
+    s.visibility = GPU_VIS_PIXEL;
+    return s;
+}
+/* A layout and, in *rs, its ID3D12RootSignature* for the native binds (NULL
+ * on failure). */
+static gpu_layout lay_make(const gpu_layout_desc* ld, ID3D12RootSignature** rs)
+{
+    const gpu_layout l = gpu_layout_create(s_rc_dev, ld);
+    *rs = (ID3D12RootSignature*)gpu_native(s_rc_dev, GPU_NATIVE_LAYOUT, l.id);
+    return l;
 }

@@ -59,6 +59,7 @@ static const char* const s_aa_why[] = {
 
 static struct {
     ID3D12RootSignature*  rs;
+    gpu_layout            layout;     /* rs's handle (step C3b) */
     ID3D12PipelineState*  pso;
     ID3D12PipelineState*  pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
@@ -97,68 +98,38 @@ static int aa_ready(void)
     if (s_aa.pso) return 1;
     if (s_aa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
     s_aa.failed = 1;   /* until it is made */
-    ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
-                            GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb, &err);
-    if (SUCCEEDED(hr))
-        hr = sc_compile(GPU_SC_PS, rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL,
-                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb, &err);
-    if (FAILED(hr))
-        printf("[AA] shader compile failed: %s\n",
-               err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
-                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER rp[2] = {0};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[0].DescriptorTable.NumDescriptorRanges = 1;
-        rp[0].DescriptorTable.pDescriptorRanges = &range;
-        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp[1].Constants.Num32BitValues = 4;
-        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_STATIC_SAMPLER_DESC smp = {0};
-        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        smp.MaxLOD = D3D12_FLOAT32_MAX;
-        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_ROOT_SIGNATURE_DESC rsd = {2, rp, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
-        if (SUCCEEDED(hr))
-            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
-                &IID_ID3D12RootSignature, (void**)&s_aa.rs);
+    gpu_shader vb = sc_shader(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
+                              GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    gpu_shader pb = {0};
+    if (GPU_VALID(vb))
+        pb = sc_shader(GPU_SC_PS, rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL,
+                       GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    if (!GPU_VALID(pb))
+        printf("[AA] shader compile failed: %s\n", sc_msg("?"));
+    else {
+        /* The GPU layer's layout and pipelines (step C3b): the t0 table, b0 =
+         * 4 constants, a linear clamp at s0. */
+        gpu_layout_desc ld;
+        memset(&ld, 0, sizeof ld);
+        ld.nslots = 2;
+        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_PIXEL);
+        ld.nstatic = 1;
+        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+        s_aa.layout = lay_make(&ld, &s_aa.rs);
     }
-    if (SUCCEEDED(hr)) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-        pd.pRootSignature = s_aa.rs;
-        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
-        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
-        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
-        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = (UINT8)(D3D12_COLOR_WRITE_ENABLE_RED |
-            D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE);
-        pd.SampleMask = UINT_MAX;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pd.SampleDesc.Count = 1;
-        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-            &IID_ID3D12PipelineState, (void**)&s_aa.pso);
-        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;   /* without it, FP16 targets go unfiltered */
-        if (SUCCEEDED(hr) && FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-                &IID_ID3D12PipelineState, (void**)&s_aa.pso16)))
-            s_aa.pso16 = NULL;
+    if (s_aa.rs) {
+        gpu_pipeline_desc pd;
+        pass_desc(&pd, s_aa.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM,
+                  GPU_WRITE_R | GPU_WRITE_G | GPU_WRITE_B, 1);
+        s_aa.pso = rc_pipeline(&pd, NULL);
+        pd.rt_format[0] = GPU_FORMAT_R16G16B16A16_FLOAT;   /* without it, FP16 targets go unfiltered */
+        if (s_aa.pso) s_aa.pso16 = rc_pipeline(&pd, NULL);
     }
-    if (vb) vb->lpVtbl->Release(vb);
-    if (pb) pb->lpVtbl->Release(pb);
-    if (rsb) rsb->lpVtbl->Release(rsb);
-    if (err) err->lpVtbl->Release(err);
-    if (FAILED(hr) || !s_aa.pso) {
-        printf("[AA] pipeline failed (0x%08lX): anti-aliasing stays off\n", (long)hr);
+    sc_shader_drop(&vb);
+    sc_shader_drop(&pb);
+    if (!s_aa.pso) {
+        printf("[AA] pipeline failed (0x%08lX): anti-aliasing stays off\n", (long)E_FAIL);
         return 0;
     }
     s_aa.failed = 0;
@@ -207,6 +178,7 @@ static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDL
 
 static struct {
     ID3D12RootSignature*  rs;
+    gpu_layout            layout;      /* rs's handle (step C3b) */
     ID3D12PipelineState*  pso[3];      /* edges, weights, blend into RGBA8 */
     ID3D12PipelineState*  blend16;     /* the blend pass into FP16 (HDR's scene target) */
     int                   failed;      /* could not be made: FXAA runs instead */
@@ -260,7 +232,7 @@ static int smaa_ready(void)
     };
     const size_t nh = sizeof rsx_smaa_head - 1, ns = sizeof rsx_smaa_src - 1, nt = sizeof rsx_smaa_tail - 1;
     char* text = (char*)malloc(nh + ns + nt);
-    ID3DBlob *code[6] = {0}, *rsb = NULL, *err = NULL;
+    gpu_shader code[6] = {{0}};
     HRESULT hr = text ? S_OK : E_OUTOFMEMORY;
     if (text) {
         memcpy(text, rsx_smaa_head, nh);
@@ -268,64 +240,39 @@ static int smaa_ready(void)
         memcpy(text + nh + ns, rsx_smaa_tail, nt);
     }
     for (int i = 0; i < 6 && SUCCEEDED(hr); i++) {
-        hr = sc_compile((i & 1) ? GPU_SC_PS : GPU_SC_VS, text, nh + ns + nt, "rsx_smaa", entry[i],
-                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &code[i], &err);
-        if (FAILED(hr))
-            printf("[AA] SMAA shader %s failed to compile: %s\n", entry[i],
-                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+        code[i] = sc_shader((i & 1) ? GPU_SC_PS : GPU_SC_VS, text, nh + ns + nt, "rsx_smaa", entry[i],
+                            GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        if (!GPU_VALID(code[i])) {
+            hr = E_FAIL;
+            printf("[AA] SMAA shader %s failed to compile: %s\n", entry[i], sc_msg("?"));
+        }
     }
     free(text);
     if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0,
-                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER rp[2] = {0};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[0].DescriptorTable.NumDescriptorRanges = 1;
-        rp[0].DescriptorTable.pDescriptorRanges = &range;
-        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp[1].Constants.Num32BitValues = 4;
-        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   /* the vertex shaders use them too */
-        D3D12_STATIC_SAMPLER_DESC smp[2] = {{0}};
-        for (int k = 0; k < 2; k++) {
-            smp[k].Filter = k ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-            smp[k].AddressU = smp[k].AddressV = smp[k].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-            smp[k].MaxLOD = D3D12_FLOAT32_MAX;
-            smp[k].ShaderRegister = (UINT)k;
-            smp[k].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        }
-        D3D12_ROOT_SIGNATURE_DESC rsd = {2, rp, 2, smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
-        if (SUCCEEDED(hr))
-            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
-                &IID_ID3D12RootSignature, (void**)&s_smaa.rs);
+        /* The GPU layer's layout and pipelines (step C3b): a t0-t2 table, b0
+         * = 4 constants (the vertex shaders use them too), a linear clamp at
+         * s0 and a point clamp at s1. */
+        gpu_layout_desc ld;
+        memset(&ld, 0, sizeof ld);
+        ld.nslots = 2;
+        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 3, GPU_VIS_PIXEL);
+        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_ALL);
+        ld.nstatic = 2;
+        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 0, 0), 0);
+        ld.statics[1] = pass_sampler(GPU_FILTER(0, 0, 0, 0), 1);
+        s_smaa.layout = lay_make(&ld, &s_smaa.rs);
+        if (!s_smaa.rs) hr = E_FAIL;
     }
     for (int p = 0; p < 4 && SUCCEEDED(hr); p++) {   /* edges, weights, blend, blend16 */
         const int s = p < 3 ? p : 2;
-        static const DXGI_FORMAT fmt[4] = {DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-                                           DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-        pd.pRootSignature = s_smaa.rs;
-        pd.VS.pShaderBytecode = code[2 * s]->lpVtbl->GetBufferPointer(code[2 * s]);
-        pd.VS.BytecodeLength  = code[2 * s]->lpVtbl->GetBufferSize(code[2 * s]);
-        pd.PS.pShaderBytecode = code[2 * s + 1]->lpVtbl->GetBufferPointer(code[2 * s + 1]);
-        pd.PS.BytecodeLength  = code[2 * s + 1]->lpVtbl->GetBufferSize(code[2 * s + 1]);
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = s == 2
-            ? (UINT8)(D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE)
-            : (UINT8)D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = fmt[p];
-        pd.SampleDesc.Count = 1;
+        static const gpu_format fmt[4] = {GPU_FORMAT_R8G8_UNORM, GPU_FORMAT_R8G8B8A8_UNORM,
+                                          GPU_FORMAT_R8G8B8A8_UNORM, GPU_FORMAT_R16G16B16A16_FLOAT};
+        gpu_pipeline_desc pd;
+        pass_desc(&pd, s_smaa.layout, code[2 * s], code[2 * s + 1], fmt[p],
+                  s == 2 ? (u8)(GPU_WRITE_R | GPU_WRITE_G | GPU_WRITE_B) : (u8)GPU_WRITE_ALL, 1);
         ID3D12PipelineState** out = p < 3 ? &s_smaa.pso[p] : &s_smaa.blend16;
-        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-            &IID_ID3D12PipelineState, (void**)out);
-        if (FAILED(hr)) *out = NULL;
+        *out = rc_pipeline(&pd, NULL);
+        hr = *out ? S_OK : E_FAIL;
         if (p == 3) hr = S_OK;   /* without it, FP16 targets get FXAA */
     }
     if (SUCCEEDED(hr)) {
@@ -347,10 +294,7 @@ static int smaa_ready(void)
         if (SUCCEEDED(hr))   /* step C4: sampled (smaa_draw's SRV writes) */
             rc_tex_set(k ? &s_smaa.search_tex : &s_smaa.area_tex, k ? s_smaa.search : s_smaa.area);
     }
-    for (int i = 0; i < 6; i++)
-        if (code[i]) code[i]->lpVtbl->Release(code[i]);
-    if (rsb) rsb->lpVtbl->Release(rsb);
-    if (err) err->lpVtbl->Release(err);
+    for (int i = 0; i < 6; i++) sc_shader_drop(&code[i]);
     if (FAILED(hr) || !s_smaa.pso[2]) {
         printf("[AA] SMAA pipeline failed (0x%08lX): FXAA runs instead\n", (long)hr);
         return 0;

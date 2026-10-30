@@ -69,13 +69,14 @@ static u32 rt_guest_bpp(u32 dxgi)
  * later at that offset was filled from it: the Profile List showed coloured
  * noise below its footer, where it draws nothing over a recreated target. */
 static ID3D12RootSignature*  s_down_rs;
+static gpu_layout            s_down_layout;   /* s_down_rs's handle (step C3b) */
 static ID3D12PipelineState*  s_down_pso[8];
 static u32                   s_down_pso_fmt[8];   /* format, | 1 << 31 for guest byte order */
 static ID3D12DescriptorHeap* s_down_srv;   /* shader visible, 2 x MAX_OFF_RTS (frame parity) */
 static ID3D12DescriptorHeap* s_down_rtv;
-static ID3DBlob*             s_down_vs;
-static ID3DBlob*             s_down_ps;
-static ID3DBlob*             s_down_ps_argb;   /* A,R,G,B bytes: the guest's A8R8G8B8 */
+static gpu_shader            s_down_vs;
+static gpu_shader            s_down_ps;
+static gpu_shader            s_down_ps_argb;   /* A,R,G,B bytes: the guest's A8R8G8B8 */
 
 static int down_init(void)
 {
@@ -99,37 +100,28 @@ static int down_init(void)
         "float4 main(float4 p : SV_Position) : SV_Target {\n"
         "    return src.Load(int3(int2(p.xy * ratio), 0)).argb;\n"
         "}\n";
-    ID3DBlob* err = NULL;
-    if (FAILED(sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE, &s_down_vs, &err)) ||
-        FAILED(sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE, &s_down_ps, &err)) ||
-        FAILED(sc_compile(GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, GPU_SC_NO_CACHE,
-                          &s_down_ps_argb, &err))) {
-        if (err) { fprintf(stderr, "[D3D12] write-back downscale: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
-                   err->lpVtbl->Release(err); }
+    /* The shaders are the GPU layer's (step C3b), kept for down_pso's later
+     * formats: never freed. */
+    s_down_vs = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_vs))
+        s_down_ps = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_ps))
+        s_down_ps_argb = sc_shader(GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(s_down_ps_argb)) {
+        if (t_sc_msg[0]) fprintf(stderr, "[D3D12] write-back downscale: %s%c", t_sc_msg, 10);
         return 0;
     }
-    D3D12_DESCRIPTOR_RANGE range = {0};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
-    D3D12_ROOT_PARAMETER rp[2] = {0};
-    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[0].DescriptorTable.NumDescriptorRanges = 1;
-    rp[0].DescriptorTable.pDescriptorRanges = &range;
-    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[1].Constants.Num32BitValues = 2;
-    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rd = {0};
-    rd.NumParameters = 2; rd.pParameters = rp;
-    ID3DBlob* sig = NULL;
-    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
-        if (err) err->lpVtbl->Release(err);
-        return 0;
-    }
-    HRESULT hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-        sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
-        &IID_ID3D12RootSignature, (void**)&s_down_rs);
-    sig->lpVtbl->Release(sig);
+    /* The GPU layer's layout: the t0 table, b0 = 2 constants. (Call map G12:
+     * today's range has offset 0, the GPU layer's OFFSET_APPEND; the first
+     * range of its table, it lands at 0 either way, so only the serialized
+     * bytes differ.) */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 2;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 2, GPU_VIS_PIXEL);
+    s_down_layout = lay_make(&ld, &s_down_rs);
+    HRESULT hr = s_down_rs ? S_OK : E_FAIL;
     if (FAILED(hr)) return 0;
     {   /* the GPU layer's table pool, a 1-entry table each (step C4) */
         gpu_table_pool_desc pd;
@@ -160,23 +152,10 @@ static ID3D12PipelineState* down_pso(DXGI_FORMAT f, int argb)
     int slot = -1;
     for (int i = 0; i < 8; i++) if (!s_down_pso[i]) { slot = i; break; }
     if (slot < 0) return NULL;
-    ID3DBlob* const ps = argb ? s_down_ps_argb : s_down_ps;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-    pd.pRootSignature = s_down_rs;
-    pd.VS.pShaderBytecode = s_down_vs->lpVtbl->GetBufferPointer(s_down_vs);
-    pd.VS.BytecodeLength  = s_down_vs->lpVtbl->GetBufferSize(s_down_vs);
-    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps);
-    pd.PS.BytecodeLength  = ps->lpVtbl->GetBufferSize(ps);
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pd.SampleMask = UINT_MAX;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = f;
-    pd.SampleDesc.Count = 1;
-    if (FAILED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-            &IID_ID3D12PipelineState, (void**)&s_down_pso[slot]))) { s_down_pso[slot] = NULL; return NULL; }
+    gpu_pipeline_desc pd;
+    pass_desc(&pd, s_down_layout, s_down_vs, argb ? s_down_ps_argb : s_down_ps, (gpu_format)f, GPU_WRITE_ALL, 0);
+    s_down_pso[slot] = rc_pipeline(&pd, NULL);   /* (the GPU layer's: step C3b) */
+    if (!s_down_pso[slot]) return NULL;
     s_down_pso_fmt[slot] = key;
     return s_down_pso[slot];
 }

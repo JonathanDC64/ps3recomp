@@ -242,7 +242,7 @@ typedef struct {
  * transformed by the wrong program (text offscreen). */
 typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
-    ID3DBlob* vs;
+    gpu_shader vs;          /* the compiled program (step C3b: the GPU layer's; never freed) */
     int uses_c03;
     int fetch;              /* reads vf_buf (rsx_vp_decompile_fetch): no input layout */
     u64 code64;             /* the pipeline index's fingerprint: FNV-1a 64 of the words up to END */
@@ -324,6 +324,7 @@ typedef struct {
     ID3D12DescriptorHeap*      swap_rtv_heap;
     u32                        win_w, win_h;
     ID3D12RootSignature*       blit_rs;
+    gpu_layout                 blit_layout;   /* blit_rs's handle (step C3b) */
     ID3D12PipelineState*       blit_pso;
     ID3D12DescriptorHeap*      blit_srv_heap;   /* shader-visible: one SRV per render_targets[i] */
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
@@ -378,6 +379,7 @@ typedef struct {
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
     ID3D12RootSignature*  vp_root_sig;          /* CBV(b0) + SRV table + sampler */
+    gpu_layout            vp_layout;            /* vp_root_sig's handle (step C3b) */
     ID3D12Resource*       vf_buf;               /* GPU vertex fetch ring (x2 parity) */
     void*                 vf_mapped;
     ID3D12PipelineState*  pipeline_state_vp;    /* decompiled VS + atlas PS      */
@@ -394,7 +396,7 @@ typedef struct {
     void*                 vp_fpcb_mapped;
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
-    ID3DBlob*             vp_vs_blob;           /* kept for guest-FP PSO builds  */
+    gpu_shader            vp_vs_shader;         /* kept for guest-FP PSO builds (step C3b: a shader) */
     u32                   vp_gen;               /* bumped per VP recompile       */
     int                   vp_uses_c03;          /* VS references vp_c[0..3]      */
     VPTexSlot             vp_tex[VP_TEX_SLOTS]; /* per-frame VP texture slots    */
@@ -458,6 +460,16 @@ static gpu_swapchain s_rc_swap;
 static gpu_texture   s_rc_swap_image[FRAME_COUNT];
 static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
+/* Step C3b: the root signatures, the pipelines and the shaders they are made
+ * from are the GPU layer's (gpu_layout_create, gpu_pipeline_create,
+ * gpu_shader_create). The ID3D12RootSignature* and ID3D12PipelineState*
+ * fields hold the same objects for the commands that still bind them
+ * natively: borrowed, never released by the core (gpu_destroy frees them).
+ * A layout's handle is beside its field (s_d3d.vp_layout, blit_layout,
+ * s_of.layout, ...); a pipeline's handle is its ID3D12PipelineState* itself
+ * (gpu_pipeline.v). The pipelines made this run, from the GPU layer's
+ * library and compiled (rc_pipeline): */
+static volatile LONG s_rc_pipe_loaded, s_rc_pipe_made;
 static int draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;

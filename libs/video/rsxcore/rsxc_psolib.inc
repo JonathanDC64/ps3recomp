@@ -4,12 +4,20 @@
  * in one frame (PERF=1 "pipelines created"). The driver's cache belongs to the
  * executable, so a rebuilt exe starts cold. Ours, in the shader cache dir:
  *
- *   pso_library.bin  an ID3D12PipelineLibrary: the compiled pipelines, named by
- *                    a hash of the whole description. Only good for the driver
- *                    and GPU that wrote it; another one fails to load.
- *   pso_library.n    how many manifest records the saved library holds.
+ *   gpu/d3d12/pipelines.lib  the GPU layer's pipeline library
+ *                    (gpu_pipeline_cache_load/save; on D3D12 an
+ *                    ID3D12PipelineLibrary): the compiled pipelines, named by
+ *                    the GPU layer's hash of the whole description (call map
+ *                    G9), so it is not the d3d12 route's pso_library.bin,
+ *                    which this route never reads or writes. Only good for the
+ *                    driver and GPU that wrote it; another one fails to load.
+ *   gpu/d3d12/pipelines.n    how many manifest records the saved library holds.
+ *   gpu/d3d12/index.built    the pipeline index's build mark (rsxc_pipeline.inc).
  *   pso_manifest.bin every pipeline ever created, as a description that can
- *                    be rebuilt without the guest (fixed-size records).
+ *                    be rebuilt without the guest (fixed-size records): the
+ *                    d3d12 route's file, with the same records (the D3D12
+ *                    description the GPU layer makes of a pipeline is
+ *                    today's, gpu_d3d12_pipeline_d3d_desc).
  *   pso_blobs/       the shader bytecode those records name, by content hash.
  *
  * At startup, worker threads build every manifest record the library does not
@@ -18,9 +26,7 @@
  * session has met yet is still compiled on first use, once.
  * PS3_PSO_LIBRARY=0 turns all of it off; PS3_PSO_PREBUILD=0 keeps the library
  * but skips the startup build. */
-static ID3D12PipelineLibrary* s_pso_lib;
-static void*         s_pso_lib_blob;        /* the library reads from this while it lives */
-static SRWLOCK       s_pso_lib_lock = SRWLOCK_INIT;   /* Load/Store */
+static int           s_pso_lib_on;          /* the GPU layer has its library (pso_lib_open) */
 static volatile LONG s_pso_lib_new;         /* pipelines stored since the last save */
 static volatile LONG s_pso_lib_saving;
 static volatile LONG s_pso_man_pending;     /* manifest records queued or being written */
@@ -126,31 +132,33 @@ static void pso_names_add(u64 k)
     for (u32 i = (u32)k & (s_pso_names_cap - 1);; i = (i + 1) & (s_pso_names_cap - 1))
         if (!s_pso_names[i]) { s_pso_names[i] = k; s_pso_names_n++; return; }
 }
+/* The GPU layer's library's files (step C3b): <shader cache>/gpu/d3d12/. */
+static void pso_lib_path(char* out, size_t n, const char* leaf)
+{
+    snprintf(out, n, "%s/gpu/d3d12/%s", shader_cache_dir(), leaf);
+}
+static long pso_file_size(const char* path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return 0;
+    return (long)(((u64)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+}
+/* The library is the GPU layer's (gpu_pipeline_create loads from it and
+ * stores in it): its file read here, before any pipeline is made, or a new
+ * one when the file is another driver's or GPU's, or there is none. */
 static void pso_lib_open(void)
 {
     if (!ps3_env_int("PS3_PSO_LIBRARY", 1) || !shader_cache_dir()[0]) return;
-    ID3D12Device1* d1 = NULL;
-    if (FAILED(s_d3d.device->lpVtbl->QueryInterface(s_d3d.device, &IID_ID3D12Device1, (void**)&d1)))
-        return;
+    if (!(s_rc_dev->caps.bits & GPU_CAP_PIPELINE_CACHE)) return;   /* (no ID3D12Device1) */
     char path[MAX_PATH + 32];
-    pso_path(path, sizeof path, "pso_library.bin");
-    long n = 0;
-    s_pso_lib_blob = pso_read_file(path, &n);
-    HRESULT hr = E_FAIL;
-    if (s_pso_lib_blob) {
-        hr = d1->lpVtbl->CreatePipelineLibrary(d1, s_pso_lib_blob, (SIZE_T)n,
-                 &IID_ID3D12PipelineLibrary, (void**)&s_pso_lib);
-        if (FAILED(hr)) {
-            printf("[D3D12] pipeline library: '%s' is from another driver or GPU (0x%08lX); rebuilding it\n",
-                   path, hr);
-            free(s_pso_lib_blob); s_pso_lib_blob = NULL;
-        }
-    }
-    if (!s_pso_lib && FAILED(d1->lpVtbl->CreatePipelineLibrary(d1, NULL, 0,
-                                 &IID_ID3D12PipelineLibrary, (void**)&s_pso_lib)))
-        s_pso_lib = NULL;
-    d1->lpVtbl->Release(d1);
-    if (!s_pso_lib) return;
+    snprintf(path, sizeof path, "%s/gpu", shader_cache_dir());
+    CreateDirectoryA(path, NULL);
+    snprintf(path, sizeof path, "%s/gpu/d3d12", shader_cache_dir());
+    CreateDirectoryA(path, NULL);
+    pso_lib_path(path, sizeof path, "pipelines.lib");
+    const long n = pso_file_size(path);
+    const int loaded = gpu_pipeline_cache_load(s_rc_dev, path);
+    s_pso_lib_on = 1;
 
     /* The manifest: whole records only; a torn tail is cut off. */
     char mp[MAX_PATH + 32];
@@ -168,25 +176,26 @@ static void pso_lib_open(void)
         for (u32 i = 0; i < cnt; i++) pso_names_add(m[i].name);
     }
     s_pso_man = m; s_pso_man_n = s_pso_man_read = cnt;
-    if (SUCCEEDED(hr)) {
+    if (loaded) {
         char np[MAX_PATH + 32];
-        pso_path(np, sizeof np, "pso_library.n");
+        pso_lib_path(np, sizeof np, "pipelines.n");
         FILE* f = fopen(np, "rb");
         unsigned have = 0;
         if (f) { if (fscanf(f, "%u", &have) != 1) have = 0; fclose(f); }
         s_pso_lib_have = have < cnt ? have : cnt;
-    }
-    if (FAILED(hr)) {
+    } else {
         /* A new library (none yet, or another driver's): the pipeline index's
          * pipelines with a geometry shader are in no manifest, so the index is
          * built again. The start's shader pass may have looked already; then
-         * the next start does it. */
+         * the next start does it. (The pass reads the d3d12 route's
+         * pso_index.built, rsx_shader_precompile_index_built; this route's
+         * mark is its own and today's file is left alone.) */
         char ip[MAX_PATH + 32];
-        pso_path(ip, sizeof ip, "pso_index.built");
+        pso_lib_path(ip, sizeof ip, "index.built");
         DeleteFileA(ip);
     }
     printf("[D3D12] pipeline library: %s (%ld KB), %u known pipelines, %u to build\n",
-           SUCCEEDED(hr) ? "loaded" : "new", n >> 10, cnt, cnt - s_pso_lib_have);
+           loaded ? "loaded" : "new", n >> 10, cnt, cnt - s_pso_lib_have);
 }
 /* The pipeline index (defined with vp_fp_desc). */
 static volatile LONG s_pxb_live;      /* index build threads running */
@@ -194,36 +203,26 @@ static volatile LONG s_pxr_writing;   /* a thread writing new rows */
 static void pso_index_flush(void);
 static void pso_index_tick(void);
 static void pso_index_build_start(void);
-/* Serialize can fail when a pipeline is stored between sizing and writing;
- * the next attempt sizes again. pso_library.n follows the library, so after a
- * crash between the two it only undercounts, and the next startup's build
- * finds those pipelines in the library (pso_prebuild_one). */
+/* gpu_pipeline_cache_save writes the library (Serialize can fail when a
+ * pipeline is stored between sizing and writing; it tries again, sizing
+ * again). pipelines.n follows the library, so after a crash between the two
+ * it only undercounts, and the next startup's build finds those pipelines in
+ * the library (pso_prebuild_one). */
 static void pso_lib_save(void)
 {
-    for (int tries = 0; tries < 3; tries++) {
-        const LONG pending = s_pso_lib_new;
-        AcquireSRWLockExclusive(&s_pso_lib_lock);
-        const u32 recs = s_pso_man_n;
-        ReleaseSRWLockExclusive(&s_pso_lib_lock);
-        const SIZE_T n = s_pso_lib->lpVtbl->GetSerializedSize(s_pso_lib);
-        void* buf = malloc(n ? n : 1);
-        if (buf && SUCCEEDED(s_pso_lib->lpVtbl->Serialize(s_pso_lib, buf, n))) {
-            char path[MAX_PATH + 32];
-            pso_path(path, sizeof path, "pso_library.bin");
-            const int ok = pso_write_file(path, buf, n);
-            free(buf);
-            if (ok) {
-                char np[MAX_PATH + 32], txt[16];
-                pso_path(np, sizeof np, "pso_library.n");
-                pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
-                InterlockedExchangeAdd(&s_pso_lib_new, -pending);
-                printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
-                       (unsigned long)(n >> 10), recs, (unsigned)s_pso_lib_hits, (unsigned)s_pso_lib_live);
-            }
-            return;
-        }
-        free(buf);
-    }
+    const LONG pending = s_pso_lib_new;
+    AcquireSRWLockShared(&s_pso_man_lock);
+    const u32 recs = s_pso_man_n;
+    ReleaseSRWLockShared(&s_pso_man_lock);
+    char path[MAX_PATH + 32];
+    pso_lib_path(path, sizeof path, "pipelines.lib");
+    if (!gpu_pipeline_cache_save(s_rc_dev, path)) return;
+    char np[MAX_PATH + 32], txt[16];
+    pso_lib_path(np, sizeof np, "pipelines.n");
+    pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
+    InterlockedExchangeAdd(&s_pso_lib_new, -pending);
+    printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
+           (unsigned long)(pso_file_size(path) >> 10), recs, (unsigned)s_pso_lib_hits, (unsigned)s_pso_lib_live);
 }
 static DWORD WINAPI pso_lib_save_thread(LPVOID unused)
 {
@@ -363,31 +362,56 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         }
     }
 }
-/* Store a pipeline under its name, unless the library has that name. Storing
- * a name the library held (from the file, or stored by another thread in the
- * meantime) made the library's next Serialize read past a buffer in
- * D3D12Core (seen 2026-10-23), so the name is looked up first, under the
- * same lock. 1 if stored. */
-static int pso_lib_store(const WCHAR* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
-                         ID3D12PipelineState* pso)
+/* A manifest record as the GPU layer's description: the inverse of the D3D12
+ * description the GPU layer makes of vp_fp_desc's (gpu_d3d12_pipe_d3d_desc),
+ * so the record's pipeline gets the name a draw's gets. 0 for a record no
+ * vp_fp_desc makes. */
+static int pso_rec_desc(const pso_rec* r, gpu_shader vs, gpu_shader ps, gpu_pipeline_desc* pd)
 {
-    ID3D12PipelineState* had = NULL;
-    int stored = 0;
-    AcquireSRWLockExclusive(&s_pso_lib_lock);
-    if (SUCCEEDED(s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
-                      &IID_ID3D12PipelineState, (void**)&had)))
-        had->lpVtbl->Release(had);
-    else if (SUCCEEDED(s_pso_lib->lpVtbl->StorePipeline(s_pso_lib, name, pso))) {
-        InterlockedIncrement(&s_pso_lib_new);
-        stored = 1;
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d = &r->desc;
+    const D3D12_RENDER_TARGET_BLEND_DESC* rt = &d->BlendState.RenderTarget[0];
+    if (r->nel > GPU_MAX_VERTEX_ATTRS || d->NumRenderTargets > 4) return 0;
+    memset(pd, 0, sizeof *pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    pd->layout = s_d3d.vp_layout;
+    pd->vs = vs;
+    pd->ps = ps;
+    pd->vertex.count = r->nel;
+    pd->vertex.stride = r->nel ? 256 : 0;
+    for (u32 i = 0; i < r->nel; i++) {
+        snprintf(pd->vertex.attr[i].semantic, sizeof pd->vertex.attr[i].semantic, "%s", r->el[i].sem);
+        pd->vertex.attr[i].semantic_index = r->el[i].e.SemanticIndex;
+        pd->vertex.attr[i].format = (gpu_format)r->el[i].e.Format;
+        pd->vertex.attr[i].offset = r->el[i].e.AlignedByteOffset;
     }
-    ReleaseSRWLockExclusive(&s_pso_lib_lock);
-    return stored;
+    pd->topology_type = (u8)d->PrimitiveTopologyType;
+    pd->cull = (u8)d->RasterizerState.CullMode;
+    pd->front_ccw = d->RasterizerState.FrontCounterClockwise ? 1 : 0;
+    pd->depth_clip = d->RasterizerState.DepthClipEnable ? 1 : 0;
+    pd->multisample = d->RasterizerState.MultisampleEnable ? 1 : 0;
+    pd->depth_test = d->DepthStencilState.DepthEnable ? 1 : 0;
+    pd->depth_write = d->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 1 : 0;
+    pd->depth_func = (u8)d->DepthStencilState.DepthFunc;
+    pd->blend.enable = rt->BlendEnable ? 1 : 0;
+    pd->blend.src = (u8)rt->SrcBlend;
+    pd->blend.dst = (u8)rt->DestBlend;
+    pd->blend.op = (u8)rt->BlendOp;
+    pd->blend.src_alpha = (u8)rt->SrcBlendAlpha;
+    pd->blend.dst_alpha = (u8)rt->DestBlendAlpha;
+    pd->blend.op_alpha = (u8)rt->BlendOpAlpha;
+    pd->blend.write_mask = (u8)rt->RenderTargetWriteMask;
+    pd->nrt = d->NumRenderTargets;
+    for (u32 i = 0; i < pd->nrt; i++) pd->rt_format[i] = (gpu_format)d->RTVFormats[i];
+    pd->ds_format = (gpu_format)d->DSVFormat;
+    pd->samples = d->SampleDesc.Count;
+    pd->sample_mask = d->SampleMask;
+    pd->strip_cut = (u32)d->IBStripCutValue;
+    return 1;
 }
 
 /* One startup build: the record's shaders from pso_blobs, its description
- * back together, and its name checked against the rebuilt description.
- * 1: built, 2: the library had it, 0: not built. */
+ * back together, and its name checked against the rebuilt description (the
+ * D3D12 one the GPU layer makes of it). 1: built, 2: the library had it, 0:
+ * not built. */
 static int pso_prebuild_one(const pso_rec* r)
 {
     char dir[MAX_PATH + 32];
@@ -395,6 +419,8 @@ static int pso_prebuild_one(const pso_rec* r)
     void* blob[2] = { NULL, NULL }; long len[2] = { 0, 0 };
     const u64 hs[2] = { r->vs_hash, r->ps_hash };
     const u32 ls[2] = { r->vs_len, r->ps_len };
+    gpu_shader sh[2] = { {0}, {0} };
+    uint32_t loaded = 0;
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         char bp[MAX_PATH + 64];
@@ -404,34 +430,35 @@ static int pso_prebuild_one(const pso_rec* r)
             fnv_bytes(14695981039346656037ull, blob[i], (size_t)len[i]) != hs[i])
             goto out;
     }
-    D3D12_INPUT_ELEMENT_DESC il[16];
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
-    memcpy(&pd, &r->desc, sizeof pd);
-    pd.pRootSignature = s_d3d.vp_root_sig;
-    pd.VS.pShaderBytecode = blob[0]; pd.VS.BytecodeLength = (SIZE_T)len[0];
-    pd.PS.pShaderBytecode = blob[1]; pd.PS.BytecodeLength = (SIZE_T)len[1];
-    for (u32 i = 0; i < r->nel && i < 16; i++) { il[i] = r->el[i].e; il[i].SemanticName = r->el[i].sem; }
-    pd.InputLayout.pInputElementDescs = r->nel ? il : NULL;
-    if (pso_desc_key(&pd) != r->name) goto out;   /* another build's layout, or a stale root signature */
-    WCHAR name[20];
-    swprintf(name, 20, L"%016llx", (unsigned long long)r->name);
-    ID3D12PipelineState* pso = NULL;
-    /* A record pso_library.n does not count may be in the library already:
+    for (int i = 0; i < 2; i++) {
+        gpu_shader_desc sd;
+        memset(&sd, 0, sizeof sd);
+        sd.stage = i ? GPU_STAGE_PS : GPU_STAGE_VS;
+        sd.code = GPU_CODE_DXBC;
+        sd.bytes = blob[i];
+        sd.size = (size_t)len[i];
+        sh[i] = gpu_shader_create(s_rc_dev, &sd);
+        if (!GPU_VALID(sh[i])) goto out;
+    }
+    gpu_pipeline_desc pd;
+    if (!pso_rec_desc(r, sh[0], sh[1], &pd)) goto out;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
+    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
+    gpu_d3d12_pipeline_d3d_desc(s_rc_dev, &pd, &dd, il);
+    if (pso_desc_key(&dd) != r->name) goto out;   /* another build's layout, or a stale root signature */
+    /* A record pipelines.n does not count may be in the library already:
      * one stored while the library was being saved, or a crash between the
      * two files. It is loaded then, not built. */
-    AcquireSRWLockExclusive(&s_pso_lib_lock);
-    const HRESULT lh = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, &pd,
-                           &IID_ID3D12PipelineState, (void**)&pso);
-    ReleaseSRWLockExclusive(&s_pso_lib_lock);
-    if (SUCCEEDED(lh)) { pso->lpVtbl->Release(pso); ok = 2; goto out; }
-    pso = NULL;
-    if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-            s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
-        pso_lib_store(name, &pd, pso);
-        pso->lpVtbl->Release(pso);
-        ok = 1;
+    if (rc_pipeline(&pd, &loaded)) {
+        if (loaded) ok = 2;
+        else {
+            InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
+            ok = 1;
+        }
     }
 out:
+    sc_shader_drop(&sh[0]);
+    sc_shader_drop(&sh[1]);
     free(blob[0]); free(blob[1]);
     return ok;
 }
@@ -454,11 +481,24 @@ static DWORD WINAPI pso_prebuild_thread(LPVOID unused)
 /* Once per present, on the render thread. Starts the startup build once the
  * root signature exists, then the pipeline index's, and saves in the
  * background once those builds are done, the manifest has every record
- * queued so far (pso_library.n counts its records), and a burst of new
+ * queued so far (pipelines.n counts its records), and a burst of new
  * pipelines has settled (120 presents with none, or 256 pending). */
+/* The pipelines the GPU layer made this run (rc_pipeline), from its library
+ * or compiled, and the guest-FP ones' share (pso_create_cached). */
+static void pso_count_print(const char* when)
+{
+    printf("[D3D12] pipelines %s: %ld loaded from the library, %ld compiled; guest FP: %ld loaded, %ld compiled\n",
+           when, (long)s_rc_pipe_loaded, (long)s_rc_pipe_made, (long)s_pso_lib_hits, (long)s_pso_lib_live);
+}
 static void pso_lib_tick(void)
 {
-    if (!s_pso_lib) return;
+    /* PS3_PSO_LOG=1: those counts after each present that made pipelines (a
+     * replay ends without rc_backend_shutdown's line). */
+    { static int lg = -1; PS3_KNOB(lg, ps3_env_int("PS3_PSO_LOG", 0));
+      static LONG seen = -1;
+      const LONG t = s_rc_pipe_loaded + s_rc_pipe_made;
+      if (lg && t != seen) { seen = t; pso_count_print("so far"); } }
+    if (!s_pso_lib_on) return;
     if (!s_pso_pre_started && s_d3d.vp_root_sig) {
         s_pso_pre_started = 1;
         if (s_pso_man_read > s_pso_lib_have && ps3_env_int("PS3_PSO_PREBUILD", 1)) {
@@ -484,29 +524,24 @@ static void pso_lib_tick(void)
         if (t) CloseHandle(t); else InterlockedExchange(&s_pso_lib_saving, 0);
     }
 }
-static HRESULT pso_create_cached(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
-                                 ID3D12PipelineState** out)
+/* A guest-FP pipeline (vp_get_fp_pso, psj's workers): the GPU layer's, which
+ * loads it from its library or compiles and stores it. One it compiled goes
+ * into the manifest under today's name, pso_desc_key of the D3D12
+ * description the GPU layer made of it (the bridge, on this miss path
+ * only). NULL on failure. Thread-safe. */
+static ID3D12PipelineState* pso_create_cached(const gpu_pipeline_desc* pd)
 {
-    *out = NULL;
-    if (!s_pso_lib)
-        return s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-            s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
-    const u64 key = pso_desc_key(pd);
-    WCHAR name[20];
-    swprintf(name, 20, L"%016llx", (unsigned long long)key);
-    AcquireSRWLockExclusive(&s_pso_lib_lock);
-    HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, pd,
-                     &IID_ID3D12PipelineState, (void**)out);
-    ReleaseSRWLockExclusive(&s_pso_lib_lock);
-    if (SUCCEEDED(hr)) { InterlockedIncrement(&s_pso_lib_hits); return S_OK; }
-    *out = NULL;
+    uint32_t loaded = 0;
+    ID3D12PipelineState* const pso = rc_pipeline(pd, &loaded);
+    if (!s_pso_lib_on || !pso) return pso;
+    if (loaded) { InterlockedIncrement(&s_pso_lib_hits); return pso; }
     InterlockedIncrement(&s_pso_lib_live);
-    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-        s_d3d.device, pd, &IID_ID3D12PipelineState, (void**)out);
-    if (SUCCEEDED(hr)) {
-        if (pso_lib_store(name, pd, *out)) s_pso_lib_quiet = 0;
-        pso_manifest_add(key, pd);
-    }
-    return hr;
+    InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
+    s_pso_lib_quiet = 0;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
+    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
+    gpu_d3d12_pipeline_d3d_desc(s_rc_dev, pd, &dd, il);
+    pso_manifest_add(pso_desc_key(&dd), &dd);
+    return pso;
 }
 

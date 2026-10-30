@@ -318,27 +318,19 @@ static int init_d3d12(u32 width, u32 height)
             "struct PSInput { float4 pos : SV_POSITION; float4 col : COLOR; };\n"
             "float4 main(PSInput i) : SV_TARGET { return i.col; }\n";
 
-        ID3DBlob* vs_blob = NULL;
-        ID3DBlob* ps_blob = NULL;
-        ID3DBlob* err = NULL;
+        /* (These debug pipelines stay native: their bytecode is the compile
+         * service's own blob, released once they are made.) */
+        gpu_sc_blob vs_blob, ps_blob;
 
-        hr = sc_compile(GPU_SC_VS, vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL,
-                        GPU_SC_NO_CACHE, &vs_blob, &err);
-        if (FAILED(hr)) {
-            printf("[D3D12] VS compile failed: %s\n",
-                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
-            if (err) err->lpVtbl->Release(err);
-        }
+        if (!sc_compile(GPU_SC_VS, vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL,
+                        GPU_SC_NO_CACHE, &vs_blob))
+            printf("[D3D12] VS compile failed: %s\n", sc_msg("unknown"));
 
-        hr = sc_compile(GPU_SC_PS, ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL,
-                        GPU_SC_NO_CACHE, &ps_blob, &err);
-        if (FAILED(hr)) {
-            printf("[D3D12] PS compile failed: %s\n",
-                   err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
-            if (err) err->lpVtbl->Release(err);
-        }
+        if (!sc_compile(GPU_SC_PS, ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL,
+                        GPU_SC_NO_CACHE, &ps_blob))
+            printf("[D3D12] PS compile failed: %s\n", sc_msg("unknown"));
 
-        if (vs_blob && ps_blob) {
+        if (vs_blob.data && ps_blob.data) {
             D3D12_INPUT_ELEMENT_DESC input_layout[] = {
                 {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -350,10 +342,10 @@ static int init_d3d12(u32 width, u32 height)
 
             D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {0};
             pso_desc.pRootSignature = s_d3d.root_signature;
-            pso_desc.VS.pShaderBytecode = vs_blob->lpVtbl->GetBufferPointer(vs_blob);
-            pso_desc.VS.BytecodeLength = vs_blob->lpVtbl->GetBufferSize(vs_blob);
-            pso_desc.PS.pShaderBytecode = ps_blob->lpVtbl->GetBufferPointer(ps_blob);
-            pso_desc.PS.BytecodeLength = ps_blob->lpVtbl->GetBufferSize(ps_blob);
+            pso_desc.VS.pShaderBytecode = vs_blob.data;
+            pso_desc.VS.BytecodeLength = vs_blob.size;
+            pso_desc.PS.pShaderBytecode = ps_blob.data;
+            pso_desc.PS.BytecodeLength = ps_blob.size;
             pso_desc.InputLayout.pInputElementDescs = input_layout;
             pso_desc.InputLayout.NumElements = 3;
             pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -400,10 +392,9 @@ static int init_d3d12(u32 width, u32 height)
                 &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state_points);
             if (SUCCEEDED(hr)) printf("[D3D12] Pipeline state created (point class)\n");
             else printf("[D3D12] PSO POINT creation failed (0x%08lX)\n", hr);
-
-            vs_blob->lpVtbl->Release(vs_blob);
-            ps_blob->lpVtbl->Release(ps_blob);
         }
+        gpu_sc_blob_release(&vs_blob);
+        gpu_sc_blob_release(&ps_blob);
 
         /* -----------------------------------------------------------------
          * Textured triangle PSO (dbgfont / 2D atlas quads). Same MVP VS but
@@ -430,13 +421,13 @@ static int init_d3d12(u32 width, u32 height)
                 "  float cov = tex.Sample(smp, uv2).r;\n"
                 "  return float4(i.col.rgb, i.col.a * cov); }\n";
 
-            ID3DBlob *vtb = NULL, *ptb = NULL, *e2 = NULL;
-            hr = sc_compile(GPU_SC_VS, vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, GPU_SC_NO_CACHE, &vtb, &e2);
-            if (FAILED(hr)) printf("[D3D12] VS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
-            hr = sc_compile(GPU_SC_PS, ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, GPU_SC_NO_CACHE, &ptb, &e2);
-            if (FAILED(hr)) printf("[D3D12] PS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
+            gpu_sc_blob vtb, ptb;
+            if (!sc_compile(GPU_SC_VS, vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, GPU_SC_NO_CACHE, &vtb))
+                printf("[D3D12] VS(tex) compile failed: %s\n", sc_msg("?"));
+            if (!sc_compile(GPU_SC_PS, ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, GPU_SC_NO_CACHE, &ptb))
+                printf("[D3D12] PS(tex) compile failed: %s\n", sc_msg("?"));
 
-            if (vtb && ptb) {
+            if (vtb.data && ptb.data) {
                 D3D12_INPUT_ELEMENT_DESC il[] = {
                     {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                     {"COLOR",    0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
@@ -444,10 +435,10 @@ static int init_d3d12(u32 width, u32 height)
                 };
                 D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
                 pd.pRootSignature = s_d3d.root_signature;
-                pd.VS.pShaderBytecode = vtb->lpVtbl->GetBufferPointer(vtb);
-                pd.VS.BytecodeLength  = vtb->lpVtbl->GetBufferSize(vtb);
-                pd.PS.pShaderBytecode = ptb->lpVtbl->GetBufferPointer(ptb);
-                pd.PS.BytecodeLength  = ptb->lpVtbl->GetBufferSize(ptb);
+                pd.VS.pShaderBytecode = vtb.data;
+                pd.VS.BytecodeLength  = vtb.size;
+                pd.PS.pShaderBytecode = ptb.data;
+                pd.PS.BytecodeLength  = ptb.size;
                 pd.InputLayout.pInputElementDescs = il;
                 pd.InputLayout.NumElements = 3;
                 pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -473,8 +464,8 @@ static int init_d3d12(u32 width, u32 height)
                 if (SUCCEEDED(hr)) printf("[D3D12] Pipeline state created (textured class)\n");
                 else printf("[D3D12] PSO TEX creation failed (0x%08lX)\n", hr);
             }
-            if (vtb) vtb->lpVtbl->Release(vtb);
-            if (ptb) ptb->lpVtbl->Release(ptb);
+            gpu_sc_blob_release(&vtb);
+            gpu_sc_blob_release(&ptb);
         }
 
         /* SRV descriptor heap (shader-visible). Layout: slot 0 = legacy atlas
@@ -557,38 +548,21 @@ static int init_d3d12(u32 width, u32 height)
     {
         /* SRV table t0-t15 so decompiled fragment programs can sample every
          * RSX texture unit; the hardcoded atlas/colour PSs use only t0 and are
-         * unaffected. Matching sampler table s0-s15. */
-        D3D12_DESCRIPTOR_RANGE srv_range = {0};
-        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srv_range.NumDescriptors = RSX_FP_UNITS;
-        srv_range.BaseShaderRegister = 0;
-        srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-
-        D3D12_ROOT_PARAMETER rp[6] = {0};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
-        rp[0].Descriptor.ShaderRegister = 0;
-        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[1].DescriptorTable.NumDescriptorRanges = 1;
-        rp[1].DescriptorTable.pDescriptorRanges = &srv_range;
-        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b1 = FP texscale */
-        rp[2].Descriptor.ShaderRegister = 1;
-        rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+         * unaffected. Matching sampler table s0-s15. The root signature is the
+         * GPU layer's layout (step C3b), slot for slot today's parameters. */
+        gpu_layout_desc ld;
+        memset(&ld, 0, sizeof ld);
+        ld.flags = GPU_LAYOUT_VERTEX_INPUT;
+        ld.nslots = 6;
+        ld.slot[0] = lay_slot(GPU_SLOT_CB, 0, 0, GPU_VIS_VERTEX);                    /* b0 = vp_c bank */
+        ld.slot[1] = lay_slot(GPU_SLOT_TABLE_TEX, 0, RSX_FP_UNITS, GPU_VIS_PIXEL);
+        ld.slot[2] = lay_slot(GPU_SLOT_CB, 1, 0, GPU_VIS_PIXEL);                     /* b1 = FP texscale */
 
         /* s0-s15 come from a per-draw sampler table built from the guest's
          * TEXTURE_ADDRESS/TEXTURE_FILTER (vp_sampler_table). Fixed static
          * samplers sampled a 256x1 gamma LUT with WRAP, so u=0 blended texel 0
          * with texel 255 and black came out mid-grey. */
-        D3D12_DESCRIPTOR_RANGE samp_range = {0};
-        samp_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-        samp_range.NumDescriptors = RSX_FP_UNITS;
-        samp_range.BaseShaderRegister = 0;
-        samp_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[3].DescriptorTable.NumDescriptorRanges = 1;
-        rp[3].DescriptorTable.pDescriptorRanges = &samp_range;
-        rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        ld.slot[3] = lay_slot(GPU_SLOT_TABLE_SAMPLER, 0, RSX_FP_UNITS, GPU_VIS_PIXEL);
         {
             /* The GPU layer's table pool: table t at t*16 (step C4). */
             gpu_table_pool_desc sh;
@@ -607,28 +581,13 @@ static int init_d3d12(u32 width, u32 height)
 
         /* GPU vertex fetch: t20 = the frame's raw guest vertex bytes (vf_buf),
          * b2 = one constant, the draw's attribute records' offset in it. */
-        rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rp[4].Descriptor.ShaderRegister = 20;
-        rp[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp[5].Constants.ShaderRegister = 2;
-        rp[5].Constants.Num32BitValues = 1;
-        rp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-        D3D12_ROOT_SIGNATURE_DESC rd = {0};
-        rd.NumParameters = 6; rd.pParameters = rp;
-        rd.NumStaticSamplers = 0; rd.pStaticSamplers = NULL;
-        rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-
-        ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
-        hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
-        if (SUCCEEDED(hr)) {
-            s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-                sig->lpVtbl->GetBufferPointer(sig), sig->lpVtbl->GetBufferSize(sig),
-                &IID_ID3D12RootSignature, (void**)&s_d3d.vp_root_sig);
-            s_vp_root_hash = fnv_bytes(14695981039346656037ull, sig->lpVtbl->GetBufferPointer(sig),
-                                       sig->lpVtbl->GetBufferSize(sig));
-            sig->lpVtbl->Release(sig);
-        } else if (err) { printf("[D3D12] VP root sig: %s\n", (const char*)err->lpVtbl->GetBufferPointer(err)); err->lpVtbl->Release(err); }
+        ld.slot[4] = lay_slot(GPU_SLOT_RAW, 20, 0, GPU_VIS_VERTEX);
+        ld.slot[5] = lay_slot(GPU_SLOT_CONST32, 2, 1, GPU_VIS_VERTEX);
+        /* No static samplers. The layout's serialized bytes are today's, so
+         * s_vp_root_hash, and with it every pipeline's name in the manifest
+         * (pso_desc_key), is today's too. */
+        s_d3d.vp_layout = lay_make(&ld, &s_d3d.vp_root_sig);
+        s_vp_root_hash = gpu_d3d12_layout_hash(s_rc_dev, s_d3d.vp_layout);
 
         /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently mapped) */
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
