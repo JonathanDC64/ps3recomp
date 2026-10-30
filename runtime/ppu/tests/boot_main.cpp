@@ -357,6 +357,16 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
  * makes, so the ticker below is backend-agnostic and a POSIX host gets a
  * frame clock instead of no clock at all. */
 #if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+#if defined(PS3RECOMP_RSX_HAL)
+/* Built with the portable renderer: the route switch picks today's renderer
+ * or the new path at run time (RSX_BACKEND, libs/video/rsx_out.h). */
+#include "../../../libs/video/rsx_out.h"
+#  define rsx_backend_init    rsx_out_backend_init
+#  define rsx_backend_present rsx_out_backend_present
+#  define rsx_backend_pump    rsx_out_backend_pump_messages
+#  define rsx_backend_idle    rsx_out_overlay_tick
+#  define rsx_backend_display_timing rsx_out_display_timing
+#else
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
@@ -367,6 +377,7 @@ extern "C" long long rsx_d3d12_display_timing(long long* vblank);
 #  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
 #  define rsx_backend_idle    rsx_d3d12_overlay_tick
 #  define rsx_backend_display_timing rsx_d3d12_display_timing
+#endif
 #elif defined(__APPLE__)
 extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_metal_backend_present(void);
@@ -1930,6 +1941,12 @@ extern "C" volatile long g_rsx_prof_toggle;
 extern "C" void rsx_prof_begin(const char* prefix);
 extern "C" int  rsx_prof_end(char* digest, size_t cap);
 extern "C" void rsx_prof_title(const char* note);
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D))
+/* Built with the portable renderer: the session is the picked renderer's. */
+#  define rsx_prof_begin rsx_out_prof_begin
+#  define rsx_prof_end   rsx_out_prof_end
+#  define rsx_prof_title rsx_out_prof_title
+#endif
 
 struct ProfThr { DWORD tid; ULONGLONG t; };
 static int prof_threads(ProfThr* a, int max)

@@ -23,6 +23,15 @@
  * CELLMARK_DUMP_DIR=<dir> writes the presented frame as a BMP and RSX_CAP=0
  * RSX_CAP_DIR=<dir> the per-op manifest. The capture and
  * the replayer must come from the same build (raw state structs).
+ *
+ * Each frame's time is printed for frames 0-2 (and every 120th when playing
+ * until closed). RSX_REPLAY_TIMES=1 prints every frame instead, with the
+ * replaying thread's CPU time beside the wall time, and after each capture
+ * the means over its frames after the first:
+ *   [replay] frame 7: 5.123 ms, cpu 4.688 ms
+ *   [replay] times: 199 frames after the first: wall 5.140 ms, cpu 4.981 ms a frame
+ * Windows counts a thread's time in clock ticks (about 15.6 ms), so one
+ * frame's cpu figure is coarse; the mean over many frames is not.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -31,9 +40,18 @@
 
 uint8_t* vm_base = NULL;
 
+#if defined(PS3RECOMP_RSX_HAL)
+/* Built with the portable renderer: RSX_BACKEND picks the renderer the
+ * capture plays through (rsx_out.h). */
+#include "rsx_out.h"
+#define rsx_d3d12_backend_init          rsx_out_backend_init
+#define rsx_d3d12_backend_present       rsx_out_backend_present
+#define rsx_d3d12_backend_pump_messages rsx_out_backend_pump_messages
+#else
 int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 void rsx_d3d12_backend_present(void);
 int  rsx_d3d12_backend_pump_messages(void);
+#endif
 int  cellGcm_replay_load(const char* file, uint32_t** methods);
 void cellGcm_replay_reset(void);
 void cellGcm_replay_method(uint32_t mfull, uint32_t data);
@@ -58,6 +76,16 @@ static LONG WINAPI commit_on_touch(EXCEPTION_POINTERS* ep)
                                                                    : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* The calling thread's CPU time so far (user + kernel), in ms. */
+static double thread_cpu_ms(void)
+{
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+    const ULONGLONG t = ((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) +
+                        ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime);
+    return (double)t / 1e4;   /* 100 ns units */
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -79,21 +107,34 @@ int main(int argc, char** argv)
     }
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
+    char tv[16] = "";
+    const int times = GetEnvironmentVariableA("RSX_REPLAY_TIMES", tv, sizeof tv) < sizeof tv && atoi(tv) > 0;
     for (int c = 0; c < ncaps; c++) {
         uint32_t* m = NULL;
         const int n = cellGcm_replay_load(argv[1 + c], &m);
         if (n < 0) { fprintf(stderr, "rsx_replay: cannot read %s\n", argv[1 + c]); return 1; }
         printf("[replay] %s: %d methods\n", argv[1 + c], n);
+        double wall_sum = 0.0, cpu_sum = 0.0;
+        int timed = 0;
         for (int k = 0; frames == 0 || k < frames; k++) {
+            const double cpu0 = times ? thread_cpu_ms() : 0.0;
             QueryPerformanceCounter(&t0);
             cellGcm_replay_reset();
             for (int i = 0; i < n; i++) cellGcm_replay_method(m[2 * i], m[2 * i + 1]);
             rsx_d3d12_backend_present();
             QueryPerformanceCounter(&t1);
-            if (k < 3 || frames == 0 && k % 120 == 0)
+            if (times) {
+                const double wall = 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart;
+                const double cpu = thread_cpu_ms() - cpu0;
+                printf("[replay] frame %d: %.3f ms, cpu %.3f ms\n", k, wall, cpu);
+                if (k > 0) { wall_sum += wall; cpu_sum += cpu; timed++; }
+            } else if (k < 3 || frames == 0 && k % 120 == 0)
                 printf("[replay] frame %d: %.1f ms\n", k, 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
             if (rsx_d3d12_backend_pump_messages() != 0) { c = ncaps; break; }
         }
+        if (timed)
+            printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame\n",
+                   timed, wall_sum / timed, cpu_sum / timed);
     }
     fflush(stdout);
     /* The backend's threads and device are torn down with the process. */
