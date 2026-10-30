@@ -1,0 +1,64 @@
+# What libs/video/rsxcore/ and libs/video/gpu/ copy from today's renderer,
+# libs/video/rsx_d3d12_backend.c, read at commit base. A change to the
+# renderer after base touches the copies of the ranges it changes.
+#
+# One line per copied range: <new file> <legacy start>-<legacy end> <legacy names>
+# Names as the original spells them. Notes on a range are on the comment
+# lines above it.
+base=e6b8f14a7850e3c5bf44fdb5c72b74dfa3c42c88
+
+# Constants the text builders use, guarded so rsxc_types.h can own them later.
+libs/video/rsxcore/rsxc_shader.c 166-166 RSX_FP_UNITS
+libs/video/rsxcore/rsxc_shader.c 188-188 FPCB_KMAX
+libs/video/rsxcore/rsxc_shader.c 2392-2396 fnv_bytes
+libs/video/rsxcore/rsxc_shader.c 5242-5370 fp_out_anchor fp_set_out hlsl_insert_before_close fp_bind_b1
+libs/video/rsxcore/rsxc_shader.c 5397-5454 FPVariant s_fpv fpv_find fpv_add fpv_load fpv_note
+libs/video/rsxcore/rsxc_shader.c 5456-5489 s_fp_baked fp_build_hlsl
+# fp_hash_at's note of the programs drawn with: here with fp_hash_at, not in
+# rsxc_targets.c; the write-back's log reads it through rsxc_fp_seen.
+libs/video/rsxcore/rsxc_shader.c 8783-8790 s_fp_seen fp_seen_note
+libs/video/rsxcore/rsxc_shader.c 5493-5563 FpHashMemo s_fph fp_hash_at fp_units_at
+# uvclamp_gs's source text only, as uvclamp_gs_src; its D3DCompile is
+# gpu_sc_compile with GPU_SC_NO_CACHE (gpu_shader.c).
+libs/video/rsxcore/rsxc_shader.c 5583-5617 uvclamp_gs
+libs/video/rsxcore/rsxc_shader.c 5626-5670 fp_inject_uvclamp
+libs/video/rsxcore/rsxc_shader.c 5702-5705 HDRV_SAT
+# rsx_d3d12_shader_hdr is exported as rsxc_shader_hdr.
+libs/video/rsxcore/rsxc_shader.c 5727-5783 fp_hdr_unclamp fp_hdr_sat_units rsx_d3d12_shader_hdr
+libs/video/rsxcore/rsxc_shader.c 4661-4669 vp_hash_ucode
+# vp_get_vs_mode's text half, split into vp_vs_locate (start slot, size, hash)
+# and vp_vs_text (decompile, VP_W_ONE, VP_BYPASS, uses_c03); the decompile
+# call writes into the caller's buffer instead of a static one, and
+# rsxc_vs_code64 is its code64 line. The cache, the memo and the dumps
+# (4713-4766, 4777-4801, 4805-4821, 4857-4864, 4868-4869, 4871-4885) are not
+# copied.
+libs/video/rsxcore/rsxc_shader.c 4701-4712 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4738-4738 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4767-4776 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4802-4804 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4822-4856 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4865-4867 vp_get_vs_mode
+libs/video/rsxcore/rsxc_shader.c 4870-4870 vp_get_vs_mode
+# Exported as rsxc_shader_hlsl, rsxc_program_hash64 and rsxc_shader_key.
+libs/video/rsxcore/rsxc_shader.c 16310-16386 rsx_d3d12_shader_hlsl rsx_d3d12_program_hash64 rsx_d3d12_shader_key
+# Exported as rsxc_shader_fp_variants.
+libs/video/rsxcore/rsxc_shader.c 16406-16421 rsx_d3d12_shader_fp_variants
+
+libs/video/gpu/gpu_shader.c 143-153 rsx_path_last_sep
+# perf_now; perf_on is gpu_sc_perf's switch instead of PERF and the profiler.
+libs/video/gpu/gpu_shader.c 768-773 perf_now
+libs/video/gpu/gpu_shader.c 3956-3966 s_perf_fxc s_perf_fxc_n s_perf_sc_hits
+libs/video/gpu/gpu_shader.c 3970-3988 shader_cache_dir
+# shader_key is the compile service's (gpu_sc_key), outside the dxbc guard;
+# rsxc_shader.c calls it.
+libs/video/gpu/gpu_shader.c 3989-3996 shader_key
+libs/video/gpu/gpu_shader.c 3997-4055 shader_cache_load shader_cache_store shader_compile_cached
+libs/video/gpu/gpu_shader.c 5619-5619 uvclamp_gs
+# Exported as gpu_sc_put and gpu_sc_cache_dir.
+libs/video/gpu/gpu_shader.c 16388-16402 rsx_d3d12_shader_cache_put
+libs/video/gpu/gpu_shader.c 16404-16404 rsx_d3d12_shader_cache_path
+
+# Not copied from 5241-5860 (the draw-state half, for the record's package):
+# vp_pso_knobs_check 5372-5395, dr_uvclamp 5564-5575, hdr_scene_limit
+# 5672-5700, dr_hdrv 5706-5725, hdr_batch_start 5785-5806, hdr_mark_scan
+# 5808-5859. From 3948-4160: the read-ahead (shader_cache_warm, 4057-4147).

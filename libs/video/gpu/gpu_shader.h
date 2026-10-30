@@ -1,0 +1,103 @@
+/*
+ * ps3recomp - the shader compile service (portable renderer)
+ *
+ * Turns shader text into the bytecode a GPU backend takes, through a disk
+ * cache, with no device: setup's shader pass can use it as well as a
+ * running game. One target per bytecode format, each with its own compiler
+ * and flags:
+ *
+ *   dxbc      FXC (D3DCompile), today's D3D12 renderer's exact call: the
+ *             files are today's <cache>/<profile>_<key>.dxbc, shared with it.
+ *   spv, dxil, metallib, msl
+ *             declared; not available yet.
+ *
+ * The cache directory is PS3_SHADER_CACHE (default shader_cache beside the
+ * executable; 0 turns the cache off), as today's. Built only with
+ * PS3RECOMP_RSX_HAL; dxbc only on Windows and on vkd3d.
+ */
+#ifndef PS3RECOMP_GPU_SHADER_H
+#define PS3RECOMP_GPU_SHADER_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum gpu_sc_target {
+    GPU_SC_DXBC = 0,
+    GPU_SC_SPV,
+    GPU_SC_DXIL,
+    GPU_SC_METALLIB,
+    GPU_SC_MSL,
+    GPU_SC_TARGET_COUNT
+} gpu_sc_target;
+
+typedef enum gpu_sc_stage {
+    GPU_SC_VS = 0,
+    GPU_SC_PS,
+    GPU_SC_GS,
+    GPU_SC_STAGE_COUNT
+} gpu_sc_stage;
+
+/* gpu_sc_compile's results. */
+enum {
+    GPU_SC_OK          = 0,
+    GPU_SC_UNAVAILABLE = -1,   /* the target is not built here */
+    GPU_SC_FAILED      = -2,   /* the compiler refused the text */
+    GPU_SC_BAD_ARG     = -3
+};
+
+/* gpu_sc_compile's flags. */
+#define GPU_SC_NO_CACHE 1u     /* compile, and neither read nor write the cache */
+
+/* Compiled bytecode. Release with gpu_sc_blob_release. */
+typedef struct gpu_sc_blob {
+    const void* data;
+    size_t      size;
+    void*       impl;          /* the target's own object */
+} gpu_sc_blob;
+
+/* 1 if the target is built here. */
+int gpu_sc_available(gpu_sc_target target);
+/* The compiler's name for the stage ("vs_5_0" for dxbc), NULL if none. */
+const char* gpu_sc_profile(gpu_sc_target target, gpu_sc_stage stage);
+
+/* The cache directory ("" when the cache is off or there is none here). The
+ * first call reads PS3_SHADER_CACHE and creates the directory. */
+const char* gpu_sc_cache_dir(void);
+/* Key K of a text: FNV-1a 64 over profile, 0xFF, text (today's .dxbc key). */
+uint64_t gpu_sc_key(const char* src, size_t n, const char* profile);
+/* The cache file a text is stored under (path, cap >= 324); 0 when there
+ * is no cache or no such target. */
+int gpu_sc_cache_path(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                      char* path, size_t cap);
+
+/* Compile src (n bytes; name is the compiler's source name) for a stage,
+ * from the cache when it holds a whole program, into it otherwise.
+ * PS3_SHADER_CACHE_HLSL=1 keeps each compiled text beside its program. On
+ * GPU_SC_FAILED the compiler's message is in err (when given). Thread-safe. */
+int gpu_sc_compile(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                   const char* name, unsigned flags, gpu_sc_blob* out, char* err, size_t err_cap);
+void gpu_sc_blob_release(gpu_sc_blob* blob);
+
+/* Compile a guest program's text into the cache (setup's pass):
+ * 1 = already there, 2 = compiled, 0 = failed (or no cache), as
+ * rsx_d3d12_shader_cache_put. Thread-safe. */
+int gpu_sc_put(gpu_sc_target target, gpu_sc_stage stage, const char* src);
+
+/* PERF counters (today's s_perf_fxc, s_perf_fxc_n, s_perf_sc_hits): kept
+ * while gpu_sc_perf(1) is on. take copies them and, with reset, zeroes them. */
+typedef struct gpu_sc_stats {
+    double compile_s;          /* time inside the compiler */
+    int    compiles;
+    int    cache_hits;
+} gpu_sc_stats;
+void gpu_sc_perf(int on);
+void gpu_sc_stats_take(gpu_sc_stats* out, int reset);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* PS3RECOMP_GPU_SHADER_H */
