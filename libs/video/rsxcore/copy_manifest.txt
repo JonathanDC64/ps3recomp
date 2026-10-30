@@ -314,3 +314,70 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 # 12796-12820), the debug pipelines' root signature and pipelines
 # (2734-2791, 2879-2972), the shutdown order (rsx_d3d12_backend_shutdown:
 # gpu_destroy releases what the device made), SetName.
+
+# ---------------------------------------------------------------------------
+# Step C4: the shader-visible descriptor heaps, the texture pool, staging and
+# uploads, every SRV write and the samplers on the GPU layer. The regions
+# below are no longer verbatim at these legacy lines: a fix there needs a
+# hand port.
+# The four shader-visible heaps are table pools (gpu_table_pool_create; the
+# backend fills a new pool with today's R8_UNORM null SRVs). s_d3d.srv_heap,
+# samp_heap, blit_srv_heap and writeback's s_down_srv hold the pools' heaps,
+# borrowed (gpu_d3d12_table_pool_heap), for SetDescriptorHeaps and the
+# native table binds that are still the core's. The RTV and DSV heaps are
+# not converted (step C5).
+# Textures that get SRVs carry a GPU layer handle next to the native field
+# (gpu_texture tex): the pool's slot textures are gpu_texture_create's (res
+# is gpu_native); every other one is adopted at its creation site
+# (rc_tex_set: gpu_d3d12_adopt_texture_of) and dropped at its release
+# (rc_tex_drop). SrvMemo and its knob RSX_SRV_MEMO are gone: the SRV pool's
+# memo (gpu_fast_table_write_tex) skips an unchanged entry everywhere.
+#  rsxc_state.inc 294, 307 (OffRT tex, snap_tex), 359, 364 (VPTexSlot tex;
+#   blk, the TexBlock's gpu_heap; blk_heap is unused), 677 (s_subvp tex),
+#   715 (subvp_capture adopts), and the step C4 statics after 796:
+#   s_rc_srv_pool, s_rc_samp_pool, s_rc_blit_pool, s_rc_down_pool,
+#   s_rc_rt_tex, s_rc_screen_copy_tex, k_rc_no_tex, rc_tex_set, rc_tex_drop.
+#  rsxc_init.inc 2424 (display_targets_make adopts render_targets[i]);
+#   init_d3d12 2985-3009: srv_heap is s_rc_srv_pool, regions per draw window
+#   (DRAW_SRV_BASE, MAX_DRAWS x RSX_FP_UNITS), 21, 22 and 24 (SMAA's three
+#   tables); the null fill and its s_res_gen++ are the backend's; 3098-3103:
+#   samp_heap is s_rc_samp_pool (VP_SAMP_TABLES tables of RSX_FP_UNITS).
+#  rsxc_hdr.inc blit_init 1891-1897 (blit_srv_heap is s_rc_blit_pool, a table
+#   of 2 per frame); blit_srvs_write 2026-2042 and blit_to_window 2096-2111:
+#   gpu_table_write_tex; blit_srv_none is the empty RGBA16F entry.
+#  rsxc_texture.inc 6910-6982: the staging ring is gpu_buffer upload buffers
+#   (gpu_buffer_create, mapped once); a replaced one is destroyed at the next
+#   tex_stage_frame, after render_frame's wait (it was off_rt_defer_release);
+#   tex_stage_alloc stays for smaa_luts_load (gpu_native). 6985-7088: the
+#   pool's chunks are gpu_heap_create, its textures gpu_texture_create placed
+#   at the block (committed when there is none), the aliasing barrier on a
+#   reused block is gpu_cmd_barrier_n. vp_upload_tex_slot 7290-7303,
+#   7621-7671: the copies and barriers are gpu_cmd_copy_buf_to_tex and
+#   gpu_cmd_barrier on s_rc_cmd, the SRV gpu_table_write_tex.
+#  rsxc_targets.inc 8367-8407: vp_sampler_table's keys, LRU and hint stay;
+#   each unit is gpu_sampler_get then gpu_fast_table_write_sampler.
+#   vp_bind_sampler_table 8410-8414: gpu_fast_table_ref, gpu_cmd_bind_table.
+#   ZetaRT 8458 (tex); zeta_get 8525, 8533, 8552 and off_rt_get 8597, 8621,
+#   8640: adopt and drop lines; off_rt_get's SRV 8748-8756:
+#   gpu_table_write_tex.
+#  rsxc_writeback.inc down_init 8906-8912 (s_down_srv is s_rc_down_pool);
+#   off_rt_downscale 8988-8995 (gpu_table_write_tex, gpu_table_ref);
+#   off_rt_drop_rewritten 9365 (drops); srv_write_ex and srv_write 9379-9422
+#   take a gpu_texture and are gpu_fast_table_write_tex (SrvMemo removed);
+#   off_rt_snapshot 9452, 9465 and screen_copy_capture 9533: adopt and drop.
+#  rsxc_diag.inc rsx_scale_apply 10504-10514: drops with the releases.
+#  rsxc_post.inc s_aa 10590 (disp_tex), s_smaa 10738-10742 (area_tex,
+#   search_tex, edges_tex, weights_tex); aa_draw 10697-10698, smaa_draw
+#   10956-10964, aa_filter_for 11013, aa_run_rt 11031 and aa_run_display
+#   11045-11081 take the source's handle; smaa_ready 10866, smaa_targets
+#   10930, 10946 and aa_run_display adopt and drop.
+#  rsxc_frame.inc 11593-11723, 12266, 12284: the window writes pass the
+#   handles (k_rc_no_tex for none).
+#  rsxc_api.inc rc_backend_shutdown 15869 and after 15879: the pools' heaps
+#   go with gpu_destroy; the borrowed pointers are cleared first.
+#  Not converted: the atlas path's SRV at srv_heap index 0 (rsxc_frame.inc
+#   11240-11308) and the SetDescriptorHeaps and table binds of frame, post,
+#   hdr and writeback (native on the frame's list).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C4 blocks):
+#   gpu_d3d12_adopt_texture_of (adopt with the resource's own description)
+#   and gpu_d3d12_table_pool_heap (a pool's heap, borrowed).

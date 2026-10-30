@@ -63,6 +63,7 @@ static struct {
     ID3D12PipelineState*  pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
     ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
+    gpu_texture           disp_tex;   /* disp, adopted (step C4) */
     u32                   disp_w, disp_h;
     D3D12_RESOURCE_STATES disp_st;
     u32                   fp[AA_FP_MAX];   /* RSX_AA_BEFORE_FP */
@@ -169,8 +170,8 @@ static int aa_ready(void)
  * RENDER_TARGET. Binds its own root signature, pipeline, target, viewport and
  * topology; the shader-visible heap must be srv_heap. The backend waits for
  * the GPU before each batch, so the one descriptor at AA_SRV_SLOT is free to
- * rewrite. */
-static void aa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+ * rewrite. src is the copy's handle (step C4: the SRV pool's write). */
+static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     srv_write(AA_SRV_SLOT, src, fmt, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
@@ -211,10 +212,14 @@ static struct {
     int                   failed;      /* could not be made: FXAA runs instead */
     ID3D12DescriptorHeap* rtv;         /* edges, weights */
     ID3D12Resource*       area;        /* AreaTex, R8G8 160x560 */
+    gpu_texture           area_tex;    /* area, adopted (step C4) */
     ID3D12Resource*       search;      /* SearchTex, R8 64x16 */
+    gpu_texture           search_tex;  /* search, adopted (step C4) */
     int                   lut_loaded;  /* their upload is recorded */
     ID3D12Resource*       edges;
+    gpu_texture           edges_tex;   /* edges, adopted (step C4) */
     ID3D12Resource*       weights;
+    gpu_texture           weights_tex; /* weights, adopted (step C4) */
     D3D12_RESOURCE_STATES edges_st, weights_st;
     u32                   w, h;        /* of edges and weights */
 } s_smaa;
@@ -339,6 +344,8 @@ static int smaa_ready(void)
         td.SampleDesc.Count = 1; td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         hr = d3d_create_committed(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
                                   NULL, &IID_ID3D12Resource, (void**)(k ? &s_smaa.search : &s_smaa.area));
+        if (SUCCEEDED(hr))   /* step C4: sampled (smaa_draw's SRV writes) */
+            rc_tex_set(k ? &s_smaa.search_tex : &s_smaa.area_tex, k ? s_smaa.search : s_smaa.area);
     }
     for (int i = 0; i < 6; i++)
         if (code[i]) code[i]->lpVtbl->Release(code[i]);
@@ -403,6 +410,7 @@ static int smaa_targets(u32 w, u32 h)
     off_rt_defer_release(s_smaa.edges);     /* the open list may still use them */
     off_rt_defer_release(s_smaa.weights);
     s_smaa.edges = s_smaa.weights = NULL;
+    rc_tex_drop(&s_smaa.edges_tex); rc_tex_drop(&s_smaa.weights_tex);   /* step C4 */
     ID3D12Resource** out[2] = {&s_smaa.edges, &s_smaa.weights};
     for (int k = 0; k < 2; k++) {
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -419,6 +427,7 @@ static int smaa_targets(u32 w, u32 h)
             *out[k] = NULL;
             return 0;   /* the next run tries again */
         }
+        rc_tex_set(k ? &s_smaa.weights_tex : &s_smaa.edges_tex, *out[k]);   /* step C4: sampled (smaa_draw) */
         s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, *out[k], NULL, smaa_rtv(k));
     }
     s_smaa.edges_st = s_smaa.weights_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -428,15 +437,15 @@ static int smaa_targets(u32 w, u32 h)
 
 /* SMAA's three passes: src (as aa_draw's) into the target behind rtv, w x h,
  * in RENDER_TARGET. Needs smaa_targets(w, h) and smaa_luts_load() first. */
-static void smaa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     const UINT map = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_write(SMAA_SRV_SLOT + 0, src, fmt, map);
-    srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights, DXGI_FORMAT_R8G8B8A8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search, DXGI_FORMAT_R8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights_tex, DXGI_FORMAT_R8G8B8A8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges_tex, DXGI_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area_tex, DXGI_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search_tex, DXGI_FORMAT_R8_UNORM, map);
     D3D12_GPU_DESCRIPTOR_HANDLE g0, g2;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g0);
     g0.ptr += (u64)SMAA_SRV_SLOT * s_d3d.srv_inc;
@@ -485,7 +494,7 @@ static int aa_filter_for(u32 w, u32 h, DXGI_FORMAT fmt)
     return 1;
 }
 
-static void aa_filter(int f, ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
+static void aa_filter(int f, gpu_texture src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h)
 {
     if (f == 2) smaa_draw(src, fmt, rtv, w, h);
     else aa_draw(src, fmt, rtv, w, h);
@@ -503,7 +512,7 @@ static int aa_run_rt(int t)
     ID3D12Resource* src = off_rt_snapshot(t);
     if (!src) return 0;
     off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    aa_filter(f, src, (DXGI_FORMAT)r->dxgi, off_rt_rtv(t), r->hw, r->hh);
+    aa_filter(f, r->snap_tex, (DXGI_FORMAT)r->dxgi, off_rt_rtv(t), r->hw, r->hh);
     return 1;
 }
 
@@ -518,6 +527,7 @@ static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     if (s_aa.disp && (s_aa.disp_w != w || s_aa.disp_h != h)) {
         off_rt_defer_release(s_aa.disp);   /* the open list may still use it */
         s_aa.disp = NULL;
+        rc_tex_drop(&s_aa.disp_tex);   /* step C4 */
     }
     if (!s_aa.disp) {
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -531,6 +541,7 @@ static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
             s_aa.disp = NULL;
             return;
         }
+        rc_tex_set(&s_aa.disp_tex, s_aa.disp);   /* step C4: the filter's source (its SRV write) */
         s_aa.disp_w = w; s_aa.disp_h = h;
         s_aa.disp_st = D3D12_RESOURCE_STATE_COPY_DEST;
     }
@@ -553,7 +564,7 @@ static void aa_run_display(u32 fi, D3D12_CPU_DESCRIPTOR_HANDLE rtv)
     s_aa.disp_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
     cl->lpVtbl->SetDescriptorHeaps(cl, s_d3d.samp_heap ? 2 : 1, heaps);
-    aa_filter(f, s_aa.disp, DXGI_FORMAT_R8G8B8A8_UNORM, rtv, w, h);
+    aa_filter(f, s_aa.disp_tex, DXGI_FORMAT_R8G8B8A8_UNORM, rtv, w, h);
 }
 
 /* Where this batch's pass goes (see the top of this section): returns T's

@@ -131,12 +131,18 @@ static int down_init(void)
         &IID_ID3D12RootSignature, (void**)&s_down_rs);
     sig->lpVtbl->Release(sig);
     if (FAILED(hr)) return 0;
+    {   /* the GPU layer's table pool, a 1-entry table each (step C4) */
+        gpu_table_pool_desc pd;
+        memset(&pd, 0, sizeof pd);
+        pd.kind = GPU_TABLE_TEX;
+        pd.count = 2 * MAX_OFF_RTS;
+        pd.nregions = 1;
+        pd.region[0].first = 0; pd.region[0].tables = 2 * MAX_OFF_RTS; pd.region[0].size = 1;
+        s_rc_down_pool = gpu_table_pool_create(s_rc_dev, &pd);
+        s_down_srv = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_down_pool);
+        if (!s_down_srv) return 0;
+    }
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2 * MAX_OFF_RTS;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd,
-            &IID_ID3D12DescriptorHeap, (void**)&s_down_srv))) return 0;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     hd.NumDescriptors = MAX_OFF_RTS;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -212,14 +218,18 @@ static ID3D12Resource* off_rt_downscale(int i, int argb)
         cl->lpVtbl->ResourceBarrier(cl, 1, &b);
         r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
-    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    /* The source's default view (today's NULL description) in the down pool,
+     * and its table (step C4). */
     const u32 di = (u32)(s_d3d.frame_count & 1u) * MAX_OFF_RTS + (u32)i;
-    D3D12_CPU_DESCRIPTOR_HANDLE sc; D3D12_GPU_DESCRIPTOR_HANDLE sg;
-    s_down_srv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_down_srv, &sc);
-    s_down_srv->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_down_srv, &sg);
-    sc.ptr += (SIZE_T)di * inc; sg.ptr += (u64)di * inc;
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, r->res, NULL, sc);
+    {
+        gpu_view_desc sv;
+        memset(&sv, 0, sizeof sv);
+        sv.texture = r->tex;
+        sv.kind = GPU_VIEW_SRV;
+        gpu_table_write_tex(s_rc_dev, s_rc_down_pool, di, &sv);
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE sg;
+    sg.ptr = gpu_table_ref(s_rc_dev, s_rc_down_pool, di).v;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv;
     s_down_rtv->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_down_rtv, &rtv);
     rtv.ptr += (SIZE_T)i * s_d3d.rtv_descriptor_size;
@@ -593,6 +603,7 @@ static void off_rt_drop_rewritten(void)
         off_rt_defer_release(r->up);   r->up = NULL;
         off_rt_defer_release(r->snap); r->snap = NULL;
         off_rt_defer_release(r->down); r->down = NULL;
+        rc_tex_drop(&r->tex); rc_tex_drop(&r->snap_tex);   /* step C4 */
         r->gsum_ok = 0;
     }
 }
@@ -606,50 +617,40 @@ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
     return rh;
 }
 
-/* Write a texture SRV (or a null SRV when res == NULL) at an absolute SRV
+/* Write a texture SRV (or a null SRV when tex is none) at an absolute SRV
  * heap slot. Used to fill per-draw t0-t3 descriptor windows. */
-/* What each per-draw window descriptor last held. A draw at the same index
- * usually binds the same textures as it did the frame before, and at 5-6k
- * draws a frame (Demon's Souls's Boletarian Palace) re-creating all 16 views
- * of every window was ~11 ms of the render thread's frame. An unchanged view
- * is left as it is. The heap is only written after the GPU has finished the
- * previous frame (render_frame waits first), so skipping a write is safe. */
-typedef struct { ID3D12Resource* res; u32 fmt, mapping, gen; } SrvMemo;
-static SrvMemo s_srv_memo[MAX_DRAWS * RSX_FP_UNITS];
-
-static void srv_write_ex(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt,
+/* What each descriptor last held is the SRV pool's memo (step C4; it was
+ * SrvMemo here, for the windows only). A draw at the same index usually
+ * binds the same textures as it did the frame before, and at 5-6k draws a
+ * frame (Demon's Souls's Boletarian Palace) re-creating all 16 views of
+ * every window was ~11 ms of the render thread's frame. An unchanged view is
+ * left as it is. The heap is only written after the GPU has finished the
+ * previous frame (render_frame waits first), so skipping a write is safe.
+ * The memo compares the whole view, the texture by its handle, and a handle
+ * names one texture for the device's life, so no stamp is needed: today's
+ * memo rewrote every window after any resource was made, and those rewrites
+ * of an unchanged view are the only ones skipped as well. It is always on
+ * (RSX_SRV_MEMO=0 is gone). Inline: the compare is gpu_d3d12_cmd.h's, only
+ * a write calls out. */
+static void srv_write_ex(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt,
                          UINT mapping, int cube)
 {
-    static int en = -1;
-    PS3_KNOB(en, ps3_env_int("RSX_SRV_MEMO", 1));
-    SrvMemo* m = NULL;
-    if (en && heap_slot >= DRAW_SRV_BASE && heap_slot < VP_TEX_SRV_BASE) {
-        m = &s_srv_memo[heap_slot - DRAW_SRV_BASE];
-        const u32 g = (s_res_gen << 1) | (cube ? 1u : 0u);
-        if (m->gen == g && m->res == res && m->fmt == (u32)fmt && m->mapping == mapping)
-            return;
-        m->res = res; m->fmt = (u32)fmt; m->mapping = mapping; m->gen = g;
-    }
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-    sv.Format = fmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    sv.Shader4ComponentMapping = mapping;
-    sv.Texture2D.MipLevels = 1;
-    if (cube) {   /* must match the TextureCube declaration in the HLSL */
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &h);
-    h.ptr += (u64)heap_slot * s_d3d.srv_inc;
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, res, &sv, h);
+    gpu_view_desc sv;
+    sv.texture = tex;
+    sv.kind = GPU_VIEW_SRV;
+    sv.dim = cube ? GPU_DIM_CUBE : GPU_DIM_2D;   /* a cube must match the TextureCube declaration in the HLSL */
+    sv.flags = 0;
+    sv.mips = 1;
+    sv.format = (gpu_format)fmt;
+    sv.swizzle = mapping;
+    sv.mip = 0;
+    sv.layer = 0;
+    gpu_fast_table_write_tex(s_rc_dev, s_rc_srv_pool, heap_slot, &sv);
 }
 
-static void srv_write(u32 heap_slot, ID3D12Resource* res, DXGI_FORMAT fmt, UINT mapping)
+static void srv_write(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt, UINT mapping)
 {
-    srv_write_ex(heap_slot, res, fmt, mapping, 0);
+    srv_write_ex(heap_slot, tex, fmt, mapping, 0);
 }
 
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
@@ -680,6 +681,7 @@ static ID3D12Resource* off_rt_snapshot(int slot)
     if (r->snap && (r->snap_w != r->hw || r->snap_h != r->hh || r->snap_dxgi != r->dxgi)) {
         off_rt_defer_release(r->snap);   /* the open list may still use it */
         r->snap = NULL;
+        rc_tex_drop(&r->snap_tex);   /* step C4 */
     }
     if (!r->snap) {
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -693,6 +695,7 @@ static ID3D12Resource* off_rt_snapshot(int slot)
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&r->snap)))
             return NULL;
+        rc_tex_set(&r->snap_tex, r->snap);   /* step C4: sampled (the SRV writes) */
         r->snap_w = r->hw; r->snap_h = r->hh; r->snap_dxgi = r->dxgi;
         r->snap_st = D3D12_RESOURCE_STATE_COPY_DEST;
     }
@@ -761,6 +764,8 @@ static void screen_copy_capture(u32 fi)
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
                         &IID_ID3D12Resource, (void**)&s_screen_copy)))
                     s_screen_copy = NULL;
+                else
+                    rc_tex_set(&s_rc_screen_copy_tex, s_screen_copy);   /* step C4: sampled (the SRV writes) */
             }
             if (s_screen_copy) {
                 D3D12_RESOURCE_BARRIER bb[2] = {0};

@@ -83,6 +83,18 @@ void gpu_d3d12_pipeline_d3d_desc(gpu_device* d, const gpu_pipeline_desc* desc,
 /* A layout's serialized root signature hash (FNV-1a 64). */
 uint64_t gpu_d3d12_layout_hash(gpu_device* d, gpu_layout layout);
 
+/* ---- step C4 ---- */
+
+/* A texture over res, as gpu_d3d12_adopt_texture, its description read from
+ * res itself (GetDesc: size, layers, mips, format, samples, and the target
+ * flags as use). For the old code's creation sites: one line after each. */
+gpu_texture gpu_d3d12_adopt_texture_of(gpu_device* d, ID3D12Resource* res);
+
+/* A table pool's descriptor heap, borrowed (gpu_native has no kind for it),
+ * for the old code's SetDescriptorHeaps and descriptor arithmetic. Freed
+ * with the pool, at gpu_destroy: never Released by the caller. */
+ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool pool);
+
 #ifdef __cplusplus
 }
 #endif

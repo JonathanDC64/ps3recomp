@@ -543,16 +543,21 @@ static void rsx_scale_apply(void)
         off_rt_defer_release(r->up);   r->up = NULL;
         off_rt_defer_release(r->snap); r->snap = NULL;
         off_rt_defer_release(r->down); r->down = NULL;
+        rc_tex_drop(&r->tex); rc_tex_drop(&r->snap_tex);   /* step C4 */
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
         off_rt_defer_release(s_zeta[i].res); s_zeta[i].res = NULL; s_zeta[i].used = 0;
+        rc_tex_drop(&s_zeta[i].tex);   /* step C4 */
     }
     for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
+    for (int i = 0; i < SUBVP_SLOTS; i++) rc_tex_drop(&s_subvp[i].tex);   /* step C4 */
     off_rt_defer_release(s_screen_copy);      s_screen_copy = NULL;
+    rc_tex_drop(&s_rc_screen_copy_tex);   /* step C4 */
     off_rt_defer_release(s_d3d.readback_buf); s_d3d.readback_buf = NULL;
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;
+        rc_tex_drop(&s_rc_rt_tex[i]);   /* step C4 */
     }
     off_rt_defer_release(s_d3d.depth_buffer); s_d3d.depth_buffer = NULL;
     s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
