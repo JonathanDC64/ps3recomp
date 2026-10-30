@@ -1464,6 +1464,67 @@ static void test_bridges_c4(const scene* s)
     }
 }
 
+/* ---- step C5b ---- */
+/* gpu_d3d12_query_pool_heap (a pool's heap, borrowed): the one the commands
+ * record with, none for a handle that names no pool. */
+static void test_bridges_c5b(const scene* s)
+{
+    ID3D12QueryHeap* h = gpu_d3d12_query_pool_heap(g_d, s->queries);
+    CHECK(h != NULL);
+    if (GPU_VALID(s->queries)) CHECK(h == g_dd->qpool[GPU_HANDLE_INDEX(s->queries.id)].heap);
+    const gpu_query_pool none = {0};
+    CHECK(gpu_d3d12_query_pool_heap(g_d, none) == NULL);
+}
+
+/* The write-back's GPU store (RSX_WB_GPU, wbg_record): a texture copied into
+ * a buffer over host memory at a 512-byte offset, with a row pitch (a
+ * multiple of 256) wider than its rows, lands there row by row, and the
+ * bytes around and between the rows stay as they were. */
+static void test_host_copy_c5b(void)
+{
+    if (!(g_d->caps.bits & GPU_CAP_HOST_IMPORT)) return;
+    const uint32_t w = 16, h = 8, gp = 512, at = 3 * 512;
+    const size_t n = 1u << 20;
+    uint8_t* host = (uint8_t*)VirtualAlloc(NULL, n, MEM_RESERVE, PAGE_READWRITE);
+    CHECK(host != NULL);
+    if (!host) return;
+    const gpu_buffer hb = gpu_buffer_import_host(g_d, host, n);
+    const gpu_texture_desc td = tex_desc(w, h, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC |
+                                         GPU_USE_COPY_DST, GPU_STATE_COPY_DEST);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    CHECK(GPU_VALID(hb) && GPU_VALID(t));
+    if (GPU_VALID(hb) && GPU_VALID(t)) {
+        gpu_footprint fp;
+        uint32_t rows = 0;
+        uint64_t row_bytes = 0;
+        const uint64_t total = gpu_texture_footprints(g_d, &td, 0, 1, 0, &fp, &rows, &row_bytes);
+        const gpu_buffer up = buf_new(g_d, total, GPU_MEM_UPLOAD, GPU_STATE_GENERIC_READ);
+        uint8_t* p = buf_ptr(up);
+        for (uint32_t r = 0; r < h; r++)
+            for (uint32_t k = 0; k < w * 4; k++) p[(uint64_t)r * fp.row_pitch + k] = (uint8_t)(r * 29u + k * 7u + 1u);
+        gpu_footprint to;
+        memset(&to, 0, sizeof to);
+        to.offset = at;
+        to.format = GPU_FORMAT_R8G8B8A8_UNORM;
+        to.width = w; to.height = h; to.depth = 1;
+        to.row_pitch = gp;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_copy_buf_to_tex(c, t, 0, 0, 0, 0, up, &fp);
+        gpu_cmd_barrier(c, t, GPU_STATE_COPY_DEST, GPU_STATE_COPY_SOURCE);
+        gpu_cmd_copy_tex_to_buf(c, hb, &to, t, 0, NULL);
+        CHECK(run(g_d, c));
+        int same = 1;
+        for (uint32_t r = 0; r < h; r++)
+            if (memcmp(host + at + (uint64_t)r * gp, p + (uint64_t)r * fp.row_pitch, w * 4)) same = 0;
+        CHECK(same);
+        CHECK(host[at - 1] == 0 && host[at + w * 4] == 0 && host[at + (uint64_t)(h - 1) * gp + w * 4] == 0);
+        gpu_buffer_destroy(g_d, up, 0);
+    }
+    if (GPU_VALID(t)) gpu_texture_destroy(g_d, t, 0);
+    if (GPU_VALID(hb)) gpu_buffer_destroy(g_d, hb, 0);
+    VirtualFree(host, 0, MEM_RELEASE);
+}
+
 /* GPU_DEVICE_BREADCRUMBS (DRED, not the debug layer): its feature bits, a
  * marker, and, on WARP only, a device removed on purpose (as today's
  * RSX_LOSE_DEVICE_AT_FRAME removes it): lost, its fence passing every value,
@@ -1531,6 +1592,8 @@ int main(void)
         test_memo(&s);
         test_bridges(&s);
         test_bridges_c4(&s);
+        test_bridges_c5b(&s);
+        test_host_copy_c5b();
     }
     test_caches();
     test_fences();

@@ -541,9 +541,9 @@ static void rsx_scale_apply(void)
         OffRT* r = &s_d3d.off_rt[i];
         off_rt_defer_release(r->res);  r->res = NULL;
         off_rt_defer_release(r->up);   r->up = NULL;
-        off_rt_defer_release(r->snap); r->snap = NULL;
-        off_rt_defer_release(r->down); r->down = NULL;
-        rc_tex_drop(&r->tex); rc_tex_drop(&r->snap_tex);   /* step C4 */
+        r->snap = NULL; wb_tex_retire(&r->snap_tex);   /* step C5b */
+        r->down = NULL; wb_tex_retire(&r->down_tex);
+        rc_tex_drop(&r->tex);   /* step C4 */
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
@@ -552,8 +552,7 @@ static void rsx_scale_apply(void)
     }
     for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
     for (int i = 0; i < SUBVP_SLOTS; i++) rc_tex_drop(&s_subvp[i].tex);   /* step C4 */
-    off_rt_defer_release(s_screen_copy);      s_screen_copy = NULL;
-    rc_tex_drop(&s_rc_screen_copy_tex);   /* step C4 */
+    s_screen_copy = NULL; wb_tex_retire(&s_rc_screen_copy_tex);   /* step C5b */
     off_rt_defer_release(s_d3d.readback_buf); s_d3d.readback_buf = NULL;
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;

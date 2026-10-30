@@ -1812,4 +1812,12 @@ ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool po
     return gpu_d3d12_slot_valid(&dd->tpool_slots, pool.id) ? dd->tpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
 }
 
+/* ---- step C5b ---- */
+
+ID3D12QueryHeap* gpu_d3d12_query_pool_heap(gpu_device* d, gpu_query_pool pool)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    return gpu_d3d12_slot_valid(&dd->qpool_slots, pool.id) ? dd->qpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
+}
+
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */

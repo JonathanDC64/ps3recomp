@@ -443,3 +443,50 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #  rsxc_api.inc: rc_backend_shutdown 15833, 15840 (pso_count_print),
 #   15866-15867 (the passes' borrowed pointers cleared, so the releases
 #   after them find NULL).
+
+# Step C5b: the colour write-back (the host import included), its downscale
+# pass, the snapshots, the screen copy, the composite and guest_fb's
+# barriers, and ZPASS's query pool and readback, on the GPU layer. The
+# regions below are no longer verbatim at these legacy lines: a fix there
+# needs a hand port. The textures made here (OffRT.down, OffRT.snap,
+# s_screen_copy) are gpu_texture_create's in the handle fields (down_tex,
+# snap_tex, s_rc_screen_copy_tex), and the ID3D12Resource* fields hold
+# their resources, borrowed (gpu_native); one dropped while a frame is
+# recorded waits in wb_tex_retire's grave and is destroyed (after 0) at a
+# later render_frame's pre-pass, after its opening wait_for_gpu: where
+# off_rt_defer_release let it go. The readback buffers (OffRT.rb, ZPASS's
+# s_zq_rb) are gpu_buffer_create's (rb_buf, s_zq_rb_buf), read with
+# gpu_buffer_map / gpu_buffer_unmap (today's Map(0, {0, n}), Unmap(0,
+# {0, 0})); the buffer over RSX local memory is gpu_buffer_import_host's
+# (the core keeps the VirtualQuery check, its line, and the commit). Every
+# command in these regions is a gpu_cmd_* on s_rc_cmd (barrier, barrier_n,
+# copy_texture, copy_texture_whole, copy_tex_to_buf; the downscale pass's
+# pass_begin with a gpu_view_get RTV, set_layout, set_pipeline,
+# set_table_pools, bind_table, push_const, viewport, scissor, topology,
+# draw), but two copies into or from step C2's buffers (guest_fb's upload
+# buffer, frame.inc's readback_buf for SCREENCOPY_DUMP), native until those
+# have handles. ZPASS's pool is gpu_query_pool_create's (s_zq_pool);
+# s_zq_heap is its heap, borrowed (gpu_d3d12_query_pool_heap), for the
+# queries and the resolve frame.inc records natively until step C7.
+#  rsxc_writeback.inc: the grave (wb_tex_retire, wb_tex_bury), new after
+#   rt_guest_bpp (8830-8834); s_down_pso 8845 (gpu_pipeline) and s_down_rtv
+#   8848 (gone); down_init 8913-8917 (the RTV heap gone); down_pso
+#   8922-8948; off_rt_downscale 8951-9022; s_wbg 9038 and wbg_ready
+#   9062-9083; wbg_record 9106-9119; rt_writeback_record 9143-9173;
+#   wbg_check 9213-9214, 9222-9223; rt_writeback_store 9294-9295, 9313,
+#   9325-9326; off_rt_drop_rewritten 9351 (wb_tex_bury every frame) and
+#   9364-9365 (the snapshot and the downscale copy retired);
+#   off_rt_transition 9425-9437 (gpu_cmd_barrier with OffRT.tex, inline);
+#   off_rt_snapshot 9450-9492 (it still returns the resource, which its
+#   callers test); screen_copy_capture 9521-9586; composite_present
+#   9658-9684; guest_fb_present 9733-9739, 9753-9755 (its buffer, map and
+#   copy are as they were).
+#  rsxc_zpass.inc: s_zq_heap and s_zq_rb 9863-9864 (s_zq_pool, s_zq_rb_buf
+#   beside them); zq_ready 9897-9919; zq_finish 9929-9935.
+#  rsxc_state.inc: OffRT rb_buf after rb (303), down_tex after down (310),
+#   snap_tex's comment; s_rc_screen_copy_tex's comment (step C4's block).
+#  rsxc_diag.inc: rsx_scale_apply 10503-10505, 10511 (retired, not
+#   released).
+#  rsxc_api.inc: rc_backend_shutdown 15843-15845 (gpu_buffer_destroy).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C5b blocks):
+#   gpu_d3d12_query_pool_heap (a query pool's heap, borrowed).

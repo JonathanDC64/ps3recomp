@@ -99,8 +99,10 @@ static void rc_backend_shutdown(void)
     pso_count_print("this run");
 
     /* Release D3D12 resources */
-    if (s_wbg.buf)  { s_wbg.buf->lpVtbl->Release(s_wbg.buf);   s_wbg.buf = NULL; }
-    if (s_wbg.heap) { s_wbg.heap->lpVtbl->Release(s_wbg.heap); s_wbg.heap = NULL; }
+    /* The write-back's buffer over guest memory (the GPU layer's, step C5b)
+     * goes here, as today, while guest memory is there; the GPU is idle. */
+    if (GPU_VALID(s_wbg.buf)) gpu_buffer_destroy(s_rc_dev, s_wbg.buf, 0);
+    s_wbg.buf.id = 0;
     s_wbg.state = -1;
     if (s_d3d.vertex_buffer) {
         s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);

@@ -95,6 +95,13 @@ gpu_texture gpu_d3d12_adopt_texture_of(gpu_device* d, ID3D12Resource* res);
  * with the pool, at gpu_destroy: never Released by the caller. */
 ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool pool);
 
+/* ---- step C5b ---- */
+
+/* A query pool's heap, borrowed (gpu_native has no kind for it), for the old
+ * code's BeginQuery, EndQuery and ResolveQueryData. Freed with the pool, at
+ * gpu_destroy: never Released by the caller. */
+ID3D12QueryHeap* gpu_d3d12_query_pool_heap(gpu_device* d, gpu_query_pool pool);
+
 #ifdef __cplusplus
 }
 #endif
