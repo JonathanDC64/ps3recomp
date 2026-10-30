@@ -564,6 +564,26 @@ if(PS3RECOMP_RSX_HAL)
         set_target_properties(test_gpu_vk PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME gpu_vk COMMAND test_gpu_vk)
     endif()
+
+    # The null backend's test: it records and checks and draws nothing, so it
+    # runs on every system; its stream hash is a golden. The backend is built
+    # into it with the strict flags. Built on demand:
+    #   cmake --build build --target test_gpu_null
+    #   ctest --test-dir build -R gpu_null
+    add_executable(test_gpu_null EXCLUDE_FROM_ALL
+        libs/video/tests/test_gpu_null.c
+        libs/video/gpu/gpu_null.c
+    )
+    target_compile_definitions(test_gpu_null PRIVATE PS3RECOMP_RSX_HAL=1)
+    target_include_directories(test_gpu_null PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/gpu")
+    if(MSVC)
+        target_compile_definitions(test_gpu_null PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        set_target_properties(test_gpu_null PROPERTIES C_STANDARD 99 C_EXTENSIONS OFF)
+        target_compile_options(test_gpu_null PRIVATE
+            -Wall -Wextra -Wpedantic -Wno-unused-parameter -Werror)
+    endif()
+    add_test(NAME gpu_null COMMAND test_gpu_null)
     message(STATUS "  Renderer:     the portable renderer's GPU layer too (PS3RECOMP_RSX_HAL)")
 endif()
 
