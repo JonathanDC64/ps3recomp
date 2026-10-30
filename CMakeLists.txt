@@ -529,6 +529,41 @@ if(PS3RECOMP_RSX_HAL)
         set_target_properties(test_gpu_d3d12 PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME gpu_d3d12 COMMAND test_gpu_d3d12)
     endif()
+
+    # The Vulkan backend (gpu_vk*, PS3RECOMP_RSX_HAL_VULKAN from gpu_deps.cmake): volk and the pinned headers.
+    # PS3RECOMP_RSX_HAL_VULKAN is public, as PS3RECOMP_RSX_HAL is: the route switch offers Vulkan only when built.
+    if(PS3RECOMP_RSX_HAL_VULKAN)
+        set(_ps3_volk "${CMAKE_CURRENT_SOURCE_DIR}/third_party/volk/volk.c")
+        target_sources(ps3recomp_runtime PRIVATE "${_ps3_volk}")
+        set_source_files_properties("${_ps3_volk}" PROPERTIES COMPILE_OPTIONS "-w")   # upstream code
+        if(WIN32)   # volk loads the Win32 surface functions too
+            set_source_files_properties("${_ps3_volk}" PROPERTIES COMPILE_DEFINITIONS VK_USE_PLATFORM_WIN32_KHR)
+        endif()
+        target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_HAL_VULKAN=1)
+        target_include_directories(ps3recomp_runtime PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/volk")
+        target_link_libraries(ps3recomp_runtime PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+
+        # Its test, the D3D12 test's cases on Vulkan: on a CPU device (lavapipe) when there is one, else on the
+        # GPU; GPU_TEST_HW=1 takes the GPU. The validation layer is on (GPU_TEST_VALIDATION=0 runs without it)
+        # and any message it gives fails the test; RSX_VK_MASK=<GPU_CAP_* bits> runs the fallbacks. On demand:
+        #   cmake --build build --target test_gpu_vk
+        #   ctest --test-dir build -R gpu_vk
+        add_executable(test_gpu_vk EXCLUDE_FROM_ALL
+            libs/video/tests/test_gpu_vk.c
+            runtime/host/host_stubs.c
+        )
+        target_compile_definitions(test_gpu_vk PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_gpu_vk PRIVATE ps3recomp_runtime Vulkan::Headers)
+        target_include_directories(test_gpu_vk PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/gpu"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/volk")
+        if(WIN32)   # the footprint check compares with D3D12's, on WARP
+            target_link_libraries(test_gpu_vk PRIVATE d3d12 dxgi dxguid user32)
+        endif()
+        set_target_properties(test_gpu_vk PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME gpu_vk COMMAND test_gpu_vk)
+    endif()
     message(STATUS "  Renderer:     the portable renderer's GPU layer too (PS3RECOMP_RSX_HAL)")
 endif()
 

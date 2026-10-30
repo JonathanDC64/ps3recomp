@@ -1246,6 +1246,16 @@ static void test_swapchain(void)
             r->lpVtbl->GetDesc(r, &rd);
             CHECK(rd.Width == 96 && rd.Height == 64);
         }
+        /* Every image by index (gpu_swap_image): the current one is acquire's, the other another, none
+         * past the count, which is the buffers asked. */
+        {
+            gpu_texture cur;
+            const uint32_t ci = gpu_swap_acquire(g_d, sc, &cur);
+            const uint32_t n = gpu_swap_image_count(g_d, sc);
+            CHECK(n == 2 && ci < n && gpu_swap_image(g_d, sc, ci).id == cur.id);
+            CHECK(GPU_VALID(gpu_swap_image(g_d, sc, 1 - ci)) && gpu_swap_image(g_d, sc, 1 - ci).id != cur.id &&
+                  !GPU_VALID(gpu_swap_image(g_d, sc, n)));
+        }
         gpu_swap_destroy(g_d, sc);
         CHECK(!gpu_d3d12_slot_valid(&g_dd->tex_slots, img2.id));
     }

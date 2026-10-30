@@ -35,7 +35,11 @@
  *     does;
  *   - clears clear the whole view, or one rectangle of it, and may name a
  *     view that is not bound (on Vulkan it must be bound or the clear ends
- *     the pass).
+ *     the pass);
+ *   - a barrier on one plane of a depth-stencil texture moves both on
+ *     Vulkan, so the two planes move together;
+ *   - a placed texture's contents are undefined until it is written or
+ *     cleared, as on D3D12.
  */
 #ifndef PS3RECOMP_GPU_CMD_OPS_H
 #define PS3RECOMP_GPU_CMD_OPS_H
@@ -67,7 +71,8 @@ extern "C" {
     X(set_scissor,     V, void, (gpu_cmd* c, const gpu_rect* rect), (c, rect)) \
     /* The pools tables are bound from (SetDescriptorHeaps); either may be none. */ \
     X(set_table_pools, V, void, (gpu_cmd* c, gpu_table_pool tex, gpu_table_pool samplers), (c, tex, samplers)) \
-    /* A CB slot's constants at addr (cb_align aligned); a RAW slot's buffer at addr. */ \
+    /* A CB slot's constants at addr (cb_align aligned, a GPU_USE_CONSTANT buffer); a RAW \
+     * slot's buffer at addr (cb_align aligned too on Vulkan), read up to the buffer's end. */ \
     X(bind_cb,         V, void, (gpu_cmd* c, uint32_t slot, gpu_addr addr), (c, slot, addr)) \
     X(bind_raw,        V, void, (gpu_cmd* c, uint32_t slot, gpu_addr addr), (c, slot, addr)) \
     X(bind_table,      V, void, (gpu_cmd* c, uint32_t slot, gpu_table table), (c, slot, table)) \
@@ -75,7 +80,8 @@ extern "C" {
     X(push_const,      V, void, (gpu_cmd* c, uint32_t slot, uint32_t count, const void* values, uint32_t first), (c, slot, count, values, first)) \
     /* One of them (SetGraphicsRoot32BitConstant): the fetch draws' b2, per draw. */ \
     X(push_const1,     V, void, (gpu_cmd* c, uint32_t slot, uint32_t value, uint32_t first), (c, slot, value, first)) \
-    /* Vertex buffer slot: size bytes at addr, stride bytes a vertex. */ \
+    /* Vertex buffer slot: size bytes at addr, stride bytes a vertex (Vulkan's comes from the \
+     * pipeline, so they must agree). */ \
     X(set_vb,          V, void, (gpu_cmd* c, uint32_t slot, gpu_addr addr, uint32_t size, uint32_t stride), (c, slot, addr, size, stride)) \
     /* format GPU_FORMAT_R32_UINT or _R16_UINT. */ \
     X(set_ib,          V, void, (gpu_cmd* c, gpu_addr addr, uint32_t size, gpu_format format), (c, addr, size, format)) \
@@ -96,7 +102,10 @@ extern "C" {
     X(copy_buffer,     V, void, (gpu_cmd* c, gpu_buffer dst, uint64_t dst_offset, gpu_buffer src, uint64_t src_offset, uint64_t size), (c, dst, dst_offset, src, src_offset, size)) \
     /* An MSAA texture's samples averaged into a single-sample one (ResolveSubresource). */ \
     X(resolve,         V, void, (gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, gpu_texture src, uint32_t src_sub, gpu_format format), (c, dst, dst_sub, src, src_sub, format)) \
-    /* Before a query's first use in a recording (Vulkan; nothing on D3D12). */ \
+    /* Before each use of a query in a recording (Vulkan; nothing on D3D12). From query_begin \
+     * to query_end nothing may end the pass: no pass_begin, pass_end, barrier, copy, resolve, \
+     * query_reset, query_resolve or clear of a view not bound; no query is open at cmd_end. \
+     * Occlusion counts samples with GPU_CAP_OCCLUSION_PRECISE, else zero or not zero. */ \
     X(query_reset,     V, void, (gpu_cmd* c, gpu_query_pool pool, uint32_t first, uint32_t count), (c, pool, first, count)) \
     X(query_begin,     V, void, (gpu_cmd* c, gpu_query_pool pool, uint32_t index), (c, pool, index)) \
     X(query_end,       V, void, (gpu_cmd* c, gpu_query_pool pool, uint32_t index), (c, pool, index)) \

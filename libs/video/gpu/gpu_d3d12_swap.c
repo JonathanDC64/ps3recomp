@@ -159,6 +159,14 @@ int gpu_d3d12_swap_resize(gpu_device* d, gpu_swapchain sc, uint32_t width, uint3
     return got;
 }
 
+/* gpu_swap_image_count: the buffers asked (DXGI makes exactly those). gpu_swap_image is
+ * gpu_d3d12_swap_image, below. */
+uint32_t gpu_d3d12_swap_image_count(gpu_device* d, gpu_swapchain sc)
+{
+    gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
+    return s ? s->buffers : 0;
+}
+
 uint32_t gpu_d3d12_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image)
 {
     gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
