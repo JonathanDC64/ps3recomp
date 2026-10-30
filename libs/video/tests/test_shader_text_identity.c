@@ -555,6 +555,17 @@ static void cache_test(const char* da, const char* db)
     for (int t = GPU_SC_SPV; t < GPU_SC_TARGET_COUNT; t++) {
         gpu_sc_blob blob;
         snprintf(g_ctx, sizeof g_ctx, "target %d", t);
+#if defined(PS3RECOMP_RSX_HAL_SPV)
+        if (t == GPU_SC_SPV) {
+            /* Built here (test_gpu_sc_spv is its test); without the cache, so
+             * the directories compared above stay the dxbc target's alone. */
+            check_int("spv available", gpu_sc_available(GPU_SC_SPV), 1);
+            check_int("spv refuses a broken text",
+                      gpu_sc_compile(GPU_SC_SPV, GPU_SC_VS, "x", 1, "x", GPU_SC_NO_CACHE, &blob, NULL, 0),
+                      GPU_SC_FAILED);
+            continue;
+        }
+#endif
         check_int("target not available", gpu_sc_available((gpu_sc_target)t), 0);
         check_int("target compile", gpu_sc_compile((gpu_sc_target)t, GPU_SC_VS, "x", 1, "x", 0, &blob, NULL, 0),
                   GPU_SC_UNAVAILABLE);

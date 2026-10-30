@@ -4,8 +4,10 @@
  * The dxbc target is today's D3D12 renderer's shader disk cache, its
  * read-ahead and FXC call, copied from rsx_d3d12_backend.c line for line
  * (copy_manifest.txt): the same key, file name, header checks and store, so
- * its files are today's. The other targets are declared and not available
- * yet.
+ * its files are today's. The spv target (PS3RECOMP_RSX_HAL_SPV) has its own
+ * files under <cache>/gpu/spv/ and its compiler in gpu_shader_spv*.cpp; the
+ * dxbc target's code and files do not change with it. dxil, metallib and
+ * msl are declared and not available yet.
  */
 #if defined(PS3RECOMP_RSX_HAL)
 
@@ -15,6 +17,10 @@
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/ps3types.h"
 #include "gpu_shader.h"
+#if defined(PS3RECOMP_RSX_HAL_SPV)
+#define GPU_SC_HAVE_SPV 1
+#include "gpu_shader_spv.h"
+#endif
 
 static u64 shader_key(const char* src, size_t n, const char* profile)
 {
@@ -256,30 +262,343 @@ static const char* const s_dxbc_profile[GPU_SC_STAGE_COUNT] = { "vs_5_0", "ps_5_
 
 const char* gpu_sc_cache_dir(void) { return shader_cache_dir(); }
 
+static void spv_stats_take(gpu_sc_stats* out, int reset);
+
 void gpu_sc_stats_take(gpu_sc_stats* out, int reset)
 {
     if (out) { out->compile_s = s_perf_fxc; out->compiles = s_perf_fxc_n; out->cache_hits = s_perf_sc_hits; }
     if (reset) { s_perf_fxc = 0.0; s_perf_fxc_n = 0; s_perf_sc_hits = 0; }
+    spv_stats_take(out, reset);
 }
 
 #else /* no dxbc here */
 
+#if defined(GPU_SC_HAVE_SPV)
+#include <sys/stat.h>
+#include <unistd.h>
+/* Where only spv is built (Linux): the cache directory as the dxbc target's,
+ * PS3_SHADER_CACHE or shader_cache beside the executable (0: no cache). */
+static const char* shader_cache_dir(void)
+{
+    static char dir[4096]; static int init = 0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("PS3_SHADER_CACHE");
+        if (e && !strcmp(e, "0")) dir[0] = 0;
+        else if (e && *e) snprintf(dir, sizeof dir, "%s", e);
+        else {
+            char exe[4000];
+            const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+            char* slash = NULL;
+            if (n > 0) { exe[n] = 0; slash = strrchr(exe, '/'); }
+            if (slash) { *slash = 0; snprintf(dir, sizeof dir, "%s/shader_cache", exe); }
+            else snprintf(dir, sizeof dir, "shader_cache");
+        }
+        if (dir[0]) mkdir(dir, 0755);
+    }
+    return dir;
+}
+const char* gpu_sc_cache_dir(void) { return shader_cache_dir(); }
+#else
 const char* gpu_sc_cache_dir(void) { return ""; }
+#endif
 
 void gpu_sc_warm(void) {}
 
+static void spv_stats_take(gpu_sc_stats* out, int reset);
+
 void gpu_sc_stats_take(gpu_sc_stats* out, int reset)
 {
-    (void)reset;
     if (out) { out->compile_s = 0.0; out->compiles = 0; out->cache_hits = 0; }
+    spv_stats_take(out, reset);
 }
 
 #endif /* _WIN32 || PS3RECOMP_RSX_D3D12_VKD3D */
+
+#if defined(GPU_SC_HAVE_SPV)
+/* ---- the spv target (gpu_shader_spv.h) -------------------------------------
+ * The cache holds glslang's module for a text after the edits, with its
+ * layout's sets and bindings: one file per text and layout,
+ *   <cache>/gpu/spv/<vs|ps|gs>_<T>.spv
+ * T = gpu_spv_key(K, layout), K the text's dxbc key (gpu_sc_key over the
+ * dxbc profile), behind a 24-byte header the loader checks: "GSPV", version
+ * 1, T (low word, high word), the module's size in bytes and 0, each a
+ * little-endian u32. The post-passes run on every module handed out, by the
+ * options of the moment, so one file serves every device. Debug builds (and
+ * RSX_SPV_VALIDATE=1) validate each one. gpu_sc_load, gpu_sc_put and
+ * gpu_sc_cache_path are the guest layout's. */
+#ifndef _WIN32
+#include <pthread.h>
+#include <sys/stat.h>
+#include <time.h>
+#endif
+
+#define SPV_HDR 24u
+
+static volatile unsigned s_spv_opts = GPU_SC_SPV_DEFAULT;
+static double s_spv_s;
+static int s_spv_n, s_spv_hits;
+static const char* const s_k_profile[GPU_SC_STAGE_COUNT] = { "vs_5_0", "ps_5_0", "gs_5_0" };
+static const char* const s_spv_stage[GPU_SC_STAGE_COUNT] = { "vs", "ps", "gs" };
+
+void gpu_sc_spv_set_options(unsigned opts) { s_spv_opts = opts & GPU_SC_SPV_ALL; }
+
+unsigned gpu_sc_spv_options(void)
+{
+    static int nocontract = -1;
+    PS3_KNOB(nocontract, ps3_env_int("RSX_SPV_NOCONTRACT", 1));
+    return nocontract ? s_spv_opts : (s_spv_opts & ~GPU_SC_SPV_NO_CONTRACT);
+}
+
+static void spv_stats_take(gpu_sc_stats* out, int reset)
+{
+    if (out) { out->compile_s += s_spv_s; out->compiles += s_spv_n; out->cache_hits += s_spv_hits; }
+    if (reset) { s_spv_s = 0.0; s_spv_n = 0; s_spv_hits = 0; }
+}
+
+static double spv_now(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
+
+static void spv_mkdir(const char* path)
+{
+#ifdef _WIN32
+    CreateDirectoryA(path, NULL);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+/* The file a stage's module with key T is stored under; 0 when there is no
+ * cache. Makes <cache>/gpu/spv the first time. */
+static int spv_path(gpu_sc_stage stage, u64 t, char* path, size_t cap)
+{
+    static volatile int made = 0;
+    const char* root = gpu_sc_cache_dir();
+    if (!root[0] || !path || cap < 32) return 0;
+    if (!made) {
+        snprintf(path, cap, "%s/gpu", root);
+        spv_mkdir(path);
+        snprintf(path, cap, "%s/gpu/spv", root);
+        spv_mkdir(path);
+        made = 1;
+    }
+    snprintf(path, cap, "%s/gpu/spv/%s_%016llx.spv", root, s_spv_stage[stage], (unsigned long long)t);
+    return 1;
+}
+
+static u32 spv_le32(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static void spv_put32(u8* p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
+
+/* A cached module, if the file is a whole one for T: the header's magic,
+ * version and key, its size the rest of the file, and SPIR-V's magic. */
+static uint32_t* spv_file_load(const char* path, u64 t, size_t* nwords)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+    uint32_t* w = NULL;
+    u8 h[SPV_HDR];
+    if (n > (long)SPV_HDR + 20 && fread(h, 1, SPV_HDR, f) == SPV_HDR && !memcmp(h, "GSPV", 4) &&
+        spv_le32(h + 4) == 1u && spv_le32(h + 8) == (u32)t && spv_le32(h + 12) == (u32)(t >> 32) &&
+        spv_le32(h + 16) == (u32)(n - (long)SPV_HDR) && spv_le32(h + 20) == 0u && ((n - (long)SPV_HDR) & 3) == 0) {
+        const size_t size = (size_t)(n - (long)SPV_HDR);
+        w = (uint32_t*)malloc(size);
+        if (w && (fread(w, 1, size, f) != size || w[0] != 0x07230203u)) { free(w); w = NULL; }
+        if (w) *nwords = size / 4;
+    }
+    fclose(f);
+    return w;
+}
+
+/* Written to a temporary name and renamed, as the dxbc files are. */
+static void spv_file_store(const char* path, u64 t, const uint32_t* w, size_t nwords)
+{
+    char tmp[4200];
+#ifdef _WIN32
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)GetCurrentThreadId());
+#else
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, (unsigned long)pthread_self());
+#endif
+    FILE* f = fopen(tmp, "wb");
+    if (!f) return;
+    const size_t size = nwords * 4;
+    u8 h[SPV_HDR];
+    memcpy(h, "GSPV", 4);
+    spv_put32(h + 4, 1u);
+    spv_put32(h + 8, (u32)t);
+    spv_put32(h + 12, (u32)(t >> 32));
+    spv_put32(h + 16, (u32)size);
+    spv_put32(h + 20, 0u);
+    const int ok = fwrite(h, 1, SPV_HDR, f) == SPV_HDR && fwrite(w, 1, size, f) == size;
+#ifdef _WIN32
+    if (fclose(f) || !ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        DeleteFileA(tmp);
+#else
+    if (fclose(f) || !ok || rename(tmp, path)) remove(tmp);
+#endif
+}
+
+static int spv_exists(const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int spv_validate_on(void)
+{
+#ifndef NDEBUG
+    return 1;
+#else
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_SPV_VALIDATE", 0));
+    return on != 0;
+#endif
+}
+
+/* A module from the cache or glslang, through the post-passes into out. */
+static int spv_hand_out(gpu_sc_stage stage, const uint32_t* raw, size_t nraw, gpu_sc_blob* out,
+                        char* err, size_t err_cap)
+{
+    uint32_t* w = NULL; size_t n = 0;
+    if (gpu_spv_post(stage, raw, nraw, gpu_sc_spv_options(), &w, &n) != GPU_SC_OK) {
+        if (err && err_cap) snprintf(err, err_cap, "spv: malformed module");
+        return GPU_SC_FAILED;
+    }
+    if (spv_validate_on()) {
+        char msg[1024];
+        if (!gpu_spv_validate(w, n, msg, sizeof msg)) {
+            static int said = 0;
+            if (said < 8 && ++said) printf("[GPU] spv: %s\n", msg);
+            if (err && err_cap) snprintf(err, err_cap, "%s", msg);
+            free(w);
+            return GPU_SC_FAILED;
+        }
+    }
+    out->impl = w;            /* (impl == data: one malloc, see gpu_sc_blob_release) */
+    out->data = w;
+    out->size = n * 4;
+    return GPU_SC_OK;
+}
+
+/* The edits and glslang; *text_out the edited text (malloc'd) when asked. */
+static int spv_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
+                       const gpu_layout_desc* layout, unsigned flags, uint32_t** w, size_t* nw, char** text_out,
+                       char* err, size_t err_cap)
+{
+    size_t tl = 0;
+    if (!layout) layout = gpu_spv_guest_layout();
+    char* text = gpu_spv_edit(stage, src, n, GPU_SPV_EDITS_ALL, layout, &tl, err, err_cap);
+    if (!text) {
+        if (err && err_cap && !err[0]) snprintf(err, err_cap, "spv: out of memory");
+        return GPU_SC_FAILED;
+    }
+    const int perf = s_sc_perf != 0;
+    const double t0 = perf ? spv_now() : 0.0;
+    const int r = gpu_spv_glslang(stage, text, tl, name, entry, (flags & GPU_SC_OPTIMIZE) ? GPU_SPV_GL_OPTIMIZE : 0u,
+                                  gpu_spv_text_has_bindings(src, n) ? NULL : layout, w, nw, err, err_cap);
+    if (perf) { s_spv_s += spv_now() - t0; s_spv_n++; }
+    if (text_out && r == GPU_SC_OK) *text_out = text;
+    else free(text);
+    return r;
+}
+
+static int spv_compile_entry(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
+                             const gpu_layout_desc* layout, unsigned flags, gpu_sc_blob* out, char* err,
+                             size_t err_cap)
+{
+    char path[4200]; path[0] = 0;
+    u64 t = 0;
+    if (!layout) layout = gpu_spv_guest_layout();
+    if (!(flags & GPU_SC_NO_CACHE)) {
+        t = gpu_spv_key(shader_key(src, n, s_k_profile[stage]), layout);
+        if (!spv_path(stage, t, path, sizeof path)) path[0] = 0;
+        size_t nw = 0;
+        uint32_t* w = path[0] ? spv_file_load(path, t, &nw) : NULL;
+        if (w) {
+            if (s_sc_perf) s_spv_hits++;
+            const int r = spv_hand_out(stage, w, nw, out, err, err_cap);
+            free(w);
+            return r;
+        }
+    }
+    uint32_t* w = NULL; size_t nw = 0; char* text = NULL;
+    int r = spv_compile(stage, src, n, name, entry, layout, flags, &w, &nw, path[0] ? &text : NULL, err, err_cap);
+    if (r != GPU_SC_OK) return r;
+    if (path[0]) {
+        spv_file_store(path, t, w, nw);
+        /* PS3_SHADER_CACHE_HLSL=1: the edited text beside its module. */
+        static int keep = -1;
+        PS3_KNOB(keep, ps3_env_int("PS3_SHADER_CACHE_HLSL", 0));
+        if (keep && text) {
+            char hp[4300];
+            snprintf(hp, sizeof hp, "%s.hlsl", path);
+            FILE* f = fopen(hp, "wb");
+            if (f) { fwrite(text, 1, strlen(text), f); fclose(f); }
+        }
+    }
+    free(text);
+    r = spv_hand_out(stage, w, nw, out, err, err_cap);
+    free(w);
+    return r;
+}
+
+static int spv_load(gpu_sc_stage stage, u64 key, gpu_sc_blob* out)
+{
+    char path[4200];
+    const u64 t = gpu_spv_key(key, NULL);
+    if (!spv_path(stage, t, path, sizeof path)) return GPU_SC_NOT_CACHED;
+    size_t nw = 0;
+    uint32_t* w = spv_file_load(path, t, &nw);
+    if (!w) return GPU_SC_NOT_CACHED;
+    const int r = spv_hand_out(stage, w, nw, out, NULL, 0);
+    free(w);
+    return r;
+}
+
+static int spv_put(gpu_sc_stage stage, const char* src)
+{
+    char path[4200];
+    if (!src) return 0;
+    const size_t n = strlen(src);
+    const u64 t = gpu_spv_key(shader_key(src, n, s_k_profile[stage]), NULL);
+    if (!spv_path(stage, t, path, sizeof path)) return 0;
+    if (spv_exists(path)) return 1;
+    uint32_t* w = NULL; size_t nw = 0;
+    if (spv_compile(stage, src, n, stage == GPU_SC_PS ? "guest_fp" : "guest_vp2", NULL, NULL, 0, &w, &nw, NULL,
+                    NULL, 0) != GPU_SC_OK)
+        return 0;
+    spv_file_store(path, t, w, nw);
+    free(w);
+    return 2;
+}
+
+#else /* no spv here */
+
+static void spv_stats_take(gpu_sc_stats* out, int reset) { (void)out; (void)reset; }
+void gpu_sc_spv_set_options(unsigned opts) { (void)opts; }
+unsigned gpu_sc_spv_options(void) { return 0; }
+
+#endif /* GPU_SC_HAVE_SPV */
 
 int gpu_sc_available(gpu_sc_target target)
 {
 #ifdef GPU_SC_HAVE_DXBC
     if (target == GPU_SC_DXBC) return 1;
+#endif
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return 1;
 #endif
     (void)target;
     return 0;
@@ -291,6 +610,9 @@ const char* gpu_sc_profile(gpu_sc_target target, gpu_sc_stage stage)
 #ifdef GPU_SC_HAVE_DXBC
     if (target == GPU_SC_DXBC) return s_dxbc_profile[stage];
 #endif
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return s_k_profile[stage];
+#endif
     return NULL;
 }
 
@@ -300,6 +622,9 @@ int gpu_sc_cache_path(gpu_sc_target target, gpu_sc_stage stage, const char* src,
     const char* profile = gpu_sc_profile(target, stage);
     const char* dir = gpu_sc_cache_dir();
     if (!profile || !src || !path || !cap || !dir[0]) return 0;
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return spv_path(stage, gpu_spv_key(shader_key(src, n, profile), NULL), path, cap);
+#endif
     snprintf(path, cap, "%s/%s_%016llx.dxbc", dir, profile,
              (unsigned long long)shader_key(src, n, profile));
     return 1;
@@ -315,6 +640,13 @@ int gpu_sc_compile_entry(gpu_sc_target target, gpu_sc_stage stage, const char* s
                          const char* name, const char* entry, unsigned flags, gpu_sc_blob* out,
                          char* err, size_t err_cap)
 {
+    return gpu_sc_compile_layout(target, stage, src, n, name, entry, NULL, flags, out, err, err_cap);
+}
+
+int gpu_sc_compile_layout(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                          const char* name, const char* entry, const struct gpu_layout_desc* layout,
+                          unsigned flags, gpu_sc_blob* out, char* err, size_t err_cap)
+{
     if (out) { out->data = NULL; out->size = 0; out->impl = NULL; }
     if (err && err_cap) err[0] = 0;
     if (!src || !out || (unsigned)stage >= GPU_SC_STAGE_COUNT) return GPU_SC_BAD_ARG;
@@ -323,6 +655,10 @@ int gpu_sc_compile_entry(gpu_sc_target target, gpu_sc_stage stage, const char* s
     if (!(flags & GPU_SC_NO_CACHE) && ((flags & GPU_SC_OPTIMIZE) || strcmp(entry, "main")))
         return GPU_SC_BAD_ARG;
     if (!gpu_sc_available(target)) return GPU_SC_UNAVAILABLE;
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return spv_compile_entry(stage, src, n, name, entry, layout, flags, out, err, err_cap);
+#endif
+    (void)layout;   /* dxbc: the registers are the root signature's */
 #ifdef GPU_SC_HAVE_DXBC
     const char* profile = s_dxbc_profile[stage];
     const UINT fl = (flags & GPU_SC_OPTIMIZE) ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0;
@@ -355,6 +691,9 @@ int gpu_sc_load(gpu_sc_target target, gpu_sc_stage stage, uint64_t key, gpu_sc_b
     if (out) { out->data = NULL; out->size = 0; out->impl = NULL; }
     if (!out || (unsigned)stage >= GPU_SC_STAGE_COUNT) return GPU_SC_BAD_ARG;
     if (!gpu_sc_available(target)) return GPU_SC_UNAVAILABLE;
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return spv_load(stage, key, out);
+#endif
 #ifdef GPU_SC_HAVE_DXBC
     const char* dir = shader_cache_dir();
     if (!dir[0]) return GPU_SC_NOT_CACHED;
@@ -375,8 +714,11 @@ int gpu_sc_load(gpu_sc_target target, gpu_sc_stage stage, uint64_t key, gpu_sc_b
 void gpu_sc_blob_release(gpu_sc_blob* blob)
 {
     if (!blob) return;
+    /* An spv module is one malloc, its impl its data; a dxbc one an ID3DBlob,
+     * whose buffer is never the object itself. */
+    if (blob->impl && blob->impl == blob->data) free(blob->impl);
 #ifdef GPU_SC_HAVE_DXBC
-    if (blob->impl) { ID3DBlob* b = (ID3DBlob*)blob->impl; b->lpVtbl->Release(b); }
+    else if (blob->impl) { ID3DBlob* b = (ID3DBlob*)blob->impl; b->lpVtbl->Release(b); }
 #endif
     blob->data = NULL; blob->size = 0; blob->impl = NULL;
 }
@@ -385,6 +727,9 @@ void gpu_sc_blob_release(gpu_sc_blob* blob)
 int gpu_sc_put(gpu_sc_target target, gpu_sc_stage stage, const char* src)
 {
     if (!gpu_sc_available(target) || (stage != GPU_SC_VS && stage != GPU_SC_PS)) return 0;
+#ifdef GPU_SC_HAVE_SPV
+    if (target == GPU_SC_SPV) return spv_put(stage, src);
+#endif
 #ifdef GPU_SC_HAVE_DXBC
     const int fragment = stage == GPU_SC_PS;
     const char* hlsl = src;
