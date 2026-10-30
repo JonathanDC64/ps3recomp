@@ -571,6 +571,33 @@ if(WIN32)
     set_target_properties(rsx_shader_precompile PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
+# The portable renderer's shader texts (libs/video/rsxcore/rsxc_shader.c) and
+# compile service (libs/video/gpu/gpu_shader.c) against today's D3D12
+# renderer's exports, byte for byte: libs/video/tests/test_shader_text_identity.c.
+# It compiles those two files itself, with PS3RECOMP_RSX_HAL defined, unless
+# the library already has them. Built on demand:
+#   cmake --build build --target test_shader_text_identity
+if(WIN32)
+    add_executable(test_shader_text_identity EXCLUDE_FROM_ALL
+        libs/video/tests/test_shader_text_identity.c
+        runtime/host/host_stubs.c
+    )
+    if(NOT PS3RECOMP_RSX_HAL)
+        target_sources(test_shader_text_identity PRIVATE
+            libs/video/rsxcore/rsxc_shader.c
+            libs/video/gpu/gpu_shader.c
+        )
+    endif()
+    target_compile_definitions(test_shader_text_identity PRIVATE
+        PS3RECOMP_RSX_HAL=1 _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(test_shader_text_identity PRIVATE ps3recomp_runtime dxguid d3dcompiler)
+    target_include_directories(test_shader_text_identity PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(test_shader_text_identity PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 # ---------------------------------------------------------------------------
 # PPU boot smoke title
 # ---------------------------------------------------------------------------

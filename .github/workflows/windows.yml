@@ -247,6 +247,17 @@ jobs:
           .\test_rsx_primitives.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # The portable renderer's shader texts (libs/video/rsxcore) and compile
+      # service (libs/video/gpu) against today's D3D12 renderer, byte for byte:
+      # a few thousand generated programs through both, and both filling a
+      # shader cache. It links the runtime library built above.
+      - name: Run the shader text identity test
+        run: |
+          cmake --build build --target test_shader_text_identity
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\build\test_shader_text_identity.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run condition semantics regressions
         run: |
           cmake -S tests/sync_stress -B build-sync -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
