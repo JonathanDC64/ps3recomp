@@ -322,13 +322,16 @@ static int blit_init(void)
         hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
                                                                (void**)&s_d3d.blit_pso);
     }
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = FRAME_COUNT * 2;   /* the frame and T (blit_srvs_write) */
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
-                                                        (void**)&s_d3d.blit_srv_heap);
+    if (SUCCEEDED(hr)) {   /* the GPU layer's table pool: frame fi's table at 2 fi (step C4) */
+        gpu_table_pool_desc pd;
+        memset(&pd, 0, sizeof pd);
+        pd.kind = GPU_TABLE_TEX;
+        pd.count = FRAME_COUNT * 2;   /* the frame and T (blit_srvs_write) */
+        pd.nregions = 1;
+        pd.region[0].first = 0; pd.region[0].tables = FRAME_COUNT; pd.region[0].size = 2;
+        s_rc_blit_pool = gpu_table_pool_create(s_rc_dev, &pd);
+        s_d3d.blit_srv_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_blit_pool);
+        if (!s_d3d.blit_srv_heap) hr = E_FAIL;
     }
     if (SUCCEEDED(hr)) blit_srvs_write();
     if (vb) vb->lpVtbl->Release(vb);
@@ -457,23 +460,27 @@ static int hdr_blit_ready(void)
 }
 
 /* The blit's descriptors: for each frame fi, the game's frame at 2 fi and T
- * or nothing at 2 fi + 1 (written by blit_to_window). */
+ * or nothing at 2 fi + 1 (written by blit_to_window). The frame's is the
+ * default view (today's NULL description); nothing is an empty RGBA16F
+ * entry. */
+static void blit_srv_none(gpu_view_desc* v)
+{
+    memset(v, 0, sizeof *v);
+    v->kind = GPU_VIEW_SRV;
+    v->dim = GPU_DIM_2D;
+    v->mips = 1;
+    v->format = GPU_FORMAT_R16G16B16A16_FLOAT;
+}
 static void blit_srvs_write(void)
 {
-    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
-    D3D12_SHADER_RESOURCE_VIEW_DESC none = {0};
-    none.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    none.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    none.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    none.Texture2D.MipLevels = 1;
+    gpu_view_desc fr, none;
+    blit_srv_none(&none);
+    memset(&fr, 0, sizeof fr);
+    fr.kind = GPU_VIEW_SRV;
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[i], NULL, h);
-        h.ptr += inc;
-        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &none, h);
-        h.ptr += inc;
+        fr.texture = s_rc_rt_tex[i];
+        gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, 2 * i, &fr);
+        gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, 2 * i + 1, &none);
     }
 }
 
@@ -527,22 +534,16 @@ static void blit_to_window(u32 fi)
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     int use_t = 0;
     if (hdr) {   /* T's highlights at 2 fi + 1, for this frame only */
-        D3D12_CPU_DESCRIPTOR_HANDLE h;
-        s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
-        h.ptr += (SIZE_T)(2 * fi + 1) * inc;
         const int t = s_hdr.frame_t;
+        gpu_view_desc v;
+        blit_srv_none(&v);
         if (t >= 0 && s_d3d.off_rt[t].res && s_d3d.off_rt[t].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
             off_rt_transition(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.off_rt[t].res, NULL, h);
+            memset(&v, 0, sizeof v);   /* the default view */
+            v.texture = s_d3d.off_rt[t].tex;
             use_t = 1;
-        } else {
-            D3D12_SHADER_RESOURCE_VIEW_DESC none = {0};
-            none.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            none.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            none.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            none.Texture2D.MipLevels = 1;
-            s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &none, h);
         }
+        gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, 2 * fi + 1, &v);
     }
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.blit_srv_heap);
     D3D12_GPU_DESCRIPTOR_HANDLE g;

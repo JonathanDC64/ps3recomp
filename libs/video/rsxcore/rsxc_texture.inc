@@ -304,44 +304,69 @@ static u32 tcj_sum(int i, u32 off, u32 nb)
  * A frame that needs more than the buffer holds puts the rest into one-off
  * buffers (released the next frame), and the next frame starts with the
  * buffer grown to what that frame used, up to TEX_STAGE_MAX_MB (default
- * 512). TEX_STAGE_MB sets the starting size (default 32). */
-static void off_rt_defer_release(ID3D12Resource* res);
-static ID3D12Resource* s_ts_buf;
+ * 512). TEX_STAGE_MB sets the starting size (default 32).
+ *
+ * The buffers are the GPU layer's upload buffers, mapped for their life
+ * (step C4). One that a frame stops using (a one-off buffer, or the buffer
+ * the next frame outgrew) is destroyed at the start of the frame after, once
+ * the GPU is idle: when today's off_rt_defer_release let it go. */
+static gpu_buffer      s_ts_buf;
 static u8*             s_ts_map;
 static u64             s_ts_cap, s_ts_off;
-static ID3D12Resource* tex_stage_create(u64 bytes, u8** map)
+static gpu_buffer*     s_ts_grave;   /* destroyed by the next tex_stage_frame */
+static int             s_ts_grave_n, s_ts_grave_cap;
+static gpu_buffer tex_stage_create(u64 bytes, u8** map)
 {
-    D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC bd = {0};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = bytes;
-    bd.Height = 1; bd.DepthOrArraySize = 1;
-    bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ID3D12Resource* r = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
-    if (FAILED(d3d_create_committed(s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
-                                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                                    &IID_ID3D12Resource, (void**)&r)))
-        return NULL;
-    if (FAILED(r->lpVtbl->Map(r, 0, &nr, &mp)) || !mp) { r->lpVtbl->Release(r); return NULL; }
-    *map = (u8*)mp;
-    return r;
+    gpu_buffer_desc bd;
+    memset(&bd, 0, sizeof bd);
+    bd.size = bytes;
+    bd.use = GPU_USE_COPY_SRC;
+    bd.memory = GPU_MEM_UPLOAD;
+    bd.state = GPU_STATE_GENERIC_READ;
+    gpu_buffer b = gpu_buffer_create(s_rc_dev, &bd);
+    if (!GPU_VALID(b)) return b;
+    *map = (u8*)gpu_buffer_map(s_rc_dev, b, 0, 0);
+    if (!*map) { gpu_buffer_destroy(s_rc_dev, b, 0); b.id = 0; }
+    return b;
+}
+static void tex_stage_drop(gpu_buffer b)
+{
+    if (s_ts_grave_n == s_ts_grave_cap) {
+        const int nc = s_ts_grave_cap ? s_ts_grave_cap * 2 : 64;
+        gpu_buffer* g = (gpu_buffer*)realloc(s_ts_grave, (size_t)nc * sizeof *g);
+        if (!g) { wait_for_gpu(); gpu_buffer_destroy(s_rc_dev, b, 0); return; }   /* best effort */
+        s_ts_grave = g; s_ts_grave_cap = nc;
+    }
+    s_ts_grave[s_ts_grave_n++] = b;
 }
 /* Space for `bytes` of decoded texture, 512-byte aligned (a placed
  * footprint's offset must be). NULL if no buffer could be had. */
-static u8* tex_stage_alloc(u64 bytes, ID3D12Resource** res, u64* at)
+static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
 {
     const u64 a = (s_ts_off + 511u) & ~511ull;
     s_ts_off = a + bytes;               /* counted either way: next frame's size */
-    if (s_ts_map && a + bytes <= s_ts_cap) { *res = s_ts_buf; *at = a; return s_ts_map + a; }
+    if (s_ts_map && a + bytes <= s_ts_cap) { *buf = s_ts_buf; *at = a; return s_ts_map + a; }
     u8* mp = NULL;
-    ID3D12Resource* r = tex_stage_create(bytes, &mp);
-    if (!r) return NULL;
-    off_rt_defer_release(r);            /* read by this frame's copy; gone next frame */
-    *res = r; *at = 0;
+    const gpu_buffer b = tex_stage_create(bytes, &mp);
+    if (!GPU_VALID(b)) return NULL;
+    tex_stage_drop(b);                  /* read by this frame's copy; gone next frame */
+    *buf = b; *at = 0;
+    return mp;
+}
+/* The same, the buffer as its resource, for the old code's copies (SMAA's
+ * lookup textures) until they move onto the GPU layer. */
+static u8* tex_stage_alloc(u64 bytes, ID3D12Resource** res, u64* at)
+{
+    gpu_buffer b;
+    u8* const mp = tex_stage_alloc_buf(bytes, &b, at);
+    if (mp) *res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, b.id);
     return mp;
 }
 /* Start of a frame's uploads; the GPU is idle. */
 static void tex_stage_frame(void)
 {
+    for (int i = 0; i < s_ts_grave_n; i++) gpu_buffer_destroy(s_rc_dev, s_ts_grave[i], 0);
+    s_ts_grave_n = 0;
     const u64 used = s_ts_off;
     s_ts_off = 0;
     static u64 limit = 0;
@@ -349,20 +374,20 @@ static void tex_stage_frame(void)
     u64 cap = s_ts_cap ? s_ts_cap : (u64)ps3_env_int("TEX_STAGE_MB", 32) << 20;
     while (cap < used + used / 4 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
-    if (s_ts_buf && cap <= s_ts_cap) return;
+    if (GPU_VALID(s_ts_buf) && cap <= s_ts_cap) return;
     u8* mp = NULL;
-    ID3D12Resource* r = tex_stage_create(cap, &mp);
-    if (!r) {
+    const gpu_buffer r = tex_stage_create(cap, &mp);
+    if (!GPU_VALID(r)) {
         static int warned = 0;
         if (!warned++) fprintf(stderr, "[TEXSTAGE] no %llu MB staging buffer; staying at %llu MB%c",
                                (unsigned long long)(cap >> 20), (unsigned long long)(s_ts_cap >> 20), 10);
         limit = s_ts_cap ? s_ts_cap : 1;
         return;
     }
-    if (s_ts_buf) {
+    if (GPU_VALID(s_ts_buf)) {
         fprintf(stderr, "[TEXSTAGE] a frame staged %llu MB of textures: buffer grown to %llu MB%c",
                 (unsigned long long)(used >> 20), (unsigned long long)(cap >> 20), 10);
-        off_rt_defer_release(s_ts_buf);
+        tex_stage_drop(s_ts_buf);
     }
     s_ts_buf = r; s_ts_map = mp; s_ts_cap = cap;
 }
@@ -372,16 +397,17 @@ static void tex_stage_frame(void)
  * memory is reused when the slot takes another texture. A committed
  * resource per texture cost ~0.24 ms to create; 67 new textures on one
  * Tutorial camera turn were 16 ms of a 38 ms frame. A texture over 64 MB
- * (or TEX_PLACED=0) is still committed. Heaps are never released. */
+ * (or TEX_PLACED=0) is still committed. Heaps are never released (the GPU
+ * layer's heaps, step C4: they go with the device). */
 #define TEX_POOL_CHUNK   (64ull << 20)
 #define TEX_POOL_MIN     (64ull << 10)
 #define TEX_POOL_CLASSES 11                  /* 64 KB << 0..10 = 64 MB */
-typedef struct { ID3D12Heap* heap; u64 off; } TexBlock;
+typedef struct { gpu_heap heap; u64 off; } TexBlock;
 static TexBlock*   s_tp_free[TEX_POOL_CLASSES];
 static int         s_tp_free_n[TEX_POOL_CLASSES], s_tp_free_cap[TEX_POOL_CLASSES];
-static ID3D12Heap* s_tp_chunk;
+static gpu_heap    s_tp_chunk;
 static u64         s_tp_chunk_off;
-static void tex_pool_put(int k, ID3D12Heap* heap, u64 off)
+static void tex_pool_put(int k, gpu_heap heap, u64 off)
 {
     if (s_tp_free_n[k] == s_tp_free_cap[k]) {
         const int nc = s_tp_free_cap[k] ? s_tp_free_cap[k] * 2 : 64;
@@ -394,7 +420,7 @@ static void tex_pool_put(int k, ID3D12Heap* heap, u64 off)
 }
 /* A block of class k: a freed one, or carved from the current heap. *reused
  * says the memory held another texture before. */
-static int tex_pool_get(int k, ID3D12Heap** heap, u64* off, int* reused)
+static int tex_pool_get(int k, gpu_heap* heap, u64* off, int* reused)
 {
     if (s_tp_free_n[k]) {
         const TexBlock b = s_tp_free[k][--s_tp_free_n[k]];
@@ -402,18 +428,18 @@ static int tex_pool_get(int k, ID3D12Heap** heap, u64* off, int* reused)
         return 1;
     }
     const u64 sz = TEX_POOL_MIN << k;
-    if (!s_tp_chunk || s_tp_chunk_off + sz > TEX_POOL_CHUNK) {
-        D3D12_HEAP_DESC hd = {0};
-        hd.SizeInBytes = TEX_POOL_CHUNK;
-        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;   /* any heap tier */
-        ID3D12Heap* nh = NULL;
-        if (FAILED(s_d3d.device->lpVtbl->CreateHeap(s_d3d.device, &hd, &IID_ID3D12Heap,
-                                                    (void**)&nh)))
+    if (!GPU_VALID(s_tp_chunk) || s_tp_chunk_off + sz > TEX_POOL_CHUNK) {
+        gpu_heap_desc hd;
+        memset(&hd, 0, sizeof hd);
+        hd.size = TEX_POOL_CHUNK;
+        hd.memory = GPU_MEM_GPU;
+        hd.flags = GPU_HEAP_SAMPLED_TEXTURES;   /* any heap tier */
+        const gpu_heap nh = gpu_heap_create(s_rc_dev, &hd);
+        if (!GPU_VALID(nh))
             return 0;
         /* The old heap's tail goes to the free lists. Blocks are carved in
          * any order, so align each piece to its own size. */
-        if (s_tp_chunk) {
+        if (GPU_VALID(s_tp_chunk)) {
             u64 o = s_tp_chunk_off;
             while (o + TEX_POOL_MIN <= TEX_POOL_CHUNK) {
                 int c = 0;
@@ -439,50 +465,55 @@ static int tex_pool_get(int k, ID3D12Heap** heap, u64* off, int* reused)
     s_tp_chunk_off += sz;
     return 1;
 }
-/* The slot's texture resource, in COPY_DEST. */
-static HRESULT tex_res_create(VPTexSlot* t, const D3D12_RESOURCE_DESC* td)
+/* The slot's texture, in COPY_DEST: the GPU layer's (step C4), t->res its
+ * resource, borrowed. 0 if it could not be made. */
+static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
 {
     static int placed = -1;
     PS3_KNOB(placed, ps3_env_int("TEX_PLACED", 1));
-    t->blk_heap = NULL; t->blk_class = -1;
+    t->blk.id = 0; t->blk_class = -1;
     if (placed) {
-        D3D12_RESOURCE_ALLOCATION_INFO ai;
-        s_d3d.device->lpVtbl->GetResourceAllocationInfo(s_d3d.device, &ai, 0, 1, td);
+        u64 size = 0, align = 0;
+        gpu_texture_size(s_rc_dev, td, &size, &align);
         int k = 0;
-        while (k < TEX_POOL_CLASSES && (TEX_POOL_MIN << k) < ai.SizeInBytes) k++;
-        ID3D12Heap* heap; u64 off; int reused;
-        if (ai.SizeInBytes != UINT64_MAX && ai.Alignment <= TEX_POOL_MIN &&
+        while (k < TEX_POOL_CLASSES && (TEX_POOL_MIN << k) < size) k++;
+        gpu_heap heap; u64 off; int reused;
+        if (size != UINT64_MAX && align <= TEX_POOL_MIN &&
             k < TEX_POOL_CLASSES && tex_pool_get(k, &heap, &off, &reused)) {
-            s_res_gen++;
-            if (SUCCEEDED(s_d3d.device->lpVtbl->CreatePlacedResource(
-                    s_d3d.device, heap, off, td, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                    &IID_ID3D12Resource, (void**)&t->res))) {
-                t->blk_heap = heap; t->blk_off = off; t->blk_class = k;
+            gpu_texture_desc pd = *td;
+            pd.heap = heap;
+            pd.heap_offset = off;
+            t->tex = gpu_texture_create(s_rc_dev, &pd);
+            if (GPU_VALID(t->tex)) {
+                t->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->tex.id);
+                t->blk = heap; t->blk_off = off; t->blk_class = k;
                 if (reused) {   /* the memory held another texture */
-                    D3D12_RESOURCE_BARRIER b = {0};
-                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
-                    b.Aliasing.pResourceAfter = t->res;
-                    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+                    gpu_barrier b;
+                    memset(&b, 0, sizeof b);
+                    b.type = GPU_BARRIER_ALIASING;
+                    b.texture = t->tex;
+                    gpu_cmd_barrier_n(s_rc_cmd, 1, &b);
                 }
-                return S_OK;
+                return 1;
             }
             tex_pool_put(k, heap, off);
         }
     }
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    return d3d_create_committed(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, td,
-                                D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                                &IID_ID3D12Resource, (void**)&t->res);
+    t->tex = gpu_texture_create(s_rc_dev, td);   /* committed */
+    t->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->tex.id);
+    return t->res != NULL;
 }
 /* Release the slot's texture; a placed one's block goes back to its list.
  * The GPU is idle (render_frame waits before the pre-pass), and a slot
- * that is replaced was not used this frame. */
+ * that is replaced was not used this frame, so it goes at once, as the
+ * Release did. */
 static void tex_res_release(VPTexSlot* t)
 {
     if (!t->res) return;
-    t->res->lpVtbl->Release(t->res); t->res = NULL;
-    if (t->blk_heap) tex_pool_put(t->blk_class, t->blk_heap, t->blk_off);
-    t->blk_heap = NULL; t->blk_class = -1;
+    gpu_texture_destroy(s_rc_dev, t->tex, 0);
+    t->tex.id = 0; t->res = NULL;
+    if (GPU_VALID(t->blk)) tex_pool_put(t->blk_class, t->blk, t->blk_off);
+    t->blk.id = 0; t->blk_class = -1;
 }
 
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
@@ -684,20 +715,21 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
         tex_res_release(t);
     if (!t->res) {
-        D3D12_RESOURCE_DESC td = {0};
-        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w; td.Height = h;
-        td.DepthOrArraySize = cube ? 6 : 1;   /* cube = 6 array slices */
-        td.MipLevels = 1;
-        td.Format = dxfmt; td.SampleDesc.Count = 1;
-        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        if (FAILED(tex_res_create(t, &td)))
+        gpu_texture_desc td;
+        memset(&td, 0, sizeof td);
+        td.width = w; td.height = h;
+        td.layers = cube ? 6 : 1;   /* cube = 6 array slices */
+        td.mips = 1;
+        td.format = (gpu_format)dxfmt; td.samples = 1;
+        td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
+        td.state = GPU_STATE_COPY_DEST;
+        if (!tex_res_create(t, &td))
             return -1;
         fresh = 1;
     }
 
-    ID3D12Resource* up = NULL; u64 up_at = 0;
-    void* mapped = tex_stage_alloc((u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1), &up, &up_at);
+    gpu_buffer up = {0}; u64 up_at = 0;
+    void* mapped = tex_stage_alloc_buf((u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1), &up, &up_at);
     if (!mapped) {
         /* A fresh resource has never been through the copy below, so it
          * would be left in COPY_DEST: drop it and try again next frame. */
@@ -1015,57 +1047,35 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
 
-    if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
-        D3D12_RESOURCE_BARRIER b = {0};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = t->res;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+    /* On the frame's recorder (step C4): the barriers, one copy per face,
+     * the barriers back. */
+    if (!fresh)     /* reused resource: PSR -> COPY_DEST first */
+        gpu_cmd_barrier(s_rc_cmd, t->tex, GPU_STATE_PIXEL_SHADER_RESOURCE, GPU_STATE_COPY_DEST);
+    gpu_footprint fp;
+    fp.format    = (gpu_format)dxfmt;
+    fp.width     = w;
+    fp.height    = h;
+    fp.depth     = 1;
+    fp.row_pitch = pitch;
+    for (u32 _f = 0; _f < _nfaces; _f++) {    /* cube face = array slice */
+        fp.offset = up_at + (u64)_f * pitch * _face_rows;
+        gpu_cmd_copy_buf_to_tex(s_rc_cmd, t->tex, _f, 0, 0, 0, up, &fp);
     }
-    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-    dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = up;     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint.Format   = dxfmt;
-    src.PlacedFootprint.Footprint.Width    = w;
-    src.PlacedFootprint.Footprint.Height   = h;
-    src.PlacedFootprint.Footprint.Depth    = 1;
-    src.PlacedFootprint.Footprint.RowPitch = pitch;
-    for (u32 _f = 0; _f < _nfaces; _f++) {
-        dst.SubresourceIndex        = _f;      /* cube face = array slice */
-        src.PlacedFootprint.Offset  = up_at + (u64)_f * pitch * _face_rows;
-        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
-    }
-    {
-        D3D12_RESOURCE_BARRIER b = {0};
-        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = t->res;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
-    }
+    gpu_cmd_barrier(s_rc_cmd, t->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
     /* SRV at heap slot VP_TEX_SRV_BASE+slot */
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-    sv.Format = dxfmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    gpu_view_desc sv;
+    memset(&sv, 0, sizeof sv);
+    sv.texture = t->tex;
+    sv.kind = GPU_VIEW_SRV;
+    sv.dim = cube ? GPU_DIM_CUBE : GPU_DIM_2D;   /* a cube must match the TextureCube declaration in the HLSL */
+    sv.mips = 1;
+    sv.format = (gpu_format)dxfmt;
     /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
      * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
      * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
      * keeps the identity mapping. */
-    sv.Shader4ComponentMapping = (basef == 0x81) ? 0x1000 : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE sh;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-    sh.ptr += (u64)(VP_TEX_SRV_BASE + slot) * s_d3d.srv_inc;
-    if (cube) {
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
-    }
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
+    sv.swizzle = (basef == 0x81) ? 0x1000 : GPU_SWIZZLE_IDENTITY;
+    gpu_table_write_tex(s_rc_dev, s_rc_srv_pool, VP_TEX_SRV_BASE + (u32)slot, &sv);
 
     if (t->key != key_off || t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)
         s_vp_tex_index_dirty = 1;

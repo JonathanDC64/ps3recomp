@@ -119,7 +119,6 @@ static void rc_backend_shutdown(void)
     if (s_of.pso) s_of.pso->lpVtbl->Release(s_of.pso);
     if (s_of.rs) s_of.rs->lpVtbl->Release(s_of.rs);
     memset(&s_of, 0, sizeof s_of);
-    if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
     if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
@@ -140,6 +139,12 @@ static void rc_backend_shutdown(void)
     }
     s_rc_cmd = NULL;
     s_rc_swap.id = 0;
+    /* Step C4: the shader-visible heaps are the table pools', borrowed too;
+     * the pools, the texture slots, the staging buffers, the pool's heaps and
+     * the adopted textures' handles go with the device. */
+    s_d3d.srv_heap = s_d3d.samp_heap = s_d3d.blit_srv_heap = NULL;
+    s_down_srv = NULL;
+    s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
     if (s_rc_dev) gpu_destroy(s_rc_dev);
     s_rc_dev = NULL;
 

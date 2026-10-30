@@ -1782,4 +1782,32 @@ uint64_t gpu_d3d12_layout_hash(gpu_device* d, gpu_layout layout)
     return gpu_d3d12_slot_valid(&dd->layout_slots, layout.id) ? dd->layout_hash[GPU_HANDLE_INDEX(layout.id)] : 0;
 }
 
+/* ---- step C4 ---- */
+
+gpu_texture gpu_d3d12_adopt_texture_of(gpu_device* d, ID3D12Resource* res)
+{
+    D3D12_RESOURCE_DESC rd;
+    gpu_texture_desc td;
+    if (!res) return (gpu_texture){0};
+    res->lpVtbl->GetDesc(res, &rd);
+    memset(&td, 0, sizeof td);
+    td.width = (uint32_t)rd.Width;
+    td.height = rd.Height;
+    td.layers = rd.DepthOrArraySize;
+    td.mips = rd.MipLevels;
+    td.format = (gpu_format)rd.Format;
+    td.samples = rd.SampleDesc.Count;
+    td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+    if (!(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) td.use |= GPU_USE_SAMPLED;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) td.use |= GPU_USE_RT;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) td.use |= GPU_USE_DS;
+    return gpu_d3d12_adopt_texture(d, res, &td);
+}
+
+ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    return gpu_d3d12_slot_valid(&dd->tpool_slots, pool.id) ? dd->tpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
+}
+
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */

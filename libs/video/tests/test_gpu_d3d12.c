@@ -1407,6 +1407,53 @@ static void test_bridges(const scene* s)
     }
 }
 
+/* ---- step C4 ---- */
+/* gpu_d3d12_adopt_texture_of (the description from the resource) and
+ * gpu_d3d12_table_pool_heap (a pool's heap, borrowed). */
+static void test_bridges_c4(const scene* s)
+{
+    {
+        D3D12_RESOURCE_DESC rd;
+        memset(&rd, 0, sizeof rd);
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = 16; rd.Height = 8; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* r = native_committed(&rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        CHECK(r != NULL);
+        const gpu_texture t = gpu_d3d12_adopt_texture_of(g_d, r);
+        CHECK(GPU_VALID(t) && gpu_native(g_d, GPU_NATIVE_TEXTURE, t.id) == r);
+        CHECK(!GPU_VALID(gpu_d3d12_adopt_texture_of(g_d, NULL)));
+        if (GPU_VALID(t)) {
+            const gpu_d3d12_tex* x = &g_dd->tex[GPU_HANDLE_INDEX(t.id)];
+            CHECK(x->width == 16 && x->height == 8 && x->layers == 1 && x->mips == 1 && x->samples == 1 &&
+                  x->format == GPU_FORMAT_R16G16B16A16_FLOAT &&
+                  x->use == (GPU_USE_SAMPLED | GPU_USE_RT | GPU_USE_COPY_SRC | GPU_USE_COPY_DST));
+            const gpu_texture_desc td = tex_desc(16, 8, GPU_FORMAT_R16G16B16A16_FLOAT,
+                                                 GPU_USE_SAMPLED | GPU_USE_RT | GPU_USE_COPY_SRC |
+                                                 GPU_USE_COPY_DST, GPU_STATE_COPY_DEST);
+            if (r) r->lpVtbl->Release(r);
+            tex_roundtrip_on("adopted from its description", t, &td, 0);
+            gpu_texture_destroy(g_d, t, 0);
+        } else if (r) {
+            r->lpVtbl->Release(r);
+        }
+    }
+    {
+        ID3D12DescriptorHeap* h = gpu_d3d12_table_pool_heap(g_d, s->tex_pool);
+        CHECK(h != NULL);
+        if (h) {
+            D3D12_GPU_DESCRIPTOR_HANDLE g;
+            h->lpVtbl->GetGPUDescriptorHandleForHeapStart(h, &g);
+            CHECK(gpu_d3d12_wrap_table(g).v == gpu_table_ref(g_d, s->tex_pool, 0).v);
+        }
+        CHECK(gpu_d3d12_table_pool_heap(g_d, s->samp_pool) != NULL &&
+              gpu_d3d12_table_pool_heap(g_d, s->samp_pool) != h);
+        const gpu_table_pool none = {0};
+        CHECK(gpu_d3d12_table_pool_heap(g_d, none) == NULL);
+    }
+}
+
 /* GPU_DEVICE_BREADCRUMBS (DRED, not the debug layer): its feature bits, a
  * marker, and, on WARP only, a device removed on purpose (as today's
  * RSX_LOSE_DEVICE_AT_FRAME removes it): lost, its fence passing every value,
@@ -1473,6 +1520,7 @@ int main(void)
         test_draw(&s);
         test_memo(&s);
         test_bridges(&s);
+        test_bridges_c4(&s);
     }
     test_caches();
     test_fences();

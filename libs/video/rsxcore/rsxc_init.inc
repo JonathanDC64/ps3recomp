@@ -55,6 +55,7 @@ static int display_targets_make(void)
             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL,
             &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
         if (FAILED(hr)) return -1;
+        rc_tex_set(&s_rc_rt_tex[i], s_d3d.render_targets[i]);   /* step C4: the blit's SRVs */
 
         s_d3d.device->lpVtbl->CreateRenderTargetView(
             s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
@@ -481,30 +482,26 @@ static int init_d3d12(u32 width, u32 height)
          * 5-20 = offscreen render targets (render-to-texture), rest spare.
          * All slots start as null SRVs so any 4-wide table window (the
          * root signature binds t0-t3) is valid on tier-1 hardware. */
+        /* The GPU layer's table pool, its entries made as these R8_UNORM
+         * null SRVs (step C4). The regions name its tables for Vulkan: the
+         * per-draw windows, the AA source (AA_SRV_SLOT, rsxc_post.inc) and
+         * SMAA's two 3-wide windows (SMAA_SRV_SLOT + 0 and + 2). */
         {
-            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-            hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd.NumDescriptors = SRV_HEAP_SIZE;
-            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
-                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.srv_heap);
-            if (FAILED(hr)) printf("[D3D12] SRV heap creation failed (0x%08lX)\n", hr);
-            else {
+            gpu_table_pool_desc pd;
+            memset(&pd, 0, sizeof pd);
+            pd.kind = GPU_TABLE_TEX;
+            pd.count = SRV_HEAP_SIZE;
+            pd.nregions = 4;
+            pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
+            pd.region[1].first = 21; pd.region[1].tables = 1; pd.region[1].size = 1;
+            pd.region[2].first = 22; pd.region[2].tables = 1; pd.region[2].size = 3;
+            pd.region[3].first = 24; pd.region[3].tables = 1; pd.region[3].size = 3;
+            s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
+            s_d3d.srv_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_srv_pool);
+            if (!s_d3d.srv_heap) printf("[D3D12] SRV heap creation failed\n");
+            else
                 s_d3d.srv_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
                     s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-                D3D12_SHADER_RESOURCE_VIEW_DESC nv = {0};
-                nv.Format = DXGI_FORMAT_R8_UNORM;
-                nv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                nv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                nv.Texture2D.MipLevels = 1;
-                D3D12_CPU_DESCRIPTOR_HANDLE hh;
-                s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &hh);
-                for (int _i = 0; _i < SRV_HEAP_SIZE; _i++) {
-                    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &nv, hh);
-                    hh.ptr += s_d3d.srv_inc;
-                }
-                s_res_gen++;   /* a new heap: forget srv_write_ex's memo */
-            }
         }
 
         /* RTV heap for offscreen render targets (CPU-visible only). */
@@ -593,12 +590,16 @@ static int init_d3d12(u32 width, u32 height)
         rp[3].DescriptorTable.pDescriptorRanges = &samp_range;
         rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
         {
-            D3D12_DESCRIPTOR_HEAP_DESC sh = {0};
-            sh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-            sh.NumDescriptors = VP_SAMP_TABLES * RSX_FP_UNITS;
-            sh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-            if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &sh,
-                    &IID_ID3D12DescriptorHeap, (void**)&s_d3d.samp_heap)))
+            /* The GPU layer's table pool: table t at t*16 (step C4). */
+            gpu_table_pool_desc sh;
+            memset(&sh, 0, sizeof sh);
+            sh.kind = GPU_TABLE_SAMPLER;
+            sh.count = VP_SAMP_TABLES * RSX_FP_UNITS;
+            sh.nregions = 1;
+            sh.region[0].first = 0; sh.region[0].tables = VP_SAMP_TABLES; sh.region[0].size = RSX_FP_UNITS;
+            s_rc_samp_pool = gpu_table_pool_create(s_rc_dev, &sh);
+            s_d3d.samp_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_samp_pool);
+            if (!s_d3d.samp_heap)
                 printf("[D3D12] sampler heap creation failed\n");
             s_d3d.samp_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
                 s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);

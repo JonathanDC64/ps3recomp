@@ -139,6 +139,7 @@ typedef struct {
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
 typedef struct {
     ID3D12Resource*       res;
+    gpu_texture           tex;         /* res, adopted (step C4): the SRV writes' handle */
     ID3D12Resource*       up;          /* init-upload staging (kept alive) */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
@@ -152,6 +153,7 @@ typedef struct {
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
     ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
+    gpu_texture           snap_tex;    /* snap, adopted (step C4) */
     u32                   snap_w, snap_h, snap_dxgi;
     D3D12_RESOURCE_STATES snap_st;
     ID3D12Resource*       down;        /* guest-size copy of a scaled target (write-back) */
@@ -204,11 +206,13 @@ static u32 s_rf_serial = 0;
  * memory). SRV lives at heap index VP_TEX_SRV_BASE+slot. */
 typedef struct {
     ID3D12Resource* res;
+    gpu_texture tex;    /* the GPU layer's texture; res is its resource, borrowed (step C4) */
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
     u32 face_bytes;     /* guest bytes from one cube face to the next */
     ID3D12Heap* blk_heap; /* res is placed here (tex_pool), at blk_off; NULL = committed */
+    gpu_heap blk;       /* blk_heap's place on the GPU layer, which tex_pool uses; blk_heap is unused (step C4) */
     u64 blk_off;
     int blk_class;
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
@@ -532,7 +536,9 @@ static ID3D12Resource* s_screen_copy = NULL;
  * binding themselves are confirmed working -- SUBVP_DBG shows the 512x512 and
  * 256x256 regions captured and handed to fp 0x5DB81/0x5EA81/0x5EF81/0x5E381. */
 #define SUBVP_SLOTS 4
-static struct { ID3D12Resource* res; u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
+static struct { ID3D12Resource* res;
+                gpu_texture tex;   /* res, adopted (step C4) */
+                u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
 static int s_subvp_n = 0;
 
 static void subvp_note(u32 x, u32 y, u32 w, u32 h)
@@ -571,6 +577,7 @@ static void subvp_capture(u32 fi)
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
                     &IID_ID3D12Resource, (void**)&s_subvp[i].res)))
                 { s_subvp[i].res = NULL; continue; }
+            s_subvp[i].tex = gpu_d3d12_adopt_texture_of(s_rc_dev, s_subvp[i].res);   /* step C4 */
         }
         D3D12_RESOURCE_BARRIER bb[2] = {0};
         bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -651,4 +658,38 @@ static int   s_lock_valid = 0;
  * magnification walks the target off-screen entirely. */
 static double s_lock_sx = 0.0, s_lock_sy = 0.0;
 static u32    s_lock_n  = 0;
+
+/* Step C4: the shader-visible descriptor heaps are the GPU layer's table
+ * pools, and every SRV and sampler write goes through them, the memo
+ * included (gpu_table_write_tex; per draw gpu_fast_table_write_tex). The
+ * heap pointers (s_d3d.srv_heap, samp_heap, blit_srv_heap, writeback's
+ * s_down_srv) are the pools' heaps, borrowed (gpu_d3d12_table_pool_heap),
+ * for the binding commands not converted yet. Every resource an SRV names
+ * has a handle beside its pointer: a texture slot's is its own
+ * (VPTexSlot.tex), the others are adopted where they are made (rc_tex_set)
+ * and dropped where they are released (rc_tex_drop), so no write looks a
+ * handle up. */
+static gpu_table_pool s_rc_srv_pool;    /* s_d3d.srv_heap */
+static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
+static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
+static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
+static gpu_texture    s_rc_rt_tex[FRAME_COUNT];   /* s_d3d.render_targets, adopted */
+static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy, adopted */
+static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
+
+/* res, just made by the old code, as *t (a handle *t held goes first). */
+static void rc_tex_set(gpu_texture* t, ID3D12Resource* res)
+{
+    if (GPU_VALID(*t)) gpu_texture_destroy(s_rc_dev, *t, 0);
+    *t = gpu_d3d12_adopt_texture_of(s_rc_dev, res);
+}
+
+/* The old code released, or put off releasing, the resource behind *t: the
+ * handle and its reference go now, and the old code's own reference keeps
+ * the resource until that release. */
+static void rc_tex_drop(gpu_texture* t)
+{
+    if (GPU_VALID(*t)) gpu_texture_destroy(s_rc_dev, *t, 0);
+    t->id = 0;
+}
 

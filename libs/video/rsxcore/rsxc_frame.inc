@@ -432,7 +432,7 @@ rtt_dump_done:;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
             if (!(_used & (1u << _u))) {
-                srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
                           D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 continue;
             }
@@ -451,7 +451,7 @@ rtt_dump_done:;
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
                     dr->d2c_mask |= 1u << _u;
-                    srv_write(wslot, s_zeta[zs].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                    srv_write(wslot, s_zeta[zs].tex, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
@@ -462,10 +462,10 @@ rtt_dump_done:;
                 int zs = zeta_find(dr->tex[_u].raw);
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
-                    srv_write(wslot, s_zeta[zs].res, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                    srv_write(wslot, s_zeta[zs].tex, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 } else
-                    srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 continue;
             }
@@ -488,7 +488,7 @@ rtt_dump_done:;
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
                                         " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
                                 dr->tex[_u].w, dr->tex[_u].h, 10); }
-                    srv_write(wslot, s_screen_copy, DXGI_FORMAT_R8G8B8A8_UNORM,
+                    srv_write(wslot, s_rc_screen_copy_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
@@ -509,7 +509,7 @@ rtt_dump_done:;
                         { static int _n = 0; if (getenv("SUBVP_DBG") && _n < 8 && ++_n)
                             fprintf(stderr, "[SUBVP] unit %d fp=0x%X <- captured %ux%u%c",
                                     _u, dr->fp_addr, dr->tex[_u].w, dr->tex[_u].h, 10); }
-                        srv_write(wslot, s_subvp[hit].res, DXGI_FORMAT_R8G8B8A8_UNORM,
+                        srv_write(wslot, s_subvp[hit].tex, DXGI_FORMAT_R8G8B8A8_UNORM,
                                   D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                         continue;
                     }
@@ -519,7 +519,7 @@ rtt_dump_done:;
                 int rt = off_rt_find(dr->tex[_u].raw);
                 if (rt >= 0) {
                     dr->tex_rt[_u] = rt;
-                    srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
+                    srv_write(wslot, s_d3d.off_rt[rt].tex, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
@@ -544,7 +544,7 @@ rtt_dump_done:;
                          * ones are viewed as stored, like an offscreen RT. */
                         const int _x8 = _tl.fmt == RSX_TEXFMT_R8G8B8A8 ||
                                         _tl.fmt == RSX_TEXFMT_R8G8 || _tl.compressed;
-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].res, rsx_texfmt_dxgi(_tl.fmt),
+                        srv_write_ex(wslot, s_d3d.vp_tex[ts].tex, rsx_texfmt_dxgi(_tl.fmt),
                                   (_bf == 0x81) ? 0x1000
                                   : _x8 ? rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf)
                                         : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
@@ -562,7 +562,7 @@ rtt_dump_done:;
                 fprintf(stderr, "[TEXBIND] null SRV unit=%d raw=0x%X off=0x%X %ux%u fmt=0x%02X%c",
                         _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
                         dr->tex[_u].h, dr->tex[_u].fmt, 10); } }
-            srv_write(wslot, NULL, DXGI_FORMAT_R8G8B8A8_UNORM,
+            srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
@@ -1105,7 +1105,7 @@ rtt_dump_done:;
                         if (tz == cur_z && cur_zro)   /* bound read-only: readable */
                             ;
                         else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
-                            srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, NULL,
+                            srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, k_rc_no_tex,
                                       DXGI_FORMAT_R8G8B8A8_UNORM,
                                       D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                             fpwatch_unreadable(dr->fp_addr);
@@ -1123,7 +1123,8 @@ rtt_dump_done:;
                     }
                     /* Sampling a bound colour target: read a copy (above). */
                     ID3D12Resource* snap = off_rt_snapshot(rt);
-                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, snap,
+                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u,
+                              snap ? s_d3d.off_rt[rt].snap_tex : k_rc_no_tex,
                               (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 }
