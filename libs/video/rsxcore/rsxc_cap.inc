@@ -97,48 +97,33 @@ static void cap_write_raw(const char* path, const void* mapped, u32 w, u32 h, u3
            100.0 * (double)over / ((double)w * h));
 }
 
-static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
+/* (Step C6: tex is the GPU layer's handle of the resource; the readback
+ * buffer is gpu_buffer_create's, today's committed READBACK buffer in
+ * COPY_DEST, and the barriers and the copy are on the recorder begun here.) */
+static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
                                D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
 {
-    if (!res || !w || !h) return;
+    if (!GPU_VALID(tex) || !w || !h) return;
     u32 bpp = (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
               (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
     u32 pitch = (w * bpp + 255) & ~255u;
 
-    ID3D12Resource* rb = NULL;
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rd = {0};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = (u64)pitch * h; rd.Height = 1; rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(d3d_create_committed(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&rb)) || !rb)
+    gpu_buffer rb = {0};
+    ID3D12Resource* rb_res = NULL;   /* (borrowed; only tested) */
+    if (!rc_buf_make((u64)pitch * h, 0, GPU_MEM_READBACK, &rb, &rb_res, NULL))
         return;
 
     wait_for_gpu();
     frame_cmd_begin(fi);
 
-    D3D12_RESOURCE_BARRIER b = {0};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = res;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-        b.Transition.StateBefore = prior;
-        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
-    }
+    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE)
+        gpu_cmd_barrier(s_rc_cmd, tex, (gpu_state)prior, GPU_STATE_COPY_SOURCE);
 
-    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-    dst.pResource = rb; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Footprint.Format = (DXGI_FORMAT)dxgi;
-    dst.PlacedFootprint.Footprint.Width = w; dst.PlacedFootprint.Footprint.Height = h;
-    dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
-    src.pResource = res; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+    gpu_footprint fp;
+    memset(&fp, 0, sizeof fp);
+    fp.format = (gpu_format)dxgi;
+    fp.width = w; fp.height = h; fp.depth = 1; fp.row_pitch = pitch;
+    gpu_cmd_copy_tex_to_buf(s_rc_cmd, rb, &fp, tex, 0, NULL);
         /* TEXUP_DBG=1: texture uploads per second. A cache that misses every
          * draw re-uploads megabytes per frame, which is the kind of GPU work
          * that trips a 2-second TDR while looking like nothing in a draw count. */
@@ -152,23 +137,19 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
                           n, bytes / 1048576.0);
                   n = 0; bytes = 0; t0 = now; } } }
 
-    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter  = prior;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
-    }
+    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE)
+        gpu_cmd_barrier(s_rc_cmd, tex, GPU_STATE_COPY_SOURCE, (gpu_state)prior);
 
     frame_cmd_submit();
     wait_for_gpu();
 
-    void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};
-    if (SUCCEEDED(rb->lpVtbl->Map(rb, 0, &rr, &mp)) && mp) {
+    void* mp = gpu_buffer_map(s_rc_dev, rb, 0, (u64)pitch * h);   /* Map(0, {0, n}) */
+    if (mp) {
         if (s_cap_raw) cap_write_raw(path, mp, w, h, pitch);
         else cap_write_bmp(path, mp, w, h, pitch, dxgi);
-        D3D12_RANGE wr = {0, 0};
-        rb->lpVtbl->Unmap(rb, 0, &wr);
+        gpu_buffer_unmap(s_rc_dev, rb, 0, 0);   /* Unmap(0, {0, 0}) */
     }
-    rb->lpVtbl->Release(rb);
+    gpu_buffer_destroy(s_rc_dev, rb, 0);   /* the GPU is idle */
 }
 
 static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
@@ -253,15 +234,16 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         fclose(mf);
     }
 
-    /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT. */
+    /* Backbuffer (in PRESENT state at capture time) + every used offscreen RT.
+     * (Step C6: their handles, s_rc_rt_tex[fi] and r->tex.) */
     snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
-    cap_readback_write(s_d3d.render_targets[fi], s_d3d.host_w, s_d3d.host_h,
+    cap_readback_write(s_rc_rt_tex[fi], s_d3d.host_w, s_d3d.host_h,
                        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!r->res || !r->used) continue;
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
-        cap_readback_write(r->res, r->hw, r->hh, r->dxgi, r->st, fi, path);
+        cap_readback_write(r->tex, r->hw, r->hh, r->dxgi, r->st, fi, path);
     }
     printf("[RSXCAP] frame %llu -> %s (%u ops)\n",
            (unsigned long long)s_d3d.frame_count, dir, ndraws);
@@ -389,22 +371,9 @@ static void compile_vp(void)
     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
     else {
         printf("[VP] PSO creation FAIL (0x%08lX)\n", hr);
-        /* Drain the debug layer's message queue to get the EXACT validation
-         * reason (E_INVALIDARG is otherwise opaque). One-shot. */
-        ID3D12InfoQueue* iq = NULL;
-        if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
-                s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
-            UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
-            for (UINT64 mi = 0; mi < n; mi++) {
-                SIZE_T len = 0;
-                iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
-                D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
-                if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len)))
-                    printf("[VP][DBG] %s\n", m->pDescription);
-                free(m);
-            }
-            iq->lpVtbl->Release(iq);
-        }
+        /* (Today's drain of the debug layer's message queue is not copied
+         * (step C6; call map G16): the debug layer is never on here, so the
+         * device has no info queue and it printed nothing.) */
     }
 }
 

@@ -631,3 +631,52 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   gpu_fast_table_write_tex reads the description's fields and the entry's
 #   20 bytes as three words (no copy of the description on the stack but for
 #   a write); its D3D12 calls are unchanged.
+
+# Step C6: the passes that run a few times a frame on the GPU layer: the
+# blit to the window (the output filter's and the HDR blit's pipelines
+# included), the repaint hold, FXAA and SMAA, and the captures' readbacks.
+# The regions below are no longer verbatim at these legacy lines: a fix there
+# needs a hand port. Every command in them is a gpu_cmd_* on s_rc_cmd
+# (barrier, barrier_n, copy_texture_whole, copy_buf_to_tex, copy_tex_to_buf,
+# pass_begin with the targets' views, clear_color, set_layout, set_pipeline,
+# set_table_pools, bind_table with gpu_table_ref, push_const, viewport,
+# scissor, topology, draw). The textures made here (the hold, the AA display
+# copy, SMAA's lookup textures and its edges and weights targets) are
+# gpu_texture_create's with today's descriptions, states and clear values,
+# and their ID3D12Resource* fields borrow them (gpu_native); the SMAA
+# targets' RTVs are gpu_view_get's (no RTV heap). A target dropped while a
+# frame is recorded goes into step C5a's grave (rc_grave_tex), where today's
+# off_rt_defer_release put it; the hold is destroyed at once, as it was
+# Released. The pipelines are bound by their pointers' handles (rc_pipe) and
+# the layouts by the handles step C3b keeps beside the root signatures.
+#  rsxc_state.inc: rc_pipe, new at the end (after 796).
+#  rsxc_hdr.inc: swap_buffers_get 1745-1753 (the images by index are
+#   gpu_swap_image's); blit_to_window 2048-2140; s_hold 2145 (s_hold_tex
+#   beside it); hold_copy 2160-2207 (hold_barriers, new before it).
+#  rsxc_cap.inc: cap_readback_write 3628-3703 takes a gpu_texture; its
+#   readback buffer is rc_buf_make's (READBACK, COPY_DEST), read with
+#   gpu_buffer_map and gpu_buffer_unmap (today's Map(0, {0, n}), Unmap(0,
+#   {0, 0})), destroyed at once after the wait; rsx_capture_frame 3787-3796
+#   (the handles); compile_vp 3930-3945: the drain of the debug layer's
+#   message queue is not copied (call map G16: with the debug layer never on
+#   there is no info queue, so it printed nothing).
+#  rsxc_post.inc: s_aa 10590 (disp_tex is the copy's own handle); aa_draw
+#   10692-10717 (aa_target, new before it); s_smaa 10732-10745 (edges_rtv and
+#   weights_rtv in place of the RTV heap); smaa_rtv 10747-10754 (gone);
+#   smaa_state 10756-10767; smaa_ready 10851-10867 (no RTV heap; the lookup
+#   textures); smaa_luts_load 10883-10922 (tex_stage_alloc_buf, step C4's
+#   note); smaa_targets 10924-10952; smaa_draw 10954-10999; aa_filter
+#   11013-11017; aa_run_rt 11019-11033 (the target's view); aa_run_display
+#   11035-11082 (no rtv argument: the display target's view).
+#  rsxc_frame.inc: 12711 (aa_run_display(fi)) and 12954 (the HDR snap reads
+#   s_rc_swap_image[fi]).
+#  rsxc_api.inc: rc_backend_shutdown 15866-15875 (the AA display copy and the
+#   hold go with gpu_destroy; their borrowed pointers are cleared first);
+#   rc_overlay_tick 16106 and 16119-16134 (hold_barriers and the copy).
+#  Not converted, and why: rsxc_present.inc has no command left
+#   (dump_backbuffer_bmp's copy and barriers are rsxc_frame.inc's); the HDR
+#   display queries (rsxc_hdr.inc 1668-1715, call map G14) stay core as they
+#   are; rsxc_diag.inc's rsx_scale_apply releases s_subvp natively, as
+#   subvp_capture (rsxc_state.inc 704-715) still makes it; the menu renderer
+#   still gets the device, the queue and the swap chain's buffers as native
+#   objects (rc_device, rc_queue, rc_back_buffer, the overlay's frame).

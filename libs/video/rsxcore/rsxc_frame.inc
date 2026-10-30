@@ -1497,7 +1497,7 @@ skip_dump_consider: ;
             printf("[AA] %s on the finished frame, HUD included (RSX_AA_AT=present)\n",
                    aa_mode() == 2 ? "SMAA" : "FXAA");
         s_aa.present_logged = aa_mode();
-        aa_run_display(fi, rtv_handle);
+        aa_run_display(fi);
     }
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
@@ -1699,7 +1699,7 @@ skip_dump_consider: ;
       if (e && *e && strcmp(e, last) && s_present_this_frame && s_hdr.active) {
           snprintf(last, sizeof last, "%s", e);
           s_cap_raw = 1;
-          cap_readback_write(s_d3d.swap_buffers[fi], s_d3d.win_w, s_d3d.win_h, DXGI_FORMAT_R16G16B16A16_FLOAT,
+          cap_readback_write(s_rc_swap_image[fi], s_d3d.win_w, s_d3d.win_h, DXGI_FORMAT_R16G16B16A16_FLOAT,
                              D3D12_RESOURCE_STATE_PRESENT, fi, e);
           s_cap_raw = 0;
       } }

@@ -807,3 +807,16 @@ static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format fo
     return v;
 }
 
+/* Step C6: the passes that run a few times a frame (the output filter, the
+ * blit to the window, the HDR blit, the repaint hold, FXAA and SMAA, the
+ * captures' readbacks) record on the GPU layer, on the frame's recorder
+ * (s_rc_cmd). Their pipeline fields still hold the ID3D12PipelineState*
+ * (step C3b), and a pipeline's handle is that pointer: rc_pipe gives it with
+ * no lookup. */
+static gpu_pipeline rc_pipe(ID3D12PipelineState* pso)
+{
+    gpu_pipeline p;
+    p.v = (u64)(uintptr_t)pso;
+    return p;
+}
+
