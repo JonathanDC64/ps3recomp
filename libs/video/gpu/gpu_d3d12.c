@@ -1647,6 +1647,7 @@ static void* d12_native(gpu_device* d, uint32_t kind, uint64_t handle)
     case GPU_NATIVE_TEXTURE:  return gpu_d3d12_slot_valid(&dd->tex_slots, id) ? dd->tex_res[i] : NULL;
     case GPU_NATIVE_LAYOUT:   return gpu_d3d12_slot_valid(&dd->layout_slots, id) ? dd->layout_rs[i] : NULL;
     case GPU_NATIVE_SWAPCHAIN: return gpu_d3d12_slot_valid(&dd->swap_slots, id) ? dd->swap[i].sc : NULL;
+    case GPU_NATIVE_PIPELINE: return (void*)(uintptr_t)handle;   /* (the handle is the pointer) */
     default:                  return NULL;
     }
 }

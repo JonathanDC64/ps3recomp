@@ -16,8 +16,9 @@
  *   - the table memo, sampler and view caching, fences and a wait's timeout;
  *   - root signatures and pipeline descriptions against today's, byte for
  *     byte (its recipes are copied here: rsx_d3d12_backend.c);
- *   - the pipeline cache across two devices, a swap chain on a hidden
- *     window, and the conversion's bridges (gpu_d3d12_bridge.h);
+ *   - the pipeline cache across two devices, pipelines made only for it
+ *     (GPU_PIPELINE_STORE_ONLY) and a device without one, a swap chain on a
+ *     hidden window, and the conversion's bridges (gpu_d3d12_bridge.h);
  *   - DRED (GPU_DEVICE_BREADCRUMBS) and, on WARP, a device lost on purpose.
  */
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
@@ -847,8 +848,8 @@ static int scene_make(scene* s)
     if (!GPU_VALID(s->vs) || !GPU_VALID(s->ps)) return 0;
     draw_desc(&s->desc, s->layout, s->vs, s->ps);
     uint32_t cached = 7;
-    s->pso = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(s->pso.v != 0 && cached == 0);
+    s->pso = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    CHECK(s->pso.v != 0 && cached == GPU_PIPELINE_COMPILED);   /* no library yet */
 
     gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
                                    GPU_STATE_RENDER_TARGET);
@@ -1020,8 +1021,8 @@ static void test_draw(scene* s)
     /* The same description again: the pipeline is the library's when the
      * device has one (none until gpu_pipeline_cache_load). */
     uint32_t cached = 7;
-    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(again.v != 0 && cached == 0);
+    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    CHECK(again.v != 0 && cached == GPU_PIPELINE_COMPILED);
 }
 
 /* ---- The memo, caches, fences ---- */
@@ -1155,27 +1156,68 @@ static void test_pipeline_cache(void)
         CHECK(d != NULL);
         if (!d) break;
         const int loaded = gpu_pipeline_cache_load(d, path);
-        CHECK(loaded == run_no);   /* none the first time, the first device's the second */
-        if (!GPU_D3D12_DEV(d)->lib) {
+        if (loaded == GPU_PIPELINE_CACHE_NONE) {
+            CHECK(GPU_D3D12_DEV(d)->lib == NULL);
             printf("  pipeline cache: skipped (no pipeline library on this device)\n");
             gpu_destroy(d);
             break;
         }
+        /* none the first time, the first device's the second */
+        CHECK(loaded == (run_no ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW));
+        CHECK(GPU_D3D12_DEV(d)->lib != NULL);
         /* The layout and shaders made again on each device: the name is their
          * content's, not their handles'. */
         const gpu_layout l = guest_layout(d);
         const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
         const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
-        gpu_pipeline_desc pd;
+        gpu_pipeline_desc pd, pd2;
         draw_desc(&pd, l, vs, ps);
+        pd2 = pd;
+        pd2.depth_clip = 1;
+        const gpu_d3d12_device* const g = GPU_D3D12_DEV(d);
+        const uint32_t kept = g->npso;
+        /* Made only for the library (today's startup builds): stored, or
+         * loaded, then released; no handle, nothing kept. */
+        uint32_t how = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == (run_no ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED) && g->npso == kept);
+        how = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == GPU_PIPELINE_LOADED && g->npso == kept);   /* the library has it */
+        /* A draw's is kept, loaded from the library the build filled. */
+        how = 7;
+        const gpu_pipeline p0 = gpu_pipeline_create(d, &pd2, 0, &how);
+        CHECK(p0.v != 0 && how == GPU_PIPELINE_LOADED && g->npso == kept + 1);
+        CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, p0.v) == (void*)(uintptr_t)p0.v);
         uint32_t cached = 7;
-        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, &cached);
-        CHECK(p1.v != 0 && cached == (uint32_t)run_no);
-        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, &cached);
-        CHECK(p2.v != 0 && cached == 1);   /* stored by the first */
+        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, 0, &cached);
+        CHECK(p1.v != 0 && cached == (run_no ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED));
+        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, 0, &cached);
+        CHECK(p2.v != 0 && cached == GPU_PIPELINE_LOADED);   /* stored by the first */
+        CHECK(g->npso == kept + 3);
         gpu_shader_destroy(d, vs);          /* pipelines outlive their shaders */
         gpu_shader_destroy(d, ps);
         if (run_no == 0) CHECK(gpu_pipeline_cache_save(d, path) == 1);
+        gpu_destroy(d);
+    }
+    /* No library (the cap masked, as a fallback would): pipelines are
+     * compiled and never stored; a store-only one is compiled and released. */
+    dd.cap_mask = GPU_CAP_PIPELINE_CACHE;
+    gpu_device* const d = gpu_d3d12_create(&dd);
+    CHECK(d != NULL);
+    if (d) {
+        CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NONE && GPU_D3D12_DEV(d)->lib == NULL);
+        const gpu_layout l = guest_layout(d);
+        const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+        const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+        gpu_pipeline_desc pd;
+        draw_desc(&pd, l, vs, ps);
+        uint32_t how = 7;
+        CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == GPU_PIPELINE_COMPILED && GPU_D3D12_DEV(d)->npso == 0);
+        how = 7;
+        CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_COMPILED);
+        CHECK(gpu_pipeline_cache_save(d, path) == 0);
         gpu_destroy(d);
     }
     DeleteFileA(path);

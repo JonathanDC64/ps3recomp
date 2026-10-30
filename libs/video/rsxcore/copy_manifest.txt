@@ -443,3 +443,23 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #  rsxc_api.inc: rc_backend_shutdown 15833, 15840 (pso_count_print),
 #   15866-15867 (the passes' borrowed pointers cleared, so the releases
 #   after them find NULL).
+
+# Step C3c: pipelines made only for the library, and the pipeline contract's
+# gaps. gpu.h: gpu_pipeline_create takes flags and says what it did (*how:
+# GPU_PIPELINE_LOADED, _COMPILED, _STORED); GPU_PIPELINE_STORE_ONLY loads, or
+# compiles and stores, then frees the pipeline and returns none (D3D12:
+# StorePipeline then Release, as today; Vulkan: made with the VkPipelineCache,
+# then vkDestroyPipeline); gpu_pipeline_cache_load returns
+# GPU_PIPELINE_CACHE_NONE, _NEW or _LOADED; GPU_NATIVE_PIPELINE.
+#  rsxc_shadercache.inc rc_pipeline: *how in place of *loaded, the pointer
+#   from gpu_native (GPU_NATIVE_PIPELINE).
+#  rsxc_psolib.inc pso_lib_open 4277-4338: no library possible (NONE) leaves
+#   the library off with the manifest unread, as today's s_pso_lib NULL;
+#   rc_pipeline_store and s_rc_pipe_store_only before pso_prebuild_one;
+#   pso_prebuild_one 4539-4583 (4571-4580: the load-or-build, the Releases)
+#   is rc_pipeline_store; pso_create_cached 4635-4659 counts a new pipeline
+#   (s_pso_lib_new, s_pso_lib_quiet) only when it was stored, as
+#   pso_lib_store's 1; pso_count_print also prints
+#   "[D3D12] pipelines resident: N; only stored in the library: S".
+#  rsxc_pipeline.inc pxi_build_one 6181-6226 (6200-6221: the load-or-build,
+#   the Release) is rc_pipeline_store.

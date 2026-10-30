@@ -157,7 +157,11 @@ static void pso_lib_open(void)
     CreateDirectoryA(path, NULL);
     pso_lib_path(path, sizeof path, "pipelines.lib");
     const long n = pso_file_size(path);
-    const int loaded = gpu_pipeline_cache_load(s_rc_dev, path);
+    /* Step C3c: no library possible (today's s_pso_lib NULL) leaves it all
+     * off, the manifest unread; else the file's library, or a new one. */
+    const int lib = gpu_pipeline_cache_load(s_rc_dev, path);
+    if (lib == GPU_PIPELINE_CACHE_NONE) return;
+    const int loaded = lib == GPU_PIPELINE_CACHE_LOADED;
     s_pso_lib_on = 1;
 
     /* The manifest: whole records only; a torn tail is cut off. */
@@ -408,6 +412,22 @@ static int pso_rec_desc(const pso_rec* r, gpu_shader vs, gpu_shader ps, gpu_pipe
     return 1;
 }
 
+/* Step C3c: a pipeline made only to be stored in the library
+ * (GPU_PIPELINE_STORE_ONLY), as today's startup and index builds release
+ * theirs once stored (pso_prebuild_one, pxi_build_one): the GPU layer loads
+ * it, or compiles and stores it, then frees it, so it is not resident beside
+ * the one a draw later loads. GPU_PIPELINE_LOADED (the library had it),
+ * _STORED (new in it), _COMPILED (another thread stored it first) or
+ * _FAILED. Thread-safe. */
+static volatile LONG s_rc_pipe_store_only;   /* those made (LOADED, STORED or COMPILED) */
+static uint32_t rc_pipeline_store(const gpu_pipeline_desc* d)
+{
+    uint32_t how = GPU_PIPELINE_FAILED;
+    (void)gpu_pipeline_create(s_rc_dev, d, GPU_PIPELINE_STORE_ONLY, &how);
+    if (how != GPU_PIPELINE_FAILED) InterlockedIncrement(&s_rc_pipe_store_only);
+    return how;
+}
+
 /* One startup build: the record's shaders from pso_blobs, its description
  * back together, and its name checked against the rebuilt description (the
  * D3D12 one the GPU layer makes of it). 1: built, 2: the library had it, 0:
@@ -420,7 +440,7 @@ static int pso_prebuild_one(const pso_rec* r)
     const u64 hs[2] = { r->vs_hash, r->ps_hash };
     const u32 ls[2] = { r->vs_len, r->ps_len };
     gpu_shader sh[2] = { {0}, {0} };
-    uint32_t loaded = 0;
+    uint32_t how = GPU_PIPELINE_FAILED;
     int ok = 0;
     for (int i = 0; i < 2; i++) {
         char bp[MAX_PATH + 64];
@@ -448,13 +468,13 @@ static int pso_prebuild_one(const pso_rec* r)
     if (pso_desc_key(&dd) != r->name) goto out;   /* another build's layout, or a stale root signature */
     /* A record pipelines.n does not count may be in the library already:
      * one stored while the library was being saved, or a crash between the
-     * two files. It is loaded then, not built. */
-    if (rc_pipeline(&pd, &loaded)) {
-        if (loaded) ok = 2;
-        else {
-            InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
-            ok = 1;
-        }
+     * two files. It is loaded then, not built. Either way only the library
+     * keeps it (step C3c). */
+    how = rc_pipeline_store(&pd);
+    if (how == GPU_PIPELINE_LOADED) ok = 2;
+    else if (how != GPU_PIPELINE_FAILED) {
+        if (how == GPU_PIPELINE_STORED) InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
+        ok = 1;
     }
 out:
     sc_shader_drop(&sh[0]);
@@ -484,11 +504,16 @@ static DWORD WINAPI pso_prebuild_thread(LPVOID unused)
  * queued so far (pipelines.n counts its records), and a burst of new
  * pipelines has settled (120 presents with none, or 256 pending). */
 /* The pipelines the GPU layer made this run (rc_pipeline), from its library
- * or compiled, and the guest-FP ones' share (pso_create_cached). */
+ * or compiled, and the guest-FP ones' share (pso_create_cached). Step C3c:
+ * those are the ones it keeps (resident: today's renderer keeps the same);
+ * the startup and index builds' only went into the library
+ * (rc_pipeline_store). */
 static void pso_count_print(const char* when)
 {
     printf("[D3D12] pipelines %s: %ld loaded from the library, %ld compiled; guest FP: %ld loaded, %ld compiled\n",
            when, (long)s_rc_pipe_loaded, (long)s_rc_pipe_made, (long)s_pso_lib_hits, (long)s_pso_lib_live);
+    printf("[D3D12] pipelines resident: %ld; only stored in the library: %ld\n",
+           (long)(s_rc_pipe_loaded + s_rc_pipe_made), (long)s_rc_pipe_store_only);
 }
 static void pso_lib_tick(void)
 {
@@ -496,7 +521,7 @@ static void pso_lib_tick(void)
      * replay ends without rc_backend_shutdown's line). */
     { static int lg = -1; PS3_KNOB(lg, ps3_env_int("PS3_PSO_LOG", 0));
       static LONG seen = -1;
-      const LONG t = s_rc_pipe_loaded + s_rc_pipe_made;
+      const LONG t = s_rc_pipe_loaded + s_rc_pipe_made + s_rc_pipe_store_only;
       if (lg && t != seen) { seen = t; pso_count_print("so far"); } }
     if (!s_pso_lib_on) return;
     if (!s_pso_pre_started && s_d3d.vp_root_sig) {
@@ -531,13 +556,15 @@ static void pso_lib_tick(void)
  * only). NULL on failure. Thread-safe. */
 static ID3D12PipelineState* pso_create_cached(const gpu_pipeline_desc* pd)
 {
-    uint32_t loaded = 0;
-    ID3D12PipelineState* const pso = rc_pipeline(pd, &loaded);
+    uint32_t how = GPU_PIPELINE_FAILED;
+    ID3D12PipelineState* const pso = rc_pipeline(pd, &how);
     if (!s_pso_lib_on || !pso) return pso;
-    if (loaded) { InterlockedIncrement(&s_pso_lib_hits); return pso; }
+    if (how == GPU_PIPELINE_LOADED) { InterlockedIncrement(&s_pso_lib_hits); return pso; }
     InterlockedIncrement(&s_pso_lib_live);
-    InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
-    s_pso_lib_quiet = 0;
+    if (how == GPU_PIPELINE_STORED) {   /* new in the library (step C3c: only then, as today's) */
+        InterlockedIncrement(&s_pso_lib_new);
+        s_pso_lib_quiet = 0;
+    }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
     D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
     gpu_d3d12_pipeline_d3d_desc(s_rc_dev, pd, &dd, il);

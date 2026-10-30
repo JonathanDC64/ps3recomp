@@ -1797,6 +1797,13 @@ static void* vkb_native(gpu_device* d, uint32_t kind, uint64_t handle)
         return gpu_vk_slot_valid(&dd->layout_slots, id) ? (void*)(uintptr_t)dd->layout[i].pl : NULL;
     case GPU_NATIVE_SWAPCHAIN:
         return gpu_vk_slot_valid(&dd->swap_slots, id) ? (void*)(uintptr_t)dd->swap[i].sc : NULL;
+    case GPU_NATIVE_PIPELINE: {   /* (gpu_pipeline.v is its index + 1) */
+        VkPipeline p = VK_NULL_HANDLE;
+        gpu_vk_lock(&dd->pso_lock);
+        if (handle && handle <= dd->npso) p = dd->pso[handle - 1u].p;
+        gpu_vk_unlock(&dd->pso_lock);
+        return (void*)(uintptr_t)p;
+    }
     default:                  return NULL;
     }
 }
