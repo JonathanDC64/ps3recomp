@@ -119,8 +119,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
         return;
 
     wait_for_gpu();
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    frame_cmd_begin(fi);
 
     D3D12_RESOURCE_BARRIER b = {0};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -159,9 +158,7 @@ static void cap_readback_write(ID3D12Resource* res, u32 w, u32 h, u32 dxgi,
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
 
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
-    ID3D12CommandList* cl[] = { (ID3D12CommandList*)s_d3d.cmd_list };
-    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cl);
+    frame_cmd_submit();
     wait_for_gpu();
 
     void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)pitch * h};

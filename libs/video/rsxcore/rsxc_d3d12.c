@@ -23,6 +23,10 @@
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
 
 #include "rsxc_head.inc"
+/* The GPU layer, with the D3D12 backend's static inline commands (the draw
+ * loop calls them directly) and, while the conversion runs, its bridges. */
+#include "gpu_d3d12_cmd.h"
+#include "gpu_d3d12_bridge.h"
 #include "rsxc_state.inc"
 #include "rsxc_shadercache.inc"   /* (before the first fragment that compiles a shader) */
 #include "rsxc_window.inc"

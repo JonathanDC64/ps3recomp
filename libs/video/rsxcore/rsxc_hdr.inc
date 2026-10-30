@@ -156,12 +156,7 @@ static void hdr_display_check(void)
  * ones. 0 if it was refused. */
 static int swap_color_space(int hdr)
 {
-    const DXGI_COLOR_SPACE_TYPE cs = hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
-                                         : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-    UINT sup = 0;
-    return SUCCEEDED(s_d3d.swap_chain->lpVtbl->CheckColorSpaceSupport(s_d3d.swap_chain, cs, &sup)) &&
-           (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) &&
-           SUCCEEDED(s_d3d.swap_chain->lpVtbl->SetColorSpace1(s_d3d.swap_chain, cs));
+    return gpu_swap_hdr(s_rc_dev, s_rc_swap, hdr ? GPU_COLOR_SCRGB : GPU_COLOR_SRGB, NULL);
 }
 #else
 /* Off Windows no display reports HDR here: the swap chain stays RGBA8. */
@@ -180,15 +175,16 @@ static int hdr_want(void)
     return s_hdr.disp_hdr && !s_hdr.failed && hdr_blit_ready();
 }
 
-/* The swap chain's buffers and their RTVs (init and after ResizeBuffers). */
+/* The swap chain's buffers and their RTVs (init and after a resize). The
+ * buffers are the swap chain's images; s_d3d.swap_buffers borrows them. */
 static int swap_buffers_get(void)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &h);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        HRESULT hr = s_d3d.swap_chain->lpVtbl->GetBuffer(
-            s_d3d.swap_chain, i, &IID_ID3D12Resource, (void**)&s_d3d.swap_buffers[i]);
-        if (FAILED(hr)) return -1;
+        s_rc_swap_image[i] = gpu_d3d12_swap_image(s_rc_dev, s_rc_swap, i);
+        s_d3d.swap_buffers[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
+        if (!s_d3d.swap_buffers[i]) return -1;
         s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.swap_buffers[i], NULL, h);
         h.ptr += s_d3d.rtv_descriptor_size;
     }
@@ -675,13 +671,12 @@ static void display_note(long long now)
     }
     if (now - last < freq / 10) return;
     last = now;
-    DXGI_FRAME_STATISTICS fs;
-    memset(&fs, 0, sizeof fs);
-    if (FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)) ||
-        !fs.SyncQPCTime.QuadPart || !fs.SyncRefreshCount)
+    gpu_present_stats st;
+    memset(&st, 0, sizeof st);
+    if (gpu_swap_stats(s_rc_dev, s_rc_swap, &st) || !st.sync_qpc || !st.sync_refresh_count)
         return;
-    const long long q = fs.SyncQPCTime.QuadPart;
-    const UINT c = fs.SyncRefreshCount;
+    const long long q = st.sync_qpc;
+    const UINT c = st.sync_refresh_count;
     if (!base_q || c < base_c || q < base_q) {   /* (the first, or the statistics started over) */
         base_q = q;
         base_c = c;
@@ -733,8 +728,8 @@ static const char* removed_reason_text(HRESULT rr)
 
 static void check_device(const char* where)
 {
-    if (s_device_lost || !s_d3d.device) return;
-    const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+    if (s_device_lost || !s_rc_dev) return;
+    const HRESULT rr = (HRESULT)gpu_lost(s_rc_dev);
     if (rr == S_OK) return;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
@@ -756,8 +751,7 @@ static void swap_present(int game_frame)
     }
     const int tear = !vsync && s_d3d.tearing;
     const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
-    const HRESULT hr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, interval, tear ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (FAILED(hr)) check_device("present");
+    if (gpu_swap_present(s_rc_dev, s_rc_swap, interval, tear ? GPU_PRESENT_TEARING : 0)) check_device("present");
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     s_last_present_qpc = q.QuadPart;
@@ -778,23 +772,21 @@ static void swap_resize(void)
     if (w == s_d3d.win_w && h == s_d3d.win_h && hdr == s_hdr.active) return;
     wait_for_gpu();
     if (s_overlay_on && s_overlay.release) s_overlay.release(s_overlay.user);
-    for (u32 i = 0; i < FRAME_COUNT; i++)
-        if (s_d3d.swap_buffers[i]) {
-            s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
-            s_d3d.swap_buffers[i] = NULL;
-        }
-    const UINT flags = s_d3d.tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    HRESULT hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(
-        s_d3d.swap_chain, FRAME_COUNT, w, h,
-        hdr ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM, flags);
+    /* The buffers are the swap chain's (borrowed): the resize drops them and
+     * gets them again, with the buffer count and flags it was made with. */
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        s_d3d.swap_buffers[i] = NULL;
+        s_rc_swap_image[i].id = 0;
+    }
+    HRESULT hr = (HRESULT)gpu_swap_resize(s_rc_dev, s_rc_swap, w, h,
+                                          hdr ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);
     if (SUCCEEDED(hr) && hdr != s_hdr.active) {
         /* A display that refuses scRGB keeps RGBA8. */
         if (!swap_color_space(hdr)) {
             if (hdr) {
                 printf("[D3D12] HDR: the swap chain's scRGB colour space was refused; staying SDR\n");
                 s_hdr.failed = 1;
-                hr = s_d3d.swap_chain->lpVtbl->ResizeBuffers(s_d3d.swap_chain, FRAME_COUNT, w, h,
-                                                             DXGI_FORMAT_R8G8B8A8_UNORM, flags);
+                hr = (HRESULT)gpu_swap_resize(s_rc_dev, s_rc_swap, w, h, GPU_FORMAT_R8G8B8A8_UNORM);
             }
         } else {
             s_hdr.active = hdr;
@@ -812,11 +804,9 @@ static void swap_resize(void)
         InterlockedExchange(&s_win_req, (LONG)((s_d3d.win_w << 16) | s_d3d.win_h));
     }
     if (swap_buffers_get() != 0) printf("[D3D12] swap chain buffers lost after a resize\n");
-    /* The back buffer index starts over; the GPU is idle, so every frame's
-     * fence value moves to the highest one and the fence never steps back. */
-    s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
-    u64 fv = 0;
-    for (u32 i = 0; i < FRAME_COUNT; i++) if (s_d3d.fence_values[i] > fv) fv = s_d3d.fence_values[i];
-    for (u32 i = 0; i < FRAME_COUNT; i++) s_d3d.fence_values[i] = fv;
+    /* The back buffer index starts over. The GPU is idle, so every frame
+     * slot's fence is passed already, and the timeline only goes up: nothing
+     * to move (today's code moved every frame's fence value to the highest). */
+    s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
 }
 

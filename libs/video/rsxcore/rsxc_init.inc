@@ -11,6 +11,23 @@ static u64 fnv_bytes(u64 h, const void* p, size_t n)
     return h;
 }
 
+/* Recording on a frame slot's recorder (the GPU layer's, one allocator and
+ * list per slot): today's allocator and list Reset. s_rc_cmd is the recorder
+ * for converted code; s_d3d.cmd_list becomes its list, so code that records
+ * into s_d3d.cmd_list records into the one open now. */
+static void frame_cmd_begin(u32 slot)
+{
+    s_rc_cmd = gpu_cmd_begin(s_rc_dev, slot);
+    s_d3d.cmd_list = (ID3D12GraphicsCommandList*)gpu_native(s_rc_dev, GPU_NATIVE_CMD, (u64)(uintptr_t)s_rc_cmd);
+}
+
+/* Today's Close and ExecuteCommandLists of the open recorder. */
+static void frame_cmd_submit(void)
+{
+    gpu_cmd_end(s_rc_dev, s_rc_cmd);
+    gpu_submit(s_rc_dev, &s_rc_cmd, 1, NULL);
+}
+
 /* The display buffers and the shared depth buffer, at RSX_SCALE's size: made
  * by init_d3d12, and again by rsx_scale_apply when the scale changes. Their
  * descriptor heaps already exist. */
@@ -96,171 +113,53 @@ static int init_d3d12(u32 width, u32 height)
 {
     HRESULT hr;
 
-    /* Enable debug layer in debug builds */
-    /* Debug layer: on in debug builds, or in any build when D3D12_DBG is set
-     * (so a Release run can capture exact PSO/validation errors). */
-    if (
-#ifdef NDEBUG
-        getenv("D3D12_DBG")
-#else
-        1
-#endif
-    ) {
-        ID3D12Debug* debug_controller = NULL;
-        hr = D3D12GetDebugInterface(&IID_ID3D12Debug, (void**)&debug_controller);
-        if (SUCCEEDED(hr) && debug_controller) {
-            debug_controller->lpVtbl->EnableDebugLayer(debug_controller);
-            debug_controller->lpVtbl->Release(debug_controller);
-            printf("[D3D12] Debug layer enabled\n");
-        } else {
-            printf("[D3D12] Debug layer requested but unavailable (0x%08lX) -- "
-                   "install 'Graphics Tools' optional feature\n", hr);
-        }
-    }
-
-    /* D3D12_DRED=1: Device Removed Extended Data (auto-breadcrumbs + page
-     * faults). Part of the D3D12 runtime, so it works without the Graphics
-     * Tools debug layer; dred_report() prints it once when the device is lost. */
-    if (getenv("D3D12_DRED")) {
-        ID3D12DeviceRemovedExtendedDataSettings* ds = NULL;
-        if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings,
-                                             (void**)&ds)) && ds) {
-            ds->lpVtbl->SetAutoBreadcrumbsEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
-            ds->lpVtbl->SetPageFaultEnablement(ds, D3D12_DRED_ENABLEMENT_FORCED_ON);
-            const char* text = "";
-#ifdef _WIN32
-            /* DRED 1.2: keep the strings of the per-draw markers (dred_mark). */
-            ID3D12DeviceRemovedExtendedDataSettings1* ds1 = NULL;
-            text = ", without the draws' markers";
-            if (SUCCEEDED(D3D12GetDebugInterface(&IID_ID3D12DeviceRemovedExtendedDataSettings1,
-                                                 (void**)&ds1)) && ds1) {
-                ds1->lpVtbl->SetBreadcrumbContextEnablement(ds1, D3D12_DRED_ENABLEMENT_FORCED_ON);
-                ds1->lpVtbl->Release(ds1);
-                text = ", with the draws' markers";
-            }
-#endif
-            ds->lpVtbl->Release(ds);
-            printf("[D3D12] DRED enabled%s\n", text);
-        } else printf("[D3D12] DRED unavailable\n");
-    }
-
-    /* Create DXGI factory */
-    IDXGIFactory4* factory = NULL;
-    hr = CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&factory);
-    if (FAILED(hr)) {
-        printf("[D3D12] ERROR: CreateDXGIFactory1 failed (0x%08lX)\n", hr);
-        return -1;
-    }
-
-    /* Create D3D12 device. On a dual-GPU laptop a NULL adapter usually lands on
-     * the integrated GPU; explicitly pick the high-performance (discrete)
-     * adapter via IDXGIFactory6. Set CELLMARK_IGPU to force the low-power one
-     * (for A/B testing a suspected iGPU-driver stall). */
+    /* The device, its queue, a recorder per frame slot and the fence: the GPU
+     * layer's D3D12 backend, with today's choices. D3D12_DRED=1: Device
+     * Removed Extended Data (auto-breadcrumbs, page faults, the draws'
+     * markers), which gpu_fault_report prints once the device is lost.
+     * CELLMARK_IGPU: the low-power adapter (for A/B testing a suspected
+     * iGPU-driver stall); else the high-performance one, software adapters
+     * skipped, the default adapter last. The debug layer is never enabled on
+     * this route (D3D12_DBG and debug builds included). */
     {
-        IDXGIFactory6* factory6 = NULL;
-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(
-                factory, &IID_IDXGIFactory6, (void**)&factory6))) {
-            DXGI_GPU_PREFERENCE pref = getenv("CELLMARK_IGPU")
-                ? DXGI_GPU_PREFERENCE_MINIMUM_POWER
-                : DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE;
-            IDXGIAdapter1* adapter = NULL;
-            for (UINT ai = 0; factory6->lpVtbl->EnumAdapterByGpuPreference(
-                     factory6, ai, pref, &IID_IDXGIAdapter1, (void**)&adapter)
-                     != DXGI_ERROR_NOT_FOUND; ai++) {
-                DXGI_ADAPTER_DESC1 ad;
-                adapter->lpVtbl->GetDesc1(adapter, &ad);
-                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                    SUCCEEDED(D3D12CreateDevice((IUnknown*)adapter,
-                        D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
-                        (void**)&s_d3d.device))) {
-                    printf("[D3D12] adapter: %ls (VRAM %llu MB)\n", ad.Description,
-                           (unsigned long long)(ad.DedicatedVideoMemory >> 20));
-                    adapter->lpVtbl->Release(adapter);
-                    break;
-                }
-                adapter->lpVtbl->Release(adapter);
-                adapter = NULL;
-            }
-            factory6->lpVtbl->Release(factory6);
-        }
-    }
-    if (!s_d3d.device) {
-        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0,
-                               &IID_ID3D12Device, (void**)&s_d3d.device);
-        if (FAILED(hr)) {
-            printf("[D3D12] ERROR: D3D12CreateDevice failed (0x%08lX)\n", hr);
-            factory->lpVtbl->Release(factory);
-            return -1;
-        }
-        printf("[D3D12] Device created on default adapter (feature level 11.0)\n");
+        gpu_device_desc dd;
+        memset(&dd, 0, sizeof dd);
+        if (getenv("D3D12_DRED")) dd.flags |= GPU_DEVICE_BREADCRUMBS;
+        if (getenv("CELLMARK_IGPU")) dd.flags |= GPU_DEVICE_LOW_POWER;
+        dd.cmd_slots = FRAME_COUNT;
+        s_rc_dev = gpu_d3d12_create(&dd);
+        if (!s_rc_dev) return -1;
+        s_d3d.device = (ID3D12Device*)gpu_native(s_rc_dev, GPU_NATIVE_DEVICE, 0);
+        s_d3d.cmd_queue = (ID3D12CommandQueue*)gpu_native(s_rc_dev, GPU_NATIVE_QUEUE, 0);
     }
 
     pso_lib_open();
     shader_cache_warm();
 
-    /* Create command queue */
-    D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
-    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    hr = s_d3d.device->lpVtbl->CreateCommandQueue(
-        s_d3d.device, &queue_desc, &IID_ID3D12CommandQueue, (void**)&s_d3d.cmd_queue);
-    if (FAILED(hr)) {
-        printf("[D3D12] ERROR: CreateCommandQueue failed\n");
-        factory->lpVtbl->Release(factory);
-        return -1;
-    }
-
-    /* Create swap chain */
-    DXGI_SWAP_CHAIN_DESC1 sc_desc = {0};
-    sc_desc.Width = width;
-    sc_desc.Height = height;
-    sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sc_desc.SampleDesc.Count = 1;
-    sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    sc_desc.BufferCount = FRAME_COUNT;
-    sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    /* A windowed flip-model swap chain presenting with sync interval 0 is
-     * still paced by the compositor at the display's refresh unless it may
-     * tear: the swap chain has to be made with ALLOW_TEARING and each such
-     * Present pass DXGI_PRESENT_ALLOW_TEARING (RSX_VSYNC=0 below). Asked once;
-     * a system without it (no variable refresh support in the driver or OS)
+    /* The swap chain: flip model, FRAME_COUNT buffers, Alt+Enter left to the
+     * window. A windowed flip-model swap chain presenting with sync interval 0
+     * is still paced by the compositor at the display's refresh unless it may
+     * tear: it is made with ALLOW_TEARING when the system has it, and each such
+     * Present passes DXGI_PRESENT_ALLOW_TEARING (RSX_VSYNC=0, swap_present). A
+     * system without it (no variable refresh support in the driver or OS)
      * presents with vsync. */
+    s_d3d.tearing = (s_rc_dev->caps.bits & GPU_CAP_TEARING) ? 1 : 0;
     {
-        IDXGIFactory5* f5 = NULL;
-        BOOL allow = FALSE;
-        if (SUCCEEDED(factory->lpVtbl->QueryInterface(factory, &IID_IDXGIFactory5, (void**)&f5))) {
-            if (FAILED(f5->lpVtbl->CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                                                       &allow, sizeof allow)))
-                allow = FALSE;
-            f5->lpVtbl->Release(f5);
-        }
-        s_d3d.tearing = allow ? 1 : 0;
-        if (allow) sc_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        gpu_swapchain_desc sd;
+        memset(&sd, 0, sizeof sd);
+        sd.window = s_d3d.hwnd;
+        sd.width = width;
+        sd.height = height;
+        sd.format = GPU_FORMAT_R8G8B8A8_UNORM;
+        sd.buffers = FRAME_COUNT;
+        sd.colour_space = GPU_COLOR_SRGB;
+        sd.flags = s_d3d.tearing ? GPU_SWAP_TEARING : 0;
+        s_rc_swap = gpu_swap_create(s_rc_dev, &sd);
+        if (!GPU_VALID(s_rc_swap)) return -1;
+        s_d3d.swap_chain = (IDXGISwapChain3*)gpu_native(s_rc_dev, GPU_NATIVE_SWAPCHAIN, s_rc_swap.id);
     }
 
-    IDXGISwapChain1* swap_chain1 = NULL;
-    hr = factory->lpVtbl->CreateSwapChainForHwnd(
-        factory, (IUnknown*)s_d3d.cmd_queue,
-        s_d3d.hwnd, &sc_desc, NULL, NULL, &swap_chain1);
-    if (FAILED(hr)) {
-        printf("[D3D12] ERROR: CreateSwapChainForHwnd failed (0x%08lX)\n", hr);
-        factory->lpVtbl->Release(factory);
-        return -1;
-    }
-
-    /* Disable Alt+Enter fullscreen toggle */
-    factory->lpVtbl->MakeWindowAssociation(factory, s_d3d.hwnd, DXGI_MWA_NO_ALT_ENTER);
-    factory->lpVtbl->Release(factory);
-
-    /* Query SwapChain3 interface */
-    hr = swap_chain1->lpVtbl->QueryInterface(
-        swap_chain1, &IID_IDXGISwapChain3, (void**)&s_d3d.swap_chain);
-    swap_chain1->lpVtbl->Release(swap_chain1);
-    if (FAILED(hr)) {
-        printf("[D3D12] ERROR: QueryInterface for SwapChain3 failed\n");
-        return -1;
-    }
-
-    s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+    s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
 
     /* Create RTV descriptor heap */
     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
@@ -312,31 +211,14 @@ static int init_d3d12(u32 width, u32 height)
         printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
     }
 
-    /* Create command allocators and command list */
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        hr = s_d3d.device->lpVtbl->CreateCommandAllocator(
-            s_d3d.device, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            &IID_ID3D12CommandAllocator, (void**)&s_d3d.cmd_allocators[i]);
-        if (FAILED(hr)) return -1;
-    }
-
-    hr = s_d3d.device->lpVtbl->CreateCommandList(
-        s_d3d.device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        s_d3d.cmd_allocators[0], NULL,
-        &IID_ID3D12GraphicsCommandList, (void**)&s_d3d.cmd_list);
-    if (FAILED(hr)) return -1;
-
-    /* Close the command list (it starts in recording state) */
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
-
-    /* Create fence */
-    hr = s_d3d.device->lpVtbl->CreateFence(
-        s_d3d.device, 0, D3D12_FENCE_FLAG_NONE,
-        &IID_ID3D12Fence, (void**)&s_d3d.fence);
-    if (FAILED(hr)) return -1;
-
-    s_d3d.fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    memset(s_d3d.fence_values, 0, sizeof(s_d3d.fence_values));
+    /* The recorders and the fence are the device's (one fence, the device's
+     * timeline: s_rc_frame_fence holds each frame slot's point on it). Until
+     * the first frame, s_d3d.cmd_list is slot 0's list, closed, as today's one
+     * list is after init. */
+    frame_cmd_begin(0);
+    if (!s_rc_cmd) return -1;
+    gpu_cmd_end(s_rc_dev, s_rc_cmd);
+    memset(s_rc_frame_fence, 0, sizeof s_rc_frame_fence);
 
     /* ---------------------------------------------------------------
      * Create root signature with 16 root constants (one mat4 MVP at b0).
