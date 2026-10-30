@@ -334,14 +334,14 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
         ReleaseSRWLockShared(&s_pso_man_lock);
         if (known) r = 0;
         else {
-            uint32_t loaded = 0;
-            if (rc_pipeline(&pd, &loaded)) {
-                if (loaded) r = 0;
-                else {
-                    InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
-                    pso_manifest_add(key, &dd);
-                    r = 1;
-                }
+            /* Only into the library (step C3c): today's releases the pipeline
+             * once stored, and a draw loads it from there. */
+            const uint32_t how = rc_pipeline_store(&pd);
+            if (how == GPU_PIPELINE_LOADED) r = 0;
+            else if (how != GPU_PIPELINE_FAILED) {
+                if (how == GPU_PIPELINE_STORED) InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
+                pso_manifest_add(key, &dd);
+                r = 1;
             }
         }
     }

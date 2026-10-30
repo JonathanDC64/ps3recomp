@@ -11,7 +11,8 @@
  *     does not;
  *   - buffers' bytes from upload to GPU to readback memory, a host import, a
  *     texture's readback (zeroes), footprints and sizes;
- *   - fences, the caps, and a lost device;
+ *   - fences, the caps, and a lost device; pipelines made only for the
+ *     cache (GPU_PIPELINE_STORE_ONLY) keep nothing;
  *   - a case for each kind of check, each on its own device, which fails
  *     that check the number of times it should and no other. The first
  *     failure of each kind is printed: those lines are expected.
@@ -230,8 +231,8 @@ static gpu_pipeline pipe_new(gpu_device* d, gpu_layout layout, gpu_shader vs, gp
     pd.samples = 1;
     pd.sample_mask = 0xFFFFFFFFu;
     uint32_t cached = 7;
-    const gpu_pipeline p = gpu_pipeline_create(d, &pd, &cached);
-    CHECK(p.v != 0 && cached == 0);
+    const gpu_pipeline p = gpu_pipeline_create(d, &pd, 0, &cached);
+    CHECK(p.v != 0 && cached == GPU_PIPELINE_COMPILED);
     return p;
 }
 
@@ -717,6 +718,39 @@ static void test_footprints(void)
     gpu_destroy(d);
 }
 
+/* GPU_PIPELINE_STORE_ONLY: checked as any create and counted; it keeps
+ * nothing and puts nothing in the stream, and the same description made
+ * for a draw after it is a new, kept pipeline. */
+static void test_store_only(void)
+{
+    gpu_device* const d = dev_new(0);
+    if (!d) return;
+    gpu_pipeline_desc pd;
+    memset(&pd, 0, sizeof pd);
+    pd.layout = guest_layout(d);
+    pd.vs = shader(d, GPU_STAGE_VS, "guest vertex program 1");
+    pd.ps = shader(d, GPU_STAGE_PS, "guest fragment program 1");
+    pd.topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
+    pd.nrt = 1;
+    pd.rt_format[0] = GPU_FORMAT_R8G8B8A8_UNORM;
+    pd.samples = 1;
+    pd.sample_mask = 0xFFFFFFFFu;
+    const uint64_t h0 = gpu_null_stream_hash(d);
+    uint32_t how = 7;
+    CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0 && how == GPU_PIPELINE_COMPILED);
+    CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, NULL).v == 0);
+    gpu_null_counts n;
+    gpu_null_counts_get(d, &n);
+    CHECK(n.pipelines == 0 && n.stored_only == 2);
+    CHECK(gpu_null_stream_hash(d) == h0);
+    how = 7;
+    CHECK(gpu_pipeline_create(d, &pd, 0, &how).v == 1 && how == GPU_PIPELINE_COMPILED);
+    gpu_null_counts_get(d, &n);
+    CHECK(n.pipelines == 1 && n.stored_only == 2);
+    CHECK(gpu_null_errors(d, GPU_NULL_ERR_ALL) == 0);
+    gpu_destroy(d);
+}
+
 static void test_device(void)
 {
     gpu_device* d = dev_new(0);
@@ -726,6 +760,11 @@ static void test_device(void)
     CHECK(!strncmp(info.name, "null", 4));
     CHECK(d->caps.api == GPU_API_NULL && d->caps.cb_align == 256 && (d->caps.bits & GPU_CAP_BC));
     CHECK(gpu_native(d, 0, 0) == NULL);
+    CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, 1) == NULL);
+    /* No pipeline cache: none to load or save. */
+    CHECK(!(d->caps.bits & GPU_CAP_PIPELINE_CACHE));
+    CHECK(gpu_pipeline_cache_load(d, "unused") == GPU_PIPELINE_CACHE_NONE);
+    CHECK(gpu_pipeline_cache_save(d, "unused") == 0);
     const uint32_t rgba = gpu_format_support(d, GPU_FORMAT_R8G8B8A8_UNORM, 1);
     CHECK((rgba & GPU_FMT_SAMPLED) && (rgba & GPU_FMT_RT) && (rgba & GPU_FMT_DISPLAY));
     CHECK((gpu_format_support(d, GPU_FORMAT_BC1_UNORM, 1) & (GPU_FMT_SAMPLED | GPU_FMT_RT)) == GPU_FMT_SAMPLED);
@@ -848,9 +887,22 @@ static void neg_handle(void)
     memset(&pd, 0, sizeof pd);
     pd.layout = blit_layout(d);
     pd.vs = vs;
-    CHECK(gpu_pipeline_create(d, &pd, NULL).v == 0);                                  /* 5: a freed shader */
+    CHECK(gpu_pipeline_create(d, &pd, 0, NULL).v == 0);                               /* 5: a freed shader */
+    CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, NULL).v == 0);         /* 6: the same, store-only */
     gpu_buffer_destroy(d, (gpu_buffer){0}, 0);                                        /* (nothing) */
-    expect(d, GPU_NULL_ERR_HANDLE, 5);
+    /* A pipeline made only for the cache keeps no entry: the handle the next
+     * kept one would get names nothing yet. */
+    pd.vs = shader(d, GPU_STAGE_VS, "vs 2");
+    uint32_t how = 7;
+    CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0 && how == GPU_PIPELINE_COMPILED);
+    gpu_null_counts n;
+    gpu_null_counts_get(d, &n);
+    CHECK(n.pipelines == 0 && n.stored_only == 1);
+    gpu_cmd* const c2 = gpu_cmd_begin(d, 0);
+    const gpu_pipeline guess = {n.pipelines + 1};
+    gpu_cmd_set_pipeline(c2, guess);                                                  /* 7: never made */
+    CHECK(run(d, c2));
+    expect(d, GPU_NULL_ERR_HANDLE, 7);
     gpu_destroy(d);
 }
 
@@ -1170,6 +1222,7 @@ int main(void)
     test_bytes();
     test_footprints();
     test_device();
+    test_store_only();
     printf("  one case per check (each prints its first failure, as it should):\n");
     fflush(stdout);
     neg_handle();

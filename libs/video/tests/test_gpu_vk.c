@@ -781,23 +781,23 @@ static int scene_make(scene* s)
     if (!GPU_VALID(s->layout) || !GPU_VALID(s->vs) || !GPU_VALID(s->ps)) return 0;
     draw_desc(&s->desc, s->layout, s->vs, s->ps);
     uint32_t cached = 7;
-    s->pso = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(s->pso.v != 0 && cached == 0);
+    s->pso = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    CHECK(s->pso.v != 0 && cached == GPU_PIPELINE_STORED);   /* the device's cache, empty before it */
     gpu_pipeline_desc pd = s->desc;
     pd.depth_clip = 1;
-    s->pso_clip = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_clip = gpu_pipeline_create(g_d, &pd, 0, NULL);
     if (GPU_VALID(s->gs)) {
         pd = s->desc;
         pd.vs = s->vs_gs;
         pd.gs = s->gs;
-        s->pso_gs = gpu_pipeline_create(g_d, &pd, NULL);
+        s->pso_gs = gpu_pipeline_create(g_d, &pd, 0, NULL);
         CHECK(s->pso_gs.v != 0);
     }
     pd = s->desc;
     pd.depth_test = 1;
     pd.depth_write = 1;
     pd.ds_format = GPU_FORMAT_D32_FLOAT;
-    s->pso_depth = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_depth = gpu_pipeline_create(g_d, &pd, 0, NULL);
     /* Today's zeta pipelines: D24S8 with stencil, which the D32S8 fallback must take too. */
     pd.ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
     pd.depth_func = GPU_CMP_LESS_EQUAL;
@@ -807,7 +807,7 @@ static int scene_make(scene* s)
     pd.stencil_front.pass = GPU_STENCIL_REPLACE;
     pd.stencil_front.func = GPU_CMP_ALWAYS;
     pd.stencil_back = pd.stencil_front;
-    s->pso_zeta = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_zeta = gpu_pipeline_create(g_d, &pd, 0, NULL);
     CHECK(s->pso_clip.v != 0 && s->pso_depth.v != 0 && s->pso_zeta.v != 0);
 
     gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
@@ -1139,7 +1139,7 @@ static void test_draw(scene* s)
     gpu_buffer_destroy(g_d, qrb, 0);
 
     uint32_t cached = 7;
-    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, &cached);
+    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
     CHECK(again.v != 0);
 }
 
@@ -1154,7 +1154,7 @@ static void test_post(const scene* s)
     gpu_pipeline_desc pd;
     draw_desc(&pd, blit, vs, ps);
     memset(&pd.vertex, 0, sizeof pd.vertex);
-    const gpu_pipeline pso = gpu_pipeline_create(g_d, &pd, NULL);
+    const gpu_pipeline pso = gpu_pipeline_create(g_d, &pd, 0, NULL);
     CHECK(pso.v != 0);
 
     const gpu_texture_desc td = tex_desc(2, 2, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_SAMPLED | GPU_USE_COPY_DST,
@@ -1362,24 +1362,40 @@ static void test_pipeline_cache(void)
         CHECK(d != NULL);
         if (!d) break;
         const int loaded = gpu_pipeline_cache_load(d, path);
-        CHECK(loaded == run_no);   /* none the first time, the first device's the second */
+        /* none the first time, the first device's the second */
+        CHECK(loaded == (run_no ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW));
         /* The layout and shaders made again on each device: the name is their
          * content's, not their handles'. */
         const gpu_layout l = guest_layout(d);
         const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
         const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
-        gpu_pipeline_desc pd;
+        gpu_pipeline_desc pd, pd2;
         draw_desc(&pd, l, vs, ps);
+        pd2 = pd;
+        pd2.depth_clip = 1;
+        const gpu_vk_device* const g = GPU_VK_DEV(d);
+        const uint32_t kept = g->npso;
+        /* Made only for the cache (today's startup builds): made with it,
+         * destroyed at once; no handle, no slot. Then a draw's, kept. */
+        uint32_t c0 = 7, c3 = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &c0).v == 0 && g->npso == kept);
+        const gpu_pipeline p0 = gpu_pipeline_create(d, &pd2, 0, &c3);
+        CHECK(p0.v != 0 && g->npso == kept + 1);
+        CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, p0.v) != NULL);
         uint32_t c1 = 7, c2 = 7;
-        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, &c1);
-        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, &c2);
+        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, 0, &c1);
+        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, 0, &c2);
         CHECK(p1.v != 0 && p2.v != 0);
         if (run_no == 0) {
-            CHECK(c1 == 0);
-            hits = c2 == 1;   /* the cache's hit, if the driver says (creation feedback) */
+            /* The first in an empty cache; the second description differs by
+             * depth_clip alone, so a driver that caches per stage may find
+             * it there (NVIDIA does). */
+            CHECK(c0 == GPU_PIPELINE_STORED && (c1 == GPU_PIPELINE_STORED || c1 == GPU_PIPELINE_LOADED));
+            hits = c3 == GPU_PIPELINE_LOADED;   /* the store-only one's, if the driver says (creation feedback) */
             if (!hits) printf("  pipeline cache: the driver does not say when it hits\n");
+            else CHECK(c2 == GPU_PIPELINE_LOADED);
         } else if (hits) {
-            CHECK(c1 == 1);   /* from the file */
+            CHECK(c0 == GPU_PIPELINE_LOADED && c1 == GPU_PIPELINE_LOADED);   /* from the file */
         }
         gpu_shader_destroy(d, vs);   /* pipelines outlive their shaders */
         gpu_shader_destroy(d, ps);
@@ -1396,9 +1412,33 @@ static void test_pipeline_cache(void)
         }
         gpu_device* d = gpu_vk_create(&dd);
         if (d) {
-            CHECK(gpu_pipeline_cache_load(d, path) == 0);
+            CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);
             gpu_destroy(d);
         }
+    }
+    /* No cache (the cap masked, as RSX_VK_MASK would): pipelines are made
+     * without it and never stored; a store-only one is made and destroyed. */
+    {
+        dd.cap_mask = GPU_CAP_PIPELINE_CACHE;
+        gpu_device* d = gpu_vk_create(&dd);
+        CHECK(d != NULL);
+        if (d) {
+            CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NONE);
+            const gpu_layout l = guest_layout(d);
+            const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
+            const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
+            gpu_pipeline_desc pd;
+            draw_desc(&pd, l, vs, ps);
+            uint32_t how = 7;
+            CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+            CHECK(how == GPU_PIPELINE_COMPILED && GPU_VK_DEV(d)->npso == 0);
+            how = 7;
+            CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_COMPILED);
+            CHECK(gpu_pipeline_cache_save(d, path) == 0);
+            CHECK(GPU_VK_DEV(d)->n_validation == 0);
+            gpu_destroy(d);
+        }
+        dd.cap_mask = 0;
     }
     remove(path);
 }
