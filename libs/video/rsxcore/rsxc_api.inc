@@ -113,14 +113,7 @@ static void rc_backend_shutdown(void)
     if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
-    if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
-    if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
-    }
-    if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
-    if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
     /* The passes' root signatures and pipelines are the GPU layer's (step
      * C3b): borrowed, and gpu_destroy frees them, so the releases below find
      * NULL. */
@@ -154,6 +147,11 @@ static void rc_backend_shutdown(void)
     s_d3d.srv_heap = s_d3d.samp_heap = s_d3d.blit_srv_heap = NULL;
     s_down_srv = NULL;
     s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
+    /* Step C5a: the display targets, the depth buffer, zeta and the
+     * offscreen targets with their views (no RTV or DSV heap is made) go
+     * with the device too; the native pointers were borrowed. */
+    s_d3d.depth_buffer = NULL;
+    for (u32 i = 0; i < FRAME_COUNT; i++) s_d3d.render_targets[i] = NULL;
     if (s_rc_dev) gpu_destroy(s_rc_dev);
     s_rc_dev = NULL;
 

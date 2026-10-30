@@ -95,6 +95,14 @@ gpu_texture gpu_d3d12_adopt_texture_of(gpu_device* d, ID3D12Resource* res);
  * with the pool, at gpu_destroy: never Released by the caller. */
 ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool pool);
 
+/* ---- step C5a ---- */
+
+/* A target view's CPU descriptor (an RTV or DSV in the backend's own heaps),
+ * for the old code's OMSetRenderTargets and Clear*View: the descriptor
+ * gpu_cmd_pass_begin binds. Valid while the view's texture lives; 0 for a
+ * handle that names no view. Read it once, where the view is made. */
+D3D12_CPU_DESCRIPTOR_HANDLE gpu_d3d12_view_cpu(gpu_device* d, gpu_view v);
+
 #ifdef __cplusplus
 }
 #endif

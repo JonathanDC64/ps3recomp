@@ -1464,6 +1464,64 @@ static void test_bridges_c4(const scene* s)
     }
 }
 
+/* ---- step C5a ---- */
+/* gpu_d3d12_view_cpu: a view's CPU descriptor is the one pass_begin binds,
+ * the old code's native bind and clear through it reach the texture, and it
+ * goes with the texture. */
+static void test_bridges_c5a(void)
+{
+    const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
+                                         GPU_STATE_RENDER_TARGET);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = t;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(g_d, &vd);
+    CHECK(GPU_VALID(t) && GPU_VALID(rtv));
+    const D3D12_CPU_DESCRIPTOR_HANDLE h = gpu_d3d12_view_cpu(g_d, rtv);
+    CHECK(h.ptr != 0 && GPU_VALID(rtv) && h.ptr == (SIZE_T)g_dd->view_cpu[GPU_HANDLE_INDEX(rtv.id)]);
+    const gpu_view none = {0};
+    CHECK(gpu_d3d12_view_cpu(g_d, none).ptr == 0);
+    if (GPU_VALID(t) && h.ptr) {
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        ID3D12GraphicsCommandList* cl =
+            (ID3D12GraphicsCommandList*)gpu_native(g_d, GPU_NATIVE_CMD, (uint64_t)(uintptr_t)c);
+        const float green[4] = {0, 1, 0, 1};
+        cl->lpVtbl->OMSetRenderTargets(cl, 1, &h, FALSE, NULL);
+        cl->lpVtbl->ClearRenderTargetView(cl, h, green, 0, NULL);
+        gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        CHECK(run(g_d, c));
+        readback rb;
+        CHECK(tex_read(t, &td, &rb));
+        if (rb.p) {
+            const uint8_t* a = px(&rb, 7, 9);
+            CHECK(a[0] == 0 && a[1] == 255 && a[2] == 0 && a[3] == 255);
+        }
+        rb_done(&rb);
+    }
+
+    /* A depth view's, the read-only one apart. */
+    gpu_texture_desc zd = tex_desc(16, 16, GPU_FORMAT_R24G8_TYPELESS, GPU_USE_DS | GPU_USE_SAMPLED,
+                                   GPU_STATE_DEPTH_WRITE);
+    zd.clear_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    zd.clear_depth = 1.0f;
+    const gpu_texture z = gpu_texture_create(g_d, &zd);
+    memset(&vd, 0, sizeof vd);
+    vd.texture = z;
+    vd.kind = GPU_VIEW_DSV;
+    vd.format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    const gpu_view dsv = gpu_view_get(g_d, &vd);
+    vd.flags = GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL;
+    const gpu_view ro = gpu_view_get(g_d, &vd);
+    const D3D12_CPU_DESCRIPTOR_HANDLE dh = gpu_d3d12_view_cpu(g_d, dsv), rh = gpu_d3d12_view_cpu(g_d, ro);
+    CHECK(GPU_VALID(z) && dh.ptr && rh.ptr && dh.ptr != rh.ptr && dh.ptr != h.ptr);
+
+    gpu_texture_destroy(g_d, t, 0);
+    gpu_texture_destroy(g_d, z, 0);
+    CHECK(gpu_d3d12_view_cpu(g_d, rtv).ptr == 0 && gpu_d3d12_view_cpu(g_d, dsv).ptr == 0);
+}
+
 /* GPU_DEVICE_BREADCRUMBS (DRED, not the debug layer): its feature bits, a
  * marker, and, on WARP only, a device removed on purpose (as today's
  * RSX_LOSE_DEVICE_AT_FRAME removes it): lost, its fence passing every value,
@@ -1532,6 +1590,7 @@ int main(void)
         test_bridges(&s);
         test_bridges_c4(&s);
     }
+    test_bridges_c5a();
     test_caches();
     test_fences();
     test_swapchain();

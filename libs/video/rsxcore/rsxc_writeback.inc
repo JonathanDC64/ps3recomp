@@ -578,22 +578,18 @@ static void off_rt_drop_rewritten(void)
           if (n < 40 && ++n) fprintf(stderr, "[RT] 0x%X (%ux%u) rewritten by the title: "
                                 "dropped (frame %llu)%c", r->off, r->w, r->h,
                                 (unsigned long long)s_d3d.frame_count, 10); }
-        off_rt_defer_release(r->res);  r->res = NULL;
-        off_rt_defer_release(r->up);   r->up = NULL;
+        off_rt_drop_target(r);   /* res and up (step C5a) */
         off_rt_defer_release(r->snap); r->snap = NULL;
         off_rt_defer_release(r->down); r->down = NULL;
-        rc_tex_drop(&r->tex); rc_tex_drop(&r->snap_tex);   /* step C4 */
+        rc_tex_drop(&r->snap_tex);   /* step C4 */
         r->gsum_ok = 0;
     }
 }
 
+/* The target's RTV, as off_rt_get made it (a view: step C5a). */
 static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE rh;
-    s_d3d.rt_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rt_rtv_heap, &rh);
-    rh.ptr += (u64)slot * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    return rh;
+    return s_d3d.off_rt[slot].rtv_cpu;
 }
 
 /* Write a texture SRV (or a null SRV when tex is none) at an absolute SRV

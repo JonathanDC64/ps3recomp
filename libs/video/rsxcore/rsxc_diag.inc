@@ -539,16 +539,14 @@ static void rsx_scale_apply(void)
     printf("[D3D12] RSX_SCALE: render targets at %u%%%c", want, 10);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        off_rt_defer_release(r->res);  r->res = NULL;
-        off_rt_defer_release(r->up);   r->up = NULL;
+        off_rt_drop_target(r);   /* res and up (step C5a) */
         off_rt_defer_release(r->snap); r->snap = NULL;
         off_rt_defer_release(r->down); r->down = NULL;
-        rc_tex_drop(&r->tex); rc_tex_drop(&r->snap_tex);   /* step C4 */
+        rc_tex_drop(&r->snap_tex);   /* step C4 */
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
-        off_rt_defer_release(s_zeta[i].res); s_zeta[i].res = NULL; s_zeta[i].used = 0;
-        rc_tex_drop(&s_zeta[i].tex);   /* step C4 */
+        zeta_drop(&s_zeta[i]); s_zeta[i].used = 0;   /* step C5a */
     }
     for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
     for (int i = 0; i < SUBVP_SLOTS; i++) rc_tex_drop(&s_subvp[i].tex);   /* step C4 */
@@ -556,11 +554,10 @@ static void rsx_scale_apply(void)
     rc_tex_drop(&s_rc_screen_copy_tex);   /* step C4 */
     gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
     s_d3d.readback_buf = NULL;
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;
-        rc_tex_drop(&s_rc_rt_tex[i]);   /* step C4 */
+    for (u32 i = 0; i < FRAME_COUNT; i++) {   /* with their views (step C5a) */
+        rc_grave_tex(&s_rc_rt_tex[i]); s_d3d.render_targets[i] = NULL;
     }
-    off_rt_defer_release(s_d3d.depth_buffer); s_d3d.depth_buffer = NULL;
+    rc_grave_tex(&s_rc_depth_tex); s_d3d.depth_buffer = NULL;
     s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
     s_d3d.host_h = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.height);
     if (display_targets_make() != 0 || depth_buffer_make() != 0) {

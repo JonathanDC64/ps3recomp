@@ -590,14 +590,11 @@ rtt_dump_done:;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
 
-    /* Get RTV handle for current frame */
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
-    rtv_handle.ptr += fi * s_d3d.rtv_descriptor_size;
+    /* Get RTV handle for current frame (its view's, step C5a) */
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rc_rt_rtv_cpu[fi];
 
     /* Get DSV handle (single depth buffer shared across frames) */
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = s_rc_depth_dsv_cpu;
 
     if (perf_on()) s_perf_pre += perf_now() - _pre0;
     /* Set render target + depth */
