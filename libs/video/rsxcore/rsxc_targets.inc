@@ -723,15 +723,20 @@ static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
     gpu_cmd_bind_table(s_rc_cmd, 3, gpu_fast_table_ref(s_rc_dev, s_rc_samp_pool, t * RSX_FP_UNITS));
 }
 
-/* Resources dropped while a frame is being recorded, released once the GPU
- * has finished that frame (off_rt_release_deferred, after render_frame's
- * opening wait). Grows as needed: a frame that flips a surface between two
- * formats draw by draw drops a resource each time. Step C5a: the GPU
- * layer's targets (and the offscreen targets' staging) wait here as
- * handles, and go with the fence of the last frame submitted: one dropped
- * while a frame is recorded was last used by that frame, and one dropped
- * before (rsx_scale_apply) by an earlier one. A texture's views go with it.
- * (Step C8a: the sub-viewport captures too; nothing native waits here.) */
+/* The grave (step C8a: the one deferred-destroy list; step C5a's and step
+ * C5b's write-back grave were two). Textures and buffers dropped while a
+ * frame is being recorded may still be used by that frame's list: they wait
+ * here, and at the next render_frame's start, after its opening wait
+ * (rc_grave_release), each goes to gpu_*_destroy with the fence of the last
+ * frame submitted, which the GPU layer frees it after. One dropped while a
+ * frame is recorded was last used by that frame, and one dropped before
+ * (rsx_scale_apply) by an earlier one. A texture's views go with it. Grows
+ * as needed: a frame that flips a surface between two formats draw by draw
+ * drops a target each time. In it: the offscreen targets and their staging,
+ * zeta, the display and depth targets, SMAA's targets, the AA display copy,
+ * the sub-viewport captures, and the write-back's downscale copies,
+ * snapshots and screen copy (which waited for a later render_frame's
+ * pre-pass, wb_tex_bury: the same point, after the same wait). */
 typedef struct { gpu_texture tex; gpu_buffer buf; } RcGrave;
 static RcGrave* s_rc_grave;
 static int s_rc_grave_n, s_rc_grave_cap;
@@ -745,7 +750,7 @@ static gpu_fence rc_last_frame_fence(void)
     return f;
 }
 
-static void off_rt_release_deferred(void)
+static void rc_grave_release(void)
 {
     if (s_rc_grave_n) {
         const gpu_fence after = rc_last_frame_fence();
@@ -757,7 +762,7 @@ static void off_rt_release_deferred(void)
     }
 }
 
-/* Step C5a: t and b (either may be none) into the handles' grave. */
+/* t and b (either may be none) into the grave. */
 static void rc_grave_put(gpu_texture t, gpu_buffer b)
 {
     if (!GPU_VALID(t) && !GPU_VALID(b)) return;
@@ -777,8 +782,8 @@ static void rc_grave_put(gpu_texture t, gpu_buffer b)
     s_rc_grave_n++;
 }
 
-/* A display or depth target (or a sub-viewport capture) dropped: its handle
- * (and views) into the grave; *t is none after. */
+/* A texture dropped (a target, a copy, a capture): its handle (and views)
+ * into the grave; *t is none after. */
 static void rc_grave_tex(gpu_texture* t)
 {
     const gpu_buffer none = {0};

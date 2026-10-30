@@ -340,7 +340,7 @@ static int smaa_luts_load(void)
 /* The edges and weights targets at w x h, made again when the size changes.
  * The GPU layer's (step C6): today's committed textures that allow a render
  * target, in RENDER_TARGET, cleared to zero fastest, with their RTVs as
- * views. A pair dropped while a frame is recorded waits in the handles' grave
+ * views. A pair dropped while a frame is recorded waits in the grave
  * (rc_grave_tex) and goes once the GPU is past that frame, as today's
  * off_rt_defer_release let it go. */
 static int smaa_targets(u32 w, u32 h)
@@ -455,8 +455,8 @@ static int aa_run_rt(int t)
 /* RSX_AA_AT=present: display buffer fi (in RENDER_TARGET, its view
  * s_rc_rt_rtv[fi]), finished, filtered from a copy of it. The copy is the
  * GPU layer's (step C6): today's committed RGBA8 texture with no flags, made
- * in COPY_DEST; one dropped while a frame is recorded waits in the handles'
- * grave, as today's off_rt_defer_release. The barriers, the copy and the
+ * in COPY_DEST; one dropped while a frame is recorded waits in the grave,
+ * as today's off_rt_defer_release. The barriers, the copy and the
  * pools bound are on the frame's recorder. */
 static void aa_run_display(u32 fi)
 {

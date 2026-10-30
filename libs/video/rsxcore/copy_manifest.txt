@@ -778,3 +778,17 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   OffRT.rtv_cpu with off_rt_rtv (9370), ZetaRT's dsv_cpu and dsv_ro_cpu
 #   (8466-8520), and render_frame's rtv_handle (12711's aa_run_display
 #   takes the view). Every bind and clear names the view.
+#  One grave: today's off_rt_defer_release (8418-8440) let a resource
+#   dropped while a frame is recorded go at the next render_frame's start,
+#   after its opening wait. Steps C5a and C5b kept two lists for that
+#   (the handles' grave, and the write-back's s_wb_grave with wb_tex_retire
+#   and wb_tex_bury, freed at a later render_frame's pre-pass): now one,
+#   rc_grave_put / rc_grave_tex into s_rc_grave, emptied by
+#   rc_grave_release (off_rt_release_deferred's place in render_frame),
+#   where each handle goes to gpu_texture_destroy or gpu_buffer_destroy
+#   with the fence of the last frame submitted (passed by then, so the GPU
+#   layer frees it at once). The write-back's copies, snapshots and screen
+#   copy go into it as the targets do. The staging buffers' list
+#   (s_ts_grave, tex_stage_frame) and the rings' old halves
+#   (rc_ring_retire, rc_ring_release) are freed at the same point, two
+#   lines later, and stay as they are.

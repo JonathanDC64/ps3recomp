@@ -33,7 +33,7 @@ static void render_frame(void)
       s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
     rsx_scale_apply();
     hdr_batch_start();           /* the targets HDR promotes in this batch */
-    off_rt_release_deferred();   /* RT resources the previous frame dropped */
+    rc_grave_release();          /* what the previous frame dropped (step C8a: the one grave) */
     rc_ring_release();           /* the rings it outgrew (step C2) */
     tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);

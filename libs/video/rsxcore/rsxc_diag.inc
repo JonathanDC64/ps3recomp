@@ -540,15 +540,15 @@ static void rsx_scale_apply(void)
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         off_rt_drop_target(r);   /* the target and its staging (step C5a) */
-        wb_tex_retire(&r->snap_tex);   /* step C5b */
-        wb_tex_retire(&r->down_tex);
+        rc_grave_tex(&r->snap_tex);   /* step C5b */
+        rc_grave_tex(&r->down_tex);
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
         zeta_drop(&s_zeta[i]); s_zeta[i].used = 0;   /* step C5a */
     }
     for (int i = 0; i < SUBVP_SLOTS; i++) rc_grave_tex(&s_subvp[i].tex);   /* step C8a */
-    wb_tex_retire(&s_rc_screen_copy_tex);   /* step C5b */
+    rc_grave_tex(&s_rc_screen_copy_tex);   /* step C5b */
     gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
     for (u32 i = 0; i < FRAME_COUNT; i++) rc_grave_tex(&s_rc_rt_tex[i]);   /* with their views (step C5a) */
     rc_grave_tex(&s_rc_depth_tex);

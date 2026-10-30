@@ -62,41 +62,9 @@ static u32 rt_guest_bpp(u32 dxgi)
 
 /* Step C5b: the textures made here (the downscale copies, the snapshots, the
  * screen copy) are the GPU layer's, held by their handles (step C8a). One
- * dropped while a frame is recorded may still be
- * used by that frame's list, so it waits in a grave and is destroyed at the
- * pre-pass of a later render_frame (wb_tex_bury, from
- * off_rt_drop_rewritten), after that render_frame's opening wait_for_gpu has
- * seen the GPU pass it: where today's off_rt_defer_release let it go. */
-typedef struct { gpu_texture tex; u32 serial; } WbGrave;   /* serial: the render_frame that dropped it */
-static WbGrave* s_wb_grave;
-static int s_wb_grave_n, s_wb_grave_cap;
-
-/* *t is dropped (none after). */
-static void wb_tex_retire(gpu_texture* t)
-{
-    if (!GPU_VALID(*t)) return;
-    if (s_wb_grave_n == s_wb_grave_cap) {
-        const int nc = s_wb_grave_cap ? s_wb_grave_cap * 2 : 32;
-        WbGrave* g = (WbGrave*)realloc(s_wb_grave, (size_t)nc * sizeof *g);
-        if (!g) { wait_for_gpu(); gpu_texture_destroy(s_rc_dev, *t, 0); t->id = 0; return; }   /* best effort */
-        s_wb_grave = g; s_wb_grave_cap = nc;
-    }
-    s_wb_grave[s_wb_grave_n].tex = *t;
-    s_wb_grave[s_wb_grave_n].serial = s_rf_serial;
-    s_wb_grave_n++;
-    t->id = 0;
-}
-
-/* The textures earlier render_frames dropped: the GPU is past them. */
-static void wb_tex_bury(void)
-{
-    int k = 0;
-    for (int i = 0; i < s_wb_grave_n; i++) {
-        if (s_wb_grave[i].serial != s_rf_serial) gpu_texture_destroy(s_rc_dev, s_wb_grave[i].tex, 0);
-        else s_wb_grave[k++] = s_wb_grave[i];
-    }
-    s_wb_grave_n = k;
-}
+ * dropped while a frame is recorded may still be used by that frame's list,
+ * so it goes into the grave (rc_grave_tex, rsxc_targets.inc), where today's
+ * off_rt_defer_release put it. */
 
 /* RSX_SCALE: the write-back of a scaled target.
  *
@@ -203,7 +171,7 @@ static gpu_texture off_rt_downscale(int i, int argb)
     const gpu_pipeline pso = down_pso((DXGI_FORMAT)r->gdxgi, argb);
     if (!pso.v) return none;
     if (GPU_VALID(r->down_tex) && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->gdxgi))
-        wb_tex_retire(&r->down_tex);   /* the open list may still use it */
+        rc_grave_tex(&r->down_tex);   /* the open list may still use it */
     if (!GPU_VALID(r->down_tex)) {
         /* Today's: committed, ALLOW_RENDER_TARGET, in RENDER_TARGET, no clear
          * value. */
@@ -581,7 +549,6 @@ static void off_rt_drop_rewritten(void)
 {
     extern uint8_t* vm_base;
     static int en = -1;
-    wb_tex_bury();   /* (step C5b) every frame, before the knob */
     PS3_KNOB(en, ps3_env_int("RSX_RT_REWRITTEN", 1));
     if (!en || !vm_base) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
@@ -593,8 +560,8 @@ static void off_rt_drop_rewritten(void)
                                 "dropped (frame %llu)%c", r->off, r->w, r->h,
                                 (unsigned long long)s_d3d.frame_count, 10); }
         off_rt_drop_target(r);   /* the target and its staging (step C5a) */
-        wb_tex_retire(&r->snap_tex);   /* step C5b */
-        wb_tex_retire(&r->down_tex);
+        rc_grave_tex(&r->snap_tex);   /* step C5b */
+        rc_grave_tex(&r->down_tex);
         r->gsum_ok = 0;
     }
 }
@@ -658,7 +625,7 @@ static gpu_texture off_rt_snapshot(int slot)
     OffRT* r = &s_d3d.off_rt[slot];
     if (!GPU_VALID(r->tex)) return k_rc_no_tex;
     if (GPU_VALID(r->snap_tex) && (r->snap_w != r->hw || r->snap_h != r->hh || r->snap_dxgi != r->dxgi))
-        wb_tex_retire(&r->snap_tex);   /* the open list may still use it */
+        rc_grave_tex(&r->snap_tex);   /* the open list may still use it */
     if (!GPU_VALID(r->snap_tex)) {
         /* The GPU layer's (step C5b), sampled by the draws (the SRV writes).
          * Today's: committed, no flags, in COPY_DEST. */
