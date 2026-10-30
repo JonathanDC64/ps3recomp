@@ -8,12 +8,23 @@
  *
  *   dxbc      FXC (D3DCompile), today's D3D12 renderer's exact call: the
  *             files are today's <cache>/<profile>_<key>.dxbc, shared with it.
- *   spv, dxil, metallib, msl
+ *   spv       glslang's HLSL front end, SPIR-V 1.3 for Vulkan 1.1, after the
+ *             text edits E1-E5, with the Vulkan backend's binding model and
+ *             the post-passes (gpu_shader_spv.h). Files are
+ *             <cache>/gpu/spv/<vs|ps|gs>_<T>.spv, T from the text's dxbc
+ *             key K, so one text has one K on every target. A vertex
+ *             shader flips y (D3D's clip space is y-up, Vulkan's y-down),
+ *             so the backend sets D3D's viewport as it is; a geometry
+ *             shader passes the position on unflipped, so there is one flip
+ *             with it or without it. A pixel shader's SV_Position.w is
+ *             D3D's, the reciprocal of Vulkan's FragCoord.w.
+ *   dxil, metallib, msl
  *             declared; not available yet.
  *
  * The cache directory is PS3_SHADER_CACHE (default shader_cache beside the
  * executable; 0 turns the cache off), as today's. Built only with
- * PS3RECOMP_RSX_HAL; dxbc only on Windows and on vkd3d.
+ * PS3RECOMP_RSX_HAL; dxbc only on Windows and on vkd3d, spv with
+ * PS3RECOMP_RSX_HAL_SPV (Windows and Linux).
  */
 #ifndef PS3RECOMP_GPU_SHADER_H
 #define PS3RECOMP_GPU_SHADER_H
@@ -64,7 +75,9 @@ typedef struct gpu_sc_blob {
 
 /* 1 if the target is built here. */
 int gpu_sc_available(gpu_sc_target target);
-/* The compiler's name for the stage ("vs_5_0" for dxbc), NULL if none. */
+/* The compiler's name for the stage ("vs_5_0" for dxbc), NULL if none. The
+ * spv target gives the dxbc names too: its texts are the same HLSL, and the
+ * key K of a text is gpu_sc_key over them on every target. */
 const char* gpu_sc_profile(gpu_sc_target target, gpu_sc_stage stage);
 
 /* The cache directory ("" when the cache is off or there is none here). The
@@ -88,6 +101,16 @@ int gpu_sc_compile(gpu_sc_target target, gpu_sc_stage stage, const char* src, si
 int gpu_sc_compile_entry(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
                          const char* name, const char* entry, unsigned flags, gpu_sc_blob* out,
                          char* err, size_t err_cap);
+/* gpu_sc_compile_entry for a layout of the GPU layer (gpu.h): the spv target
+ * puts each resource where the Vulkan backend's pipeline layout for it has
+ * it, and the layout's CONST32 slots in its push constant block. NULL is the
+ * guest programs' layout, which gpu_sc_compile and gpu_sc_compile_entry use;
+ * a built-in pass passes its own. With the cache, the spv key holds the
+ * layout. dxbc does not use it (the registers are the root signature's). */
+struct gpu_layout_desc;
+int gpu_sc_compile_layout(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                          const char* name, const char* entry, const struct gpu_layout_desc* layout,
+                          unsigned flags, gpu_sc_blob* out, char* err, size_t err_cap);
 /* The program the cache holds under key K (gpu_sc_key of its text), with the
  * checks a cache hit makes: GPU_SC_OK, or GPU_SC_NOT_CACHED. Not counted as a
  * hit. Thread-safe. */
@@ -106,10 +129,25 @@ void gpu_sc_warm(void);
  * rsx_d3d12_shader_cache_put. Thread-safe. */
 int gpu_sc_put(gpu_sc_target target, gpu_sc_stage stage, const char* src);
 
+/* The spv target's post-passes, run on every module it hands out (compiled
+ * or read from the cache, which holds glslang's output), so a backend can
+ * leave out what its device lacks: set them before compiling. The default
+ * is all but BASE_VERTEX (every draw today starts at vertex 0, where the two
+ * agree); RSX_SPV_NOCONTRACT=0 leaves NoContraction out (an A/B knob). */
+#define GPU_SC_SPV_FLOAT_PRESERVE  1u   /* SignedZeroInfNanPreserve 32 (shaderSignedZeroInfNanPreserveFloat32) */
+#define GPU_SC_SPV_DENORM_PRESERVE 2u   /* DenormPreserve 32 (shaderDenormPreserveFloat32) */
+#define GPU_SC_SPV_NO_CONTRACT     4u   /* NoContraction on float arithmetic: no fused multiply-add */
+#define GPU_SC_SPV_INVARIANT       8u   /* Invariant on the position output */
+#define GPU_SC_SPV_BASE_VERTEX     16u  /* SV_VertexID as D3D12's: VertexIndex - BaseVertex (shaderDrawParameters) */
+#define GPU_SC_SPV_ALL             31u
+#define GPU_SC_SPV_DEFAULT         15u
+void gpu_sc_spv_set_options(unsigned opts);
+unsigned gpu_sc_spv_options(void);
+
 /* PERF counters (today's s_perf_fxc, s_perf_fxc_n, s_perf_sc_hits): kept
  * while gpu_sc_perf(1) is on. take copies them and, with reset, zeroes them. */
 typedef struct gpu_sc_stats {
-    double compile_s;          /* time inside the compiler */
+    double compile_s;          /* time inside the compiler (every target's) */
     int    compiles;
     int    cache_hits;
 } gpu_sc_stats;

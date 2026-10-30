@@ -58,6 +58,51 @@ FetchContent_Declare(spirv_cross
     GIT_TAG f11ba9f0b21ba8fc15153d50a2a1ae31ab1cf8f7   # vulkan-sdk-1.4.363.0
     ${_ps3_gpu_dep_excl})
 
+# The shader compile service's spv target (libs/video/gpu/gpu_shader_spv*.cpp): HLSL -> SPIR-V through glslang's
+# HLSL front end, with SPIRV-Tools' legalization passes and validator. On by default where the Vulkan backend is
+# (Windows and Linux). SPIRV-Headers, SPIRV-Tools and glslang come from their pins above, built static, libraries
+# only: no tests, tools or install rules. Their build runs Python 3 (grammar tables, glslang's build_info.h).
+if(WIN32 OR (UNIX AND NOT APPLE))
+    set(_ps3_gpu_spv_default ON)
+else()
+    set(_ps3_gpu_spv_default OFF)
+endif()
+option(PS3RECOMP_RSX_HAL_SPV "The shader compile service's spv target (glslang and SPIRV-Tools, fetched)"
+       ${_ps3_gpu_spv_default})
+if(PS3RECOMP_RSX_HAL_SPV AND (TARGET glslang::glslang OR TARGET SPIRV-Tools-opt))
+    # A system glslang found earlier (CMakeLists.txt, the Metal path's MSL translation) defines the same target
+    # names as the pinned one, so the two cannot be in one build.
+    message(WARNING "PS3RECOMP_RSX_HAL_SPV: a system glslang or SPIRV-Tools is already loaded; the spv target is "
+                    "not built. Configure without it, or with -DPS3RECOMP_RSX_HAL_SPV=OFF.")
+    set(PS3RECOMP_RSX_HAL_SPV OFF)
+endif()
+if(PS3RECOMP_RSX_HAL_SPV)
+    set(_ps3_gpu_spv_shared "${BUILD_SHARED_LIBS}")
+    set(BUILD_SHARED_LIBS OFF)
+    set(SPIRV_HEADERS_ENABLE_TESTS OFF)
+    set(SPIRV_HEADERS_ENABLE_INSTALL OFF)
+    FetchContent_MakeAvailable(spirv_headers)
+    set(SPIRV-Headers_SOURCE_DIR "${spirv_headers_SOURCE_DIR}")
+    set(SPIRV_SKIP_TESTS ON)
+    set(SPIRV_SKIP_EXECUTABLES ON)
+    set(SKIP_SPIRV_TOOLS_INSTALL ON)
+    set(SPIRV_WERROR OFF)
+    set(SPIRV_BUILD_FUZZER OFF)
+    set(SPIRV_TOOLS_BUILD_STATIC ON)
+    set(SPIRV_TOOLS_USE_MIMALLOC OFF)
+    FetchContent_MakeAvailable(spirv_tools)
+    set(GLSLANG_TESTS OFF)
+    set(GLSLANG_ENABLE_INSTALL OFF)
+    set(ENABLE_GLSLANG_BINARIES OFF)
+    set(ENABLE_GLSLANG_JS OFF)
+    set(ENABLE_HLSL ON)
+    set(ENABLE_OPT ON)
+    set(BUILD_EXTERNAL OFF)
+    FetchContent_MakeAvailable(glslang)
+    set(BUILD_SHARED_LIBS "${_ps3_gpu_spv_shared}")
+    message(STATUS "  Renderer:     the compile service's spv target (glslang, SPIRV-Tools: fetched at their pins)")
+endif()
+
 message(STATUS "  Renderer:     GPU layer dependencies declared (Vulkan SDK 1.4.363.0 pins)")
 
 # The Vulkan backend (libs/video/gpu/gpu_vk*): on by default on the systems with a Vulkan driver to run it today,
