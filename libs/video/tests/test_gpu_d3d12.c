@@ -1210,6 +1210,9 @@ static void test_swapchain(void)
         gpu_texture img;
         const uint32_t i = gpu_swap_acquire(g_d, sc, &img);
         CHECK(i < 2 && GPU_VALID(img));
+        /* The bridge's image by index: the current one is acquire's; the other is another; none past 2. */
+        CHECK(gpu_d3d12_swap_image(g_d, sc, i).id == img.id && GPU_VALID(gpu_d3d12_swap_image(g_d, sc, 1 - i)) &&
+              gpu_d3d12_swap_image(g_d, sc, 1 - i).id != img.id && !GPU_VALID(gpu_d3d12_swap_image(g_d, sc, 2)));
         gpu_view_desc vd;
         memset(&vd, 0, sizeof vd);
         vd.texture = img;
@@ -1234,8 +1237,8 @@ static void test_swapchain(void)
         CHECK(gpu_swap_resize(g_d, sc, 96, 64, GPU_FORMAT_R8G8B8A8_UNORM) == 0);
         CHECK(!gpu_d3d12_slot_valid(&g_dd->tex_slots, img.id) && !gpu_d3d12_slot_valid(&g_dd->view_slots, rtv.id));
         gpu_texture img2;
-        gpu_swap_acquire(g_d, sc, &img2);
-        CHECK(GPU_VALID(img2) && img2.id != img.id);
+        const uint32_t i2 = gpu_swap_acquire(g_d, sc, &img2);
+        CHECK(GPU_VALID(img2) && img2.id != img.id && gpu_d3d12_swap_image(g_d, sc, i2).id == img2.id);
         ID3D12Resource* r = (ID3D12Resource*)gpu_native(g_d, GPU_NATIVE_TEXTURE, img2.id);
         CHECK(r != NULL);
         if (r) {

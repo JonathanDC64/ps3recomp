@@ -126,6 +126,48 @@ libs/video/rsxcore/rsxc_vertex.inc 13403-15040 vertex reads and uploads, the ver
 libs/video/rsxcore/rsxc_record2.inc 15041-15742 draw_arrays, draw_indexed, bind_texture, vertex attribs, shader, blend, depth
 libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutdown, display timing, the overlay, the exports
 
+# ---------------------------------------------------------------------------
+# Step C1: the device, recording, fences and the swap chain on the GPU layer.
+# The fragments below are no longer verbatim at these legacy lines: a fix
+# there needs a hand port. The rest of each fragment is still its range run
+# through the #sed script. s_d3d.device, cmd_queue, swap_chain, swap_buffers
+# and cmd_list hold the GPU layer's objects, borrowed (gpu_native); s_d3d's
+# fence, fence_event, fence_values and cmd_allocators are unused.
+#  rsxc_d3d12.c: includes gpu_d3d12_cmd.h and gpu_d3d12_bridge.h after
+#    rsxc_head.inc.
+#  rsxc_state.inc, after s_d3d (598): s_rc_dev, s_rc_swap, s_rc_swap_image,
+#    s_rc_cmd, s_rc_frame_fence.
+#  rsxc_hdr.inc: swap_color_space 1721-1726 (gpu_swap_hdr); swap_buffers_get
+#    1745-1753 (the swap chain's images through gpu_d3d12_swap_image, the RTVs
+#    as before); display_note 2240-2246 (gpu_swap_stats); check_device
+#    2298-2299 (gpu_lost); swap_present 2321-2322 (gpu_swap_present);
+#    swap_resize 2343-2351, 2358-2359, 2377-2382 (gpu_swap_resize,
+#    gpu_swap_acquire; no fence values to move on one timeline).
+#  rsxc_init.inc: frame_cmd_begin and frame_cmd_submit, new after fnv_bytes
+#    (2397); init_d3d12 2483-2609: the debug layer is never enabled on this
+#    route (D3D12_DBG and debug builds included); DRED, the factory, the
+#    adapter, the device and the queue are gpu_d3d12_create's (D3D12_DRED:
+#    GPU_DEVICE_BREADCRUMBS, CELLMARK_IGPU: GPU_DEVICE_LOW_POWER, FRAME_COUNT
+#    cmd slots), pso_lib_open and shader_cache_warm after it; the swap chain
+#    is gpu_swap_create's, tearing from GPU_CAP_TEARING; init_d3d12 2612-2647
+#    and 2699-2723: the recorders and the fence are the device's (slot 0
+#    begun and ended once, so s_d3d.cmd_list is a closed list after init).
+#  rsxc_sync.inc: dred_list and dred_report 3223-3334 (gpu_fault_report);
+#    wait_for_gpu 3339-3367 and move_to_next_frame 3413-3436 (the device's
+#    timeline: gpu_signal, gpu_fence_wait 2000 ms, gpu_fence_completed,
+#    gpu_lost; s_rc_frame_fence per frame slot); lose_device_test 3403-3404
+#    (gpu_native).
+#  rsxc_cap.inc: cap_readback_write 3650-3651, 3690-3692 (frame_cmd_begin,
+#    frame_cmd_submit).
+#  rsxc_diag.inc: frame_log 10473-10474, 10482 (gpu_swap_stats).
+#  rsxc_frame.inc: render_frame 11230-11231, 12775-12777 (frame_cmd_begin,
+#    frame_cmd_submit).
+#  rsxc_api.inc: rc_backend_shutdown 15856-15862, 15877-15879 (the GPU
+#    layer's objects go with gpu_destroy; the borrowed pointers are cleared
+#    first); present_queued 16056-16062 (gpu_swap_stats); rc_overlay_tick
+#    16105-16108, 16115, 16138-16140 (frame_cmd_begin, gpu_cmd_end,
+#    frame_cmd_submit); a comment before rc_device (16167).
+
 # ---- The D3D12 backend (libs/video/gpu/gpu_d3d12*, package S2) ----
 # Today's device calls with their parameters, onto handles: the D3D12 calls
 # and their logic are copied, s_d3d's fields are the device's. Knobs read

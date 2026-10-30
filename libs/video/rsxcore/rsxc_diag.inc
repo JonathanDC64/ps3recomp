@@ -509,8 +509,8 @@ static void frame_log(long long q0, long long q1)
     extern volatile long long g_gcm_flip_word_qpc;
     if (!first) first = q0;
     const double ms = 1000.0 / (double)freq;
-    DXGI_FRAME_STATISTICS fs; memset(&fs, 0, sizeof fs);
-    if (FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)))
+    gpu_present_stats fs; memset(&fs, 0, sizeof fs);
+    if (gpu_swap_stats(s_rc_dev, s_rc_swap, &fs))
         memset(&fs, 0, sizeof fs);
     const u32 fw = g_gcm_flip_words;
     const long long fq = g_gcm_flip_word_qpc;
@@ -518,7 +518,7 @@ static void frame_log(long long q0, long long q1)
             (q0 - first) * ms, prev ? (q0 - prev) * ms : 0.0,
             s_rf_entry_qpc ? (q0 - s_rf_entry_qpc) * ms : 0.0, (q1 - q0) * ms,
             fq ? (q0 - fq) * ms : -1.0, fw - fw_prev, s_dbg_last_draws,
-            fs.PresentCount, fs.PresentRefreshCount, fs.SyncRefreshCount,
+            fs.present_count, fs.present_refresh_count, fs.sync_refresh_count,
             s_fl_wait_ms, s_fl_store_ms);
     prev = q0; fw_prev = fw;
     { static int n = 0; if (++n % 64 == 0) fflush(f); }

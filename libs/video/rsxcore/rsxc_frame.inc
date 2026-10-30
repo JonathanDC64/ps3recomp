@@ -70,8 +70,7 @@ static void render_frame(void)
     }
 
     /* Reset command allocator and list */
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+    frame_cmd_begin(fi);
 
     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
      * The atlas is a linear 8-bit coverage map, so a straight row copy (no
@@ -1615,9 +1614,7 @@ skip_dump_consider: ;
     }
 
     /* Close and execute */
-    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
-    ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
-    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
+    frame_cmd_submit();
 
     dred_report("frame submit");
     if (write_color_on() && write_color_defer()) {

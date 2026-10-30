@@ -443,6 +443,17 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+/* The GPU layer's objects (portable renderer, step C1): the device, the swap
+ * chain and its images, the recorder begun last (open until frame_cmd_submit),
+ * and each frame slot's fence. s_d3d.device, cmd_queue, swap_chain,
+ * swap_buffers and cmd_list hold the same objects as native pointers for the
+ * code not converted yet: borrowed (gpu_native), never released by the core.
+ * s_d3d.fence, fence_event, fence_values and cmd_allocators are unused. */
+static gpu_device*   s_rc_dev;
+static gpu_swapchain s_rc_swap;
+static gpu_texture   s_rc_swap_image[FRAME_COUNT];
+static gpu_cmd*      s_rc_cmd;
+static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
 static int draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;

@@ -12,6 +12,7 @@
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
 
 #include "gpu_d3d12_internal.h"
+#include "gpu_d3d12_bridge.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -168,6 +169,14 @@ uint32_t gpu_d3d12_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* im
     const uint32_t i = s->sc->lpVtbl->GetCurrentBackBufferIndex(s->sc);
     if (image) *image = i < GPU_D3D12_MAX_IMAGES ? s->image[i] : s->image[0];
     return i;
+}
+
+/* The bridge (gpu_d3d12_bridge.h): image i of the swap chain. */
+gpu_texture gpu_d3d12_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t i)
+{
+    gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
+    gpu_texture none = {0};
+    return s && i < s->buffers ? s->image[i] : none;
 }
 
 /* 0, or the failed Present's HRESULT (for the caller's check_device). */

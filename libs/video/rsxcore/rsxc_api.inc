@@ -111,13 +111,8 @@ static void rc_backend_shutdown(void)
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
-    if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
-    if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
-    if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
-        if (s_d3d.swap_buffers[i]) s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
@@ -132,9 +127,21 @@ static void rc_backend_shutdown(void)
     if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
     if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
     memset(&s_aa, 0, sizeof s_aa);
-    if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
-    if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
-    if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
+    /* The swap chain and its buffers, the recorders, the fence, the queue and
+     * the device are the GPU layer's: s_d3d's pointers to them were borrowed,
+     * and gpu_destroy frees them once the GPU is idle. */
+    s_d3d.device = NULL;
+    s_d3d.cmd_queue = NULL;
+    s_d3d.swap_chain = NULL;
+    s_d3d.cmd_list = NULL;
+    for (u32 i = 0; i < FRAME_COUNT; i++) {
+        s_d3d.swap_buffers[i] = NULL;
+        s_rc_swap_image[i].id = 0;
+    }
+    s_rc_cmd = NULL;
+    s_rc_swap.id = 0;
+    if (s_rc_dev) gpu_destroy(s_rc_dev);
+    s_rc_dev = NULL;
 
     /* A window belongs to the thread that made it: the window thread
      * destroys its own and then leaves its message loop. */
@@ -311,13 +318,11 @@ static int rc_display_shown_mhz(void)
  * chain's statistics cannot say. */
 static int present_queued(void)
 {
-    UINT last = 0;
-    DXGI_FRAME_STATISTICS fs;
-    memset(&fs, 0, sizeof fs);
-    if (FAILED(s_d3d.swap_chain->lpVtbl->GetLastPresentCount(s_d3d.swap_chain, &last)) ||
-        FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)) || !fs.PresentCount)
+    gpu_present_stats st;
+    memset(&st, 0, sizeof st);
+    if (gpu_swap_stats(s_rc_dev, s_rc_swap, &st) || !st.present_count)
         return -1;
-    const UINT ahead = last - fs.PresentCount;
+    const UINT ahead = st.last_present_count - st.present_count;
     if (ahead > FRAME_COUNT + 1) return -1;   /* (statistics that do not follow this swap chain) */
     return ahead != 0;
 }
@@ -361,16 +366,15 @@ static void rc_overlay_tick(void)
     /* The held frame into the game's buffer for this index (cleared by the
      * next batch anyway), then into the window's as for any frame. */
     const u32 fi = s_d3d.frame_index;
+    frame_cmd_begin(fi);
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
     if (!held) {
         /* The last frame shown is still in its render target: a frame index
          * moves only at a Present, so every batch since has drawn into the
          * other one. */
         hold_copy(s_shown_fi);
         if (!s_hold_valid) {
-            cl->lpVtbl->Close(cl);
+            gpu_cmd_end(s_rc_dev, s_rc_cmd);
             return;
         }
     }
@@ -393,9 +397,7 @@ static void rc_overlay_tick(void)
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
     blit_to_window(fi);
     s_shown_fi = fi;
-    cl->lpVtbl->Close(cl);
-    ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
-    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+    frame_cmd_submit();
     s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[fi], fi, s_d3d.win_w, s_d3d.win_h);
     swap_present(0);
     s_repaints++;
@@ -423,6 +425,8 @@ static void rc_set_borderless(int on)
 #endif
 }
 static int      rc_borderless(void)   { return s_borderless; }
+/* The device, the queue and the swap chain's buffers for the menu renderer:
+ * the GPU layer's own objects (gpu_native), borrowed as today's were. */
 static void*    rc_device(void)       { return s_d3d.device; }
 static long     rc_device_lost(long long* qpc)
 {
