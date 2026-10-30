@@ -792,3 +792,9 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   (s_ts_grave, tex_stage_frame) and the rings' old halves
 #   (rc_ring_retire, rc_ring_release) are freed at the same point, two
 #   lines later, and stay as they are.
+#  Shutdown (rsx_d3d12_backend_shutdown, 15828-15897): the vertex jobs'
+#   queued work is finished first (vpj_sync), then the GPU waited for:
+#   the rings they write are the GPU layer's buffers, which gpu_destroy
+#   frees (today's leaked, mapped for life). The grave and the staging
+#   buffers' list are emptied before gpu_destroy, which frees what they
+#   hold, so a device made again never destroys by an old handle.
