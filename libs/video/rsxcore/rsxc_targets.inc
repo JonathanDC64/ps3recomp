@@ -793,7 +793,7 @@ static void off_rt_drop_target(OffRT* r)
     rc_grave_put(r->tex, r->up_buf);
     r->tex.id = 0;
     r->up_buf.id = 0;
-    r->rtv.id = 0;   r->rtv_cpu.ptr = 0;
+    r->rtv.id = 0;
 }
 
 static int off_rt_find(u32 off)
@@ -814,7 +814,6 @@ static int off_rt_find(u32 off)
 typedef struct {
     gpu_texture tex;    /* the GPU layer's texture (step C5a) */
     gpu_view dsv, dsv_ro;   /* its writable and read-only DSVs (step C5a) */
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_cpu, dsv_ro_cpu;   /* theirs, for the native binds */
     u32 off, w, h;      /* guest dims */
     u32 hw, hh;         /* the resource's dims (RSX_SCALE) */
     int used;
@@ -838,7 +837,6 @@ static void zeta_drop(ZetaRT* z)
 {
     rc_grave_tex(&z->tex);
     z->dsv.id = z->dsv_ro.id = 0;
-    z->dsv_cpu.ptr = z->dsv_ro_cpu.ptr = 0;
 }
 
 static int zeta_find(u32 off)
@@ -898,19 +896,19 @@ static int zeta_get(u32 off, u32 w, u32 h)
     z->off = off; z->w = w; z->h = h; z->used = 1;
     z->hw = td.width; z->hh = td.height;
     z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT, &z->dsv_cpu);
+    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
     z->dsv_ro = rc_target_view(z->tex, GPU_VIEW_DSV, GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL,
-                               GPU_FORMAT_D24_UNORM_S8_UINT, &z->dsv_ro_cpu);
+                               GPU_FORMAT_D24_UNORM_S8_UINT);
     gpu_cmd_clear_depth(s_rc_cmd, z->dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0, NULL);
     printf("[ZETA] depth surface 0x%08X %ux%u (host %ux%u, slot %d)\n", off, w, h, z->hw, z->hh, slot);
     return slot;
 }
 
 /* Ensure an RT resource exists for this surface; (re)creates its RTV (a view
- * of the texture, step C5a) and the SRV at srv_heap[RT_SRV_BASE+i]. */
+ * of the texture, step C5a) and the SRV at the SRV pool's RT_SRV_BASE+i. */
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
 {
-    if (!off || !s_d3d.srv_heap) return -1;
+    if (!off || !GPU_VALID(s_rc_srv_pool)) return -1;
     if (!w) w = s_d3d.width;
     if (!h) h = s_d3d.height;
     DXGI_FORMAT want_fmt = rt_dxgi(off, rsx_fmt);
@@ -1065,7 +1063,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
 
-    r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0, &r->rtv_cpu);   /* today's NULL description */
+    r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0);   /* today's NULL description */
 
     gpu_view_desc sv;   /* in the SRV pool (step C4) */
     memset(&sv, 0, sizeof sv);

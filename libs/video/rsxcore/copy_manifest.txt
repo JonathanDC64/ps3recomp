@@ -765,3 +765,16 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   (rsxc_d3d12.c: rc_be_create for gpu_d3d12_create, rc_be_layout_hash,
 #   rc_be_pipeline_desc for pso_manifest.bin's D3D12 records, and
 #   rc_be_lose_device for lose_device_test's RemoveDevice, 3395-3410).
+#  Heaps and views: no descriptor heap or CPU descriptor is borrowed. The
+#   shader-visible heaps were the table pools' (s_d3d.srv_heap 516,
+#   samp_heap 557, blit_srv_heap 477, writeback's s_down_srv 8847, read
+#   through gpu_d3d12_table_pool_heap since step C4): each goes, and made?
+#   (2992, 3103, 1897, 8912, 7106, 8572, 10622, 10774) is GPU_VALID of the
+#   pool. rt_rtv_heap (571) goes too: the offscreen RTVs are views. The CPU
+#   descriptors kept beside the views for the native binds go with them:
+#   rc_target_view's cpu parameter (gpu_d3d12_view_cpu), the display
+#   targets', the depth target's and the swap chain's (s_rc_rt_rtv_cpu,
+#   s_rc_depth_dsv_cpu, s_rc_swap_rtv_cpu: 2404, 2473, 11762-11767),
+#   OffRT.rtv_cpu with off_rt_rtv (9370), ZetaRT's dsv_cpu and dsv_ro_cpu
+#   (8466-8520), and render_frame's rtv_handle (12711's aa_run_display
+#   takes the view). Every bind and clear names the view.

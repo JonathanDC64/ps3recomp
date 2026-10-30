@@ -140,7 +140,6 @@ typedef struct {
 typedef struct {
     gpu_texture           tex;         /* the GPU layer's texture (step C5a) */
     gpu_view              rtv;         /* its RTV (step C5a) */
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_cpu;   /* rtv's CPU descriptor, for the native binds (off_rt_rtv) */
     gpu_buffer            up_buf;      /* init-upload staging (kept alive): the GPU layer's (step C5a) */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
@@ -305,7 +304,6 @@ typedef struct {
     u32                        win_w, win_h;
     gpu_layout                 blit_layout;   /* (step C3b) */
     gpu_pipeline               blit_pso;
-    ID3D12DescriptorHeap*      blit_srv_heap;   /* shader-visible: one SRV per render_targets[i] */
 
     /* Synchronization */
     u32          frame_index;
@@ -325,8 +323,8 @@ typedef struct {
     int                   dump_skip_left;   /* CELLMARK_DUMP_SKIP: presents to ignore first */
 
     /* (The font atlas's pipeline, texture and state are gone with the pass of
-     * the draws without a vertex program: step C8a.) */
-    ID3D12DescriptorHeap* srv_heap;             /* shader-visible, 1 SRV slot  */
+     * the draws without a vertex program: step C8a.) The shader-visible
+     * heaps are the table pools s_rc_srv_pool and s_rc_samp_pool (step C4). */
 
     /* Real RSX vertex-program path: the captured VP is decompiled to HLSL and
      * used as the vertex shader, fed the raw float4 attrib0 + the vp_c[]
@@ -354,10 +352,9 @@ typedef struct {
     int                   vp_fp_n, vp_fp_cap;
     /* VP path: latest texture bound per unit (t0-t3). */
     struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
-    ID3D12DescriptorHeap* samp_heap;            /* shader-visible guest samplers */
     u32                   samp_n;               /* 4-sampler tables created so far */
 
-    /* Render-to-texture: offscreen RT pool + their RTV heap. */
+    /* Render-to-texture: offscreen RT pool (their RTVs are views). */
     OffRT                 off_rt[MAX_OFF_RTS];
     /* DRAW_ARRAYS batch merging (see d3d12_draw_arrays): the vertex index one
      * past the last batch, and whether the current BEGIN/END may still be
@@ -367,7 +364,6 @@ typedef struct {
     /* Indexed strip/fan merging (see d3d12_draw_indexed): the primitive of
      * the last draw when it was one, else 0. merge_first_end is its end. */
     int                   merge_strip;
-    ID3D12DescriptorHeap* rt_rtv_heap;          /* MAX_OFF_RTS RTVs (CPU only)   */
 
     /* Frame-parity double buffering for the per-draw upload streams (vp_vb
      * vertices, vp_cb constants, vp_fpcb texscales): records for frame N+1
@@ -664,41 +660,33 @@ static u32    s_lock_n  = 0;
 
 /* Step C4: the shader-visible descriptor heaps are the GPU layer's table
  * pools, and every SRV and sampler write goes through them, the memo
- * included (gpu_table_write_tex; per draw gpu_fast_table_write_tex). The
- * heap pointers (s_d3d.srv_heap, samp_heap, blit_srv_heap, writeback's
- * s_down_srv) are the pools' heaps, borrowed (gpu_d3d12_table_pool_heap),
- * for the binding commands not converted yet. Every resource an SRV names
+ * included (gpu_table_write_tex; per draw gpu_fast_table_write_tex), and
+ * every bind names a pool (step C8a: no heap pointer is borrowed; made? is
+ * the pool's handle). Every resource an SRV names
  * is a texture of the GPU layer's, by its handle (step C8a: the last ones
  * adopted, the sub-viewport captures, are its own now), so no write looks a
  * handle up. */
-static gpu_table_pool s_rc_srv_pool;    /* s_d3d.srv_heap */
-static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
-static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
-static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
+static gpu_table_pool s_rc_srv_pool;    /* the textures' (the draws, the passes) */
+static gpu_table_pool s_rc_samp_pool;   /* the guest's samplers */
+static gpu_table_pool s_rc_blit_pool;   /* the blit's: one SRV per display target */
+static gpu_table_pool s_rc_down_pool;   /* the write-back downscale's (rsxc_writeback.inc) */
 static gpu_texture    s_rc_screen_copy_tex;       /* the screen copy: the GPU layer's (step C5b) */
 static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 
 /* Step C5a: the colour and depth targets are the GPU layer's textures (the
  * display targets s_rc_rt_tex above, the depth buffer, zeta, the offscreen
  * pool), held by their handles (step C8a), and their RTVs and
- * DSVs are its views (gpu_view_get): s_d3d.rtv_heap, swap_rtv_heap,
- * dsv_heap and rt_rtv_heap are never made (unused), nor zeta's DSV heap. The
- * binds and clears not converted yet (rsxc_frame.inc, blit_to_window, the
- * AA pass) take CPU descriptors: each view's is read once where it is made
- * (gpu_d3d12_view_cpu) and kept beside it, so they stay plain loads. */
+ * DSVs are its views (gpu_view_get): no RTV or DSV heap is made. Every bind
+ * and clear takes the view (step C8a: no CPU descriptor is kept beside it). */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
-static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_rt_rtv_cpu[FRAME_COUNT];
 static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
-static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_depth_dsv_cpu;
 static gpu_view       s_rc_swap_rtv[FRAME_COUNT];     /* the swap chain images' RTVs */
-static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_swap_rtv_cpu[FRAME_COUNT];
 
 /* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and
- * kept with t, and its CPU descriptor in *cpu. Format 0 and flags 0 are
- * today's NULL RTV description; DSVs spell their format out, as today. */
-static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format format,
-                               D3D12_CPU_DESCRIPTOR_HANDLE* cpu)
+ * kept with t. Format 0 and flags 0 are today's NULL RTV description; DSVs
+ * spell their format out, as today. */
+static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format format)
 {
     gpu_view_desc vd;
     memset(&vd, 0, sizeof vd);
@@ -707,9 +695,7 @@ static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format fo
     vd.dim = GPU_DIM_2D;
     vd.flags = (uint8_t)flags;
     vd.format = format;
-    const gpu_view v = gpu_view_get(s_rc_dev, &vd);
-    *cpu = gpu_d3d12_view_cpu(s_rc_dev, v);
-    return v;
+    return gpu_view_get(s_rc_dev, &vd);
 }
 
 /* Step C6: the passes that run a few times a frame (the output filter, the

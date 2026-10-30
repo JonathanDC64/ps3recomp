@@ -521,7 +521,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
       } }
     extern uint8_t* vm_base;
 
-    if (!off || !w || !h || !vm_base || !s_d3d.srv_heap) return -1;
+    if (!off || !w || !h || !vm_base || !GPU_VALID(s_rc_srv_pool)) return -1;
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45

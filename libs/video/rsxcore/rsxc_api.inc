@@ -125,11 +125,8 @@ static void rc_backend_shutdown(void)
     for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
     s_rc_cmd = NULL;
     s_rc_swap.id = 0;
-    /* Step C4: the shader-visible heaps are the table pools', borrowed too;
-     * the pools, the texture slots, the staging buffers, the pool's heaps and
-     * the adopted textures' handles go with the device. */
-    s_d3d.srv_heap = s_d3d.samp_heap = s_d3d.blit_srv_heap = NULL;
-    s_down_srv = NULL;
+    /* Step C4: the table pools, the texture slots, the staging buffers and
+     * the pool's heaps go with the device. */
     s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
     /* Step C5a: the display targets, the depth buffer, zeta and the
      * offscreen targets with their views (no RTV or DSV heap is made) go

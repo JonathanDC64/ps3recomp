@@ -48,7 +48,7 @@ static int display_targets_make(void)
         td.state   = GPU_STATE_PRESENT;
         s_rc_rt_tex[i] = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(s_rc_rt_tex[i])) return -1;
-        s_rc_rt_rtv[i] = rc_target_view(s_rc_rt_tex[i], GPU_VIEW_RTV, 0, 0, &s_rc_rt_rtv_cpu[i]);
+        s_rc_rt_rtv[i] = rc_target_view(s_rc_rt_tex[i], GPU_VIEW_RTV, 0, 0);
     }
     return 0;
 }
@@ -80,8 +80,7 @@ static int depth_buffer_make(void)
     }
 
     /* The DSV: D24S8, 2D, mip 0, no flags. */
-    s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT,
-                                    &s_rc_depth_dsv_cpu);
+    s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
     return 0;
 }
 
@@ -192,8 +191,7 @@ static int init_d3d12(u32 width, u32 height)
             pd.region[2].first = 22; pd.region[2].tables = 1; pd.region[2].size = 3;
             pd.region[3].first = 24; pd.region[3].tables = 1; pd.region[3].size = 3;
             s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
-            s_d3d.srv_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_srv_pool);
-            if (!s_d3d.srv_heap) printf("[D3D12] SRV heap creation failed\n");
+            if (!GPU_VALID(s_rc_srv_pool)) printf("[D3D12] SRV heap creation failed\n");
         }
 
         /* The offscreen targets' RTVs are views of their textures (off_rt_get,
@@ -245,8 +243,7 @@ static int init_d3d12(u32 width, u32 height)
             sh.nregions = 1;
             sh.region[0].first = 0; sh.region[0].tables = VP_SAMP_TABLES; sh.region[0].size = RSX_FP_UNITS;
             s_rc_samp_pool = gpu_table_pool_create(s_rc_dev, &sh);
-            s_d3d.samp_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_samp_pool);
-            if (!s_d3d.samp_heap)
+            if (!GPU_VALID(s_rc_samp_pool))
                 printf("[D3D12] sampler heap creation failed\n");
         }
 

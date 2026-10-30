@@ -505,10 +505,8 @@ rtt_dump_done:;
     gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
 
     /* The current frame's RTV and the depth buffer shared across frames
-     * (views: step C5a). rtv_handle is the RTV's descriptor, for
-     * aa_run_display, which still takes it. */
+     * (views: step C5a). */
     const gpu_pass disp_pass = { 1, { s_rc_rt_rtv[fi] }, s_rc_depth_dsv };
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rc_rt_rtv_cpu[fi];
 
     if (perf_on()) s_perf_pre += perf_now() - _pre0;
     /* Set render target + depth */

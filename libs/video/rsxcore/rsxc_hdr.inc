@@ -183,11 +183,10 @@ static int hdr_want(void)
 static int swap_buffers_get(void)
 {
     memset(s_rc_swap_rtv, 0, sizeof s_rc_swap_rtv);
-    memset(s_rc_swap_rtv_cpu, 0, sizeof s_rc_swap_rtv_cpu);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         s_rc_swap_image[i] = gpu_swap_image(s_rc_dev, s_rc_swap, i);
         if (!GPU_VALID(s_rc_swap_image[i])) return -1;
-        s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0, &s_rc_swap_rtv_cpu[i]);
+        s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0);
     }
     return 0;
 }
@@ -286,8 +285,7 @@ static int blit_init(void)
         pd.nregions = 1;
         pd.region[0].first = 0; pd.region[0].tables = FRAME_COUNT; pd.region[0].size = 2;
         s_rc_blit_pool = gpu_table_pool_create(s_rc_dev, &pd);
-        s_d3d.blit_srv_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_blit_pool);
-        if (!s_d3d.blit_srv_heap) hr = E_FAIL;
+        if (!GPU_VALID(s_rc_blit_pool)) hr = E_FAIL;
     }
     if (SUCCEEDED(hr)) blit_srvs_write();
     sc_shader_drop(&vb);

@@ -94,7 +94,7 @@ static void aa_before_fp_load(void)
 static int aa_ready(void)
 {
     if (s_aa.pso.v) return 1;
-    if (s_aa.failed || !s_rc_dev || !s_d3d.srv_heap) return 0;
+    if (s_aa.failed || !s_rc_dev || !GPU_VALID(s_rc_srv_pool)) return 0;
     s_aa.failed = 1;   /* until it is made */
     gpu_shader vb = sc_shader(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
                               GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
@@ -214,7 +214,7 @@ static void smaa_state(gpu_texture t, D3D12_RESOURCE_STATES* st, D3D12_RESOURCE_
 static int smaa_ready(void)
 {
     if (s_smaa.pso[2].v) return 1;
-    if (s_smaa.failed || !s_rc_dev || !s_d3d.srv_heap) return 0;
+    if (s_smaa.failed || !s_rc_dev || !GPU_VALID(s_rc_srv_pool)) return 0;
     s_smaa.failed = 1;   /* until it is made */
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);

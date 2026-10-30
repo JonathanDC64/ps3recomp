@@ -109,7 +109,6 @@ static void wb_tex_bury(void)
 static gpu_layout            s_down_layout;   /* (step C3b) */
 static gpu_pipeline          s_down_pso[8];   /* the GPU layer's (step C3b), bound as handles (step C5b) */
 static u32                   s_down_pso_fmt[8];   /* format, | 1 << 31 for guest byte order */
-static ID3D12DescriptorHeap* s_down_srv;   /* shader visible, 2 x MAX_OFF_RTS (frame parity) */
 /* (The copies' RTVs are gpu_view_get's, kept with each copy: step C5b.) */
 static gpu_shader            s_down_vs;
 static gpu_shader            s_down_ps;
@@ -159,7 +158,8 @@ static int down_init(void)
     ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 2, GPU_VIS_PIXEL);
     s_down_layout = lay_make(&ld);
     if (!GPU_VALID(s_down_layout)) return 0;
-    {   /* the GPU layer's table pool, a 1-entry table each (step C4) */
+    {   /* the GPU layer's table pool, a 1-entry table each (step C4): shader
+         * visible, 2 x MAX_OFF_RTS (frame parity) */
         gpu_table_pool_desc pd;
         memset(&pd, 0, sizeof pd);
         pd.kind = GPU_TABLE_TEX;
@@ -167,8 +167,7 @@ static int down_init(void)
         pd.nregions = 1;
         pd.region[0].first = 0; pd.region[0].tables = 2 * MAX_OFF_RTS; pd.region[0].size = 1;
         s_rc_down_pool = gpu_table_pool_create(s_rc_dev, &pd);
-        s_down_srv = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_down_pool);
-        if (!s_down_srv) return 0;
+        if (!GPU_VALID(s_rc_down_pool)) return 0;
     }
     state = 1;
     return 1;
@@ -598,12 +597,6 @@ static void off_rt_drop_rewritten(void)
         wb_tex_retire(&r->down_tex);
         r->gsum_ok = 0;
     }
-}
-
-/* The target's RTV, as off_rt_get made it (a view: step C5a). */
-static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
-{
-    return s_d3d.off_rt[slot].rtv_cpu;
 }
 
 /* Write a texture SRV (or a null SRV when tex is none) at an absolute SRV
