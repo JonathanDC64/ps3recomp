@@ -152,14 +152,16 @@ typedef struct {
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
     ID3D12Resource*       rb;          /* colour write-back readback buffer */
+    gpu_buffer            rb_buf;      /* rb: the GPU layer's (step C5b); rb is its resource, borrowed */
     u64                   rb_size;
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
     ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
-    gpu_texture           snap_tex;    /* snap, adopted (step C4) */
+    gpu_texture           snap_tex;    /* snap: the GPU layer's (step C5b); snap is its resource, borrowed */
     u32                   snap_w, snap_h, snap_dxgi;
     D3D12_RESOURCE_STATES snap_st;
     ID3D12Resource*       down;        /* guest-size copy of a scaled target (write-back) */
+    gpu_texture           down_tex;    /* down: the GPU layer's (step C5b); down is its resource, borrowed */
     u32                   down_w, down_h, down_dxgi;
     D3D12_RESOURCE_STATES down_st;
     /* Guest bytes after our last write-back (tex_csum over [gaddr, +glen)).
@@ -747,7 +749,7 @@ static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
 static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
 static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
 static gpu_texture    s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a): s_d3d.render_targets borrows them */
-static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy, adopted */
+static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy: the GPU layer's (step C5b), s_screen_copy borrowed */
 static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 
 /* res, just made by the old code, as *t (a handle *t held goes first). */

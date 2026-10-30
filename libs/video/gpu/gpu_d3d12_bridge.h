@@ -103,6 +103,13 @@ ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool po
  * handle that names no view. Read it once, where the view is made. */
 D3D12_CPU_DESCRIPTOR_HANDLE gpu_d3d12_view_cpu(gpu_device* d, gpu_view v);
 
+/* ---- step C5b ---- */
+
+/* A query pool's heap, borrowed (gpu_native has no kind for it), for the old
+ * code's BeginQuery, EndQuery and ResolveQueryData. Freed with the pool, at
+ * gpu_destroy: never Released by the caller. */
+ID3D12QueryHeap* gpu_d3d12_query_pool_heap(gpu_device* d, gpu_query_pool pool);
+
 #ifdef __cplusplus
 }
 #endif
