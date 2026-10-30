@@ -40,11 +40,13 @@
  *
  * SPU_NATIVE_SCAN (live): 1 (default) as above; 0 runs the lifted loop, for
  * A/B; 3 tests every entry on the lifted helpers, for A/B; 2 checks: every
- * SPU_NATIVE_SCAN_EVERY-th time (default 64) the skipped entries also run in
- * the SPU interpreter on a copy of the context and its local store, one entry
- * at a time, and every register and the whole local store are compared with
- * the copy's ([spu-scan] lines). A mismatch turns the block off for the
- * session. The check also counts stops at an entry that goes to no handler.
+ * SPU_NATIVE_SCAN_EVERY-th call that skips an entry (default 64), the skipped
+ * entries also run in the SPU interpreter on a copy of the context and its
+ * local store, one entry at a time, and every register and the whole local
+ * store are compared with the copy's ([spu-scan] lines). A mismatch puts the
+ * state back, so the lifted loop runs those entries, and turns the block off
+ * for the session. The check also counts stops at an entry that goes to no
+ * handler.
  */
 
 #include <stdio.h>
@@ -315,12 +317,14 @@ static uint32_t scan_run(spu_context* ctx, int* done, int sse)
 }
 
 /* SPU_NATIVE_SCAN=2: the block on the real context, then the same entries in
- * the interpreter on a copy, and compare. */
-static int scan_check(spu_context* ctx)
+ * the interpreter on a copy, and compare. *used is 0 when the block skipped
+ * no entry, so there was nothing to compare. */
+static int scan_check(spu_context* ctx, int* used)
 {
     static uint8_t* ls_copy;
     static unsigned long long checked, bad;
     int done;
+    *used = 1;
     if (!ls_copy && !(ls_copy = (uint8_t*)malloc(SPU_LS_SIZE))) return scan_run(ctx, &done, 1) && done;
     spu_context* c = (spu_context*)malloc(sizeof *c);
     if (!c) return scan_run(ctx, &done, 1) && done;
@@ -331,6 +335,9 @@ static int scan_check(spu_context* ctx)
      * function to rejoin, so it stops only at the stop address (see
      * spu_diff_hook.c). If it stops elsewhere the check is skipped. */
     c->image_id = 0x7FFF;
+    static u128 pre[128];
+    memcpy(pre, ctx->gpr, sizeof pre);
+    const uint32_t steps0 = ctx->steps;
     const uint32_t n = scan_run(ctx, &done, 1);
     /* The entry the block stopped at must go to a handler too; a stop there
      * costs only speed, so the interpreter compare below cannot see it. */
@@ -346,6 +353,7 @@ static int scan_check(spu_context* ctx)
         }
     }
     if (!n) {                         /* the lifted loop runs: nothing to compare */
+        *used = 0;
         free(c);
         return 0;
     }
@@ -388,6 +396,13 @@ static int scan_check(spu_context* ctx)
             fprintf(stderr, "[spu-scan]   r%d block %08X %08X %08X %08X, interpreter %08X %08X %08X %08X\n", reg,
                     ctx->gpr[reg]._u32[0], ctx->gpr[reg]._u32[1], ctx->gpr[reg]._u32[2], ctx->gpr[reg]._u32[3],
                     c->gpr[reg]._u32[0], c->gpr[reg]._u32[1], c->gpr[reg]._u32[2], c->gpr[reg]._u32[3]);
+        /* The state the loop started from, and the lifted loop runs the
+         * entries. The loop stores nothing, so the copy's local store is the
+         * one from before; it is put back only where the two differ. */
+        memcpy(ctx->gpr, pre, sizeof pre);
+        if (lsoff < SPU_LS_SIZE) memcpy(ctx->ls, ls_copy, SPU_LS_SIZE);
+        ctx->steps = steps0;
+        done = 0;
     }
     if (checked == 1 || (checked & (checked - 1)) == 0 || mism)
         fprintf(stderr, "[spu-scan] %llu checked, %llu mismatches\n", checked, bad);
@@ -402,11 +417,20 @@ int spu_hook_entry_scan(spu_context* ctx)
     if (g_spu_goto_slow || g_yz_lockstep_on || g_pm_flow_ctx || g_spu_trampoline_fn || g_spu_ls_dbg ||
         (ctx->int_enable && (__atomic_load_n(&ctx->event_status, __ATOMIC_RELAXED) & ctx->event_mask)))
         return 0;
-    if (mode == 2) {
-        static unsigned tick;
-        if (++tick % native_scan_every() == 0) return scan_check(ctx);
-    }
     int done;
+    if (mode == 2) {
+        /* Only a call that skips an entry counts, so a check that found
+         * nothing to compare is tried again at the next call. */
+        static unsigned tick;
+        if (tick + 1 >= native_scan_every()) {
+            int used;
+            const int ret = scan_check(ctx, &used);
+            if (used) tick = 0;
+            return ret;
+        }
+        if (scan_run(ctx, &done, 1)) tick++;
+        return done;
+    }
     scan_run(ctx, &done, mode != 3);
     return done;
 }
