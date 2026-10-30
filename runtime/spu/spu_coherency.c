@@ -125,11 +125,17 @@ static void spu_lockline_stats(int contended, unsigned long holder, unsigned lon
  * Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
-static void spu_ll_acquire(unsigned i)
+ * -- FMOD's mixer task among them, 25-40 ms at a time.
+ *
+ * spu_ll_acquire takes a free stripe in line; this is the rest: a held one,
+ * or any with SPU_LOCKLINE_STATS on. Kept out of line, as are the walks over
+ * several stripes below, so that the store into one line pays for none of
+ * their frame: in Demon's Souls, where HighGraphics makes about 5 million of
+ * those stores a second, the vectorized stripe walk's xmm saves, the stack
+ * cookie and the pushes were most of the lock's time outside its two locked
+ * instructions. */
+static __declspec(noinline) void spu_ll_acquire_wait(unsigned i, int s_st)
 {
-    static int s_st = -1;
-    PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
     volatile long* l = &g_ll[i].v;
     unsigned spins = 0;
     int contended = 0;
@@ -154,6 +160,23 @@ static void spu_ll_acquire(unsigned i)
         spu_lockline_stats(contended, holder, wait);
     }
 }
+/* SPU_LL_ONE_LINE (live): 1 (default) takes a free stripe, and the stripe of
+ * a range in one line, in line; 0 sends every acquire and every range through
+ * the out-of-line paths, as before, for A/B. Both take the same stripes, so a
+ * change between a lock and its unlock is harmless. */
+static __forceinline int spu_ll_one_on(void)
+{
+    static int on = 1;
+    PS3_KNOB(on, ps3_env_int("SPU_LL_ONE_LINE", 1));
+    return on;
+}
+static __forceinline void spu_ll_acquire(unsigned i)
+{
+    static int s_st = -1;
+    PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
+    if (!s_st && spu_ll_one_on() && !_interlockedbittestandset(&g_ll[i].v, 0)) return;
+    spu_ll_acquire_wait(i, s_st);
+}
 /* The stripes [ea, ea+len) touches, as a bit set. */
 static unsigned long long spu_ll_set(uint32_t ea, uint32_t len)
 {
@@ -165,15 +188,35 @@ static unsigned long long spu_ll_set(uint32_t ea, uint32_t len)
     for (unsigned long long l = l0; l <= l1; l++) s |= 1ull << (l & m);
     return s;
 }
-void spu_lockline_lock_ea(uint32_t ea, uint32_t len)
+/* The stripe of [ea, ea+len) when it lies in one line, as spu_ll_set has it;
+ * -1 when it spans lines. */
+static __forceinline int spu_ll_one(uint32_t ea, uint32_t len)
+{
+    if (!spu_ll_one_on()) return -1;
+    return (unsigned long long)(ea & 127u) + (len ? len : 1u) <= 128u ? (int)((ea >> 7) & spu_ll_mask())
+                                                                      : -1;
+}
+static __declspec(noinline) void spu_ll_lock_set(uint32_t ea, uint32_t len)
 {
     unsigned long long s = spu_ll_set(ea, len);
     while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; spu_ll_acquire((unsigned)i); }
 }
-void spu_lockline_unlock_ea(uint32_t ea, uint32_t len)
+static __declspec(noinline) void spu_ll_unlock_set(uint32_t ea, uint32_t len)
 {
     unsigned long long s = spu_ll_set(ea, len);
     while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; _InterlockedIncrement(&g_ll[i].v); }
+}
+void spu_lockline_lock_ea(uint32_t ea, uint32_t len)
+{
+    const int i = spu_ll_one(ea, len);
+    if (i < 0) { spu_ll_lock_set(ea, len); return; }
+    spu_ll_acquire((unsigned)i);
+}
+void spu_lockline_unlock_ea(uint32_t ea, uint32_t len)
+{
+    const int i = spu_ll_one(ea, len);
+    if (i < 0) { spu_ll_unlock_set(ea, len); return; }
+    _InterlockedIncrement(&g_ll[i].v);
 }
 int spu_lockline_read_begin(uint32_t ea, long* seq)
 {
