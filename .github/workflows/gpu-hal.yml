@@ -7,6 +7,11 @@
 # sizes between C and C++. On Windows the D3D12 backend's test (libs/video/tests/test_gpu_d3d12.c) runs too, on
 # WARP, the software adapter, so it needs no GPU.
 #
+# Both also build the shader compile service's spv target (PS3RECOMP_RSX_HAL_SPV, on by default with the option:
+# glslang and SPIRV-Tools fetched at their pins) and run its test (libs/video/tests/test_gpu_sc_spv.c): the seeded
+# generator's programs and the built-in passes compile, validate, bind where the Vulkan backend's layout says, and
+# compile to the same bytes twice; the edits match their goldens; the cache round trip holds.
+#
 # windows.yml and linux.yml build the runtime with the option off, today's build.
 name: GPU layer
 
@@ -51,6 +56,12 @@ jobs:
       - name: Run the D3D12 backend's test (WARP)
         run: ctest --test-dir build -R gpu_d3d12 --output-on-failure
 
+      - name: Build the spv target's test
+        run: cmake --build build --target test_gpu_sc_spv
+
+      - name: Run the spv target's test
+        run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
+
   linux:
     name: Linux x64 (HAL on, ${{ matrix.compiler }})
     runs-on: ubuntu-latest
@@ -81,3 +92,9 @@ jobs:
 
       - name: Run the contract test
         run: ctest --test-dir build -R gpu_contract --output-on-failure
+
+      - name: Build the spv target's test
+        run: cmake --build build --target test_gpu_sc_spv
+
+      - name: Run the spv target's test
+        run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
