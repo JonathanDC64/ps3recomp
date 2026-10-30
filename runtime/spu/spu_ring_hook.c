@@ -78,6 +78,7 @@ extern unsigned g_spu_ch_diag_gen;
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t value);
+void spu_wrch_xfer_wait(spu_context* ctx, uint32_t cmd, uint32_t mode);
 int  spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea);
 
 #define RING_LINE_LS  0x13480u   /* the control line's copy (GETLLAR target) */
@@ -132,6 +133,15 @@ typedef struct ring_get_memo {
 } ring_get_memo;
 static SPU_THREAD_LOCAL ring_get_memo t_get;
 
+/* SPU_XFER_WAIT (live): 1 (default) issues a transfer and its tag wait as
+ * one spu_wrch_xfer_wait call; 0 as two spu_wrch_word calls, for A/B. */
+RING_INLINE int ring_xfer_wait_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_XFER_WAIT", 1));
+    return on;
+}
+
 static int ring_get_skip_mode(void)
 {
     static int on = -1;
@@ -146,8 +156,68 @@ RING_NOINLINE void ring_get_stats(const spu_context* ctx)
     fflush(stderr);
 }
 
-/* The fetch step: 1 when it took a command, 0 runs the lifted code. */
-RING_INLINE int ring_fetch(spu_context* ctx)
+/* What a fetch that took a command read; its register writes are worked out
+ * from these (ring_fetch_regs). */
+typedef struct ring_fetched {
+    u128 old_line, state, line, r73, r71;
+} ring_fetched;
+
+/* 0x4618-0x4690's writes before the GETLLAR, which stay when the fetch gives
+ * the command back at the GETLLAR. */
+RING_INLINE void ring_fetch_regs_head(spu_context* ctx, u128 old_line)
+{
+    u128* r = ctx->gpr;
+    const u128 r52 = spu_il(208);
+    const u128 r55 = spu_rotqbyi(old_line, 8);
+    r[58] = spu_il(0);
+    r[57] = spu_il(1024);
+    r[56] = old_line;
+    r[55] = r55;
+    r[54] = spu_shlqbyi(r55, 4);
+    r[52] = r52;
+    r[53] = spu_ori(r52, 0);
+}
+
+/* The registers 0x4618-0x472C leave (a register written twice is written its
+ * last value). The tag status is the fetch's tag wait's: nothing after the
+ * fetch changes it before these are written. */
+RING_INLINE void ring_fetch_regs(spu_context* ctx, const ring_fetched* f)
+{
+    u128* r = ctx->gpr;
+    ring_fetch_regs_head(ctx, f->old_line);
+    const u128 r8 = spu_rotqbyi(f->line, 8);
+    r[63] = f->state;
+    r[61] = spu_ceq(f->line, f->state);
+    r[8] = r8;
+    r[14] = spu_shlqbyi(r8, 4);
+    r[6] = spu_il(180);
+    r[76] = f->state;
+    r[10] = spu_ori(r[85], 0);
+    r[13] = spu_andi(f->state, -128);
+    r[81] = spu_il(64);
+    r[79] = spu_il(1);
+    r[78] = spu_il(2);
+    r[2] = spu_make_preferred_u32(ctx->mfc_tag_status);
+    const u128 r74 = spu_cwd(r[1], 0);
+    const u128 r72 = spu_ai(f->r73, 16);
+    const u128 r70 = spu_shufb(r72, f->r73, r74);
+    r[73] = f->r73;
+    r[5] = spu_il(16);
+    r[4] = spu_ila(RING_STATE_LS);
+    r[75] = spu_andi(f->state, 127);
+    r[74] = r74;
+    r[71] = f->r71;
+    r[72] = r72;
+    r[70] = r70;
+    r[3] = spu_rotqbyi(r70, 8);
+}
+
+/* The fetch step without its register writes: 1 when it took a command (f
+ * then has what ring_fetch_regs works them out from), 0 runs the lifted code.
+ * `lazy` (ring_lazy, inside a run of commands): a skipped GET's tag wait is
+ * not made, as the tag status it reads cannot have changed since the last
+ * one (see ring_lazy). */
+RING_INLINE int ring_fetch_take(spu_context* ctx, ring_fetched* f, int lazy)
 {
     if (!native_ring_on() || !vm_base) return 0;
     /* The channel latches below are written in place, as spu_wrch_latch
@@ -170,62 +240,50 @@ RING_INLINE int ring_fetch(spu_context* ctx)
     /* The live put. Empty ring: the lifted code GETLLARs and waits. */
     if (!known && be32_at(vm_base + line_ea) == state._u32[0]) return 0;
 
-    /* The registers are worked out in locals and only stored: a value stored
-     * into ctx->gpr a word at a time and read back whole cannot be forwarded
-     * from the store buffer, and the fetch did that a few times a command. */
+    /* The registers are worked out by ring_fetch_regs, from what this reads
+     * (a value stored into ctx->gpr a word at a time and read back whole
+     * cannot be forwarded from the store buffer). */
     /* 0x4618-0x4690: wrch ch69 (no channel), event mask, GETLLAR. */
-    const u128 r52 = spu_il(208);
-    const u128 r55 = spu_rotqbyi(old_line, 8);
-    const u128 r54 = spu_shlqbyi(r55, 4);
-    r[58] = spu_il(0);
-    r[57] = spu_il(1024);
     ctx->event_mask = 1024;
-    r[56] = old_line;
-    r[55] = r55;
-    r[54] = r54;
-    r[52] = r52;
-    r[53] = spu_ori(r52, 0);
     /* The GETLLAR and the unchanged PUTLLC at 0x46BC, together. */
     if (known) {
         if (ctx->resv_valid) __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELEASE);
         ctx->atomic_stat = 0;
-    } else if (!spu_llar_noop_commit(ctx, RING_LINE_LS, r54._u32[0])) return 0;
-    r[5] = spu_il(0);
+    } else if (!spu_llar_noop_commit(ctx, RING_LINE_LS, old_line._u32[3])) {
+        ring_fetch_regs_head(ctx, old_line);
+        return 0;
+    }
     /* 0x4694: the compare (not equal: the live put was read above, and the
      * copy is as new as that). */
-    const u128 r4 = spu_ls_read128(ctx, RING_LINE_LS);
-    const u128 r8 = spu_rotqbyi(r4, 8);
-    r[4] = r4;
-    r[63] = state;
-    r[61] = spu_ceq(r4, state);
-    r[8] = r8;
-    r[14] = spu_shlqbyi(r8, 4);
-    r[6] = spu_il(180);
+    const u128 line = spu_ls_read128(ctx, RING_LINE_LS);
     /* 0x46C4-0x4700: GET the command's 128 bytes, wait for tag 0. */
-    const u128 r10 = spu_ori(r[85], 0);
-    const u128 r13 = spu_andi(state, -128);
-    r[76] = state;
-    r[10] = r10;
-    r[13] = r13;
-    r[3] = spu_il(128);
-    r[81] = spu_il(64);
-    ctx->mfc_lsa = r10._u32[0];
-    ctx->mfc_eal = r13._u32[0];
+    const uint32_t blk = state._u32[0] & ~127u;
+    const uint32_t lsa_raw = r[85]._u32[0];
+    ctx->mfc_lsa = lsa_raw;
+    ctx->mfc_eal = blk;
     ctx->mfc_size = 128;
     ctx->mfc_tag = 0;
     {
         const int skip_mode = ring_get_skip_mode();
-        const uint32_t get = state._u32[0], blk = r13._u32[0];
-        const uint32_t lsa = r10._u32[0] & SPU_LS_MASK;
+        const uint32_t get = state._u32[0];
+        const uint32_t lsa = lsa_raw & SPU_LS_MASK;
         ring_get_memo* m = &t_get;
         int skip = 0;
         if (skip_mode && m->ctx == ctx && m->next == get && m->ea == blk && m->lsa == lsa &&
             get + 16u <= m->put)
             skip = memcmp(ctx->ls + lsa + (get & 112u), &m->q[(get & 112u) >> 4], 16) == 0;
+        ctx->mfc_tag_mask = 1;
+        if (skip && lazy && !(ctx->event_mask & 1u)) {
+            /* the tag wait alone, which reads what the last one read */
+        } else if (ring_xfer_wait_on()) {
+            spu_wrch_xfer_wait(ctx, skip ? 0u : 64u, 2);   /* the GET, then wait for all of tag 0 */
+        } else {
+            if (!skip) spu_wrch_word(ctx, MFC_Cmd, 64);
+            spu_wrch_word(ctx, MFC_WrTagUpdate, 2);
+        }
         if (!skip) {
-            spu_wrch_word(ctx, MFC_Cmd, 64);
             if (skip_mode && !(lsa & 15u) && lsa + 128u <= SPU_LS_SIZE) {
-                m->ctx = ctx; m->ea = blk; m->lsa = lsa; m->put = r4._u32[0];
+                m->ctx = ctx; m->ea = blk; m->lsa = lsa; m->put = line._u32[0];
                 memcpy(m->q, ctx->ls + lsa, 128);
             } else {
                 m->ctx = NULL;
@@ -237,29 +295,27 @@ RING_INLINE int ring_fetch(spu_context* ctx)
             if ((++m->n & ((1ull << 22) - 1)) == 0) ring_get_stats(ctx);
         }
     }
-    r[79] = spu_il(1);
-    ctx->mfc_tag_mask = 1;
-    r[78] = spu_il(2);
-    spu_wrch_word(ctx, MFC_WrTagUpdate, 2);
-    r[2] = spu_make_preferred_u32(ctx->mfc_tag_status);
     /* 0x4704-0x472C: copy the command out, get += 16. */
     const u128 r73 = spu_ls_read128(ctx, RING_STATE_LS);
-    const u128 r75 = spu_andi(state, 127);
-    const u128 r74 = spu_cwd(r[1], 0);
-    const u128 r71 = spu_ls_read128(ctx, r75._u32[0] + r[85]._u32[0]);
+    const u128 r71 = spu_ls_read128(ctx, (state._u32[0] & 127u) + lsa_raw);
     const u128 r72 = spu_ai(r73, 16);
-    const u128 r70 = spu_shufb(r72, r73, r74);
-    r[73] = r73;
-    r[5] = spu_il(16);
-    r[4] = spu_ila(RING_STATE_LS);
-    r[75] = r75;
-    r[74] = r74;
-    r[71] = r71;
-    r[72] = r72;
-    r[70] = r70;
+    const u128 r70 = spu_shufb(r72, r73, spu_cwd(r[1], 0));
     spu_ls_write128(ctx, RING_CMD_LS, r71);
-    r[3] = spu_rotqbyi(r70, 8);
     spu_ls_write128(ctx, RING_STATE_LS, r70);
+    f->old_line = old_line;
+    f->state = state;
+    f->line = line;
+    f->r73 = r73;
+    f->r71 = r71;
+    return 1;
+}
+
+/* The fetch step: 1 when it took a command, 0 runs the lifted code. */
+RING_INLINE int ring_fetch(spu_context* ctx)
+{
+    ring_fetched f;
+    if (!ring_fetch_take(ctx, &f, 0)) return 0;
+    ring_fetch_regs(ctx, &f);
     return 1;
 }
 
@@ -522,6 +578,53 @@ RING_NOINLINE void post_fast_check(spu_context* ctx, uint32_t sp, u128 link, u12
     }
 }
 
+/* The registers and context fields the fast path leaves, from the buffer's
+ * descriptor d, the segment quadword before its store, r5 = the command byte
+ * and the image id after the return. */
+RING_INLINE void ring_post_regs(spu_context* ctx, u128 d, u128 seg_old, u128 r5, int32_t img)
+{
+    u128* r = ctx->gpr;
+    const u128 r2 = spu_rotqbyi(d, 4);                            /* {limit, cur, 0, base} */
+    const u128 r3 = spu_rotqbyi(d, 8);                            /* {cur, 0, base, limit} */
+    r[30] = spu_cwd(spu_ai(r[1], -256), 12);
+    r[0] = spu_link(RING_POST_END);
+    r[2] = r2;
+    r[3] = r3;
+    r[4] = spu_clgt(r2, r3);
+    r[5] = r5;
+    r[6] = spu_ila(RING_DESC_LS + 4u);
+    r[7] = d;
+    r[8] = spu_ceqi(r5, 35);
+    r[29] = seg_old;
+    /* What SPU_RET and the call bracket leave after a plain return. */
+    ctx->pc = RING_POST_END;
+    ctx->drain_ret_pc = 0;
+    ctx->image_id = img;
+}
+
+/* The prologue stores in k_post_slot's order, one statement each, and the
+ * segment quadword: only while g_spu_ls_dbg is 0, with sp past the frame
+ * checks (so every slot is in local store). */
+RING_INLINE void ring_post_frame(spu_context* ctx, uint32_t sp, u128 link, u128 seg)
+{
+    const u128* r = ctx->gpr;
+    uint8_t* const ls = ctx->ls;
+    ls_put128(ls, sp - 0x20u, r[81]);
+    ls_put128(ls, sp - 0x60u, r[85]);
+    ls_put128(ls, sp - 0x10u, r[80]);
+    ls_put128(ls, sp - 0x30u, r[82]);
+    ls_put128(ls, sp - 0x40u, r[83]);
+    ls_put128(ls, sp - 0x50u, r[84]);
+    ls_put128(ls, sp - 0x80u, r[87]);
+    ls_put128(ls, sp - 0x90u, r[88]);
+    ls_put128(ls, sp + 0x10u, link);
+    ls_put128(ls, sp - 0x70u, r[86]);
+    ls_put128(ls, sp - 0xA0u, r[89]);
+    ls_put128(ls, sp - 0xB0u, r[90]);
+    ls_put128(ls, sp - 0x100u, r[1]);
+    ls_put128(ls, RING_SEG_LS, seg);
+}
+
 /* The fast path, or the reason it is not taken (nothing written then). With
  * rec, the result goes there and nothing is written; without, it is applied. */
 RING_INLINE int ring_post_run(spu_context* ctx, ring_post* rec)
@@ -570,41 +673,14 @@ RING_INLINE int ring_post_run(spu_context* ctx, ring_post* rec)
      * in the deep Palace, every command. */
     const int fast = post_fast();
     if (fast) {
-        uint8_t* const ls = ctx->ls;
-        ls_put128(ls, sp - 0x20u, r[81]);
-        ls_put128(ls, sp - 0x60u, r[85]);
-        ls_put128(ls, sp - 0x10u, r[80]);
-        ls_put128(ls, sp - 0x30u, r[82]);
-        ls_put128(ls, sp - 0x40u, r[83]);
-        ls_put128(ls, sp - 0x50u, r[84]);
-        ls_put128(ls, sp - 0x80u, r[87]);
-        ls_put128(ls, sp - 0x90u, r[88]);
-        ls_put128(ls, sp + 0x10u, link);
-        ls_put128(ls, sp - 0x70u, r[86]);
-        ls_put128(ls, sp - 0xA0u, r[89]);
-        ls_put128(ls, sp - 0xB0u, r[90]);
-        ls_put128(ls, sp - 0x100u, r[1]);
-        ls_put128(ls, RING_SEG_LS, seg);
+        ring_post_frame(ctx, sp, link, seg);
         if (__builtin_expect(fast == 2, 0)) post_fast_check(ctx, sp, link, seg);
     } else {
         for (int k = 0; k < 13; k++)
             spu_ls_write128(ctx, sp + (uint32_t)(int32_t)k_post_slot[k], k_post_reg[k] ? r[k_post_reg[k]] : link);
         spu_ls_write128(ctx, RING_SEG_LS, seg);
     }
-    r[30] = spu_cwd(spu_ai(r[1], -256), 12);
-    r[0] = link;
-    r[2] = r2;
-    r[3] = r3;
-    r[4] = spu_clgt(r2, r3);
-    r[5] = r5;
-    r[6] = spu_ila(RING_DESC_LS + 4u);
-    r[7] = d;
-    r[8] = spu_ceqi(r5, 35);
-    r[29] = seg_old;
-    /* What SPU_RET and the call bracket leave after a plain return. */
-    ctx->pc = RING_POST_END;
-    ctx->drain_ret_pc = 0;
-    ctx->image_id = img;
+    ring_post_regs(ctx, d, seg_old, r5, img);
     return POST_OK;
 }
 
@@ -1060,23 +1136,12 @@ RING_INLINE int loop_yield(const spu_context* ctx, unsigned gen)
            g_post_checking || g_spu_ring_hist || t_post_bad || t_loop.bad;
 }
 
-/* The command at 0x13560 (fetched, the lifted code about to go on at 0x4730)
- * can run here: one of the commands above, and every check. */
-RING_INLINE int loop_case_ok(const spu_context* ctx, loop_plan* p)
+/* The checks that depend on the command itself: one of the commands above,
+ * its stores and its GET clear of the ring's quadwords and the frame at sp. */
+RING_INLINE int loop_cmd_ok(const uint8_t* ls, loop_plan* p, uint32_t sp, int v2)
 {
-    const uint8_t* ls = ctx->ls;
     if (!loop_plan_cmd(ls, ls[RING_CMD_LS + 3], p)) return 0;
-    if (p->cmd != 7u && p->cmd != 8u && !native_loop_v2()) return 0;
-    const u128* r = ctx->gpr;
-    if ((r[83]._u32[0] & 255u) != 0) return 0;
-    /* put_wait's case: r3 = the state's EA, r4 = 0x13400, r5 = 16. */
-    if ((r[3]._u32[1] & 15u) || r[4]._u32[0] != RING_STATE_LS || r[5]._u32[0] != 16u) return 0;
-    /* post's frame, and its local buffer under the limit. */
-    const uint32_t sp = r[1]._u32[0];
-    if ((sp & 15u) || sp < 0x100u || sp > SPU_LS_SIZE - 0x20u) return 0;
-    if (sp - 0x100u < RING_DESC_LS + 16u && sp + 0x20u > RING_SEG_LS) return 0;
-    const u128 d = lsq(ls, RING_DESC_LS);
-    if (!(d._u32[1] > d._u32[2])) return 0;
+    if (p->cmd != 7u && p->cmd != 8u && !v2) return 0;
     for (int i = 0; i < p->ntgt; i++)
         if (!loop_target_ok(p->tgt[i], sp)) return 0;
     if (p->get) {
@@ -1087,6 +1152,25 @@ RING_INLINE int loop_case_ok(const spu_context* ctx, loop_plan* p)
         for (uint32_t a = lsa; a < lsa + size; a += 16)
             if (!loop_target_ok(a, sp)) return 0;
     }
+    return 1;
+}
+
+/* The command at 0x13560 (fetched, the lifted code about to go on at 0x4730)
+ * can run here: one of the commands above, and every check. */
+RING_INLINE int loop_case_ok(const spu_context* ctx, loop_plan* p)
+{
+    const uint8_t* ls = ctx->ls;
+    const u128* r = ctx->gpr;
+    const uint32_t sp = r[1]._u32[0];
+    if (!loop_cmd_ok(ls, p, sp, native_loop_v2())) return 0;
+    if ((r[83]._u32[0] & 255u) != 0) return 0;
+    /* put_wait's case: r3 = the state's EA, r4 = 0x13400, r5 = 16. */
+    if ((r[3]._u32[1] & 15u) || r[4]._u32[0] != RING_STATE_LS || r[5]._u32[0] != 16u) return 0;
+    /* post's frame, and its local buffer under the limit. */
+    if ((sp & 15u) || sp < 0x100u || sp > SPU_LS_SIZE - 0x20u) return 0;
+    if (sp - 0x100u < RING_DESC_LS + 16u && sp + 0x20u > RING_SEG_LS) return 0;
+    const u128 d = lsq(ls, RING_DESC_LS);
+    if (!(d._u32[1] > d._u32[2])) return 0;
     return 1;
 }
 
@@ -1120,9 +1204,13 @@ RING_INLINE void loop_get_wait(spu_context* ctx, const loop_plan* p)
     ctx->mfc_eal = p->get_eal;
     ctx->mfc_size = p->get_size;
     ctx->mfc_tag = 0;
-    spu_wrch_word(ctx, MFC_Cmd, 64);             /* GET */
     ctx->mfc_tag_mask = 1;
-    spu_wrch_word(ctx, MFC_WrTagUpdate, 1);      /* ANY: waits for tag 0 */
+    if (ring_xfer_wait_on()) {
+        spu_wrch_xfer_wait(ctx, 64, 1);          /* GET, then ANY: waits for tag 0 */
+    } else {
+        spu_wrch_word(ctx, MFC_Cmd, 64);         /* GET */
+        spu_wrch_word(ctx, MFC_WrTagUpdate, 1);  /* ANY: waits for tag 0 */
+    }
     r[3] = spu_make_preferred_u32(ctx->mfc_tag_status);
     r[0] = spu_ls_read128(ctx, sp + 0x10);
     ctx->pc = r[0]._u32[0];                      /* SPU_RET */
@@ -1208,10 +1296,142 @@ RING_INLINE void ring_put_out(spu_context* ctx, ring_put_pend* p)
     if (p->n) { spu_put_flush(ctx, p->eah, p->eal, p->lsa, p->size); p->n = 0; }
 }
 
+/* ---- SPU_RING_LAZY: a run of commands, written out once at its end -------
+ *
+ * Inside ring_loop every command leaves every register, the frame and the
+ * context fields as the lifted path leaves them at that command's end, and
+ * the next command writes nearly all of them again before anything reads
+ * them:
+ *     the fetch's registers (r2-r8, r10, r13, r14, r52-r58, r61, r63, r70-r76,
+ *         r78, r79, r81): volatile, and read only by the put at 0x4730 (r3,
+ *         r4, r5: the state's EA, 0x13400, 16, the same for the whole run)
+ *         and by the lifted code if the run ends there;
+ *     the post's registers (r0, r2-r8, r29, r30), pc, drain_ret_pc and the
+ *         image id: the same in every command but r5 and r8, and the fetch
+ *         and the next post write them again;
+ *     put_wait's and 0xC4D8's stack stores (the link at sp + 0x10, the back
+ *         chain at sp - 0x20) and the post's 13 prologue stores: the post
+ *         stores both slots again, with values that change only with r80;
+ *         nothing in the loop reads the frame;
+ *     the segment quadword: the post stores cur into it, and no command the
+ *         loop runs moves cur (their stores miss 0x13300-0x135FF);
+ *     the tag waits of a deferred PUT and a skipped GET: they read tag 0's
+ *         completion in this context's own engine, which only this context's
+ *         transfers change, and every transfer in the run does its own wait,
+ *         so such a wait reads what the last one read (with the event mask
+ *         at 1024, as every fetch sets it, no tag event either).
+ * So ring_lazy keeps r80, the last command and the last fetch's reads in
+ * locals and writes the registers, the frame and the segment quadword once,
+ * when the run ends, as the last command's post and (if it ends at 0x4730)
+ * the last fetch leave them: ring_post_frame, ring_post_regs and
+ * ring_fetch_regs, the same code the per-command path runs. Per command it
+ * does the rest as that path does: the latches, the PUT every n-th command,
+ * the GETs, the handler's local-store stores, the fetch's local-store and
+ * channel work. The checks that hold for the whole run (r83, the put's case,
+ * the frame and the buffer's limit, the knobs; a knob change ends the run)
+ * are made for its first command only; each command's own checks
+ * (loop_cmd_ok) for every one.
+ *
+ * SPU_RING_LAZY (live): 1 (default) as above; 0 every command writes all of
+ * it, as before, for A/B. */
+static int ring_lazy_mode(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("SPU_RING_LAZY", 1));
+    return on;
+}
+int spu_put_hook_on(void);
+
+/* A transfer and its tag wait as the hooks issue them (cmd 0: the wait). */
+RING_INLINE void ring_xfer(spu_context* ctx, int one, uint32_t cmd, uint32_t mode)
+{
+    if (one) {
+        spu_wrch_xfer_wait(ctx, cmd, mode);
+    } else {
+        if (cmd) spu_wrch_word(ctx, MFC_Cmd, cmd);
+        spu_wrch_word(ctx, MFC_WrTagUpdate, mode);
+    }
+}
+
+/* ring_loop's run of commands from the one the fetch just took. 1: the lifted
+ * code goes on at 0x4730 with the command at 0x13560; 0: at 0x4618; -1: the
+ * run needs the per-command path (nothing done). */
+RING_NOINLINE int ring_lazy(spu_context* ctx)
+{
+    const unsigned gen = ps3_env_gen;
+    u128* r = ctx->gpr;
+    loop_plan p;
+    if (loop_yield(ctx, gen) || native_post_mode() != 1 || !loop_case_ok(ctx, &p)) return 1;
+    const int32_t img = ctx->image_id;
+    if (!spu_put_hook_on() || (ctx->module_img_a00 && ctx->module_img_a00 != img)) return -1;
+    const int every = ring_put_every(), v2 = native_loop_v2(), one = ring_xfer_wait_on();
+    const uint32_t sp = r[1]._u32[0];
+    const uint32_t eah = r[3]._u32[0], eal = r[3]._u32[1];   /* the state's home, the PUT's EA */
+    const u128 d = spu_ls_read128(ctx, RING_DESC_LS);
+    const u128 seg0 = spu_ls_read128(ctx, RING_SEG_LS);
+    u128 seg = seg0;
+    seg._u32[3] = d._u32[2];                                  /* what each post stores */
+    u128 r80 = r[80], cmd;
+    ring_put_pend pend = {0};
+    ring_fetched f;
+    unsigned n = 0, steps = 0;
+    int out;
+    for (;;) {
+        /* 0x4730: the brsl to 0xC358, spu_hook_put_wait's work. */
+        int defer = 0;
+        if (every > 1) {
+            if (pend.n && (pend.eah != eah || pend.eal != eal || pend.lsa != RING_STATE_LS || pend.size != 16u))
+                ring_put_out(ctx, &pend);
+            defer = pend.n + 1 < every;
+            pend.eah = eah; pend.eal = eal; pend.lsa = RING_STATE_LS; pend.size = 16;
+        }
+        ctx->mfc_lsa = RING_STATE_LS;
+        ctx->mfc_eah = eah;
+        ctx->mfc_eal = eal;
+        ctx->mfc_size = 16;
+        ctx->mfc_tag = 0;
+        ctx->mfc_tag_mask = 1;
+        if (!defer) ring_xfer(ctx, one, 32, 1);
+        else if (ctx->event_mask & 1u) ring_xfer(ctx, one, 0, 1);
+        pend.n = defer ? pend.n + 1 : 0;
+        /* 0x4734 and the handler: a GET through 0xC4D8's main case, then the
+         * handler's stores. */
+        if (p.get) {
+            ctx->mfc_lsa = p.get_lsa;
+            ctx->mfc_eah = p.get_eah;
+            ctx->mfc_eal = p.get_eal;
+            ctx->mfc_size = p.get_size;
+            ctx->mfc_tag = 0;
+            ctx->mfc_tag_mask = 1;
+            ring_xfer(ctx, one, 64, 1);
+        }
+        r80 = loop_cmd_ls(ctx->ls, p.cmd, r80);
+        cmd = spu_ls_read128(ctx, RING_CMD_LS);
+        steps += p.steps;
+        n++;
+        /* 0x4808: the post, written out at the end. 0x4818: back to 0x4618. */
+        if (loop_yield(ctx, gen) || !ring_fetch_take(ctx, &f, 1)) { out = 0; break; }
+        if (loop_yield(ctx, gen) || !loop_cmd_ok(ctx->ls, &p, sp, v2)) { out = 1; break; }
+    }
+    /* The last command's post, then (at 0x4730) the last fetch. */
+    r[80] = r80;
+    r[81] = spu_andi(r[83], 255);
+    ring_post_frame(ctx, sp, spu_link(RING_POST_END), seg);
+    ring_post_regs(ctx, d, n > 1 ? seg : seg0, spu_andi(cmd, 255), img);
+    ctx->steps += steps;
+    if (out) ring_fetch_regs(ctx, &f);
+    ring_put_out(ctx, &pend);
+    return out;
+}
+
 /* From the fetch, which just took a command: run the commands it can. 1: the
  * lifted code goes on at 0x4730 with the command at 0x13560; 0: at 0x4618. */
 RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
 {
+    if (mode == 1 && ring_lazy_mode() == 1) {
+        const int out = ring_lazy(ctx);
+        if (out >= 0) return out;
+    }
     const unsigned gen = ps3_env_gen;
     const int every = ring_put_every();
     ring_put_pend pend = {0};

@@ -1578,6 +1578,26 @@ void spu_wrch_word(spu_context* ctx, uint32_t channel, uint32_t v)
     spu_wrch_word_slow(ctx, channel, v);
 }
 
+/* A native hook's transfer and its tag wait in one call: spu_wrch_word(ctx,
+ * MFC_Cmd, cmd) unless cmd is 0, then spu_wrch_word(ctx, MFC_WrTagUpdate,
+ * mode), with the engine looked up once. The hooks set the tag mask first;
+ * only the tag wait reads it. */
+void spu_wrch_xfer_wait(spu_context* ctx, uint32_t cmd, uint32_t mode)
+{
+    if (spu_ch_diag() || (cmd && !mfc_is_plain_xfer(cmd))) {
+        if (cmd) spu_wrch_word(ctx, MFC_Cmd, cmd);
+        spu_wrch_word(ctx, MFC_WrTagUpdate, mode);
+        return;
+    }
+    mfc_engine* e = mfc_for(ctx);
+    if (cmd && mfc_fast_xfer(e, ctx, cmd) < 0) mfc_submit(e, ctx, cmd);
+    ctx->mfc_tag_status = mfc_tag_wait(e, ctx->mfc_tag_mask, mode);
+    if (mode != 0 && (ctx->event_mask & 0x1u)) {   /* as spu_wrch_full */
+        __atomic_fetch_or(&ctx->event_status, 0x1u, __ATOMIC_SEQ_CST);
+        spu_ch_wake(ctx);
+    }
+}
+
 static SPU_NOINLINE void spu_wrch_full(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
