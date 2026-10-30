@@ -4,7 +4,8 @@
 # The contract is plain C99 that C++ includes as well, and its numbers are D3D12's. On Windows the test checks them
 # against the SDK's headers; on Linux, built as C99 and C++ with -Wpedantic -Werror, it checks that nothing in the
 # headers is a Windows or compiler extension. Both run every command through the table and compare the structures'
-# sizes between C and C++.
+# sizes between C and C++. On both, the null backend's test (libs/video/tests/test_gpu_null.c): the backend that
+# records and checks and draws nothing, its operation stream's hash against a golden.
 #
 # windows.yml and linux.yml build the runtime with the option off, today's build.
 name: GPU layer
@@ -42,10 +43,13 @@ jobs:
           -DPS3RECOMP_RSX_HAL=ON
 
       - name: Build
-        run: cmake --build build --target ps3recomp_runtime test_gpu_contract
+        run: cmake --build build --target ps3recomp_runtime test_gpu_contract test_gpu_null
 
       - name: Run the contract test
         run: ctest --test-dir build -R gpu_contract --output-on-failure
+
+      - name: Run the null backend's test
+        run: ctest --test-dir build -R gpu_null --output-on-failure
 
   linux:
     name: Linux x64 (HAL on, ${{ matrix.compiler }})
@@ -73,7 +77,10 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON
 
       - name: Build
-        run: cmake --build build --target ps3recomp_runtime test_gpu_contract
+        run: cmake --build build --target ps3recomp_runtime test_gpu_contract test_gpu_null
 
       - name: Run the contract test
         run: ctest --test-dir build -R gpu_contract --output-on-failure
+
+      - name: Run the null backend's test
+        run: ctest --test-dir build -R gpu_null --output-on-failure
