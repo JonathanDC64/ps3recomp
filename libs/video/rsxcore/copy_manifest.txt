@@ -62,3 +62,66 @@ libs/video/gpu/gpu_shader.c 16404-16404 rsx_d3d12_shader_cache_path
 # vp_pso_knobs_check 5372-5395, dr_uvclamp 5564-5575, hdr_scene_limit
 # 5672-5700, dr_hdrv 5706-5725, hdr_batch_start 5785-5806, hdr_mark_scan
 # 5808-5859. From 3948-4160: the read-ahead (shader_cache_warm, 4057-4147).
+
+# ---------------------------------------------------------------------------
+# Step 1.0: the whole renderer, copied as it is, so that RSX_BACKEND=hal-d3d12
+# (libs/video/rsx_out.c) draws exactly what today's renderer draws. The
+# fragments below are compiled only by libs/video/rsxcore/rsxc_d3d12.c, which
+# includes them in this order (the CMake glob takes *.c, not *.inc). It keeps
+# its own static copy of everything, the shader texts too: it does not use
+# rsxc_shader.c or gpu_shader.c yet. Later steps convert the fragments to the
+# GPU layer one piece at a time, and note each change here.
+#
+# A fragment is its range run through this sed -E script (the lines that
+# start "#sed "), and nothing else:
+#  1. the functions the original exports become static (their definitions,
+#     and rsx_vtx_pos_dbg's prototype);
+#  2. and are renamed, in code and comments alike: rsx_d3d12_<x> -> rc_<x>,
+#     rsx_prof_<x> -> rc_prof_<x>, rsx_vtx_pos_dbg -> rc_vtx_pos_dbg. Types
+#     (rsx_d3d12_overlay) and rsx_d3d12_backend.h keep their names; the copy
+#     includes that header for its types;
+#  3. the two globals the original defines are extern here: the original is
+#     always linked beside the copy and owns them.
+#sed /^(static|extern|typedef) /!s/^([A-Za-z_][A-Za-z0-9_ *]*[ *])(rsx_d3d12_[a-z0-9_]+|rsx_prof_(begin|end|title)|rsx_vtx_pos_dbg)\(/static \1\2(/
+#sed s/\brsx_d3d12_(backend_init|backend_shutdown|backend_pump_messages|backend_present|set_overlay|overlay_repaint|overlay_wake|overlay_tick|device|device_lost|queue|hwnd|post_message|back_buffer|back_buffer_count|back_buffer_format|hdr|set_borderless|borderless|display_timing|display_refresh_mhz|display_mode_mhz|display_shown_mhz|shader_hlsl|shader_hdr|shader_cache_put|shader_cache_path|shader_fp_variants|pso_index_game|program_hash64|shader_key|pso_index_add|pso_index_ready|composite_from_offscreen)\b/rc_\1/g
+#sed s/\brsx_(prof_begin|prof_end|prof_title|vtx_pos_dbg)\b/rc_\1/g
+#sed s/^char g_rsx_title_base\[128\] = "ps3recomp";/extern char g_rsx_title_base[128];/
+#sed s/^volatile long g_rsx_prof_toggle;/extern volatile long g_rsx_prof_toggle;/
+# To check one fragment (bash, at the repo root):
+#   grep '^#sed ' libs/video/rsxcore/copy_manifest.txt | cut -c6- > rules.sed
+#   git show <base>:libs/video/rsx_d3d12_backend.c | sed -n 21,153p |
+#     sed -E -f rules.sed | diff - libs/video/rsxcore/rsxc_head.inc
+#
+# Not copied: lines 1-20 (the file's comment, and its outer #if for Windows
+# or vkd3d: rsxc_d3d12.c has its own, PS3RECOMP_RSX_HAL and _WIN32, since the
+# new path off Windows is the Vulkan backend, later) and 16423-16472 (the
+# stubs for a build without D3D12, and the #endif).
+#
+# Besides the sed edits, the compiler and linker need nothing: both objects
+# only refer to the D3D12 and DXGI GUIDs (initguid.h comes after the headers
+# that declare them; dxguid has them), dwmapi.h's c_DwmMax* constants are
+# selectany, and the #pragma comment(lib) lines only repeat the original's.
+libs/video/rsxcore/rsxc_head.inc 21-153 knobs (VTX_DUMP, RSX_PRESENT, RSX_SCALE, RSX_ASPECT), the includes, rsx_path_last_sep
+libs/video/rsxcore/rsxc_state.inc 154-796 constants, D3D12DrawRecord, OffRT, the slots, D3D12State s_d3d, the shared statics
+libs/video/rsxcore/rsxc_window.inc 797-1562 the window: Win32 (and SDL, not built here)
+libs/video/rsxcore/rsxc_hdr.inc 1563-2384 HDR output, the output filter, blit_to_window, the repaint hold, the display note, device checks, swap_present, swap_resize
+libs/video/rsxcore/rsxc_init.inc 2385-3218 init_d3d12: device, swap chain, heaps, root signature, pipelines
+libs/video/rsxcore/rsxc_sync.inc 3219-3436 DRED, wait_for_gpu, the device-loss tests, move_to_next_frame
+libs/video/rsxcore/rsxc_present.inc 3437-3528 dump_backbuffer_bmp
+libs/video/rsxcore/rsxc_cap.inc 3529-3948 rsxcap frame capture, compile_vp
+libs/video/rsxcore/rsxc_shadercache.inc 3949-4148 the .dxbc disk cache and its read-ahead
+libs/video/rsxcore/rsxc_psolib.inc 4149-4660 the pipeline library and manifest, pso_create_cached
+libs/video/rsxcore/rsxc_vs.inc 4661-4887 vertex programs: vp_get_vs_mode
+libs/video/rsxcore/rsxc_fp.inc 4888-5860 blend, cull and depth keys, the FP pipeline cache and jobs, FP texts, uvclamp, HDR variants
+libs/video/rsxcore/rsxc_pipeline.inc 5861-6603 vp_fp_desc, the pipeline index, vp_get_fp_pso
+libs/video/rsxcore/rsxc_texture.inc 6604-7684 texture uploads: staging, the pool, vp_upload_tex_slot
+libs/video/rsxcore/rsxc_targets.inc 7685-8764 late checks, DRED marks, vp_record_cb, samplers, the offscreen RT pool, zeta
+libs/video/rsxcore/rsxc_writeback.inc 8765-9840 colour write-back, downscale, views, screen copy, composite, vertex and index buffers
+libs/video/rsxcore/rsxc_zpass.inc 9841-9961 occlusion queries (ZPASS)
+libs/video/rsxcore/rsxc_diag.inc 9962-10525 DRAWPRINT, FPWATCH, the profiler (rsx_prof_*), the frame log, rsx_scale_apply
+libs/video/rsxcore/rsxc_post.inc 10526-11157 post anti-aliasing: FXAA, SMAA
+libs/video/rsxcore/rsxc_frame.inc 11158-13039 render_frame: the replay of the recorded draws
+libs/video/rsxcore/rsxc_record.inc 13040-13402 rsx_backend callbacks: init, present, clear, flip, render target, viewport
+libs/video/rsxcore/rsxc_vertex.inc 13403-15040 vertex reads and uploads, the vertex jobs, the GPU fetch path
+libs/video/rsxcore/rsxc_record2.inc 15041-15742 draw_arrays, draw_indexed, bind_texture, vertex attribs, shader, blend, depth
+libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutdown, display timing, the overlay, the exports
