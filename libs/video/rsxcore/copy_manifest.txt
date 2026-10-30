@@ -722,3 +722,17 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   15074, 15180, 15330 (vp_layout made? in place of vp_root_sig), and
 #   15866-15876 (rc_backend_shutdown: the dead Releases of the passes'
 #   pipelines, root signatures and the AA copy go).
+#  The sub-viewport captures (SUBVP_RTT=1): each is gpu_texture_create's
+#   (today's committed RGBA8 texture, no flags, in PIXEL_SHADER_RESOURCE),
+#   and subvp_capture's barriers and copy are gpu_cmd_barrier_n and
+#   gpu_cmd_copy_texture with today's box on the frame's recorder;
+#   rsx_scale_apply puts them in step C5a's grave (rc_grave_tex), where
+#   off_rt_defer_release put them. With that, nothing native is made,
+#   adopted or released in the core: d3d_create_committed and s_res_gen
+#   (340-348), step C4's rc_tex_set and rc_tex_drop, and the native grave
+#   (8418-8440: s_rt_grave, off_rt_defer_release, the Release loop of
+#   off_rt_release_deferred) go. At these legacy lines: 677-752 (s_subvp,
+#   subvp_note, subvp_capture; s_rc_rt_tex is declared with step C1's
+#   statics, before them), 10510 (rsx_scale_apply), 11659 (a sampler that
+#   reads a capture: made? is its handle). capsetv (scratch: capset0 with
+#   SUBVP_RTT=1, and RSX_SCALE=150 on the fogwall) passes the gate exact.

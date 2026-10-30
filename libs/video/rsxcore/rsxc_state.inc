@@ -188,19 +188,6 @@ typedef struct {
 #define VP_TEX_SRV_BASE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
 #define SRV_HEAP_SIZE (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
 
-/* Bumped on every resource creation. A cached descriptor (srv_write_ex) names
- * its resource by pointer, and a released resource's address can come back
- * for a new one: the stamp tells the two apart. */
-static u32 s_res_gen = 1;
-static HRESULT d3d_create_committed(ID3D12Device* dev, const D3D12_HEAP_PROPERTIES* hp,
-                                    D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* rd,
-                                    D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv,
-                                    REFIID riid, void** out)
-{
-    s_res_gen++;
-    return dev->lpVtbl->CreateCommittedResource(dev, hp, hf, rd, st, cv, riid, out);
-}
-
 /* Counts render_frame calls. What one call's pre-pass leaves for its later
  * passes carries this stamp (D3D12DrawRecord.pso, the TEX_CSUM_THREADS sums),
  * so nothing an earlier frame left passes for this one's. */
@@ -448,6 +435,7 @@ static gpu_swapchain s_rc_swap;
 static gpu_texture   s_rc_swap_image[FRAME_COUNT];
 static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
+static gpu_texture   s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a): s_d3d.render_targets borrows them */
 /* Step C3b: the root signatures, the pipelines and the shaders they are made
  * from are the GPU layer's (gpu_layout_create, gpu_pipeline_create,
  * gpu_shader_create), never released by the core (gpu_destroy frees them).
@@ -589,10 +577,10 @@ static ID3D12Resource* s_screen_copy = NULL;
  * title yet: the fluid draws that would consume these captures never rasterize
  * (see below), so binding them changes nothing observable. The capture and
  * binding themselves are confirmed working -- SUBVP_DBG shows the 512x512 and
- * 256x256 regions captured and handed to fp 0x5DB81/0x5EA81/0x5EF81/0x5E381. */
+ * 256x256 regions captured and handed to fp 0x5DB81/0x5EA81/0x5EF81/0x5E381.
+ * Each capture is a texture of the GPU layer's (step C8a). */
 #define SUBVP_SLOTS 4
-static struct { ID3D12Resource* res;
-                gpu_texture tex;   /* res, adopted (step C4) */
+static struct { gpu_texture tex;
                 u32 x, y, w, h; } s_subvp[SUBVP_SLOTS];
 static int s_subvp_n = 0;
 
@@ -605,66 +593,61 @@ static void subvp_note(u32 x, u32 y, u32 w, u32 h)
     if (s_subvp_n >= SUBVP_SLOTS) return;
     s_subvp[s_subvp_n].x = x; s_subvp[s_subvp_n].y = y;
     s_subvp[s_subvp_n].w = w; s_subvp[s_subvp_n].h = h;
-    s_subvp[s_subvp_n].res = NULL;
+    s_subvp[s_subvp_n].tex.id = 0;
     s_subvp_n++;
 }
 
 /* Copy each noted region out of the backbuffer. Called at the same moment as
  * screen_copy_capture -- after the reduced-viewport passes and before the
- * full-screen scene overwrites them. */
+ * full-screen scene overwrites them. The capture is made, and the region
+ * copied into it, on the GPU layer (step C8a): today's committed RGBA8
+ * texture with no flags, in PIXEL_SHADER_RESOURCE, and today's barriers and
+ * copy on the frame's recorder (s_rc_rt_tex[fi] is the display target). */
 static void subvp_capture(u32 fi)
 {
     static int en = -1;
     PS3_KNOB(en, ps3_env_int("SUBVP_RTT", 0));
-    if (!en || !s_d3d.device || !s_subvp_n) return;
+    if (!en || !s_rc_dev || !s_subvp_n) return;
     for (int i = 0; i < s_subvp_n; i++) {
-        if (!s_subvp[i].res) {
-            D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC td = {0};
-            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            td.Width  = (u64)s_subvp[i].w * s_d3d.host_w / s_d3d.width;
-            td.Height = s_subvp[i].h * s_d3d.host_h / s_d3d.height;
-            td.DepthOrArraySize = 1; td.MipLevels = 1;
-            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
-            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            if (FAILED(d3d_create_committed(
-                    s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
-                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL,
-                    &IID_ID3D12Resource, (void**)&s_subvp[i].res)))
-                { s_subvp[i].res = NULL; continue; }
-            s_subvp[i].tex = gpu_d3d12_adopt_texture_of(s_rc_dev, s_subvp[i].res);   /* step C4 */
+        if (!GPU_VALID(s_subvp[i].tex)) {
+            gpu_texture_desc td;
+            memset(&td, 0, sizeof td);
+            td.width  = (u32)((u64)s_subvp[i].w * s_d3d.host_w / s_d3d.width);
+            td.height = s_subvp[i].h * s_d3d.host_h / s_d3d.height;
+            td.layers = 1; td.mips = 1;
+            td.format = GPU_FORMAT_R8G8B8A8_UNORM; td.samples = 1;
+            td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
+            td.state = GPU_STATE_PIXEL_SHADER_RESOURCE;
+            s_subvp[i].tex = gpu_texture_create(s_rc_dev, &td);
+            if (!GPU_VALID(s_subvp[i].tex)) continue;
         }
-        D3D12_RESOURCE_BARRIER bb[2] = {0};
-        bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        bb[0].Transition.pResource   = s_d3d.render_targets[fi];
-        bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        bb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        gpu_barrier bb[2];
+        memset(bb, 0, sizeof bb);
+        bb[0].type    = GPU_BARRIER_TRANSITION;
+        bb[0].texture = s_rc_rt_tex[fi];
+        bb[0].sub     = GPU_SUB_ALL;
+        bb[0].before  = GPU_STATE_RENDER_TARGET;
+        bb[0].after   = GPU_STATE_COPY_SOURCE;
         bb[1] = bb[0];
-        bb[1].Transition.pResource   = s_subvp[i].res;
-        bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+        bb[1].texture = s_subvp[i].tex;
+        bb[1].before  = GPU_STATE_PIXEL_SHADER_RESOURCE;
+        bb[1].after   = GPU_STATE_COPY_DEST;
+        gpu_cmd_barrier_n(s_rc_cmd, 2, bb);
 
-        D3D12_TEXTURE_COPY_LOCATION dstl = {0}, srcl = {0};
-        dstl.pResource = s_subvp[i].res;
-        dstl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dstl.SubresourceIndex = 0;
-        srcl.pResource = s_d3d.render_targets[fi];
-        srcl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srcl.SubresourceIndex = 0;
         const u32 hx = s_subvp[i].x * s_d3d.host_w / s_d3d.width;
         const u32 hy = s_subvp[i].y * s_d3d.host_h / s_d3d.height;
-        D3D12_BOX box; box.left = hx; box.top = hy;
+        gpu_box box; box.left = hx; box.top = hy;
         box.front = 0; box.right = hx + s_subvp[i].w * s_d3d.host_w / s_d3d.width;
         box.bottom = hy + s_subvp[i].h * s_d3d.host_h / s_d3d.height; box.back = 1;
         if (box.right > s_d3d.host_w)  box.right  = s_d3d.host_w;
         if (box.bottom > s_d3d.host_h) box.bottom = s_d3d.host_h;
-        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dstl, 0, 0, 0, &srcl, &box);
+        gpu_cmd_copy_texture(s_rc_cmd, s_subvp[i].tex, 0, 0, 0, 0, s_rc_rt_tex[fi], 0, &box);
 
-        bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        bb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        bb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, bb);
+        bb[0].before = GPU_STATE_COPY_SOURCE;
+        bb[0].after  = GPU_STATE_RENDER_TARGET;
+        bb[1].before = GPU_STATE_COPY_DEST;
+        bb[1].after  = GPU_STATE_PIXEL_SHADER_RESOURCE;
+        gpu_cmd_barrier_n(s_rc_cmd, 2, bb);
         { static int _n = 0; if (getenv("SUBVP_DBG") && _n < 8 && ++_n)
             fprintf(stderr, "[SUBVP] captured %ux%u from (%u,%u)%c",
                     s_subvp[i].w, s_subvp[i].h, s_subvp[i].x, s_subvp[i].y, 10); }
@@ -720,33 +703,15 @@ static u32    s_lock_n  = 0;
  * heap pointers (s_d3d.srv_heap, samp_heap, blit_srv_heap, writeback's
  * s_down_srv) are the pools' heaps, borrowed (gpu_d3d12_table_pool_heap),
  * for the binding commands not converted yet. Every resource an SRV names
- * has a handle beside its pointer: a texture slot's is its own
- * (VPTexSlot.tex), the others are adopted where they are made (rc_tex_set)
- * and dropped where they are released (rc_tex_drop), so no write looks a
+ * is a texture of the GPU layer's, by its handle (step C8a: the last ones
+ * adopted, the sub-viewport captures, are its own now), so no write looks a
  * handle up. */
 static gpu_table_pool s_rc_srv_pool;    /* s_d3d.srv_heap */
 static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
 static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
 static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
-static gpu_texture    s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a): s_d3d.render_targets borrows them */
 static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy: the GPU layer's (step C5b), s_screen_copy borrowed */
 static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
-
-/* res, just made by the old code, as *t (a handle *t held goes first). */
-static void rc_tex_set(gpu_texture* t, ID3D12Resource* res)
-{
-    if (GPU_VALID(*t)) gpu_texture_destroy(s_rc_dev, *t, 0);
-    *t = gpu_d3d12_adopt_texture_of(s_rc_dev, res);
-}
-
-/* The old code released, or put off releasing, the resource behind *t: the
- * handle and its reference go now, and the old code's own reference keeps
- * the resource until that release. */
-static void rc_tex_drop(gpu_texture* t)
-{
-    if (GPU_VALID(*t)) gpu_texture_destroy(s_rc_dev, *t, 0);
-    t->id = 0;
-}
 
 /* Step C5a: the colour and depth targets are the GPU layer's textures (the
  * display targets s_rc_rt_tex above, the depth buffer, zeta, the offscreen

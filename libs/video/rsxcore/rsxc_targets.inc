@@ -726,14 +726,12 @@ static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
 /* Resources dropped while a frame is being recorded, released once the GPU
  * has finished that frame (off_rt_release_deferred, after render_frame's
  * opening wait). Grows as needed: a frame that flips a surface between two
- * formats draw by draw drops a resource each time. */
-static ID3D12Resource** s_rt_grave;
-static int s_rt_grave_n, s_rt_grave_cap;
-/* Step C5a: the GPU layer's targets (and the offscreen targets' staging)
- * wait here as handles, and go with the fence of the last frame submitted:
- * one dropped while a frame is recorded was last used by that frame, and
- * one dropped before (rsx_scale_apply) by an earlier one. A texture's views
- * go with it. */
+ * formats draw by draw drops a resource each time. Step C5a: the GPU
+ * layer's targets (and the offscreen targets' staging) wait here as
+ * handles, and go with the fence of the last frame submitted: one dropped
+ * while a frame is recorded was last used by that frame, and one dropped
+ * before (rsx_scale_apply) by an earlier one. A texture's views go with it.
+ * (Step C8a: the sub-viewport captures too; nothing native waits here.) */
 typedef struct { gpu_texture tex; gpu_buffer buf; } RcGrave;
 static RcGrave* s_rc_grave;
 static int s_rc_grave_n, s_rc_grave_cap;
@@ -749,8 +747,6 @@ static gpu_fence rc_last_frame_fence(void)
 
 static void off_rt_release_deferred(void)
 {
-    for (int i = 0; i < s_rt_grave_n; i++) s_rt_grave[i]->lpVtbl->Release(s_rt_grave[i]);
-    s_rt_grave_n = 0;
     if (s_rc_grave_n) {
         const gpu_fence after = rc_last_frame_fence();
         for (int i = 0; i < s_rc_grave_n; i++) {
@@ -761,18 +757,6 @@ static void off_rt_release_deferred(void)
     }
 }
 
-static void off_rt_defer_release(ID3D12Resource* res)
-{
-    if (!res) return;
-    if (s_rt_grave_n == s_rt_grave_cap) {
-        int nc = s_rt_grave_cap ? s_rt_grave_cap * 2 : 64;
-        ID3D12Resource** g = (ID3D12Resource**)realloc(s_rt_grave, (size_t)nc * sizeof *g);
-        if (!g) { wait_for_gpu(); res->lpVtbl->Release(res); return; }   /* best effort */
-        s_rt_grave = g; s_rt_grave_cap = nc;
-    }
-    s_rt_grave[s_rt_grave_n++] = res;
-}
-
 /* Step C5a: t and b (either may be none) into the handles' grave. */
 static void rc_grave_put(gpu_texture t, gpu_buffer b)
 {
@@ -780,7 +764,7 @@ static void rc_grave_put(gpu_texture t, gpu_buffer b)
     if (s_rc_grave_n == s_rc_grave_cap) {
         int nc = s_rc_grave_cap ? s_rc_grave_cap * 2 : 64;
         RcGrave* g = (RcGrave*)realloc(s_rc_grave, (size_t)nc * sizeof *g);
-        if (!g) {   /* best effort, as off_rt_defer_release */
+        if (!g) {   /* best effort: at once, once the GPU is idle */
             wait_for_gpu();
             if (GPU_VALID(t)) gpu_texture_destroy(s_rc_dev, t, 0);
             if (GPU_VALID(b)) gpu_buffer_destroy(s_rc_dev, b, 0);
@@ -793,8 +777,8 @@ static void rc_grave_put(gpu_texture t, gpu_buffer b)
     s_rc_grave_n++;
 }
 
-/* A display or depth target the old code released with off_rt_defer_release:
- * its handle (and views) into the grave; *t is none after. */
+/* A display or depth target (or a sub-viewport capture) dropped: its handle
+ * (and views) into the grave; *t is none after. */
 static void rc_grave_tex(gpu_texture* t)
 {
     const gpu_buffer none = {0};

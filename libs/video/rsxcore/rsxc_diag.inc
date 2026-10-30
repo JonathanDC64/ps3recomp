@@ -547,8 +547,7 @@ static void rsx_scale_apply(void)
     for (int i = 0; i < MAX_ZETA; i++) {
         zeta_drop(&s_zeta[i]); s_zeta[i].used = 0;   /* step C5a */
     }
-    for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
-    for (int i = 0; i < SUBVP_SLOTS; i++) rc_tex_drop(&s_subvp[i].tex);   /* step C4 */
+    for (int i = 0; i < SUBVP_SLOTS; i++) rc_grave_tex(&s_subvp[i].tex);   /* step C8a */
     s_screen_copy = NULL; wb_tex_retire(&s_rc_screen_copy_tex);   /* step C5b */
     gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
     s_d3d.readback_buf = NULL;

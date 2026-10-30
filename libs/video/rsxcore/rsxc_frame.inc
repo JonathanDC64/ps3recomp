@@ -403,7 +403,7 @@ rtt_dump_done:;
             if (dr->tex[_u].set && dr->tex[_u].off && s_subvp_n) {
                 int hit = -1;
                 for (int i = 0; i < s_subvp_n; i++)
-                    if (s_subvp[i].res && s_subvp[i].w == dr->tex[_u].w &&
+                    if (GPU_VALID(s_subvp[i].tex) && s_subvp[i].w == dr->tex[_u].w &&
                         s_subvp[i].h == dr->tex[_u].h) { hit = i; break; }
                 if (hit >= 0) {
                     extern uint8_t* vm_base;
