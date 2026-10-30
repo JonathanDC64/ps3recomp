@@ -81,19 +81,18 @@ static gpu_shader sc_load(gpu_sc_stage stage, u64 key)
 }
 
 /* Step C3b: every pipeline is the GPU layer's, from its library when that
- * has it (its own file: pso_lib_open). The ID3D12PipelineState* returned is
- * the handle's (gpu_native), kept by the core for the commands that bind it
- * natively until steps C6/C7; pipelines live as long as the device, so it is
- * never released. NULL on failure; *how (may be NULL) says whether it came
- * from the library (GPU_PIPELINE_LOADED) or was compiled and stored in it
- * (_STORED, step C3c). Thread-safe. */
-static ID3D12PipelineState* rc_pipeline(const gpu_pipeline_desc* d, uint32_t* how)
+ * has it (its own file: pso_lib_open). The core keeps its handle (step C8a);
+ * pipelines live as long as the device, so it is never released. None (.v
+ * 0) on failure; *how (may be NULL) says whether it came from the library
+ * (GPU_PIPELINE_LOADED) or was compiled and stored in it (_STORED, step
+ * C3c). Thread-safe. */
+static gpu_pipeline rc_pipeline(const gpu_pipeline_desc* d, uint32_t* how)
 {
     uint32_t h = GPU_PIPELINE_FAILED;
     const gpu_pipeline p = gpu_pipeline_create(s_rc_dev, d, 0, &h);
     if (p.v) InterlockedIncrement(h == GPU_PIPELINE_LOADED ? &s_rc_pipe_loaded : &s_rc_pipe_made);
     if (how) *how = p.v ? h : GPU_PIPELINE_FAILED;
-    return (ID3D12PipelineState*)gpu_native(s_rc_dev, GPU_NATIVE_PIPELINE, p.v);
+    return p;
 }
 
 /* A built-in pass's pipeline (the blit, the output filter, the HDR blit, the
@@ -138,11 +137,8 @@ static gpu_static_sampler pass_sampler(u32 filter, u32 reg)
     s.visibility = GPU_VIS_PIXEL;
     return s;
 }
-/* A layout and, in *rs, its ID3D12RootSignature* for the native binds (NULL
- * on failure). */
-static gpu_layout lay_make(const gpu_layout_desc* ld, ID3D12RootSignature** rs)
+/* A layout (not GPU_VALID on failure). */
+static gpu_layout lay_make(const gpu_layout_desc* ld)
 {
-    const gpu_layout l = gpu_layout_create(s_rc_dev, ld);
-    *rs = (ID3D12RootSignature*)gpu_native(s_rc_dev, GPU_NATIVE_LAYOUT, l.id);
-    return l;
+    return gpu_layout_create(s_rc_dev, ld);
 }

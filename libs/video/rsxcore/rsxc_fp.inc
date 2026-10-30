@@ -148,8 +148,8 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 static int s_vp_fp_head[VP_FP_BUCKETS];
 static u32 vp_fp_bucket(u32 fp_addr) { return ((fp_addr >> 4) * 2654435761u) >> 20; }
 
-/* Append a finished (or failed: pso NULL) key to the guest-FP PSO cache. */
-static ID3D12PipelineState* vp_fp_insert(const VPFPEntry* e)
+/* Append a finished (or failed: pso none) key to the guest-FP PSO cache. */
+static gpu_pipeline vp_fp_insert(const VPFPEntry* e)
 {
     if (s_d3d.vp_fp_n >= s_d3d.vp_fp_cap) {
         const int cap = s_d3d.vp_fp_cap ? s_d3d.vp_fp_cap * 2 : VP_FP_CACHE_INIT;
@@ -207,12 +207,12 @@ typedef struct {
     gpu_pipeline_desc pd;
     gpu_shader ps;                      /* the job's own, freed in psj_finish */
     int entry;                          /* its VPFPEntry */
-    ID3D12PipelineState* pso;
+    gpu_pipeline pso;
 } PsjJob;
 static PsjJob s_psj[PSJ_MAX];
 static int s_psj_n;                     /* jobs this frame (render thread) */
 static int s_psj_defer;                 /* set during the draw pre-pass */
-static int s_psj_last = -1;             /* vp_get_fp_pso: the pending entry it returned NULL for */
+static int s_psj_last = -1;             /* vp_get_fp_pso: the pending entry it returned none for */
 static struct { u32 draw; int entry; } s_psj_fix[MAX_DRAWS];   /* draws to fill in */
 static int s_psj_fix_n;
 static struct {
@@ -279,14 +279,14 @@ static int psj_add(const gpu_pipeline_desc* pd, gpu_shader ps, const VPFPEntry* 
     if (s_psj_n >= PSJ_MAX) return -1;
     const int at = s_d3d.vp_fp_n;
     VPFPEntry e = *key;
-    e.pso = NULL; e.pending = 1;
+    e.pso = k_rc_no_pipe; e.pending = 1;
     vp_fp_insert(&e);
     if (s_d3d.vp_fp_n != at + 1) return -1;   /* the cache could not grow */
     PsjJob* j = &s_psj[s_psj_n++];
     j->pd = *pd;
     j->ps = ps;
     j->entry = at;
-    j->pso = NULL;
+    j->pso = k_rc_no_pipe;
     return at;
 }
 
@@ -329,7 +329,7 @@ static void psj_finish(void)
         VPFPEntry* e = &s_d3d.vp_fp[j->entry];
         e->pso = j->pso;
         e->pending = 0;
-        if (!j->pso) {
+        if (!j->pso.v) {
             static int said = 0;
             failed++;
             if (said < 16 && ++said) printf("[FP] PSO FAIL (fp=0x%08X)\n", e->fp_addr);

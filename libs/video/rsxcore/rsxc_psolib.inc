@@ -62,7 +62,7 @@ static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
     c.StreamOutput.pSODeclaration = NULL; c.StreamOutput.pBufferStrides = NULL;
     c.InputLayout.pInputElementDescs = NULL; c.CachedPSO.pCachedBlob = NULL;
     /* The root signature by its serialized bytes: every caller passes
-     * vp_root_sig. Callers zero the whole description first, so padding hashes
+     * vp_layout. Callers zero the whole description first, so padding hashes
      * the same every run. */
     u64 h = fnv_bytes(14695981039346656037ull, &s_vp_root_hash, sizeof s_vp_root_hash);
     h = fnv_bytes(h, &c, sizeof c);
@@ -524,7 +524,7 @@ static void pso_lib_tick(void)
       const LONG t = s_rc_pipe_loaded + s_rc_pipe_made + s_rc_pipe_store_only;
       if (lg && t != seen) { seen = t; pso_count_print("so far"); } }
     if (!s_pso_lib_on) return;
-    if (!s_pso_pre_started && s_d3d.vp_root_sig) {
+    if (!s_pso_pre_started && GPU_VALID(s_d3d.vp_layout)) {
         s_pso_pre_started = 1;
         if (s_pso_man_read > s_pso_lib_have && ps3_env_int("PS3_PSO_PREBUILD", 1)) {
             SYSTEM_INFO si; GetSystemInfo(&si);
@@ -553,12 +553,12 @@ static void pso_lib_tick(void)
  * loads it from its library or compiles and stores it. One it compiled goes
  * into the manifest under today's name, pso_desc_key of the D3D12
  * description the GPU layer made of it (the bridge, on this miss path
- * only). NULL on failure. Thread-safe. */
-static ID3D12PipelineState* pso_create_cached(const gpu_pipeline_desc* pd)
+ * only). None on failure. Thread-safe. */
+static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
 {
     uint32_t how = GPU_PIPELINE_FAILED;
-    ID3D12PipelineState* const pso = rc_pipeline(pd, &how);
-    if (!s_pso_lib_on || !pso) return pso;
+    const gpu_pipeline pso = rc_pipeline(pd, &how);
+    if (!s_pso_lib_on || !pso.v) return pso;
     if (how == GPU_PIPELINE_LOADED) { InterlockedIncrement(&s_pso_lib_hits); return pso; }
     InterlockedIncrement(&s_pso_lib_live);
     if (how == GPU_PIPELINE_STORED) {   /* new in the library (step C3c: only then, as today's) */

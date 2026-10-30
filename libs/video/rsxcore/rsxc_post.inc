@@ -58,10 +58,9 @@ static const char* const s_aa_why[] = {
 };
 
 static struct {
-    ID3D12RootSignature*  rs;
-    gpu_layout            layout;     /* rs's handle (step C3b) */
-    ID3D12PipelineState*  pso;
-    ID3D12PipelineState*  pso16;      /* the same into an FP16 target (HDR's scene target) */
+    gpu_layout            layout;     /* (step C3b) */
+    gpu_pipeline          pso;
+    gpu_pipeline          pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
     ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
     gpu_texture           disp_tex;   /* the GPU layer's (step C6); disp is its resource, borrowed */
@@ -95,7 +94,7 @@ static void aa_before_fp_load(void)
  * use. */
 static int aa_ready(void)
 {
-    if (s_aa.pso) return 1;
+    if (s_aa.pso.v) return 1;
     if (s_aa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
     s_aa.failed = 1;   /* until it is made */
     gpu_shader vb = sc_shader(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
@@ -116,19 +115,19 @@ static int aa_ready(void)
         ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_PIXEL);
         ld.nstatic = 1;
         ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
-        s_aa.layout = lay_make(&ld, &s_aa.rs);
+        s_aa.layout = lay_make(&ld);
     }
-    if (s_aa.rs) {
+    if (GPU_VALID(s_aa.layout)) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_aa.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM,
                   GPU_WRITE_R | GPU_WRITE_G | GPU_WRITE_B, 1);
         s_aa.pso = rc_pipeline(&pd, NULL);
         pd.rt_format[0] = GPU_FORMAT_R16G16B16A16_FLOAT;   /* without it, FP16 targets go unfiltered */
-        if (s_aa.pso) s_aa.pso16 = rc_pipeline(&pd, NULL);
+        if (s_aa.pso.v) s_aa.pso16 = rc_pipeline(&pd, NULL);
     }
     sc_shader_drop(&vb);
     sc_shader_drop(&pb);
-    if (!s_aa.pso) {
+    if (!s_aa.pso.v) {
         printf("[AA] pipeline failed (0x%08lX): anti-aliasing stays off\n", (long)E_FAIL);
         return 0;
     }
@@ -165,7 +164,7 @@ static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h
     gpu_cmd_set_viewport(c, &vp);
     gpu_cmd_set_scissor(c, &sc);
     gpu_cmd_set_layout(c, s_aa.layout);
-    gpu_cmd_set_pipeline(c, rc_pipe(fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso));
+    gpu_cmd_set_pipeline(c, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
     gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_srv_pool, AA_SRV_SLOT));
     gpu_cmd_push_const(c, 1, 4, k, 0);
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
@@ -186,10 +185,9 @@ static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h
 #define SMAA_SRV_SLOT 22   /* SRV heap slots 22-26, after AA_SRV_SLOT */
 
 static struct {
-    ID3D12RootSignature*  rs;
-    gpu_layout            layout;      /* rs's handle (step C3b) */
-    ID3D12PipelineState*  pso[3];      /* edges, weights, blend into RGBA8 */
-    ID3D12PipelineState*  blend16;     /* the blend pass into FP16 (HDR's scene target) */
+    gpu_layout            layout;      /* (step C3b) */
+    gpu_pipeline          pso[3];      /* edges, weights, blend into RGBA8 */
+    gpu_pipeline          blend16;     /* the blend pass into FP16 (HDR's scene target) */
     int                   failed;      /* could not be made: FXAA runs instead */
     /* (The edges' and weights' RTVs are their views, edges_rtv and
      * weights_rtv: step C6, no RTV heap.) */
@@ -220,7 +218,7 @@ static void smaa_state(gpu_texture t, D3D12_RESOURCE_STATES* st, D3D12_RESOURCE_
  * use. */
 static int smaa_ready(void)
 {
-    if (s_smaa.pso[2]) return 1;
+    if (s_smaa.pso[2].v) return 1;
     if (s_smaa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
     s_smaa.failed = 1;   /* until it is made */
     LARGE_INTEGER q0, q1, qf;
@@ -258,8 +256,8 @@ static int smaa_ready(void)
         ld.nstatic = 2;
         ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 0, 0), 0);
         ld.statics[1] = pass_sampler(GPU_FILTER(0, 0, 0, 0), 1);
-        s_smaa.layout = lay_make(&ld, &s_smaa.rs);
-        if (!s_smaa.rs) hr = E_FAIL;
+        s_smaa.layout = lay_make(&ld);
+        if (!GPU_VALID(s_smaa.layout)) hr = E_FAIL;
     }
     for (int p = 0; p < 4 && SUCCEEDED(hr); p++) {   /* edges, weights, blend, blend16 */
         const int s = p < 3 ? p : 2;
@@ -268,9 +266,9 @@ static int smaa_ready(void)
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_smaa.layout, code[2 * s], code[2 * s + 1], fmt[p],
                   s == 2 ? (u8)(GPU_WRITE_R | GPU_WRITE_G | GPU_WRITE_B) : (u8)GPU_WRITE_ALL, 1);
-        ID3D12PipelineState** out = p < 3 ? &s_smaa.pso[p] : &s_smaa.blend16;
+        gpu_pipeline* const out = p < 3 ? &s_smaa.pso[p] : &s_smaa.blend16;
         *out = rc_pipeline(&pd, NULL);
-        hr = *out ? S_OK : E_FAIL;
+        hr = out->v ? S_OK : E_FAIL;
         if (p == 3) hr = S_OK;   /* without it, FP16 targets get FXAA */
     }
     /* (No RTV heap: the targets' RTVs are views, step C6.) The lookup
@@ -293,7 +291,7 @@ static int smaa_ready(void)
         if (!*res) { t->id = 0; hr = E_FAIL; }
     }
     for (int i = 0; i < 6; i++) sc_shader_drop(&code[i]);
-    if (FAILED(hr) || !s_smaa.pso[2]) {
+    if (FAILED(hr) || !s_smaa.pso[2].v) {
         printf("[AA] SMAA pipeline failed (0x%08lX): FXAA runs instead\n", (long)hr);
         return 0;
     }
@@ -415,20 +413,20 @@ static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32
     smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     gpu_cmd_clear_color(c, s_smaa.edges_rtv, zero, NULL);
     aa_target(s_smaa.edges_rtv);
-    gpu_cmd_set_pipeline(c, rc_pipe(s_smaa.pso[0]));
+    gpu_cmd_set_pipeline(c, s_smaa.pso[0]);
     gpu_cmd_bind_table(c, 0, g0);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     /* 2. Blending weights: every pixel is written. */
     smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     aa_target(s_smaa.weights_rtv);
-    gpu_cmd_set_pipeline(c, rc_pipe(s_smaa.pso[1]));
+    gpu_cmd_set_pipeline(c, s_smaa.pso[1]);
     gpu_cmd_bind_table(c, 0, g2);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     /* 3. The colour blended along the edges, into the target. */
     smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     aa_target(rtv);
-    gpu_cmd_set_pipeline(c, rc_pipe(fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_smaa.blend16 : s_smaa.pso[2]));
+    gpu_cmd_set_pipeline(c, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_smaa.blend16 : s_smaa.pso[2]);
     gpu_cmd_bind_table(c, 0, g0);
     gpu_cmd_draw(c, 3, 1, 0, 0);
 }
@@ -439,9 +437,9 @@ static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32
 static int aa_filter_for(u32 w, u32 h, DXGI_FORMAT fmt)
 {
     const int fp16 = fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (aa_mode() == 2 && smaa_ready() && (!fp16 || s_smaa.blend16) && smaa_targets(w, h) && smaa_luts_load())
+    if (aa_mode() == 2 && smaa_ready() && (!fp16 || s_smaa.blend16.v) && smaa_targets(w, h) && smaa_luts_load())
         return 2;
-    if (!aa_ready() || (fp16 && !s_aa.pso16)) return 0;
+    if (!aa_ready() || (fp16 && !s_aa.pso16.v)) return 0;
     return 1;
 }
 

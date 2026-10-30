@@ -203,11 +203,11 @@ static int swap_buffers_get(void)
  * if that fails, the bilinear blit stays. */
 #include "rsx_outfilter.h"
 static int knob_outfilter(void) { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_OUTFILTER", 0)); return v; }
-static struct { ID3D12RootSignature* rs; gpu_layout layout; ID3D12PipelineState* pso; int failed; } s_of;
+static struct { gpu_layout layout; gpu_pipeline pso; int failed; } s_of;
 
 static int of_ready(void)
 {
-    if (s_of.pso) return 1;
+    if (s_of.pso.v) return 1;
     if (s_of.failed || !s_d3d.device) return 0;
     s_of.failed = 1;   /* until it is made */
     gpu_shader vb = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
@@ -225,16 +225,16 @@ static int of_ready(void)
         ld.nslots = 2;
         ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
         ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 8, GPU_VIS_PIXEL);
-        s_of.layout = lay_make(&ld, &s_of.rs);
+        s_of.layout = lay_make(&ld);
     }
-    if (s_of.rs) {
+    if (GPU_VALID(s_of.layout)) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_of.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM, GPU_WRITE_ALL, 1);
         s_of.pso = rc_pipeline(&pd, NULL);
     }
     sc_shader_drop(&vb);
     sc_shader_drop(&pb);
-    if (!s_of.pso) {
+    if (!s_of.pso.v) {
         printf("[D3D12] RSX_OUTFILTER pipeline failed (0x%08lX): the bilinear blit stays\n", (long)E_FAIL);
         return 0;
     }
@@ -271,13 +271,13 @@ static int blit_init(void)
     ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
     ld.nstatic = 1;
     ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
-    s_d3d.blit_layout = lay_make(&ld, &s_d3d.blit_rs);
-    HRESULT hr = s_d3d.blit_rs ? S_OK : E_FAIL;
+    s_d3d.blit_layout = lay_make(&ld);
+    HRESULT hr = GPU_VALID(s_d3d.blit_layout) ? S_OK : E_FAIL;
     if (SUCCEEDED(hr)) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_d3d.blit_layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM, GPU_WRITE_ALL, 1);
         s_d3d.blit_pso = rc_pipeline(&pd, NULL);
-        hr = s_d3d.blit_pso ? S_OK : E_FAIL;
+        hr = s_d3d.blit_pso.v ? S_OK : E_FAIL;
     }
     if (SUCCEEDED(hr)) {   /* the GPU layer's table pool: frame fi's table at 2 fi (step C4) */
         gpu_table_pool_desc pd;
@@ -321,11 +321,11 @@ static int blit_init(void)
     "    }\n" \
     "    return l * hw_white;\n" \
     "}\n"
-static struct { ID3D12RootSignature* rs; gpu_layout layout; ID3D12PipelineState* pso[2]; int failed; } s_hdr_blit;
+static struct { gpu_layout layout; gpu_pipeline pso[2]; int failed; } s_hdr_blit;
 
 static int hdr_blit_ready(void)
 {
-    if (s_hdr_blit.pso[0] && s_hdr_blit.pso[1]) return 1;
+    if (s_hdr_blit.pso[0].v && s_hdr_blit.pso[1].v) return 1;
     if (s_hdr_blit.failed || !s_d3d.device) return 0;
     s_hdr_blit.failed = 1;   /* until it is made */
     static const char vs[] =
@@ -364,19 +364,19 @@ static int hdr_blit_ready(void)
         for (int i = 1; i <= 2; i++) ld.slot[i] = lay_slot(GPU_SLOT_CONST32, (u8)(i - 1), 8, GPU_VIS_PIXEL);
         ld.nstatic = 1;
         ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
-        s_hdr_blit.layout = lay_make(&ld, &s_hdr_blit.rs);
+        s_hdr_blit.layout = lay_make(&ld);
     }
-    for (int i = 0; i < 2 && s_hdr_blit.rs; i++) {
+    for (int i = 0; i < 2 && GPU_VALID(s_hdr_blit.layout); i++) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_hdr_blit.layout, vb[i], pb[i], GPU_FORMAT_R16G16B16A16_FLOAT, GPU_WRITE_ALL, 1);
         s_hdr_blit.pso[i] = rc_pipeline(&pd, NULL);
-        if (!s_hdr_blit.pso[i]) break;
+        if (!s_hdr_blit.pso[i].v) break;
     }
     for (int i = 0; i < 2; i++) {
         sc_shader_drop(&vb[i]);
         sc_shader_drop(&pb[i]);
     }
-    if (!s_hdr_blit.pso[0] || !s_hdr_blit.pso[1]) {
+    if (!s_hdr_blit.pso[0].v || !s_hdr_blit.pso[1].v) {
         printf("[D3D12] HDR blit pipeline failed (0x%08lX): HDR stays off\n", (long)E_FAIL);
         return 0;
     }
@@ -456,10 +456,10 @@ static void blit_to_window(u32 fi)
     const int sharp = knob_outfilter() == 1 && vw >= 1.0f && vh >= 1.0f && (hdr || of_ready());
     if (hdr) {
         gpu_cmd_set_layout(c, s_hdr_blit.layout);
-        gpu_cmd_set_pipeline(c, rc_pipe(s_hdr_blit.pso[sharp]));
+        gpu_cmd_set_pipeline(c, s_hdr_blit.pso[sharp]);
     } else {
         gpu_cmd_set_layout(c, sharp ? s_of.layout : s_d3d.blit_layout);
-        gpu_cmd_set_pipeline(c, rc_pipe(sharp ? s_of.pso : s_d3d.blit_pso));
+        gpu_cmd_set_pipeline(c, sharp ? s_of.pso : s_d3d.blit_pso);
     }
     int use_t = 0;
     if (hdr) {   /* T's highlights at 2 fi + 1, for this frame only */

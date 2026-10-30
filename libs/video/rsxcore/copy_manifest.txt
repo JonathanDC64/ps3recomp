@@ -702,3 +702,23 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   15850-15852 and 15855 (their Releases). The VP pass's base pipeline
 #   (11902-11907) is the colour PS's, the atlas PS's when there is none, as
 #   it was with no atlas uploaded.
+#  Pipelines and layouts: every pipeline field, local, parameter and return
+#   is a gpu_pipeline (made? is .v), every root signature only its layout
+#   (made? is GPU_VALID); rc_pipeline returns the handle and lay_make only
+#   the layout (no gpu_native), and RC_PIPE and rc_pipe are gone. None is
+#   k_rc_no_pipe (rsxc_state.inc, new at the end). Pipelines still live as
+#   long as the device. At these legacy lines: 287 and 433 (the record's and
+#   the cache entry's pso), 475-476, 529-533 (blit_rs and vp_root_sig gone),
+#   1770-1830 (s_of, of_ready), 1838-1930 (blit_init), 1932-2000
+#   (s_hdr_blit, hdr_blit_ready), 2051-2140 (blit_to_window's binds), 2391
+#   and 3209 (the init's log prints the layout's id where it printed the
+#   root signature), 3803-3880 (compile_vp), 4610, 4635-4660
+#   (pso_create_cached), 5039-5060 (vp_fp_insert), 5094 (PsjJob.pso),
+#   5161-5250 (psj_add, psj_finish), 6275-6700 (vp_get_fp_pso returns none
+#   where it returned NULL), 8844-8930 (s_down_rs gone, down_init,
+#   down_pso), 10585-10700 (s_aa, aa_ready), 10732-10900 (s_smaa,
+#   smaa_ready), 11004-11012 (aa_filter_for), 11730, 11902-11925 (the VP
+#   pass's base pipeline; VPPASS prints the layout's id), 12202-12210,
+#   15074, 15180, 15330 (vp_layout made? in place of vp_root_sig), and
+#   15866-15876 (rc_backend_shutdown: the dead Releases of the passes'
+#   pipelines, root signatures and the AA copy go).

@@ -255,7 +255,7 @@ static void compile_vp(void)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
     const rsx_state* st = s_d3d.current_rsx_state;
-    if (!st || st->vp_ucode_bytes < 16 || !s_d3d.vp_root_sig) return;
+    if (!st || st->vp_ucode_bytes < 16 || !GPU_VALID(s_d3d.vp_layout)) return;
 
     static char hlsl[64 * 1024];
     int ni = rsx_vp_decompile(st->vp_ucode, st->vp_ucode_bytes, hlsl, sizeof hlsl);
@@ -338,7 +338,7 @@ static void compile_vp(void)
     pd.depth_func = GPU_CMP_LESS_EQUAL;
     pd.samples = 1;
     s_d3d.pipeline_state_vp = rc_pipeline(&pd, NULL);
-    HRESULT hr = s_d3d.pipeline_state_vp ? S_OK : E_FAIL;
+    HRESULT hr = s_d3d.pipeline_state_vp.v ? S_OK : E_FAIL;
 
     /* Second PSO: same VS but a COLOUR-only PS (no texture sample, no alpha
      * discard) for untextured 3D geometry (vkcube's cube). The atlas PS above
@@ -354,8 +354,8 @@ static void compile_vp(void)
         if (GPU_VALID(pcb)) {
             pd.ps = pcb;
             s_d3d.pipeline_state_vp_color = rc_pipeline(&pd, NULL);
-            printf(s_d3d.pipeline_state_vp_color ? "[VP] colour pipeline ready\n"
-                                                 : "[VP] colour PSO FAIL (0x%08lX)\n", (long)E_FAIL);
+            printf(s_d3d.pipeline_state_vp_color.v ? "[VP] colour pipeline ready\n"
+                                                   : "[VP] colour PSO FAIL (0x%08lX)\n", (long)E_FAIL);
             sc_shader_drop(&pcb);
         }
     }

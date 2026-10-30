@@ -129,9 +129,9 @@ typedef struct {
     /* The pre-pass's vp_get_fp_pso result, and the render_frame it was made
      * in (s_rf_serial). The VP pass binds it instead of looking the pipeline
      * up a second time (RSX_PSO_IN_REC); a draw the pre-pass skipped keeps an
-     * older serial. Pipelines are only released at shutdown, so the pointer
+     * older serial. Pipelines are only released at shutdown, so the handle
      * stays good. */
-    ID3D12PipelineState* pso;
+    gpu_pipeline pso;
     u32   pso_serial;
 } D3D12DrawRecord;
 
@@ -286,7 +286,7 @@ typedef struct {
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     u32 uvclamp;            /* 1 with the sprite-edge clamp (dr_uvclamp), else 0 (PSO key) */
     u32 hdrv;               /* HDR: a scene program's clamp limit (dr_hdrv), float bits, or 0 (PSO key) */
-    ID3D12PipelineState* pso;   /* NULL: this key failed to build; not retried */
+    gpu_pipeline pso;       /* none: this key failed to build; not retried */
     int pending;            /* psj: in this frame's batch, pso not built yet */
     int next;               /* vp_fp_find: next entry in this fp_addr's bucket */
 } VPFPEntry;
@@ -328,9 +328,8 @@ typedef struct {
     ID3D12Resource*            swap_buffers[FRAME_COUNT];   /* the window's, win_w x win_h */
     ID3D12DescriptorHeap*      swap_rtv_heap;
     u32                        win_w, win_h;
-    ID3D12RootSignature*       blit_rs;
-    gpu_layout                 blit_layout;   /* blit_rs's handle (step C3b) */
-    ID3D12PipelineState*       blit_pso;
+    gpu_layout                 blit_layout;   /* (step C3b) */
+    gpu_pipeline               blit_pso;
     ID3D12DescriptorHeap*      blit_srv_heap;   /* shader-visible: one SRV per render_targets[i] */
     ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
     ID3D12GraphicsCommandList* cmd_list;
@@ -368,12 +367,11 @@ typedef struct {
      * used as the vertex shader, fed the raw float4 attrib0 + the vp_c[]
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
-    ID3D12RootSignature*  vp_root_sig;          /* CBV(b0) + SRV table + sampler */
-    gpu_layout            vp_layout;            /* vp_root_sig's handle (step C3b) */
+    gpu_layout            vp_layout;            /* CBV(b0) + SRV table + sampler (step C3b) */
     ID3D12Resource*       vf_buf;               /* GPU vertex fetch ring (x2 parity) */
     void*                 vf_mapped;
-    ID3D12PipelineState*  pipeline_state_vp;    /* decompiled VS + atlas PS      */
-    ID3D12PipelineState*  pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
+    gpu_pipeline          pipeline_state_vp;    /* decompiled VS + atlas PS      */
+    gpu_pipeline          pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
     ID3D12Resource*       vp_vb;                /* raw float4 attrib0, per-frame */
     void*                 vp_vb_mapped;
     u32                   vp_vb_offset;
@@ -452,19 +450,11 @@ static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
 /* Step C3b: the root signatures, the pipelines and the shaders they are made
  * from are the GPU layer's (gpu_layout_create, gpu_pipeline_create,
- * gpu_shader_create). The ID3D12RootSignature* and ID3D12PipelineState*
- * fields hold the same objects for the commands that still bind them
- * natively: borrowed, never released by the core (gpu_destroy frees them).
- * A layout's handle is beside its field (s_d3d.vp_layout, blit_layout,
- * s_of.layout, ...); a pipeline's handle is its ID3D12PipelineState* itself
- * (gpu_pipeline.v). The pipelines made this run, from the GPU layer's
- * library and compiled (rc_pipeline): */
+ * gpu_shader_create), never released by the core (gpu_destroy frees them).
+ * The core holds their handles (gpu_layout, gpu_pipeline: step C8a). The
+ * pipelines made this run, from the GPU layer's library and compiled
+ * (rc_pipeline): */
 static volatile LONG s_rc_pipe_loaded, s_rc_pipe_made;
-/* Step C7: render_frame's commands are the GPU layer's inline ones
- * (gpu_d3d12_cmd.h) on the frame's recorder. A pipeline field
- * (ID3D12PipelineState*, gpu_pipeline.v on D3D12) as its handle, with no
- * lookup, for the draws that bind one: */
-#define RC_PIPE(p) ((gpu_pipeline){ (uint64_t)(uintptr_t)(p) })
 static int draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;
@@ -795,13 +785,10 @@ static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format fo
 /* Step C6: the passes that run a few times a frame (the output filter, the
  * blit to the window, the HDR blit, the repaint hold, FXAA and SMAA, the
  * captures' readbacks) record on the GPU layer, on the frame's recorder
- * (s_rc_cmd). Their pipeline fields still hold the ID3D12PipelineState*
- * (step C3b), and a pipeline's handle is that pointer: rc_pipe gives it with
- * no lookup. */
-static gpu_pipeline rc_pipe(ID3D12PipelineState* pso)
-{
-    gpu_pipeline p;
-    p.v = (u64)(uintptr_t)pso;
-    return p;
-}
+ * (s_rc_cmd). */
+
+/* Step C8a: the core holds no native object. Every field that held one is
+ * the handle it borrowed from (made? is GPU_VALID, or .v for a pipeline),
+ * and none is borrowed through gpu_native but the menu's (rsxc_api.inc). */
+static const gpu_pipeline k_rc_no_pipe = {0};      /* none */
 

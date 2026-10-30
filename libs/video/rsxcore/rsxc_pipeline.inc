@@ -399,10 +399,10 @@ static void pso_index_build_start(void)
 }
 
 /* Compiled guest-FP pipeline for a draw (VS by cache slot + the FP at fp_addr). */
-static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                          DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 depth, u32 cube_mask, u32 d2c_mask, u32 uvclamp,
-                                          u32 hdrv)
+static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
+                                u32 depth, u32 cube_mask, u32 d2c_mask, u32 uvclamp,
+                                u32 hdrv)
 {
     s_psj_last = -1;
     vp_pso_knobs_check();
@@ -410,21 +410,21 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
-    if (!fp_addr || !vm_base) return NULL;
-    { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return NULL; }
+    if (!fp_addr || !vm_base) return k_rc_no_pipe;
+    { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return k_rc_no_pipe; }
     /* Resolve the VS: the draw's cached per-VP shader, else the primary. */
     gpu_shader vsb = {0}; u32 vs_hash = 0;
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
         vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
     }
     if (!GPU_VALID(vsb)) { vsb = s_d3d.vp_vs_shader; vs_idx = -1; }
-    if (!GPU_VALID(vsb)) return NULL;
+    if (!GPU_VALID(vsb)) return k_rc_no_pipe;
 
     /* SET_SHADER_PROGRAM low bits = location+1 (same as textures): 1 = LOCAL
      * (VRAM), 2 = MAIN (gcm/cube emits 0x00B90001 for its VRAM-resident FP). */
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     u32 off = cellGcmResolveLocated((fp_addr & 0x3u) == 1, fp_addr & ~0x3u);
-    if (off == 0xFFFFFFFFu) return NULL;
+    if (off == 0xFFFFFFFFu) return k_rc_no_pipe;
 
     /* Content hash: inline constants are patched in place per frame (wave's
      * stamp), so identity is the BYTES, not the address. */
@@ -453,7 +453,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     key.rtfmt = (u32)rtfmt; key.exp32 = exp32; key.ucode_hash = uhash;
     key.cmask = cmask; key.cull = cull; key.depth = depth; key.cube_mask = cube_mask;
     key.d2c_mask = d2c_mask; key.uvclamp = uvclamp != 0; key.hdrv = hdrv;
-    key.pso = NULL;
+    key.pso = k_rc_no_pipe;
     { const VPFPEntry* hit = vp_fp_find(&key);
       if (hit) {
           if (hit->pending) s_psj_last = (int)(hit - s_d3d.vp_fp);
@@ -705,12 +705,12 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */
-    if (s_psj_defer && (s_psj_last = psj_add(&pd, pb, &key)) >= 0) return NULL;
+    if (s_psj_defer && (s_psj_last = psj_add(&pd, pb, &key)) >= 0) return k_rc_no_pipe;
     const double cp_t0 = perf_on() ? perf_now() : 0.0;
-    ID3D12PipelineState* pso = pso_create_cached(&pd);
+    const gpu_pipeline pso = pso_create_cached(&pd);
     if (perf_on()) { s_perf_cpso += perf_now() - cp_t0; s_perf_cpso_n++; }
     sc_shader_drop(&pb);
-    if (!pso) {
+    if (!pso.v) {
         static int _e3=0; if (_e3 < 16 && ++_e3) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, (long)E_FAIL);
         return vp_fp_insert(&key);
     }

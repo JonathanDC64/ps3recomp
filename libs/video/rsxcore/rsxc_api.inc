@@ -112,23 +112,14 @@ static void rc_backend_shutdown(void)
     s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
     s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
     s_rc_vf_buf.id = s_rc_readback_buf.id = s_rc_ring_old[0].id = s_rc_ring_old[1].id = 0;
-    /* The passes' root signatures and pipelines are the GPU layer's (step
-     * C3b): borrowed, and gpu_destroy frees them, so the releases below find
-     * NULL. */
-    s_of.pso = NULL; s_of.rs = NULL;
-    s_d3d.blit_pso = NULL; s_d3d.blit_rs = NULL;
-    s_aa.pso = NULL; s_aa.pso16 = NULL; s_aa.rs = NULL;
+    /* The passes' layouts and pipelines are the GPU layer's (step C3b) and go
+     * with gpu_destroy. */
+    s_d3d.blit_pso = k_rc_no_pipe;
     /* Step C6: the AA display copy, SMAA's textures and the repaint hold are
      * the GPU layer's and go with gpu_destroy; their pointers were borrowed. */
     s_aa.disp = NULL; s_aa.disp_tex.id = 0;
     s_hold = NULL; s_hold_tex.id = 0; s_hold_valid = 0;
     memset(&s_of, 0, sizeof s_of);
-    if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
-    if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
-    if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
-    if (s_aa.pso16) s_aa.pso16->lpVtbl->Release(s_aa.pso16);
-    if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
-    if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
     memset(&s_aa, 0, sizeof s_aa);
     /* The swap chain and its buffers, the recorders, the fence, the queue and
      * the device are the GPU layer's: s_d3d's pointers to them were borrowed,

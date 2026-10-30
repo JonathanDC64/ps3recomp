@@ -31,7 +31,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          * UNtextured cube to the fixed-function fallback, which never applies the
          * VP's MVP transform, so the cube was drawn in object space and clipped
          * off-screen. Untextured VP draws now render via the colour PSO. */
-        if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
+        if (s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout)) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
             if (emitted && draw_room()) {
@@ -135,7 +135,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * go down the fixed-function passthrough below instead. */
     if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
-        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
+        s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout) &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
@@ -283,7 +283,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     }
     if (!s_d3d.pipeline_ready) return;
     if (count == 0 || count > MAX_VERTICES) return;
-    if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
+    if (!s_d3d.vp_vb_mapped || !GPU_VALID(s_d3d.vp_layout)) return;
 
     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
      * triangles per quad, TRIANGLES straight through, STRIP/FAN -> triangle

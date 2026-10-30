@@ -106,8 +106,7 @@ static void wb_tex_bury(void)
  * under a scaled target kept whatever was there before, and a target created
  * later at that offset was filled from it: the Profile List showed coloured
  * noise below its footer, where it draws nothing over a recreated target. */
-static ID3D12RootSignature*  s_down_rs;
-static gpu_layout            s_down_layout;   /* s_down_rs's handle (step C3b) */
+static gpu_layout            s_down_layout;   /* (step C3b) */
 static gpu_pipeline          s_down_pso[8];   /* the GPU layer's (step C3b), bound as handles (step C5b) */
 static u32                   s_down_pso_fmt[8];   /* format, | 1 << 31 for guest byte order */
 static ID3D12DescriptorHeap* s_down_srv;   /* shader visible, 2 x MAX_OFF_RTS (frame parity) */
@@ -158,9 +157,8 @@ static int down_init(void)
     ld.nslots = 2;
     ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
     ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 2, GPU_VIS_PIXEL);
-    s_down_layout = lay_make(&ld, &s_down_rs);
-    HRESULT hr = s_down_rs ? S_OK : E_FAIL;
-    if (FAILED(hr)) return 0;
+    s_down_layout = lay_make(&ld);
+    if (!GPU_VALID(s_down_layout)) return 0;
     {   /* the GPU layer's table pool, a 1-entry table each (step C4) */
         gpu_table_pool_desc pd;
         memset(&pd, 0, sizeof pd);
@@ -187,8 +185,7 @@ static gpu_pipeline down_pso(DXGI_FORMAT f, int argb)
     if (slot < 0) return none;
     gpu_pipeline_desc pd;
     pass_desc(&pd, s_down_layout, s_down_vs, argb ? s_down_ps_argb : s_down_ps, (gpu_format)f, GPU_WRITE_ALL, 0);
-    /* (The GPU layer's: step C3b. rc_pipeline's pointer is the handle's value.) */
-    s_down_pso[slot].v = (u64)(uintptr_t)rc_pipeline(&pd, NULL);
+    s_down_pso[slot] = rc_pipeline(&pd, NULL);   /* (the GPU layer's: step C3b) */
     if (!s_down_pso[slot].v) return none;
     s_down_pso_fmt[slot] = key;
     return s_down_pso[slot];

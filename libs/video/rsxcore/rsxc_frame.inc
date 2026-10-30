@@ -537,8 +537,8 @@ rtt_dump_done:;
         /* The colour-only PS (untextured 3D, vkcube); the atlas's sampling PS
          * when there is none. (With no atlas upload, step C8a, there is no
          * atlas for that PS to sample.) */
-        gpu_pipeline vpso = RC_PIPE(s_d3d.pipeline_state_vp_color);
-        if (!vpso.v) vpso = RC_PIPE(s_d3d.pipeline_state_vp);
+        gpu_pipeline vpso = s_d3d.pipeline_state_vp_color;
+        if (!vpso.v) vpso = s_d3d.pipeline_state_vp;
         { static int cap = -1, n = 0;
           PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
           if (cap && n < cap) { n++;
@@ -549,11 +549,11 @@ rtt_dump_done:;
             }
             fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
                     s_d3d.draw_count, nvp, nclr, any,
-                    (void*)(uintptr_t)vpso.v, (void*)s_d3d.vp_root_sig); } }
+                    (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
         if (any && vpso.v && s_d3d.vp_vb && s_d3d.vp_cb) {
-            gpu_cmd_set_layout(rc, s_d3d.vp_layout);   /* vp_root_sig's */
+            gpu_cmd_set_layout(rc, s_d3d.vp_layout);
             gpu_cmd_set_pipeline(rc, vpso);
             gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
             s_vp_topo_strip = 0;
@@ -814,17 +814,17 @@ rtt_dump_done:;
                  * again, as before. */
                 static int pso_in_rec = -1;
                 PS3_KNOB(pso_in_rec, ps3_env_int("RSX_PSO_IN_REC", 1));
-                gpu_pipeline dpso = {0};   /* (the record's pipeline fields: RC_PIPE, step C7) */
+                gpu_pipeline dpso = {0};
                 if (dr->fp_addr) {
-                    if (pso_in_rec && dr->pso && dr->pso_serial == s_rf_serial) dpso = RC_PIPE(dr->pso);
+                    if (pso_in_rec && dr->pso.v && dr->pso_serial == s_rf_serial) dpso = dr->pso;
                     if (!dpso.v || pso_in_rec == 2) {
                         const gpu_pipeline look =
-                            RC_PIPE(vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
-                                                  dr_num_rts(dr),
-                                                  dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
-                                                             : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                  dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                                  dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr)));
+                            vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
+                                          dr_num_rts(dr),
+                                          dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
+                                                     : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                          dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                          dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
                         if (dpso.v && look.v != dpso.v) {
                             static int n = 0;
                             if (n < 8) {

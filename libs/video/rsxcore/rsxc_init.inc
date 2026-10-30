@@ -4,7 +4,7 @@
 
 static void pso_lib_open(void);   /* pipeline library, defined with the shader cache */
 static void shader_cache_warm(void);   /* the shader cache read ahead, defined with it */
-static u64 s_vp_root_hash;        /* vp_root_sig's serialized bytes, part of every pipeline's name */
+static u64 s_vp_root_hash;        /* vp_layout's serialized bytes, part of every pipeline's name */
 static u64 fnv_bytes(u64 h, const void* p, size_t n)
 {
     for (size_t i = 0; i < n; i++) { h ^= ((const u8*)p)[i]; h *= 1099511628211ull; }
@@ -272,7 +272,7 @@ static int init_d3d12(u32 width, u32 height)
         /* No static samplers. The layout's serialized bytes are today's, so
          * s_vp_root_hash, and with it every pipeline's name in the manifest
          * (pso_desc_key), is today's too. */
-        s_d3d.vp_layout = lay_make(&ld, &s_d3d.vp_root_sig);
+        s_d3d.vp_layout = lay_make(&ld);
         s_vp_root_hash = gpu_d3d12_layout_hash(s_rc_dev, s_d3d.vp_layout);
 
         /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently
@@ -336,7 +336,7 @@ static int init_d3d12(u32 width, u32 height)
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
-               (void*)s_d3d.vp_root_sig, (void*)s_d3d.vp_vb, (void*)s_d3d.vp_cb);
+               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)s_d3d.vp_vb, (void*)s_d3d.vp_cb);
     }
 
     printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",
