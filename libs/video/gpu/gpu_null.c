@@ -3482,6 +3482,22 @@ static uint32_t nl_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* im
     return s->next;
 }
 
+/* The images, as made: a query, not in the stream. Views of every image may be
+ * made up front; drawing into one still needs its acquire. */
+static uint32_t nl_swap_image_count(gpu_device* d, gpu_swapchain sc)
+{
+    const gpu_null_swap* const s = swap_at(GPU_NULL_DEV(d), sc.id);
+    return s ? s->buffers : 0u;
+}
+
+static gpu_texture nl_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t index)
+{
+    const gpu_null_swap* const s = swap_at(GPU_NULL_DEV(d), sc.id);
+    gpu_texture r = {0};
+    if (s && index < s->buffers) r = s->image[index];
+    return r;
+}
+
 static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags)
 {
     gpu_null_device* const nd = GPU_NULL_DEV(d);
