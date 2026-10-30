@@ -18,7 +18,10 @@
  *    _program_hash64 and _fp_variants for every program; some calls get a
  *    buffer just too small, so the failure paths are compared too;
  *  - the draw path's vertex text (rsxc_vs_locate / rsxc_vs_text, from an
- *    rsx_state) must be the export's text, key and fingerprint;
+ *    rsx_state) must be the export's text, key and fingerprint, with
+ *    VP_W_ONE, VP_BYPASS and VP_START_OFF acting as in vp_get_vs_mode; the
+ *    fragment memo (rsxc_fp_hash_at) must give the decompiler's hash, size
+ *    and units, before and after the program changes;
  *  - for a sample of texts, gpu_sc_put and rsx_d3d12_shader_cache_put each
  *    fill their own new cache directory: the same results, file names and
  *    bytes (PS3_SHADER_CACHE_HLSL=1, so the kept texts too).
@@ -35,6 +38,7 @@
 #endif
 #include <windows.h>
 
+#include "ps3emu/ps3_knob.h"        /* ps3_env_gen: a knob's next read sees a setenv */
 #include "rsx_d3d12_backend.h"     /* today's exports */
 #include "rsx_fp_decompiler.h"
 #include "rsx_vp_decompiler.h"
@@ -401,8 +405,12 @@ static void compare_fp_program(Rng* r, const u8* uc, u32 len, u32 index)
                     compare_hlsl(kind, uc, len, 0, exp32, 0, 0, tl / 2 + 2);
                 }
                 if (m == 0 || m == 4) {
+                    /* Limits that print the same at any precision, and ones
+                     * that need all nine digits (0.1f is 0.100000001). */
                     const u32 hdrvs[] = { f2u(2.0f), f2u(64.0f), f2u(1000.5f), f2u(65504.0f),
-                                          f2u(1e30f), HDRV_SAT | units, HDRV_SAT | 0xFFFFu,
+                                          f2u(1e30f), f2u(0.1f), f2u(10.0f / 3.0f),
+                                          f2u(1.0f + (float)(rnd % 60000u) / 7.0f),
+                                          HDRV_SAT | units, HDRV_SAT | 0xFFFFu,
                                           HDRV_SAT | (units & rnd), 0 };
                     for (unsigned h = 0; h < sizeof hdrvs / sizeof hdrvs[0]; h++) {
                         snprintf(g_ctx, sizeof g_ctx, "fp %u kind %d exp32 %d mask %d hdrv %08X", index,
@@ -494,6 +502,32 @@ static void compare_vp_program(Rng* r, u32 index)
         if (nb > 0)
             check_int("vs_text uses_c03", (strstr(A, "vp_c[0]") || strstr(A, "vp_c[1]") ||
                                            strstr(A, "vp_c[2]") || strstr(A, "vp_c[3]")) ? 1 : 0, c03);
+        /* The draw path's knobs: VP_W_ONE and VP_BYPASS patch the text in
+         * place, space-padded (vp_get_vs_mode); VP_START_OFF starts at 0. */
+        if ((index % 4) == 0 && nb > 0) {
+            static const char* const pat[2][2] = {
+                { "o[0].w = _v.w;", "o[0].w = 1.0;" },
+                { "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);",
+                  "Out.pos = float4(v[0].xy * 0.5, 0.5, 1.0);" } };
+            for (int k = 0; k < 2; k++)
+                for (char* at = A; (at = strstr(at, pat[k][0])) != NULL; at += strlen(pat[k][0])) {
+                    memcpy(at, pat[k][1], strlen(pat[k][1]));
+                    memset(at + strlen(pat[k][1]), ' ', strlen(pat[k][0]) - strlen(pat[k][1]));
+                }
+            _putenv_s("VP_W_ONE", "1");
+            _putenv_s("VP_BYPASS", "1");
+            check_int("vs_text VP_W_ONE/VP_BYPASS result", rsxc_vs_text(&vp, fetch, B, 262144, NULL), nb);
+            check_str("vs_text VP_W_ONE/VP_BYPASS text", A, B);
+            _putenv_s("VP_W_ONE", "");
+            _putenv_s("VP_BYPASS", "");
+            _putenv_s("VP_START_OFF", "1");
+            ps3_env_gen++;
+            rsxc_vs_program v0;
+            check_int("vs_locate VP_START_OFF", rsxc_vs_locate(&g_st, fetch, &v0), 0);
+            check_int("vs_locate VP_START_OFF start", v0.vstart, 0);
+            _putenv_s("VP_START_OFF", "");
+            ps3_env_gen++;
+        }
     }
 }
 
@@ -705,8 +739,9 @@ static void memo_test(uint64_t seed)
         offs[n++] = at;
         at = (at + len + 0x40 + rn(&r, 4096)) & ~0xFu;
     }
-    for (int pass = 0; pass < 3; pass++)
+    for (int pass = 0; pass < 4; pass++)
         for (u32 i = 0; i < n; i++) {
+            if (pass == 3 && i == 0) { _putenv_s("RSX_FP_HASH_MEMO", "0"); ps3_env_gen++; }
             snprintf(g_ctx, sizeof g_ctx, "fp memo pass %d program %u", pass, i);
             if (pass == 2 && (i & 1)) mem[offs[i] + 4] ^= 0x10;   /* a word changes */
             u32 sz = 0;
@@ -717,6 +752,8 @@ static void memo_test(uint64_t seed)
             check_int("fp_hash_at size", sz, want);
             check_int("fp_units_at", rsxc_fp_units_at(offs[i]), rsx_fp_texture_units(mem + offs[i], RSX_FP_MAX_BYTES));
         }
+    _putenv_s("RSX_FP_HASH_MEMO", "");
+    ps3_env_gen++;
     snprintf(g_ctx, sizeof g_ctx, "fp seen");
     check_int("fp_seen", rsxc_fp_seen(-1, NULL, NULL), (long long)n);
     vm_base = NULL;
