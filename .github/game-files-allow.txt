@@ -10,3 +10,5 @@ scratch/ppu_conformance.cpp
 packaging/macos/icon_1024.png
 # SMAA's reference shader (iryoku/smaa, MIT), vendored as published for the D3D12 backend's RSX_AA=2 pass.
 third_party/smaa/SMAA.hlsl
+# The Vulkan backend's test shaders, written for test_gpu_vk.c; test_gpu_vk_spv.h holds them compiled.
+libs/video/tests/test_gpu_vk_shaders.hlsl
