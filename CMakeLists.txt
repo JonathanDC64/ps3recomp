@@ -513,6 +513,22 @@ if(PS3RECOMP_RSX_HAL)
     endif()
     enable_testing()
     add_test(NAME gpu_contract COMMAND test_gpu_contract)
+
+    # The D3D12 backend's test: on WARP, so it needs no GPU; GPU_TEST_HW=1
+    # runs it on the real one. Built on demand:
+    #   cmake --build build --target test_gpu_d3d12
+    #   ctest --test-dir build -R gpu_d3d12
+    if(WIN32)
+        add_executable(test_gpu_d3d12 EXCLUDE_FROM_ALL
+            libs/video/tests/test_gpu_d3d12.c
+            runtime/host/host_stubs.c
+        )
+        target_compile_definitions(test_gpu_d3d12 PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_gpu_d3d12 PRIVATE ps3recomp_runtime d3d12 dxgi dxguid d3dcompiler)
+        target_include_directories(test_gpu_d3d12 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/gpu")
+        set_target_properties(test_gpu_d3d12 PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME gpu_d3d12 COMMAND test_gpu_d3d12)
+    endif()
     message(STATUS "  Renderer:     the portable renderer's GPU layer too (PS3RECOMP_RSX_HAL)")
 endif()
 

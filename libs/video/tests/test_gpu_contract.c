@@ -8,9 +8,10 @@
  *   - the numbers gpu.h borrows from D3D12 are D3D12's: against <d3d12.h>
  *     and <dxgi1_6.h> on Windows, against the documented values everywhere;
  *   - the structures copied field for field from D3D12 have its layout;
- *   - gpu_vt_cmd.h defines every command with the list's parameters
- *     (GPU_CMD_CHECK), and its wrappers and gpu.h's reach the right entry of
- *     a recorder's or a device's table.
+ *   - gpu_vt_cmd.h defines every command with the list's parameters and
+ *     every per-draw device call (GPU_FAST_FUNCS) with its gpu_vt
+ *     function's (GPU_CMD_CHECK), and its wrappers and gpu.h's reach the
+ *     right entry of a recorder's or a device's table.
  * The pipeline description's size is pinned too: its bytes name a pipeline
  * in the cache, so a change to it is a change to every name.
  */
@@ -386,7 +387,21 @@ int gpu_contract_c_run(void)
         memset(&bd, 0, sizeof bd);
         dev.vt = &k_fake_vt;
         gpu_device* const d = &dev;
+        gpu_table_pool pool;
+        gpu_buffer buf;
+        gpu_sampler smp;
+        gpu_shader sh;
+        pool.id = 1;
+        buf.id = 2;
+        smp.id = 3;
+        sh.id = 4;
         (void)gpu_buffer_create(d, &bd);          CHECK(g_vt_last == VT_buffer_create);
+        gpu_shader_destroy(d, sh);                CHECK(g_vt_last == VT_shader_destroy);
+        /* The per-draw device calls through gpu_vt_cmd.h. */
+        gpu_fast_table_write_tex(d, pool, 7, NULL); CHECK(g_vt_last == VT_table_write_tex);
+        gpu_fast_table_write_sampler(d, pool, 7, smp); CHECK(g_vt_last == VT_table_write_sampler);
+        CHECK(gpu_fast_table_ref(d, pool, 7).v == 0); CHECK(g_vt_last == VT_table_ref);
+        CHECK(gpu_fast_buffer_addr(d, buf) == 0); CHECK(g_vt_last == VT_buffer_addr);
         (void)gpu_signal(d);                      CHECK(g_vt_last == VT_signal);
         (void)gpu_fence_wait(d, 1, 2000);         CHECK(g_vt_last == VT_fence_wait);
         CHECK(gpu_cmd_begin(d, 0) == NULL);       CHECK(g_vt_last == VT_cmd_begin);
