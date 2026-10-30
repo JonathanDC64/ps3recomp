@@ -259,6 +259,8 @@ void          gpu_d3d12_swap_destroy(gpu_device* d, gpu_swapchain sc);
 int           gpu_d3d12_swap_resize(gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t height,
                                     gpu_format format);
 uint32_t      gpu_d3d12_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image);
+uint32_t      gpu_d3d12_swap_image_count(gpu_device* d, gpu_swapchain sc);
+gpu_texture   gpu_d3d12_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t i);   /* also the bridge's */
 int           gpu_d3d12_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags);
 int           gpu_d3d12_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out);
 int           gpu_d3d12_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space,
