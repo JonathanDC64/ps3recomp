@@ -29,84 +29,64 @@ static void frame_cmd_submit(void)
 }
 
 /* The display buffers and the shared depth buffer, at RSX_SCALE's size: made
- * by init_d3d12, and again by rsx_scale_apply when the scale changes. Their
- * descriptor heaps already exist. */
+ * by init_d3d12, and again by rsx_scale_apply when the scale changes. They
+ * are the GPU layer's textures, with their views (step C5a). */
 static int display_targets_make(void)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
-
     /* The game's frame: textures of their own (see render_targets), in the
      * PRESENT (= COMMON) state between frames as the swap chain's were, so
-     * every transition and readback of them is unchanged. */
+     * every transition and readback of them is unchanged. No clear value;
+     * the RTV is today's NULL description. render_targets[i] borrows the
+     * texture. */
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        D3D12_HEAP_PROPERTIES hp = {0};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd = {0};
-        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width            = s_d3d.host_w;
-        rd.Height           = s_d3d.host_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels        = 1;
-        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rd.SampleDesc.Count = 1;
-        rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-        HRESULT hr = s_d3d.device->lpVtbl->CreateCommittedResource(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PRESENT, NULL,
-            &IID_ID3D12Resource, (void**)&s_d3d.render_targets[i]);
-        if (FAILED(hr)) return -1;
-        rc_tex_set(&s_rc_rt_tex[i], s_d3d.render_targets[i]);   /* step C4: the blit's SRVs */
-
-        s_d3d.device->lpVtbl->CreateRenderTargetView(
-            s_d3d.device, s_d3d.render_targets[i], NULL, rtv_handle);
-        rtv_handle.ptr += s_d3d.rtv_descriptor_size;
+        gpu_texture_desc td;
+        memset(&td, 0, sizeof td);
+        td.width   = s_d3d.host_w;
+        td.height  = s_d3d.host_h;
+        td.layers  = 1;
+        td.mips    = 1;
+        td.format  = GPU_FORMAT_R8G8B8A8_UNORM;
+        td.samples = 1;
+        td.use     = GPU_USE_RT | GPU_USE_SAMPLED | GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+        td.state   = GPU_STATE_PRESENT;
+        s_rc_rt_tex[i] = gpu_texture_create(s_rc_dev, &td);
+        if (!GPU_VALID(s_rc_rt_tex[i])) return -1;
+        s_d3d.render_targets[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_rt_tex[i].id);
+        s_rc_rt_rtv[i] = rc_target_view(s_rc_rt_tex[i], GPU_VIEW_RTV, 0, 0, &s_rc_rt_rtv_cpu[i]);
     }
     return 0;
 }
 
 static int depth_buffer_make(void)
 {
-    D3D12_HEAP_PROPERTIES heap_props = {0};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    D3D12_RESOURCE_DESC depth_desc = {0};
-    depth_desc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    gpu_texture_desc td;
+    memset(&td, 0, sizeof td);
     /* Sized to cover the LARGEST render target, not just the window:
      * D3D12 clips rasterization to the smallest bound attachment, and
      * this DSV is shared by every pass -- with a window-sized depth
      * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
      * image) were silently cropped to the window rect. */
-    depth_desc.Width              = rt_host_dim(2048, 2048, 2048);
-    depth_desc.Height             = rt_host_dim(2048, 2048, 2048);
-    depth_desc.DepthOrArraySize   = 1;
-    depth_desc.MipLevels          = 1;
-    depth_desc.Format             = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_desc.SampleDesc.Count   = 1;
-    depth_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    depth_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-
-    D3D12_CLEAR_VALUE depth_clear = {0};
-    depth_clear.Format                       = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    depth_clear.DepthStencil.Depth           = 1.0f;
-    depth_clear.DepthStencil.Stencil         = 0;
-
-    HRESULT hr = d3d_create_committed(
-        s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
-        &depth_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &depth_clear,
-        &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
-    if (FAILED(hr)) {
-        printf("[D3D12] Depth buffer creation failed (0x%08lX)\n", hr);
+    td.width         = rt_host_dim(2048, 2048, 2048);
+    td.height        = rt_host_dim(2048, 2048, 2048);
+    td.layers        = 1;
+    td.mips          = 1;
+    td.format        = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.samples       = 1;
+    td.use           = GPU_USE_DS;
+    td.state         = GPU_STATE_DEPTH_WRITE;
+    td.clear_format  = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.clear_depth   = 1.0f;
+    td.clear_stencil = 0;
+    s_rc_depth_tex = gpu_texture_create(s_rc_dev, &td);
+    if (!GPU_VALID(s_rc_depth_tex)) {
+        printf("[D3D12] Depth buffer creation failed\n");
         return -1;
     }
+    s_d3d.depth_buffer = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_depth_tex.id);
 
-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc = {0};
-    dsv_desc.Format         = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dsv_desc.ViewDimension  = D3D12_DSV_DIMENSION_TEXTURE2D;
-
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle;
-    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv_handle);
-    s_d3d.device->lpVtbl->CreateDepthStencilView(
-        s_d3d.device, s_d3d.depth_buffer, &dsv_desc, dsv_handle);
+    /* The DSV: D24S8, 2D, mip 0, no flags. */
+    s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT,
+                                    &s_rc_depth_dsv_cpu);
     return 0;
 }
 
@@ -162,28 +142,16 @@ static int init_d3d12(u32 width, u32 height)
 
     s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
 
-    /* Create RTV descriptor heap */
-    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
-    rtv_heap_desc.NumDescriptors = FRAME_COUNT;
-    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
-        s_d3d.device, &rtv_heap_desc, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.rtv_heap);
-    if (FAILED(hr)) return -1;
-
+    /* The display targets' and the swap chain images' RTVs and the depth
+     * DSV are the GPU layer's views (step C5a): no RTV or DSV heap here. The
+     * RTV heaps still made elsewhere (the downscale's, SMAA's) step by this
+     * size. */
     s_d3d.rtv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     if (display_targets_make() != 0) return -1;
 
-    /* The window's buffers, with RTVs of their own. */
-    {
-        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-        hd.NumDescriptors = FRAME_COUNT;
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
-            s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.swap_rtv_heap);
-        if (FAILED(hr)) return -1;
-    }
+    /* The window's buffers, with RTVs of their own (swap_buffers_get). */
     s_d3d.win_w = width;
     s_d3d.win_h = height;
     if (swap_buffers_get() != 0) return -1;
@@ -193,20 +161,9 @@ static int init_d3d12(u32 width, u32 height)
      * Depth/stencil buffer
      * 24-bit depth + 8-bit stencil (DXGI_FORMAT_D24_UNORM_S8_UINT).
      * One shared depth texture across both frames — RSX games on PS3
-     * typically use a single zeta surface.
+     * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
     {
-        D3D12_DESCRIPTOR_HEAP_DESC dsv_heap_desc = {0};
-        dsv_heap_desc.NumDescriptors = 1;
-        dsv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
-            s_d3d.device, &dsv_heap_desc, &IID_ID3D12DescriptorHeap,
-            (void**)&s_d3d.dsv_heap);
-        if (FAILED(hr)) {
-            printf("[D3D12] DSV heap creation failed\n");
-            return -1;
-        }
-
         if (depth_buffer_make() != 0) return -1;
 
         printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
@@ -504,15 +461,8 @@ static int init_d3d12(u32 width, u32 height)
                     s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
 
-        /* RTV heap for offscreen render targets (CPU-visible only). */
-        {
-            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-            hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            hd.NumDescriptors = MAX_OFF_RTS;
-            hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
-                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.rt_rtv_heap);
-            if (FAILED(hr)) printf("[D3D12] offscreen RTV heap creation failed (0x%08lX)\n", hr);
-        }
+        /* The offscreen targets' RTVs are views of their textures (off_rt_get,
+         * step C5a): no RTV heap for them. */
     }
 
     /* ---------------------------------------------------------------

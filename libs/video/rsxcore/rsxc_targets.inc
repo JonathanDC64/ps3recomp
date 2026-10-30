@@ -738,11 +738,36 @@ static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
  * formats draw by draw drops a resource each time. */
 static ID3D12Resource** s_rt_grave;
 static int s_rt_grave_n, s_rt_grave_cap;
+/* Step C5a: the GPU layer's targets (and the offscreen targets' staging)
+ * wait here as handles, and go with the fence of the last frame submitted:
+ * one dropped while a frame is recorded was last used by that frame, and
+ * one dropped before (rsx_scale_apply) by an earlier one. A texture's views
+ * go with it. */
+typedef struct { gpu_texture tex; gpu_buffer buf; } RcGrave;
+static RcGrave* s_rc_grave;
+static int s_rc_grave_n, s_rc_grave_cap;
+
+/* The last frame's fence: the highest of the frame slots' (one timeline). */
+static gpu_fence rc_last_frame_fence(void)
+{
+    gpu_fence f = 0;
+    for (u32 i = 0; i < FRAME_COUNT; i++)
+        if (s_rc_frame_fence[i] > f) f = s_rc_frame_fence[i];
+    return f;
+}
 
 static void off_rt_release_deferred(void)
 {
     for (int i = 0; i < s_rt_grave_n; i++) s_rt_grave[i]->lpVtbl->Release(s_rt_grave[i]);
     s_rt_grave_n = 0;
+    if (s_rc_grave_n) {
+        const gpu_fence after = rc_last_frame_fence();
+        for (int i = 0; i < s_rc_grave_n; i++) {
+            if (GPU_VALID(s_rc_grave[i].tex)) gpu_texture_destroy(s_rc_dev, s_rc_grave[i].tex, after);
+            if (GPU_VALID(s_rc_grave[i].buf)) gpu_buffer_destroy(s_rc_dev, s_rc_grave[i].buf, after);
+        }
+        s_rc_grave_n = 0;
+    }
 }
 
 static void off_rt_defer_release(ID3D12Resource* res)
@@ -755,6 +780,45 @@ static void off_rt_defer_release(ID3D12Resource* res)
         s_rt_grave = g; s_rt_grave_cap = nc;
     }
     s_rt_grave[s_rt_grave_n++] = res;
+}
+
+/* Step C5a: t and b (either may be none) into the handles' grave. */
+static void rc_grave_put(gpu_texture t, gpu_buffer b)
+{
+    if (!GPU_VALID(t) && !GPU_VALID(b)) return;
+    if (s_rc_grave_n == s_rc_grave_cap) {
+        int nc = s_rc_grave_cap ? s_rc_grave_cap * 2 : 64;
+        RcGrave* g = (RcGrave*)realloc(s_rc_grave, (size_t)nc * sizeof *g);
+        if (!g) {   /* best effort, as off_rt_defer_release */
+            wait_for_gpu();
+            if (GPU_VALID(t)) gpu_texture_destroy(s_rc_dev, t, 0);
+            if (GPU_VALID(b)) gpu_buffer_destroy(s_rc_dev, b, 0);
+            return;
+        }
+        s_rc_grave = g; s_rc_grave_cap = nc;
+    }
+    s_rc_grave[s_rc_grave_n].tex = t;
+    s_rc_grave[s_rc_grave_n].buf = b;
+    s_rc_grave_n++;
+}
+
+/* A display or depth target the old code released with off_rt_defer_release:
+ * its handle (and views) into the grave; *t is none after. */
+static void rc_grave_tex(gpu_texture* t)
+{
+    const gpu_buffer none = {0};
+    rc_grave_put(*t, none);
+    t->id = 0;
+}
+
+/* An offscreen target and its init staging, dropped (step C5a): the handles
+ * go into the grave, the borrowed pointers and the RTV are cleared. */
+static void off_rt_drop_target(OffRT* r)
+{
+    rc_grave_put(r->tex, r->up_buf);
+    r->tex.id = 0;   r->res = NULL;
+    r->up_buf.id = 0; r->up = NULL;
+    r->rtv.id = 0;   r->rtv_cpu.ptr = 0;
 }
 
 static int off_rt_find(u32 off)
@@ -774,7 +838,9 @@ static int off_rt_find(u32 off)
  * Created typeless (R24G8) so a later pass can sample one as a texture. */
 typedef struct {
     ID3D12Resource* res;
-    gpu_texture tex;    /* res, adopted (step C4): the SRV writes' handle */
+    gpu_texture tex;    /* the GPU layer's texture (step C5a): res borrows it */
+    gpu_view dsv, dsv_ro;   /* its writable and read-only DSVs (step C5a) */
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv_cpu, dsv_ro_cpu;   /* theirs, for the native binds */
     u32 off, w, h;      /* guest dims */
     u32 hw, hh;         /* the resource's dims (RSX_SCALE) */
     int used;
@@ -782,22 +848,25 @@ typedef struct {
 } ZetaRT;
 #define MAX_ZETA 8
 static ZetaRT s_zeta[MAX_ZETA];
-static ID3D12DescriptorHeap* s_zeta_dsv_heap;
 
-static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(int slot)
-{
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_zeta_dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_zeta_dsv_heap, &h);
-    h.ptr += (u64)slot * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-    return h;
-}
+/* The surface's DSV, as zeta_get made it (a view: step C5a). */
+static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(int slot) { return s_zeta[slot].dsv_cpu; }
 
 /* The same surface as a read-only depth-stencil view: depth-tested and
  * sampled by one draw. The resource is then in ZETA_READ_STATE. */
 #define ZETA_READ_STATE ((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_DEPTH_READ | \
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
-static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv_ro(int slot) { return zeta_dsv(MAX_ZETA + slot); }
+static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv_ro(int slot) { return s_zeta[slot].dsv_ro_cpu; }
+
+/* A depth surface dropped (step C5a): its handle and views into the grave,
+ * the borrowed pointer cleared. */
+static void zeta_drop(ZetaRT* z)
+{
+    rc_grave_tex(&z->tex);
+    z->res = NULL;
+    z->dsv.id = z->dsv_ro.id = 0;
+    z->dsv_cpu.ptr = z->dsv_ro_cpu.ptr = 0;
+}
 
 static int zeta_find(u32 off)
 {
@@ -810,13 +879,7 @@ static void zeta_transition(int slot, D3D12_RESOURCE_STATES to)
 {
     ZetaRT* z = &s_zeta[slot];
     if (z->st == to) return;
-    D3D12_RESOURCE_BARRIER br = {0};
-    br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    br.Transition.pResource   = z->res;
-    br.Transition.StateBefore = z->st;
-    br.Transition.StateAfter  = to;
-    br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &br);
+    gpu_cmd_barrier(s_rc_cmd, z->tex, (gpu_state)z->st, (gpu_state)to);   /* (step C5a) */
     z->st = to;
 }
 
@@ -827,22 +890,13 @@ static int zeta_get(u32 off, u32 w, u32 h)
 {
     if (!w) w = s_d3d.width;
     if (!h) h = s_d3d.height;
-    if (!s_zeta_dsv_heap) {
-        D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
-        hd.NumDescriptors = MAX_ZETA * 2;   /* writable, then read-only */
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        if (FAILED(s_d3d.device->lpVtbl->CreateDescriptorHeap(
-                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_zeta_dsv_heap)))
-            return -1;
-    }
     int slot = zeta_find(off);
     if (slot >= 0) {
         ZetaRT* z = &s_zeta[slot];
         if (z->w >= w && z->h >= h) { z->used = 1; return slot; }
         if (z->w > w) w = z->w;
         if (z->h > h) h = z->h;
-        off_rt_defer_release(z->res); z->res = NULL;
-        rc_tex_drop(&z->tex);   /* step C4 */
+        zeta_drop(z);
     } else {
         for (int i = 0; i < MAX_ZETA; i++)
             if (!s_zeta[i].res) { slot = i; break; }
@@ -850,48 +904,41 @@ static int zeta_get(u32 off, u32 w, u32 h)
             for (int i = 0; i < MAX_ZETA; i++)
                 if (!s_zeta[i].used) { slot = i; break; }
             if (slot < 0) return -1;
-            off_rt_defer_release(s_zeta[slot].res); s_zeta[slot].res = NULL;
-            rc_tex_drop(&s_zeta[slot].tex);   /* step C4 */
+            zeta_drop(&s_zeta[slot]);
         }
     }
     ZetaRT* z = &s_zeta[slot];
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC td = {0};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = rt_host_dim(w, h, w); td.Height = rt_host_dim(w, h, h);
-    td.DepthOrArraySize = 1; td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R24G8_TYPELESS; td.SampleDesc.Count = 1;
-    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    D3D12_CLEAR_VALUE cv = {0};
-    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    cv.DepthStencil.Depth = 1.0f;
-    if (FAILED(d3d_create_committed(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
-            &IID_ID3D12Resource, (void**)&z->res)))
-        return -1;
-    rc_tex_set(&z->tex, z->res);   /* step C4: sampled as depth (the SRV writes) */
+    /* The GPU layer's texture (step C5a), res borrows it: typeless R24G8,
+     * cleared to depth 1.0 fastest, sampled as depth (the SRV writes). Its
+     * DSVs are D24S8 views, writable and read-only. */
+    gpu_texture_desc td;
+    memset(&td, 0, sizeof td);
+    td.width = rt_host_dim(w, h, w); td.height = rt_host_dim(w, h, h);
+    td.layers = 1; td.mips = 1;
+    td.format = GPU_FORMAT_R24G8_TYPELESS; td.samples = 1;
+    td.use = GPU_USE_DS | GPU_USE_SAMPLED;
+    td.state = GPU_STATE_DEPTH_WRITE;
+    td.clear_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.clear_depth = 1.0f;
+    z->tex = gpu_texture_create(s_rc_dev, &td);
+    if (!GPU_VALID(z->tex)) return -1;
+    z->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, z->tex.id);
     z->off = off; z->w = w; z->h = h; z->used = 1;
-    z->hw = (u32)td.Width; z->hh = td.Height;
+    z->hw = td.width; z->hh = td.height;
     z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    D3D12_DEPTH_STENCIL_VIEW_DESC dd = {0};
-    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, z->res, &dd, zeta_dsv(slot));
-    dd.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL;
-    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, z->res, &dd, zeta_dsv_ro(slot));
-    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zeta_dsv(slot),
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT, &z->dsv_cpu);
+    z->dsv_ro = rc_target_view(z->tex, GPU_VIEW_DSV, GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL,
+                               GPU_FORMAT_D24_UNORM_S8_UINT, &z->dsv_ro_cpu);
+    gpu_cmd_clear_depth(s_rc_cmd, z->dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0, NULL);
     printf("[ZETA] depth surface 0x%08X %ux%u (host %ux%u, slot %d)\n", off, w, h, z->hw, z->hh, slot);
     return slot;
 }
 
-/* Ensure an RT resource exists for this surface; (re)creates the RTV at
- * rt_rtv_heap[i] and the SRV at srv_heap[RT_SRV_BASE+i]. */
+/* Ensure an RT resource exists for this surface; (re)creates its RTV (a view
+ * of the texture, step C5a) and the SRV at srv_heap[RT_SRV_BASE+i]. */
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
 {
-    if (!off || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap) return -1;
+    if (!off || !s_d3d.srv_heap) return -1;
     if (!w) w = s_d3d.width;
     if (!h) h = s_d3d.height;
     DXGI_FORMAT want_fmt = rt_dxgi(off, rsx_fmt);
@@ -916,9 +963,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
          * after the GPU finishes this frame. Demon's Souls declares its
          * luminance targets as A8R8G8B8 and then as F_X32 at the same offsets;
          * releasing at once removed the device about one run in two. */
-        off_rt_defer_release(r->res); r->res = NULL;     /* dims/format changed */
-        rc_tex_drop(&r->tex);   /* step C4 */
-        off_rt_defer_release(r->up);  r->up = NULL;
+        off_rt_drop_target(r);     /* dims/format changed */
     } else {
         for (int i = 0; i < MAX_OFF_RTS; i++)
             if (!s_d3d.off_rt[i].res) { slot = i; break; }
@@ -941,28 +986,23 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                                     s_d3d.off_rt[slot].off, s_d3d.off_rt[slot].w,
                                     s_d3d.off_rt[slot].h, off, w, h, 10); }
             /* same hazard as above: the open list may still use it */
-            off_rt_defer_release(s_d3d.off_rt[slot].res); s_d3d.off_rt[slot].res = NULL;
-            rc_tex_drop(&s_d3d.off_rt[slot].tex);   /* step C4 */
-            off_rt_defer_release(s_d3d.off_rt[slot].up);  s_d3d.off_rt[slot].up = NULL;
+            off_rt_drop_target(&s_d3d.off_rt[slot]);
         }
     }
     OffRT* r = &s_d3d.off_rt[slot];
     const u32 hw = rt_host_dim(w, h, w), hh = rt_host_dim(w, h, h);
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC td = {0};
-    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    td.Width = hw; td.Height = hh; td.DepthOrArraySize = 1; td.MipLevels = 1;
-    td.Format = want_fmt; td.SampleDesc.Count = 1;
-    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    D3D12_CLEAR_VALUE cv = {0};
-    cv.Format = td.Format;
-    if (FAILED(d3d_create_committed(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
-            D3D12_RESOURCE_STATE_COPY_DEST, &cv,
-            &IID_ID3D12Resource, (void**)&r->res)))
-        return -1;
-    rc_tex_set(&r->tex, r->res);   /* step C4: sampled (the SRV writes) */
+    /* The GPU layer's texture (step C5a), res borrows it: made in COPY_DEST
+     * for the refill below, cleared fastest to zero in its own format. */
+    gpu_texture_desc td;
+    memset(&td, 0, sizeof td);
+    td.width = hw; td.height = hh; td.layers = 1; td.mips = 1;
+    td.format = (gpu_format)want_fmt; td.samples = 1;
+    td.use = GPU_USE_RT | GPU_USE_SAMPLED | GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+    td.state = GPU_STATE_COPY_DEST;
+    td.clear_format = td.format;
+    r->tex = gpu_texture_create(s_rc_dev, &td);
+    if (!GPU_VALID(r->tex)) return -1;
+    r->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, r->tex.id);
     r->off = off; r->w = w; r->h = h; r->hw = hw; r->hh = hh; r->dxgi = (u32)want_fmt;
     r->gdxgi = (u32)gfmt;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -986,18 +1026,19 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         u32 src = cellGcmResolveOffset(off);
         u8* wide = (hw != w) ? (u8*)malloc((size_t)w * bpp) : NULL;
         if (vm_base && src != 0xFFFFFFFFu) {
-            D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
-            D3D12_RESOURCE_DESC bd = {0};
-            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = (u64)pitch * hh; bd.Height = 1; bd.DepthOrArraySize = 1;
-            bd.MipLevels = 1; bd.SampleDesc.Count = 1;
-            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            if ((hw == w || wide) && SUCCEEDED(d3d_create_committed(
-                    s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
-                    D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                    &IID_ID3D12Resource, (void**)&r->up))) {
-                void* mp = NULL; D3D12_RANGE nr = {0,0};
-                if (SUCCEEDED(r->up->lpVtbl->Map(r->up, 0, &nr, &mp)) && mp) {
+            /* The staging: a GPU layer upload buffer, mapped for its life
+             * (step C5a); up borrows it. */
+            gpu_buffer_desc bd;
+            memset(&bd, 0, sizeof bd);
+            bd.size = (u64)pitch * hh;
+            bd.use = GPU_USE_COPY_SRC;
+            bd.memory = GPU_MEM_UPLOAD;
+            bd.state = GPU_STATE_GENERIC_READ;
+            if (hw == w || wide) r->up_buf = gpu_buffer_create(s_rc_dev, &bd);
+            if (GPU_VALID(r->up_buf)) {
+                r->up = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, r->up_buf.id);
+                void* mp = gpu_buffer_map(s_rc_dev, r->up_buf, 0, 0);
+                if (mp) {
                     const u8* sp = vm_base + src;
                     for (u32 y = 0; y < hh; y++) {
                         const u8* srow = sp + (u64)((u64)y * h / hh) * w * sbpp;
@@ -1036,39 +1077,25 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                             for (u32 x = 0; x < hw; x++)
                                 memcpy(hrow + (u64)x * bpp, wide + (u64)((u64)x * w / hw) * bpp, bpp);
                     }
-                    r->up->lpVtbl->Unmap(r->up, 0, NULL);
-                    D3D12_TEXTURE_COPY_LOCATION cdst = {0}, csrc = {0};
-                    cdst.pResource = r->res;
-                    cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                    csrc.pResource = r->up;
-                    csrc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                    csrc.PlacedFootprint.Footprint.Format   = want_fmt;
-                    csrc.PlacedFootprint.Footprint.Width    = hw;
-                    csrc.PlacedFootprint.Footprint.Height   = hh;
-                    csrc.PlacedFootprint.Footprint.Depth    = 1;
-                    csrc.PlacedFootprint.Footprint.RowPitch = pitch;
-                    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &cdst, 0, 0, 0, &csrc, NULL);
+                    /* (an upload buffer stays mapped: the unmap writes nothing) */
+                    gpu_buffer_unmap(s_rc_dev, r->up_buf, 0, bd.size);
+                    gpu_footprint fp;   /* the whole buffer, from offset 0 */
+                    memset(&fp, 0, sizeof fp);
+                    fp.format    = (gpu_format)want_fmt;
+                    fp.width     = hw;
+                    fp.height    = hh;
+                    fp.depth     = 1;
+                    fp.row_pitch = pitch;
+                    gpu_cmd_copy_buf_to_tex(s_rc_cmd, r->tex, 0, 0, 0, 0, r->up_buf, &fp);
                 }
             }
         }
         free(wide);
-        {
-            D3D12_RESOURCE_BARRIER b = {0};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource   = r->res;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-            b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
-            r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        }
+        gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
+        r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rh;
-    s_d3d.rt_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rt_rtv_heap, &rh);
-    rh.ptr += (u64)slot * s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, r->res, NULL, rh);
+    r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0, &r->rtv_cpu);   /* today's NULL description */
 
     gpu_view_desc sv;   /* in the SRV pool (step C4) */
     memset(&sv, 0, sizeof sv);
@@ -1076,7 +1103,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     sv.kind = GPU_VIEW_SRV;
     sv.dim = GPU_DIM_2D;
     sv.mips = 1;
-    sv.format = (gpu_format)td.Format;
+    sv.format = td.format;
     sv.swizzle = GPU_SWIZZLE_IDENTITY;
     gpu_table_write_tex(s_rc_dev, s_rc_srv_pool, RT_SRV_BASE + (u32)slot, &sv);
 

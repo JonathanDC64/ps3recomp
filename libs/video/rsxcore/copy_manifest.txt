@@ -381,3 +381,48 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C4 blocks):
 #   gpu_d3d12_adopt_texture_of (adopt with the resource's own description)
 #   and gpu_d3d12_table_pool_heap (a pool's heap, borrowed).
+
+# Step C5a: the colour and depth targets and their RTVs and DSVs on the GPU
+# layer. The regions below are no longer verbatim at these legacy lines: a
+# fix there needs a hand port.
+# The display targets, the shared depth buffer, the zeta surfaces and the
+# offscreen pool are gpu_texture_create's (today's descriptions, states and
+# clear values); render_targets[i], depth_buffer, ZetaRT.res and OffRT.res
+# borrow them (gpu_native), and OffRT.up borrows the init staging, a GPU
+# layer upload buffer (OffRT.up_buf). Their RTVs and DSVs are gpu_view_get's:
+# the RTV and DSV heaps (s_d3d.rtv_heap, swap_rtv_heap, dsv_heap, rt_rtv_heap
+# and zeta's) are not made. Each view's CPU descriptor is read once where the
+# view is made (gpu_d3d12_view_cpu) and kept beside it, for the binds and
+# clears that are still native (frame.inc, blit_to_window, the AA pass). A
+# dropped target and its staging go into a grave of handles, which
+# off_rt_release_deferred destroys with the last frame's fence (their views
+# go with them); the native grave for the other resources is unchanged.
+#  rsxc_state.inc 294-295 (OffRT rtv, rtv_cpu, up_buf) and the step C5a
+#   statics after C4's: s_rc_rt_rtv(_cpu), s_rc_depth_tex,
+#   s_rc_depth_dsv(_cpu), s_rc_swap_rtv(_cpu), rc_target_view.
+#  rsxc_hdr.inc swap_buffers_get 1745-1756 (the images' RTVs are views);
+#   blit_to_window 2065-2067 (image fi's view's descriptor).
+#  rsxc_init.inc display_targets_make 2398-2431 and depth_buffer_make
+#   2433-2477 (texture_create, view_get); init_d3d12 2649-2670 and 2682-2692
+#   (no RTV, swap RTV or DSV heap; rtv_descriptor_size stays for the
+#   downscale's and SMAA's heaps) and 3012-3020 (no offscreen RTV heap).
+#  rsxc_targets.inc 8421-8440 (off_rt_release_deferred also empties the
+#   handles' grave; rc_last_frame_fence, rc_grave_put, rc_grave_tex and
+#   off_rt_drop_target beside it); ZetaRT 8457-8481 (dsv, dsv_ro and their
+#   descriptors, no DSV heap; zeta_dsv and zeta_dsv_ro are loads; zeta_drop);
+#   zeta_transition 8494-8500 (gpu_cmd_barrier); zeta_get 8511-8563
+#   (texture_create, two view_get DSVs, gpu_cmd_clear_depth); off_rt_get
+#   8568-8572, 8597-8598, 8621-8622, 8627-8640 (texture_create), 8664-8675
+#   (the staging: buffer_create, buffer_map), 8714-8725
+#   (gpu_cmd_copy_buf_to_tex), 8730-8739 (gpu_cmd_barrier), 8742-8746 (the
+#   RTV: view_get) and 8749.
+#  Outside the targets, for the objects above: rsxc_writeback.inc
+#   off_rt_drop_rewritten 9362-9363 (off_rt_drop_target) and off_rt_rtv
+#   9370-9377 (the stored descriptor); rsxc_diag.inc rsx_scale_apply
+#   10501-10502, 10508 and 10513-10516 (the drops); rsxc_frame.inc
+#   render_frame 11760-11767 (the display target's RTV and the depth DSV:
+#   the stored descriptors); rsxc_api.inc rc_backend_shutdown 15853-15854,
+#   15861 and 15864-15865 (the borrowed pointers are cleared, not Released:
+#   they go with gpu_destroy).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C5a blocks):
+#   gpu_d3d12_view_cpu (a view's CPU descriptor).

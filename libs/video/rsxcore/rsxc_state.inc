@@ -139,8 +139,11 @@ typedef struct {
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
 typedef struct {
     ID3D12Resource*       res;
-    gpu_texture           tex;         /* res, adopted (step C4): the SRV writes' handle */
+    gpu_texture           tex;         /* the GPU layer's texture (step C5a): res borrows it */
+    gpu_view              rtv;         /* its RTV (step C5a) */
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv_cpu;   /* rtv's CPU descriptor, for the native binds (off_rt_rtv) */
     ID3D12Resource*       up;          /* init-upload staging (kept alive) */
+    gpu_buffer            up_buf;      /* the GPU layer's upload buffer (step C5a): up borrows it */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
     u32                   dxgi;        /* DXGI_FORMAT of the resource */
@@ -673,7 +676,7 @@ static gpu_table_pool s_rc_srv_pool;    /* s_d3d.srv_heap */
 static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
 static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
 static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
-static gpu_texture    s_rc_rt_tex[FRAME_COUNT];   /* s_d3d.render_targets, adopted */
+static gpu_texture    s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a): s_d3d.render_targets borrows them */
 static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy, adopted */
 static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 
@@ -691,5 +694,39 @@ static void rc_tex_drop(gpu_texture* t)
 {
     if (GPU_VALID(*t)) gpu_texture_destroy(s_rc_dev, *t, 0);
     t->id = 0;
+}
+
+/* Step C5a: the colour and depth targets are the GPU layer's textures (the
+ * display targets s_rc_rt_tex above, the depth buffer, zeta, the offscreen
+ * pool), the native pointers borrow them (gpu_native), and their RTVs and
+ * DSVs are its views (gpu_view_get): s_d3d.rtv_heap, swap_rtv_heap,
+ * dsv_heap and rt_rtv_heap are never made (unused), nor zeta's DSV heap. The
+ * binds and clears not converted yet (rsxc_frame.inc, blit_to_window, the
+ * AA pass) take CPU descriptors: each view's is read once where it is made
+ * (gpu_d3d12_view_cpu) and kept beside it, so they stay plain loads. */
+static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
+static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_rt_rtv_cpu[FRAME_COUNT];
+static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer: s_d3d.depth_buffer */
+static gpu_view       s_rc_depth_dsv;
+static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_depth_dsv_cpu;
+static gpu_view       s_rc_swap_rtv[FRAME_COUNT];     /* the swap chain images' RTVs */
+static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_swap_rtv_cpu[FRAME_COUNT];
+
+/* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and
+ * kept with t, and its CPU descriptor in *cpu. Format 0 and flags 0 are
+ * today's NULL RTV description; DSVs spell their format out, as today. */
+static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format format,
+                               D3D12_CPU_DESCRIPTOR_HANDLE* cpu)
+{
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = t;
+    vd.kind = (uint8_t)kind;
+    vd.dim = GPU_DIM_2D;
+    vd.flags = (uint8_t)flags;
+    vd.format = format;
+    const gpu_view v = gpu_view_get(s_rc_dev, &vd);
+    *cpu = gpu_d3d12_view_cpu(s_rc_dev, v);
+    return v;
 }
 

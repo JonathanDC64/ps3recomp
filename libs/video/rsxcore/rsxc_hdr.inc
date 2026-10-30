@@ -176,17 +176,18 @@ static int hdr_want(void)
 }
 
 /* The swap chain's buffers and their RTVs (init and after a resize). The
- * buffers are the swap chain's images; s_d3d.swap_buffers borrows them. */
+ * buffers are the swap chain's images; s_d3d.swap_buffers borrows them. The
+ * RTVs are views of the images (step C5a, today's NULL description), which
+ * a resize drops with the images, so they are made again here. */
 static int swap_buffers_get(void)
 {
-    D3D12_CPU_DESCRIPTOR_HANDLE h;
-    s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &h);
+    memset(s_rc_swap_rtv, 0, sizeof s_rc_swap_rtv);
+    memset(s_rc_swap_rtv_cpu, 0, sizeof s_rc_swap_rtv_cpu);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         s_rc_swap_image[i] = gpu_d3d12_swap_image(s_rc_dev, s_rc_swap, i);
         s_d3d.swap_buffers[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
         if (!s_d3d.swap_buffers[i]) return -1;
-        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.swap_buffers[i], NULL, h);
-        h.ptr += s_d3d.rtv_descriptor_size;
+        s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0, &s_rc_swap_rtv_cpu[i]);
     }
     return 0;
 }
@@ -503,9 +504,7 @@ static void blit_to_window(u32 fi)
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
-    s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &rtv);
-    rtv.ptr += (u64)fi * s_d3d.rtv_descriptor_size;
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = s_rc_swap_rtv_cpu[fi];   /* image fi's view (step C5a) */
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
 
     const float ww = (float)s_d3d.win_w, wh = (float)s_d3d.win_h;
