@@ -2,8 +2,9 @@
  * ps3recomp - the portable renderer's GPU layer: commands through the table
  *
  * gpu_cmd_<name>(c, ...) for every command in gpu_cmd_ops.h, each calling the
- * recorder's own table (its gpu_cmd_head's ops). For code compiled once for
- * every backend: the passes that run a few times a frame. The draw loop
+ * recorder's own table (its gpu_cmd_head's ops), and gpu_fast_<name>(d, ...)
+ * for the per-draw device calls, through the device's table. For code
+ * compiled once for every backend: the passes that run a few times a frame. The draw loop
  * includes its backend's gpu_<backend>_cmd.h instead, never this file too.
  */
 #ifndef PS3RECOMP_GPU_VT_CMD_H
@@ -24,6 +25,17 @@ GPU_CMD_OPS(GPU__CMD_WRAP)
 #undef GPU__CMD_WRAP
 #undef GPU__CMD_WRAP_V
 #undef GPU__CMD_WRAP_R
+
+/* The per-draw device calls (GPU_FAST_FUNCS), through the device's table. */
+#define GPU__FAST_WRAP_V(name, ret, params, args) \
+    static inline void gpu_fast_##name params { d->vt->name args; }
+#define GPU__FAST_WRAP_R(name, ret, params, args) \
+    static inline ret gpu_fast_##name params { return d->vt->name args; }
+#define GPU__FAST_WRAP(name, form, ret, params, args) GPU__FAST_WRAP_##form(name, ret, params, args)
+GPU_FAST_FUNCS(GPU__FAST_WRAP)
+#undef GPU__FAST_WRAP
+#undef GPU__FAST_WRAP_V
+#undef GPU__FAST_WRAP_R
 
 #ifdef __cplusplus
 }

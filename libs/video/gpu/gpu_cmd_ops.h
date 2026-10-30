@@ -17,6 +17,14 @@
  * every command is there with the right parameters, and GPU_CMD_OPS_TABLE
  * fills a backend's table from its static inline versions.
  *
+ * The draw loop also makes a few device calls per draw: it writes its
+ * textures and samplers into tables and names the tables and buffers it
+ * binds. Those are GPU_FAST_FUNCS below, each gpu_fast_<name>(d, ...) with
+ * the parameters of the gpu.h function of the same name, defined by the same
+ * two files: through the device's table in gpu_vt_cmd.h, and static inline in
+ * a backend's header (on D3D12 the memo's compare and the address arithmetic
+ * inline, the descriptor write out of line). GPU_CMD_CHECK checks them too.
+ *
  * The numbers they take are D3D12's (gpu.h), and so is what they do; where
  * Vulkan differs, its backend makes up the difference:
  *   - a pass is the targets bound (OMSetRenderTargets). pass_begin may follow
@@ -82,7 +90,8 @@ extern "C" {
     X(copy_texture_whole, V, void, (gpu_cmd* c, gpu_texture dst, gpu_texture src), (c, dst, src)) \
     /* Buffer to texture: the bytes `from` describes, to x, y, z. */ \
     X(copy_buf_to_tex, V, void, (gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, uint32_t x, uint32_t y, uint32_t z, gpu_buffer src, const gpu_footprint* from), (c, dst, dst_sub, x, y, z, src, from)) \
-    /* Texture to buffer: src's box (NULL: from 0, 0, the footprint's size) laid out as `to` says. */ \
+    /* Texture to buffer: src's box laid out as `to` says. NULL: the whole subresource (D3D12's \
+     * NULL box), which must be the footprint's size. */ \
     X(copy_tex_to_buf, V, void, (gpu_cmd* c, gpu_buffer dst, const gpu_footprint* to, gpu_texture src, uint32_t src_sub, const gpu_box* box), (c, dst, to, src, src_sub, box)) \
     X(copy_buffer,     V, void, (gpu_cmd* c, gpu_buffer dst, uint64_t dst_offset, gpu_buffer src, uint64_t src_offset, uint64_t size), (c, dst, dst_offset, src, src_offset, size)) \
     /* An MSAA texture's samples averaged into a single-sample one (ResolveSubresource). */ \
@@ -99,6 +108,15 @@ extern "C" {
     /* len bytes of text where the API's crash tools read it (DRED's breadcrumbs, a Vulkan \
      * checkpoint), for the draw that follows. */ \
     X(marker,          V, void, (gpu_cmd* c, const char* text, uint32_t len), (c, text, len))
+
+/* The per-draw device calls: gpu_fast_<name>, the gpu_vt function <name>
+ * with the same parameters. Vulkan has the same four: its memo in front of
+ * vkUpdateDescriptorSets, a set from the pool's region, a device address. */
+#define GPU_FAST_FUNCS(X) \
+    X(table_write_tex,     V, void,      (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
+    X(table_write_sampler, V, void,      (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
+    X(table_ref,           R, gpu_table, (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \
+    X(buffer_addr,         R, gpu_addr,  (gpu_device* d, gpu_buffer b), (d, b))
 
 /* The recorder's command table, in the list's order. */
 #define GPU__CMD_MEMBER(name, form, ret, params, args) ret (*name) params;
@@ -122,18 +140,29 @@ enum { GPU_CMD_OPS(GPU__CMD_INDEX) GPU_CMD_OP_COUNT };
 
 /* "GPU_CMD_CHECK(tag);" at file scope, after the header that defines the
  * commands (gpu_vt_cmd.h, or a backend's), fails to compile unless every
- * command is there as gpu_cmd_<name>, taking exactly the list's parameters.
- * tag names the check, so one file can hold several. */
+ * command is there as gpu_cmd_<name>, taking exactly the list's parameters,
+ * and every per-draw device call as gpu_fast_<name>, taking those of its
+ * gpu_vt function. tag names the check, so one file can hold several. */
 #if GPU_CPP11
 #define GPU__CMD_CHECK_ONE(name, form, ret, params, args) \
     static_assert(std::is_same<decltype(&gpu_cmd_##name), ret (*) params>::value, \
                   "gpu_cmd_" #name " does not match gpu_cmd_ops.h");
-#define GPU_CMD_CHECK(tag) GPU_CMD_OPS(GPU__CMD_CHECK_ONE) typedef int gpu_cmd_checked_##tag
+#define GPU__FAST_CHECK_ONE(name, form, ret, params, args) \
+    static_assert(std::is_same<decltype(&gpu_fast_##name), ret (*) params>::value && \
+                  std::is_same<decltype(gpu_vt::name), ret (*) params>::value, \
+                  "gpu_fast_" #name " does not match gpu_cmd_ops.h and gpu_vt");
+#define GPU_CMD_CHECK(tag) GPU_CMD_OPS(GPU__CMD_CHECK_ONE) GPU_FAST_FUNCS(GPU__FAST_CHECK_ONE) \
+    typedef int gpu_cmd_checked_##tag
 #elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #define GPU__CMD_CHECK_ONE(name, form, ret, params, args) \
     _Static_assert(_Generic((&gpu_cmd_##name), ret (*) params: 1, default: 0), \
                    "gpu_cmd_" #name " does not match gpu_cmd_ops.h");
-#define GPU_CMD_CHECK(tag) GPU_CMD_OPS(GPU__CMD_CHECK_ONE) typedef int gpu_cmd_checked_##tag
+#define GPU__FAST_CHECK_ONE(name, form, ret, params, args) \
+    _Static_assert(_Generic((&gpu_fast_##name), ret (*) params: 1, default: 0) && \
+                   _Generic((((gpu_vt*)0)->name), ret (*) params: 1, default: 0), \
+                   "gpu_fast_" #name " does not match gpu_cmd_ops.h and gpu_vt");
+#define GPU_CMD_CHECK(tag) GPU_CMD_OPS(GPU__CMD_CHECK_ONE) GPU_FAST_FUNCS(GPU__FAST_CHECK_ONE) \
+    typedef int gpu_cmd_checked_##tag
 #else
 /* C99: a pointer of the list's type initialised from each function, which a
  * mismatch makes a constraint violation (an error with -pedantic-errors, and
@@ -145,8 +174,11 @@ enum { GPU_CMD_OPS(GPU__CMD_INDEX) GPU_CMD_OP_COUNT };
 #endif
 #define GPU__CMD_CHECK_ONE(name, form, ret, params, args) \
     { ret (*p_) params = gpu_cmd_##name; (void)p_; }
+#define GPU__FAST_CHECK_ONE(name, form, ret, params, args) \
+    { ret (*p_) params = gpu_fast_##name; ret (*q_) params = vt_->name; (void)p_; (void)q_; }
 #define GPU_CMD_CHECK(tag) \
-    static GPU__CMD_CHECK_UNUSED void gpu_cmd_check_##tag(void) { GPU_CMD_OPS(GPU__CMD_CHECK_ONE) } \
+    static GPU__CMD_CHECK_UNUSED void gpu_cmd_check_##tag(const gpu_vt* vt_) \
+        { GPU_CMD_OPS(GPU__CMD_CHECK_ONE) GPU_FAST_FUNCS(GPU__FAST_CHECK_ONE) } \
     typedef int gpu_cmd_checked_##tag
 #endif
 

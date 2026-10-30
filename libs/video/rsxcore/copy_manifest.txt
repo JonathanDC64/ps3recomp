@@ -125,3 +125,99 @@ libs/video/rsxcore/rsxc_record.inc 13040-13402 rsx_backend callbacks: init, pres
 libs/video/rsxcore/rsxc_vertex.inc 13403-15040 vertex reads and uploads, the vertex jobs, the GPU fetch path
 libs/video/rsxcore/rsxc_record2.inc 15041-15742 draw_arrays, draw_indexed, bind_texture, vertex attribs, shader, blend, depth
 libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutdown, display timing, the overlay, the exports
+
+# ---- The D3D12 backend (libs/video/gpu/gpu_d3d12*, package S2) ----
+# Today's device calls with their parameters, onto handles: the D3D12 calls
+# and their logic are copied, s_d3d's fields are the device's. Knobs read
+# with getenv there are device flags here (D3D12_DRED: GPU_DEVICE_BREADCRUMBS,
+# CELLMARK_IGPU: GPU_DEVICE_LOW_POWER).
+
+# dred_enable: DRED's settings before the device (not the debug layer).
+libs/video/gpu/gpu_d3d12.c 2508-2529 init_d3d12
+# adapter_pick: the factory, the preference loop and the NULL fallback;
+# GPU_DEVICE_WARP and GPU_DEVICE_USE_LUID are tried first when asked.
+libs/video/gpu/gpu_d3d12.c 2532-2537 init_d3d12
+libs/video/gpu/gpu_d3d12.c 2543-2580 init_d3d12
+# device_init: the queue; an allocator and a closed list per cmd slot (today:
+# FRAME_COUNT allocators, one list); the fence.
+libs/video/gpu/gpu_d3d12.c 2586-2594 init_d3d12
+libs/video/gpu/gpu_d3d12.c 2700-2723 init_d3d12
+# caps_read: the tearing check, read once (GPU_CAP_TEARING).
+libs/video/gpu/gpu_d3d12.c 2611-2622 init_d3d12
+# tpool_add: a texture pool's entries start as these empty SRVs.
+libs/video/gpu/gpu_d3d12.c 2997-3007 init_d3d12
+# d12_layout_create: vp_root_sig's serialize, create and blob hash, for
+# every layout.
+libs/video/gpu/gpu_d3d12.c 3123-3132 init_d3d12
+# d12_buffer_create: committed, upload buffers mapped once with {0,0}.
+libs/video/gpu/gpu_d3d12.c 341-348 d3d_create_committed
+libs/video/gpu/gpu_d3d12.c 3134-3140 init_d3d12
+# d12_heap_create and d12_texture_create (placed or committed, the clear value
+# as asked; the pool's carving stays core).
+libs/video/gpu/gpu_d3d12.c 7009-7016 tex_pool_get
+libs/video/gpu/gpu_d3d12.c 7046-7079 tex_res_create
+# view_make: the DSVs, spelled out.
+libs/video/gpu/gpu_d3d12.c 2468-2475 depth_buffer_make
+libs/video/gpu/gpu_d3d12.c 8556-8561 zeta_get
+# d12_buffer_import_host: the heap over guest memory and its buffer; the
+# log lines are worded for any caller.
+libs/video/gpu/gpu_d3d12.c 9045-9090 wbg_ready
+# gpu_d3d12_write_srv: the SRV write; the memo compare is in gpu_d3d12_cmd.h.
+libs/video/gpu/gpu_d3d12.c 9390-9418 srv_write_ex
+libs/video/gpu/gpu_d3d12.c 9900-9904 zq_ready
+# d12_cmd_begin.
+libs/video/gpu/gpu_d3d12.c 11230-11231 render_frame
+# d12_lost: the first reason kept.
+libs/video/gpu/gpu_d3d12.c 2296-2309 check_device
+# d12_fence_wait and d12_wait_idle: the bounded waits on the fence (one
+# timeline, a thread-local event).
+libs/video/gpu/gpu_d3d12.c 3337-3369 wait_for_gpu
+libs/video/gpu/gpu_d3d12.c 3411-3435 move_to_next_frame
+# d12_fault_report: line for line, once per device.
+libs/video/gpu/gpu_d3d12.c 3227-3279 dred_list
+libs/video/gpu/gpu_d3d12.c 3283-3335 dred_report
+
+# gpu_d3d12_fnv.
+libs/video/gpu/gpu_d3d12_internal.h 2392-2396 fnv_bytes
+
+# gpu_d3d12_pipe_d3d_desc: every field the description sets is passed
+# through; vp_fp_desc's render target rule (call map G8).
+libs/video/gpu/gpu_d3d12_pipe.c 5864-5949 vp_fp_desc
+# The library: names per gpu.h (pso_desc_key is not copied), its own file.
+libs/video/gpu/gpu_d3d12_pipe.c 4635-4659 pso_create_cached
+libs/video/gpu/gpu_d3d12_pipe.c 4519-4534 pso_lib_store
+libs/video/gpu/gpu_d3d12_pipe.c 4228-4251 pso_write_file pso_read_file
+# pso_lib_open's library half; the manifest, pso_library.n and
+# pso_index.built (4303-4337) stay core.
+libs/video/gpu/gpu_d3d12_pipe.c 4277-4301 pso_lib_open
+libs/video/gpu/gpu_d3d12_pipe.c 4349-4375 pso_lib_save
+
+# gpu_d3d12_swap_create; FRAME_COUNT and the format are the caller's.
+libs/video/gpu/gpu_d3d12_swap.c 2597-2645 init_d3d12
+# images_get: the buffers (their RTVs are gpu_view_get's).
+libs/video/gpu/gpu_d3d12_swap.c 1746-1758 swap_buffers_get
+libs/video/gpu/gpu_d3d12_swap.c 2321-2321 swap_present
+# gpu_d3d12_swap_resize: the D3D12 half; the window size, the HDR choice,
+# its RGBA8 retry (a second resize) and the fence values stay core.
+libs/video/gpu/gpu_d3d12_swap.c 2343-2351 swap_resize
+libs/video/gpu/gpu_d3d12_swap.c 2376-2376 swap_resize
+libs/video/gpu/gpu_d3d12_swap.c 1718-1726 swap_color_space
+# gpu_d3d12_swap_stats.
+libs/video/gpu/gpu_d3d12_swap.c 2242-2242 display_note
+libs/video/gpu/gpu_d3d12_swap.c 16056-16061 present_queued
+
+# gpu_cmd_marker: the PIX-format words of dred_mark (its text is the caller's).
+libs/video/gpu/gpu_d3d12_cmd.h 7794-7808 dred_mark
+
+# The test's recipes, to compare the backend's results with today's.
+libs/video/tests/test_gpu_d3d12.c 3066-3121 init_d3d12
+libs/video/tests/test_gpu_d3d12.c 1855-1871 blit_init
+libs/video/tests/test_gpu_d3d12.c 10799-10822 smaa_ready
+# legacy_vp_fp_desc: with CULL_OFF, CULL_FLIP, CMASK_FORCE and DEPTH_OFF off.
+libs/video/tests/test_gpu_d3d12.c 5864-5949 vp_fp_desc
+libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
+
+# Not copied: the debug layer and the info queue (2486-2503, 3932-3945,
+# 12796-12820), the debug pipelines' root signature and pipelines
+# (2734-2791, 2879-2972), the shutdown order (rsx_d3d12_backend_shutdown:
+# gpu_destroy releases what the device made), SetName.
