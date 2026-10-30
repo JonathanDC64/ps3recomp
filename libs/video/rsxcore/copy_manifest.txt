@@ -314,3 +314,65 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 # 12796-12820), the debug pipelines' root signature and pipelines
 # (2734-2791, 2879-2972), the shutdown order (rsx_d3d12_backend_shutdown:
 # gpu_destroy releases what the device made), SetName.
+
+# Step C3b: root signatures, pipelines, the pipeline library and the shaders
+# on the GPU layer. Every root signature the copy makes, but the debug
+# pipelines', is gpu_layout_create's, every pipeline gpu_pipeline_create's
+# (rc_pipeline), every shader a gpu_shader (gpu_shader_create; C3a's
+# TEMPORARY sc_d3d_blob is gone). The ID3D12RootSignature* and
+# ID3D12PipelineState* fields hold the GPU layer's objects, borrowed
+# (gpu_native GPU_NATIVE_LAYOUT; a pipeline's handle is its pointer,
+# gpu_pipeline.v) for the binds that stay native until C6/C7; the core never
+# releases them (gpu_destroy does). Each layout's handle sits beside its
+# field (vp_layout, blit_layout, s_of/s_hdr_blit/s_aa/s_smaa.layout,
+# s_down_layout). The D3D12 descriptions are today's byte for byte (call map
+# F, G8), and so are the serialized root signatures but one: down_init's
+# (call map G12: its SRV range's offset is 0 where the GPU layer writes
+# D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND; the first range of its table, it
+# lands at 0 either way, so only the serialized bytes differ).
+#  rsxc_state.inc: VPVSEntry.vs (394) and vp_vs_blob (546, now
+#   vp_vs_shader) are gpu_shader; blit_layout after blit_rs (475),
+#   vp_layout after vp_root_sig (529); s_rc_pipe_loaded and s_rc_pipe_made
+#   after s_rc_frame_fence.
+#  rsxc_shadercache.inc 4004-4029: sc_compile gives the service's blob,
+#   sc_shader / sc_load / shader_compile_cached a gpu_shader, sc_shader_drop
+#   frees one where the original released its blob once its pipeline was
+#   made (G5); new beside them: rc_pipeline, pass_desc (the built-in passes'
+#   pipeline), lay_slot, pass_sampler, lay_make.
+#  rsxc_hdr.inc: s_of (1770) and s_hdr_blit (1932) hold a layout; of_ready
+#   1777-1828, blit_init 1848-1889 and 1900-1904 (the heap's lines between,
+#   1890-1899, are as they were), hdr_blit_ready 1953-2018.
+#  rsxc_init.inc 2822-2978: the debug pipelines' shaders are the service's
+#   blobs (their root signature and pipelines stay native, unconverted);
+#   vp_root_sig 3065-3132 is gpu_layout_create's, and s_vp_root_hash its
+#   serialized bytes' hash (gpu_d3d12_layout_hash: the same value).
+#  rsxc_cap.inc: compile_vp 3840-3925.
+#  rsxc_psolib.inc 4155-4171, 4280-4369, 4514-4580, 4605-4658: the library
+#   is the GPU layer's (gpu_pipeline_cache_load / _save; gpu_pipeline_create
+#   loads from it and stores in it under G9's names), so it is its own file:
+#   <shader cache>/gpu/d3d12/pipelines.lib, with pipelines.n and the index's
+#   index.built beside it; this route never reads or writes pso_library.bin,
+#   pso_library.n or pso_index.built. pso_manifest.bin and pso_blobs/ keep
+#   their names and records: a record is the D3D12 description the GPU layer
+#   makes (gpu_d3d12_pipeline_d3d_desc, on the miss path only) under
+#   pso_desc_key, as today. pso_lib_store is gone; pso_prebuild_one turns a
+#   record back into a gpu_pipeline_desc (pso_rec_desc) and checks its name
+#   against the description the GPU layer makes of it; pso_create_cached
+#   takes a gpu_pipeline_desc and returns the pipeline. PS3_PSO_LOG=1 prints
+#   the run's pipeline counts after each present that made one
+#   (pso_count_print; rc_backend_shutdown prints them once).
+#  rsxc_vs.inc 4671-4863: the VS cache holds gpu_shader (never freed).
+#  rsxc_fp.inc 5086-5228: a psj job holds a gpu_pipeline_desc and its pixel
+#   shader, freed in psj_finish; uvclamp_gs 5577-5622 is a gpu_shader.
+#  rsxc_pipeline.inc: vp_fp_desc 5863-5948 fills a gpu_pipeline_desc (with
+#   no colour target its write mask is every channel, the D3D12
+#   description's, so one description is one name); pxi_build_one,
+#   pxi_build_thread, pso_index_build_start 6180-6269; vp_get_fp_pso
+#   6288-6595.
+#  rsxc_writeback.inc: s_down_* 8844-8851, down_init 8875-8905, down_pso
+#   8930-8946.
+#  rsxc_post.inc: s_aa and s_smaa (a layout after rs), aa_ready
+#   10624-10685, smaa_ready 10783-10848 and 10868-10869.
+#  rsxc_api.inc: rc_backend_shutdown 15833, 15840 (pso_count_print),
+#   15866-15867 (the passes' borrowed pointers cleared, so the releases
+#   after them find NULL).

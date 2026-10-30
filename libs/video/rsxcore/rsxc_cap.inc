@@ -306,11 +306,10 @@ static void compile_vp(void)
         "float4 main(PSIn i):SV_TARGET{ float cov = tex.Sample(smp, i.t0.xy).r;\n"
         "  if (cov <= 0.5) discard; return float4(i.col0.rgb, 1); }\n";
 
-    ID3DBlob *vb=NULL,*pb=NULL,*e=NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, hlsl, strlen(hlsl), "vp", NULL, GPU_SC_NO_CACHE, &vb, &e);
-    if (FAILED(hr)) { printf("[VP] VS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
-    hr = sc_compile(GPU_SC_PS, ps, sizeof(ps)-1, "vpps", NULL, GPU_SC_NO_CACHE, &pb, &e);
-    if (FAILED(hr)) { printf("[VP] PS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); if(vb)vb->lpVtbl->Release(vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
+    gpu_shader vb = sc_shader(GPU_SC_VS, hlsl, strlen(hlsl), "vp", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(vb)) { printf("[VP] VS compile FAIL: %s\n", sc_msg("?")); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
+    gpu_shader pb = sc_shader(GPU_SC_PS, ps, sizeof(ps)-1, "vpps", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(pb)) { printf("[VP] PS compile FAIL: %s\n", sc_msg("?")); sc_shader_drop(&vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
 
     /* The decompiled VS declares inputs a0:ATTR0 .. a15:ATTR15 and the HLSL
      * compiler keeps whichever the program body reads. D3D12 requires EVERY VS
@@ -322,45 +321,42 @@ static void compile_vp(void)
      * slot reads that same float4 at offset 0; attributes other than position
      * therefore alias attrib0 for now (colours/uv wrong until the VP path
      * uploads multiple attributes), but geometry is correct and the PSO is
-     * valid. */
-    D3D12_INPUT_ELEMENT_DESC il[16];
+     * valid. The pipeline is the GPU layer's (step C3b). */
+    gpu_pipeline_desc pd;
+    memset(&pd, 0, sizeof pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    pd.layout = s_d3d.vp_layout;
+    pd.vs = vb;
+    pd.ps = pb;
+    pd.vertex.count = 16;
+    pd.vertex.stride = 256;
     for (int _e = 0; _e < 16; _e++) {
-        il[_e].SemanticName = "ATTR";
-        il[_e].SemanticIndex = _e;
-        il[_e].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        il[_e].InputSlot = 0;
+        strcpy(pd.vertex.attr[_e].semantic, "ATTR");
+        pd.vertex.attr[_e].semantic_index = (u32)_e;
+        pd.vertex.attr[_e].format = GPU_FORMAT_R32G32B32A32_FLOAT;
         /* 256-byte generic VP vertex: every ATTRi is a float4 slot at i*16
          * (read_vp_vertex converts each enabled RSX attrib by type; disabled
          * slots hold (0,0,0,1)). Covers tiny3d (a0/a3/a8), SDK gcm samples
          * (a0/a1/a2), dbgfont -- no aliasing. */
-        il[_e].AlignedByteOffset = (UINT)(_e * 16);
-        il[_e].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-        il[_e].InstanceDataStepRate = 0;
+        pd.vertex.attr[_e].offset = (u32)(_e * 16);
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-    pd.pRootSignature = s_d3d.vp_root_sig;
-    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb); pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
-    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb); pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
-    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = 16;
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pd.SampleMask = UINT_MAX;
-    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.cull = GPU_CULL_NONE;
+    pd.blend.write_mask = GPU_WRITE_ALL;
+    pd.sample_mask = UINT_MAX;
+    pd.topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
     /* Strip draws (vf_strip_native) cut at 0xFFFFFFFF; list draws never hold it. */
-    pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
-    pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.strip_cut = GPU_STRIP_CUT_FFFFFFFF;
+    pd.nrt = 1; pd.rt_format[0] = GPU_FORMAT_R8G8B8A8_UNORM;
+    pd.ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
     /* Depth test ON (LESS_EQUAL, matching the guest's rsxtiny_DepthTestFunc 515 /
      * CELL_GCM_LEQUAL). Without it the cube's faces drew in submission order and
      * back faces overwrote the front -> you saw through the near face to the
      * darker interior. The depth buffer is bound + cleared to 1.0 each frame. */
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    pd.DepthStencilState.StencilEnable = FALSE;
-    pd.SampleDesc.Count = 1;
-    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&s_d3d.pipeline_state_vp);
+    pd.depth_test = 1;
+    pd.depth_write = 1;
+    pd.depth_func = GPU_CMP_LESS_EQUAL;
+    pd.samples = 1;
+    s_d3d.pipeline_state_vp = rc_pipeline(&pd, NULL);
+    HRESULT hr = s_d3d.pipeline_state_vp ? S_OK : E_FAIL;
 
     /* Second PSO: same VS but a COLOUR-only PS (no texture sample, no alpha
      * discard) for untextured 3D geometry (vkcube's cube). The atlas PS above
@@ -372,26 +368,23 @@ static void compile_vp(void)
             "  float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
             "  float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7; };\n"
             "float4 main(PSIn i):SV_TARGET{ return float4(i.col0.rgb, 1); }\n";
-        ID3DBlob *pcb=NULL,*ec=NULL;
-        if (SUCCEEDED(sc_compile(GPU_SC_PS, ps_col, sizeof(ps_col)-1, "vppsc", NULL,
-                                 GPU_SC_NO_CACHE, &pcb, &ec)) && pcb) {
-            pd.PS.pShaderBytecode = pcb->lpVtbl->GetBufferPointer(pcb);
-            pd.PS.BytecodeLength  = pcb->lpVtbl->GetBufferSize(pcb);
-            HRESULT hr2 = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-                s_d3d.device, &pd, &IID_ID3D12PipelineState,
-                (void**)&s_d3d.pipeline_state_vp_color);
-            printf(SUCCEEDED(hr2) ? "[VP] colour pipeline ready\n"
-                                  : "[VP] colour PSO FAIL (0x%08lX)\n", hr2);
-            pcb->lpVtbl->Release(pcb);
+        gpu_shader pcb = sc_shader(GPU_SC_PS, ps_col, sizeof(ps_col)-1, "vppsc", NULL, GPU_SC_NO_CACHE);
+        if (GPU_VALID(pcb)) {
+            pd.ps = pcb;
+            s_d3d.pipeline_state_vp_color = rc_pipeline(&pd, NULL);
+            printf(s_d3d.pipeline_state_vp_color ? "[VP] colour pipeline ready\n"
+                                                 : "[VP] colour PSO FAIL (0x%08lX)\n", (long)E_FAIL);
+            sc_shader_drop(&pcb);
         }
-        if (ec) ec->lpVtbl->Release(ec);
     }
-    /* Keep the VS bytecode for guest-FP PSO builds (vp_get_fp_pso); bump the
-     * generation so cached FP PSOs built against the old VS are rebuilt. */
-    if (s_d3d.vp_vs_blob) s_d3d.vp_vs_blob->lpVtbl->Release(s_d3d.vp_vs_blob);
-    s_d3d.vp_vs_blob = vb;
+    /* Keep the VS for guest-FP PSO builds (vp_get_fp_pso); bump the
+     * generation so cached FP PSOs built against the old VS are rebuilt. The
+     * old one is freed: its pipelines keep working, and none is being made
+     * from it (the pipeline workers run inside psj_finish only). */
+    sc_shader_drop(&s_d3d.vp_vs_shader);
+    s_d3d.vp_vs_shader = vb;
     s_d3d.vp_gen++;
-    pb->lpVtbl->Release(pb);
+    sc_shader_drop(&pb);
     s_d3d.vp_compiled_bytes = st->vp_ucode_bytes;
     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
     else {

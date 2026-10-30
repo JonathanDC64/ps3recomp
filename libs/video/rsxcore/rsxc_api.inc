@@ -88,7 +88,7 @@ static void rc_backend_shutdown(void)
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
-    if (s_pso_lib) {
+    if (s_pso_lib_on) {
         InterlockedExchange(&s_pso_pre_abort, 1);
         while (s_pso_lib_saving || s_pso_pre_live || s_pxb_live) Sleep(1);
         pso_manifest_flush();
@@ -96,6 +96,7 @@ static void rc_backend_shutdown(void)
     }
     while (s_pxr_writing) Sleep(1);
     pso_index_flush();
+    pso_count_print("this run");
 
     /* Release D3D12 resources */
     if (s_wbg.buf)  { s_wbg.buf->lpVtbl->Release(s_wbg.buf);   s_wbg.buf = NULL; }
@@ -116,8 +117,12 @@ static void rc_backend_shutdown(void)
     }
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
-    if (s_of.pso) s_of.pso->lpVtbl->Release(s_of.pso);
-    if (s_of.rs) s_of.rs->lpVtbl->Release(s_of.rs);
+    /* The passes' root signatures and pipelines are the GPU layer's (step
+     * C3b): borrowed, and gpu_destroy frees them, so the releases below find
+     * NULL. */
+    s_of.pso = NULL; s_of.rs = NULL;
+    s_d3d.blit_pso = NULL; s_d3d.blit_rs = NULL;
+    s_aa.pso = NULL; s_aa.pso16 = NULL; s_aa.rs = NULL;
     memset(&s_of, 0, sizeof s_of);
     if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);

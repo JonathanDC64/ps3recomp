@@ -1,61 +1,55 @@
 /* A guest-FP pipeline's description, from its shaders and the draw state
  * vp_get_fp_pso keys it by. A draw's and the pipeline index's (pxi_build_one)
- * come from this one recipe, so the two give a pipeline the same name. */
-static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEMENT_DESC il[16],
-                       const void* vs, SIZE_T vs_len, int fetch, const void* ps, SIZE_T ps_len,
-                       const void* gs, SIZE_T gs_len, u32 blend, int nrt, DXGI_FORMAT rtfmt,
-                       u32 cmask, u32 cull, u32 depth)
+ * come from this one recipe, so the two give a pipeline the same name. Step
+ * C3b: the GPU layer's description; the D3D12 description the layer makes of
+ * it is today's, byte for byte but the pointers (call map F, G8), so the
+ * manifest's names (pso_desc_key of that) are today's too. */
+static void vp_fp_desc(gpu_pipeline_desc* pd, gpu_shader vs, int fetch, gpu_shader ps, gpu_shader gs,
+                       u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth)
 {
-    for (int _i = 0; _i < 16; _i++) {
-        il[_i].SemanticName = "ATTR"; il[_i].SemanticIndex = _i;
-        il[_i].Format = DXGI_FORMAT_R32G32B32A32_FLOAT; il[_i].InputSlot = 0;
-        il[_i].AlignedByteOffset = (UINT)(_i * 16);
-        il[_i].InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-        il[_i].InstanceDataStepRate = 0;
+    memset(pd, 0, sizeof *pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    pd->layout = s_d3d.vp_layout;
+    pd->vs = vs;
+    pd->ps = ps;
+    pd->gs = gs;
+    if (!fetch) {   /* (fetch: SV_VertexID only, no input layout) */
+        pd->vertex.count = 16;
+        pd->vertex.stride = 256;
+        for (int _i = 0; _i < 16; _i++) {
+            strcpy(pd->vertex.attr[_i].semantic, "ATTR");
+            pd->vertex.attr[_i].semantic_index = (u32)_i;
+            pd->vertex.attr[_i].format = GPU_FORMAT_R32G32B32A32_FLOAT;
+            pd->vertex.attr[_i].offset = (u32)(_i * 16);
+        }
     }
-    memset(pd, 0, sizeof *pd);   /* zeroed whole: pso_desc_key hashes its bytes */
-    pd->pRootSignature = s_d3d.vp_root_sig;
-    pd->VS.pShaderBytecode = vs; pd->VS.BytecodeLength = vs_len;
-    pd->PS.pShaderBytecode = ps; pd->PS.BytecodeLength = ps_len;
-    if (gs) { pd->GS.pShaderBytecode = gs; pd->GS.BytecodeLength = gs_len; }
-    pd->InputLayout.pInputElementDescs = il; pd->InputLayout.NumElements = 16;
-    if (fetch) pd->InputLayout.NumElements = 0;   /* SV_VertexID only */
-    pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     /* Guest face culling. CULL_OFF=1 forces double-sided, the old
      * unconditional behaviour -- geometry that vanishes under culling is a
      * winding/front-face problem, not a missing draw. */
     { static int _co = -1; PS3_KNOB(_co, getenv("CULL_OFF") ? 1 : 0);
-      pd->RasterizerState.CullMode = (!_co && (cull & 1u))
-          ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
-          : D3D12_CULL_MODE_NONE;
+      pd->cull = (!_co && (cull & 1u)) ? ((cull & 2u) ? GPU_CULL_FRONT : GPU_CULL_BACK) : GPU_CULL_NONE;
       /* CULL_FLIP=1: invert the front-face convention. Our VP path may hand
        * D3D the opposite winding from the guest's, in which case honouring
        * CULL_FACE culls exactly the faces it should keep. */
       static int _cfl = -1; PS3_KNOB(_cfl, getenv("CULL_FLIP") ? 1 : 0);
-      pd->RasterizerState.FrontCounterClockwise =
-          (((cull & 4u) ? 1 : 0) ^ _cfl) ? TRUE : FALSE; }
+      pd->front_ccw = (((cull & 4u) ? 1 : 0) ^ _cfl) ? 1 : 0; }
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
      * straight alpha; demosaic's effect passes blend OFF; DeferredShading's
-     * light accumulation is additive ONE,ONE. */
-    pd->BlendState.RenderTarget[0].BlendEnable    = (blend & 1) ? TRUE : FALSE;
-    pd->BlendState.RenderTarget[0].SrcBlend       = (blend & 1) ? (D3D12_BLEND)((blend >> 1)  & 0x1F) : D3D12_BLEND_ONE;
-    pd->BlendState.RenderTarget[0].DestBlend      = (blend & 1) ? (D3D12_BLEND)((blend >> 6)  & 0x1F) : D3D12_BLEND_ZERO;
-    pd->BlendState.RenderTarget[0].BlendOp        = (blend & 1) ? (D3D12_BLEND_OP)((blend >> 21) & 0x7) : D3D12_BLEND_OP_ADD;
-    pd->BlendState.RenderTarget[0].SrcBlendAlpha  = (blend & 1) ? (D3D12_BLEND)((blend >> 11) & 0x1F) : D3D12_BLEND_ONE;
-    pd->BlendState.RenderTarget[0].DestBlendAlpha = (blend & 1) ? (D3D12_BLEND)((blend >> 16) & 0x1F) : D3D12_BLEND_ZERO;
-    pd->BlendState.RenderTarget[0].BlendOpAlpha   = (blend & 1) ? (D3D12_BLEND_OP)((blend >> 24) & 0x7) : D3D12_BLEND_OP_ADD;
-    pd->BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pd->SampleMask = UINT_MAX;
-    pd->PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+     * light accumulation is additive ONE,ONE. Every target takes it (the GPU
+     * layer writes it into each of the nrt targets: zero-init left
+     * RenderTargetWriteMask 0 on secondary targets, masking every MRT-B write). */
+    pd->blend.enable    = (blend & 1) ? 1 : 0;
+    pd->blend.src       = (blend & 1) ? (u8)((blend >> 1)  & 0x1F) : (u8)GPU_BLEND_ONE;
+    pd->blend.dst       = (blend & 1) ? (u8)((blend >> 6)  & 0x1F) : (u8)GPU_BLEND_ZERO;
+    pd->blend.op        = (blend & 1) ? (u8)((blend >> 21) & 0x7)  : (u8)GPU_BLEND_OP_ADD;
+    pd->blend.src_alpha = (blend & 1) ? (u8)((blend >> 11) & 0x1F) : (u8)GPU_BLEND_ONE;
+    pd->blend.dst_alpha = (blend & 1) ? (u8)((blend >> 16) & 0x1F) : (u8)GPU_BLEND_ZERO;
+    pd->blend.op_alpha  = (blend & 1) ? (u8)((blend >> 24) & 0x7)  : (u8)GPU_BLEND_OP_ADD;
+    pd->sample_mask = UINT_MAX;
+    pd->topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
     /* Strip draws (vf_strip_native) cut at 0xFFFFFFFF; list draws never hold it. */
-    pd->IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
-    pd->NumRenderTargets = (UINT)nrt;
-    for (int _r = 0; _r < nrt; _r++) {
-        pd->RTVFormats[_r] = rtfmt;
-        /* Zero-init leaves RenderTargetWriteMask 0 on secondary targets --
-         * every MRT-B write would be masked off. Mirror RT0's blend state. */
-        pd->BlendState.RenderTarget[_r] = pd->BlendState.RenderTarget[0];
-    }
+    pd->strip_cut = GPU_STRIP_CUT_FFFFFFFF;
+    pd->nrt = (u32)nrt;
+    for (int _r = 0; _r < nrt && _r < 4; _r++) pd->rt_format[_r] = (gpu_format)rtfmt;
     /* Guest colour write mask (RGBA nibble, already D3D-ordered). cmask is 0xF
      * by default (unset colour_mask register decodes to all-on); a literal 0
      * therefore means the guest EXPLICITLY masked every channel -- a depth-only
@@ -66,16 +60,16 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
      * which is indistinguishable from "the draw never happened". */
     { static int _cf = -1; PS3_KNOB(_cf, getenv("CMASK_FORCE") ? 1 : 0);
       if (_cf) cmask = 0xF; }
-    for (int _r = 0; _r < nrt; _r++)
-        pd->BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
-    pd->DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    /* With no colour target the mask writes nothing; it is every channel
+     * there, as the D3D12 description's target 0 has it, so that one D3D12
+     * description is one name in the GPU layer's library (pso_rec_desc). */
+    pd->blend.write_mask = nrt ? (u8)(cmask & 0xF) : (u8)GPU_WRITE_ALL;
+    pd->ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
     /* Guest depth state (rsx_depth_key). With the test off RSX neither tests
      * nor writes depth, which is D3D's DepthEnable FALSE as well. */
-    pd->DepthStencilState.DepthEnable = (depth & 1u) ? TRUE : FALSE;
-    pd->DepthStencilState.DepthWriteMask = (depth & 2u) ? D3D12_DEPTH_WRITE_MASK_ALL
-                                                        : D3D12_DEPTH_WRITE_MASK_ZERO;
-    pd->DepthStencilState.DepthFunc = (D3D12_COMPARISON_FUNC)(((depth >> 2) & 7u) + 1u);
-    pd->DepthStencilState.StencilEnable = FALSE;
+    pd->depth_test = (depth & 1u) ? 1 : 0;
+    pd->depth_write = (depth & 2u) ? 1 : 0;
+    pd->depth_func = (u8)(((depth >> 2) & 7u) + 1u);
     /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
      * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
      * object in front of everything and answers "is it merely occluded?" --
@@ -83,9 +77,9 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
      * depth test against whatever is already in the buffer. Diagnostic. */
     { static int doff = -1;
       PS3_KNOB(doff, ps3_env_int("DEPTH_OFF", 0));
-      if (doff) { pd->DepthStencilState.DepthEnable = FALSE;
-                  pd->DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } }
-    pd->SampleDesc.Count = 1;
+      if (doff) { pd->depth_test = 0;
+                  pd->depth_write = 0; } }
+    pd->samples = 1;
 }
 
 /* ---- The pipeline index --------------------------------------------------
@@ -317,58 +311,54 @@ static void rc_pso_index_ready(u64 hash)
 }
 
 /* 1 built, 0 there already, -1 not built (a shader missing from the cache, or
- * the driver refused it). */
-static int pxi_build_one(const PxiItem* it, ID3DBlob* gs)
+ * the driver refused it). The shaders are the GPU layer's, made for the row
+ * and freed after; gs is the uvclamp GS (never freed). */
+static int pxi_build_one(const PxiItem* it, gpu_shader gs)
 {
-    ID3DBlob* vs = sc_load(GPU_SC_VS, it->vs_key);
-    ID3DBlob* ps = sc_load(GPU_SC_PS, it->ps_key);
+    gpu_shader vs = sc_load(GPU_SC_VS, it->vs_key);
+    gpu_shader ps = sc_load(GPU_SC_PS, it->ps_key);
     int r = -1;
-    if (vs && ps && (!it->clamp || gs)) {
-        D3D12_INPUT_ELEMENT_DESC il[16];
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
-        vp_fp_desc(&pd, il, vs->lpVtbl->GetBufferPointer(vs), vs->lpVtbl->GetBufferSize(vs), (int)it->fetch,
-                   ps->lpVtbl->GetBufferPointer(ps), ps->lpVtbl->GetBufferSize(ps),
-                   it->clamp ? gs->lpVtbl->GetBufferPointer(gs) : NULL,
-                   it->clamp ? gs->lpVtbl->GetBufferSize(gs) : 0,
+    if (GPU_VALID(vs) && GPU_VALID(ps) && (!it->clamp || GPU_VALID(gs))) {
+        const gpu_shader none = {0};
+        gpu_pipeline_desc pd;
+        vp_fp_desc(&pd, vs, (int)it->fetch, ps, it->clamp ? gs : none,
                    it->blend, (int)it->nrt, (DXGI_FORMAT)it->rtfmt, it->cmask, it->cull, it->depth);
-        const u64 key = pso_desc_key(&pd);
+        /* Its manifest name: pso_desc_key of the D3D12 description the GPU
+         * layer makes of it (today's). */
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
+        D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
+        gpu_d3d12_pipeline_d3d_desc(s_rc_dev, &pd, &dd, il);
+        const u64 key = pso_desc_key(&dd);
         AcquireSRWLockShared(&s_pso_man_lock);
         const int known = pso_names_has(key);   /* the manifest's: its startup build saw to it */
         ReleaseSRWLockShared(&s_pso_man_lock);
-        ID3D12PipelineState* pso = NULL;
         if (known) r = 0;
         else {
-            WCHAR name[20];
-            swprintf(name, 20, L"%016llx", (unsigned long long)key);
-            AcquireSRWLockExclusive(&s_pso_lib_lock);
-            const HRESULT hr = s_pso_lib->lpVtbl->LoadGraphicsPipeline(s_pso_lib, name, &pd,
-                                   &IID_ID3D12PipelineState, (void**)&pso);
-            ReleaseSRWLockExclusive(&s_pso_lib_lock);
-            if (SUCCEEDED(hr)) r = 0;
-            else {
-                pso = NULL;
-                if (SUCCEEDED(s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
-                        s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso))) {
-                    pso_lib_store(name, &pd, pso);
-                    pso_manifest_add(key, &pd);
+            uint32_t loaded = 0;
+            if (rc_pipeline(&pd, &loaded)) {
+                if (loaded) r = 0;
+                else {
+                    InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
+                    pso_manifest_add(key, &dd);
                     r = 1;
                 }
             }
         }
-        if (pso) pso->lpVtbl->Release(pso);
     }
-    if (vs) vs->lpVtbl->Release(vs);
-    if (ps) ps->lpVtbl->Release(ps);
+    sc_shader_drop(&vs);
+    sc_shader_drop(&ps);
     return r;
 }
 
-static DWORD WINAPI pxi_build_thread(LPVOID gs)
+static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
 {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    gpu_shader gs;
+    gs.id = (u32)(uintptr_t)gs_id;
     for (;;) {
         const u32 i = (u32)(InterlockedIncrement(&s_pxb_next) - 1);
         if (i >= s_pxb_n || s_pso_pre_abort) break;
-        const int r = pxi_build_one(&s_pxb[i], (ID3DBlob*)gs);
+        const int r = pxi_build_one(&s_pxb[i], gs);
         InterlockedIncrement(r > 0 ? &s_pxb_built : r == 0 ? &s_pxb_had : &s_pxb_failed);
     }
     if (InterlockedDecrement(&s_pxb_live) == 0) {
@@ -377,7 +367,7 @@ static DWORD WINAPI pxi_build_thread(LPVOID gs)
                s_pxb_built, s_pxb_had, s_pxb_failed, s_pxb_n, 1000.0 * (perf_now() - s_pxb_t0));
         if (done == s_pxb_n && s_pxb_hash) {
             char path[MAX_PATH + 32], txt[24];
-            pso_path(path, sizeof path, "pso_index.built");
+            pso_lib_path(path, sizeof path, "index.built");   /* (the GPU layer's library's own) */
             pso_write_file(path, txt, (size_t)snprintf(txt, sizeof txt, "%016llx\n",
                                                        (unsigned long long)s_pxb_hash));
         }
@@ -394,7 +384,7 @@ static void pso_index_build_start(void)
     s_pxb_started = 1;
     ReleaseSRWLockExclusive(&s_pxb_lock);
     if (!s_pxb_n) return;
-    ID3DBlob* gs = NULL;
+    gpu_shader gs = {0};
     for (u32 i = 0; i < s_pxb_n; i++)
         if (s_pxb[i].clamp) { gs = uvclamp_gs(); break; }   /* here: it compiles on its first call */
     SYSTEM_INFO si; GetSystemInfo(&si);
@@ -403,7 +393,7 @@ static void pso_index_build_start(void)
     s_pxb_t0 = perf_now();
     s_pxb_live = nt;
     for (int t = 0; t < nt; t++) {
-        HANDLE h = CreateThread(NULL, 0, pxi_build_thread, gs, 0, NULL);
+        HANDLE h = CreateThread(NULL, 0, pxi_build_thread, (LPVOID)(uintptr_t)gs.id, 0, NULL);
         if (h) CloseHandle(h); else InterlockedDecrement(&s_pxb_live);
     }
 }
@@ -422,13 +412,13 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     extern u32 cellGcmResolveOffset(u32);
     if (!fp_addr || !vm_base) return NULL;
     { static int _off=-1; if(_off<0)_off=getenv("FP_OFF")?1:0; if(_off) return NULL; }
-    /* Resolve the VS: the draw's cached per-VP blob, else the primary. */
-    ID3DBlob* vsb = NULL; u32 vs_hash = 0;
+    /* Resolve the VS: the draw's cached per-VP shader, else the primary. */
+    gpu_shader vsb = {0}; u32 vs_hash = 0;
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
         vsb = s_d3d.vp_vs[vs_idx].vs; vs_hash = s_d3d.vp_vs[vs_idx].hash;
     }
-    if (!vsb) { vsb = s_d3d.vp_vs_blob; vs_idx = -1; }
-    if (!vsb) return NULL;
+    if (!GPU_VALID(vsb)) { vsb = s_d3d.vp_vs_shader; vs_idx = -1; }
+    if (!GPU_VALID(vsb)) return NULL;
 
     /* SET_SHADER_PROGRAM low bits = location+1 (same as textures): 1 = LOCAL
      * (VRAM), 2 = MAIN (gcm/cube emits 0x00B90001 for its VRAM-resident FP). */
@@ -688,8 +678,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                       strchr(fs, ':') + 1, (unsigned)n2, 10);
           }
       } }
-    ID3DBlob* gsb = uvclamp ? uvclamp_gs() : NULL;
-    if (gsb && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb = NULL;
+    gpu_shader gsb = {0};
+    if (uvclamp) gsb = uvclamp_gs();
+    if (GPU_VALID(gsb) && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb.id = 0;
     if (hdrv) {
         const int sat = (hdrv & HDRV_SAT) != 0;
         const int k = rc_shader_hdr(hlsl, sizeof hlsl, hdrv);
@@ -698,38 +689,29 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                                         sat ? (k == 1 ? "sample clamped" : "samples clamped")
                                             : (k == 1 ? "clamp raised" : "clamps raised"));
     }
-    ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0", &pb, &e);
-    if (FAILED(hr) || !pb) {
+    gpu_shader pb = shader_compile_cached(hlsl, strlen(hlsl), "guest_fp", "ps_5_0");
+    if (!GPU_VALID(pb)) {
         static int _e2=0; if (_e2 < 16 && ++_e2)
-            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
-                   e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
-        if (e) e->lpVtbl->Release(e);
+            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr, sc_msg("?"));
         return vp_fp_insert(&key);
     }
-    if (e) e->lpVtbl->Release(e);
 
-    D3D12_INPUT_ELEMENT_DESC il[16];
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
-    vp_fp_desc(&pd, il, vsb->lpVtbl->GetBufferPointer(vsb), vsb->lpVtbl->GetBufferSize(vsb),
-               vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].fetch,
-               pb->lpVtbl->GetBufferPointer(pb), pb->lpVtbl->GetBufferSize(pb),
-               gsb ? gsb->lpVtbl->GetBufferPointer(gsb) : NULL, gsb ? gsb->lpVtbl->GetBufferSize(gsb) : 0,
+    gpu_pipeline_desc pd;
+    vp_fp_desc(&pd, vsb, vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].fetch, pb, gsb,
                blend, nrt, rtfmt, cmask, cull, depth);
     if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)   /* a row for the pipeline index */
-        pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask, gsb != NULL,
+        pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask, GPU_VALID(gsb),
                        blend, nrt, rtfmt, cmask, cull, depth, hdrv);
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */
-    if (s_psj_defer && (s_psj_last = psj_add(&pd, il, vsb, pb, gsb, &key)) >= 0) return NULL;
-    ID3D12PipelineState* pso = NULL;
+    if (s_psj_defer && (s_psj_last = psj_add(&pd, pb, &key)) >= 0) return NULL;
     const double cp_t0 = perf_on() ? perf_now() : 0.0;
-    hr = pso_create_cached(&pd, &pso);
+    ID3D12PipelineState* pso = pso_create_cached(&pd);
     if (perf_on()) { s_perf_cpso += perf_now() - cp_t0; s_perf_cpso_n++; }
-    pb->lpVtbl->Release(pb);
-    if (FAILED(hr)) {
-        static int _e3=0; if (_e3 < 16 && ++_e3) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+    sc_shader_drop(&pb);
+    if (!pso) {
+        static int _e3=0; if (_e3 < 16 && ++_e3) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, (long)E_FAIL);
         return vp_fp_insert(&key);
     }
     { static int _ok=0; if (_ok < 32 && ++_ok) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }

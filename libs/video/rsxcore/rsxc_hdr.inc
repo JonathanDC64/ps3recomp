@@ -201,65 +201,39 @@ static int swap_buffers_get(void)
  * if that fails, the bilinear blit stays. */
 #include "rsx_outfilter.h"
 static int knob_outfilter(void) { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_OUTFILTER", 0)); return v; }
-static struct { ID3D12RootSignature* rs; ID3D12PipelineState* pso; int failed; } s_of;
+static struct { ID3D12RootSignature* rs; gpu_layout layout; ID3D12PipelineState* pso; int failed; } s_of;
 
 static int of_ready(void)
 {
     if (s_of.pso) return 1;
     if (s_of.failed || !s_d3d.device) return 0;
     s_of.failed = 1;   /* until it is made */
-    ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
-                            NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb, &err);
-    if (SUCCEEDED(hr))
-        hr = sc_compile(GPU_SC_PS, rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps",
-                        NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb, &err);
-    if (FAILED(hr))
-        printf("[D3D12] RSX_OUTFILTER shader compile failed: %s\n",
-               err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,
-                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER rp[2] = {0};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[0].DescriptorTable.NumDescriptorRanges = 1;
-        rp[0].DescriptorTable.pDescriptorRanges = &range;
-        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        rp[1].Constants.Num32BitValues = 8;
-        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_ROOT_SIGNATURE_DESC rsd = {2, rp, 0, NULL, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
-        if (SUCCEEDED(hr))
-            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
-                &IID_ID3D12RootSignature, (void**)&s_of.rs);
+    gpu_shader vb = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
+                              NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    gpu_shader pb = {0};
+    if (GPU_VALID(vb))
+        pb = sc_shader(GPU_SC_PS, rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps",
+                       NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    if (!GPU_VALID(pb))
+        printf("[D3D12] RSX_OUTFILTER shader compile failed: %s\n", sc_msg("?"));
+    else {
+        /* The GPU layer's layout (step C3b): the t0 table, b0 = 8 constants. */
+        gpu_layout_desc ld;
+        memset(&ld, 0, sizeof ld);
+        ld.nslots = 2;
+        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 8, GPU_VIS_PIXEL);
+        s_of.layout = lay_make(&ld, &s_of.rs);
     }
-    if (SUCCEEDED(hr)) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-        pd.pRootSignature = s_of.rs;
-        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
-        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
-        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
-        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pd.SampleDesc.Count = 1;
-        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-            &IID_ID3D12PipelineState, (void**)&s_of.pso);
+    if (s_of.rs) {
+        gpu_pipeline_desc pd;
+        pass_desc(&pd, s_of.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM, GPU_WRITE_ALL, 1);
+        s_of.pso = rc_pipeline(&pd, NULL);
     }
-    if (vb) vb->lpVtbl->Release(vb);
-    if (pb) pb->lpVtbl->Release(pb);
-    if (rsb) rsb->lpVtbl->Release(rsb);
-    if (err) err->lpVtbl->Release(err);
-    if (FAILED(hr) || !s_of.pso) {
-        printf("[D3D12] RSX_OUTFILTER pipeline failed (0x%08lX): the bilinear blit stays\n", (long)hr);
+    sc_shader_drop(&vb);
+    sc_shader_drop(&pb);
+    if (!s_of.pso) {
+        printf("[D3D12] RSX_OUTFILTER pipeline failed (0x%08lX): the bilinear blit stays\n", (long)E_FAIL);
         return 0;
     }
     s_of.failed = 0;
@@ -279,48 +253,29 @@ static int blit_init(void)
         "Texture2D t : register(t0); SamplerState s : register(s0);\n"
         "float4 main(float4 p : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {\n"
         "  return float4(t.Sample(s, uv).rgb, 1); }\n";
-    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *rsb = NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "blit_vs", NULL, GPU_SC_NO_CACHE, &vb, &err);
-    if (SUCCEEDED(hr)) hr = sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "blit_ps", NULL, GPU_SC_NO_CACHE, &pb, &err);
-    if (FAILED(hr)) {
-        printf("[D3D12] blit shader compile failed: %s\n", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
+    gpu_shader vb = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "blit_vs", NULL, GPU_SC_NO_CACHE);
+    gpu_shader pb = {0};
+    if (GPU_VALID(vb)) pb = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "blit_ps", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(pb)) {
+        printf("[D3D12] blit shader compile failed: %s\n", sc_msg("?"));
+        sc_shader_drop(&vb);
         return -1;
     }
-    D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-    D3D12_ROOT_PARAMETER param = {0};
-    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    param.DescriptorTable.NumDescriptorRanges = 1;
-    param.DescriptorTable.pDescriptorRanges = &range;
-    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC smp = {0};
-    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    smp.MaxLOD = D3D12_FLOAT32_MAX;
-    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC rsd = {1, &param, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
-    if (SUCCEEDED(hr))
-        hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0, rsb->lpVtbl->GetBufferPointer(rsb),
-                                                        rsb->lpVtbl->GetBufferSize(rsb),
-                                                        &IID_ID3D12RootSignature, (void**)&s_d3d.blit_rs);
+    /* The GPU layer's layout and pipeline (step C3b): the t0 table and a
+     * linear clamp at s0. */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 1;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.nstatic = 1;
+    ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+    s_d3d.blit_layout = lay_make(&ld, &s_d3d.blit_rs);
+    HRESULT hr = s_d3d.blit_rs ? S_OK : E_FAIL;
     if (SUCCEEDED(hr)) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-        pd.pRootSignature = s_d3d.blit_rs;
-        pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
-        pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
-        pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
-        pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-        pd.SampleDesc.Count = 1;
-        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd, &IID_ID3D12PipelineState,
-                                                               (void**)&s_d3d.blit_pso);
+        gpu_pipeline_desc pd;
+        pass_desc(&pd, s_d3d.blit_layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM, GPU_WRITE_ALL, 1);
+        s_d3d.blit_pso = rc_pipeline(&pd, NULL);
+        hr = s_d3d.blit_pso ? S_OK : E_FAIL;
     }
     if (SUCCEEDED(hr)) {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -331,10 +286,8 @@ static int blit_init(void)
                                                         (void**)&s_d3d.blit_srv_heap);
     }
     if (SUCCEEDED(hr)) blit_srvs_write();
-    if (vb) vb->lpVtbl->Release(vb);
-    if (pb) pb->lpVtbl->Release(pb);
-    if (rsb) rsb->lpVtbl->Release(rsb);
-    if (err) err->lpVtbl->Release(err);
+    sc_shader_drop(&vb);
+    sc_shader_drop(&pb);
     if (FAILED(hr)) printf("[D3D12] blit pipeline failed (0x%08lX)\n", (long)hr);
     return FAILED(hr) ? -1 : 0;
 }
@@ -363,7 +316,7 @@ static int blit_init(void)
     "    }\n" \
     "    return l * hw_white;\n" \
     "}\n"
-static struct { ID3D12RootSignature* rs; ID3D12PipelineState* pso[2]; int failed; } s_hdr_blit;
+static struct { ID3D12RootSignature* rs; gpu_layout layout; ID3D12PipelineState* pso[2]; int failed; } s_hdr_blit;
 
 static int hdr_blit_ready(void)
 {
@@ -384,72 +337,42 @@ static int hdr_blit_ready(void)
         "  return float4(hw_map(of_main(pos).rgb, (pos.xy - vp_org) * scale / src_size), 1); }\n";
     static char sharp[sizeof rsx_outfilter_ps + sizeof sharp_tail + 64];
     snprintf(sharp, sizeof sharp, "#define main of_main\n%s\n%s", rsx_outfilter_ps, sharp_tail);
-    ID3DBlob *vb[2] = {NULL, NULL}, *pb[2] = {NULL, NULL}, *rsb = NULL, *err = NULL;
-    HRESULT hr = sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "hdr_blit_vs", NULL, GPU_SC_NO_CACHE, &vb[0], &err);
-    if (SUCCEEDED(hr))
-        hr = sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "hdr_blit_ps", NULL, GPU_SC_NO_CACHE, &pb[0], &err);
-    if (SUCCEEDED(hr))
-        hr = sc_compile(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL,
-                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb[1], &err);
-    if (SUCCEEDED(hr))
-        hr = sc_compile(GPU_SC_PS, sharp, strlen(sharp), "hdr_sharp_ps", NULL,
-                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb[1], &err);
-    if (FAILED(hr))
-        printf("[D3D12] HDR blit shader compile failed: %s\n",
-               err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
-    if (SUCCEEDED(hr)) {
-        D3D12_DESCRIPTOR_RANGE range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0,
-                                        D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND};
-        D3D12_ROOT_PARAMETER rp[3] = {0};
-        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[0].DescriptorTable.NumDescriptorRanges = 1;
-        rp[0].DescriptorTable.pDescriptorRanges = &range;
-        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        for (int i = 1; i <= 2; i++) {
-            rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-            rp[i].Constants.ShaderRegister = (UINT)(i - 1);
-            rp[i].Constants.Num32BitValues = 8;
-            rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        }
-        D3D12_STATIC_SAMPLER_DESC smp = {0};
-        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        smp.MaxLOD = D3D12_FLOAT32_MAX;
-        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        D3D12_ROOT_SIGNATURE_DESC rsd = {3, rp, 1, &smp, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-        hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &err);
-        if (SUCCEEDED(hr))
-            hr = s_d3d.device->lpVtbl->CreateRootSignature(s_d3d.device, 0,
-                rsb->lpVtbl->GetBufferPointer(rsb), rsb->lpVtbl->GetBufferSize(rsb),
-                &IID_ID3D12RootSignature, (void**)&s_hdr_blit.rs);
+    gpu_shader vb[2] = {{0}, {0}}, pb[2] = {{0}, {0}};
+    vb[0] = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "hdr_blit_vs", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(vb[0]))
+        pb[0] = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "hdr_blit_ps", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(pb[0]))
+        vb[1] = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL,
+                          GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    if (GPU_VALID(vb[1]))
+        pb[1] = sc_shader(GPU_SC_PS, sharp, strlen(sharp), "hdr_sharp_ps", NULL,
+                          GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    if (!GPU_VALID(pb[1]))
+        printf("[D3D12] HDR blit shader compile failed: %s\n", sc_msg("?"));
+    else {
+        /* The GPU layer's layout (step C3b): the t0-t1 table, b0 and b1 = 8
+         * constants each, a linear clamp at s0. */
+        gpu_layout_desc ld;
+        memset(&ld, 0, sizeof ld);
+        ld.nslots = 3;
+        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 2, GPU_VIS_PIXEL);
+        for (int i = 1; i <= 2; i++) ld.slot[i] = lay_slot(GPU_SLOT_CONST32, (u8)(i - 1), 8, GPU_VIS_PIXEL);
+        ld.nstatic = 1;
+        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+        s_hdr_blit.layout = lay_make(&ld, &s_hdr_blit.rs);
     }
-    for (int i = 0; i < 2 && SUCCEEDED(hr); i++) {
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
-        pd.pRootSignature = s_hdr_blit.rs;
-        pd.VS.pShaderBytecode = vb[i]->lpVtbl->GetBufferPointer(vb[i]);
-        pd.VS.BytecodeLength  = vb[i]->lpVtbl->GetBufferSize(vb[i]);
-        pd.PS.pShaderBytecode = pb[i]->lpVtbl->GetBufferPointer(pb[i]);
-        pd.PS.BytecodeLength  = pb[i]->lpVtbl->GetBufferSize(pb[i]);
-        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pd.RasterizerState.DepthClipEnable = TRUE;
-        pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-        pd.SampleMask = UINT_MAX;
-        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pd.NumRenderTargets = 1;
-        pd.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        pd.SampleDesc.Count = 1;
-        hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(s_d3d.device, &pd,
-            &IID_ID3D12PipelineState, (void**)&s_hdr_blit.pso[i]);
+    for (int i = 0; i < 2 && s_hdr_blit.rs; i++) {
+        gpu_pipeline_desc pd;
+        pass_desc(&pd, s_hdr_blit.layout, vb[i], pb[i], GPU_FORMAT_R16G16B16A16_FLOAT, GPU_WRITE_ALL, 1);
+        s_hdr_blit.pso[i] = rc_pipeline(&pd, NULL);
+        if (!s_hdr_blit.pso[i]) break;
     }
     for (int i = 0; i < 2; i++) {
-        if (vb[i]) vb[i]->lpVtbl->Release(vb[i]);
-        if (pb[i]) pb[i]->lpVtbl->Release(pb[i]);
+        sc_shader_drop(&vb[i]);
+        sc_shader_drop(&pb[i]);
     }
-    if (rsb) rsb->lpVtbl->Release(rsb);
-    if (err) err->lpVtbl->Release(err);
-    if (FAILED(hr) || !s_hdr_blit.pso[0] || !s_hdr_blit.pso[1]) {
-        printf("[D3D12] HDR blit pipeline failed (0x%08lX): HDR stays off\n", (long)hr);
+    if (!s_hdr_blit.pso[0] || !s_hdr_blit.pso[1]) {
+        printf("[D3D12] HDR blit pipeline failed (0x%08lX): HDR stays off\n", (long)E_FAIL);
         return 0;
     }
     s_hdr_blit.failed = 0;
