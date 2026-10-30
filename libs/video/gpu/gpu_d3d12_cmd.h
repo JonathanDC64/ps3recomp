@@ -20,6 +20,8 @@
 
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
 
+#include <stddef.h>   /* offsetof */
+
 #define GPU_D3D12_CPU(c, v) { (SIZE_T)(c)->view[GPU_HANDLE_INDEX((v).id)] }
 
 static inline void gpu_cmd_pass_begin(gpu_cmd* c, const gpu_pass* pass)
@@ -306,22 +308,40 @@ static inline void gpu_cmd_marker(gpu_cmd* c, const char* text, uint32_t len)
 /* ---- The per-draw device calls (GPU_FAST_FUNCS) ---- */
 
 /* The memo (today's SrvMemo): an entry already holding this description is
- * left as it is. srv NULL is today's per-draw empty slot. */
+ * left as it is. srv NULL is today's per-draw empty slot.
+ * The compare reads srv's fields as they are (inline, the caller's values in
+ * registers) and packs them as the entry's 20 bytes lie: three words, read
+ * from the memo with three loads. A copy of srv built on the stack with
+ * narrow stores and read back with a wide load stalled store forwarding on
+ * every call; the copy is now made only for a write. */
+typedef char gpu_d3d12_memo_layout_[(sizeof(gpu_view_desc) == 20 && offsetof(gpu_view_desc, kind) == 4 &&
+                                     offsetof(gpu_view_desc, dim) == 5 && offsetof(gpu_view_desc, flags) == 6 &&
+                                     offsetof(gpu_view_desc, mips) == 7 && offsetof(gpu_view_desc, format) == 8 &&
+                                     offsetof(gpu_view_desc, swizzle) == 12 && offsetof(gpu_view_desc, mip) == 16 &&
+                                     offsetof(gpu_view_desc, layer) == 18) ? 1 : -1];
 static inline void gpu_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t index,
                                             const gpu_view_desc* srv)
 {
+    static const gpu_view_desc none = { {0}, GPU_VIEW_SRV, GPU_DIM_2D, 0, 1, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0, 0 };
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
     gpu_d3d12_tpool* const p = &dd->tpool[GPU_HANDLE_INDEX(pool.id)];
+    const gpu_view_desc* const s = srv ? srv : &none;
+    const uint32_t swizzle = s->swizzle ? s->swizzle : GPU_SWIZZLE_IDENTITY;
+    /* Little-endian (every target of this backend). */
+    const uint64_t w0 = (uint64_t)s->texture.id | (uint64_t)s->kind << 32 | (uint64_t)s->dim << 40 |
+                        (uint64_t)s->flags << 48 | (uint64_t)s->mips << 56;
+    const uint64_t w1 = (uint64_t)s->format | (uint64_t)swizzle << 32;
+    const uint32_t w2 = (uint32_t)s->mip | (uint32_t)s->layer << 16;
+    const gpu_view_desc* const e = &((const gpu_view_desc*)p->memo)[index];
+    uint64_t m0, m1;
+    uint32_t m2;
     gpu_view_desc v;
-    if (srv) {
-        v = *srv;
-    } else {
-        memset(&v, 0, sizeof v);
-        v.mips = 1;
-        v.format = GPU_FORMAT_R8G8B8A8_UNORM;
-    }
-    if (!v.swizzle) v.swizzle = GPU_SWIZZLE_IDENTITY;
-    if (!memcmp(&((const gpu_view_desc*)p->memo)[index], &v, sizeof v)) return;
+    memcpy(&m0, e, 8);             /* texture, kind, dim, flags, mips */
+    memcpy(&m1, &e->format, 8);    /* format, swizzle */
+    memcpy(&m2, &e->mip, 4);       /* mip, layer */
+    if (!((m0 ^ w0) | (m1 ^ w1) | (uint64_t)(m2 ^ w2))) return;
+    v = *s;
+    v.swizzle = swizzle;
     gpu_d3d12_write_srv(dd, p, index, &v);
 }
 

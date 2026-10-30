@@ -94,7 +94,7 @@ static u64 dred_fp64(u32 fp_addr)
     }
     return memo[b].h64;
 }
-static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecord* dr)
+static void dred_mark(u32 d, const D3D12DrawRecord* dr)   /* on the frame's recorder (step C7) */
 {
     static int on = -1;
     if (on < 0) on = getenv("D3D12_DRED") ? 1 : 0;
@@ -110,23 +110,14 @@ static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecor
         dr->tex[0].off, dr->tex[0].w, dr->tex[0].h, dr->tex[0].fmt);
     if (n < 0) return;
     if (n >= (int)sizeof a) n = (int)sizeof a - 1;
-    /* DRED keeps the text of a marker in the form WinPixEventRuntime gives
-     * SetMarker (metadata 2), not a plain string: a SetMarker event with no
-     * arguments (type 8 at bit 10, no timestamp), a colour, then the text as
-     * an ANSI string (chunk size 8 at bit 55, ANSI at bit 54) packed eight
-     * bytes a word, its zero byte included. */
-    u64 q[3 + 256 / 8 + 1] = {0};
-    q[0] = 0x008ull << 10;
-    q[1] = 0xFF4080C0ull;
-    q[2] = (8ull << 55) | (1ull << 54);
-    memcpy(&q[3], a, (size_t)n + 1);
-    const u32 words = 3 + ((u32)n + 1 + 7) / 8;
-    cl->lpVtbl->SetMarker(cl, 2, q, words * 8u);
+    /* gpu_cmd_marker packs the text as DRED keeps it (today's words: the PIX
+     * SetMarker form, metadata 2) and cuts it at 255 bytes, as above. */
+    gpu_cmd_marker(s_rc_cmd, a, (u32)n);
 }
 #else
-static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecord* dr)
+static void dred_mark(u32 d, const D3D12DrawRecord* dr)
 {
-    (void)cl; (void)d; (void)dr;
+    (void)d; (void)dr;
 }
 #endif
 static void late_note(u32 slot, const D3D12DrawRecord* dr)
@@ -849,14 +840,15 @@ typedef struct {
 #define MAX_ZETA 8
 static ZetaRT s_zeta[MAX_ZETA];
 
-/* The surface's DSV, as zeta_get made it (a view: step C5a). */
-static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv(int slot) { return s_zeta[slot].dsv_cpu; }
+/* The surface's DSV, as zeta_get made it (a view: step C5a; the view itself
+ * for the frame's inline commands, step C7). */
+static gpu_view zeta_dsv(int slot) { return s_zeta[slot].dsv; }
 
 /* The same surface as a read-only depth-stencil view: depth-tested and
  * sampled by one draw. The resource is then in ZETA_READ_STATE. */
 #define ZETA_READ_STATE ((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_DEPTH_READ | \
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
-static D3D12_CPU_DESCRIPTOR_HANDLE zeta_dsv_ro(int slot) { return s_zeta[slot].dsv_ro_cpu; }
+static gpu_view zeta_dsv_ro(int slot) { return s_zeta[slot].dsv_ro; }
 
 /* A depth surface dropped (step C5a): its handle and views into the grave,
  * the borrowed pointer cleared. */

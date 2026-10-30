@@ -581,38 +581,34 @@ rtt_dump_done:;
     drawprint_batch();
     RF_CP(4); rf_pp_snap(s_rf_pp, s_rf_ppn);
 
-    /* Transition render target to RENDER_TARGET state */
-    D3D12_RESOURCE_BARRIER barrier = {0};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = s_d3d.render_targets[fi];
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+    /* From here to the submit, the commands are the GPU layer's inline ones
+     * (gpu_d3d12_cmd.h: today's D3D12 calls) on the frame's recorder, rc
+     * (step C7). Nothing between begins another. */
+    gpu_cmd* const rc = s_rc_cmd;
 
-    /* Get RTV handle for current frame (its view's, step C5a) */
+    /* Transition render target to RENDER_TARGET state (s_rc_rt_tex[fi] is
+     * render_targets[fi]'s handle) */
+    gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
+
+    /* The current frame's RTV and the depth buffer shared across frames
+     * (views: step C5a). rtv_handle is the RTV's descriptor, for
+     * aa_run_display, which still takes it. */
+    const gpu_pass disp_pass = { 1, { s_rc_rt_rtv[fi] }, s_rc_depth_dsv };
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = s_rc_rt_rtv_cpu[fi];
-
-    /* Get DSV handle (single depth buffer shared across frames) */
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv_handle = s_rc_depth_dsv_cpu;
 
     if (perf_on()) s_perf_pre += perf_now() - _pre0;
     /* Set render target + depth */
-    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+    gpu_cmd_pass_begin(rc, &disp_pass);
 
     /* Clear color and depth */
-    s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
-        s_d3d.cmd_list, rtv_handle, s_d3d.clear_color, 0, NULL);
-    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(
-        s_d3d.cmd_list, dsv_handle,
-        D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-        1.0f, 0, 0, NULL);
+    gpu_cmd_clear_color(rc, s_rc_rt_rtv[fi], s_d3d.clear_color, NULL);
+    gpu_cmd_clear_depth(rc, s_rc_depth_dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0, NULL);
 
     /* Set viewport and scissor */
-    D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
-    D3D12_RECT scissor = {0, 0, (LONG)s_d3d.host_w, (LONG)s_d3d.host_h};
-    s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &viewport);
-    s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &scissor);
+    const gpu_viewport viewport = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
+    const gpu_rect scissor = {0, 0, (int32_t)s_d3d.host_w, (int32_t)s_d3d.host_h};
+    gpu_cmd_set_viewport(rc, &viewport);
+    gpu_cmd_set_scissor(rc, &scissor);
 
     /* Bind pipeline state and push MVP if anything to draw */
     if (s_d3d.pipeline_ready && s_d3d.draw_count > 0) {
@@ -731,10 +727,10 @@ rtt_dump_done:;
             if (s_d3d.draws[d].is_vp) { any = 1; break; }
         /* Textured geometry (dbgfont atlas) uses the sampling PS; untextured 3D
          * (vkcube) uses the colour-only PS. Fall back to whichever exists. */
-        ID3D12PipelineState* vpso =
-            (s_d3d.tex_ready && s_d3d.pipeline_state_vp) ? s_d3d.pipeline_state_vp
-                                                         : s_d3d.pipeline_state_vp_color;
-        if (!vpso) vpso = s_d3d.pipeline_state_vp;
+        gpu_pipeline vpso =
+            RC_PIPE((s_d3d.tex_ready && s_d3d.pipeline_state_vp) ? s_d3d.pipeline_state_vp
+                                                                 : s_d3d.pipeline_state_vp_color);
+        if (!vpso.v) vpso = RC_PIPE(s_d3d.pipeline_state_vp);
         { static int cap = -1, n = 0;
           PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
           if (cap && n < cap) { n++;
@@ -745,42 +741,28 @@ rtt_dump_done:;
             }
             fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
                     s_d3d.draw_count, nvp, nclr, any,
-                    (void*)vpso, (void*)s_d3d.vp_root_sig); } }
+                    (void*)(uintptr_t)vpso.v, (void*)s_d3d.vp_root_sig); } }
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
-        if (any && vpso && s_d3d.vp_vb && s_d3d.vp_cb) {
-            s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.vp_root_sig);
-            s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, vpso);
-            s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (any && vpso.v && s_d3d.vp_vb && s_d3d.vp_cb) {
+            gpu_cmd_set_layout(rc, s_d3d.vp_layout);   /* vp_root_sig's */
+            gpu_cmd_set_pipeline(rc, vpso);
+            gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
             s_vp_topo_strip = 0;
-            s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
-                gpu_buffer_addr(s_rc_dev, s_rc_vp_cb));
-            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
-            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, heaps);
+            gpu_cmd_bind_cb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_cb));
+            /* The texture pool and, when there is one, the samplers', in today's
+             * order; then the samplers' table 0 and the pool's first entry. */
+            gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
             vp_bind_sampler_table(NULL);
-            D3D12_GPU_DESCRIPTOR_HANDLE gh;
-            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
-            s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
-            D3D12_VERTEX_BUFFER_VIEW vbv;
-            vbv.BufferLocation = gpu_buffer_addr(s_rc_dev, s_rc_vp_vb)
-                               + (u64)s_d3d.vp_parity * s_vp_cap * 256;
-            vbv.SizeInBytes    = s_vp_cap * 256;
-            vbv.StrideInBytes  = 256;   /* 16 float4 attrib slots */
-            s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
-            if (s_d3d.vp_ib) {
-                D3D12_INDEX_BUFFER_VIEW ibv;
-                ibv.BufferLocation = gpu_buffer_addr(s_rc_dev, s_rc_vp_ib)
-                                   + (u64)s_d3d.vp_parity * s_vp_icap * 4;
-                ibv.SizeInBytes    = s_vp_icap * 4;
-                ibv.Format         = DXGI_FORMAT_R32_UINT;
-                s_d3d.cmd_list->lpVtbl->IASetIndexBuffer(s_d3d.cmd_list, &ibv);
-            }
+            gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, 0));
+            gpu_cmd_set_vb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256,
+                           s_vp_cap * 256, 256);   /* 16 float4 attrib slots */
+            if (s_d3d.vp_ib)
+                gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
+                               s_vp_icap * 4, GPU_FORMAT_R32_UINT);
             if (s_d3d.vf_buf)
-                s_d3d.cmd_list->lpVtbl->SetGraphicsRootShaderResourceView(s_d3d.cmd_list, 4,
-                    gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
-                    + (u64)s_d3d.vp_parity * s_vf_cap);
-            D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
-            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
+                gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
+                                        + (u64)s_d3d.vp_parity * s_vf_cap);
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
             /* its host size over guest size (RSX_SCALE). The batch starts on the display
@@ -818,6 +800,14 @@ rtt_dump_done:;
                 aa_t = aa_pick(&aa_before, &why);
                 aa_log(aa_t, aa_before, why);
             }
+            /* Read once for the loop (step C7): the device, the texture pool and
+             * the constant buffers' addresses, made at init and fixed through a
+             * frame, so a draw's binds look nothing up (today's took gh_base and
+             * the srv_inc it was given). */
+            gpu_device* const rdev = s_rc_dev;
+            const gpu_table_pool rsrv = s_rc_srv_pool;
+            const gpu_addr cb_va = gpu_fast_buffer_addr(rdev, s_rc_vp_cb);
+            const gpu_addr fpcb_va = s_d3d.vp_fpcb ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -827,24 +817,22 @@ rtt_dump_done:;
                  * below), its topology, and the targets bound now. */
                 if (aa_t >= 0 && d >= aa_before) {
                     if (aa_run_rt(aa_t)) {
-                        ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-                        cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
+                        gpu_cmd_set_layout(rc, s_d3d.vp_layout);
                         if (s_d3d.vf_buf)
-                            cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 4,
-                                gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
-                                + (u64)s_d3d.vp_parity * s_vf_cap);
-                        cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                            gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
+                                                    + (u64)s_d3d.vp_parity * s_vf_cap);
+                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
                         s_vp_topo_strip = 0;
-                        D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
-                        UINT nrt = 0;
+                        gpu_pass ap;
+                        ap.nrt = 0;
                         if (!cur_nocol) {
-                            rh[nrt++] = cur_rt >= 0 ? off_rt_rtv(cur_rt) : rtv_handle;
+                            ap.rt[ap.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
                             for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
-                                rh[nrt++] = off_rt_rtv(cur_m[_m]);
+                                ap.rt[ap.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
                         }
-                        D3D12_CPU_DESCRIPTOR_HANDLE dz = cur_z < 0 ? dsv_handle
-                                                       : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
-                        cl->lpVtbl->OMSetRenderTargets(cl, nrt, nrt ? rh : NULL, FALSE, &dz);
+                        ap.ds = cur_z < 0 ? s_rc_depth_dsv
+                              : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
+                        gpu_cmd_pass_begin(rc, &ap);
                     }
                     aa_t = -1;
                 }
@@ -862,8 +850,7 @@ rtt_dump_done:;
                         captured = 1;
                         screen_copy_capture(fi);
                         subvp_capture(fi);
-                        s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
-                            s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
+                        gpu_cmd_pass_begin(rc, &disp_pass);
                     }
                 }
                 /* Render-to-texture: retarget when this op's surfaces differ.
@@ -898,46 +885,44 @@ rtt_dump_done:;
                 if (want != cur_rt || wantm[0] != cur_m[0] ||
                     wantm[1] != cur_m[1] || wantm[2] != cur_m[2] || wz != cur_z ||
                     wro != cur_zro || nocol != cur_nocol) {
-                    D3D12_CPU_DESCRIPTOR_HANDLE dsv_op = wz < 0 ? dsv_handle
-                                                       : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
+                    gpu_pass tp;   /* the op's targets (views: step C5a) */
+                    tp.ds = wz < 0 ? s_rc_depth_dsv : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
                     if (wz >= 0) zeta_transition(wz, wro ? ZETA_READ_STATE
                                                          : D3D12_RESOURCE_STATE_DEPTH_WRITE);
-                    D3D12_CPU_DESCRIPTOR_HANDLE rh[4];
-                    UINT nrt = 1;
-                    rh[0] = rtv_handle;
-                    D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
+                    tp.nrt = 1;
+                    tp.rt[0] = s_rc_rt_rtv[fi];
+                    gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
                     float gw = (float)s_d3d.width, gh = (float)s_d3d.height;   /* the guest's size of it */
                     if (want >= 0) {
                         off_rt_transition(want, D3D12_RESOURCE_STATE_RENDER_TARGET);
-                        rh[0] = off_rt_rtv(want);
-                        vp.Width  = (float)s_d3d.off_rt[want].hw;
-                        vp.Height = (float)s_d3d.off_rt[want].hh;
+                        tp.rt[0] = s_d3d.off_rt[want].rtv;
+                        vp.width  = (float)s_d3d.off_rt[want].hw;
+                        vp.height = (float)s_d3d.off_rt[want].hh;
                         gw = (float)s_d3d.off_rt[want].w;
                         gh = (float)s_d3d.off_rt[want].h;
                     }
                     for (int _m = 0; _m < 3 && wantm[_m] >= 0; _m++) {
                         off_rt_transition(wantm[_m], D3D12_RESOURCE_STATE_RENDER_TARGET);
-                        rh[nrt++] = off_rt_rtv(wantm[_m]);
+                        tp.rt[tp.nrt++] = s_d3d.off_rt[wantm[_m]].rtv;
                     }
                     if (nocol) {
-                        nrt = 0;
-                        vp.Width  = wz >= 0 ? (float)s_zeta[wz].hw : (float)s_d3d.host_w;
-                        vp.Height = wz >= 0 ? (float)s_zeta[wz].hh : (float)s_d3d.host_h;
+                        tp.nrt = 0;
+                        vp.width  = wz >= 0 ? (float)s_zeta[wz].hw : (float)s_d3d.host_w;
+                        vp.height = wz >= 0 ? (float)s_zeta[wz].hh : (float)s_d3d.host_h;
                         gw = wz >= 0 ? (float)s_zeta[wz].w : (float)s_d3d.width;
                         gh = wz >= 0 ? (float)s_zeta[wz].h : (float)s_d3d.height;
                     }
-                    D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
+                    const gpu_rect sc = {0, 0, (int32_t)vp.width, (int32_t)vp.height};
                     vp_last_w = gw; vp_last_h = gh;
-                    tgt_sx = vp.Width / gw; tgt_sy = vp.Height / gh;
-                    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, nrt,
-                                                               nrt ? rh : NULL, FALSE, &dsv_op);
-                    s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
-                    s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
+                    tgt_sx = vp.width / gw; tgt_sy = vp.height / gh;
+                    gpu_cmd_pass_begin(rc, &tp);
+                    gpu_cmd_set_viewport(rc, &vp);
+                    gpu_cmd_set_scissor(rc, &sc);
                     /* The shared buffer stands in for "no guest depth surface",
                      * so it starts each target fresh; a zeta keeps its content. */
                     if (wz < 0)
-                        s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, dsv_handle,
-                            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, NULL);
+                        gpu_cmd_clear_depth(rc, s_rc_depth_dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0,
+                                            NULL);
                     cur_z = wz;
                     cur_zro = wro;
                     cur_nocol = nocol;
@@ -951,8 +936,7 @@ rtt_dump_done:;
                       PS3_KNOB(cd2, ps3_env_int("RT_CLEARDBG", 0));
                       if (cd2 >= 2 && want >= 0) {
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(
-                              s_d3d.cmd_list, off_rt_rtv(want), mag, 0, NULL);
+                          gpu_cmd_clear_color(rc, s_d3d.off_rt[want].rtv, mag, NULL);
                       } }
                     /* VP_TESTTRI=1: our own triangle, through the game's exact
                      * pipeline -- same vpso, same root signature, same vertex
@@ -978,7 +962,7 @@ rtt_dump_done:;
                               dstv[0] = tri[_v][0]; dstv[1] = tri[_v][1];
                               dstv[2] = tri[_v][2]; dstv[3] = tri[_v][3];
                           }
-                          s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, 3, 1, 1000, 0);
+                          gpu_cmd_draw(rc, 3, 1, 1000, 0);
                           { static int _n = 0;
                             if (_n < 3 && ++_n) fprintf(stderr, "[TESTTRI] issued on rt=%d off=0x%08X%c",
                                                   want, s_d3d.off_rt[want].off, 10); }
@@ -987,16 +971,13 @@ rtt_dump_done:;
                     for (int _m = 0; _m < 3; _m++) cur_m[_m] = wantm[_m];
                 }
                 if (dr->is_clear && (dr->clr_flags & 3u) && cur_z >= 0) {
-                    D3D12_CLEAR_FLAGS zf = (D3D12_CLEAR_FLAGS)(
-                        ((dr->clr_flags & 1u) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
-                        ((dr->clr_flags & 2u) ? D3D12_CLEAR_FLAG_STENCIL : 0));
-                    s_d3d.cmd_list->lpVtbl->ClearDepthStencilView(s_d3d.cmd_list, zeta_dsv(cur_z),
-                        zf, dr->clr_z, (UINT8)dr->clr_s, 0, NULL);
+                    const u32 zf = ((dr->clr_flags & 1u) ? GPU_CLEAR_DEPTH : 0) |
+                                   ((dr->clr_flags & 2u) ? GPU_CLEAR_STENCIL : 0);
+                    gpu_cmd_clear_depth(rc, zeta_dsv(cur_z), zf, dr->clr_z, (uint8_t)dr->clr_s, NULL);
                 }
                 if (dr->is_clear && (!(dr->clr_flags & 0xF0u) || nocol)) continue;   /* depth/stencil only */
                 if (dr->is_clear) {
-                    D3D12_CPU_DESCRIPTOR_HANDLE rh =
-                        (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
+                    const gpu_view rh = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
                     /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
                      * than the guest colour. "0.000% nonzero" cannot tell an
                      * untouched surface from one written black, and that
@@ -1008,14 +989,12 @@ rtt_dump_done:;
                       PS3_KNOB(cd, ps3_env_int("RT_CLEARDBG", 0));
                       if (cd && cur_rt >= 0) {
                           const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, mag, 0, NULL);
+                          gpu_cmd_clear_color(rc, rh, mag, NULL);
                       } else
-                          s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rh, dr->cc, 0, NULL); }
+                          gpu_cmd_clear_color(rc, rh, dr->cc, NULL); }
                     for (int _m = 0; _m < 3; _m++)
-                        if (cur_m[_m] >= 0) {
-                            D3D12_CPU_DESCRIPTOR_HANDLE rhm = off_rt_rtv(cur_m[_m]);
-                            s_d3d.cmd_list->lpVtbl->ClearRenderTargetView(s_d3d.cmd_list, rhm, dr->cc, 0, NULL);
-                        }
+                        if (cur_m[_m] >= 0)
+                            gpu_cmd_clear_color(rc, s_d3d.off_rt[cur_m[_m]].rtv, dr->cc, NULL);
                     continue;
                 }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
@@ -1027,18 +1006,18 @@ rtt_dump_done:;
                  * again, as before. */
                 static int pso_in_rec = -1;
                 PS3_KNOB(pso_in_rec, ps3_env_int("RSX_PSO_IN_REC", 1));
-                ID3D12PipelineState* dpso = NULL;
+                gpu_pipeline dpso = {0};   /* (the record's pipeline fields: RC_PIPE, step C7) */
                 if (dr->fp_addr) {
-                    if (pso_in_rec && dr->pso && dr->pso_serial == s_rf_serial) dpso = dr->pso;
-                    if (!dpso || pso_in_rec == 2) {
-                        ID3D12PipelineState* look =
-                            vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
-                                          dr_num_rts(dr),
-                                          dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
-                                                     : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                          dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                          dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
-                        if (dpso && look != dpso) {
+                    if (pso_in_rec && dr->pso && dr->pso_serial == s_rf_serial) dpso = RC_PIPE(dr->pso);
+                    if (!dpso.v || pso_in_rec == 2) {
+                        const gpu_pipeline look =
+                            RC_PIPE(vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
+                                                  dr_num_rts(dr),
+                                                  dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
+                                                             : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                                  dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                                  dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr)));
+                        if (dpso.v && look.v != dpso.v) {
                             static int n = 0;
                             if (n < 8) {
                                 n++;
@@ -1050,8 +1029,7 @@ rtt_dump_done:;
                         dpso = look;
                     }
                 }
-                s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
-                                                         dpso ? dpso : vpso);
+                gpu_cmd_set_pipeline(rc, dpso.v ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
                  * full target. Scissor tracks the same rect. */
                 {
@@ -1059,30 +1037,30 @@ rtt_dump_done:;
                              : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
                     float th = cur_nocol ? vp_last_h
                              : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
-                    D3D12_VIEWPORT dvp = {0, 0, tw, th, 0.0f, 1.0f};
+                    gpu_viewport dvp = {0, 0, tw, th, 0.0f, 1.0f};
                     if (dr->vp_w >= 2 && dr->vp_h >= 2 &&
                         (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
                         (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
-                        dvp.TopLeftX = (float)dr->vp_x;
-                        dvp.TopLeftY = (float)dr->vp_y;
-                        dvp.Width    = (float)dr->vp_w;
-                        dvp.Height   = (float)dr->vp_h;
+                        dvp.x      = (float)dr->vp_x;
+                        dvp.y      = (float)dr->vp_y;
+                        dvp.width  = (float)dr->vp_w;
+                        dvp.height = (float)dr->vp_h;
                     }
-                    D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
-                                      (LONG)(dvp.TopLeftX + dvp.Width),
-                                      (LONG)(dvp.TopLeftY + dvp.Height)};
-                    dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
-                    dvp_w = dvp.Width;    dvp_h = dvp.Height;
+                    gpu_rect dsc = {(int32_t)dvp.x, (int32_t)dvp.y,
+                                    (int32_t)(dvp.x + dvp.width),
+                                    (int32_t)(dvp.y + dvp.height)};
+                    dvp_x = dvp.x;     dvp_y = dvp.y;
+                    dvp_w = dvp.width; dvp_h = dvp.height;
                     if (tgt_sx != 1.0f || tgt_sy != 1.0f) {   /* RSX_SCALE: the guest rect, scaled */
-                        dvp.TopLeftX *= tgt_sx; dvp.Width  *= tgt_sx;
-                        dvp.TopLeftY *= tgt_sy; dvp.Height *= tgt_sy;
-                        dsc.left   = lroundf(dvp.TopLeftX);
-                        dsc.top    = lroundf(dvp.TopLeftY);
-                        dsc.right  = lroundf(dvp.TopLeftX + dvp.Width);
-                        dsc.bottom = lroundf(dvp.TopLeftY + dvp.Height);
+                        dvp.x *= tgt_sx; dvp.width  *= tgt_sx;
+                        dvp.y *= tgt_sy; dvp.height *= tgt_sy;
+                        dsc.left   = lroundf(dvp.x);
+                        dsc.top    = lroundf(dvp.y);
+                        dsc.right  = lroundf(dvp.x + dvp.width);
+                        dsc.bottom = lroundf(dvp.y + dvp.height);
                     }
-                    s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
-                    s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &dsc);
+                    gpu_cmd_set_viewport(rc, &dvp);
+                    gpu_cmd_set_scissor(rc, &dsc);
                 }
                 /* Per-draw textures: bind this draw's SRV window.
                  * Any sampled offscreen RT transitions to PSR first (never
@@ -1110,23 +1088,19 @@ rtt_dump_done:;
                         continue;
                     }
                     /* Sampling a bound colour target: read a copy (above). */
-                    ID3D12Resource* snap = off_rt_snapshot(rt);
+                    const int snap = off_rt_snapshot(rt) != NULL;
                     srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u,
                               snap ? s_d3d.off_rt[rt].snap_tex : k_rc_no_tex,
                               (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 }
-                D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
-                gh.ptr += (u64)(DRAW_SRV_BASE + d * RSX_FP_UNITS) * s_d3d.srv_inc;
-                s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, DRAW_SRV_BASE + d * RSX_FP_UNITS));
                 vp_bind_sampler_table(dr);
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
-                s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
-                    gpu_fast_buffer_addr(s_rc_dev, s_rc_vp_cb)
+                gpu_cmd_bind_cb(rc, 0, cb_va
                     + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->vcb_slot) * VP_CB_STRIDE);
                 if (s_d3d.vp_fpcb)
-                    s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
-                        gpu_fast_buffer_addr(s_rc_dev, s_rc_vp_fpcb)
+                    gpu_cmd_bind_cb(rc, 2, fpcb_va
                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
                  * the target they are aimed at. A zero vertex count, or a start
@@ -1135,8 +1109,6 @@ rtt_dump_done:;
                 { static int dcap = -1, dn = 0;
                   PS3_KNOB(dcap, ps3_env_int("DRAWARGS", 0));
                   if (dcap && dn < dcap) { dn++;
-                      D3D12_CPU_DESCRIPTOR_HANDLE _rh =
-                          (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
                       fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d rec=0x%08X bound=0x%08X"
                               " tex0=0x%08X texrt=%d dvp=%.0f,%.0f %.0fx%.0f%c",
                               dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
@@ -1155,13 +1127,13 @@ rtt_dump_done:;
                 { static int rb = -1;
                   PS3_KNOB(rb, ps3_env_int("RT_REBIND", 0));
                   if (rb) {
-                      D3D12_CPU_DESCRIPTOR_HANDLE brh[4];
-                      UINT bn = 1;
-                      brh[0] = (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
+                      gpu_pass bp;
+                      bp.nrt = 1;
+                      bp.rt[0] = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
                       for (int _m = 0; _m < 3; _m++)
-                          if (cur_m[_m] >= 0) brh[bn++] = off_rt_rtv(cur_m[_m]);
-                      s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
-                          s_d3d.cmd_list, bn, brh, FALSE, &dsv_handle);
+                          if (cur_m[_m] >= 0) bp.rt[bp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
+                      bp.ds = s_rc_depth_dsv;
+                      gpu_cmd_pass_begin(rc, &bp);
                   } }
                 { int zq = -1;
                   if (g_rsx_report_hook && (s_zq_nev || s_zq_on_start) &&
@@ -1169,30 +1141,26 @@ rtt_dump_done:;
                       zq = s_zq_n++;
                       s_zq_rec[zq] = dr->cb_slot;
                       s_zq_area[zq] = tgt_sx * tgt_sy;
-                      s_d3d.cmd_list->lpVtbl->BeginQuery(s_d3d.cmd_list, s_zq_heap,
-                          D3D12_QUERY_TYPE_OCCLUSION, (UINT)zq);
+                      /* The batch's queries are reset before its first one
+                       * (Vulkan's rule; nothing on D3D12). */
+                      if (!zq) gpu_cmd_query_reset(rc, s_zq_pool, 0, ZQ_MAX);
+                      gpu_cmd_query_begin(rc, s_zq_pool, (u32)zq);
                   }
                 if (dr->fetch)
-                    s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstant(s_d3d.cmd_list, 5,
-                        dr->fdesc, 0);
+                    gpu_cmd_push_const1(rc, 5, dr->fdesc, 0);
                 /* A strip draw's indices are a strip (vf_strip_native). */
                 if ((dr->fetch == 2) != s_vp_topo_strip) {
                     s_vp_topo_strip = dr->fetch == 2;
-                    s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list,
-                        s_vp_topo_strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
-                                        : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
                 }
-                dred_mark(s_d3d.cmd_list, d, dr);
+                dred_mark(d, dr);
                 if (dr->index_count)
-                    s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
-                        dr->index_count, hang_test_instances(dr->index_count), dr->ib_first,
-                        (INT)(dr->vb_byte_offset / 256), 0);
+                    gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count), dr->ib_first,
+                                         (int32_t)(dr->vb_byte_offset / 256), 0);
                 else
-                    s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
-                        dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
+                    gpu_cmd_draw(rc, dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                   if (zq >= 0)
-                      s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_zq_heap,
-                          D3D12_QUERY_TYPE_OCCLUSION, (UINT)zq); }
+                      gpu_cmd_query_end(rc, s_zq_pool, (u32)zq); }
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
                  * "records exist" and "draws were submitted" are different
                  * claims, and every blank-output investigation conflates them. */
@@ -1200,7 +1168,7 @@ rtt_dump_done:;
                   PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
                   if (cap && n < cap) { n++;
                     fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
-                            d, dr->vertex_count, dpso ? "guest-fp" : "fallback",
+                            d, dr->vertex_count, dpso.v ? "guest-fp" : "fallback",
                             dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
                             dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10);
                     fprintf(stderr, "            vs_idx=%d cb_slot=%u vbofs=%u cull=%u blend=%d%c",
@@ -1211,11 +1179,11 @@ rtt_dump_done:;
             fpwatch_batch();
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
-                s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
-                D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
-                D3D12_RECT sc = {0, 0, (LONG)s_d3d.host_w, (LONG)s_d3d.host_h};
-                s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
-                s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
+                gpu_cmd_pass_begin(rc, &disp_pass);
+                const gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
+                const gpu_rect sc = {0, 0, (int32_t)s_d3d.host_w, (int32_t)s_d3d.host_h};
+                gpu_cmd_set_viewport(rc, &vp);
+                gpu_cmd_set_scissor(rc, &sc);
             }
         }
     }
@@ -1429,17 +1397,14 @@ rtt_dump_done:;
             if (!s_rtsave_buf) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
             if (s_rtsave_buf) {
                 off_rt_transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                D3D12_TEXTURE_COPY_LOCATION cdst = {0}, csrc = {0};
-                cdst.pResource = s_rtsave_buf;
-                cdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                cdst.PlacedFootprint.Footprint.Format   = (DXGI_FORMAT)r->dxgi;
-                cdst.PlacedFootprint.Footprint.Width    = r->hw;
-                cdst.PlacedFootprint.Footprint.Height   = r->hh;
-                cdst.PlacedFootprint.Footprint.Depth    = 1;
-                cdst.PlacedFootprint.Footprint.RowPitch = pitch;
-                csrc.pResource = r->res;
-                csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &cdst, 0, 0, 0, &csrc, NULL);
+                gpu_footprint cfp;   /* (r->tex is r->res's handle) */
+                memset(&cfp, 0, sizeof cfp);
+                cfp.format    = (gpu_format)r->dxgi;
+                cfp.width     = r->hw;
+                cfp.height    = r->hh;
+                cfp.depth     = 1;
+                cfp.row_pitch = pitch;
+                gpu_cmd_copy_tex_to_buf(rc, s_rtsave_b, &cfp, r->tex, 0, NULL);
                 off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 s_rtsave_state = 1;
                 s_rtsave_w = r->hw; s_rtsave_h = r->hh;
@@ -1551,42 +1516,30 @@ skip_dump_consider: ;
     }
     if (dumping) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
 
-        D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-        dst.pResource = s_d3d.readback_buf;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Offset = 0;
-        dst.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
-        dst.PlacedFootprint.Footprint.Width    = s_d3d.host_w;
-        dst.PlacedFootprint.Footprint.Height   = s_d3d.host_h;
-        dst.PlacedFootprint.Footprint.Depth    = 1;
-        dst.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
-        src.pResource = s_d3d.render_targets[fi];
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
-        s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+        gpu_footprint dfp;
+        memset(&dfp, 0, sizeof dfp);
+        dfp.format    = GPU_FORMAT_R8G8B8A8_UNORM;
+        dfp.width     = s_d3d.host_w;
+        dfp.height    = s_d3d.host_h;
+        dfp.depth     = 1;
+        dfp.row_pitch = s_d3d.readback_pitch;
+        gpu_cmd_copy_tex_to_buf(rc, s_rc_readback_buf, &dfp, s_rc_rt_tex[fi], 0, NULL);
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT);
     } else {
         /* End-of-frame fallback snapshot: used when the frame never contained a
          * reduced-viewport pass to capture mid-frame. */
         screen_copy_capture(fi);
         /* Transition render target to PRESENT state */
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
     }
 
     RF_CP(7);
     rt_writeback_record();
     if (s_zq_n)
-        s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_zq_heap,
-            D3D12_QUERY_TYPE_OCCLUSION, 0, (UINT)s_zq_n, s_zq_rb, 0);
+        gpu_cmd_query_resolve(rc, s_zq_pool, 0, (u32)s_zq_n, s_zq_rb_buf, 0);
 
     /* The game's frame, scaled into the window's buffer (and held for the
      * overlay's repaints). */
@@ -1611,36 +1564,9 @@ skip_dump_consider: ;
     if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
     zq_finish();
 
-    /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
-     * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
-     * pixels in flOw's render injection while ClearRenderTargetView worked, and
-     * every input (verts, offsets, layout, MVP, PSO, root sig, depth, cull) was
-     * verified correct -- so the only remaining explanation is a validation
-     * error the debug layer is swallowing. Off unless the env var is set. */
-    { static int _iq = -1;
-      if (_iq < 0) { const char* e = getenv("D3D12_IQ"); _iq = e ? 1 : 0; }
-      if (_iq && s_d3d.device) {
-        ID3D12InfoQueue* iq = NULL;
-        if (SUCCEEDED(s_d3d.device->lpVtbl->QueryInterface(
-                s_d3d.device, &IID_ID3D12InfoQueue, (void**)&iq)) && iq) {
-            UINT64 n = iq->lpVtbl->GetNumStoredMessages(iq);
-            static int _printed = 0;
-            for (UINT64 mi = 0; mi < n && _printed < 80; mi++) {
-                SIZE_T len = 0;
-                iq->lpVtbl->GetMessage(iq, mi, NULL, &len);
-                D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
-                if (m && SUCCEEDED(iq->lpVtbl->GetMessage(iq, mi, m, &len))) {
-                    fprintf(stderr, "[D3D12-IQ][sev=%d id=%d] %s\n",
-                            (int)m->Severity, (int)m->ID, m->pDescription);
-                    _printed++;
-                }
-                free(m);
-            }
-            if (n) iq->lpVtbl->ClearStoredMessages(iq);
-            iq->lpVtbl->Release(iq);
-            fflush(stderr);
-        }
-      } }
+    /* (D3D12_IQ's drain of the debug layer's message queue is not copied:
+     * this route never enables the debug layer, so the queue holds nothing;
+     * call map G16.) */
 
     if (s_sc_dump_pending) {
         s_sc_dump_pending = 0;

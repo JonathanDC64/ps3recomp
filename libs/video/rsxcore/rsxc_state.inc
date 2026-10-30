@@ -475,6 +475,11 @@ static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
  * (gpu_pipeline.v). The pipelines made this run, from the GPU layer's
  * library and compiled (rc_pipeline): */
 static volatile LONG s_rc_pipe_loaded, s_rc_pipe_made;
+/* Step C7: render_frame's commands are the GPU layer's inline ones
+ * (gpu_d3d12_cmd.h) on the frame's recorder. A pipeline field
+ * (ID3D12PipelineState*, gpu_pipeline.v on D3D12) as its handle, with no
+ * lookup, for the draws that bind one: */
+#define RC_PIPE(p) ((gpu_pipeline){ (uint64_t)(uintptr_t)(p) })
 static int draw_room(void)
 {
     if (s_d3d.draw_count < MAX_DRAWS) return 1;
