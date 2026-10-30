@@ -25,7 +25,9 @@
  * no-op commit copies the line, or now and then fails, the same calls
  * failing in both runs. The knobs the loop reads are varied across cases:
  * the PUT interval, the one-call transfers, the GET skip, the line read for
- * every command.
+ * every command, the empty ring's wait. In some cases with the ring empty
+ * after a command or two, put moves on during the wait, at the same read in
+ * both runs, and every read in a wait checks that the state was PUT first.
  *
  * Build (clang targeting MSVC, or clang-cl's driver):
  *   clang -O2 -msse4.1 -D_CRT_SECURE_NO_WARNINGS -I include -I runtime -I runtime/spu \
@@ -34,6 +36,10 @@
  * Exit code 0 if every case matched; the last line is a summary.
  */
 
+/* The empty ring's wait reads put through this (test_put_read, below). */
+#include <stdint.h>
+static uint32_t test_put_read(const uint32_t* p);
+#define RING_PUT_READ(p) test_put_read(p)
 #include "../spu_ring_hook.c"
 #include "../spu_put_hook.c"
 
@@ -128,6 +134,23 @@ static uint32_t rnd(void) { g_rng = g_rng * 1664525u + 1013904223u; return g_rng
 static uint32_t rndn(uint32_t n) { return rnd() % n; }
 
 static void put32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+/* The producer during the empty ring's wait: on the wait's g_put_at-th read
+ * of put in a run (0: none), put moves on to g_put_full, the commands up to
+ * it already in memory, so both runs see it move at the same read. Each read
+ * also checks that the state is already PUT (memory at STATE_EA as the local
+ * store has it): the producer must see get before the consumer waits. */
+static unsigned g_put_reads, g_put_at;
+static uint32_t g_put_full;
+static unsigned long long g_put_moves, g_put_stale;
+static const uint8_t* g_cur_ls;
+static uint32_t test_put_read(const uint32_t* p)
+{
+    if (memcmp(vm_base + STATE_EA, g_cur_ls + RING_STATE_LS, 16)) g_put_stale++;
+    if (++g_put_reads == g_put_at) { put32((uint8_t*)p, g_put_full); g_put_moves++; }
+    const uint8_t* b = (const uint8_t*)p;
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3];
+}
 static void ls_q(uint8_t* ls, uint32_t a, uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3)
 {
     put32(ls + a, w0); put32(ls + a + 4, w1); put32(ls + a + 8, w2); put32(ls + a + 12, w3);
@@ -192,9 +215,13 @@ static void build(image* im, unsigned ncmd, uint32_t put_old_delta)
     /* guest memory: the control line, the commands */
     put32(mem + LINE_EA, put); put32(mem + LINE_EA + 12, LINE_EA);
     for (unsigned i = 0; i < ncmd; i++) make_cmd(mem + get + 16u * i);
+    g_put_at = 0;
+    g_put_full = put;
     if (rndn(3) == 0) {   /* the ring empty after the first command or two: the live put is get */
         put32(mem + LINE_EA, get + 16u * (1 + rndn(2)));
         ls_q(ls, RING_LINE_LS, get + 16u * (1 + rndn(2)), rnd(), rnd(), LINE_EA);
+        /* and put moves on during the wait, at a read within it or past it */
+        if (rndn(2)) g_put_at = 1 + rndn(RING_WAIT_READS + 8);
     }
 }
 
@@ -257,12 +284,14 @@ int main(int argc, char** argv)
         set_knob("SPU_XFER_WAIT", one);
         set_knob("SPU_RING_GET_SKIP", skip);
         set_knob("SPU_NATIVE_RING", ring);
+        set_knob("SPU_RING_WAIT", (int[]){4, 64, 0}[(c / 7) % 3]);
         const unsigned ncmd = 1 + rndn(40);
         const uint32_t put_old_delta = rndn(2) ? 0u : 16u * rndn(ncmd + 1);
         const uint32_t seed = rnd(), tag0 = rndn(4) == 0 ? 0u : 1u, commit_seed = rnd();
         ring_get_memo memo0 = {0};
         memo0.ctx = rndn(2) ? im[0].ctx : NULL;   /* (the context pointer differs between the runs) */
         int rc[2];
+        unsigned long long stale[2];
         ring_get_memo memo_after[2];
         for (int m = 0; m < 2; m++) {
             g_rng = seed;
@@ -273,10 +302,13 @@ int main(int argc, char** argv)
             vm_base = im[m].mem;
             g_tag_done = tag0;
             g_rng_commit = commit_seed;
-            g_nlog = 0; g_nwait = 0; g_since_xfer = 0;
+            g_nlog = 0; g_nwait = 0; g_since_xfer = 0; g_put_reads = 0;
+            g_cur_ls = im[m].ls;
+            const unsigned long long stale0 = g_put_stale;
             t_get = memo0;
             if (memo0.ctx) t_get.ctx = im[m].ctx;
             rc[m] = spu_hook_ring_fetch(im[m].ctx);
+            stale[m] = g_put_stale - stale0;
             waits[m] += (unsigned)g_nwait;
             memo_after[m] = t_get;
             memo_after[m].ctx = t_get.ctx == im[m].ctx ? (const spu_context*)1 : t_get.ctx;
@@ -286,6 +318,7 @@ int main(int argc, char** argv)
         char why[96] = "";
         int ok = rc[0] == rc[1];
         if (!ok) snprintf(why, sizeof why, "return %d vs %d", rc[0], rc[1]);
+        if (ok && (stale[0] || stale[1])) { strcpy(why, "state not PUT before a wait"); ok = 0; }
         if (ok) {
             spu_context a = *im[0].ctx, b = *im[1].ctx;
             ok = same_ctx(&a, &b, rc[0] == 0, why);
@@ -311,7 +344,8 @@ int main(int argc, char** argv)
         }
         if (im[1].ctx->steps) lazy_runs++;
     }
-    printf("%u cases (%u ran commands natively, %llu steps), %u differ; tag waits: per-command %llu, lazy %llu\n",
-           ran, lazy_runs, cmds, bad, waits[0], waits[1]);
+    printf("%u cases (%u ran commands natively, %llu steps, put moved in %llu waits), %u differ; "
+           "tag waits: per-command %llu, lazy %llu\n",
+           ran, lazy_runs, cmds, g_put_moves / 2, bad, waits[0], waits[1]);
     return bad ? 1 : 0;
 }

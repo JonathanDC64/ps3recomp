@@ -25,8 +25,9 @@
  * call at 0x4730 when the line already shows a command: the GETLLAR and the
  * unchanged PUTLLC become one plain read of the line
  * (spu_llar_noop_commit), and the GET and its tag wait go through the
- * channels as before. When the ring is empty it returns 0 and the lifted
- * code waits exactly as it always has. While the line copy from the last
+ * channels as before. When the ring is empty it watches put for a short
+ * while (SPU_RING_WAIT, at ring_wait_put), then returns 0 and the lifted
+ * code waits as it always has. While the line copy from the last
  * read still shows commands ahead of get, the line is not read at all.
  *
  * SPU_NATIVE_RING (live): 1 (default) as above, 2 reads the line for every
@@ -162,6 +163,11 @@ typedef struct ring_fetched {
     u128 old_line, state, line, r73, r71;
 } ring_fetched;
 
+/* The PUT a run of commands has deferred (below, at ring_put_every), and the
+ * empty ring's wait (at ring_wait_put). */
+typedef struct ring_put_pend ring_put_pend;
+RING_NOINLINE int ring_wait_put(spu_context* ctx, ring_put_pend* pend, uint32_t line_ea, uint32_t get);
+
 /* 0x4618-0x4690's writes before the GETLLAR, which stay when the fetch gives
  * the command back at the GETLLAR. */
 RING_INLINE void ring_fetch_regs_head(spu_context* ctx, u128 old_line)
@@ -216,8 +222,9 @@ RING_INLINE void ring_fetch_regs(spu_context* ctx, const ring_fetched* f)
  * then has what ring_fetch_regs works them out from), 0 runs the lifted code.
  * `lazy` (ring_lazy, inside a run of commands): a skipped GET's tag wait is
  * not made, as the tag status it reads cannot have changed since the last
- * one (see ring_lazy). */
-RING_INLINE int ring_fetch_take(spu_context* ctx, ring_fetched* f, int lazy)
+ * one (see ring_lazy). `pend`: the caller's deferred PUT, which goes out
+ * before the empty ring's wait, or NULL. */
+RING_INLINE int ring_fetch_take(spu_context* ctx, ring_fetched* f, int lazy, ring_put_pend* pend)
 {
     if (!native_ring_on() || !vm_base) return 0;
     /* The channel latches below are written in place, as spu_wrch_latch
@@ -237,8 +244,11 @@ RING_INLINE int ring_fetch_take(spu_context* ctx, ring_fetched* f, int lazy)
      * is, as if this GETLLAR had come before the producer's later stores.
      * SPU_NATIVE_RING=2 reads it for every command. */
     const int known = native_ring_on() == 1 && old_line._u32[0] != state._u32[0];
-    /* The live put. Empty ring: the lifted code GETLLARs and waits. */
-    if (!known && be32_at(vm_base + line_ea) == state._u32[0]) return 0;
+    /* The live put. Empty ring: a short wait on put, then the lifted code
+     * GETLLARs and waits. */
+    if (!known && be32_at(vm_base + line_ea) == state._u32[0] &&
+        !ring_wait_put(ctx, pend, line_ea, state._u32[0]))
+        return 0;
 
     /* The registers are worked out by ring_fetch_regs, from what this reads
      * (a value stored into ctx->gpr a word at a time and read back whole
@@ -311,10 +321,10 @@ RING_INLINE int ring_fetch_take(spu_context* ctx, ring_fetched* f, int lazy)
 }
 
 /* The fetch step: 1 when it took a command, 0 runs the lifted code. */
-RING_INLINE int ring_fetch(spu_context* ctx)
+RING_INLINE int ring_fetch(spu_context* ctx, ring_put_pend* pend)
 {
     ring_fetched f;
-    if (!ring_fetch_take(ctx, &f, 0)) return 0;
+    if (!ring_fetch_take(ctx, &f, 0, pend)) return 0;
     ring_fetch_regs(ctx, &f);
     return 1;
 }
@@ -1290,10 +1300,61 @@ static int ring_put_every(void)
     PS3_KNOB(n, ps3_env_int("SPU_RING_PUT_EVERY", 16));
     return n;
 }
-typedef struct ring_put_pend { int n; uint32_t eah, eal, lsa, size; } ring_put_pend;
+struct ring_put_pend { int n; uint32_t eah, eal, lsa, size; };
 RING_INLINE void ring_put_out(spu_context* ctx, ring_put_pend* p)
 {
     if (p->n) { spu_put_flush(ctx, p->eah, p->eal, p->lsa, p->size); p->n = 0; }
+}
+
+/* The empty ring. The lifted code waits for the producer with a GETLLAR,
+ * the lock-line event read and a GETLLAR again, back to back, each a copy or
+ * compare of the control line, and every read takes the line from the
+ * producer's core: the producer's next store into it (HighGraphics, which
+ * holds the frame in the deep Palace) has to take it back, and its coherent
+ * store finds a live reservation to break. So before that wait the fetch
+ * reads only put, one word, with a pause between reads that doubles up to
+ * SPU_RING_WAIT pauses, RING_WAIT_READS times, and takes the command as soon
+ * as put moves; then the lifted wait as before. The PUT a run deferred goes
+ * out first, as on every way out of the loop, so the producer sees get
+ * before this SPU waits. Nothing else changes: the lifted wait reads the
+ * same put and takes the same commands, only after more of them are in.
+ *
+ * SPU_RING_WAIT=<n> (live): the most pauses between two reads of put
+ * (default 16: in the deep Palace 16 beat 64 by about 1.3%, 64 beat 256,
+ * and 4 was even with 64); 0 gives the empty ring to the lifted code at
+ * once, as before, for A/B. */
+#define RING_WAIT_READS 64
+#if defined(__x86_64__) || defined(__i386__)
+#define RING_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define RING_PAUSE() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define RING_PAUSE() ((void)0)
+#endif
+#ifndef RING_PUT_READ   /* a test reads put through its own function */
+#define RING_PUT_READ(p) __builtin_bswap32(__atomic_load_n((p), __ATOMIC_ACQUIRE))
+#endif
+static int ring_wait_spin(void)
+{
+    static int n = -1;
+    PS3_KNOB(n, ps3_env_int("SPU_RING_WAIT", 16));
+    return n;
+}
+RING_NOINLINE int ring_wait_put(spu_context* ctx, ring_put_pend* pend, uint32_t line_ea, uint32_t get)
+{
+    const int most = ring_wait_spin();
+    if (most <= 0) return 0;
+    const unsigned gen = ps3_env_gen;
+    if (pend) ring_put_out(ctx, pend);
+    const uint32_t* put = (const uint32_t*)(vm_base + line_ea);
+    unsigned spin = 1;
+    for (int i = 0; i < RING_WAIT_READS; i++) {
+        for (unsigned k = 0; k < spin; k++) RING_PAUSE();
+        if (RING_PUT_READ(put) != get) return 1;
+        if (loop_yield(ctx, gen)) return 0;
+        spin = spin * 2u < (unsigned)most ? spin * 2u : (unsigned)most;
+    }
+    return 0;
 }
 
 /* ---- SPU_RING_LAZY: a run of commands, written out once at its end -------
@@ -1410,7 +1471,7 @@ RING_NOINLINE int ring_lazy(spu_context* ctx)
         steps += p.steps;
         n++;
         /* 0x4808: the post, written out at the end. 0x4818: back to 0x4618. */
-        if (loop_yield(ctx, gen) || !ring_fetch_take(ctx, &f, 1)) { out = 0; break; }
+        if (loop_yield(ctx, gen) || !ring_fetch_take(ctx, &f, 1, &pend)) { out = 0; break; }
         if (loop_yield(ctx, gen) || !loop_cmd_ok(ctx->ls, &p, sp, v2)) { out = 1; break; }
     }
     /* The last command's post, then (at 0x4730) the last fetch. */
@@ -1485,7 +1546,7 @@ RING_NOINLINE int ring_loop(spu_context* ctx, int mode)
         }
         /* 0x4818: r81 == 0, the branch back to 0x4618. */
         ctx->steps++;
-        if (loop_yield(ctx, gen) || !ring_fetch(ctx)) {
+        if (loop_yield(ctx, gen) || !ring_fetch(ctx, &pend)) {
             ring_put_out(ctx, &pend);
             return 0;
         }
@@ -1496,7 +1557,7 @@ int spu_hook_ring_fetch(spu_context* ctx)
 {
     if (__builtin_expect(g_post_checking, 0)) ring_post_check(ctx);   /* SPU_NATIVE_POST=2 */
     if (__builtin_expect(t_loop.pending, 0)) loop_check_end(ctx);     /* SPU_NATIVE_LOOP=2 */
-    const int took = ring_fetch(ctx);
+    const int took = ring_fetch(ctx, NULL);
     if (__builtin_expect(g_spu_ring_hist_gen != ps3_env_gen || g_spu_ring_hist, 0))
         ring_hist_count(ctx, took);
     if (took) {
