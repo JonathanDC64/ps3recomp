@@ -391,12 +391,16 @@ int gpu_contract_c_run(void)
         gpu_buffer buf;
         gpu_sampler smp;
         gpu_shader sh;
+        gpu_swapchain sc;
         pool.id = 1;
         buf.id = 2;
         smp.id = 3;
         sh.id = 4;
+        sc.id = 5;
         (void)gpu_buffer_create(d, &bd);          CHECK(g_vt_last == VT_buffer_create);
         gpu_shader_destroy(d, sh);                CHECK(g_vt_last == VT_shader_destroy);
+        CHECK(gpu_swap_image_count(d, sc) == 0);  CHECK(g_vt_last == VT_swap_image_count);
+        CHECK(!GPU_VALID(gpu_swap_image(d, sc, 1))); CHECK(g_vt_last == VT_swap_image);
         /* The per-draw device calls through gpu_vt_cmd.h. */
         gpu_fast_table_write_tex(d, pool, 7, NULL); CHECK(g_vt_last == VT_table_write_tex);
         gpu_fast_table_write_sampler(d, pool, 7, smp); CHECK(g_vt_last == VT_table_write_sampler);

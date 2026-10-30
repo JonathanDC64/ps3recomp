@@ -10,15 +10,10 @@
 #   glslang          HLSL -> SPIR-V (the spv target)               BSD-3-Clause and others (its LICENSE.txt)
 #   SPIRV-Cross      SPIR-V -> MSL (the Mac's plan B)              Apache-2.0
 #
-# Only declared here: nothing is downloaded, so a HAL configure fetches nothing that phase 0 does not use. The
-# packages that need them each add a sub-option here and make theirs available under it, for example
-#
-#   option(PS3RECOMP_RSX_HAL_VULKAN "The Vulkan backend (libs/video/gpu/gpu_vk*)" OFF)
-#   if(PS3RECOMP_RSX_HAL_VULKAN)
-#       FetchContent_MakeAvailable(vulkan_headers volk)
-#   endif()
-#
-# and, for the shader compile service's spv and msl targets, spirv_headers, spirv_tools, glslang and spirv_cross
+# Declared here, and downloaded only by the sub-options that use them: PS3RECOMP_RSX_HAL_VULKAN (below) fetches
+# Vulkan-Headers; volk is vendored (third_party/volk), so its declaration is only the pin. The packages still to
+# come add theirs the same way:
+# for the shader compile service's spv and msl targets, spirv_headers, spirv_tools, glslang and spirv_cross
 # (in that order: SPIRV-Tools builds on SPIRV-Headers, and glslang's optimizer on SPIRV-Tools). A build without a
 # network, or with its own copies, names them with FetchContent's own variables, which FetchContent_MakeAvailable
 # honours:
@@ -63,4 +58,23 @@ FetchContent_Declare(spirv_cross
     GIT_TAG f11ba9f0b21ba8fc15153d50a2a1ae31ab1cf8f7   # vulkan-sdk-1.4.363.0
     ${_ps3_gpu_dep_excl})
 
-message(STATUS "  Renderer:     GPU layer dependencies declared (Vulkan SDK 1.4.363.0 pins); none fetched yet")
+message(STATUS "  Renderer:     GPU layer dependencies declared (Vulkan SDK 1.4.363.0 pins)")
+
+# The Vulkan backend (libs/video/gpu/gpu_vk*): on by default on the systems with a Vulkan driver to run it today,
+# Windows and Linux (the Mac's comes later). It builds against the pinned Vulkan-Headers, fetched here, and volk,
+# vendored in third_party/volk at the same pin; it loads the Vulkan library at run time, so nothing is linked.
+# -DFETCHCONTENT_SOURCE_DIR_VULKAN_HEADERS=<a Vulkan-Headers checkout of that commit> builds without the download.
+if(WIN32 OR (UNIX AND NOT APPLE))
+    set(_ps3_gpu_vk_default ON)
+else()
+    set(_ps3_gpu_vk_default OFF)
+endif()
+option(PS3RECOMP_RSX_HAL_VULKAN "The GPU layer's Vulkan backend (libs/video/gpu/gpu_vk*)" ${_ps3_gpu_vk_default})
+if(PS3RECOMP_RSX_HAL_VULKAN)
+    # Only the C headers: not Vulkan-Hpp's C++ modules, tests or install rules.
+    set(VULKAN_HEADERS_ENABLE_MODULE OFF)
+    set(VULKAN_HEADERS_ENABLE_TESTS OFF)
+    set(VULKAN_HEADERS_ENABLE_INSTALL OFF)
+    FetchContent_MakeAvailable(vulkan_headers)
+    message(STATUS "  Renderer:     the GPU layer's Vulkan backend (Vulkan-Headers ${vulkan_headers_SOURCE_DIR})")
+endif()

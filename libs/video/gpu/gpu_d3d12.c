@@ -1663,6 +1663,8 @@ static void* d12_native(gpu_device* d, uint32_t kind, uint64_t handle)
 #define d12_swap_destroy        gpu_d3d12_swap_destroy
 #define d12_swap_resize         gpu_d3d12_swap_resize
 #define d12_swap_acquire        gpu_d3d12_swap_acquire
+#define d12_swap_image_count    gpu_d3d12_swap_image_count
+#define d12_swap_image          gpu_d3d12_swap_image
 #define d12_swap_present        gpu_d3d12_swap_present
 #define d12_swap_stats          gpu_d3d12_swap_stats
 #define d12_swap_hdr            gpu_d3d12_swap_hdr

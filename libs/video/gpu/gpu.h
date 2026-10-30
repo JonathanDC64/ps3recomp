@@ -294,7 +294,8 @@ enum { GPU_QUERY_OCCLUSION = 0, GPU_QUERY_BINARY_OCCLUSION = 1 };
  * -------------------------------------------------------------------------*/
 enum {
     GPU_CAP_GS                  = 1u << 0,    /* geometry shaders (else the vertex-shader clamp) */
-    GPU_CAP_D24S8               = 1u << 1,    /* D24_UNORM_S8_UINT targets (else D32S8) */
+    GPU_CAP_D24S8               = 1u << 1,    /* D24_UNORM_S8_UINT targets (else Vulkan makes the D24S8
+                                               * formats D32S8: the same use, float depth in copies) */
     GPU_CAP_DEPTH_CLAMP         = 1u << 2,    /* depth_clip 0 pipelines */
     GPU_CAP_MIRROR_ONCE         = 1u << 3,    /* GPU_ADDRESS_MIRROR_ONCE */
     GPU_CAP_BORDER              = 1u << 4,    /* GPU_ADDRESS_BORDER, transparent black */
@@ -331,13 +332,16 @@ typedef struct gpu_caps {
  * Descriptions
  * -------------------------------------------------------------------------*/
 
-/* What a buffer or texture is used for. */
+/* What a buffer or texture is used for. A texture is used only as its bits
+ * say. On a buffer they are hints, but for CONSTANT: any buffer may be a
+ * copy's source or destination (upload, readback and host ones always are,
+ * with or without the COPY bits), and Vulkan gives every buffer every use. */
 enum {
     GPU_USE_VERTEX    = 1u << 0,    /* buffers */
     GPU_USE_INDEX     = 1u << 1,
-    GPU_USE_CONSTANT  = 1u << 2,    /* bind_cb */
+    GPU_USE_CONSTANT  = 1u << 2,    /* bind_cb: needed (Vulkan pads the buffer for a whole CB at any offset) */
     GPU_USE_RAW       = 1u << 3,    /* bind_raw: a shader's ByteAddressBuffer */
-    GPU_USE_QUERY     = 1u << 4,    /* query_resolve's destination */
+    GPU_USE_QUERY     = 1u << 4,    /* query_resolve's destination (a hint: any readback buffer will do) */
     GPU_USE_SAMPLED   = 1u << 8,    /* textures */
     GPU_USE_RT        = 1u << 9,    /* a colour target */
     GPU_USE_DS        = 1u << 10,   /* a depth-stencil target */
@@ -401,7 +405,8 @@ typedef struct gpu_footprint {
 typedef struct gpu_box { uint32_t left, top, front, right, bottom, back; } gpu_box;
 /* A rectangle (D3D12_RECT): right and bottom out. */
 typedef struct gpu_rect { int32_t left, top, right, bottom; } gpu_rect;
-/* A viewport (D3D12_VIEWPORT). */
+/* A viewport (D3D12_VIEWPORT), y down. Vulkan takes it as it is: its
+ * shaders flip y instead (the SPIR-V target). */
 typedef struct gpu_viewport { float x, y, width, height, min_depth, max_depth; } gpu_viewport;
 
 /* Views. A colour or depth target view is a gpu_view (gpu_view_get); a
@@ -440,7 +445,9 @@ typedef struct gpu_sampler_desc {
  * entry. Vulkan makes one descriptor set per table up front, so the pool says
  * where its tables are: regions of `tables` tables of `size` entries from
  * `first`. Regions may overlap; a write reaches every table holding the
- * entry. */
+ * entry. A table is a region's first entry plus a multiple of its size
+ * (table_ref gives none elsewhere on Vulkan), and a table slot binds only
+ * tables of its own count (the region's size), from register 0. */
 enum { GPU_TABLE_TEX = 0, GPU_TABLE_SAMPLER = 1 };
 #define GPU_MAX_TABLE_REGIONS 4
 typedef struct gpu_table_region { uint32_t first, tables, size; } gpu_table_region;
@@ -529,7 +536,9 @@ typedef struct gpu_stencil_face {
 /* A pipeline. Zero the whole description before filling it: the backend
  * names the pipeline in its cache by these bytes, with the shaders' code and
  * the layout's contents in place of their handles, as today's code names
- * its pipelines (pso_desc_key). */
+ * its pipelines (pso_desc_key). So what it does not use stays zero (targets
+ * past nrt, stencil faces with stencil_test 0), and the struct has no
+ * padding: keep it so (pad0) when adding fields. */
 typedef struct gpu_pipeline_desc {
     gpu_layout        layout;
     gpu_shader        vs, gs, ps;        /* gs may be none */
@@ -577,7 +586,9 @@ typedef struct gpu_barrier {
     gpu_state   before, after;
 } gpu_barrier;
 
-/* gpu_submit's options. */
+/* gpu_submit's options. The swap chain ones are needed: ACQUIRE_WAIT on the
+ * first submit that touches the image swap_acquire gave, PRESENT_SIGNAL on
+ * the last before swap_present, and the image is used only between the two. */
 enum {
     GPU_SUBMIT_ACQUIRE_WAIT   = 1u << 0,   /* wait for the swap chain's acquired image first */
     GPU_SUBMIT_PRESENT_SIGNAL = 1u << 1,   /* let the next present wait for this work */
@@ -595,7 +606,7 @@ typedef struct gpu_swapchain_desc {
     void*      window;
     uint32_t   width, height;
     gpu_format format;          /* R8G8B8A8_UNORM, or R16G16B16A16_FLOAT for HDR */
-    uint32_t   buffers;         /* images in flight (FRAME_COUNT) */
+    uint32_t   buffers;         /* images in flight (FRAME_COUNT); Vulkan may make more (swap_image_count) */
     uint32_t   colour_space;    /* GPU_COLOR_* */
     uint32_t   flags;           /* GPU_SWAP_* */
 } gpu_swapchain_desc;
@@ -653,7 +664,7 @@ enum {
 };
 typedef struct gpu_device_desc {
     uint32_t flags;       /* GPU_DEVICE_* */
-    uint32_t cmd_slots;   /* command recorders (gpu_cmd_begin's slots) */
+    uint32_t cmd_slots;   /* command recorders (gpu_cmd_begin's slots): 0 for 2, up to 16 */
     uint32_t cap_mask;    /* GPU_CAP_* bits to turn off, to try a fallback (RSX_VK_MASK) */
     uint8_t  luid[8];
 } gpu_device_desc;
@@ -679,9 +690,12 @@ typedef struct gpu_device_desc {
     X(buffer_create,     R, gpu_buffer,     (gpu_device* d, const gpu_buffer_desc* desc), (d, desc)) \
     /* A buffer over the caller's memory (RSX local memory, for the write-back), in COPY_DEST. */ \
     X(buffer_import_host, R, gpu_buffer,    (gpu_device* d, void* host, uint64_t size), (d, host, size)) \
-    /* Freed once the GPU has passed the fence `after` (0: now; the GPU is idle). */ \
+    /* Freed once the GPU has passed the fence `after`, one made after its last use (0: now, \
+     * when the caller has seen a fence after its last use pass: fence_completed, fence_wait \
+     * or wait_idle). The same for every destroy that takes `after`. */ \
     X(buffer_destroy,    V, void,           (gpu_device* d, gpu_buffer b, gpu_fence after), (d, b, after)) \
-    /* The CPU's pointer to it; read_size bytes from read_offset are read (readback). */ \
+    /* The CPU's pointer to it; read_size bytes from read_offset are read (readback: once the \
+     * caller has seen a fence after the GPU's writes pass). */ \
     X(buffer_map,        R, void*,          (gpu_device* d, gpu_buffer b, uint64_t read_offset, uint64_t read_size), (d, b, read_offset, read_size)) \
     /* Ends a map; written_size bytes from written_offset were written. */ \
     X(buffer_unmap,      V, void,           (gpu_device* d, gpu_buffer b, uint64_t written_offset, uint64_t written_size), (d, b, written_offset, written_size)) \
@@ -701,7 +715,8 @@ typedef struct gpu_device_desc {
     X(view_get,          R, gpu_view,       (gpu_device* d, const gpu_view_desc* desc), (d, desc)) \
     /* A sampler, made once per description and kept (cached). */ \
     X(sampler_get,       R, gpu_sampler,    (gpu_device* d, const gpu_sampler_desc* desc), (d, desc)) \
-    /* Tables. The GPU must be done with an entry before it is written. */ \
+    /* Tables. The GPU must be done with an entry before it is written: the caller has seen a \
+     * fence after every submit that used a table holding it pass. */ \
     X(table_pool_create, R, gpu_table_pool, (gpu_device* d, const gpu_table_pool_desc* desc), (d, desc)) \
     /* Puts a texture at index. An empty entry, which reads zero: srv's texture none (an entry \
      * of srv's format, dim and mips), or srv NULL (R8G8B8A8_UNORM, 2D, one mip: today's \
@@ -709,7 +724,8 @@ typedef struct gpu_device_desc {
      * holding this description is left as it is (today's memo). */ \
     X(table_write_tex,   V, void,           (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
     X(table_write_sampler, V, void,         (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
-    /* The table starting at index, for bind_table. On Vulkan index is a table's first entry. */ \
+    /* The table starting at index, for bind_table: a table's first entry (the regions above; \
+     * Vulkan gives none for any other index). */ \
     X(table_ref,         R, gpu_table,      (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \
     /* The compile service's hook for this device's shader target. request and result are \
      * gpu_shader.h's; opaque here. Returns nonzero on success. Thread-safe. */ \
@@ -727,7 +743,8 @@ typedef struct gpu_device_desc {
     X(pipeline_cache_load, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(pipeline_cache_save, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(query_pool_create, R, gpu_query_pool, (gpu_device* d, uint32_t type, uint32_t count), (d, type, count)) \
-    /* Starts recording on a slot (0 to cmd_slots - 1) the GPU has finished with. */ \
+    /* Starts recording on a slot (0 to cmd_slots - 1) the GPU has finished with: the caller \
+     * has seen a fence after the slot's last submit pass. */ \
     X(cmd_begin,         R, gpu_cmd*,       (gpu_device* d, uint32_t slot), (d, slot)) \
     X(cmd_end,           V, void,           (gpu_device* d, gpu_cmd* c), (d, c)) \
     /* Runs n ended recorders in order; a fence for them with GPU_SUBMIT_SIGNAL, else 0. */ \
@@ -744,13 +761,24 @@ typedef struct gpu_device_desc {
     X(swap_destroy,      V, void,           (gpu_device* d, gpu_swapchain sc), (d, sc)) \
     /* New size or format (ResizeBuffers). The GPU must be idle and the images unused. 0 on success. */ \
     X(swap_resize,       R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t height, gpu_format format), (d, sc, width, height, format)) \
-    /* The image to draw next and its index; it starts in GPU_STATE_PRESENT. */ \
+    /* The image to draw next and its index (below swap_image_count); it starts in GPU_STATE_PRESENT. \
+     * Its size is the window's on Vulkan (the surface's); a minimized window gives none. */ \
     X(swap_acquire,      R, uint32_t,       (gpu_device* d, gpu_swapchain sc, gpu_texture* image), (d, sc, image)) \
+    /* The swap chain's images: D3D12 has the buffers asked; Vulkan at least that many (the driver \
+     * may make more), so arrays by image index take this count, not FRAME_COUNT. Changes only \
+     * with swap_resize. */ \
+    X(swap_image_count,  R, uint32_t,       (gpu_device* d, gpu_swapchain sc), (d, sc)) \
+    /* Image index, the texture swap_acquire hands back with that index (none past the count): \
+     * for making every image's view up front. Valid until the next swap_resize or swap_destroy. */ \
+    X(swap_image,        R, gpu_texture,    (gpu_device* d, gpu_swapchain sc, uint32_t index), (d, sc, index)) \
     /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). 0 on success. */ \
     X(swap_present,      R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags), (d, sc, interval, flags)) \
-    /* 0 with *out filled; else nonzero (no statistics yet). */ \
+    /* 0 with *out filled; else nonzero (no statistics yet). Vulkan has them with \
+     * GPU_CAP_PRESENT_WAIT: the last present seen on the display, sync_qpc when it was seen, \
+     * no refresh counts. */ \
     X(swap_stats,        R, int,            (gpu_device* d, gpu_swapchain sc, gpu_present_stats* out), (d, sc, out)) \
-    /* The colour space (GPU_COLOR_*) and, when not NULL, HDR10 metadata. 1 if the display took it. */ \
+    /* The colour space (GPU_COLOR_*) and, when not NULL, HDR10 metadata. 1 if the display took it. \
+     * On Vulkan a new colour space makes the swap chain again: as for swap_resize. */ \
     X(swap_hdr,          R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t colour_space, const gpu_hdr_metadata* meta), (d, sc, colour_space, meta)) \
     /* On a lost device, prints what the API says of where the GPU was (DRED, device fault). */ \
     X(fault_report,      V, void,           (gpu_device* d, const char* where), (d, where)) \
