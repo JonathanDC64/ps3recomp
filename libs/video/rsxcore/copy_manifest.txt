@@ -680,3 +680,25 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   subvp_capture (rsxc_state.inc 704-715) still makes it; the menu renderer
 #   still gets the device, the queue and the swap chain's buffers as native
 #   objects (rc_device, rc_queue, rc_back_buffer, the overlay's frame).
+
+# Step C8a: the core holds no native object. Every field, local and
+# parameter that held an ID3D12* or IDXGI* object holds the GPU layer's
+# handle it was borrowed from, and nothing is borrowed through gpu_native but
+# the menu's exports (rsxc_api.inc). The regions below are no longer verbatim
+# at these legacy lines: a fix there needs a hand port.
+#  Removed, not converted: the pass of the draws recorded without a vertex
+#   program and the font atlas it sampled. No capture draws through them:
+#   with base11 the gate's legacy column is "none" on capset0 (warm and
+#   cold), capsetk and capsetaa (no DRAWPRINT line names a legacy draw), and
+#   no replay log says "atlas uploaded". Gone are:
+#   rsx_d3d12_backend.c 198-199 (D3D12DrawRecord.textured), 487-491, 499,
+#   513-523 but 516 (the root signature, the triangle, line, point and atlas
+#   pipelines, vb_view, the atlas's texture, upload buffer and state),
+#   2481 (init's hr), 2725-2979 (their root signature, shaders and
+#   pipelines; draws record from there on, pipeline_ready = 1), 3047-3050
+#   (vb_view), 9591-9606 (topo_to_d3d), 11233-11317 (the atlas upload),
+#   11787-11893 (the pass), 15082, 15157, 15216, 15303, 15434 (textured),
+#   15582-15586 and 15653-15665 (a B8 texture recorded as the atlas),
+#   15850-15852 and 15855 (their Releases). The VP pass's base pipeline
+#   (11902-11907) is the colour PS's, the atlas PS's when there is none, as
+#   it was with no atlas uploaded.

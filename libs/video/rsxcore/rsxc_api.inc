@@ -112,10 +112,6 @@ static void rc_backend_shutdown(void)
     s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
     s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
     s_rc_vf_buf.id = s_rc_readback_buf.id = s_rc_ring_old[0].id = s_rc_ring_old[1].id = 0;
-    if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
-    if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
-    if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
-    if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     /* The passes' root signatures and pipelines are the GPU layer's (step
      * C3b): borrowed, and gpu_destroy frees them, so the releases below find
      * NULL. */

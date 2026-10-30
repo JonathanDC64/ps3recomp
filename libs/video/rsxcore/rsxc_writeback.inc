@@ -797,22 +797,6 @@ static void screen_copy_capture(u32 fi)
 
 }
 
-/* rsx_topology -> D3D_PRIMITIVE_TOPOLOGY. Spelled out rather than relying on
- * the two enums happening to agree: the draw record carries the neutral value
- * so a second backend can read it, and this is the one place it becomes a D3D
- * one. */
-static D3D12_PRIMITIVE_TOPOLOGY topo_to_d3d(u32 t)
-{
-    switch (t) {
-    case RSX_TOPOLOGY_POINTS:         return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-    case RSX_TOPOLOGY_LINES:          return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-    case RSX_TOPOLOGY_LINE_STRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-    case RSX_TOPOLOGY_TRIANGLE_STRIP: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-    case RSX_TOPOLOGY_TRIANGLES:      return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    default:                          return D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    }
-}
-
 /* GCM_GUEST_FB=<off>,<w>,<h>,<pitch> -- present the guest display buffer.
  *
  * A title that composites its final image with the RSX 2D engine assembles it

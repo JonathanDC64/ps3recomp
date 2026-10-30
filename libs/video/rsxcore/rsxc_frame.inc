@@ -63,92 +63,6 @@ static void render_frame(void)
     /* Reset command allocator and list */
     frame_cmd_begin(fi);
 
-    /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
-     * The atlas is a linear 8-bit coverage map, so a straight row copy (no
-     * deswizzle) suffices. It is a DYNAMIC glyph cache -- the game rasterizes
-     * new glyphs into it over time -- so re-upload whenever it is dirty (set on
-     * every bind), not just once. Uploading only on first bind left every glyph
-     * added after frame 1 sampling stale texels -> torn text. The backend is
-     * synchronous (wait_for_gpu each frame), so recreating the resource per
-     * dirty frame is safe. */
-    if (s_d3d.tex_bound && (!s_d3d.tex_ready || s_d3d.tex_dirty) && s_d3d.srv_heap && s_d3d.pipeline_state_tex) {
-        extern uint8_t* vm_base;
-        u32 w = s_d3d.tex_w, h = s_d3d.tex_h;
-        u32 pitch = (w + 255) & ~255u;   /* D3D12 requires 256-byte row pitch */
-
-        if (s_d3d.tex_resource) { s_d3d.tex_resource->lpVtbl->Release(s_d3d.tex_resource); s_d3d.tex_resource = NULL; }
-        if (s_d3d.tex_upload)   { s_d3d.tex_upload->lpVtbl->Release(s_d3d.tex_upload);     s_d3d.tex_upload = NULL; }
-
-        D3D12_HEAP_PROPERTIES hp_def = {0}; hp_def.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC td = {0};
-        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
-        td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
-        td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        HRESULT thr = d3d_create_committed(
-            s_d3d.device, &hp_def, D3D12_HEAP_FLAG_NONE, &td,
-            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&s_d3d.tex_resource);
-
-        D3D12_HEAP_PROPERTIES hp_up = {0}; hp_up.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC ud = {0};
-        ud.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        ud.Width = (u64)pitch * h; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
-        ud.SampleDesc.Count = 1; ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (SUCCEEDED(thr))
-            thr = d3d_create_committed(
-                s_d3d.device, &hp_up, D3D12_HEAP_FLAG_NONE, &ud,
-                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&s_d3d.tex_upload);
-
-        if (SUCCEEDED(thr) && vm_base) {
-            void* mapped = NULL;
-            D3D12_RANGE nr = {0, 0};
-            if (SUCCEEDED(s_d3d.tex_upload->lpVtbl->Map(s_d3d.tex_upload, 0, &nr, &mapped)) && mapped) {
-                const u8* srcbase = vm_base + s_d3d.tex_src_offset;
-                for (u32 y = 0; y < h; y++)
-                    memcpy((u8*)mapped + (u64)y * pitch, srcbase + (u64)y * w, w);
-                s_d3d.tex_upload->lpVtbl->Unmap(s_d3d.tex_upload, 0, NULL);
-
-                D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
-                dst.pResource = s_d3d.tex_resource;
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                dst.SubresourceIndex = 0;
-                src.pResource = s_d3d.tex_upload;
-                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                src.PlacedFootprint.Offset = 0;
-                src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8_UNORM;
-                src.PlacedFootprint.Footprint.Width    = w;
-                src.PlacedFootprint.Footprint.Height   = h;
-                src.PlacedFootprint.Footprint.Depth    = 1;
-                src.PlacedFootprint.Footprint.RowPitch = pitch;
-                s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
-
-                D3D12_RESOURCE_BARRIER tb = {0};
-                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                tb.Transition.pResource   = s_d3d.tex_resource;
-                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                tb.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &tb);
-
-                D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-                sv.Format = DXGI_FORMAT_R8_UNORM;
-                sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                sv.Texture2D.MipLevels = 1;
-                D3D12_CPU_DESCRIPTOR_HANDLE sh;
-                s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-                s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.tex_resource, &sv, sh);
-
-                s_d3d.tex_ready = 1;
-                s_d3d.tex_dirty = 0;   /* content now in sync with guest atlas */
-                { static int _au = 0; if (_au < 3 && ++_au)
-                    printf("[D3D12] atlas uploaded (%ux%u R8) -> textured\n", w, h); }
-            }
-        }
-    }
-
     /* Frames with no ops (init/boot presents) don't count against the cap --
      * PNG-decode-heavy titles burn hundreds of empty presents before the first
      * real draw. */
@@ -610,113 +524,8 @@ rtt_dump_done:;
     gpu_cmd_set_viewport(rc, &viewport);
     gpu_cmd_set_scissor(rc, &scissor);
 
-    /* Bind pipeline state and push MVP if anything to draw */
-    if (s_d3d.pipeline_ready && s_d3d.draw_count > 0) {
-        s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(s_d3d.cmd_list, s_d3d.root_signature);
-        s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &s_d3d.vb_view);
-
-        /* Make the atlas SRV heap current and bind its table (t0) for textured
-         * draws. Safe to set even if no draw is textured. */
-        if (s_d3d.tex_ready && s_d3d.srv_heap) {
-            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
-            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
-            D3D12_GPU_DESCRIPTOR_HANDLE gh;
-            s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
-            s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
-        }
-
-        /* Push the MVP matrix from RSX vertex constants slots 0..3.
-         * If the game hasn't written any constants (e.g. placeholder data
-         * already in clip space), fall back to identity. */
-        float mvp[16];
-        const rsx_state* st = s_d3d.current_rsx_state;
-        int have_mvp = 0;
-        if (st) {
-            for (u32 r = 0; r < 4; r++) {
-                for (u32 c = 0; c < 4; c++) {
-                    float v = st->vertex_constants[r][c];
-                    mvp[r * 4 + c] = v;
-                    if (v != 0.0f) have_mvp = 1;
-                }
-            }
-        }
-        if (!have_mvp) {
-            memset(mvp, 0, sizeof(mvp));
-            mvp[0] = mvp[5] = mvp[10] = mvp[15] = 1.0f; /* identity */
-        }
-        s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstants(
-            s_d3d.cmd_list, 0 /*root param 0*/, 16, mvp, 0);
-
-        /* D3D12_IQ=1: dump exactly what the GPU is about to see -- the MVP root
-         * constants and the first uploaded host vertices. The legacy path draws
-         * with no validation errors yet produces zero pixels, so the geometry
-         * must be degenerate/off-screen post-VS. */
-        { static int _vd = -1;
-          if (_vd < 0) { const char* e = getenv("D3D12_IQ"); _vd = e ? 1 : 0; }
-          static int _n = 0;
-          if (_vd && _n < 3) {
-            _n++;
-            fprintf(stderr, "[D3D12-DBG] have_mvp=%d draw_count=%u vb_offset=%u\n",
-                    have_mvp, s_d3d.draw_count, s_d3d.vb_offset);
-            fprintf(stderr, "[D3D12-DBG] mvp rows: [%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]"
-                            "[%.2f %.2f %.2f %.2f][%.2f %.2f %.2f %.2f]\n",
-                    mvp[0],mvp[1],mvp[2],mvp[3], mvp[4],mvp[5],mvp[6],mvp[7],
-                    mvp[8],mvp[9],mvp[10],mvp[11], mvp[12],mvp[13],mvp[14],mvp[15]);
-            if (s_d3d.vb_mapped) {
-                /* host vertex = 9 floats (pos3 + col4 + uv2), VERTEX_STRIDE=36 */
-                const float* bv = (const float*)s_d3d.vb_mapped;
-                for (int k = 0; k < 3; k++) {
-                    const float* v = bv + k * 9;
-                    fprintf(stderr, "[D3D12-DBG]  hostvert[%d] pos=(%.3f,%.3f,%.3f) col=(%.2f,%.2f,%.2f,%.2f)\n",
-                            k, v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
-                }
-            }
-            for (u32 d = 0; d < s_d3d.draw_count && d < 3; d++) {
-                const D3D12DrawRecord* dr = &s_d3d.draws[d];
-                fprintf(stderr, "[D3D12-DBG]  draw[%u] is_vp=%d is_clear=%d topo=%u cnt=%u vbofs=%u startv=%u rt=%u\n",
-                        d, dr->is_vp, dr->is_clear, dr->topology, dr->vertex_count,
-                        dr->vb_byte_offset, dr->vb_byte_offset / VERTEX_STRIDE, dr->rt_off);
-            }
-            fflush(stderr);
-          } }
-
-        /* Replay each recorded draw with its own primitive topology and
-         * the matching PSO class (triangle / line / point). The PSO class
-         * must match the topology or D3D12 rejects the draw. */
-        u32 last_topo = 0xFFFFFFFFu;
-        ID3D12PipelineState* last_pso = NULL;
-        u32 draws = s_d3d.draw_count;
-        if (draws > MAX_DRAWS) draws = MAX_DRAWS;
-        for (u32 d = 0; d < draws; d++) {
-            const D3D12DrawRecord* dr = &s_d3d.draws[d];
-            if (dr->is_vp) continue; /* drawn by the VP pass below */
-
-            /* Select PSO: textured triangles (dbgfont) use the atlas PSO;
-             * otherwise pick by topology class. */
-            ID3D12PipelineState* target_pso = s_d3d.pipeline_state; /* default triangle */
-            if (dr->textured && s_d3d.tex_ready && s_d3d.pipeline_state_tex) {
-                target_pso = s_d3d.pipeline_state_tex;
-            } else if (dr->topology == RSX_TOPOLOGY_POINTS) {
-                target_pso = s_d3d.pipeline_state_points
-                             ? s_d3d.pipeline_state_points : s_d3d.pipeline_state;
-            } else if (dr->topology == RSX_TOPOLOGY_LINES ||
-                       dr->topology == RSX_TOPOLOGY_LINE_STRIP) {
-                target_pso = s_d3d.pipeline_state_lines
-                             ? s_d3d.pipeline_state_lines : s_d3d.pipeline_state;
-            }
-            if (target_pso != last_pso) {
-                s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, target_pso);
-                last_pso = target_pso;
-            }
-            if (dr->topology != last_topo) {
-                s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, topo_to_d3d(dr->topology));
-                last_topo = dr->topology;
-            }
-            u32 start_vert = dr->vb_byte_offset / VERTEX_STRIDE;
-            s_d3d.cmd_list->lpVtbl->DrawInstanced(
-                s_d3d.cmd_list, dr->vertex_count, 1, start_vert, 0);
-        }
-    }
+    /* (The pass of the draws recorded without a vertex program, and the font
+     * atlas it sampled, are gone: step C8a. No capture draws through them.) */
 
     RF_CP(5);
     /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
@@ -725,11 +534,10 @@ rtt_dump_done:;
         int any = 0;
         for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++)
             if (s_d3d.draws[d].is_vp) { any = 1; break; }
-        /* Textured geometry (dbgfont atlas) uses the sampling PS; untextured 3D
-         * (vkcube) uses the colour-only PS. Fall back to whichever exists. */
-        gpu_pipeline vpso =
-            RC_PIPE((s_d3d.tex_ready && s_d3d.pipeline_state_vp) ? s_d3d.pipeline_state_vp
-                                                                 : s_d3d.pipeline_state_vp_color);
+        /* The colour-only PS (untextured 3D, vkcube); the atlas's sampling PS
+         * when there is none. (With no atlas upload, step C8a, there is no
+         * atlas for that PS to sample.) */
+        gpu_pipeline vpso = RC_PIPE(s_d3d.pipeline_state_vp_color);
         if (!vpso.v) vpso = RC_PIPE(s_d3d.pipeline_state_vp);
         { static int cap = -1, n = 0;
           PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));

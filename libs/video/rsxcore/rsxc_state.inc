@@ -42,9 +42,9 @@ typedef struct {
     u32 index_count;    /* VP: > 0 = indexed, index_count indices from vp_ib at
                          * ib_first, numbered from this draw's first vertex */
     u32 ib_first;
-    u32 topology;       /* rsx_topology (NOT a D3D value; see topo_to_d3d) */
-    int textured;       /* 1 = sample the bound font/atlas texture (dbgfont) */
-    int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4) */
+    u32 topology;       /* rsx_topology (NOT a D3D value) */
+    int is_vp;          /* 1 = real VP path: vb_byte_offset indexes vp_vb (float4).
+                         * 0: not drawn (that pass is gone, step C8a) */
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
@@ -341,23 +341,16 @@ typedef struct {
     u64          fence_values[FRAME_COUNT];
     u32          frame_index;
 
-    /* Pipeline */
-    ID3D12RootSignature*  root_signature;
-    ID3D12PipelineState*  pipeline_state;         /* triangle class — default */
-    ID3D12PipelineState*  pipeline_state_lines;   /* line class */
-    ID3D12PipelineState*  pipeline_state_points;  /* point class */
-
     /* Depth/stencil */
     ID3D12DescriptorHeap* dsv_heap;
     ID3D12Resource*       depth_buffer;
 
     /* Dynamic vertex buffer (upload heap) */
     ID3D12Resource*       vertex_buffer;
-    D3D12_VERTEX_BUFFER_VIEW vb_view;
     void*                 vb_mapped;      /* persistently mapped */
     u32                   vb_offset;      /* current write position */
 
-    int                   pipeline_ready; /* 1 if root sig + PSO created */
+    int                   pipeline_ready; /* 1 once init is far enough for draws to record */
 
     /* Debug: copy the presented backbuffer to disk as BMP for the first N
      * frames (enabled by env CELLMARK_DUMP). Lets us verify what actually
@@ -367,17 +360,9 @@ typedef struct {
     int                   dump_frames_left;
     int                   dump_skip_left;   /* CELLMARK_DUMP_SKIP: presents to ignore first */
 
-    /* Textured pipeline (dbgfont / 2D atlas quads). The font atlas is an 8-bit
-     * coverage texture uploaded as R8_UNORM and sampled in the pixel shader. */
-    ID3D12PipelineState*  pipeline_state_tex;   /* triangle + texture + blend */
+    /* (The font atlas's pipeline, texture and state are gone with the pass of
+     * the draws without a vertex program: step C8a.) */
     ID3D12DescriptorHeap* srv_heap;             /* shader-visible, 1 SRV slot  */
-    ID3D12Resource*       tex_resource;         /* current atlas texture       */
-    ID3D12Resource*       tex_upload;           /* staging buffer for uploads  */
-    u32                   tex_w, tex_h;         /* dims of tex_resource         */
-    int                   tex_ready;            /* 1 once an atlas is uploaded  */
-    u32                   tex_src_offset;       /* guest RSX offset of atlas    */
-    int                   tex_bound;            /* a texture is bound for draws */
-    int                   tex_dirty;            /* re-upload needed this frame  */
 
     /* Real RSX vertex-program path: the captured VP is decompiled to HLSL and
      * used as the vertex shader, fed the raw float4 attrib0 + the vp_c[]
