@@ -31,9 +31,18 @@
 
 uint8_t* vm_base = NULL;
 
+#if defined(PS3RECOMP_RSX_HAL)
+/* Built with the portable renderer: RSX_BACKEND picks the renderer the
+ * capture plays through (rsx_out.h). */
+#include "rsx_out.h"
+#define rsx_d3d12_backend_init          rsx_out_backend_init
+#define rsx_d3d12_backend_present       rsx_out_backend_present
+#define rsx_d3d12_backend_pump_messages rsx_out_backend_pump_messages
+#else
 int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 void rsx_d3d12_backend_present(void);
 int  rsx_d3d12_backend_pump_messages(void);
+#endif
 int  cellGcm_replay_load(const char* file, uint32_t** methods);
 void cellGcm_replay_reset(void);
 void cellGcm_replay_method(uint32_t mfull, uint32_t data);
