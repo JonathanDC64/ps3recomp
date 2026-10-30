@@ -518,6 +518,64 @@ static struct {
     u32 x[16];                    /* the records' x, slot by slot */
 } s_fx;
 static u64 s_vp_iwant = 0;
+/* Step C2: the buffers are the GPU layer's. The fixed-function vertex buffer,
+ * the per-draw rings (vp_vb, vp_ib, vp_cb, vp_fpcb, vf_buf) and the dump's
+ * readback buffer are gpu_buffer_create's; upload ones are mapped once, for
+ * their life. The native fields beside them hold the same buffers, borrowed
+ * (gpu_native), for the binds and copies not converted yet: never Released
+ * by the core. Their GPU addresses are gpu_buffer_addr's (per draw
+ * gpu_fast_buffer_addr's) plus today's offsets. */
+static gpu_buffer s_rc_vertex_buf;     /* s_d3d.vertex_buffer */
+static gpu_buffer s_rc_vp_vb;          /* s_d3d.vp_vb */
+static gpu_buffer s_rc_vp_ib;          /* s_d3d.vp_ib */
+static gpu_buffer s_rc_vp_cb;          /* s_d3d.vp_cb */
+static gpu_buffer s_rc_vp_fpcb;        /* s_d3d.vp_fpcb */
+static gpu_buffer s_rc_vf_buf;         /* s_d3d.vf_buf */
+static gpu_buffer s_rc_readback_buf;   /* s_d3d.readback_buf */
+/* The rings vp_vb_grow and vp_ib_grow replaced ([0] vp_vb, [1] vp_ib), with
+ * the frame slot that last drew from each: destroyed with that frame's fence
+ * at the next render_frame's start (rc_ring_release), where today's deferred
+ * release let them go. */
+static gpu_buffer s_rc_ring_old[2];
+static u32        s_rc_ring_old_slot[2];
+
+/* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
+ * GPU_MEM_READBACK (COPY_DEST) memory, as *b, its resource borrowed in *res
+ * and, with map, its pointer for life in *map (NULL if the map failed). 0
+ * when none could be made. */
+static int rc_buf_make(u64 bytes, u32 use, u32 memory, gpu_buffer* b, ID3D12Resource** res, void** map)
+{
+    gpu_buffer_desc bd;
+    memset(&bd, 0, sizeof bd);
+    bd.size = bytes;
+    bd.use = use;
+    bd.memory = memory;
+    bd.state = memory == GPU_MEM_READBACK ? GPU_STATE_COPY_DEST : GPU_STATE_GENERIC_READ;
+    *b = gpu_buffer_create(s_rc_dev, &bd);
+    *res = GPU_VALID(*b) ? (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, b->id) : NULL;
+    if (map) *map = *res ? gpu_buffer_map(s_rc_dev, *b, 0, 0) : NULL;
+    return *res != NULL;
+}
+
+/* Ring i's buffer, replaced while this frame is recorded (one growth per
+ * frame): it goes once the GPU is past this frame. */
+static void rc_ring_retire(int i, gpu_buffer old)
+{
+    if (!GPU_VALID(old)) return;
+    s_rc_ring_old[i] = old;
+    s_rc_ring_old_slot[i] = s_d3d.frame_index;
+}
+
+/* At render_frame's start, after its wait: the rings the last frame replaced,
+ * each with the fence of the frame that drew from it (passed by now). */
+static void rc_ring_release(void)
+{
+    for (int i = 0; i < 2; i++) {
+        if (!GPU_VALID(s_rc_ring_old[i])) continue;
+        gpu_buffer_destroy(s_rc_dev, s_rc_ring_old[i], s_rc_frame_fence[s_rc_ring_old_slot[i]]);
+        s_rc_ring_old[i].id = 0;
+    }
+}
 /* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
  * vertices fetched from guest memory, vertices written to the upload heap,
  * uploads by primitive, and the mean enabled-attribute count per fetch. */

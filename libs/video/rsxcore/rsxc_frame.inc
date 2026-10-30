@@ -34,6 +34,7 @@ static void render_frame(void)
     rsx_scale_apply();
     hdr_batch_start();           /* the targets HDR promotes in this batch */
     off_rt_release_deferred();   /* RT resources the previous frame dropped */
+    rc_ring_release();           /* the rings it outgrew (step C2) */
     tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);
 
@@ -55,18 +56,8 @@ static void render_frame(void)
     /* Lazily create the readback buffer the first time a dump is requested. */
     if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.host_w * 4 + 255) & ~255u;
-        D3D12_HEAP_PROPERTIES hp = {0};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC rd = {0};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = (u64)s_d3d.readback_pitch * s_d3d.host_h;
-        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-        rd.SampleDesc.Count = 1;
-        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        d3d_create_committed(
-            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-            D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&s_d3d.readback_buf);
+        rc_buf_make((u64)s_d3d.readback_pitch * s_d3d.host_h, GPU_USE_COPY_DST, GPU_MEM_READBACK,
+                    &s_rc_readback_buf, &s_d3d.readback_buf, NULL);   /* (step C2) */
     }
 
     /* Reset command allocator and list */
@@ -766,7 +757,7 @@ rtt_dump_done:;
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_vp_topo_strip = 0;
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
-                s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
+                gpu_buffer_addr(s_rc_dev, s_rc_vp_cb));
             ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.samp_heap };
             s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, s_d3d.samp_heap ? 2 : 1, heaps);
             vp_bind_sampler_table(NULL);
@@ -774,14 +765,14 @@ rtt_dump_done:;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
             D3D12_VERTEX_BUFFER_VIEW vbv;
-            vbv.BufferLocation = s_d3d.vp_vb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_vb)
+            vbv.BufferLocation = gpu_buffer_addr(s_rc_dev, s_rc_vp_vb)
                                + (u64)s_d3d.vp_parity * s_vp_cap * 256;
             vbv.SizeInBytes    = s_vp_cap * 256;
             vbv.StrideInBytes  = 256;   /* 16 float4 attrib slots */
             s_d3d.cmd_list->lpVtbl->IASetVertexBuffers(s_d3d.cmd_list, 0, 1, &vbv);
             if (s_d3d.vp_ib) {
                 D3D12_INDEX_BUFFER_VIEW ibv;
-                ibv.BufferLocation = s_d3d.vp_ib->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_ib)
+                ibv.BufferLocation = gpu_buffer_addr(s_rc_dev, s_rc_vp_ib)
                                    + (u64)s_d3d.vp_parity * s_vp_icap * 4;
                 ibv.SizeInBytes    = s_vp_icap * 4;
                 ibv.Format         = DXGI_FORMAT_R32_UINT;
@@ -789,7 +780,7 @@ rtt_dump_done:;
             }
             if (s_d3d.vf_buf)
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootShaderResourceView(s_d3d.cmd_list, 4,
-                    s_d3d.vf_buf->lpVtbl->GetGPUVirtualAddress(s_d3d.vf_buf)
+                    gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
                     + (u64)s_d3d.vp_parity * s_vf_cap);
             D3D12_GPU_DESCRIPTOR_HANDLE gh_base;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh_base);
@@ -843,7 +834,7 @@ rtt_dump_done:;
                         cl->lpVtbl->SetGraphicsRootSignature(cl, s_d3d.vp_root_sig);
                         if (s_d3d.vf_buf)
                             cl->lpVtbl->SetGraphicsRootShaderResourceView(cl, 4,
-                                s_d3d.vf_buf->lpVtbl->GetGPUVirtualAddress(s_d3d.vf_buf)
+                                gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
                                 + (u64)s_d3d.vp_parity * s_vf_cap);
                         cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                         s_vp_topo_strip = 0;
@@ -1134,11 +1125,11 @@ rtt_dump_done:;
                 vp_bind_sampler_table(dr);
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
-                    s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
+                    gpu_fast_buffer_addr(s_rc_dev, s_rc_vp_cb)
                     + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->vcb_slot) * VP_CB_STRIDE);
                 if (s_d3d.vp_fpcb)
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 2,
-                        s_d3d.vp_fpcb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_fpcb)
+                        gpu_fast_buffer_addr(s_rc_dev, s_rc_vp_fpcb)
                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
                  * the target they are aimed at. A zero vertex count, or a start
@@ -1392,6 +1383,7 @@ rtt_dump_done:;
      * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
      * the console's setenv can save one target after another in a live run. */
     static ID3D12Resource* s_rtsave_buf = NULL;
+    static gpu_buffer s_rtsave_b;   /* step C2: s_rtsave_buf's buffer (s_rtsave_buf is borrowed) */
     static u64 s_rtsave_cap = 0;
     static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
     static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi, s_rtsave_off;
@@ -1431,20 +1423,11 @@ rtt_dump_done:;
             fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
                     rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
                     (unsigned long long)((u64)pitch * r->hh));
-            if (s_rtsave_buf && s_rtsave_cap < (u64)pitch * r->hh) {
-                s_rtsave_buf->lpVtbl->Release(s_rtsave_buf); s_rtsave_buf = NULL; }
+            if (s_rtsave_buf && s_rtsave_cap < (u64)pitch * r->hh) {   /* (GPU idle: render_frame's wait) */
+                gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; s_rtsave_buf = NULL; }
             if (!s_rtsave_buf) {
                 s_rtsave_cap = (u64)pitch * r->hh;
-                D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
-                D3D12_RESOURCE_DESC rd = {0};
-                rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                rd.Width = (u64)pitch * r->hh; rd.Height = 1; rd.DepthOrArraySize = 1;
-                rd.MipLevels = 1; rd.SampleDesc.Count = 1;
-                rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                d3d_create_committed(
-                    s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
-                    D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-                    &IID_ID3D12Resource, (void**)&s_rtsave_buf);
+                rc_buf_make(s_rtsave_cap, GPU_USE_COPY_DST, GPU_MEM_READBACK, &s_rtsave_b, &s_rtsave_buf, NULL);
             }
             if (!s_rtsave_buf) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
             if (s_rtsave_buf) {
@@ -1682,8 +1665,8 @@ skip_dump_consider: ;
         if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
                         wait_for_gpu();
                         if (perf_on()) s_perf_gpu += perf_now() - _g; }
-        void* mp = NULL; D3D12_RANGE rr = {0, (SIZE_T)s_rtsave_pitch * s_rtsave_h};
-        if (SUCCEEDED(s_rtsave_buf->lpVtbl->Map(s_rtsave_buf, 0, &rr, &mp)) && mp) {
+        void* mp = gpu_buffer_map(s_rc_dev, s_rtsave_b, 0, (u64)s_rtsave_pitch * s_rtsave_h);
+        if (mp) {
             FILE* f = fopen(_rtname, "wb");
             if (f) {
                 u32 w = s_rtsave_w, h = s_rtsave_h;
@@ -1753,7 +1736,7 @@ skip_dump_consider: ;
                 fclose(f);
                 printf("[D3D12] wrote %s (%ux%u dxgi=%u)\n", _rtname, w, h, s_rtsave_dxgi);
             }
-            s_rtsave_buf->lpVtbl->Unmap(s_rtsave_buf, 0, NULL);
+            gpu_buffer_unmap(s_rc_dev, s_rtsave_b, 0, s_rtsave_cap);   /* (today's NULL range: all of it) */
         }
         s_rtsave_state = 0;
     }

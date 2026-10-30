@@ -102,10 +102,14 @@ static void rc_backend_shutdown(void)
     if (s_wbg.buf)  { s_wbg.buf->lpVtbl->Release(s_wbg.buf);   s_wbg.buf = NULL; }
     if (s_wbg.heap) { s_wbg.heap->lpVtbl->Release(s_wbg.heap); s_wbg.heap = NULL; }
     s_wbg.state = -1;
-    if (s_d3d.vertex_buffer) {
-        s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);
-        s_d3d.vertex_buffer->lpVtbl->Release(s_d3d.vertex_buffer);
-    }
+    /* Step C2: the buffers are the GPU layer's and go with gpu_destroy; the
+     * pointers to them and into them were borrowed. */
+    s_d3d.vertex_buffer = s_d3d.vp_vb = s_d3d.vp_ib = s_d3d.vp_cb = s_d3d.vp_fpcb = NULL;
+    s_d3d.vf_buf = s_d3d.readback_buf = NULL;
+    s_d3d.vb_mapped = s_d3d.vp_vb_mapped = s_d3d.vp_ib_mapped = NULL;
+    s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
+    s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
+    s_rc_vf_buf.id = s_rc_readback_buf.id = s_rc_ring_old[0].id = s_rc_ring_old[1].id = 0;
     if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);

@@ -554,7 +554,8 @@ static void rsx_scale_apply(void)
     for (int i = 0; i < SUBVP_SLOTS; i++) rc_tex_drop(&s_subvp[i].tex);   /* step C4 */
     off_rt_defer_release(s_screen_copy);      s_screen_copy = NULL;
     rc_tex_drop(&s_rc_screen_copy_tex);   /* step C4 */
-    off_rt_defer_release(s_d3d.readback_buf); s_d3d.readback_buf = NULL;
+    gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
+    s_d3d.readback_buf = NULL;
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;
         rc_tex_drop(&s_rc_rt_tex[i]);   /* step C4 */

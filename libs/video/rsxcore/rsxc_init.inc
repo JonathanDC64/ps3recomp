@@ -510,28 +510,10 @@ static int init_d3d12(u32 width, u32 height)
      * Create dynamic vertex buffer (upload heap, 4MB)
      * ---------------------------------------------------------------*/
     {
-        D3D12_HEAP_PROPERTIES heap_props = {0};
-        heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
-
-        D3D12_RESOURCE_DESC buf_desc = {0};
-        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buf_desc.Width = MAX_VERTICES * VERTEX_STRIDE;
-        buf_desc.Height = 1;
-        buf_desc.DepthOrArraySize = 1;
-        buf_desc.MipLevels = 1;
-        buf_desc.SampleDesc.Count = 1;
-        buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        hr = d3d_create_committed(
-            s_d3d.device, &heap_props, D3D12_HEAP_FLAG_NONE,
-            &buf_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void**)&s_d3d.vertex_buffer);
-        if (SUCCEEDED(hr)) {
-            D3D12_RANGE read_range = {0, 0};
-            s_d3d.vertex_buffer->lpVtbl->Map(
-                s_d3d.vertex_buffer, 0, &read_range, &s_d3d.vb_mapped);
-            s_d3d.vb_view.BufferLocation =
-                s_d3d.vertex_buffer->lpVtbl->GetGPUVirtualAddress(s_d3d.vertex_buffer);
+        /* The GPU layer's upload buffer, mapped for its life (step C2). */
+        if (rc_buf_make((u64)(MAX_VERTICES * VERTEX_STRIDE), GPU_USE_VERTEX, GPU_MEM_UPLOAD,
+                        &s_rc_vertex_buf, &s_d3d.vertex_buffer, &s_d3d.vb_mapped)) {
+            s_d3d.vb_view.BufferLocation = gpu_buffer_addr(s_rc_dev, s_rc_vertex_buf);
             s_d3d.vb_view.StrideInBytes = VERTEX_STRIDE;
             s_d3d.vb_view.SizeInBytes = MAX_VERTICES * VERTEX_STRIDE;
             printf("[D3D12] Vertex buffer created (%u KB)\n",
@@ -589,13 +571,9 @@ static int init_d3d12(u32 width, u32 height)
         s_d3d.vp_layout = lay_make(&ld, &s_d3d.vp_root_sig);
         s_vp_root_hash = gpu_d3d12_layout_hash(s_rc_dev, s_d3d.vp_layout);
 
-        /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently mapped) */
-        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bd = {0};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
-        bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_RANGE nr = {0,0};
+        /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently
+         * mapped): the GPU layer's upload buffers (step C2, rc_buf_make) */
+        u64 bytes;
 
         /* RSX_VP_BUFFERS=0: none of the four per-frame buffers below (about
          * 1.2 GB of upload memory at the defaults), for a process that runs no
@@ -613,7 +591,7 @@ static int init_d3d12(u32 width, u32 height)
          * but the growth costs a frame; see vp_vb_grow). */
         { u64 v = (u64)ps3_env_int("VP_VB_VERTS", 0);
           if (v > MAX_VERTICES && v <= (64ull << 20)) s_vp_cap = (u32)v; }
-        bd.Width = (u64)s_vp_cap * 256 * 2;  /* generic VP vertex: 16 float4 slots,
+        bytes = (u64)s_vp_cap * 256 * 2;     /* generic VP vertex: 16 float4 slots,
                                           * DOUBLE-buffered by frame parity so a
                                           * new frame's upload never overwrites
                                           * vertices the in-flight GPU frame is
@@ -624,30 +602,22 @@ static int init_d3d12(u32 width, u32 height)
          * anywhere. Report the size too: this buffer is
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
-                (unsigned long long)(bd.Width >> 20), (unsigned)s_vp_cap, 10);
-        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
-                D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&s_d3d.vp_vb)))
-            s_d3d.vp_vb->lpVtbl->Map(s_d3d.vp_vb, 0, &nr, &s_d3d.vp_vb_mapped);
-        else
+                (unsigned long long)(bytes >> 20), (unsigned)s_vp_cap, 10);
+        if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &s_rc_vp_vb, &s_d3d.vp_vb,
+                         &s_d3d.vp_vb_mapped))
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
-        bd.Width = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;   /* per-draw constant slots, x2 parity */
+        bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */
         /* A failure here is silent and catastrophic: vp_record_cb returns early,
          * every draw loses its constants, and the whole scene transforms by
          * zeros -- indistinguishable from a broken vertex program. Say so. */
         fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
-                (unsigned long long)(bd.Width >> 20), MAX_DRAWS, 10);
-        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
-                D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&s_d3d.vp_cb)))
-            s_d3d.vp_cb->lpVtbl->Map(s_d3d.vp_cb, 0, &nr, &s_d3d.vp_cb_mapped);
+                (unsigned long long)(bytes >> 20), MAX_DRAWS, 10);
+        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_cb, &s_d3d.vp_cb, &s_d3d.vp_cb_mapped);
 
-        bd.Width = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;  /* per-draw FP slots (b1), x2 parity */
-        if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
-                D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&s_d3d.vp_fpcb)))
-            s_d3d.vp_fpcb->lpVtbl->Map(s_d3d.vp_fpcb, 0, &nr, &s_d3d.vp_fpcb_mapped);
+        bytes = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;     /* per-draw FP slots (b1), x2 parity */
+        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb,
+                    &s_d3d.vp_fpcb_mapped);
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
@@ -656,12 +626,9 @@ static int init_d3d12(u32 width, u32 height)
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
           s_vf_cap = (u32)mb << 20;
-          bd.Width = (u64)s_vf_cap * 2;
-          if (SUCCEEDED(d3d_create_committed(s_d3d.device, &hp,
-                  D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                  &IID_ID3D12Resource, (void**)&s_d3d.vf_buf)))
-              s_d3d.vf_buf->lpVtbl->Map(s_d3d.vf_buf, 0, &nr, &s_d3d.vf_mapped);
-          else s_vf_cap = 0; }
+          if (!rc_buf_make((u64)s_vf_cap * 2, GPU_USE_RAW, GPU_MEM_UPLOAD, &s_rc_vf_buf, &s_d3d.vf_buf,
+                           &s_d3d.vf_mapped))
+              s_vf_cap = 0; }
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
