@@ -925,6 +925,7 @@ static void guest_fb_present(u32 fi)
     static int inited = 0;
     static u32 off, gw, gh, gpitch, up_pitch;
     static ID3D12Resource* up = NULL;
+    static gpu_buffer up_buf;   /* step C2: up's buffer (up is borrowed), mapped for its life */
     if (!inited) {
         inited = 1;
         const char* e = getenv("GCM_GUEST_FB");
@@ -932,18 +933,7 @@ static void guest_fb_present(u32 fi)
         if (!e || sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) != 4 || !b || !c) return;
         off = a; gw = b; gh = c; gpitch = d;
         up_pitch = (gw * 4u + 255u) & ~255u;      /* D3D12 wants 256-byte rows */
-        D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bd = {0};
-        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width  = (u64)up_pitch * gh; bd.Height = 1;
-        bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-        bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
-        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(d3d_create_committed(
-                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
-                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&up)))
-            up = NULL;
+        rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_buf, &up, NULL);   /* up NULL if none */
         fprintf(stderr, "[GUESTFB] presenting guest 0x%08X %ux%u pitch %u -> backbuffer%c",
                 off, gw, gh, gpitch, 10);
     }
@@ -952,8 +942,8 @@ static void guest_fb_present(u32 fi)
       if (!vm_base) return;
       /* RSX local memory is mapped at guest 0xC0000000. */
       const u8* srow = vm_base + 0xC0000000u + off;
-      void* m = NULL; D3D12_RANGE nr = {0, 0};
-      if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
+      void* m = gpu_buffer_map(s_rc_dev, up_buf, 0, 0);
+      if (!m) return;
       for (u32 y = 0; y < gh; y++) {
           const u8* s = srow + (size_t)y * gpitch;
           u8* dp = (u8*)m + (size_t)y * up_pitch;
@@ -962,8 +952,7 @@ static void guest_fb_present(u32 fi)
               dp[x*4+2] = s[x*4+0]; dp[x*4+3] = 0xFF;
           }
       }
-      D3D12_RANGE wr = {0, (SIZE_T)up_pitch * gh};
-      up->lpVtbl->Unmap(up, 0, &wr); }
+      gpu_buffer_unmap(s_rc_dev, up_buf, 0, (u64)up_pitch * gh); }
 
     D3D12_RESOURCE_BARRIER gb = {0};
     gb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -994,8 +983,9 @@ static void guest_fb_present(u32 fi)
 /* Grow the VP vertex buffer to hold a frame of `want` vertices (with
  * headroom). The frame that overflowed has already lost its tail; the next
  * ones fit. The old buffer may still be read by the frame in flight, so it is
- * released with the deferred RT resources. VP_VB_MAX_VERTS caps the growth
- * (default 2M vertices = 1 GB of upload heap at 256 bytes x 2 parities). */
+ * destroyed with that frame's fence (rc_ring_retire). VP_VB_MAX_VERTS caps the
+ * growth (default 2M vertices = 1 GB of upload heap at 256 bytes x 2
+ * parities). */
 /* Growing creates and maps a new upload buffer of hundreds of MB on the render
  * thread: 100-400 ms for Demon's Souls's level, one frame, whose overflowing
  * draws are dropped as well. A title that needs more starts bigger
@@ -1016,27 +1006,20 @@ static void vp_vb_grow(u64 want)
                                (unsigned long long)want, s_vp_cap, 10);
         return;
     }
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC bd = {0};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
-    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bd.Width = cap * 256 * 2;          /* VP_VERT_STRIDE, two parity halves */
-    ID3D12Resource* nb = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
-    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
-            D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void**)&nb)) ||
-        FAILED(nb->lpVtbl->Map(nb, 0, &nr, &mp)) || !mp) {
-        if (nb) nb->lpVtbl->Release(nb);
+    const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
+    gpu_buffer nb; ID3D12Resource* res = NULL; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &nb, &res, &mp) || !mp) {
+        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
                 (unsigned long long)cap, s_vp_cap, 10);
         limit = s_vp_cap;
         return;
     }
-    off_rt_defer_release(s_d3d.vp_vb);
-    s_d3d.vp_vb = nb; s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
+    rc_ring_retire(0, s_rc_vp_vb);
+    s_rc_vp_vb = nb;
+    s_d3d.vp_vb = res; s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
     fprintf(stderr, "[VPVB] a frame asked for %llu vertices: buffer grown to %u (%llu MB)%c",
-            (unsigned long long)want, s_vp_cap, (unsigned long long)(bd.Width >> 20), 10);
+            (unsigned long long)want, s_vp_cap, (unsigned long long)(bytes >> 20), 10);
 }
 
 /* The VP index buffer (indexed strip uploads, upload_strip_vp_indexed): u32
@@ -1050,26 +1033,19 @@ static void vp_ib_grow(u64 want)
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
     if (s_d3d.vp_ib && cap <= s_vp_icap) return;
-    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC bd = {0};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
-    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    bd.Width = cap * 4 * 2;
-    ID3D12Resource* nb = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
-    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
-            D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-            &IID_ID3D12Resource, (void**)&nb)) ||
-        FAILED(nb->lpVtbl->Map(nb, 0, &nr, &mp)) || !mp) {
-        if (nb) nb->lpVtbl->Release(nb);
+    const u64 bytes = cap * 4 * 2;
+    gpu_buffer nb; ID3D12Resource* res = NULL; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_INDEX, GPU_MEM_UPLOAD, &nb, &res, &mp) || !mp) {
+        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         static int said = 0;
         if (!said++) fprintf(stderr, "[VPIB] index buffer of %llu indices failed%c",
                              (unsigned long long)cap, 10);
         return;
     }
-    if (s_d3d.vp_ib) off_rt_defer_release(s_d3d.vp_ib);
-    s_d3d.vp_ib = nb; s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
+    rc_ring_retire(1, s_rc_vp_ib);   /* (none the first time) */
+    s_rc_vp_ib = nb;
+    s_d3d.vp_ib = res; s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
     fprintf(stderr, "[VPIB] index buffer: %u indices (%llu MB)%c",
-            s_vp_icap, (unsigned long long)(bd.Width >> 20), 10);
+            s_vp_icap, (unsigned long long)(bytes >> 20), 10);
 }
 
