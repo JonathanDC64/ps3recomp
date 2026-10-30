@@ -439,16 +439,16 @@ static int init_d3d12(u32 width, u32 height)
         ID3DBlob* ps_blob = NULL;
         ID3DBlob* err = NULL;
 
-        hr = D3DCompile(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
-                        "main", "vs_5_0", 0, 0, &vs_blob, &err);
+        hr = sc_compile(GPU_SC_VS, vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL,
+                        GPU_SC_NO_CACHE, &vs_blob, &err);
         if (FAILED(hr)) {
             printf("[D3D12] VS compile failed: %s\n",
                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
             if (err) err->lpVtbl->Release(err);
         }
 
-        hr = D3DCompile(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
-                        "main", "ps_5_0", 0, 0, &ps_blob, &err);
+        hr = sc_compile(GPU_SC_PS, ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL,
+                        GPU_SC_NO_CACHE, &ps_blob, &err);
         if (FAILED(hr)) {
             printf("[D3D12] PS compile failed: %s\n",
                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "unknown");
@@ -548,9 +548,9 @@ static int init_d3d12(u32 width, u32 height)
                 "  return float4(i.col.rgb, i.col.a * cov); }\n";
 
             ID3DBlob *vtb = NULL, *ptb = NULL, *e2 = NULL;
-            hr = D3DCompile(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
+            hr = sc_compile(GPU_SC_VS, vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, GPU_SC_NO_CACHE, &vtb, &e2);
             if (FAILED(hr)) printf("[D3D12] VS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
-            hr = D3DCompile(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
+            hr = sc_compile(GPU_SC_PS, ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, GPU_SC_NO_CACHE, &ptb, &e2);
             if (FAILED(hr)) printf("[D3D12] PS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
 
             if (vtb && ptb) {

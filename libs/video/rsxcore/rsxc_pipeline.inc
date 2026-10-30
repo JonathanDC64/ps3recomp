@@ -126,7 +126,7 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
  * (RSX_HDR), when it is not 0: the program's HDR variant (dr_hdrv), a read
  * clamp's mask cut to the units the program samples. A row without it builds
  * the plain text, as every row did before the field.
- * A program whose constants are in its text (s_fp_baked) is not recorded.
+ * A program whose constants are in its text (rsxc_fp_baked) is not recorded.
  * PS3_PSO_INDEX=0 turns recording and building off. */
 static int pso_index_on(void)
 {
@@ -197,7 +197,7 @@ static void pxr_load(void)
 static void pso_index_note(const VPVSEntry* vs, const u8* fp_ucode, int exp32, u32 cube, u32 d2c, int clamp,
                            u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth, u32 hdrv)
 {
-    if (!pso_index_on() || !vs->code64 || s_fp_baked || !shader_cache_dir()[0]) return;
+    if (!pso_index_on() || !vs->code64 || rsxc_fp_baked() || !shader_cache_dir()[0]) return;
     const u32 used = rsx_fp_texture_units(fp_ucode, RSX_FP_MAX_BYTES);
     cube &= used | (used << 16); d2c &= used;
     if ((hdrv & HDRV_SAT) && !(hdrv & used)) hdrv = 0;   /* no promoted target sampled: the plain text */
@@ -320,11 +320,8 @@ static void rc_pso_index_ready(u64 hash)
  * the driver refused it). */
 static int pxi_build_one(const PxiItem* it, ID3DBlob* gs)
 {
-    char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s/vs_5_0_%016llx.dxbc", shader_cache_dir(), (unsigned long long)it->vs_key);
-    ID3DBlob* vs = shader_cache_load(path);
-    snprintf(path, sizeof path, "%s/ps_5_0_%016llx.dxbc", shader_cache_dir(), (unsigned long long)it->ps_key);
-    ID3DBlob* ps = shader_cache_load(path);
+    ID3DBlob* vs = sc_load(GPU_SC_VS, it->vs_key);
+    ID3DBlob* ps = sc_load(GPU_SC_PS, it->ps_key);
     int r = -1;
     if (vs && ps && (!it->clamp || gs)) {
         D3D12_INPUT_ELEMENT_DESC il[16];

@@ -57,20 +57,23 @@ libs/video/gpu/gpu_shader.c 5619-5619 uvclamp_gs
 # Exported as gpu_sc_put and gpu_sc_cache_dir.
 libs/video/gpu/gpu_shader.c 16388-16402 rsx_d3d12_shader_cache_put
 libs/video/gpu/gpu_shader.c 16404-16404 rsx_d3d12_shader_cache_path
+# The read-ahead, exported as gpu_sc_warm (step C3a).
+libs/video/gpu/gpu_shader.c 4057-4147 shader_cache_warm shader_cache_warm_files shader_cache_warm_worker shader_cache_warm_lister
 
 # Not copied from 5241-5860 (the draw-state half, for the record's package):
 # vp_pso_knobs_check 5372-5395, dr_uvclamp 5564-5575, hdr_scene_limit
 # 5672-5700, dr_hdrv 5706-5725, hdr_batch_start 5785-5806, hdr_mark_scan
-# 5808-5859. From 3948-4160: the read-ahead (shader_cache_warm, 4057-4147).
+# 5808-5859.
 
 # ---------------------------------------------------------------------------
 # Step 1.0: the whole renderer, copied as it is, so that RSX_BACKEND=hal-d3d12
 # (libs/video/rsx_out.c) draws exactly what today's renderer draws. The
 # fragments below are compiled only by libs/video/rsxcore/rsxc_d3d12.c, which
-# includes them in this order (the CMake glob takes *.c, not *.inc). It keeps
-# its own static copy of everything, the shader texts too: it does not use
-# rsxc_shader.c or gpu_shader.c yet. Later steps convert the fragments to the
-# GPU layer one piece at a time, and note each change here.
+# includes them in this order (the CMake glob takes *.c, not *.inc). It kept
+# its own static copy of everything, the shader texts too, until step C3a
+# moved those onto rsxc_shader.c and gpu_shader.c (below). Later steps
+# convert the fragments to the GPU layer one piece at a time, and note each
+# change here.
 #
 # A fragment is its range run through this sed -E script (the lines that
 # start "#sed "), and nothing else:
@@ -125,6 +128,54 @@ libs/video/rsxcore/rsxc_record.inc 13040-13402 rsx_backend callbacks: init, pres
 libs/video/rsxcore/rsxc_vertex.inc 13403-15040 vertex reads and uploads, the vertex jobs, the GPU fetch path
 libs/video/rsxcore/rsxc_record2.inc 15041-15742 draw_arrays, draw_indexed, bind_texture, vertex attribs, shader, blend, depth
 libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutdown, display timing, the overlay, the exports
+
+# Step C3a: the shader texts and compiles. The core's copies of the text
+# builders and of the .dxbc cache are gone; it calls rsxc_shader.c's texts
+# and gpu_shader.c's compile service, whose dxbc target is today's FXC call
+# and cache (the same keys and files). A legacy fix in one of these regions
+# goes to rsxc_shader.c or gpu_shader.c (their lines above), not to the
+# fragment. rsxc_d3d12.c includes rsxc_shadercache.inc right after
+# rsxc_state.inc, before the first fragment that compiles.
+#  rsxc_head.inc 143-152: rsx_path_last_sep is gpu_shader.c's.
+#  rsxc_shadercache.inc 3955-3966, 3970-4148: the cache, its key, store,
+#   compile and read-ahead are gpu_shader.c's (gpu_sc_*); s_perf_fxc,
+#   s_perf_fxc_n and s_perf_sc_hits are its counters (gpu_sc_stats_take;
+#   each compile sets gpu_sc_perf from perf_on()). The fragment keeps
+#   3949-3954 and the pipeline counters (3967-3969), and holds the bridge:
+#   sc_compile (a
+#   compile with D3DCompile's results), sc_load (a cached program by key)
+#   and, TEMPORARY until the pipeline step makes gpu_shader handles,
+#   sc_d3d_blob: the service's bytecode copied into an ID3DBlob, so the
+#   pipeline code (VPVSEntry.vs, vp_vs_blob, the FP and built-in shaders'
+#   blobs) reads the same bytes as before. shader_cache_dir,
+#   shader_cache_warm and shader_compile_cached are one-line forwards.
+#  rsxc_vs.inc 4663-4669, 4698-4700, 4767-4776, 4802-4803, 4822-4858,
+#   4865-4870: vp_hash_ucode and vp_get_vs_mode's sizing, hash, decompile,
+#   VP_W_ONE, VP_BYPASS, uses_c03 and code64 are rsxc_vs_locate,
+#   rsxc_vs_text and rsxc_vs_code64; its compile is sc_compile. The start
+#   (VP_START_OFF, which the memo needs first), the memo, the VS cache and
+#   the dumps stay; the dumps now see the text after VP_W_ONE / VP_BYPASS.
+#  rsxc_fp.inc 5242-5370, 5397-5539, 5626-5670, 5727-5783: the b1 binding,
+#   the variants list, fp_build_hlsl, the program memo (fp_hash_at,
+#   fp_units_at, fp_seen_note), fp_inject_uvclamp and the HDR edits are
+#   rsxc_shader.c's; fp_out_anchor, fp_set_out, fp_build_hlsl, fp_hash_at,
+#   fp_units_at, fp_inject_uvclamp and rc_shader_hdr are forwards to them.
+#   uvclamp_gs 5577-5625 compiles rsxc_uvclamp_gs_hlsl (GPU_SC_NO_CACHE).
+#  rsxc_writeback.inc 8783-8791: s_fp_seen is rsxc_shader.c's; the
+#   RSX_WRITE_COLOR_LOG loop (9284-9285) reads it through rsxc_fp_seen.
+#  rsxc_pipeline.inc 6183-6187 (pxi_build_one's loads: sc_load) and 6060
+#   (rsxc_fp_baked()).
+#  rsxc_diag.inc 10240-10241, rsxc_frame.inc 12470-12475: the fxc and disk
+#   counters come from gpu_sc_stats_take.
+#  rsxc_api.inc 16310-16420: the offline exports are forwards to
+#   rsxc_shader_hlsl, rsxc_program_hash64, rsxc_shader_key,
+#   rsxc_shader_fp_variants, gpu_sc_put and gpu_sc_cache_dir.
+#  Every other D3DCompile is gpu_sc_compile_entry through sc_compile, with
+#   GPU_SC_NO_CACHE (none was cached), GPU_SC_OPTIMIZE where the original
+#   passes D3DCOMPILE_OPTIMIZATION_LEVEL3, and SMAA's entry points:
+#   rsxc_hdr.inc 1778-1782, 1849-1850, 1954-1962; rsxc_init.inc 2826-2835,
+#   2935-2937; rsxc_cap.inc 3841-3843, 3907-3908 (compile_vp);
+#   rsxc_writeback.inc 8876-8878; rsxc_post.inc 10625-10629, 10791-10792.
 
 # ---- The D3D12 backend (libs/video/gpu/gpu_d3d12*, package S2) ----
 # Today's device calls with their parameters, onto handles: the D3D12 calls

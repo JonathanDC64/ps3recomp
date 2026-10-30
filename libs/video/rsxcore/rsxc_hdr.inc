@@ -213,11 +213,11 @@ static int of_ready(void)
     if (s_of.failed || !s_d3d.device) return 0;
     s_of.failed = 1;   /* until it is made */
     ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL, NULL,
-                            "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb, &err);
+    HRESULT hr = sc_compile(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
+                            NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb, &err);
     if (SUCCEEDED(hr))
-        hr = D3DCompile(rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps", NULL, NULL,
-                        "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb, &err);
+        hr = sc_compile(GPU_SC_PS, rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps",
+                        NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb, &err);
     if (FAILED(hr))
         printf("[D3D12] RSX_OUTFILTER shader compile failed: %s\n",
                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
@@ -284,8 +284,8 @@ static int blit_init(void)
         "float4 main(float4 p : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {\n"
         "  return float4(t.Sample(s, uv).rgb, 1); }\n";
     ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *rsb = NULL;
-    HRESULT hr = D3DCompile(vs, sizeof vs - 1, "blit_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err);
-    if (SUCCEEDED(hr)) hr = D3DCompile(ps, sizeof ps - 1, "blit_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err);
+    HRESULT hr = sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "blit_vs", NULL, GPU_SC_NO_CACHE, &vb, &err);
+    if (SUCCEEDED(hr)) hr = sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "blit_ps", NULL, GPU_SC_NO_CACHE, &pb, &err);
     if (FAILED(hr)) {
         printf("[D3D12] blit shader compile failed: %s\n", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
         return -1;
@@ -389,15 +389,15 @@ static int hdr_blit_ready(void)
     static char sharp[sizeof rsx_outfilter_ps + sizeof sharp_tail + 64];
     snprintf(sharp, sizeof sharp, "#define main of_main\n%s\n%s", rsx_outfilter_ps, sharp_tail);
     ID3DBlob *vb[2] = {NULL, NULL}, *pb[2] = {NULL, NULL}, *rsb = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(vs, sizeof vs - 1, "hdr_blit_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb[0], &err);
+    HRESULT hr = sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "hdr_blit_vs", NULL, GPU_SC_NO_CACHE, &vb[0], &err);
     if (SUCCEEDED(hr))
-        hr = D3DCompile(ps, sizeof ps - 1, "hdr_blit_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb[0], &err);
+        hr = sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "hdr_blit_ps", NULL, GPU_SC_NO_CACHE, &pb[0], &err);
     if (SUCCEEDED(hr))
-        hr = D3DCompile(rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL, NULL, "main",
-                        "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb[1], &err);
+        hr = sc_compile(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL,
+                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb[1], &err);
     if (SUCCEEDED(hr))
-        hr = D3DCompile(sharp, strlen(sharp), "hdr_sharp_ps", NULL, NULL, "main", "ps_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb[1], &err);
+        hr = sc_compile(GPU_SC_PS, sharp, strlen(sharp), "hdr_sharp_ps", NULL,
+                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb[1], &err);
     if (FAILED(hr))
         printf("[D3D12] HDR blit shader compile failed: %s\n",
                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");

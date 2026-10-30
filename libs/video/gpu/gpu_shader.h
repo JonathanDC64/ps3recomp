@@ -46,11 +46,14 @@ enum {
     GPU_SC_OK          = 0,
     GPU_SC_UNAVAILABLE = -1,   /* the target is not built here */
     GPU_SC_FAILED      = -2,   /* the compiler refused the text */
-    GPU_SC_BAD_ARG     = -3
+    GPU_SC_BAD_ARG     = -3,
+    GPU_SC_NOT_CACHED  = -4    /* gpu_sc_load: no whole program under that key */
 };
 
-/* gpu_sc_compile's flags. */
+/* gpu_sc_compile's flags. The cache's key holds the text and the profile
+ * only, so GPU_SC_OPTIMIZE needs GPU_SC_NO_CACHE. */
 #define GPU_SC_NO_CACHE 1u     /* compile, and neither read nor write the cache */
+#define GPU_SC_OPTIMIZE 2u     /* the compiler's highest level (dxbc: D3DCOMPILE_OPTIMIZATION_LEVEL3) */
 
 /* Compiled bytecode. Release with gpu_sc_blob_release. */
 typedef struct gpu_sc_blob {
@@ -80,7 +83,23 @@ int gpu_sc_cache_path(gpu_sc_target target, gpu_sc_stage stage, const char* src,
  * GPU_SC_FAILED the compiler's message is in err (when given). Thread-safe. */
 int gpu_sc_compile(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
                    const char* name, unsigned flags, gpu_sc_blob* out, char* err, size_t err_cap);
+/* gpu_sc_compile from the entry point entry (NULL: "main"); another entry
+ * needs GPU_SC_NO_CACHE, as the cache's key does not hold it. */
+int gpu_sc_compile_entry(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                         const char* name, const char* entry, unsigned flags, gpu_sc_blob* out,
+                         char* err, size_t err_cap);
+/* The program the cache holds under key K (gpu_sc_key of its text), with the
+ * checks a cache hit makes: GPU_SC_OK, or GPU_SC_NOT_CACHED. Not counted as a
+ * hit. Thread-safe. */
+int gpu_sc_load(gpu_sc_target target, gpu_sc_stage stage, uint64_t key, gpu_sc_blob* out);
 void gpu_sc_blob_release(gpu_sc_blob* blob);
+
+/* Read every program in the cache once, in the background, on
+ * PS3_SHADER_CACHE_WARM=<n> threads (default 4; 0 = off); the first call
+ * only. Windows' antivirus scans a file the first time it is opened after it
+ * was written, so this takes that wait off the first draws. Nothing off
+ * Windows. */
+void gpu_sc_warm(void);
 
 /* Compile a guest program's text into the cache (setup's pass):
  * 1 = already there, 2 = compiled, 0 = failed (or no cache), as

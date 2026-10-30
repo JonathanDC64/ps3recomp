@@ -565,116 +565,27 @@ static void rc_backend_present(void)
     }
 }
 
-/* Offline warm-up of the shader disk cache (rsx_shader_precompile). */
+/* The offline exports (rsx_shader_precompile, setup's shader pass): the
+ * texts are rsxc_shader.c's and the cache is the compile service's (step
+ * C3a), which is today's .dxbc cache. */
 static int rc_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
                           int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap)
 {
-    extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
-    extern int rsx_vp_decompile_fetch(const uint8_t*, u32, char*, u32);
-    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
-    extern void rsx_vp_set_branch_base(u32);
-    if (!ucode || !out || cap < 2) return 0;
-    if (fragment == 1 || fragment == 3) {
-        /* The decompiler may read up to RSX_FP_MAX_BYTES, as it does from
-         * guest memory; give it a zero tail. */
-        u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-        if (!buf) return 0;
-        memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-        int n = fp_build_hlsl(buf, exp32, cube_mask, d2c_mask, out, cap, 0, 0);
-        free(buf);
-        /* 3: as a draw without a depth test on a scaled target has it (the
-         * sprite-edge clamp, vp_get_fp_pso). */
-        if (fragment == 3 && n > 0 && !fp_inject_uvclamp(out, cap)) n = 0;
-        return n;
-    }
-    /* The binary holds big-endian words; rsx_state keeps the words
-     * SET_TRANSFORM_PROGRAM delivered, little-endian. Then as vp_get_vs_mode:
-     * trimmed to the END instruction, branch targets made relative to the
-     * slot the program is loaded at. */
-    u32 vlen = ucode_len & ~3u;
-    u8* w = (u8*)malloc(vlen ? vlen : 4);
-    if (!w) return 0;
-    for (u32 i = 0; i < vlen; i += 4) {
-        w[i] = ucode[i + 3]; w[i + 1] = ucode[i + 2]; w[i + 2] = ucode[i + 1]; w[i + 3] = ucode[i];
-    }
-    { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
-      if (instrs) vlen = instrs * 16u; }
-    rsx_vp_set_branch_base(vp_start_slot);
-    const int n = fragment == 2 ? rsx_vp_decompile_fetch(w, vlen, out, cap)
-                                : rsx_vp_decompile(w, vlen, out, cap);
-    rsx_vp_set_branch_base(0);
-    free(w);
-    return n;
+    return rsxc_shader_hlsl(fragment, ucode, ucode_len, vp_start_slot, exp32, cube_mask, d2c_mask, out, cap);
 }
-
-/* The pipeline index's fingerprint of a program, from its ucode as a Cg
- * binary holds it (big-endian words): what pso_index_note takes from the
- * guest. A fragment program: rsx_fp_code_hash64. A vertex program: FNV-1a 64
- * of its words as the transform program store holds them (little-endian), up
- * to its END instruction. */
 static u64 rc_program_hash64(int fragment, const u8* ucode, u32 ucode_len)
 {
-    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
-    if (!ucode || !ucode_len) return 0;
-    if (fragment) {
-        u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-        if (!buf) return 0;
-        memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-        const u64 h = rsx_fp_code_hash64(buf, RSX_FP_MAX_BYTES);
-        free(buf);
-        return h;
-    }
-    u32 vlen = ucode_len & ~3u;
-    u8* w = (u8*)malloc(vlen ? vlen : 4);
-    if (!w) return 0;
-    for (u32 i = 0; i < vlen; i += 4) {
-        w[i] = ucode[i + 3]; w[i + 1] = ucode[i + 2]; w[i + 2] = ucode[i + 1]; w[i + 3] = ucode[i];
-    }
-    { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
-      if (instrs) vlen = instrs * 16u; }
-    const u64 h = fnv_bytes(14695981039346656037ull, w, vlen);
-    free(w);
-    return h;
+    return rsxc_program_hash64(fragment, ucode, ucode_len);
 }
-
-static u64 rc_shader_key(int fragment, const char* hlsl)
-{
-    const char* profile = fragment ? "ps_5_0" : "vs_5_0";
-    return hlsl ? shader_key(hlsl, strlen(hlsl), profile) : 0;
-}
-
+static u64 rc_shader_key(int fragment, const char* hlsl) { return rsxc_shader_key(fragment, hlsl); }
 static int rc_shader_cache_put(int fragment, const char* hlsl)
 {
-    const char* profile = fragment ? "ps_5_0" : "vs_5_0";
-    if (!shader_cache_dir()[0] || !hlsl) return 0;
-    char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", shader_cache_dir(), profile,
-             (unsigned long long)shader_key(hlsl, strlen(hlsl), profile));
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return 1;
-    ID3DBlob* b = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), fragment ? "guest_fp" : "guest_vp2",
-                                       profile, &b, &e);
-    if (e) e->lpVtbl->Release(e);
-    if (b) b->lpVtbl->Release(b);
-    return SUCCEEDED(hr) && b ? 2 : 0;
+    gpu_sc_perf(perf_on());
+    return gpu_sc_put(GPU_SC_DXBC, fragment ? GPU_SC_PS : GPU_SC_VS, hlsl);
 }
-
-static const char* rc_shader_cache_path(void) { return shader_cache_dir(); }
-
+static const char* rc_shader_cache_path(void) { return gpu_sc_cache_dir(); }
 static int rc_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max)
 {
-    u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-    if (!buf) return 0;
-    memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-    const u32 hash = rsx_fp_code_hash(buf, RSX_FP_MAX_BYTES);
-    free(buf);
-    fpv_load();
-    int n = 0;
-    for (int i = 0; i < s_fpv_n && n < max; i++)
-        if (s_fpv[i].hash == hash) {
-            out[n * 3 + 0] = s_fpv[i].exp32; out[n * 3 + 1] = s_fpv[i].cube;
-            out[n * 3 + 2] = s_fpv[i].d2c; n++;
-        }
-    return n;
+    return rsxc_shader_fp_variants(ucode, ucode_len, out, max);
 }
 

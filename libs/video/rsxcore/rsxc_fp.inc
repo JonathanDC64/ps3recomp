@@ -352,135 +352,15 @@ static void psj_finish(void)
     s_psj_fix_n = 0;
 }
 
-/* The debug rewrites below (FP_ONE, FP_SHOW, FP_IDCOLOR, FP_TEX, FP_KILL) edit
- * the colour-0 output of a translated program. Its spelling depends on the
- * decompiler version: "_po.c0 = X;" (older), "float4 _o = X;" (one target) or
- * "float4 _o0 = X;" (several). They anchored on the first only and silently did
- * nothing with the current decompiler. Returns the start of X (or of the whole
- * statement with want_stmt) and sets *end to its ';', or NULL. */
-static char* fp_out_anchor(char* hlsl, char** end, int want_stmt)
-{
-    static const char* const pats[] = { "_po.c0 = ", "float4 _o = ", "float4 _o0 = " };
-    for (int i = 0; i < 3; i++) {
-        char* rp = strstr(hlsl, pats[i]);
-        char* semi = rp ? strchr(rp, ';') : NULL;
-        if (semi) { *end = semi; return want_stmt ? rp : rp + strlen(pats[i]); }
-    }
-    return NULL;
-}
-
-/* Replace the colour-0 expression with expr. Returns 1 if it was replaced. */
-static int fp_set_out(char* hlsl, size_t cap, const char* expr)
-{
-    char* semi; char* rp = fp_out_anchor(hlsl, &semi, 0);
-    if (!rp) return 0;
-    size_t newlen = strlen(expr), tail = strlen(semi) + 1;
-    if ((size_t)(rp - hlsl) + newlen + tail >= cap) return 0;
-    memmove(rp + newlen, semi, tail);
-    memcpy(rp, expr, newlen);
-    return 1;
-}
-
-/* Insert `ins` in front of the ')' that closes the call whose '(' is at open.
- * Returns the position just past the inserted text, or NULL. */
-static char* hlsl_insert_before_close(char* hlsl, size_t cap, char* open, const char* ins)
-{
-    int depth = 0;
-    char* p = open;
-    for (; *p; p++) {
-        if (*p == '(') depth++;
-        else if (*p == ')') { if (--depth == 0) break; }
-    }
-    if (*p != ')') return NULL;
-    const size_t il = strlen(ins), used = strlen(hlsl);
-    if (used + il + 1 > cap) return NULL;
-    memmove(p + il, p, used - (size_t)(p - hlsl) + 1);
-    memcpy(p, ins, il);
-    return p + il;
-}
-
-/* Wire a decompiled program to this backend's per-draw b1 slot (see
- * VP_FPCB_STRIDE and vp_record_cb):
- *  - its cbuffer declaration becomes the b1 layout (texel scales, alpha test,
- *    inline constants);
- *  - each 2D Sample() coordinate is multiplied by rsx_texscale[unit], which is
- *    1/size for a texture addressed in texels (format bit 0x40) and 1 otherwise;
- *  - the alpha test runs on colour target 0 before returning (D3D12 has no
- *    fixed-function one). Its state is per draw, so the pipeline key does not
- *    need it.
- * The previous decompiler emitted the scale and test itself; the current one
- * leaves them to the backend, and this path had lost both. Returns 0 on
- * failure (buffer too small or an unexpected program shape). */
-static int fp_bind_b1(char* hlsl, size_t cap, u32 cube_mask, int buffered)
-{
-    static const char decl[] =
-        "cbuffer PSConstants : register(b1) {\n"
-        "    float4 rsx_texscale[16];\n"
-        "    float4 rsx_alphatest;   /* x enable, y reference, z function - 0x200 */\n"
-        "    float4 fp_constants[128];\n"
-        "};\n"
-        "bool rsx_alpha_pass(float a) {\n"
-        "    const float r = rsx_alphatest.y; const int f = (int)rsx_alphatest.z;\n"
-        "    return f == 1 ? a < r : f == 2 ? a == r : f == 3 ? a <= r :\n"
-        "           f == 4 ? a > r : f == 5 ? a != r : f == 6 ? a >= r : f == 7;\n"
-        "}\n";
-    /* Replace the decompiler's declaration, or add ours in front of main. */
-    char* at = strstr(hlsl, "cbuffer PSConstants : register(b1) {");
-    char* end = at ? strstr(at, "};\n") : NULL;
-    if (at && !end) return 0;
-    if (!buffered && at) return 0;
-    if (!at) {
-        at = strstr(hlsl, "float4 main(");
-        if (!at) at = strstr(hlsl, "struct PSOutput {");
-        if (!at) return 0;
-        end = at;
-    } else {
-        end += 3;
-    }
-    {
-        const size_t dl = sizeof(decl) - 1, used = strlen(hlsl);
-        const size_t old = (size_t)(end - at);
-        if (used - old + dl + 1 > cap) return 0;
-        memmove(at + dl, end, used - (size_t)(end - hlsl) + 1);
-        memcpy(at, decl, dl);
-    }
-    /* Texel scale on every 2D Sample() of each unit. */
-    for (u32 u = 0; u < RSX_FP_UNITS; u++) {
-        if ((cube_mask >> u) & 1u) continue;
-        /* Every spelling the decompiler emits for a 2D unit: a program with a
-         * shadow unit declares its samplers one by one (rsx_sampN). */
-        char needle[3][48], ins[32];
-        snprintf(needle[0], sizeof needle[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
-        snprintf(needle[1], sizeof needle[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
-        snprintf(needle[2], sizeof needle[2], "rsx_tex%u.Sample(rsx_samp%u,", u, u);
-        snprintf(ins, sizeof ins, " * rsx_texscale[%u].xy", u);
-        for (int k = 0; k < 3; k++) {
-            char* from = hlsl;
-            char* hit;
-            while ((hit = strstr(from, needle[k])) != NULL) {
-                char* open = strchr(hit, '(');
-                from = open ? hlsl_insert_before_close(hlsl, cap, open, ins) : NULL;
-                if (!from) return 0;
-            }
-        }
-    }
-    /* Alpha test on target 0, just before the final return. */
-    {
-        char* ret = NULL;
-        for (char* p = strstr(hlsl, "    return "); p; p = strstr(p + 1, "    return "))
-            ret = p;
-        if (!ret) return 0;
-        const char* test = strstr(hlsl, "struct PSOutput")
-            ? "    if (rsx_alphatest.x > 0.5 && !rsx_alpha_pass(_out.t0.a)) discard;\n"
-            : "    if (rsx_alphatest.x > 0.5 && !rsx_alpha_pass(_o.a)) discard;\n";
-        if (!strstr(hlsl, "float4 _o = ") && !strstr(hlsl, "PSOutput _out;")) return 0;
-        const size_t tl = strlen(test), used = strlen(hlsl);
-        if (used + tl + 1 > cap) return 0;
-        memmove(ret + tl, ret, used - (size_t)(ret - hlsl) + 1);
-        memcpy(ret, test, tl);
-    }
-    return 1;
-}
+/* The fragment programs' texts are rsxc_shader.c's (step C3a): the b1
+ * binding, the variants list (fp_variants.txt), the program memo, the
+ * sprite-edge clamp's pixel half and the HDR variants. These keep the names
+ * the draw path calls them by. The debug rewrites (FP_ONE, FP_SHOW,
+ * FP_IDCOLOR, FP_TEX, FP_KILL) edit the colour-0 output: fp_out_anchor finds
+ * it (with want_stmt, the whole statement) and sets *end to its ';';
+ * fp_set_out replaces it (1 if it did). */
+static char* fp_out_anchor(char* hlsl, char** end, int want_stmt) { return rsxc_fp_out_anchor(hlsl, end, want_stmt); }
+static int fp_set_out(char* hlsl, size_t cap, const char* expr) { return rsxc_fp_set_out(hlsl, cap, expr); }
 
 /* Knobs baked into a pipeline when it is built. The cache keys don't hold
  * them, so after the console changes one of them every pipeline is rebuilt
@@ -507,149 +387,21 @@ static void vp_pso_knobs_check(void)
     sig = h;
 }
 
-/* The HLSL the draw path compiles for a fragment program: decompiled with its
- * inline constants read from b1 (baked in when there are more than b1 holds),
- * then given the b1 layout. The offline precompiler builds the same text, so
- * its disk-cache entries are the ones a draw looks up. ucode must be readable
- * for RSX_FP_MAX_BYTES. Returns the instruction count, <= 0 on failure;
- * fp_addr is only for the log. */
-/* Fragment-program variants this title has compiled, by code hash, in
- * <shader cache>/fp_variants.txt ("hash exp32 cube d2c" per line, hex). The
- * texture kinds a program is bound with (cube, shadow, depth-as-colour) are
- * draw state that a Cg binary does not record, so the precompiler reads this
- * list to rebuild every variant a run has needed: a cache emptied by a
- * decompiler or driver update is refilled whole before the next boot. */
-typedef struct { u32 hash, exp32, cube, d2c; } FPVariant;
-static FPVariant* s_fpv = NULL;
-static int s_fpv_n = 0, s_fpv_cap = 0, s_fpv_loaded = 0;
-static int fpv_find(u32 hash, u32 exp32, u32 cube, u32 d2c)
-{
-    for (int i = 0; i < s_fpv_n; i++)
-        if (s_fpv[i].hash == hash && s_fpv[i].exp32 == exp32 && s_fpv[i].cube == cube &&
-            s_fpv[i].d2c == d2c) return 1;
-    return 0;
-}
-static void fpv_add(u32 hash, u32 exp32, u32 cube, u32 d2c)
-{
-    if (s_fpv_n == s_fpv_cap) {
-        const int cap = s_fpv_cap ? s_fpv_cap * 2 : 256;
-        FPVariant* g = (FPVariant*)realloc(s_fpv, sizeof(FPVariant) * (size_t)cap);
-        if (!g) return;
-        s_fpv = g; s_fpv_cap = cap;
-    }
-    s_fpv[s_fpv_n].hash = hash; s_fpv[s_fpv_n].exp32 = exp32;
-    s_fpv[s_fpv_n].cube = cube; s_fpv[s_fpv_n].d2c = d2c; s_fpv_n++;
-}
-static void fpv_load(void)
-{
-    if (s_fpv_loaded) return;
-    s_fpv_loaded = 1;
-    if (!shader_cache_dir()[0]) return;
-    char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
-    FILE* f = fopen(path, "r");
-    if (!f) return;
-    unsigned h, e, c, d;
-    while (fscanf(f, "%x %x %x %x", &h, &e, &c, &d) == 4)
-        if (!fpv_find(h, e, c, d)) fpv_add(h, e, c, d);
-    fclose(f);
-}
-static void fpv_note(const u8* ucode, u32 exp32, u32 cube, u32 d2c)
-{
-    fpv_load();
-    const u32 hash = rsx_fp_code_hash(ucode, RSX_FP_MAX_BYTES);
-    if (!shader_cache_dir()[0] || fpv_find(hash, exp32, cube, d2c)) return;
-    fpv_add(hash, exp32, cube, d2c);
-    char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s/fp_variants.txt", shader_cache_dir());
-    FILE* f = fopen(path, "a");
-    if (f) { fprintf(f, "%08x %x %x %x\n", hash, exp32, cube, d2c); fclose(f); }
-}
-
-/* fp_build_hlsl's last program had more constants than b1 holds, so they
- * are in its text: a pipeline the pipeline index cannot make again from
- * the game's files, which hold other values. */
-static int s_fp_baked;
+/* The HLSL the draw path compiles for a fragment program, its variant noted
+ * in fp_variants.txt with note = 1 (rsxc_fp_build_hlsl; rsxc_fp_baked() says
+ * whether its constants are in its text). */
 static int fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask,
                          char* hlsl, size_t cap, u32 fp_addr, int note)
 {
-    /* Only the units the program samples: the masks come from whatever the
-     * draw has bound, and a cube or depth texture left on an unused unit
-     * would otherwise change the text (and the cache entry) for nothing. */
-    { const u32 used = rsx_fp_texture_units(ucode, RSX_FP_MAX_BYTES);
-      cube_mask &= used | (used << 16); d2c_mask &= used; }
-    if (note) fpv_note(ucode, exp32 ? 1u : 0u, cube_mask, d2c_mask);
-    u32 kcount = 0;
-    int n = rsx_fp_decompile_buffered_ex2(ucode, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
-                                          d2c_mask, hlsl, (u32)cap, &kcount);
-    int buffered = n > 0 && kcount <= FPCB_KMAX;
-    s_fp_baked = n > 0 && !buffered;
-    if (n > 0 && !buffered) {
-        /* More constants than b1 holds: bake them, as before. */
-        static int said = 0;
-        if (said < 4 && ++said)
-            fprintf(stderr, "[FP] fp=0x%X has %u inline constants (b1 holds %d); "
-                            "compiled with them baked in%c", fp_addr, kcount, FPCB_KMAX, 10);
-        n = rsx_fp_decompile_ex2(ucode, RSX_FP_MAX_BYTES, exp32 ? 0x40u : 0u, cube_mask,
-                                 d2c_mask, hlsl, (u32)cap);
-    }
-    if (n <= 0) { static int _e=0; if(_e < 16 && ++_e) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return n; }
-    if (!fp_bind_b1(hlsl, cap, cube_mask, buffered)) {
-        static int _e=0; if(_e < 16 && ++_e) printf("[FP] b1 binding failed (fp=0x%08X)\n", fp_addr);
-        return 0;
-    }
-    return n;
+    return rsxc_fp_build_hlsl(ucode, exp32, cube_mask, d2c_mask, hlsl, cap, fp_addr, note);
 }
 
-static void fp_seen_note(u32 ea, u32 len);
+/* rsx_fp_code_hash of the program at guest offset `off` and its size, and
+ * the texture units it samples, memoised (rsxc_fp_hash_at, rsxc_fp_units_at):
+ * the PSO lookup and the SRV binding need them for every draw. */
+static u32 fp_hash_at(u32 off, u32* size_out) { return rsxc_fp_hash_at(off, size_out); }
+static u32 fp_units_at(u32 off) { return rsxc_fp_units_at(off); }
 
-/* rsx_fp_code_hash of the program at guest offset `off`, and its size. The
- * PSO lookup needs it for every draw, and hashing (a byte-serial FNV) plus
- * sizing the program was ~12% of the render thread at Boletarian Palace's
- * 6k draws. A program is re-hashed only when its bytes differ from the copy
- * kept with the last hash: equal bytes up to the old size mean the same END
- * instruction, so the same size and the same hash. RSX_FP_HASH_MEMO=0 hashes
- * every time. */
-typedef struct { u32 off, size, hash, units; u8* bytes; } FpHashMemo;
-static FpHashMemo s_fph[1024];
-static u32 fp_hash_at(u32 off, u32* size_out)
-{
-    extern uint8_t* vm_base;
-    const u8* up = vm_base + off;
-    static int en = -1;
-    PS3_KNOB(en, ps3_env_int("RSX_FP_HASH_MEMO", 1));
-    FpHashMemo* m = &s_fph[((off >> 4) * 2654435761u) >> 22];
-    if (en && m->bytes && m->off == off && !memcmp(m->bytes, up, m->size)) {
-        *size_out = m->size;
-        return m->hash;
-    }
-    u32 usz = rsx_fp_program_size(up, RSX_FP_MAX_BYTES);
-    if (usz == 0) usz = 64;
-    const u32 h = rsx_fp_code_hash(up, RSX_FP_MAX_BYTES);
-    fp_seen_note(off, usz);
-    if (en) {
-        u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
-        if (b) { memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->hash = h;
-                 m->units = rsx_fp_texture_units(up, RSX_FP_MAX_BYTES); }
-    }
-    *size_out = usz;
-    return h;
-}
-/* The texture units the program at guest offset `off` samples, from
- * fp_hash_at's memo: render_frame binds only those. Every draw looked up all
- * sixteen units' textures (and render targets, and depth surfaces), ~14 a
- * draw at the Palace where its programs sample two or three, and that was
- * most of the frame's SRV time. */
-static u32 fp_units_at(u32 off)
-{
-    extern uint8_t* vm_base;
-    u32 usz;
-    (void)fp_hash_at(off, &usz);
-    const FpHashMemo* m = &s_fph[((off >> 4) * 2654435761u) >> 22];
-    if (m->bytes && m->off == off && !memcmp(m->bytes, vm_base + off, m->size))
-        return m->units;
-    return rsx_fp_texture_units(vm_base + off, RSX_FP_MAX_BYTES);
-}
 /* RSX_SCALE: sprite edges sampled as at 1x.
  *
  * The HUD and menus are built from quads cut out of texture atlases. At 1x a
@@ -687,100 +439,27 @@ static u32 dr_uvclamp(const D3D12DrawRecord* dr)
     return pct;
 }
 
+/* The geometry half: rsxc_uvclamp_gs_hlsl's source, compiled once (gs_5_0,
+ * not through the disk cache). The pixel half is fp_inject_uvclamp's
+ * (rsxc_fp_inject_uvclamp): the bounds as inputs after TEXCOORD9 and the
+ * clamp at the top of main; 0 leaves the text as it was. */
 static ID3DBlob* uvclamp_gs(void)
 {
     static ID3DBlob* gs = NULL;
     static int tried = 0;
     if (tried) return gs;
     tried = 1;
-    static const char src[] =
-        "struct V {\n"
-        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
-        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
-        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
-        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
-        "};\n"
-        "struct G {\n"
-        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
-        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
-        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
-        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
-        "    nointerpolation float4 b0:UVBOUND0; nointerpolation float4 b1:UVBOUND1;\n"
-        "    nointerpolation float4 b2:UVBOUND2; nointerpolation float4 b3:UVBOUND3;\n"
-        "    nointerpolation float4 b4:UVBOUND4; nointerpolation float4 b5:UVBOUND5;\n"
-        "    nointerpolation float4 b6:UVBOUND6; nointerpolation float4 b7:UVBOUND7;\n"
-        "};\n"
-        "float4 bnd(float2 a, float2 b, float2 c, bool on) {\n"
-        "    return on ? float4(min(min(a, b), c), max(max(a, b), c)) : float4(-1e30, -1e30, 1e30, 1e30);\n"
-        "}\n"
-        "[maxvertexcount(3)]\n"
-        "void main(triangle V v[3], inout TriangleStream<G> s) {\n"
-        "    const bool on = v[0].pos.w == 1.0 && v[1].pos.w == 1.0 && v[2].pos.w == 1.0;\n"
-        "    G o;\n"
-        "    o.b0 = bnd(v[0].t0.xy, v[1].t0.xy, v[2].t0.xy, on); o.b1 = bnd(v[0].t1.xy, v[1].t1.xy, v[2].t1.xy, on);\n"
-        "    o.b2 = bnd(v[0].t2.xy, v[1].t2.xy, v[2].t2.xy, on); o.b3 = bnd(v[0].t3.xy, v[1].t3.xy, v[2].t3.xy, on);\n"
-        "    o.b4 = bnd(v[0].t4.xy, v[1].t4.xy, v[2].t4.xy, on); o.b5 = bnd(v[0].t5.xy, v[1].t5.xy, v[2].t5.xy, on);\n"
-        "    o.b6 = bnd(v[0].t6.xy, v[1].t6.xy, v[2].t6.xy, on); o.b7 = bnd(v[0].t7.xy, v[1].t7.xy, v[2].t7.xy, on);\n"
-        "    [unroll] for (int i = 0; i < 3; i++) {\n"
-        "        o.pos = v[i].pos; o.col0 = v[i].col0; o.col1 = v[i].col1; o.fog = v[i].fog;\n"
-        "        o.t0 = v[i].t0; o.t1 = v[i].t1; o.t2 = v[i].t2; o.t3 = v[i].t3; o.t4 = v[i].t4;\n"
-        "        o.t5 = v[i].t5; o.t6 = v[i].t6; o.t7 = v[i].t7; o.t8 = v[i].t8; o.t9 = v[i].t9;\n"
-        "        s.Append(o);\n"
-        "    }\n"
-        "}\n";
+    size_t n = 0;
+    const char* src = rsxc_uvclamp_gs_hlsl(&n);
     ID3DBlob* err = NULL;
-    if (FAILED(D3DCompile(src, sizeof src - 1, "uvclamp_gs", NULL, NULL, "main", "gs_5_0", 0, 0, &gs, &err))) {
+    if (FAILED(sc_compile(GPU_SC_GS, src, n, "uvclamp_gs", NULL, GPU_SC_NO_CACHE, &gs, &err))) {
         if (err) { fprintf(stderr, "[D3D12] RSX_SCALE_UVCLAMP: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
                    err->lpVtbl->Release(err); }
         gs = NULL;
     }
     return gs;
 }
-
-/* The pixel-shader half of the above, on a translated program's HLSL: the
- * bounds as inputs after TEXCOORD9 (declared here if the program did not read
- * it, so the inputs line up with the geometry shader's outputs), and the clamp
- * at the top of main, half the scale from rsx_alphatest.w. Returns 0, leaving
- * hlsl as it was, if an anchor is missing or the buffer is too small. */
-static int fp_inject_uvclamp(char* hlsl, size_t cap)
-{
-    static const char tc7[] =
-        "float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n";
-    char* in = strstr(hlsl, tc7);
-    char* m = strstr(hlsl, "main(PSInput input)");
-    char* body = m ? strchr(m, '{') : NULL;
-    if (!in || !body || body < in) return 0;
-    /* The program's own TEXCOORD8/9, if it reads them, come right after TEXCOORD7. */
-    static const char tc9[] = "float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n";
-    char* after_in = in + sizeof tc7 - 1;
-    const char* next = after_in + strspn(after_in, " ");
-    const int has9 = !strncmp(next, tc9, sizeof tc9 - 1);
-    if (has9) after_in = (char*)next + sizeof tc9 - 1;
-    char decl[1024];
-    snprintf(decl, sizeof decl, "%s"
-        "    nointerpolation float4 uvb0:UVBOUND0; nointerpolation float4 uvb1:UVBOUND1;\n"
-        "    nointerpolation float4 uvb2:UVBOUND2; nointerpolation float4 uvb3:UVBOUND3;\n"
-        "    nointerpolation float4 uvb4:UVBOUND4; nointerpolation float4 uvb5:UVBOUND5;\n"
-        "    nointerpolation float4 uvb6:UVBOUND6; nointerpolation float4 uvb7:UVBOUND7;\n",
-        has9 ? "" : "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
-    char code[2048];
-    int n = snprintf(code, sizeof code, "\n    { const float k = rsx_alphatest.w;   /* half the scale: half a guest pixel, in host pixels */\n");
-    for (int i = 0; i < 8; i++)
-        n += snprintf(code + n, sizeof code - (size_t)n,
-            "      { const float2 h = k * fwidth(input.tc%d.xy);"
-            " input.tc%d.xy = clamp(input.tc%d.xy, input.uvb%d.xy + h, input.uvb%d.zw - h); }\n",
-            i, i, i, i, i);
-    snprintf(code + n, sizeof code - (size_t)n, "    }\n");
-    const size_t len = strlen(hlsl), dl = strlen(decl), cl = strlen(code);
-    if (len + dl + cl + 1 > cap) return 0;
-    const size_t body_off = (size_t)(body + 1 - hlsl) + dl;
-    memmove(after_in + dl, after_in, len - (size_t)(after_in - hlsl) + 1);
-    memcpy(after_in, decl, dl);
-    char* b = hlsl + body_off;
-    memmove(b + cl, b, strlen(b) + 1);
-    memcpy(b, code, cl);
-    return 1;
-}
+static int fp_inject_uvclamp(char* hlsl, size_t cap) { return rsxc_fp_inject_uvclamp(hlsl, cap); }
 
 /* RSX_HDR_SCENE_FP (see HDR output): the clamp limit for this program, 0 if it
  * is not named; with fp 0, how many are named. */
@@ -837,63 +516,10 @@ static u32 dr_hdrv(const D3D12DrawRecord* dr)
     return b;
 }
 
-/* The variant's text: each clamp to [0, 1] becomes a clamp to [0, limit], or
- * none for the largest half float. Returns how many it changed. */
-static int fp_hdr_unclamp(char* hlsl, size_t cap, u32 hdrv)
-{
-    static const char sat[] = " _v = saturate(_v);";
-    float l;
-    memcpy(&l, &hdrv, 4);
-    char with[64] = "";
-    if (l < 65504.0f) snprintf(with, sizeof with, " _v = clamp(_v, 0.0, %.9g);", l);
-    const size_t sl = sizeof sat - 1, wl = strlen(with);
-    int k = 0;
-    for (char* q = strstr(hlsl, sat); q; q = strstr(q + wl, sat), k++) {
-        if (strlen(hlsl) - sl + wl + 1 > cap) break;
-        memmove(q + wl, q + sl, strlen(q + sl) + 1);
-        memcpy(q, with, wl);
-    }
-    return k;
-}
-
-/* The variant of a draw into an unpromoted target (HDRV_SAT): each sample of
- * the units in mask, promoted targets, clamped to [0, 1]. Returns how many. */
-static int fp_hdr_sat_units(char* hlsl, size_t cap, u32 mask)
-{
-    int k = 0;
-    for (u32 u = 0; u < RSX_FP_UNITS; u++) {
-        if (!((mask >> u) & 1u)) continue;
-        char needle[3][48];
-        snprintf(needle[0], sizeof needle[0], "rsx_tex[%u].Sample(rsx_samp[%u],", u, u);
-        snprintf(needle[1], sizeof needle[1], "rsx_tex%u.Sample(rsx_samp[%u],", u, u);
-        snprintf(needle[2], sizeof needle[2], "rsx_tex%u.Sample(rsx_samp%u,", u, u);
-        for (int i = 0; i < 3; i++) {
-            char* from = hlsl;
-            char* hit;
-            while ((hit = strstr(from, needle[i])) != NULL) {
-                char* close = hlsl_insert_before_close(hlsl, cap, strchr(hit, '('), "");
-                const size_t used = strlen(hlsl);
-                if (!close || used + 10 + 1 > cap) return k;
-                memmove(close + 2, close + 1, used - (size_t)(close + 1 - hlsl) + 1);   /* ")" after it */
-                close[1] = ')';
-                memmove(hit + 9, hit, used + 1 - (size_t)(hit - hlsl) + 1);            /* "saturate(" before */
-                memcpy(hit, "saturate(", 9);
-                from = close + 11;
-                k++;
-            }
-        }
-    }
-    return k;
-}
-
 /* A fragment program's text in HDR variant hdrv (dr_hdrv), as vp_get_fp_pso
- * makes it; the pipeline index's build (rsx_shader_precompile.c) makes its
- * rows' texts with it too. Returns how many clamps or samples it changed. */
-static int rc_shader_hdr(char* hlsl, u32 cap, u32 hdrv)
-{
-    if (!hlsl || !hdrv) return 0;
-    return (hdrv & HDRV_SAT) ? fp_hdr_sat_units(hlsl, cap, hdrv & ~HDRV_SAT) : fp_hdr_unclamp(hlsl, cap, hdrv);
-}
+ * makes it (rsxc_shader_hdr); also the route's shader_hdr. Returns how many
+ * clamps or samples it changed. */
+static int rc_shader_hdr(char* hlsl, u32 cap, u32 hdrv) { return rsxc_shader_hdr(hlsl, cap, hdrv); }
 
 /* At a batch's start, before any target is made: the targets promoted in this
  * batch, as the last batch found them. */

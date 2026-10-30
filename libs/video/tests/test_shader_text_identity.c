@@ -24,7 +24,9 @@
  *    and units, before and after the program changes;
  *  - for a sample of texts, gpu_sc_put and rsx_d3d12_shader_cache_put each
  *    fill their own new cache directory: the same results, file names and
- *    bytes (PS3_SHADER_CACHE_HLSL=1, so the kept texts too).
+ *    bytes (PS3_SHADER_CACHE_HLSL=1, so the kept texts too); gpu_sc_load
+ *    reads them back by key, and gpu_sc_compile_entry (another entry point,
+ *    GPU_SC_OPTIMIZE) gives FXC's own bytes for the same call.
  *
  * Nothing here comes from a game. Exit 0 when everything matches. Windows
  * only: it links the runtime library, whose D3D12 renderer has the exports.
@@ -37,6 +39,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3dcompiler.h>            /* today's FXC call, for the entry point check */
 
 #include "ps3emu/ps3_knob.h"        /* ps3_env_gen: a knob's next read sees a setenv */
 #include "rsx_d3d12_backend.h"     /* today's exports */
@@ -712,6 +715,68 @@ static void cache_test(const char* da, const char* db)
         int s2 = gpu_sc_compile(GPU_SC_DXBC, GPU_SC_PS, "float4 main( {", 14, "bad", 0, &blob, err, sizeof err);
         check_int("compile error", s2, GPU_SC_FAILED);
         check_int("compile error text", err[0] != 0, 1);
+    }
+
+    /* gpu_sc_load: by key, the bytes a cache hit reads; nothing for a key
+     * that is not there. */
+    for (int i = 0; i < g_sample_n; i++) {
+        const gpu_sc_stage st = g_sample[i].fragment ? GPU_SC_PS : GPU_SC_VS;
+        const size_t tl = strlen(g_sample[i].text);
+        char p[MAX_PATH + 64];
+        if (!gpu_sc_cache_path(GPU_SC_DXBC, st, g_sample[i].text, tl, p, sizeof p)) continue;
+        long l;
+        u8* a = file_read(p, &l);
+        snprintf(g_ctx, sizeof g_ctx, "load %d", i);
+        gpu_sc_blob blob;
+        const u64 key = gpu_sc_key(g_sample[i].text, tl, gpu_sc_profile(GPU_SC_DXBC, st));
+        const int r = gpu_sc_load(GPU_SC_DXBC, st, key, &blob);
+        check_int("load", r, a && l > 0 ? GPU_SC_OK : GPU_SC_NOT_CACHED);
+        if (r == GPU_SC_OK)
+            check_int("load bytes", blob.size == (size_t)l && !memcmp(blob.data, a, (size_t)l), 1);
+        gpu_sc_blob_release(&blob);
+        free(a);
+    }
+    {
+        gpu_sc_blob blob;
+        snprintf(g_ctx, sizeof g_ctx, "load of a key not there");
+        check_int("load missing", gpu_sc_load(GPU_SC_DXBC, GPU_SC_VS, 0x0123456789abcdefull, &blob),
+                  GPU_SC_NOT_CACHED);
+    }
+
+    /* An entry point other than main and the highest optimisation, as the
+     * post-processing shaders compile: today's D3DCompile call, byte for
+     * byte, and only without the cache (its key holds neither). */
+    {
+        static const char two[] =
+            "float4 a_vs(uint id : SV_VertexID) : SV_Position { return float4(id & 1, id >> 1, 0, 1); }\n"
+            "float4 a_ps(float4 p : SV_Position) : SV_Target { return frac(p * 0.37) * p.x; }\n";
+        static const char* const entry[2] = { "a_vs", "a_ps" };
+        for (int k = 0; k < 4; k++) {
+            const int ps = k & 1, opt = k >> 1;
+            snprintf(g_ctx, sizeof g_ctx, "entry %s%s", entry[ps], opt ? " optimised" : "");
+            ID3DBlob* want = NULL;
+            const HRESULT hr = D3DCompile(two, sizeof two - 1, "two", NULL, NULL, entry[ps], ps ? "ps_5_0" : "vs_5_0",
+                                          opt ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0, 0, &want, NULL);
+            gpu_sc_blob blob;
+            const unsigned fl = GPU_SC_NO_CACHE | (opt ? GPU_SC_OPTIMIZE : 0u);
+            const int r = gpu_sc_compile_entry(GPU_SC_DXBC, ps ? GPU_SC_PS : GPU_SC_VS, two, sizeof two - 1, "two",
+                                               entry[ps], fl, &blob, NULL, 0);
+            check_int("entry compile", r, SUCCEEDED(hr) && want ? GPU_SC_OK : GPU_SC_FAILED);
+            if (r == GPU_SC_OK && want)
+                check_int("entry bytes", blob.size == want->lpVtbl->GetBufferSize(want) &&
+                          !memcmp(blob.data, want->lpVtbl->GetBufferPointer(want), blob.size), 1);
+            gpu_sc_blob_release(&blob);
+            if (want) want->lpVtbl->Release(want);
+            check_int("entry with the cache",
+                      gpu_sc_compile_entry(GPU_SC_DXBC, ps ? GPU_SC_PS : GPU_SC_VS, two, sizeof two - 1, "two",
+                                           entry[ps], opt ? GPU_SC_OPTIMIZE : 0u, &blob, NULL, 0),
+                      GPU_SC_BAD_ARG);
+        }
+        gpu_sc_blob blob;
+        snprintf(g_ctx, sizeof g_ctx, "optimised main with the cache");
+        check_int("optimise with the cache",
+                  gpu_sc_compile_entry(GPU_SC_DXBC, GPU_SC_VS, "x", 1, "x", NULL, GPU_SC_OPTIMIZE, &blob, NULL, 0),
+                  GPU_SC_BAD_ARG);
     }
     for (int t = GPU_SC_SPV; t < GPU_SC_TARGET_COUNT; t++) {
         gpu_sc_blob blob;

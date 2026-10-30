@@ -310,9 +310,9 @@ static void compile_vp(void)
         "  if (cov <= 0.5) discard; return float4(i.col0.rgb, 1); }\n";
 
     ID3DBlob *vb=NULL,*pb=NULL,*e=NULL;
-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "vp", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &e);
+    HRESULT hr = sc_compile(GPU_SC_VS, hlsl, strlen(hlsl), "vp", NULL, GPU_SC_NO_CACHE, &vb, &e);
     if (FAILED(hr)) { printf("[VP] VS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
-    hr = D3DCompile(ps, sizeof(ps)-1, "vpps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &e);
+    hr = sc_compile(GPU_SC_PS, ps, sizeof(ps)-1, "vpps", NULL, GPU_SC_NO_CACHE, &pb, &e);
     if (FAILED(hr)) { printf("[VP] PS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); if(vb)vb->lpVtbl->Release(vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
 
     /* The decompiled VS declares inputs a0:ATTR0 .. a15:ATTR15 and the HLSL
@@ -376,8 +376,8 @@ static void compile_vp(void)
             "  float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7; };\n"
             "float4 main(PSIn i):SV_TARGET{ return float4(i.col0.rgb, 1); }\n";
         ID3DBlob *pcb=NULL,*ec=NULL;
-        if (SUCCEEDED(D3DCompile(ps_col, sizeof(ps_col)-1, "vppsc", NULL, NULL,
-                                 "main", "ps_5_0", 0, 0, &pcb, &ec)) && pcb) {
+        if (SUCCEEDED(sc_compile(GPU_SC_PS, ps_col, sizeof(ps_col)-1, "vppsc", NULL,
+                                 GPU_SC_NO_CACHE, &pcb, &ec)) && pcb) {
             pd.PS.pShaderBytecode = pcb->lpVtbl->GetBufferPointer(pcb);
             pd.PS.BytecodeLength  = pcb->lpVtbl->GetBufferSize(pcb);
             HRESULT hr2 = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(

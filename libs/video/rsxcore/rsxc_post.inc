@@ -97,11 +97,11 @@ static int aa_ready(void)
     if (s_aa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
     s_aa.failed = 1;   /* until it is made */
     ID3DBlob *vb = NULL, *pb = NULL, *rsb = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL, NULL, "main",
-                            "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vb, &err);
+    HRESULT hr = sc_compile(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
+                            GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &vb, &err);
     if (SUCCEEDED(hr))
-        hr = D3DCompile(rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL, NULL, "main",
-                        "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &pb, &err);
+        hr = sc_compile(GPU_SC_PS, rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL,
+                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &pb, &err);
     if (FAILED(hr))
         printf("[AA] shader compile failed: %s\n",
                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
@@ -263,8 +263,8 @@ static int smaa_ready(void)
         memcpy(text + nh + ns, rsx_smaa_tail, nt);
     }
     for (int i = 0; i < 6 && SUCCEEDED(hr); i++) {
-        hr = D3DCompile(text, nh + ns + nt, "rsx_smaa", NULL, NULL, entry[i], (i & 1) ? "ps_5_0" : "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code[i], &err);
+        hr = sc_compile((i & 1) ? GPU_SC_PS : GPU_SC_VS, text, nh + ns + nt, "rsx_smaa", entry[i],
+                        GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE, &code[i], &err);
         if (FAILED(hr))
             printf("[AA] SMAA shader %s failed to compile: %s\n", entry[i],
                    err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");

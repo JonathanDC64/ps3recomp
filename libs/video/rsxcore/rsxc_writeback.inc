@@ -16,15 +16,6 @@
  * (it costs a GPU wait plus a CPU conversion per frame).
  * -----------------------------------------------------------------------*/
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
-/* RSX_WRITE_COLOR_LOG: guest ranges of the fragment programs drawn with,
- * so a write-back that lands on live ucode is reported. */
-static u32 s_fp_seen[512][2]; static int s_fp_seen_n;
-static void fp_seen_note(u32 ea, u32 len)
-{
-    for (int i = 0; i < s_fp_seen_n; i++) if (s_fp_seen[i][0] == ea) return;
-    if (s_fp_seen_n < 512) { s_fp_seen[s_fp_seen_n][0] = ea; s_fp_seen[s_fp_seen_n][1] = len; s_fp_seen_n++; }
-}
-
 static int write_color_on(void)
 {
     static int on = -1;
@@ -109,9 +100,9 @@ static int down_init(void)
         "    return src.Load(int3(int2(p.xy * ratio), 0)).argb;\n"
         "}\n";
     ID3DBlob* err = NULL;
-    if (FAILED(D3DCompile(vs, sizeof vs - 1, "down_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &s_down_vs, &err)) ||
-        FAILED(D3DCompile(ps, sizeof ps - 1, "down_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &s_down_ps, &err)) ||
-        FAILED(D3DCompile(ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, NULL, "main", "ps_5_0", 0, 0,
+    if (FAILED(sc_compile(GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE, &s_down_vs, &err)) ||
+        FAILED(sc_compile(GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE, &s_down_ps, &err)) ||
+        FAILED(sc_compile(GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, GPU_SC_NO_CACHE,
                           &s_down_ps_argb, &err))) {
         if (err) { fprintf(stderr, "[D3D12] write-back downscale: %s%c", (const char*)err->lpVtbl->GetBufferPointer(err), 10);
                    err->lpVtbl->Release(err); }
@@ -517,8 +508,11 @@ static void rt_writeback_store(void)
                     if (shadow[i][k] != vm_base[dst + k]) { if (!ndiff) first = k; ndiff++; }
             fprintf(stderr, "[WRITE-COLOR] off=0x%X -> 0x%08X %ux%u fmt=0x%08X pitch=%u dma=0x%X%s foreign=%u first=+0x%X%c",
                     r->off, dst, r->w, r->h, r->gfmt, gp, r->gdma, swz ? " swz" : "", ndiff, first, 10);
-            for (int q = 0; q < s_fp_seen_n; q++) {
-                u32 fa = s_fp_seen[q][0], fl = s_fp_seen[q][1];
+            /* The guest ranges of the fragment programs drawn with (rsxc_fp_seen),
+             * so a write-back that lands on live ucode is reported. */
+            for (int q = 0, nq = rsxc_fp_seen(-1, NULL, NULL); q < nq; q++) {
+                u32 fa = 0, fl = 0;
+                rsxc_fp_seen(q, &fa, &fl);
                 if (fa < dst + len && dst < fa + fl)
                     fprintf(stderr, "[WRITE-COLOR] !! surface 0x%X [0x%08X,+0x%X) overlaps FP ucode 0x%08X+0x%X%c",
                             r->off, dst, len, fa, fl, 10);

@@ -1295,6 +1295,8 @@ rtt_dump_done:;
         s_t_prev = now;
         if (++s_n % 20 == 0) {
             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
+            gpu_sc_stats sc;   /* the shader compiles: the compile service's counters */
+            gpu_sc_stats_take(&sc, 1);
             if (perf_print()) fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
                             " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
@@ -1310,12 +1312,11 @@ rtt_dump_done:;
                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
                     fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr,
                     s_perf_vs, s_perf_vs_compiles,
-                    s_perf_fxc, s_perf_fxc_n, s_perf_sc_hits, s_perf_cpso, s_perf_cpso_n, s_perf_pmiss, 10);
+                    sc.compile_s, sc.compiles, sc.cache_hits, s_perf_cpso, s_perf_cpso_n, s_perf_pmiss, 10);
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
             s_perf_vs_compiles = 0; s_perf_vs = 0.0;
-            s_perf_fxc = 0.0; s_perf_fxc_n = 0; s_perf_sc_hits = 0;
             s_perf_cpso = 0.0; s_perf_cpso_n = 0; s_perf_pmiss = 0.0;
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }

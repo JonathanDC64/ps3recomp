@@ -1,10 +1,11 @@
 /*
  * ps3recomp - the shader compile service (portable renderer): gpu_shader.h
  *
- * The dxbc target is today's D3D12 renderer's shader disk cache and FXC call,
- * copied from rsx_d3d12_backend.c line for line (copy_manifest.txt): the same
- * key, file name, header checks and store, so its files are today's. The
- * other targets are declared and not available yet.
+ * The dxbc target is today's D3D12 renderer's shader disk cache, its
+ * read-ahead and FXC call, copied from rsx_d3d12_backend.c line for line
+ * (copy_manifest.txt): the same key, file name, header checks and store, so
+ * its files are today's. The other targets are declared and not available
+ * yet.
  */
 #if defined(PS3RECOMP_RSX_HAL)
 
@@ -157,6 +158,100 @@ static HRESULT shader_compile_cached(const char* src, size_t n, const char* name
     return hr;
 }
 
+/* PS3_SHADER_CACHE_WARM=<n> (default 4; 0 = off): at startup, n threads read
+ * every program in the shader cache once, in the background. Windows'
+ * antivirus scans a file the first time it is opened after it was written:
+ * about 3 ms for one of these, against 0.07 ms after, and the scan is
+ * remembered across runs. Setup's shader pass writes some 3,600 just before
+ * a first start, so a first walk opened each for the first time when a draw
+ * needed it, on the render thread for a pixel program and the FIFO thread
+ * for a vertex program: 520 ms of lookups for 189 new pipelines in a
+ * Tutorial walk, up to 54 ms for one. On four threads the read takes about
+ * 2 s while the game boots. Off Windows there is no such scan, and nothing
+ * is read ahead. */
+#ifdef _WIN32
+static struct {
+    char (*names)[64];
+    LONG n;
+    volatile LONG next, live;
+    int threads;
+    double t0;
+    char dir[MAX_PATH];
+} s_scw;
+static void shader_cache_warm_files(void)
+{
+    char path[MAX_PATH + 80];
+    u8 buf[16 * 1024];   /* (the programs are a few KB) */
+    for (LONG i; (i = InterlockedIncrement(&s_scw.next) - 1) < s_scw.n; ) {
+        snprintf(path, sizeof path, "%s/%s", s_scw.dir, s_scw.names[i]);
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        while (fread(buf, 1, sizeof buf, f) == sizeof buf) {}
+        fclose(f);
+    }
+    if (InterlockedDecrement(&s_scw.live) == 0) {
+        printf("[D3D12] shader cache: %ld files read ahead in %.0f ms on %d threads (PS3_SHADER_CACHE_WARM)\n",
+               (long)s_scw.n, 1000.0 * (perf_now() - s_scw.t0), s_scw.threads);
+        free(s_scw.names);
+        s_scw.names = NULL;
+    }
+}
+static DWORD WINAPI shader_cache_warm_worker(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    shader_cache_warm_files();
+    return 0;
+}
+/* The first thread lists the files, starts the others and reads too. */
+static DWORD WINAPI shader_cache_warm_lister(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    char pat[MAX_PATH + 16];
+    snprintf(pat, sizeof pat, "%s/*.dxbc", s_scw.dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    LONG cap = 0;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || strlen(fd.cFileName) >= 64) continue;
+        if (s_scw.n == cap) {
+            const LONG c = cap ? cap * 2 : 4096;
+            char (*g)[64] = (char (*)[64])realloc(s_scw.names, (size_t)c * 64);
+            if (!g) break;
+            s_scw.names = g; cap = c;
+        }
+        memcpy(s_scw.names[s_scw.n++], fd.cFileName, strlen(fd.cFileName) + 1);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (!s_scw.n) { free(s_scw.names); s_scw.names = NULL; return 0; }
+    s_scw.t0 = perf_now();
+    s_scw.live = s_scw.threads;
+    for (int t = 1; t < s_scw.threads; t++) {
+        HANDLE w = CreateThread(NULL, 0, shader_cache_warm_worker, NULL, 0, NULL);
+        if (w) CloseHandle(w); else InterlockedDecrement(&s_scw.live);
+    }
+    shader_cache_warm_files();
+    return 0;
+}
+static void shader_cache_warm(void)
+{
+    static int once = 0;
+    const char* dir = shader_cache_dir();
+    int nt = ps3_env_int("PS3_SHADER_CACHE_WARM", 4);
+    if (once++ || !dir[0] || nt <= 0) return;
+    s_scw.threads = nt > 16 ? 16 : nt;
+    snprintf(s_scw.dir, sizeof s_scw.dir, "%s", dir);
+    HANDLE h = CreateThread(NULL, 0, shader_cache_warm_lister, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#else
+static void shader_cache_warm(void) {}
+#endif
+
+void gpu_sc_warm(void) { shader_cache_warm(); }
+
 static const char* const s_dxbc_profile[GPU_SC_STAGE_COUNT] = { "vs_5_0", "ps_5_0", "gs_5_0" };
 
 const char* gpu_sc_cache_dir(void) { return shader_cache_dir(); }
@@ -170,6 +265,8 @@ void gpu_sc_stats_take(gpu_sc_stats* out, int reset)
 #else /* no dxbc here */
 
 const char* gpu_sc_cache_dir(void) { return ""; }
+
+void gpu_sc_warm(void) {}
 
 void gpu_sc_stats_take(gpu_sc_stats* out, int reset)
 {
@@ -211,15 +308,27 @@ int gpu_sc_cache_path(gpu_sc_target target, gpu_sc_stage stage, const char* src,
 int gpu_sc_compile(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
                    const char* name, unsigned flags, gpu_sc_blob* out, char* err, size_t err_cap)
 {
+    return gpu_sc_compile_entry(target, stage, src, n, name, NULL, flags, out, err, err_cap);
+}
+
+int gpu_sc_compile_entry(gpu_sc_target target, gpu_sc_stage stage, const char* src, size_t n,
+                         const char* name, const char* entry, unsigned flags, gpu_sc_blob* out,
+                         char* err, size_t err_cap)
+{
     if (out) { out->data = NULL; out->size = 0; out->impl = NULL; }
     if (err && err_cap) err[0] = 0;
     if (!src || !out || (unsigned)stage >= GPU_SC_STAGE_COUNT) return GPU_SC_BAD_ARG;
+    if (!entry) entry = "main";
+    /* The cache's key holds the text and the profile, not the entry or flags. */
+    if (!(flags & GPU_SC_NO_CACHE) && ((flags & GPU_SC_OPTIMIZE) || strcmp(entry, "main")))
+        return GPU_SC_BAD_ARG;
     if (!gpu_sc_available(target)) return GPU_SC_UNAVAILABLE;
 #ifdef GPU_SC_HAVE_DXBC
     const char* profile = s_dxbc_profile[stage];
+    const UINT fl = (flags & GPU_SC_OPTIMIZE) ? D3DCOMPILE_OPTIMIZATION_LEVEL3 : 0;
     ID3DBlob* b = NULL; ID3DBlob* e = NULL;
     HRESULT hr = (flags & GPU_SC_NO_CACHE)
-        ? D3DCompile(src, n, name, NULL, NULL, "main", profile, 0, 0, &b, &e)
+        ? D3DCompile(src, n, name, NULL, NULL, entry, profile, fl, 0, &b, &e)
         : shader_compile_cached(src, n, name, profile, &b, &e);
     if (e) {
         if (err && err_cap)
@@ -237,6 +346,28 @@ int gpu_sc_compile(gpu_sc_target target, gpu_sc_stage stage, const char* src, si
     return GPU_SC_OK;
 #else
     (void)n; (void)name; (void)flags;
+    return GPU_SC_UNAVAILABLE;
+#endif
+}
+
+int gpu_sc_load(gpu_sc_target target, gpu_sc_stage stage, uint64_t key, gpu_sc_blob* out)
+{
+    if (out) { out->data = NULL; out->size = 0; out->impl = NULL; }
+    if (!out || (unsigned)stage >= GPU_SC_STAGE_COUNT) return GPU_SC_BAD_ARG;
+    if (!gpu_sc_available(target)) return GPU_SC_UNAVAILABLE;
+#ifdef GPU_SC_HAVE_DXBC
+    const char* dir = shader_cache_dir();
+    if (!dir[0]) return GPU_SC_NOT_CACHED;
+    char path[MAX_PATH + 64];
+    snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", dir, s_dxbc_profile[stage], (unsigned long long)key);
+    ID3DBlob* b = shader_cache_load(path);
+    if (!b) return GPU_SC_NOT_CACHED;
+    out->impl = b;
+    out->data = b->lpVtbl->GetBufferPointer(b);
+    out->size = b->lpVtbl->GetBufferSize(b);
+    return GPU_SC_OK;
+#else
+    (void)key;
     return GPU_SC_UNAVAILABLE;
 #endif
 }

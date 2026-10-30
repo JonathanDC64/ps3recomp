@@ -120,14 +120,3 @@ static float rsx_aspect(void)
 #endif
 #include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */
 
-/* Paths are joined with '/' on every host (Windows takes it too); one that
- * comes from the host may hold either separator. */
-static char* rsx_path_last_sep(char* path)
-{
-    char* fwd = strrchr(path, '/');
-    char* back = strrchr(path, '\\');
-    if (!fwd) return back;
-    if (!back) return fwd;
-    return fwd > back ? fwd : back;
-}
-

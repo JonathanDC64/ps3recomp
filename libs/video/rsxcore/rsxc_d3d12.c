@@ -24,13 +24,13 @@
 
 #include "rsxc_head.inc"
 #include "rsxc_state.inc"
+#include "rsxc_shadercache.inc"   /* (before the first fragment that compiles a shader) */
 #include "rsxc_window.inc"
 #include "rsxc_hdr.inc"
 #include "rsxc_init.inc"
 #include "rsxc_sync.inc"
 #include "rsxc_present.inc"
 #include "rsxc_cap.inc"
-#include "rsxc_shadercache.inc"
 #include "rsxc_psolib.inc"
 #include "rsxc_vs.inc"
 #include "rsxc_fp.inc"

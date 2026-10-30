@@ -275,9 +275,11 @@ static long long s_rf_cp[RF_CPS];
 static double s_rf_pp[6], s_rf_pp0[6]; static int s_rf_ppn[3], s_rf_ppn0[3];
 static void rf_pp_snap(double* d, int* n)
 {
+    gpu_sc_stats sc;   /* the shader compiles: the compile service's counters */
+    gpu_sc_stats_take(&sc, 0);
     d[0] = s_perf_tex; d[1] = s_perf_srv; d[2] = s_perf_pso; d[3] = s_perf_cpso;
-    d[4] = s_perf_fxc; d[5] = s_perf_pmiss;
-    n[0] = s_perf_ntex; n[1] = s_perf_cpso_n; n[2] = s_perf_fxc_n;
+    d[4] = sc.compile_s; d[5] = s_perf_pmiss;
+    n[0] = s_perf_ntex; n[1] = s_perf_cpso_n; n[2] = sc.compiles;
 }
 #define RF_CP(i) do { LARGE_INTEGER _c; QueryPerformanceCounter(&_c); s_rf_cp[i] = _c.QuadPart; } while (0)
 static void rf_slow_report(void)

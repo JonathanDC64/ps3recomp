@@ -1,12 +1,8 @@
 /* Hash + compile the CURRENT rsx_state vertex program into the VS cache;
  * returns the cache slot (or -1). Called at draw-record time so each draw
- * carries the VP that was loaded when it was submitted. */
-static u32 vp_hash_ucode(const u8* p, u32 n)
-{
-    u32 h = 2166136261u;
-    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
-    return h ? h : 1u;
-}
+ * carries the VP that was loaded when it was submitted. The program's key
+ * and text are rsxc_shader.c's (rsxc_vs_locate, rsxc_vs_text, step C3a); the
+ * cache, its memo and the dumps are here. */
 
 /* Append a program to the per-draw VS cache. vs NULL records a program that
  * failed to decompile or compile, so it is not retried on every draw. */
@@ -35,9 +31,6 @@ static int vp_get_vs(const rsx_state* st) { return vp_get_vs_mode(st, 0); }
 static int vp_get_vs_fetch(const rsx_state* st) { return vp_get_vs_mode(st, 1); }
 static int vp_get_vs_mode(const rsx_state* st, int fetch)
 {
-    extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
-    extern int rsx_vp_decompile_fetch(const uint8_t*, u32, char*, u32);
-    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
     if (!st || st->vp_ucode_bytes < 16) return -1;
     /* Start at the instruction SET_TRANSFORM_PROGRAM_START selects, not at 0.
      * The microcode store holds every resident program -- this title keeps its
@@ -45,7 +38,8 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
      * decompiling from 0 ran the scene's transform for every draw. That is why
      * the fluid's 114300 vertices rasterized nothing: they were being pushed
      * through the wrong program.
-     * VP_START_OFF=1 restores the old always-from-zero behaviour. */
+     * VP_START_OFF=1 restores the old always-from-zero behaviour.
+     * (rsxc_vs_locate finds the same start; the memo below needs it first.) */
     u32 vstart = 0;
     { static int off = -1; PS3_KNOB(off, getenv("VP_START_OFF") ? 1 : 0);
       if (!off) vstart = st->transform_program_start * 16u; }
@@ -104,16 +98,13 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
             }
     }
     VsMemo* m = &mw[ways - 1];   /* the least recently used; its copy's buffer is reused */
-    const u8* vuc = st->vp_ucode + vstart;
-    u32 vlen = avail;
-    /* Key the program by its own instructions, up to its end bit. The store
-     * holds every resident program, so hashing to the end of the store made
-     * each program's key change whenever any program after it was uploaded. */
-    int vend = 0;
-    { const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
-      if (instrs) { vlen = instrs * 16u; vend = 1; } }
-    u32 hash = vp_hash_ucode(vuc, vlen);
-    if (fetch) hash ^= 0x9E3779B9u;
+    /* The program keyed by its own instructions, up to its end bit. */
+    rsxc_vs_program vp;
+    if (rsxc_vs_locate(st, fetch, &vp) < 0) return -1;
+    const u8* vuc = vp.code;
+    const u32 vlen = vp.vlen;
+    const int vend = vp.end;
+    const u32 hash = vp.hash;
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) {
             m->st = st; m->ver = g_rsx_vp_ucode_ver; m->vstart = vstart;
@@ -139,8 +130,10 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
     static char hlsl[262144];
     const double vs_t0 = perf_on() ? perf_now() : 0.0;
     s_perf_vs_compiles++;
-    int ni = fetch ? rsx_vp_decompile_fetch(vuc, vlen, hlsl, sizeof hlsl)
-                   : rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
+    /* The text, with VP_W_ONE's and VP_BYPASS's patches (so the dumps below
+     * show them too). */
+    int uses_c03 = 0;
+    int ni = rsxc_vs_text(&vp, fetch, hlsl, sizeof hlsl, &uses_c03);
     if (ni <= 0) return vp_vs_insert(hash, NULL, 0);
     if (getenv("VP_DUMP")) { static int _d=0; if (_d < 4 && ++_d) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
@@ -159,55 +152,18 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
                    fclose(f); }
           fprintf(stderr, "[DUCKVP] wrote duck_vp.hlsl (%d instrs)%c", ni, 10);
       } }
-    /* VP_BYPASS=1: replace the guest transform with a direct map of attribute 0
-     * into clip space. If geometry appears with this on, everything from the
-     * input layout through raster/depth/present is sound and the fault is the
-     * transform (constants or the decompiled program); if it stays blank, the
-     * fault is upstream of the shader -- the attribute binding itself. Patched
-     * in place, space-padded to the original length so offsets stay valid. */
-    /* VP_W_ONE=1: keep the guest transform but force the clip-space w to 1.
-     * Different from VP_BYPASS, which replaces the whole position: this tests
-     * only the hypothesis that w is wrong. This title's VP ends
-     *   { float4 _v = (float4)((vp_c[467]).xxxx); o[0].w = _v.w; }
-     * with c467 = (-1, 1, 0, 0), so w = -1 and the clipper discards every
-     * vertex. Patched in place, space-padded so offsets stay valid. */
-    if (getenv("VP_W_ONE")) {
-        static const char anchor[] = "o[0].w = _v.w;";
-        static const char repl[]   = "o[0].w = 1.0;";
-        char* at = hlsl;
-        while ((at = strstr(at, anchor)) != NULL) {
-            size_t n = sizeof(anchor) - 1, m = sizeof(repl) - 1;
-            memcpy(at, repl, m);
-            memset(at + m, ' ', n - m);
-            at += n;
-        }
-    }
-    if (getenv("VP_BYPASS")) {
-        static const char anchor[] =
-            "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
-        static const char repl[] = "Out.pos = float4(v[0].xy * 0.5, 0.5, 1.0);";
-        char* at = hlsl;
-        while ((at = strstr(at, anchor)) != NULL) {
-            size_t n = sizeof(anchor) - 1, m = sizeof(repl) - 1;
-            memcpy(at, repl, m);
-            memset(at + m, ' ', n - m);
-            at += n;
-        }
-    }
     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), "guest_vp2", "vs_5_0", &vb, &e);
+    HRESULT hr = sc_compile(GPU_SC_VS, hlsl, strlen(hlsl), "guest_vp2", NULL, 0, &vb, &e);
     if (e) e->lpVtbl->Release(e);
     if (perf_on()) s_perf_vs += perf_now() - vs_t0;
     if (FAILED(hr) || !vb) {
         static int _e=0; if (_e < 4 && ++_e) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
         return vp_vs_insert(hash, NULL, 0);
     }
-    const int slot = vp_vs_insert(hash, vb,
-        (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
-         strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0);
+    const int slot = vp_vs_insert(hash, vb, uses_c03);
     if (slot < 0) return -1;
     s_d3d.vp_vs[slot].fetch = fetch;
-    s_d3d.vp_vs[slot].code64 = fnv_bytes(14695981039346656037ull, vuc, vlen);
+    s_d3d.vp_vs[slot].code64 = rsxc_vs_code64(&vp);
     s_d3d.vp_vs[slot].start = vstart / 16u;
     { static int _n=0; if (_n < 6 && ++_n) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
