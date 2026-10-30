@@ -28,6 +28,14 @@ void rsx_d3d12_pso_index_add(int vs_fetch, uint64_t vs_key, int clamp, uint64_t 
                              uint32_t blend, int nrt, uint32_t rtfmt, uint32_t cmask, uint32_t cull,
                              uint32_t depth);
 void rsx_d3d12_pso_index_ready(uint64_t hash);
+#if defined(PS3RECOMP_RSX_HAL)
+/* Built with the portable renderer: the pipeline index's rows go to the
+ * renderer the route switch picked (rsx_out.h). The texts, keys and the
+ * shader cache above are the same on every route and stay today's. */
+#include "rsx_out.h"
+#define rsx_d3d12_pso_index_add   rsx_out_pso_index_add
+#define rsx_d3d12_pso_index_ready rsx_out_pso_index_ready
+#endif
 
 #define CG_PROFILE_SCE_VP_RSX 0x1B5Bu
 #define CG_PROFILE_SCE_FP_RSX 0x1B5Cu
