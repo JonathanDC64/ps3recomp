@@ -122,6 +122,10 @@ static void rc_backend_shutdown(void)
     s_of.pso = NULL; s_of.rs = NULL;
     s_d3d.blit_pso = NULL; s_d3d.blit_rs = NULL;
     s_aa.pso = NULL; s_aa.pso16 = NULL; s_aa.rs = NULL;
+    /* Step C6: the AA display copy, SMAA's textures and the repaint hold are
+     * the GPU layer's and go with gpu_destroy; their pointers were borrowed. */
+    s_aa.disp = NULL; s_aa.disp_tex.id = 0;
+    s_hold = NULL; s_hold_tex.id = 0; s_hold_valid = 0;
     memset(&s_of, 0, sizeof s_of);
     if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
     if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
@@ -381,7 +385,6 @@ static void rc_overlay_tick(void)
      * next batch anyway), then into the window's as for any frame. */
     const u32 fi = s_d3d.frame_index;
     frame_cmd_begin(fi);
-    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     if (!held) {
         /* The last frame shown is still in its render target: a frame index
          * moves only at a Present, so every batch since has drawn into the
@@ -392,22 +395,11 @@ static void rc_overlay_tick(void)
             return;
         }
     }
-    D3D12_RESOURCE_BARRIER b[2] = {0};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[1].Transition.pResource   = s_hold;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
-    cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    /* (On the recorder just begun, step C6: the hold's handle and the
+     * display target's.) */
+    hold_barriers(fi, GPU_STATE_PRESENT, GPU_STATE_COPY_DEST, GPU_STATE_COMMON, GPU_STATE_COPY_SOURCE);
+    gpu_cmd_copy_texture_whole(s_rc_cmd, s_rc_rt_tex[fi], s_hold_tex);
+    hold_barriers(fi, GPU_STATE_COPY_DEST, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE, GPU_STATE_COMMON);
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
     blit_to_window(fi);
     s_shown_fi = fi;

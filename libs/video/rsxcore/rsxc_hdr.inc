@@ -178,13 +178,14 @@ static int hdr_want(void)
 /* The swap chain's buffers and their RTVs (init and after a resize). The
  * buffers are the swap chain's images; s_d3d.swap_buffers borrows them. The
  * RTVs are views of the images (step C5a, today's NULL description), which
- * a resize drops with the images, so they are made again here. */
+ * a resize drops with the images, so they are made again here. (Step C6: the
+ * images by index are gpu.h's gpu_swap_image, the bridge's no longer.) */
 static int swap_buffers_get(void)
 {
     memset(s_rc_swap_rtv, 0, sizeof s_rc_swap_rtv);
     memset(s_rc_swap_rtv_cpu, 0, sizeof s_rc_swap_rtv_cpu);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
-        s_rc_swap_image[i] = gpu_d3d12_swap_image(s_rc_dev, s_rc_swap, i);
+        s_rc_swap_image[i] = gpu_swap_image(s_rc_dev, s_rc_swap, i);
         s_d3d.swap_buffers[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
         if (!s_d3d.swap_buffers[i]) return -1;
         s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0, &s_rc_swap_rtv_cpu[i]);
@@ -412,48 +413,54 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
 
 /* Records the scale of the game's frame fi into the window's buffer fi: the
  * largest rectangle with the frame's aspect ratio (RSX_ASPECT's, when set),
- * centred, black around it. Both resources are in PRESENT before and after. */
+ * centred, black around it. Both resources are in PRESENT before and after.
+ * On the frame's recorder (step C6): s_rc_rt_tex[fi] is render_targets[fi]'s
+ * handle, s_rc_swap_image[fi] swap_buffers[fi]'s, s_rc_swap_rtv[fi] its view;
+ * the pipelines and layouts bound are the passes' handles. */
 static void blit_to_window(u32 fi)
 {
-    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    D3D12_RESOURCE_BARRIER b[2] = {0};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b[1].Transition.pResource   = s_d3d.swap_buffers[fi];
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    gpu_cmd* const c = s_rc_cmd;
+    gpu_barrier b[2];
+    memset(b, 0, sizeof b);
+    b[0].type    = GPU_BARRIER_TRANSITION;
+    b[0].texture = s_rc_rt_tex[fi];
+    b[0].sub     = GPU_SUB_ALL;
+    b[0].before  = GPU_STATE_PRESENT;
+    b[0].after   = GPU_STATE_PIXEL_SHADER_RESOURCE;
+    b[1] = b[0];
+    b[1].texture = s_rc_swap_image[fi];
+    b[1].after   = GPU_STATE_RENDER_TARGET;
+    gpu_cmd_barrier_n(c, 2, b);
 
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = s_rc_swap_rtv_cpu[fi];   /* image fi's view (step C5a) */
-    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
+    const gpu_view rtv = s_rc_swap_rtv[fi];   /* image fi's view (step C5a) */
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = rtv;
+    gpu_cmd_pass_begin(c, &pass);
 
     const float ww = (float)s_d3d.win_w, wh = (float)s_d3d.win_h;
     const float gh = (float)s_d3d.height, ar = rsx_aspect();
     const float gw = ar > 0.0f ? gh * ar : (float)s_d3d.width;   /* RSX_ASPECT: stretched to that shape */
     const float k = ww / gw < wh / gh ? ww / gw : wh / gh;
     const float vw = floorf(gw * k + 0.5f), vh = floorf(gh * k + 0.5f);
-    D3D12_VIEWPORT vp = {floorf((ww - vw) * 0.5f), floorf((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
+    const gpu_viewport vp = {floorf((ww - vw) * 0.5f), floorf((wh - vh) * 0.5f), vw, vh, 0.0f, 1.0f};
     if (vw != ww || vh != wh) {
         static const float black[4] = {0, 0, 0, 1};
-        cl->lpVtbl->ClearRenderTargetView(cl, rtv, black, 0, NULL);
+        gpu_cmd_clear_color(c, rtv, black, NULL);
     }
-    D3D12_RECT sc = {0, 0, (LONG)s_d3d.win_w, (LONG)s_d3d.win_h};
+    const gpu_rect sc = {0, 0, (int32_t)s_d3d.win_w, (int32_t)s_d3d.win_h};
     /* RSX_OUTFILTER=1: the area / bicubic pass instead of the bilinear tap.
      * With HDR on (the swap chain is FP16), the HDR pipelines (hdr_blit_ready). */
     const int hdr = s_hdr.active;
     const int sharp = knob_outfilter() == 1 && vw >= 1.0f && vh >= 1.0f && (hdr || of_ready());
     if (hdr) {
-        cl->lpVtbl->SetGraphicsRootSignature(cl, s_hdr_blit.rs);
-        cl->lpVtbl->SetPipelineState(cl, s_hdr_blit.pso[sharp]);
+        gpu_cmd_set_layout(c, s_hdr_blit.layout);
+        gpu_cmd_set_pipeline(c, rc_pipe(s_hdr_blit.pso[sharp]));
     } else {
-        cl->lpVtbl->SetGraphicsRootSignature(cl, sharp ? s_of.rs : s_d3d.blit_rs);
-        cl->lpVtbl->SetPipelineState(cl, sharp ? s_of.pso : s_d3d.blit_pso);
+        gpu_cmd_set_layout(c, sharp ? s_of.layout : s_d3d.blit_layout);
+        gpu_cmd_set_pipeline(c, rc_pipe(sharp ? s_of.pso : s_d3d.blit_pso));
     }
-    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     int use_t = 0;
     if (hdr) {   /* T's highlights at 2 fi + 1, for this frame only */
         const int t = s_hdr.frame_t;
@@ -467,39 +474,38 @@ static void blit_to_window(u32 fi)
         }
         gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, 2 * fi + 1, &v);
     }
-    cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.blit_srv_heap);
-    D3D12_GPU_DESCRIPTOR_HANDLE g;
-    s_d3d.blit_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &g);
-    g.ptr += (u64)(2 * fi) * inc;
-    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
+    const gpu_table_pool no_pool = {0};
+    gpu_cmd_set_table_pools(c, s_rc_blit_pool, no_pool);
+    gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_blit_pool, 2 * fi));   /* frame fi's table */
     if (sharp) {   /* viewport origin, frame texels per window pixel, frame size */
-        const float of[8] = {vp.TopLeftX, vp.TopLeftY, (float)s_d3d.host_w / vw, (float)s_d3d.host_h / vh,
+        const float of[8] = {vp.x, vp.y, (float)s_d3d.host_w / vw, (float)s_d3d.host_h / vh,
                              (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 0.0f};
-        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 8, of, 0);
+        gpu_cmd_push_const(c, 1, 8, of, 0);
     }
     if (hdr) {   /* paper white in scRGB units, peak / paper white, the knee, the curve, T */
         const float white = hdr_white_nits(), ratio = hdr_peak_nits() / white;
         const float knee = ratio <= 1.25f ? 0.8f * ratio : (0.6f * ratio > 1.0f ? 0.6f * ratio : 1.0f);
         const float hc[8] = {white / 80.0f, ratio, knee, knob_hdr_gamma() ? 1.0f : 0.0f,
                              (float)use_t, 0.0f, 0.0f, 0.0f};
-        cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 2, 8, hc, 0);
+        gpu_cmd_push_const(c, 2, 8, hc, 0);
     }
-    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
-    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
-    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+    gpu_cmd_set_viewport(c, &vp);
+    gpu_cmd_set_scissor(c, &sc);
+    gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
+    gpu_cmd_draw(c, 3, 1, 0, 0);
 
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    b[0].before = GPU_STATE_PIXEL_SHADER_RESOURCE;
+    b[0].after  = GPU_STATE_PRESENT;
+    b[1].before = GPU_STATE_RENDER_TARGET;
+    b[1].after  = GPU_STATE_PRESENT;
+    gpu_cmd_barrier_n(c, 2, b);
 }
 
 /* rc_overlay_repaint: the last game frame shown, as blit_to_window
  * read it (render_targets[fi] is cleared by the next batch, a frame shown or
  * not). Render thread. */
-static ID3D12Resource* s_hold;
+static ID3D12Resource* s_hold;     /* s_hold_tex's resource, borrowed (step C6) */
+static gpu_texture s_hold_tex;     /* the GPU layer's (step C6) */
 static u32 s_hold_w, s_hold_h;
 static int s_hold_valid;            /* s_hold has the last frame shown */
 static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last frame shown */
@@ -514,52 +520,55 @@ static int repaint_knob(void)
     return v;
 }
 
+/* The hold's and frame fi's whole moves between the states given, in one
+ * barrier list: render_targets[fi] (s_rc_rt_tex[fi]) first, s_hold second. */
+static void hold_barriers(u32 fi, gpu_state rt_before, gpu_state rt_after, gpu_state hold_before,
+                          gpu_state hold_after)
+{
+    gpu_barrier b[2];
+    memset(b, 0, sizeof b);
+    b[0].type    = GPU_BARRIER_TRANSITION;
+    b[0].texture = s_rc_rt_tex[fi];
+    b[0].sub     = GPU_SUB_ALL;
+    b[0].before  = rt_before;
+    b[0].after   = rt_after;
+    b[1] = b[0];
+    b[1].texture = s_hold_tex;
+    b[1].before  = hold_before;
+    b[1].after   = hold_after;
+    gpu_cmd_barrier_n(s_rc_cmd, 2, b);
+}
+
 /* Records the copy of the game's frame fi into s_hold. render_targets[fi] is
- * in PRESENT before and after. */
+ * in PRESENT before and after. The hold is the GPU layer's (step C6):
+ * today's committed RGBA8 texture with no flags, in COMMON. */
 static void hold_copy(u32 fi)
 {
     if (s_hold && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
-        s_hold->lpVtbl->Release(s_hold);
+        gpu_texture_destroy(s_rc_dev, s_hold_tex, 0);   /* at once, as today's Release */
+        s_hold_tex.id = 0;
         s_hold = NULL;
     }
     if (!s_hold) {
-        D3D12_HEAP_PROPERTIES hp = {0};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd = {0};
-        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width            = s_d3d.host_w;
-        rd.Height           = s_d3d.host_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels        = 1;
-        rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rd.SampleDesc.Count = 1;
-        if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
-                s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, NULL,
-                &IID_ID3D12Resource, (void**)&s_hold))) {
-            s_hold = NULL;
+        gpu_texture_desc td;
+        memset(&td, 0, sizeof td);
+        td.width = s_d3d.host_w; td.height = s_d3d.host_h; td.layers = 1; td.mips = 1;
+        td.format = GPU_FORMAT_R8G8B8A8_UNORM; td.samples = 1;
+        td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+        td.state = GPU_STATE_COMMON;
+        s_hold_tex = gpu_texture_create(s_rc_dev, &td);
+        s_hold = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_hold_tex.id);
+        if (!s_hold) {
+            s_hold_tex.id = 0;
             s_hold_valid = 0;
             return;
         }
         s_hold_w = s_d3d.host_w;
         s_hold_h = s_d3d.host_h;
     }
-    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    D3D12_RESOURCE_BARRIER b[2] = {0};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[1].Transition.pResource   = s_hold;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
-    cl->lpVtbl->CopyResource(cl, s_hold, s_d3d.render_targets[fi]);
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    hold_barriers(fi, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE, GPU_STATE_COMMON, GPU_STATE_COPY_DEST);
+    gpu_cmd_copy_texture_whole(s_rc_cmd, s_hold_tex, s_rc_rt_tex[fi]);
+    hold_barriers(fi, GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT, GPU_STATE_COPY_DEST, GPU_STATE_COMMON);
     s_hold_valid = 1;
 }
 
