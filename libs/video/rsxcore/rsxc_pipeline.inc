@@ -327,7 +327,7 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
          * layer makes of it (today's). */
         D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
         D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-        gpu_d3d12_pipeline_d3d_desc(s_rc_dev, &pd, &dd, il);
+        rc_be_pipeline_desc(s_rc_dev, &pd, &dd, il);
         const u64 key = pso_desc_key(&dd);
         AcquireSRWLockShared(&s_pso_man_lock);
         const int known = pso_names_has(key);   /* the manifest's: its startup build saw to it */

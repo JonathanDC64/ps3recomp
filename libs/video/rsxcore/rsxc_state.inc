@@ -138,12 +138,10 @@ typedef struct {
 /* Offscreen render target (render-to-texture). Persistent across frames --
  * pass N's output is sampled by pass N+1 and possibly by later frames. */
 typedef struct {
-    ID3D12Resource*       res;
-    gpu_texture           tex;         /* the GPU layer's texture (step C5a): res borrows it */
+    gpu_texture           tex;         /* the GPU layer's texture (step C5a) */
     gpu_view              rtv;         /* its RTV (step C5a) */
     D3D12_CPU_DESCRIPTOR_HANDLE rtv_cpu;   /* rtv's CPU descriptor, for the native binds (off_rt_rtv) */
-    ID3D12Resource*       up;          /* init-upload staging (kept alive) */
-    gpu_buffer            up_buf;      /* the GPU layer's upload buffer (step C5a): up borrows it */
+    gpu_buffer            up_buf;      /* init-upload staging (kept alive): the GPU layer's (step C5a) */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
     u32                   dxgi;        /* DXGI_FORMAT of the resource */
@@ -151,17 +149,14 @@ typedef struct {
                                         * RGBA8 target HDR promotes (rt_dxgi) */
     D3D12_RESOURCE_STATES st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
-    ID3D12Resource*       rb;          /* colour write-back readback buffer */
-    gpu_buffer            rb_buf;      /* rb: the GPU layer's (step C5b); rb is its resource, borrowed */
+    gpu_buffer            rb_buf;      /* colour write-back readback buffer: the GPU layer's (step C5b) */
     u64                   rb_size;
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
-    ID3D12Resource*       snap;        /* copy sampled by draws that also render here */
-    gpu_texture           snap_tex;    /* snap: the GPU layer's (step C5b); snap is its resource, borrowed */
+    gpu_texture           snap_tex;    /* copy sampled by draws that also render here (step C5b) */
     u32                   snap_w, snap_h, snap_dxgi;
     D3D12_RESOURCE_STATES snap_st;
-    ID3D12Resource*       down;        /* guest-size copy of a scaled target (write-back) */
-    gpu_texture           down_tex;    /* down: the GPU layer's (step C5b); down is its resource, borrowed */
+    gpu_texture           down_tex;    /* guest-size copy of a scaled target (write-back, step C5b) */
     u32                   down_w, down_h, down_dxgi;
     D3D12_RESOURCE_STATES down_st;
     /* Guest bytes after our last write-back (tex_csum over [gaddr, +glen)).
@@ -197,14 +192,12 @@ static u32 s_rf_serial = 0;
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
  * memory). SRV lives at heap index VP_TEX_SRV_BASE+slot. */
 typedef struct {
-    ID3D12Resource* res;
-    gpu_texture tex;    /* the GPU layer's texture; res is its resource, borrowed (step C4) */
+    gpu_texture tex;    /* the GPU layer's texture (step C4) */
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
     u32 face_bytes;     /* guest bytes from one cube face to the next */
-    ID3D12Heap* blk_heap; /* res is placed here (tex_pool), at blk_off; NULL = committed */
-    gpu_heap blk;       /* blk_heap's place on the GPU layer, which tex_pool uses; blk_heap is unused (step C4) */
+    gpu_heap blk;       /* tex is placed here (tex_pool), at blk_off; none = committed (step C4) */
     u64 blk_off;
     int blk_class;
     int cube;           /* resource is a 6-face cube, sampled as TextureCube */
@@ -300,39 +293,24 @@ typedef struct {
     u32  host_w, host_h;   /* the display buffers' size (RSX_SCALE); width/height are the guest's */
     int  window_closed;
 
-    /* D3D12 core */
-    ID3D12Device*              device;
-    ID3D12CommandQueue*        cmd_queue;
-    IDXGISwapChain3*           swap_chain;
+    /* D3D12 core (step C8a: the device, the queue, the swap chain and its
+     * buffers, the recorders and the fence are the GPU layer's, s_rc_dev and
+     * the statics after s_d3d; nothing here points at them) */
     int                        tearing;   /* swap chain made with ALLOW_TEARING */
-    ID3D12DescriptorHeap*      rtv_heap;
-    u32                        rtv_descriptor_size;
     /* The game's frame, width x height (the title's display size): its own
-     * textures, not the swap chain's, so the window can be any size. At the
-     * present the frame is scaled into the swap chain's buffer (blit_to_window)
-     * and an overlay draws over that at the window's own resolution. */
-    ID3D12Resource*            render_targets[FRAME_COUNT];
-    ID3D12Resource*            swap_buffers[FRAME_COUNT];   /* the window's, win_w x win_h */
-    ID3D12DescriptorHeap*      swap_rtv_heap;
+     * textures (s_rc_rt_tex), not the swap chain's, so the window can be any
+     * size. At the present the frame is scaled into the swap chain's buffer
+     * (s_rc_swap_image, win_w x win_h: blit_to_window) and an overlay draws
+     * over that at the window's own resolution. */
     u32                        win_w, win_h;
     gpu_layout                 blit_layout;   /* (step C3b) */
     gpu_pipeline               blit_pso;
     ID3D12DescriptorHeap*      blit_srv_heap;   /* shader-visible: one SRV per render_targets[i] */
-    ID3D12CommandAllocator*    cmd_allocators[FRAME_COUNT];
-    ID3D12GraphicsCommandList* cmd_list;
 
     /* Synchronization */
-    ID3D12Fence* fence;
-    HANDLE       fence_event;
-    u64          fence_values[FRAME_COUNT];
     u32          frame_index;
 
-    /* Depth/stencil */
-    ID3D12DescriptorHeap* dsv_heap;
-    ID3D12Resource*       depth_buffer;
-
-    /* Dynamic vertex buffer (upload heap) */
-    ID3D12Resource*       vertex_buffer;
+    /* Dynamic vertex buffer (upload heap: s_rc_vertex_buf) */
     void*                 vb_mapped;      /* persistently mapped */
     u32                   vb_offset;      /* current write position */
 
@@ -340,8 +318,8 @@ typedef struct {
 
     /* Debug: copy the presented backbuffer to disk as BMP for the first N
      * frames (enabled by env CELLMARK_DUMP). Lets us verify what actually
-     * rendered without racing the window/process lifetime. */
-    ID3D12Resource*       readback_buf;
+     * rendered without racing the window/process lifetime. (The readback
+     * buffer is s_rc_readback_buf.) */
     u32                   readback_pitch;
     int                   dump_frames_left;
     int                   dump_skip_left;   /* CELLMARK_DUMP_SKIP: presents to ignore first */
@@ -355,20 +333,15 @@ typedef struct {
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
     gpu_layout            vp_layout;            /* CBV(b0) + SRV table + sampler (step C3b) */
-    ID3D12Resource*       vf_buf;               /* GPU vertex fetch ring (x2 parity) */
-    void*                 vf_mapped;
+    void*                 vf_mapped;            /* GPU vertex fetch ring (x2 parity): s_rc_vf_buf */
     gpu_pipeline          pipeline_state_vp;    /* decompiled VS + atlas PS      */
     gpu_pipeline          pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
-    ID3D12Resource*       vp_vb;                /* raw float4 attrib0, per-frame */
-    void*                 vp_vb_mapped;
+    void*                 vp_vb_mapped;         /* raw float4 attrib0, per-frame: s_rc_vp_vb */
     u32                   vp_vb_offset;
-    ID3D12Resource*       vp_ib;                /* u32 indices of the VP draws, per-frame */
-    void*                 vp_ib_mapped;
+    void*                 vp_ib_mapped;         /* u32 indices of the VP draws, per-frame: s_rc_vp_ib */
     u32                   vp_ib_offset;         /* in indices */
-    ID3D12Resource*       vp_cb;                /* per-draw VP constant slots    */
-    void*                 vp_cb_mapped;
-    ID3D12Resource*       vp_fpcb;              /* per-draw FP texscale (b1)     */
-    void*                 vp_fpcb_mapped;
+    void*                 vp_cb_mapped;         /* per-draw VP constant slots: s_rc_vp_cb */
+    void*                 vp_fpcb_mapped;       /* per-draw FP texscale (b1): s_rc_vp_fpcb */
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
     gpu_shader            vp_vs_shader;         /* kept for guest-FP PSO builds (step C3b: a shader) */
@@ -379,11 +352,9 @@ typedef struct {
     int                   vp_vs_n, vp_vs_cap;
     VPFPEntry*            vp_fp;                /* guest-FP PSO cache            */
     int                   vp_fp_n, vp_fp_cap;
-    u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
     struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
     ID3D12DescriptorHeap* samp_heap;            /* shader-visible guest samplers */
-    u32                   samp_inc;
     u32                   samp_n;               /* 4-sampler tables created so far */
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
@@ -426,16 +397,14 @@ typedef struct {
 static D3D12State s_d3d;
 /* The GPU layer's objects (portable renderer, step C1): the device, the swap
  * chain and its images, the recorder begun last (open until frame_cmd_submit),
- * and each frame slot's fence. s_d3d.device, cmd_queue, swap_chain,
- * swap_buffers and cmd_list hold the same objects as native pointers for the
- * code not converted yet: borrowed (gpu_native), never released by the core.
- * s_d3d.fence, fence_event, fence_values and cmd_allocators are unused. */
+ * and each frame slot's fence. (Step C8a: s_d3d holds no native pointer to
+ * any of them; the menu's exports borrow them in rsxc_api.inc.) */
 static gpu_device*   s_rc_dev;
 static gpu_swapchain s_rc_swap;
 static gpu_texture   s_rc_swap_image[FRAME_COUNT];
 static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
-static gpu_texture   s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a): s_d3d.render_targets borrows them */
+static gpu_texture   s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a) */
 /* Step C3b: the root signatures, the pipelines and the shaders they are made
  * from are the GPU layer's (gpu_layout_create, gpu_pipeline_create,
  * gpu_shader_create), never released by the core (gpu_destroy frees them).
@@ -494,17 +463,16 @@ static u64 s_vp_iwant = 0;
 /* Step C2: the buffers are the GPU layer's. The fixed-function vertex buffer,
  * the per-draw rings (vp_vb, vp_ib, vp_cb, vp_fpcb, vf_buf) and the dump's
  * readback buffer are gpu_buffer_create's; upload ones are mapped once, for
- * their life. The native fields beside them hold the same buffers, borrowed
- * (gpu_native), for the binds and copies not converted yet: never Released
- * by the core. Their GPU addresses are gpu_buffer_addr's (per draw
+ * their life (step C8a: made? is the handle's, no native field holds them).
+ * Their GPU addresses are gpu_buffer_addr's (per draw
  * gpu_fast_buffer_addr's) plus today's offsets. */
-static gpu_buffer s_rc_vertex_buf;     /* s_d3d.vertex_buffer */
-static gpu_buffer s_rc_vp_vb;          /* s_d3d.vp_vb */
-static gpu_buffer s_rc_vp_ib;          /* s_d3d.vp_ib */
-static gpu_buffer s_rc_vp_cb;          /* s_d3d.vp_cb */
-static gpu_buffer s_rc_vp_fpcb;        /* s_d3d.vp_fpcb */
-static gpu_buffer s_rc_vf_buf;         /* s_d3d.vf_buf */
-static gpu_buffer s_rc_readback_buf;   /* s_d3d.readback_buf */
+static gpu_buffer s_rc_vertex_buf;     /* the fixed-function vertex buffer (vb_mapped) */
+static gpu_buffer s_rc_vp_vb;          /* the VP draws' vertices (vp_vb_mapped) */
+static gpu_buffer s_rc_vp_ib;          /* their indices (vp_ib_mapped) */
+static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
+static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
+static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
+static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
 /* The rings vp_vb_grow and vp_ib_grow replaced ([0] vp_vb, [1] vp_ib), with
  * the frame slot that last drew from each: destroyed with that frame's fence
  * at the next render_frame's start (rc_ring_release), where today's deferred
@@ -513,10 +481,9 @@ static gpu_buffer s_rc_ring_old[2];
 static u32        s_rc_ring_old_slot[2];
 
 /* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
- * GPU_MEM_READBACK (COPY_DEST) memory, as *b, its resource borrowed in *res
- * and, with map, its pointer for life in *map (NULL if the map failed). 0
- * when none could be made. */
-static int rc_buf_make(u64 bytes, u32 use, u32 memory, gpu_buffer* b, ID3D12Resource** res, void** map)
+ * GPU_MEM_READBACK (COPY_DEST) memory, as *b and, with map, its pointer for
+ * life in *map (NULL if the map failed). 0 when none could be made. */
+static int rc_buf_make(u64 bytes, u32 use, u32 memory, gpu_buffer* b, void** map)
 {
     gpu_buffer_desc bd;
     memset(&bd, 0, sizeof bd);
@@ -525,9 +492,8 @@ static int rc_buf_make(u64 bytes, u32 use, u32 memory, gpu_buffer* b, ID3D12Reso
     bd.memory = memory;
     bd.state = memory == GPU_MEM_READBACK ? GPU_STATE_COPY_DEST : GPU_STATE_GENERIC_READ;
     *b = gpu_buffer_create(s_rc_dev, &bd);
-    *res = GPU_VALID(*b) ? (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, b->id) : NULL;
-    if (map) *map = *res ? gpu_buffer_map(s_rc_dev, *b, 0, 0) : NULL;
-    return *res != NULL;
+    if (map) *map = GPU_VALID(*b) ? gpu_buffer_map(s_rc_dev, *b, 0, 0) : NULL;
+    return GPU_VALID(*b);
 }
 
 /* Ring i's buffer, replaced while this frame is recorded (one growth per
@@ -563,8 +529,7 @@ static u64 s_vs_fetch, s_vs_attr, s_vs_up[4];
  * renders into a D3D backbuffer, so the guest memory behind that sampler is
  * never written and it reads empty -- which is why the water had no reflection.
  * Feeding it the previous frame costs one frame of latency, which for a water
- * reflection is not visible. */
-static ID3D12Resource* s_screen_copy = NULL;
+ * reflection is not visible. (The copy is s_rc_screen_copy_tex, below.) */
 /* Sub-viewport render-to-texture. This title renders its reflection/refraction
  * pre-pass into a REGION of the same surface (vp 0,208 512x512 and 0,208
  * 1024x512, cmask=F) and then samples a texture of exactly that size. On
@@ -710,12 +675,12 @@ static gpu_table_pool s_rc_srv_pool;    /* s_d3d.srv_heap */
 static gpu_table_pool s_rc_samp_pool;   /* s_d3d.samp_heap */
 static gpu_table_pool s_rc_blit_pool;   /* s_d3d.blit_srv_heap */
 static gpu_table_pool s_rc_down_pool;   /* s_down_srv (rsxc_writeback.inc) */
-static gpu_texture    s_rc_screen_copy_tex;       /* s_screen_copy: the GPU layer's (step C5b), s_screen_copy borrowed */
+static gpu_texture    s_rc_screen_copy_tex;       /* the screen copy: the GPU layer's (step C5b) */
 static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 
 /* Step C5a: the colour and depth targets are the GPU layer's textures (the
  * display targets s_rc_rt_tex above, the depth buffer, zeta, the offscreen
- * pool), the native pointers borrow them (gpu_native), and their RTVs and
+ * pool), held by their handles (step C8a), and their RTVs and
  * DSVs are its views (gpu_view_get): s_d3d.rtv_heap, swap_rtv_heap,
  * dsv_heap and rt_rtv_heap are never made (unused), nor zeta's DSV heap. The
  * binds and clears not converted yet (rsxc_frame.inc, blit_to_window, the
@@ -723,7 +688,7 @@ static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
  * (gpu_d3d12_view_cpu) and kept beside it, so they stay plain loads. */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
 static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_rt_rtv_cpu[FRAME_COUNT];
-static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer: s_d3d.depth_buffer */
+static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
 static D3D12_CPU_DESCRIPTOR_HANDLE s_rc_depth_dsv_cpu;
 static gpu_view       s_rc_swap_rtv[FRAME_COUNT];     /* the swap chain images' RTVs */
@@ -756,4 +721,7 @@ static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format fo
  * the handle it borrowed from (made? is GPU_VALID, or .v for a pipeline),
  * and none is borrowed through gpu_native but the menu's (rsxc_api.inc). */
 static const gpu_pipeline k_rc_no_pipe = {0};      /* none */
+/* The overlay's frame callback with the window's buffer fi (the menu's,
+ * rsxc_api.inc). */
+static void rc_overlay_frame(u32 fi);
 

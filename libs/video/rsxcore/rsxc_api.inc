@@ -105,9 +105,7 @@ static void rc_backend_shutdown(void)
     s_wbg.buf.id = 0;
     s_wbg.state = -1;
     /* Step C2: the buffers are the GPU layer's and go with gpu_destroy; the
-     * pointers to them and into them were borrowed. */
-    s_d3d.vertex_buffer = s_d3d.vp_vb = s_d3d.vp_ib = s_d3d.vp_cb = s_d3d.vp_fpcb = NULL;
-    s_d3d.vf_buf = s_d3d.readback_buf = NULL;
+     * pointers into them were borrowed. */
     s_d3d.vb_mapped = s_d3d.vp_vb_mapped = s_d3d.vp_ib_mapped = NULL;
     s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
     s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
@@ -116,22 +114,15 @@ static void rc_backend_shutdown(void)
      * with gpu_destroy. */
     s_d3d.blit_pso = k_rc_no_pipe;
     /* Step C6: the AA display copy, SMAA's textures and the repaint hold are
-     * the GPU layer's and go with gpu_destroy; their pointers were borrowed. */
-    s_aa.disp = NULL; s_aa.disp_tex.id = 0;
-    s_hold = NULL; s_hold_tex.id = 0; s_hold_valid = 0;
+     * the GPU layer's and go with gpu_destroy. */
+    s_aa.disp_tex.id = 0;
+    s_hold_tex.id = 0; s_hold_valid = 0;
     memset(&s_of, 0, sizeof s_of);
     memset(&s_aa, 0, sizeof s_aa);
     /* The swap chain and its buffers, the recorders, the fence, the queue and
-     * the device are the GPU layer's: s_d3d's pointers to them were borrowed,
-     * and gpu_destroy frees them once the GPU is idle. */
-    s_d3d.device = NULL;
-    s_d3d.cmd_queue = NULL;
-    s_d3d.swap_chain = NULL;
-    s_d3d.cmd_list = NULL;
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        s_d3d.swap_buffers[i] = NULL;
-        s_rc_swap_image[i].id = 0;
-    }
+     * the device are the GPU layer's: gpu_destroy frees them once the GPU is
+     * idle. */
+    for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
     s_rc_cmd = NULL;
     s_rc_swap.id = 0;
     /* Step C4: the shader-visible heaps are the table pools', borrowed too;
@@ -142,9 +133,7 @@ static void rc_backend_shutdown(void)
     s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
     /* Step C5a: the display targets, the depth buffer, zeta and the
      * offscreen targets with their views (no RTV or DSV heap is made) go
-     * with the device too; the native pointers were borrowed. */
-    s_d3d.depth_buffer = NULL;
-    for (u32 i = 0; i < FRAME_COUNT; i++) s_d3d.render_targets[i] = NULL;
+     * with the device too. */
     if (s_rc_dev) gpu_destroy(s_rc_dev);
     s_rc_dev = NULL;
 
@@ -391,7 +380,7 @@ static void rc_overlay_tick(void)
     blit_to_window(fi);
     s_shown_fi = fi;
     frame_cmd_submit();
-    s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[fi], fi, s_d3d.win_w, s_d3d.win_h);
+    rc_overlay_frame(fi);
     swap_present(0);
     s_repaints++;
     move_to_next_frame();
@@ -418,15 +407,27 @@ static void rc_set_borderless(int on)
 #endif
 }
 static int      rc_borderless(void)   { return s_borderless; }
-/* The device, the queue and the swap chain's buffers for the menu renderer:
- * the GPU layer's own objects (gpu_native), borrowed as today's were. */
-static void*    rc_device(void)       { return s_d3d.device; }
+/* Step C8a: the menu renderer takes the device, the queue and the swap
+ * chain's buffers as native objects, and the overlay's frame callback the
+ * buffer it draws over: the GPU layer's own (gpu_native), borrowed as
+ * today's were. This is the one place the core reaches a native object. */
+static void*    rc_device(void)       { return s_rc_dev ? gpu_native(s_rc_dev, GPU_NATIVE_DEVICE, 0) : NULL; }
+static void*    rc_queue(void)        { return s_rc_dev ? gpu_native(s_rc_dev, GPU_NATIVE_QUEUE, 0) : NULL; }
+static void*    rc_back_buffer(unsigned i)
+{
+    if (i >= FRAME_COUNT || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
+    return gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
+}
+static void rc_overlay_frame(u32 fi)
+{
+    s_overlay.frame(s_overlay.user, rc_back_buffer(fi), fi, s_d3d.win_w, s_d3d.win_h);
+}
+/* (The end of the menu's native objects.) */
 static long     rc_device_lost(long long* qpc)
 {
     if (qpc) *qpc = s_device_lost_qpc;
     return s_device_lost;
 }
-static void*    rc_queue(void)        { return s_d3d.cmd_queue; }
 static void*    rc_hwnd(void)         { return s_d3d.hwnd; }
 
 static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
@@ -445,7 +446,6 @@ static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
     SDL_PushEvent(&e);
 #endif
 }
-static void*    rc_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.swap_buffers[i] : NULL; }
 static unsigned rc_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
 static unsigned rc_back_buffer_format(void)
 {

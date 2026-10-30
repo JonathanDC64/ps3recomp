@@ -62,8 +62,7 @@ static struct {
     gpu_pipeline          pso;
     gpu_pipeline          pso16;      /* the same into an FP16 target (HDR's scene target) */
     int                   failed;     /* the pipeline could not be made: stay off */
-    ID3D12Resource*       disp;       /* RSX_AA_AT=present: copy of the display buffer */
-    gpu_texture           disp_tex;   /* the GPU layer's (step C6); disp is its resource, borrowed */
+    gpu_texture           disp_tex;   /* RSX_AA_AT=present: copy of the display buffer (step C6) */
     u32                   disp_w, disp_h;
     D3D12_RESOURCE_STATES disp_st;
     u32                   fp[AA_FP_MAX];   /* RSX_AA_BEFORE_FP */
@@ -95,7 +94,7 @@ static void aa_before_fp_load(void)
 static int aa_ready(void)
 {
     if (s_aa.pso.v) return 1;
-    if (s_aa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
+    if (s_aa.failed || !s_rc_dev || !s_d3d.srv_heap) return 0;
     s_aa.failed = 1;   /* until it is made */
     gpu_shader vb = sc_shader(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
                               GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
@@ -191,16 +190,12 @@ static struct {
     int                   failed;      /* could not be made: FXAA runs instead */
     /* (The edges' and weights' RTVs are their views, edges_rtv and
      * weights_rtv: step C6, no RTV heap.) */
-    ID3D12Resource*       area;        /* AreaTex, R8G8 160x560 */
-    gpu_texture           area_tex;    /* the GPU layer's (step C6); area is its resource, borrowed */
-    ID3D12Resource*       search;      /* SearchTex, R8 64x16 */
-    gpu_texture           search_tex;  /* the GPU layer's (step C6); search is its resource, borrowed */
+    gpu_texture           area_tex;    /* AreaTex, R8G8 160x560: the GPU layer's (step C6) */
+    gpu_texture           search_tex;  /* SearchTex, R8 64x16: the GPU layer's (step C6) */
     int                   lut_loaded;  /* their upload is recorded */
-    ID3D12Resource*       edges;
-    gpu_texture           edges_tex;   /* the GPU layer's (step C6); edges is its resource, borrowed */
+    gpu_texture           edges_tex;   /* the GPU layer's (step C6) */
     gpu_view              edges_rtv;   /* its RTV (today's NULL description) */
-    ID3D12Resource*       weights;
-    gpu_texture           weights_tex; /* the GPU layer's (step C6); weights is its resource, borrowed */
+    gpu_texture           weights_tex; /* the GPU layer's (step C6) */
     gpu_view              weights_rtv;
     D3D12_RESOURCE_STATES edges_st, weights_st;
     u32                   w, h;        /* of edges and weights */
@@ -219,7 +214,7 @@ static void smaa_state(gpu_texture t, D3D12_RESOURCE_STATES* st, D3D12_RESOURCE_
 static int smaa_ready(void)
 {
     if (s_smaa.pso[2].v) return 1;
-    if (s_smaa.failed || !s_d3d.device || !s_d3d.srv_heap) return 0;
+    if (s_smaa.failed || !s_rc_dev || !s_d3d.srv_heap) return 0;
     s_smaa.failed = 1;   /* until it is made */
     LARGE_INTEGER q0, q1, qf;
     QueryPerformanceCounter(&q0);
@@ -285,10 +280,8 @@ static int smaa_ready(void)
         td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COPY_DEST;
         gpu_texture* const t = k ? &s_smaa.search_tex : &s_smaa.area_tex;
-        ID3D12Resource** const res = k ? &s_smaa.search : &s_smaa.area;
         *t = gpu_texture_create(s_rc_dev, &td);
-        *res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->id);
-        if (!*res) { t->id = 0; hr = E_FAIL; }
+        if (!GPU_VALID(*t)) hr = E_FAIL;
     }
     for (int i = 0; i < 6; i++) sc_shader_drop(&code[i]);
     if (FAILED(hr) || !s_smaa.pso[2].v) {
@@ -352,10 +345,10 @@ static int smaa_luts_load(void)
  * off_rt_defer_release let it go. */
 static int smaa_targets(u32 w, u32 h)
 {
-    if (s_smaa.edges && s_smaa.weights && s_smaa.w == w && s_smaa.h == h) return 1;
+    if (GPU_VALID(s_smaa.edges_tex) && GPU_VALID(s_smaa.weights_tex) && s_smaa.w == w && s_smaa.h == h)
+        return 1;
     rc_grave_tex(&s_smaa.edges_tex);     /* the open list may still use them (their views go with them) */
     rc_grave_tex(&s_smaa.weights_tex);
-    s_smaa.edges = s_smaa.weights = NULL;
     s_smaa.edges_rtv.id = s_smaa.weights_rtv.id = 0;
     for (int k = 0; k < 2; k++) {
         gpu_texture_desc td;
@@ -367,13 +360,8 @@ static int smaa_targets(u32 w, u32 h)
         td.state = GPU_STATE_RENDER_TARGET;
         td.clear_format = td.format;   /* (colour 0) */
         gpu_texture* const t = k ? &s_smaa.weights_tex : &s_smaa.edges_tex;
-        ID3D12Resource** const res = k ? &s_smaa.weights : &s_smaa.edges;
         *t = gpu_texture_create(s_rc_dev, &td);
-        *res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->id);
-        if (!*res) {
-            t->id = 0;
-            return 0;   /* the next run tries again */
-        }
+        if (!GPU_VALID(*t)) return 0;   /* the next run tries again */
         gpu_view_desc rv;   /* today's NULL description */
         memset(&rv, 0, sizeof rv);
         rv.texture = *t;
@@ -454,12 +442,11 @@ static void aa_filter(int f, gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32
 static int aa_run_rt(int t)
 {
     OffRT* r = &s_d3d.off_rt[t];
-    if (!r->res || (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && r->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT))
+    if (!GPU_VALID(r->tex) || (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && r->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT))
         return 0;
     const int f = aa_filter_for(r->hw, r->hh, (DXGI_FORMAT)r->dxgi);
     if (!f) return 0;
-    ID3D12Resource* src = off_rt_snapshot(t);
-    if (!src) return 0;
+    if (!GPU_VALID(off_rt_snapshot(t))) return 0;
     off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
     aa_filter(f, r->snap_tex, (DXGI_FORMAT)r->dxgi, r->rtv, r->hw, r->hh);
     return 1;
@@ -477,11 +464,9 @@ static void aa_run_display(u32 fi)
     const u32 w = s_d3d.host_w, h = s_d3d.host_h;
     const int f = aa_filter_for(w, h, DXGI_FORMAT_R8G8B8A8_UNORM);
     if (!f) return;
-    if (s_aa.disp && (s_aa.disp_w != w || s_aa.disp_h != h)) {
+    if (GPU_VALID(s_aa.disp_tex) && (s_aa.disp_w != w || s_aa.disp_h != h))
         rc_grave_tex(&s_aa.disp_tex);   /* the open list may still use it */
-        s_aa.disp = NULL;
-    }
-    if (!s_aa.disp) {
+    if (!GPU_VALID(s_aa.disp_tex)) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
         td.width = w; td.height = h; td.layers = 1; td.mips = 1;
@@ -489,11 +474,7 @@ static void aa_run_display(u32 fi)
         td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COPY_DEST;
         s_aa.disp_tex = gpu_texture_create(s_rc_dev, &td);
-        s_aa.disp = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_aa.disp_tex.id);
-        if (!s_aa.disp) {
-            s_aa.disp_tex.id = 0;
-            return;
-        }
+        if (!GPU_VALID(s_aa.disp_tex)) return;
         s_aa.disp_w = w; s_aa.disp_h = h;
         s_aa.disp_st = D3D12_RESOURCE_STATE_COPY_DEST;
     }

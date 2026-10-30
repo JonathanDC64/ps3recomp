@@ -13,12 +13,10 @@ static u64 fnv_bytes(u64 h, const void* p, size_t n)
 
 /* Recording on a frame slot's recorder (the GPU layer's, one allocator and
  * list per slot): today's allocator and list Reset. s_rc_cmd is the recorder
- * for converted code; s_d3d.cmd_list becomes its list, so code that records
- * into s_d3d.cmd_list records into the one open now. */
+ * every command goes to (step C8a: there is no native list beside it). */
 static void frame_cmd_begin(u32 slot)
 {
     s_rc_cmd = gpu_cmd_begin(s_rc_dev, slot);
-    s_d3d.cmd_list = (ID3D12GraphicsCommandList*)gpu_native(s_rc_dev, GPU_NATIVE_CMD, (u64)(uintptr_t)s_rc_cmd);
 }
 
 /* Today's Close and ExecuteCommandLists of the open recorder. */
@@ -36,8 +34,7 @@ static int display_targets_make(void)
     /* The game's frame: textures of their own (see render_targets), in the
      * PRESENT (= COMMON) state between frames as the swap chain's were, so
      * every transition and readback of them is unchanged. No clear value;
-     * the RTV is today's NULL description. render_targets[i] borrows the
-     * texture. */
+     * the RTV is today's NULL description. */
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
@@ -51,7 +48,6 @@ static int display_targets_make(void)
         td.state   = GPU_STATE_PRESENT;
         s_rc_rt_tex[i] = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(s_rc_rt_tex[i])) return -1;
-        s_d3d.render_targets[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_rt_tex[i].id);
         s_rc_rt_rtv[i] = rc_target_view(s_rc_rt_tex[i], GPU_VIEW_RTV, 0, 0, &s_rc_rt_rtv_cpu[i]);
     }
     return 0;
@@ -82,7 +78,6 @@ static int depth_buffer_make(void)
         printf("[D3D12] Depth buffer creation failed\n");
         return -1;
     }
-    s_d3d.depth_buffer = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_depth_tex.id);
 
     /* The DSV: D24S8, 2D, mip 0, no flags. */
     s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT,
@@ -99,17 +94,16 @@ static int init_d3d12(u32 width, u32 height)
      * CELLMARK_IGPU: the low-power adapter (for A/B testing a suspected
      * iGPU-driver stall); else the high-performance one, software adapters
      * skipped, the default adapter last. The debug layer is never enabled on
-     * this route (D3D12_DBG and debug builds included). */
+     * this route (D3D12_DBG and debug builds included). The backend's device
+     * is made by the instance file (rc_be_create: rsxc_d3d12.c). */
     {
         gpu_device_desc dd;
         memset(&dd, 0, sizeof dd);
         if (getenv("D3D12_DRED")) dd.flags |= GPU_DEVICE_BREADCRUMBS;
         if (getenv("CELLMARK_IGPU")) dd.flags |= GPU_DEVICE_LOW_POWER;
         dd.cmd_slots = FRAME_COUNT;
-        s_rc_dev = gpu_d3d12_create(&dd);
+        s_rc_dev = rc_be_create(&dd);
         if (!s_rc_dev) return -1;
-        s_d3d.device = (ID3D12Device*)gpu_native(s_rc_dev, GPU_NATIVE_DEVICE, 0);
-        s_d3d.cmd_queue = (ID3D12CommandQueue*)gpu_native(s_rc_dev, GPU_NATIVE_QUEUE, 0);
     }
 
     pso_lib_open();
@@ -135,17 +129,13 @@ static int init_d3d12(u32 width, u32 height)
         sd.flags = s_d3d.tearing ? GPU_SWAP_TEARING : 0;
         s_rc_swap = gpu_swap_create(s_rc_dev, &sd);
         if (!GPU_VALID(s_rc_swap)) return -1;
-        s_d3d.swap_chain = (IDXGISwapChain3*)gpu_native(s_rc_dev, GPU_NATIVE_SWAPCHAIN, s_rc_swap.id);
     }
 
     s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
 
     /* The display targets' and the swap chain images' RTVs and the depth
-     * DSV are the GPU layer's views (step C5a): no RTV or DSV heap here. The
-     * RTV heaps still made elsewhere (the downscale's, SMAA's) step by this
-     * size. */
-    s_d3d.rtv_descriptor_size = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+     * DSV are the GPU layer's views (step C5a): no RTV or DSV heap here, nor
+     * anywhere else now, so no descriptor size is read (step C8a). */
 
     if (display_targets_make() != 0) return -1;
 
@@ -169,8 +159,8 @@ static int init_d3d12(u32 width, u32 height)
 
     /* The recorders and the fence are the device's (one fence, the device's
      * timeline: s_rc_frame_fence holds each frame slot's point on it). Until
-     * the first frame, s_d3d.cmd_list is slot 0's list, closed, as today's one
-     * list is after init. */
+     * the first frame, slot 0's list is closed, as today's one list is after
+     * init. */
     frame_cmd_begin(0);
     if (!s_rc_cmd) return -1;
     gpu_cmd_end(s_rc_dev, s_rc_cmd);
@@ -204,9 +194,6 @@ static int init_d3d12(u32 width, u32 height)
             s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
             s_d3d.srv_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_srv_pool);
             if (!s_d3d.srv_heap) printf("[D3D12] SRV heap creation failed\n");
-            else
-                s_d3d.srv_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-                    s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         }
 
         /* The offscreen targets' RTVs are views of their textures (off_rt_get,
@@ -219,7 +206,7 @@ static int init_d3d12(u32 width, u32 height)
     {
         /* The GPU layer's upload buffer, mapped for its life (step C2). */
         if (rc_buf_make((u64)(MAX_VERTICES * VERTEX_STRIDE), GPU_USE_VERTEX, GPU_MEM_UPLOAD,
-                        &s_rc_vertex_buf, &s_d3d.vertex_buffer, &s_d3d.vb_mapped)) {
+                        &s_rc_vertex_buf, &s_d3d.vb_mapped)) {
             printf("[D3D12] Vertex buffer created (%u KB)\n",
                    (MAX_VERTICES * VERTEX_STRIDE) / 1024);
         }
@@ -261,8 +248,6 @@ static int init_d3d12(u32 width, u32 height)
             s_d3d.samp_heap = gpu_d3d12_table_pool_heap(s_rc_dev, s_rc_samp_pool);
             if (!s_d3d.samp_heap)
                 printf("[D3D12] sampler heap creation failed\n");
-            s_d3d.samp_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
-                s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         }
 
         /* GPU vertex fetch: t20 = the frame's raw guest vertex bytes (vf_buf),
@@ -273,7 +258,7 @@ static int init_d3d12(u32 width, u32 height)
          * s_vp_root_hash, and with it every pipeline's name in the manifest
          * (pso_desc_key), is today's too. */
         s_d3d.vp_layout = lay_make(&ld);
-        s_vp_root_hash = gpu_d3d12_layout_hash(s_rc_dev, s_d3d.vp_layout);
+        s_vp_root_hash = rc_be_layout_hash(s_rc_dev, s_d3d.vp_layout);   /* (rsxc_d3d12.c) */
 
         /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently
          * mapped): the GPU layer's upload buffers (step C2, rc_buf_make) */
@@ -307,8 +292,7 @@ static int init_d3d12(u32 width, u32 height)
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
                 (unsigned long long)(bytes >> 20), (unsigned)s_vp_cap, 10);
-        if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &s_rc_vp_vb, &s_d3d.vp_vb,
-                         &s_d3d.vp_vb_mapped))
+        if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &s_rc_vp_vb, &s_d3d.vp_vb_mapped))
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
         bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */
@@ -317,11 +301,10 @@ static int init_d3d12(u32 width, u32 height)
          * zeros -- indistinguishable from a broken vertex program. Say so. */
         fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
                 (unsigned long long)(bytes >> 20), MAX_DRAWS, 10);
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_cb, &s_d3d.vp_cb, &s_d3d.vp_cb_mapped);
+        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_cb, &s_d3d.vp_cb_mapped);
 
         bytes = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;     /* per-draw FP slots (b1), x2 parity */
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb,
-                    &s_d3d.vp_fpcb_mapped);
+        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb_mapped);
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
@@ -330,13 +313,13 @@ static int init_d3d12(u32 width, u32 height)
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
           s_vf_cap = (u32)mb << 20;
-          if (!rc_buf_make((u64)s_vf_cap * 2, GPU_USE_RAW, GPU_MEM_UPLOAD, &s_rc_vf_buf, &s_d3d.vf_buf,
-                           &s_d3d.vf_mapped))
+          if (!rc_buf_make((u64)s_vf_cap * 2, GPU_USE_RAW, GPU_MEM_UPLOAD, &s_rc_vf_buf, &s_d3d.vf_mapped))
               s_vf_cap = 0; }
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
-               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)s_d3d.vp_vb, (void*)s_d3d.vp_cb);
+               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)s_rc_vp_vb.id,
+               (void*)(uintptr_t)s_rc_vp_cb.id);
     }
 
     printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",

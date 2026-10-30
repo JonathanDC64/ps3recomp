@@ -10,7 +10,7 @@ static const char* s_dump_name = NULL;
 
 static void dump_backbuffer_bmp(void)
 {
-    if (!s_d3d.readback_buf) return;
+    if (!GPU_VALID(s_rc_readback_buf)) return;
     /* The GPU layer's readback buffer (step C2): its rows read. */
     void* mapped = gpu_buffer_map(s_rc_dev, s_rc_readback_buf, 0, (u64)s_d3d.readback_pitch * s_d3d.host_h);
     if (!mapped)

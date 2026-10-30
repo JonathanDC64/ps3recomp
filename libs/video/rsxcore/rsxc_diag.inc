@@ -163,7 +163,7 @@ static void fpwatch_batch(void)
 static u32 vp_tex_decoded_hash(const VPTexSlot* t)
 {
     extern uint8_t* vm_base;
-    if (!t->res || !vm_base) return 0;
+    if (!GPU_VALID(t->tex) || !vm_base) return 0;
     rsx_tex_layout tl;
     rsx_texture_layout(t->fmt, t->w, t->h, &tl);
     const u32 pitch = (tl.dst_row_bytes + 255) & ~255u;
@@ -539,22 +539,19 @@ static void rsx_scale_apply(void)
     printf("[D3D12] RSX_SCALE: render targets at %u%%%c", want, 10);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        off_rt_drop_target(r);   /* res and up (step C5a) */
-        r->snap = NULL; wb_tex_retire(&r->snap_tex);   /* step C5b */
-        r->down = NULL; wb_tex_retire(&r->down_tex);
+        off_rt_drop_target(r);   /* the target and its staging (step C5a) */
+        wb_tex_retire(&r->snap_tex);   /* step C5b */
+        wb_tex_retire(&r->down_tex);
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
         zeta_drop(&s_zeta[i]); s_zeta[i].used = 0;   /* step C5a */
     }
     for (int i = 0; i < SUBVP_SLOTS; i++) rc_grave_tex(&s_subvp[i].tex);   /* step C8a */
-    s_screen_copy = NULL; wb_tex_retire(&s_rc_screen_copy_tex);   /* step C5b */
+    wb_tex_retire(&s_rc_screen_copy_tex);   /* step C5b */
     gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
-    s_d3d.readback_buf = NULL;
-    for (u32 i = 0; i < FRAME_COUNT; i++) {   /* with their views (step C5a) */
-        rc_grave_tex(&s_rc_rt_tex[i]); s_d3d.render_targets[i] = NULL;
-    }
-    rc_grave_tex(&s_rc_depth_tex); s_d3d.depth_buffer = NULL;
+    for (u32 i = 0; i < FRAME_COUNT; i++) rc_grave_tex(&s_rc_rt_tex[i]);   /* with their views (step C5a) */
+    rc_grave_tex(&s_rc_depth_tex);
     s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
     s_d3d.host_h = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.height);
     if (display_targets_make() != 0 || depth_buffer_make() != 0) {

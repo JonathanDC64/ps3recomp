@@ -497,7 +497,8 @@ static u32 dr_hdrv(const D3D12DrawRecord* dr)
         u32 mask = 0;
         for (int u = 0; u < RSX_FP_UNITS; u++) {
             const int k = dr->tex_rt[u];
-            if (k >= 0 && s_d3d.off_rt[k].res && s_d3d.off_rt[k].dxgi != s_d3d.off_rt[k].gdxgi) mask |= 1u << u;
+            if (k >= 0 && GPU_VALID(s_d3d.off_rt[k].tex) && s_d3d.off_rt[k].dxgi != s_d3d.off_rt[k].gdxgi)
+                mask |= 1u << u;
         }
         return mask ? HDRV_SAT | mask : 0;
     }

@@ -54,10 +54,10 @@ static void render_frame(void)
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
     /* Lazily create the readback buffer the first time a dump is requested. */
-    if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
+    if (s_d3d.dump_frames_left > 0 && !GPU_VALID(s_rc_readback_buf)) {
         s_d3d.readback_pitch = (s_d3d.host_w * 4 + 255) & ~255u;
         rc_buf_make((u64)s_d3d.readback_pitch * s_d3d.host_h, GPU_USE_COPY_DST, GPU_MEM_READBACK,
-                    &s_rc_readback_buf, &s_d3d.readback_buf, NULL);   /* (step C2) */
+                    &s_rc_readback_buf, NULL);   /* (step C2) */
     }
 
     /* Reset command allocator and list */
@@ -382,7 +382,7 @@ rtt_dump_done:;
              * And only when the guest memory there is empty, which is what a
              * surface the GPU rendered looks like: a display-sized image the
              * title wrote itself (a cellSail movie frame) is the texture. */
-            if (dr->tex[_u].set && s_screen_copy &&
+            if (dr->tex[_u].set && GPU_VALID(s_rc_screen_copy_tex) &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
                 off_rt_find(dr->tex[_u].raw) < 0 &&
                 !tex_guest_written(dr->tex[_u].off, dr->tex[_u].w * dr->tex[_u].h * 4u)) {
@@ -552,7 +552,7 @@ rtt_dump_done:;
                     (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
-        if (any && vpso.v && s_d3d.vp_vb && s_d3d.vp_cb) {
+        if (any && vpso.v && GPU_VALID(s_rc_vp_vb) && GPU_VALID(s_rc_vp_cb)) {
             gpu_cmd_set_layout(rc, s_d3d.vp_layout);
             gpu_cmd_set_pipeline(rc, vpso);
             gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
@@ -565,10 +565,10 @@ rtt_dump_done:;
             gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, 0));
             gpu_cmd_set_vb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256,
                            s_vp_cap * 256, 256);   /* 16 float4 attrib slots */
-            if (s_d3d.vp_ib)
+            if (GPU_VALID(s_rc_vp_ib))
                 gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
                                s_vp_icap * 4, GPU_FORMAT_R32_UINT);
-            if (s_d3d.vf_buf)
+            if (GPU_VALID(s_rc_vf_buf))
                 gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
                                         + (u64)s_d3d.vp_parity * s_vf_cap);
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
@@ -615,7 +615,7 @@ rtt_dump_done:;
             gpu_device* const rdev = s_rc_dev;
             const gpu_table_pool rsrv = s_rc_srv_pool;
             const gpu_addr cb_va = gpu_fast_buffer_addr(rdev, s_rc_vp_cb);
-            const gpu_addr fpcb_va = s_d3d.vp_fpcb ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
+            const gpu_addr fpcb_va = GPU_VALID(s_rc_vp_fpcb) ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -626,7 +626,7 @@ rtt_dump_done:;
                 if (aa_t >= 0 && d >= aa_before) {
                     if (aa_run_rt(aa_t)) {
                         gpu_cmd_set_layout(rc, s_d3d.vp_layout);
-                        if (s_d3d.vf_buf)
+                        if (GPU_VALID(s_rc_vf_buf))
                             gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
                                                     + (u64)s_d3d.vp_parity * s_vf_cap);
                         gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
@@ -896,9 +896,7 @@ rtt_dump_done:;
                         continue;
                     }
                     /* Sampling a bound colour target: read a copy (above). */
-                    const int snap = off_rt_snapshot(rt) != NULL;
-                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u,
-                              snap ? s_d3d.off_rt[rt].snap_tex : k_rc_no_tex,
+                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, off_rt_snapshot(rt),
                               (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                 }
@@ -907,7 +905,7 @@ rtt_dump_done:;
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 gpu_cmd_bind_cb(rc, 0, cb_va
                     + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->vcb_slot) * VP_CB_STRIDE);
-                if (s_d3d.vp_fpcb)
+                if (GPU_VALID(s_rc_vp_fpcb))
                     gpu_cmd_bind_cb(rc, 2, fpcb_va
                         + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
@@ -1125,7 +1123,7 @@ rtt_dump_done:;
     s_vp_want = 0;
     s_d3d.vp_ib_offset = 0;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
-    if (!s_d3d.vp_ib || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
+    if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
 
     /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
@@ -1155,8 +1153,7 @@ rtt_dump_done:;
      * into a readback buffer this frame and writes rt_save_<offset>.bmp
      * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
      * the console's setenv can save one target after another in a live run. */
-    static ID3D12Resource* s_rtsave_buf = NULL;
-    static gpu_buffer s_rtsave_b;   /* step C2: s_rtsave_buf's buffer (s_rtsave_buf is borrowed) */
+    static gpu_buffer s_rtsave_b;   /* the readback buffer (step C2) */
     static u64 s_rtsave_cap = 0;
     static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
     static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi, s_rtsave_off;
@@ -1187,8 +1184,9 @@ rtt_dump_done:;
                    (unsigned)s_d3d.frame_count); fflush(stdout); } }
       if (sv && !_done && _due) {
         int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
-        fprintf(stderr, "[RTT_SAVERT] rt=%d res=%p\n", rt, rt >= 0 ? (void*)s_d3d.off_rt[rt].res : NULL);
-        if (rt >= 0 && s_d3d.off_rt[rt].res) {
+        fprintf(stderr, "[RTT_SAVERT] rt=%d res=%p\n", rt,
+                rt >= 0 ? (void*)(uintptr_t)s_d3d.off_rt[rt].tex.id : NULL);
+        if (rt >= 0 && GPU_VALID(s_d3d.off_rt[rt].tex)) {
             OffRT* r = &s_d3d.off_rt[rt];
             u32 bpp = (r->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
                       (r->dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
@@ -1196,16 +1194,16 @@ rtt_dump_done:;
             fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
                     rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
                     (unsigned long long)((u64)pitch * r->hh));
-            if (s_rtsave_buf && s_rtsave_cap < (u64)pitch * r->hh) {   /* (GPU idle: render_frame's wait) */
-                gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; s_rtsave_buf = NULL; }
-            if (!s_rtsave_buf) {
+            if (GPU_VALID(s_rtsave_b) && s_rtsave_cap < (u64)pitch * r->hh) {   /* (GPU idle: render_frame's wait) */
+                gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; }
+            if (!GPU_VALID(s_rtsave_b)) {
                 s_rtsave_cap = (u64)pitch * r->hh;
-                rc_buf_make(s_rtsave_cap, GPU_USE_COPY_DST, GPU_MEM_READBACK, &s_rtsave_b, &s_rtsave_buf, NULL);
+                rc_buf_make(s_rtsave_cap, GPU_USE_COPY_DST, GPU_MEM_READBACK, &s_rtsave_b, NULL);
             }
-            if (!s_rtsave_buf) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
-            if (s_rtsave_buf) {
+            if (!GPU_VALID(s_rtsave_b)) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
+            if (GPU_VALID(s_rtsave_b)) {
                 off_rt_transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                gpu_footprint cfp;   /* (r->tex is r->res's handle) */
+                gpu_footprint cfp;
                 memset(&cfp, 0, sizeof cfp);
                 cfp.format    = (gpu_format)r->dxgi;
                 cfp.width     = r->hw;
@@ -1307,7 +1305,7 @@ skip_dump_consider: ;
         s_aa.present_logged = aa_mode();
         aa_run_display(fi);
     }
-    int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
+    int dumping = (s_d3d.dump_frames_left > 0 && GPU_VALID(s_rc_readback_buf)
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
@@ -1518,8 +1516,7 @@ skip_dump_consider: ;
       QueryPerformanceCounter(&_pq0);
       if (s_present_this_frame && s_overlay_on && s_overlay.frame) {
           if (s_overlay_wake) InterlockedExchange(&s_overlay_wake, 0);   /* (this call is the wake) */
-          s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[s_d3d.frame_index], s_d3d.frame_index,
-                          s_d3d.win_w, s_d3d.win_h);
+          rc_overlay_frame(s_d3d.frame_index);   /* (the menu's: rsxc_api.inc) */
       }
       if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
           swap_present(1);

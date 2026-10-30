@@ -61,8 +61,8 @@ static u32 rt_guest_bpp(u32 dxgi)
 }
 
 /* Step C5b: the textures made here (the downscale copies, the snapshots, the
- * screen copy) are the GPU layer's, and their ID3D12Resource* fields are
- * borrowed (gpu_native). One dropped while a frame is recorded may still be
+ * screen copy) are the GPU layer's, held by their handles (step C8a). One
+ * dropped while a frame is recorded may still be
  * used by that frame's list, so it waits in a grave and is destroyed at the
  * pre-pass of a later render_frame (wb_tex_bury, from
  * off_rt_drop_rewritten), after that render_frame's opening wait_for_gpu has
@@ -203,11 +203,9 @@ static gpu_texture off_rt_downscale(int i, int argb)
     if (!down_init()) return none;
     const gpu_pipeline pso = down_pso((DXGI_FORMAT)r->gdxgi, argb);
     if (!pso.v) return none;
-    if (r->down && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->gdxgi)) {
-        r->down = NULL;
+    if (GPU_VALID(r->down_tex) && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->gdxgi))
         wb_tex_retire(&r->down_tex);   /* the open list may still use it */
-    }
-    if (!r->down) {
+    if (!GPU_VALID(r->down_tex)) {
         /* Today's: committed, ALLOW_RENDER_TARGET, in RENDER_TARGET, no clear
          * value. */
         gpu_texture_desc td;
@@ -217,8 +215,7 @@ static gpu_texture off_rt_downscale(int i, int argb)
         td.use = GPU_USE_RT | GPU_USE_COPY_SRC;
         td.state = GPU_STATE_RENDER_TARGET;
         r->down_tex = gpu_texture_create(s_rc_dev, &td);
-        r->down = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, r->down_tex.id);
-        if (!r->down) { r->down_tex.id = 0; return none; }
+        if (!GPU_VALID(r->down_tex)) return none;
         r->down_w = r->w; r->down_h = r->h; r->down_dxgi = r->gdxgi;
         r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
@@ -363,7 +360,7 @@ static void rt_writeback_record(void)
     if (!write_color_on()) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        if (!r->res || !r->used) continue;
+        if (!GPU_VALID(r->tex) || !r->used) continue;
         r->gpu_check = 0;
         if (wbg_record(i)) {
             if (wbg_mode() != 2) continue;
@@ -377,11 +374,11 @@ static void rt_writeback_record(void)
         /* The readback buffer is the GPU layer's (step C5b; rb its resource,
          * borrowed). One too small goes now, as today: the GPU and the last
          * store are done with it (render_frame's wait came first). */
-        if (r->rb && r->rb_size < need) {
+        if (GPU_VALID(r->rb_buf) && r->rb_size < need) {
             gpu_buffer_destroy(s_rc_dev, r->rb_buf, 0);
-            r->rb_buf.id = 0; r->rb = NULL;
+            r->rb_buf.id = 0;
         }
-        if (!r->rb) {
+        if (!GPU_VALID(r->rb_buf)) {
             gpu_buffer_desc bd;
             memset(&bd, 0, sizeof bd);
             bd.size = need;
@@ -389,8 +386,7 @@ static void rt_writeback_record(void)
             bd.memory = GPU_MEM_READBACK;
             bd.state = GPU_STATE_COPY_DEST;
             r->rb_buf = gpu_buffer_create(s_rc_dev, &bd);
-            r->rb = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, r->rb_buf.id);
-            if (!r->rb) { r->rb_buf.id = 0; continue; }
+            if (!GPU_VALID(r->rb_buf)) continue;
             r->rb_size = need;
         }
         D3D12_RESOURCE_STATES prior = r->st;
@@ -481,14 +477,14 @@ static void rt_writeback_store(void)
     if (!write_color_on() || !vm_base) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        if (r->res && r->used == 3) {   /* the GPU stored it (wbg_record) */
+        if (GPU_VALID(r->tex) && r->used == 3) {   /* the GPU stored it (wbg_record) */
             r->used = 1;
             r->gaddr = r->gpu_dst;
             r->glen = r->gpitch * r->h;
             r->gsum_new = 1;
             continue;
         }
-        if (!r->res || !r->rb || r->used != 2) continue;
+        if (!GPU_VALID(r->tex) || !GPU_VALID(r->rb_buf) || r->used != 2) continue;
         r->used = 1;
         if (r->gpu_check) { wbg_check(r); continue; }
         u32 bpp = rt_guest_bpp(r->gdxgi);
@@ -591,15 +587,15 @@ static void off_rt_drop_rewritten(void)
     if (!en || !vm_base) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        if (!r->res || !r->gsum_ok) continue;
+        if (!GPU_VALID(r->tex) || !r->gsum_ok) continue;
         if (tex_csum(vm_base + r->gaddr, r->glen) == r->gsum) continue;
         { static int n = 0;
           if (n < 40 && ++n) fprintf(stderr, "[RT] 0x%X (%ux%u) rewritten by the title: "
                                 "dropped (frame %llu)%c", r->off, r->w, r->h,
                                 (unsigned long long)s_d3d.frame_count, 10); }
-        off_rt_drop_target(r);   /* res and up (step C5a) */
-        r->snap = NULL; wb_tex_retire(&r->snap_tex);   /* step C5b */
-        r->down = NULL; wb_tex_retire(&r->down_tex);
+        off_rt_drop_target(r);   /* the target and its staging (step C5a) */
+        wb_tex_retire(&r->snap_tex);   /* step C5b */
+        wb_tex_retire(&r->down_tex);
         r->gsum_ok = 0;
     }
 }
@@ -646,8 +642,8 @@ static void srv_write(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt, UINT mapp
     srv_write_ex(heap_slot, tex, fmt, mapping, 0);
 }
 
-/* On the frame's recorder (step C5b): r->tex is r->res's handle. Inline
- * (gpu_d3d12_cmd.h), so a draw's transition is today's one call. */
+/* On the frame's recorder (step C5b). Inline (gpu_d3d12_cmd.h), so a draw's
+ * transition is today's one call. */
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
 {
     OffRT* r = &s_d3d.off_rt[slot];
@@ -662,19 +658,17 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
  * own texel. D3D12 cannot have one resource bound as RTV and SRV at once; that
  * read returned 0, so the exposure never moved past one adaptation step from 0
  * and the level drew almost black. Copy the target just before the draw and
- * return the copy for the draw to sample: the contents RSX would have read. */
-static ID3D12Resource* off_rt_snapshot(int slot)
+ * return the copy for the draw to sample: the contents RSX would have read.
+ * (The copy's handle, r->snap_tex; none when there is none.) */
+static gpu_texture off_rt_snapshot(int slot)
 {
     OffRT* r = &s_d3d.off_rt[slot];
-    if (!r->res) return NULL;
-    if (r->snap && (r->snap_w != r->hw || r->snap_h != r->hh || r->snap_dxgi != r->dxgi)) {
-        r->snap = NULL;
+    if (!GPU_VALID(r->tex)) return k_rc_no_tex;
+    if (GPU_VALID(r->snap_tex) && (r->snap_w != r->hw || r->snap_h != r->hh || r->snap_dxgi != r->dxgi))
         wb_tex_retire(&r->snap_tex);   /* the open list may still use it */
-    }
-    if (!r->snap) {
-        /* The GPU layer's (step C5b), sampled by the draws (the SRV writes);
-         * r->snap is its resource, borrowed. Today's: committed, no flags, in
-         * COPY_DEST. */
+    if (!GPU_VALID(r->snap_tex)) {
+        /* The GPU layer's (step C5b), sampled by the draws (the SRV writes).
+         * Today's: committed, no flags, in COPY_DEST. */
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
         td.width = r->hw; td.height = r->hh; td.layers = 1; td.mips = 1;
@@ -682,8 +676,7 @@ static ID3D12Resource* off_rt_snapshot(int slot)
         td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COPY_DEST;
         r->snap_tex = gpu_texture_create(s_rc_dev, &td);
-        r->snap = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, r->snap_tex.id);
-        if (!r->snap) { r->snap_tex.id = 0; return NULL; }
+        if (!GPU_VALID(r->snap_tex)) return k_rc_no_tex;
         r->snap_w = r->hw; r->snap_h = r->hh; r->snap_dxgi = r->dxgi;
         r->snap_st = D3D12_RESOURCE_STATE_COPY_DEST;
     }
@@ -695,7 +688,7 @@ static ID3D12Resource* off_rt_snapshot(int slot)
     gpu_cmd_barrier(s_rc_cmd, r->snap_tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
     r->snap_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     off_rt_transition(slot, back);
-    return r->snap;
+    return r->snap_tex;
 }
 
 /* Set by the present entry point: 1 = this batch ends with a swapchain
@@ -713,7 +706,7 @@ static u32 draw_filter_tex(const char* e)
     return (u32)strtoul(e, NULL, 16);
 }
 
-/* Copy the current backbuffer into s_screen_copy. Called mid-frame the moment
+/* Copy the current backbuffer into the screen copy. Called mid-frame the moment
  * the reduced-viewport passes finish -- this title renders its reflection into
  * the TOP-LEFT REGION of the render target and the main scene then overwrites
  * it, so a snapshot taken at end of frame contains the scene, not the
@@ -723,11 +716,11 @@ static void screen_copy_capture(u32 fi)
 {
     static int en = -1;
     PS3_KNOB(en, ps3_env_int("SCREEN_AS_TEX", 1));
-    if (!en || !s_d3d.device) return;
-            if (!s_screen_copy) {
+    if (!en || !s_rc_dev) return;
+            if (!GPU_VALID(s_rc_screen_copy_tex)) {
                 /* The GPU layer's (step C5b), sampled by the draws (the SRV
-                 * writes); s_screen_copy is its resource, borrowed. Today's:
-                 * committed, no flags, in PIXEL_SHADER_RESOURCE. */
+                 * writes). Today's: committed, no flags, in
+                 * PIXEL_SHADER_RESOURCE. */
                 gpu_texture_desc td;
                 memset(&td, 0, sizeof td);
                 td.width = s_d3d.host_w; td.height = s_d3d.host_h; td.layers = 1; td.mips = 1;
@@ -735,13 +728,10 @@ static void screen_copy_capture(u32 fi)
                 td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST | GPU_USE_COPY_SRC;
                 td.state = GPU_STATE_PIXEL_SHADER_RESOURCE;
                 s_rc_screen_copy_tex = gpu_texture_create(s_rc_dev, &td);
-                s_screen_copy = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE,
-                                                            s_rc_screen_copy_tex.id);
-                if (!s_screen_copy) s_rc_screen_copy_tex.id = 0;
             }
-            if (s_screen_copy) {
+            if (GPU_VALID(s_rc_screen_copy_tex)) {
                 /* The barriers and the copy on the frame's recorder (step C5b);
-                 * s_rc_rt_tex[fi] is render_targets[fi]'s handle. */
+                 * s_rc_rt_tex[fi] is the display target. */
                 gpu_barrier bb[2];
                 memset(bb, 0, sizeof bb);
                 bb[0].type    = GPU_BARRIER_TRANSITION;
@@ -766,25 +756,22 @@ static void screen_copy_capture(u32 fi)
                 /* SCREENCOPY_DUMP=1: stage the captured image into the readback
                  * buffer so it can be written out and LOOKED AT. Claiming a
                  * capture happened is not the same as showing what is in it.
-                 * (The readback buffer is frame.inc's, native until it has a
-                 * handle (step C2): the copy into it stays native.) */
+                 * (Step C8a: the copy into the dump's readback buffer is
+                 * gpu_cmd_copy_tex_to_buf's, today's placed footprint at 0.) */
                 { static int sd = -1;
                   PS3_KNOB(sd, ps3_env_int("SCREENCOPY_DUMP", 0));
-                  if (sd && s_d3d.readback_buf) {
+                  if (sd && GPU_VALID(s_rc_readback_buf)) {
                       gpu_cmd_barrier(s_rc_cmd, s_rc_screen_copy_tex, GPU_STATE_PIXEL_SHADER_RESOURCE,
                                       GPU_STATE_COPY_SOURCE);
 
-                      D3D12_TEXTURE_COPY_LOCATION cd = {0}, cs = {0};
-                      cd.pResource = s_d3d.readback_buf;
-                      cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                      cd.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
-                      cd.PlacedFootprint.Footprint.Width    = s_d3d.host_w;
-                      cd.PlacedFootprint.Footprint.Height   = s_d3d.host_h;
-                      cd.PlacedFootprint.Footprint.Depth    = 1;
-                      cd.PlacedFootprint.Footprint.RowPitch = s_d3d.readback_pitch;
-                      cs.pResource = s_screen_copy;
-                      cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                      s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &cd, 0, 0, 0, &cs, NULL);
+                      gpu_footprint cd;
+                      memset(&cd, 0, sizeof cd);
+                      cd.format    = GPU_FORMAT_R8G8B8A8_UNORM;
+                      cd.width     = s_d3d.host_w;
+                      cd.height    = s_d3d.host_h;
+                      cd.depth     = 1;
+                      cd.row_pitch = s_d3d.readback_pitch;
+                      gpu_cmd_copy_tex_to_buf(s_rc_cmd, s_rc_readback_buf, &cd, s_rc_screen_copy_tex, 0, NULL);
 
                       gpu_cmd_barrier(s_rc_cmd, s_rc_screen_copy_tex, GPU_STATE_COPY_SOURCE,
                                       GPU_STATE_PIXEL_SHADER_RESOURCE);
@@ -827,7 +814,7 @@ static void composite_present(u32 fi)
     int i;
     if (want == 2u) { i = s_last_drawn_slot; want = s_last_drawn_off; }
     else            { i = off_rt_find(want); }
-    if (i < 0 || !s_d3d.off_rt[i].res) return;
+    if (i < 0 || !GPU_VALID(s_d3d.off_rt[i].tex)) return;
     OffRT* r = &s_d3d.off_rt[i];
     /* Same-format copy only; a half-float source would need a converting draw. */
     if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
@@ -844,8 +831,8 @@ static void composite_present(u32 fi)
       if (n < 3 && ++n) fprintf(stderr, "[COMPOSITE] RT 0x%08X %ux%u -> backbuffer%c",
                            want, cw, ch, 10); }
 
-    /* On the frame's recorder (step C5b): r->tex is r->res's handle,
-     * s_rc_rt_tex[fi] render_targets[fi]'s. */
+    /* On the frame's recorder (step C5b): r->tex is the target's handle,
+     * s_rc_rt_tex[fi] the display target's. */
     gpu_barrier b[2];
     memset(b, 0, sizeof b);
     b[0].type    = GPU_BARRIER_TRANSITION;
@@ -874,8 +861,7 @@ static void guest_fb_present(u32 fi)
 {
     static int inited = 0;
     static u32 off, gw, gh, gpitch, up_pitch;
-    static ID3D12Resource* up = NULL;
-    static gpu_buffer up_buf;   /* step C2: up's buffer (up is borrowed), mapped for its life */
+    static gpu_buffer up_buf;   /* step C2: the upload buffer, mapped for its life */
     if (!inited) {
         inited = 1;
         const char* e = getenv("GCM_GUEST_FB");
@@ -883,11 +869,11 @@ static void guest_fb_present(u32 fi)
         if (!e || sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) != 4 || !b || !c) return;
         off = a; gw = b; gh = c; gpitch = d;
         up_pitch = (gw * 4u + 255u) & ~255u;      /* D3D12 wants 256-byte rows */
-        rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_buf, &up, NULL);   /* up NULL if none */
+        rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_buf, NULL);   /* none if none */
         fprintf(stderr, "[GUESTFB] presenting guest 0x%08X %ux%u pitch %u -> backbuffer%c",
                 off, gw, gh, gpitch, 10);
     }
-    if (!up) return;
+    if (!GPU_VALID(up_buf)) return;
     { extern u8* vm_base;
       if (!vm_base) return;
       /* RSX local memory is mapped at guest 0xC0000000. */
@@ -904,21 +890,18 @@ static void guest_fb_present(u32 fi)
       }
       gpu_buffer_unmap(s_rc_dev, up_buf, 0, (u64)up_pitch * gh); }
 
-    /* The barriers on the frame's recorder (step C5b). The upload buffer is
-     * step C2's: until it has a handle the copy from it stays native. */
+    /* The barriers and the copy on the frame's recorder (step C5b; the copy
+     * from the upload buffer step C8a's: today's placed footprint at 0). */
     gpu_cmd_barrier(s_rc_cmd, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_DEST);
 
-    D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
-    dl.pResource = s_d3d.render_targets[fi];
-    dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
-    sl.pResource = up; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    sl.PlacedFootprint.Offset = 0;
-    sl.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
-    sl.PlacedFootprint.Footprint.Width    = gw;
-    sl.PlacedFootprint.Footprint.Height   = gh;
-    sl.PlacedFootprint.Footprint.Depth    = 1;
-    sl.PlacedFootprint.Footprint.RowPitch = up_pitch;
-    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &dl, 0, 0, 0, &sl, NULL);
+    gpu_footprint sl;
+    memset(&sl, 0, sizeof sl);
+    sl.format    = GPU_FORMAT_R8G8B8A8_UNORM;
+    sl.width     = gw;
+    sl.height    = gh;
+    sl.depth     = 1;
+    sl.row_pitch = up_pitch;
+    gpu_cmd_copy_buf_to_tex(s_rc_cmd, s_rc_rt_tex[fi], 0, 0, 0, 0, up_buf, &sl);
 
     gpu_cmd_barrier(s_rc_cmd, s_rc_rt_tex[fi], GPU_STATE_COPY_DEST, GPU_STATE_RENDER_TARGET);
 }
@@ -951,8 +934,8 @@ static void vp_vb_grow(u64 want)
         return;
     }
     const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
-    gpu_buffer nb; ID3D12Resource* res = NULL; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &nb, &res, &mp) || !mp) {
+    gpu_buffer nb; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
         if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
                 (unsigned long long)cap, s_vp_cap, 10);
@@ -961,7 +944,7 @@ static void vp_vb_grow(u64 want)
     }
     rc_ring_retire(0, s_rc_vp_vb);
     s_rc_vp_vb = nb;
-    s_d3d.vp_vb = res; s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
+    s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
     fprintf(stderr, "[VPVB] a frame asked for %llu vertices: buffer grown to %u (%llu MB)%c",
             (unsigned long long)want, s_vp_cap, (unsigned long long)(bytes >> 20), 10);
 }
@@ -976,10 +959,10 @@ static void vp_ib_grow(u64 want)
     u64 cap = s_vp_icap ? s_vp_icap : (1u << 20);
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
-    if (s_d3d.vp_ib && cap <= s_vp_icap) return;
+    if (GPU_VALID(s_rc_vp_ib) && cap <= s_vp_icap) return;
     const u64 bytes = cap * 4 * 2;
-    gpu_buffer nb; ID3D12Resource* res = NULL; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_INDEX, GPU_MEM_UPLOAD, &nb, &res, &mp) || !mp) {
+    gpu_buffer nb; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_INDEX, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
         if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         static int said = 0;
         if (!said++) fprintf(stderr, "[VPIB] index buffer of %llu indices failed%c",
@@ -988,7 +971,7 @@ static void vp_ib_grow(u64 want)
     }
     rc_ring_retire(1, s_rc_vp_ib);   /* (none the first time) */
     s_rc_vp_ib = nb;
-    s_d3d.vp_ib = res; s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
+    s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
     fprintf(stderr, "[VPIB] index buffer: %u indices (%llu MB)%c",
             s_vp_icap, (unsigned long long)(bytes >> 20), 10);
 }

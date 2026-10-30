@@ -27,6 +27,35 @@
  * loop calls them directly) and, while the conversion runs, its bridges. */
 #include "gpu_d3d12_cmd.h"
 #include "gpu_d3d12_bridge.h"
+
+/* What the core needs of its backend that gpu.h does not give (step C8a):
+ * the fragments call these, and only this file names the backend. */
+/* The device (init_d3d12). */
+static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_d3d12_create(dd); }
+/* A layout's serialized bytes' hash, part of every pipeline's name in
+ * pso_manifest.bin (s_vp_root_hash, pso_desc_key). */
+static u64 rc_be_layout_hash(gpu_device* d, gpu_layout l) { return gpu_d3d12_layout_hash(d, l); }
+/* The D3D12 description the backend makes of pd: pso_manifest.bin's records
+ * are these, shared with the d3d12 route (pso_desc_key, pso_rec). */
+static void rc_be_pipeline_desc(gpu_device* d, const gpu_pipeline_desc* pd,
+                                D3D12_GRAPHICS_PIPELINE_STATE_DESC* out,
+                                D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS])
+{
+    gpu_d3d12_pipeline_d3d_desc(d, pd, out, il);
+}
+/* RSX_LOSE_DEVICE_AT_FRAME (lose_device_test): the device removed on purpose
+ * at frame `frames`, as a driver reset would lose it. */
+static void rc_be_lose_device(gpu_device* d, int frames)
+{
+    ID3D12Device* const dev = (ID3D12Device*)gpu_native(d, GPU_NATIVE_DEVICE, 0);
+    ID3D12Device5* d5 = NULL;
+    if (SUCCEEDED(dev->lpVtbl->QueryInterface(dev, &IID_ID3D12Device5, (void**)&d5)) && d5) {
+        fprintf(stderr, "[D3D12] RSX_LOSE_DEVICE_AT_FRAME: removing the device at frame %d%c", frames, 10);
+        d5->lpVtbl->RemoveDevice(d5);
+        d5->lpVtbl->Release(d5);
+    }
+}
+
 #include "rsxc_state.inc"
 #include "rsxc_shadercache.inc"   /* (before the first fragment that compiles a shader) */
 #include "rsxc_window.inc"

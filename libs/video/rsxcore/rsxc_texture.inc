@@ -145,7 +145,7 @@ static int vp_tex_find(u32 key, u32 w, u32 h, u32 fmt, int cube)
         memset(s_vp_tex_index, 0, sizeof s_vp_tex_index);
         for (int i = 0; i < VP_TEX_SLOTS; i++) {
             const VPTexSlot* c = &s_d3d.vp_tex[i];
-            if (!c->res) continue;
+            if (!GPU_VALID(c->tex)) continue;
             u32 b = vp_tex_hash(c->key, c->w, c->h, c->fmt, c->cube);
             while (s_vp_tex_index[b]) b = (b + 1) & (VP_TEX_HASH - 1);
             s_vp_tex_index[b] = (short)(i + 1);
@@ -155,7 +155,7 @@ static int vp_tex_find(u32 key, u32 w, u32 h, u32 fmt, int cube)
     for (u32 b = vp_tex_hash(key, w, h, fmt, cube); s_vp_tex_index[b]; b = (b + 1) & (VP_TEX_HASH - 1)) {
         const int i = s_vp_tex_index[b] - 1;
         const VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (c->res && c->key == key && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube)
+        if (GPU_VALID(c->tex) && c->key == key && c->w == w && c->h == h && c->fmt == fmt && c->cube == cube)
             return i;
     }
     return -1;
@@ -253,7 +253,7 @@ static void tcj_dispatch(void)
     for (int k = 0; k < norder; k++) {
         const int i = s_tcj_order[k];
         const VPTexSlot* c = &s_d3d.vp_tex[i];
-        if (!c->res) continue;
+        if (!GPU_VALID(c->tex)) continue;
         rsx_tex_layout tl;
         rsx_texture_layout(c->fmt, c->w, c->h, &tl);
         /* vp_upload_tex_slot's byte count for a cache hit */
@@ -353,15 +353,7 @@ static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
     *buf = b; *at = 0;
     return mp;
 }
-/* The same, the buffer as its resource, for the old code's copies (SMAA's
- * lookup textures) until they move onto the GPU layer. */
-static u8* tex_stage_alloc(u64 bytes, ID3D12Resource** res, u64* at)
-{
-    gpu_buffer b;
-    u8* const mp = tex_stage_alloc_buf(bytes, &b, at);
-    if (mp) *res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, b.id);
-    return mp;
-}
+
 /* Start of a frame's uploads; the GPU is idle. */
 static void tex_stage_frame(void)
 {
@@ -465,8 +457,8 @@ static int tex_pool_get(int k, gpu_heap* heap, u64* off, int* reused)
     s_tp_chunk_off += sz;
     return 1;
 }
-/* The slot's texture, in COPY_DEST: the GPU layer's (step C4), t->res its
- * resource, borrowed. 0 if it could not be made. */
+/* The slot's texture, in COPY_DEST: the GPU layer's (step C4). 0 if it could
+ * not be made. */
 static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
 {
     static int placed = -1;
@@ -485,7 +477,6 @@ static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
             pd.heap_offset = off;
             t->tex = gpu_texture_create(s_rc_dev, &pd);
             if (GPU_VALID(t->tex)) {
-                t->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->tex.id);
                 t->blk = heap; t->blk_off = off; t->blk_class = k;
                 if (reused) {   /* the memory held another texture */
                     gpu_barrier b;
@@ -500,8 +491,7 @@ static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
         }
     }
     t->tex = gpu_texture_create(s_rc_dev, td);   /* committed */
-    t->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, t->tex.id);
-    return t->res != NULL;
+    return GPU_VALID(t->tex);
 }
 /* Release the slot's texture; a placed one's block goes back to its list.
  * The GPU is idle (render_frame waits before the pre-pass), and a slot
@@ -509,9 +499,9 @@ static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
  * Release did. */
 static void tex_res_release(VPTexSlot* t)
 {
-    if (!t->res) return;
+    if (!GPU_VALID(t->tex)) return;
     gpu_texture_destroy(s_rc_dev, t->tex, 0);
-    t->tex.id = 0; t->res = NULL;
+    t->tex.id = 0;
     if (GPU_VALID(t->blk)) tex_pool_put(t->blk_class, t->blk, t->blk_off);
     t->blk.id = 0; t->blk_class = -1;
 }
@@ -712,9 +702,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
+    if (GPU_VALID(t->tex) && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
         tex_res_release(t);
-    if (!t->res) {
+    if (!GPU_VALID(t->tex)) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
         td.width = w; td.height = h;

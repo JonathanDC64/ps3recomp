@@ -21,13 +21,11 @@ extern void (*g_rsx_report_hook)(u32 method, u32 data);
 #define ZQ_EV_MAX  256    /* report events per batch */
 enum { ZQ_OFF = 0, ZQ_ON = 1, ZQ_CLEAR = 2, ZQ_REPORT = 3 };
 /* The query pool and its readback buffer are the GPU layer's (step C5b), kept
- * for the device's life. s_zq_heap and s_zq_rb are their objects, borrowed,
- * for the queries and the resolve render_frame records natively until step
- * C7 (which binds s_zq_pool and s_zq_rb_buf instead). */
-static ID3D12QueryHeap* s_zq_heap;
+ * for the device's life, and bound by their handles (step C7). s_zq_made:
+ * both are made (step C8a: in place of the native pointers' test). */
 static gpu_query_pool   s_zq_pool;
-static ID3D12Resource*  s_zq_rb;
 static gpu_buffer       s_zq_rb_buf;
+static int              s_zq_made;
 static int  s_zq_on;                       /* counting enabled, as of the stream */
 static int  s_zq_on_start;                 /* ... when the current batch began */
 static struct { u32 at, kind, idx; } s_zq_ev[ZQ_EV_MAX];
@@ -62,7 +60,7 @@ static int zq_counted(u32 slot)
 
 static int zq_ready(void)
 {
-    if (s_zq_heap) return 1;
+    if (s_zq_made) return 1;
     /* Today's: an OCCLUSION heap of ZQ_MAX, and a READBACK buffer of ZQ_MAX
      * counts in COPY_DEST. Either failing is tried again next time (the pool
      * made is kept: pools live as long as the device). */
@@ -78,9 +76,8 @@ static int zq_ready(void)
         s_zq_rb_buf = gpu_buffer_create(s_rc_dev, &bd);
         if (!GPU_VALID(s_zq_rb_buf)) return 0;
     }
-    s_zq_rb = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, s_zq_rb_buf.id);
-    s_zq_heap = gpu_d3d12_query_pool_heap(s_rc_dev, s_zq_pool);
-    return s_zq_heap && s_zq_rb;
+    s_zq_made = 1;
+    return 1;
 }
 
 /* After the batch's GPU work is complete: sum the counts in stream order and

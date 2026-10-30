@@ -60,8 +60,9 @@ static UINT hang_test_instances(u32 index_count)
 }
 
 /* RSX_LOSE_DEVICE_AT_FRAME=<n> (a test): the device is removed on purpose
- * (ID3D12Device5::RemoveDevice) at the n-th frame, as a driver reset would
- * lose it, to see what follows: the log line, the host's dialog. Read once. */
+ * (ID3D12Device5::RemoveDevice: the instance file's rc_be_lose_device) at
+ * the n-th frame, as a driver reset would lose it, to see what follows: the
+ * log line, the host's dialog. Read once. */
 static void lose_device_test(void)
 {
     static int at = -1, frames = 0;
@@ -70,13 +71,7 @@ static void lose_device_test(void)
         at = e ? atoi(e) : 0;
     }
     if (at <= 0 || ++frames != at) return;
-    ID3D12Device* const dev = (ID3D12Device*)gpu_native(s_rc_dev, GPU_NATIVE_DEVICE, 0);
-    ID3D12Device5* d5 = NULL;
-    if (SUCCEEDED(dev->lpVtbl->QueryInterface(dev, &IID_ID3D12Device5, (void**)&d5)) && d5) {
-        fprintf(stderr, "[D3D12] RSX_LOSE_DEVICE_AT_FRAME: removing the device at frame %d%c", frames, 10);
-        d5->lpVtbl->RemoveDevice(d5);
-        d5->lpVtbl->Release(d5);
-    }
+    rc_be_lose_device(s_rc_dev, frames);
 }
 
 /* The end of a frame: a point on the timeline for its slot, the swap chain's

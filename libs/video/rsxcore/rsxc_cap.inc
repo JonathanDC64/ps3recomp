@@ -109,8 +109,7 @@ static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
     u32 pitch = (w * bpp + 255) & ~255u;
 
     gpu_buffer rb = {0};
-    ID3D12Resource* rb_res = NULL;   /* (borrowed; only tested) */
-    if (!rc_buf_make((u64)pitch * h, 0, GPU_MEM_READBACK, &rb, &rb_res, NULL))
+    if (!rc_buf_make((u64)pitch * h, 0, GPU_MEM_READBACK, &rb, NULL))
         return;
 
     wait_for_gpu();
@@ -168,7 +167,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         fprintf(mf, "frame_count=%llu draws=%u backbuffer=%ux%u\n",
                 (unsigned long long)s_d3d.frame_count, ndraws, s_d3d.width, s_d3d.height);
         for (int i = 0; i < MAX_OFF_RTS; i++)
-            if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].used)
+            if (GPU_VALID(s_d3d.off_rt[i].tex) && s_d3d.off_rt[i].used)
                 fprintf(mf, "offrt[%d] off=0x%08X %ux%u dxgi=%u\n", i, s_d3d.off_rt[i].off,
                         s_d3d.off_rt[i].w, s_d3d.off_rt[i].h, s_d3d.off_rt[i].dxgi);
         fprintf(mf, "--- ops ---\n");
@@ -241,7 +240,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
                        DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        if (!r->res || !r->used) continue;
+        if (!GPU_VALID(r->tex) || !r->used) continue;
         snprintf(path, sizeof path, "%s/rt_%08X.bmp", dir, r->off);
         cap_readback_write(r->tex, r->hw, r->hh, r->dxgi, r->st, fi, path);
     }

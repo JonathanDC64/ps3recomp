@@ -787,12 +787,12 @@ static void rc_grave_tex(gpu_texture* t)
 }
 
 /* An offscreen target and its init staging, dropped (step C5a): the handles
- * go into the grave, the borrowed pointers and the RTV are cleared. */
+ * go into the grave, and the RTV is cleared. */
 static void off_rt_drop_target(OffRT* r)
 {
     rc_grave_put(r->tex, r->up_buf);
-    r->tex.id = 0;   r->res = NULL;
-    r->up_buf.id = 0; r->up = NULL;
+    r->tex.id = 0;
+    r->up_buf.id = 0;
     r->rtv.id = 0;   r->rtv_cpu.ptr = 0;
 }
 
@@ -800,7 +800,7 @@ static int off_rt_find(u32 off)
 {
     if (!off) return -1;
     for (int i = 0; i < MAX_OFF_RTS; i++)
-        if (s_d3d.off_rt[i].res && s_d3d.off_rt[i].off == off) return i;
+        if (GPU_VALID(s_d3d.off_rt[i].tex) && s_d3d.off_rt[i].off == off) return i;
     return -1;
 }
 
@@ -812,8 +812,7 @@ static int off_rt_find(u32 off)
  * Demon's Souls's frame, so later scene draws covered the player.
  * Created typeless (R24G8) so a later pass can sample one as a texture. */
 typedef struct {
-    ID3D12Resource* res;
-    gpu_texture tex;    /* the GPU layer's texture (step C5a): res borrows it */
+    gpu_texture tex;    /* the GPU layer's texture (step C5a) */
     gpu_view dsv, dsv_ro;   /* its writable and read-only DSVs (step C5a) */
     D3D12_CPU_DESCRIPTOR_HANDLE dsv_cpu, dsv_ro_cpu;   /* theirs, for the native binds */
     u32 off, w, h;      /* guest dims */
@@ -834,12 +833,10 @@ static gpu_view zeta_dsv(int slot) { return s_zeta[slot].dsv; }
                                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
 static gpu_view zeta_dsv_ro(int slot) { return s_zeta[slot].dsv_ro; }
 
-/* A depth surface dropped (step C5a): its handle and views into the grave,
- * the borrowed pointer cleared. */
+/* A depth surface dropped (step C5a): its handle and views into the grave. */
 static void zeta_drop(ZetaRT* z)
 {
     rc_grave_tex(&z->tex);
-    z->res = NULL;
     z->dsv.id = z->dsv_ro.id = 0;
     z->dsv_cpu.ptr = z->dsv_ro_cpu.ptr = 0;
 }
@@ -847,7 +844,7 @@ static void zeta_drop(ZetaRT* z)
 static int zeta_find(u32 off)
 {
     for (int i = 0; i < MAX_ZETA; i++)
-        if (s_zeta[i].res && s_zeta[i].off == off) return i;
+        if (GPU_VALID(s_zeta[i].tex) && s_zeta[i].off == off) return i;
     return -1;
 }
 
@@ -875,7 +872,7 @@ static int zeta_get(u32 off, u32 w, u32 h)
         zeta_drop(z);
     } else {
         for (int i = 0; i < MAX_ZETA; i++)
-            if (!s_zeta[i].res) { slot = i; break; }
+            if (!GPU_VALID(s_zeta[i].tex)) { slot = i; break; }
         if (slot < 0) {
             for (int i = 0; i < MAX_ZETA; i++)
                 if (!s_zeta[i].used) { slot = i; break; }
@@ -884,7 +881,7 @@ static int zeta_get(u32 off, u32 w, u32 h)
         }
     }
     ZetaRT* z = &s_zeta[slot];
-    /* The GPU layer's texture (step C5a), res borrows it: typeless R24G8,
+    /* The GPU layer's texture (step C5a): typeless R24G8,
      * cleared to depth 1.0 fastest, sampled as depth (the SRV writes). Its
      * DSVs are D24S8 views, writable and read-only. */
     gpu_texture_desc td;
@@ -898,7 +895,6 @@ static int zeta_get(u32 off, u32 w, u32 h)
     td.clear_depth = 1.0f;
     z->tex = gpu_texture_create(s_rc_dev, &td);
     if (!GPU_VALID(z->tex)) return -1;
-    z->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, z->tex.id);
     z->off = off; z->w = w; z->h = h; z->used = 1;
     z->hw = td.width; z->hh = td.height;
     z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
@@ -942,7 +938,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         off_rt_drop_target(r);     /* dims/format changed */
     } else {
         for (int i = 0; i < MAX_OFF_RTS; i++)
-            if (!s_d3d.off_rt[i].res) { slot = i; break; }
+            if (!GPU_VALID(s_d3d.off_rt[i].tex)) { slot = i; break; }
         if (slot < 0) {   /* evict an entry not used this frame */
             for (int i = 0; i < MAX_OFF_RTS; i++)
                 if (!s_d3d.off_rt[i].used) { slot = i; break; }
@@ -967,7 +963,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     }
     OffRT* r = &s_d3d.off_rt[slot];
     const u32 hw = rt_host_dim(w, h, w), hh = rt_host_dim(w, h, h);
-    /* The GPU layer's texture (step C5a), res borrows it: made in COPY_DEST
+    /* The GPU layer's texture (step C5a): made in COPY_DEST
      * for the refill below, cleared fastest to zero in its own format. */
     gpu_texture_desc td;
     memset(&td, 0, sizeof td);
@@ -978,7 +974,6 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     td.clear_format = td.format;
     r->tex = gpu_texture_create(s_rc_dev, &td);
     if (!GPU_VALID(r->tex)) return -1;
-    r->res = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, r->tex.id);
     r->off = off; r->w = w; r->h = h; r->hw = hw; r->hh = hh; r->dxgi = (u32)want_fmt;
     r->gdxgi = (u32)gfmt;
     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -1003,7 +998,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         u8* wide = (hw != w) ? (u8*)malloc((size_t)w * bpp) : NULL;
         if (vm_base && src != 0xFFFFFFFFu) {
             /* The staging: a GPU layer upload buffer, mapped for its life
-             * (step C5a); up borrows it. */
+             * (step C5a). */
             gpu_buffer_desc bd;
             memset(&bd, 0, sizeof bd);
             bd.size = (u64)pitch * hh;
@@ -1012,7 +1007,6 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             bd.state = GPU_STATE_GENERIC_READ;
             if (hw == w || wide) r->up_buf = gpu_buffer_create(s_rc_dev, &bd);
             if (GPU_VALID(r->up_buf)) {
-                r->up = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_BUFFER, r->up_buf.id);
                 void* mp = gpu_buffer_map(s_rc_dev, r->up_buf, 0, 0);
                 if (mp) {
                     const u8* sp = vm_base + src;

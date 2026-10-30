@@ -736,3 +736,32 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   statics, before them), 10510 (rsx_scale_apply), 11659 (a sampler that
 #   reads a capture: made? is its handle). capsetv (scratch: capset0 with
 #   SUBVP_RTT=1, and RSX_SCALE=150 on the fogwall) passes the gate exact.
+#  Resources and the device: no field, local or parameter holds an
+#   ID3D12Resource, ID3D12Device, queue, swap chain or command list. The
+#   textures and buffers are their handles (made? is GPU_VALID): OffRT.tex,
+#   up_buf, rb_buf, snap_tex, down_tex (294-330: res, up, rb, snap, down
+#   gone), VPTexSlot.tex and blk (359-364: res and blk_heap gone), ZetaRT.tex
+#   (8458), s_rc_rt_tex, s_rc_depth_tex, s_rc_swap_image, the rings and
+#   buffers s_rc_vertex_buf .. s_rc_readback_buf, s_rtsave_b (12550),
+#   s_hold_tex (2145), s_aa.disp_tex (10590), s_smaa's four (10738-10750),
+#   s_rc_screen_copy_tex (662), s_zq_rb_buf (9863-9866: s_zq_made in place of
+#   the borrowed pointers' test). s_d3d's device, cmd_queue, swap_chain,
+#   render_targets, swap_buffers, cmd_list, depth_buffer, vertex_buffer,
+#   readback_buf, vf_buf, vp_vb, vp_ib, vp_cb, vp_fpcb go (461-540), with
+#   the unused rtv_heap, swap_rtv_heap, cmd_allocators, fence, fence_event,
+#   fence_values, dsv_heap, and the descriptor sizes nothing read
+#   (rtv_descriptor_size, srv_inc, samp_inc: init_d3d12 2479-3215 no longer
+#   asks the device for them). rc_buf_make takes no resource out-parameter;
+#   off_rt_snapshot (9446) returns the copy's handle; tex_stage_alloc (6933)
+#   goes. The last native copies are the GPU layer's: screen_copy_capture's
+#   SCREENCOPY_DUMP copy (9516-9600) is gpu_cmd_copy_tex_to_buf, and
+#   guest_fb_present's (9688-9760) gpu_cmd_copy_buf_to_tex, each with today's
+#   footprint at offset 0. Two debug prints that showed a native pointer
+#   (VP path resources at init, RTT_SAVERT's rt=) show the handle's id.
+#  The device, the queue and the swap chain's buffers reach the menu only
+#   through rsxc_api.inc's block (rc_device, rc_queue, rc_back_buffer,
+#   rc_overlay_frame: gpu_native, at 16141, 16180-16193 and 12965), and
+#   what the core needs of the backend beyond gpu.h is the instance file's
+#   (rsxc_d3d12.c: rc_be_create for gpu_d3d12_create, rc_be_layout_hash,
+#   rc_be_pipeline_desc for pso_manifest.bin's D3D12 records, and
+#   rc_be_lose_device for lose_device_test's RemoveDevice, 3395-3410).

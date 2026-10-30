@@ -176,7 +176,7 @@ static int hdr_want(void)
 }
 
 /* The swap chain's buffers and their RTVs (init and after a resize). The
- * buffers are the swap chain's images; s_d3d.swap_buffers borrows them. The
+ * buffers are the swap chain's images (step C8a: by their handles only). The
  * RTVs are views of the images (step C5a, today's NULL description), which
  * a resize drops with the images, so they are made again here. (Step C6: the
  * images by index are gpu.h's gpu_swap_image, the bridge's no longer.) */
@@ -186,8 +186,7 @@ static int swap_buffers_get(void)
     memset(s_rc_swap_rtv_cpu, 0, sizeof s_rc_swap_rtv_cpu);
     for (u32 i = 0; i < FRAME_COUNT; i++) {
         s_rc_swap_image[i] = gpu_swap_image(s_rc_dev, s_rc_swap, i);
-        s_d3d.swap_buffers[i] = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
-        if (!s_d3d.swap_buffers[i]) return -1;
+        if (!GPU_VALID(s_rc_swap_image[i])) return -1;
         s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0, &s_rc_swap_rtv_cpu[i]);
     }
     return 0;
@@ -208,7 +207,7 @@ static struct { gpu_layout layout; gpu_pipeline pso; int failed; } s_of;
 static int of_ready(void)
 {
     if (s_of.pso.v) return 1;
-    if (s_of.failed || !s_d3d.device) return 0;
+    if (s_of.failed || !s_rc_dev) return 0;
     s_of.failed = 1;   /* until it is made */
     gpu_shader vb = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
                               NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
@@ -326,7 +325,7 @@ static struct { gpu_layout layout; gpu_pipeline pso[2]; int failed; } s_hdr_blit
 static int hdr_blit_ready(void)
 {
     if (s_hdr_blit.pso[0].v && s_hdr_blit.pso[1].v) return 1;
-    if (s_hdr_blit.failed || !s_d3d.device) return 0;
+    if (s_hdr_blit.failed || !s_rc_dev) return 0;
     s_hdr_blit.failed = 1;   /* until it is made */
     static const char vs[] =
         "struct O { float4 p : SV_POSITION; float2 uv : TEXCOORD; };\n"
@@ -466,7 +465,7 @@ static void blit_to_window(u32 fi)
         const int t = s_hdr.frame_t;
         gpu_view_desc v;
         blit_srv_none(&v);
-        if (t >= 0 && s_d3d.off_rt[t].res && s_d3d.off_rt[t].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        if (t >= 0 && GPU_VALID(s_d3d.off_rt[t].tex) && s_d3d.off_rt[t].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
             off_rt_transition(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             memset(&v, 0, sizeof v);   /* the default view */
             v.texture = s_d3d.off_rt[t].tex;
@@ -504,10 +503,9 @@ static void blit_to_window(u32 fi)
 /* rc_overlay_repaint: the last game frame shown, as blit_to_window
  * read it (render_targets[fi] is cleared by the next batch, a frame shown or
  * not). Render thread. */
-static ID3D12Resource* s_hold;     /* s_hold_tex's resource, borrowed (step C6) */
 static gpu_texture s_hold_tex;     /* the GPU layer's (step C6) */
 static u32 s_hold_w, s_hold_h;
-static int s_hold_valid;            /* s_hold has the last frame shown */
+static int s_hold_valid;            /* s_hold_tex has the last frame shown */
 static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last frame shown */
 static long long s_last_present_qpc;   /* the last Present, a repaint's too */
 static long long s_game_frame_qpc;     /* the last game frame shown (hold_frame) */
@@ -521,7 +519,7 @@ static int repaint_knob(void)
 }
 
 /* The hold's and frame fi's whole moves between the states given, in one
- * barrier list: render_targets[fi] (s_rc_rt_tex[fi]) first, s_hold second. */
+ * barrier list: the display target s_rc_rt_tex[fi] first, the hold second. */
 static void hold_barriers(u32 fi, gpu_state rt_before, gpu_state rt_after, gpu_state hold_before,
                           gpu_state hold_after)
 {
@@ -539,17 +537,16 @@ static void hold_barriers(u32 fi, gpu_state rt_before, gpu_state rt_after, gpu_s
     gpu_cmd_barrier_n(s_rc_cmd, 2, b);
 }
 
-/* Records the copy of the game's frame fi into s_hold. render_targets[fi] is
+/* Records the copy of the game's frame fi into the hold. s_rc_rt_tex[fi] is
  * in PRESENT before and after. The hold is the GPU layer's (step C6):
  * today's committed RGBA8 texture with no flags, in COMMON. */
 static void hold_copy(u32 fi)
 {
-    if (s_hold && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
+    if (GPU_VALID(s_hold_tex) && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
         gpu_texture_destroy(s_rc_dev, s_hold_tex, 0);   /* at once, as today's Release */
         s_hold_tex.id = 0;
-        s_hold = NULL;
     }
-    if (!s_hold) {
+    if (!GPU_VALID(s_hold_tex)) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
         td.width = s_d3d.host_w; td.height = s_d3d.host_h; td.layers = 1; td.mips = 1;
@@ -557,9 +554,7 @@ static void hold_copy(u32 fi)
         td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COMMON;
         s_hold_tex = gpu_texture_create(s_rc_dev, &td);
-        s_hold = (ID3D12Resource*)gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_hold_tex.id);
-        if (!s_hold) {
-            s_hold_tex.id = 0;
+        if (!GPU_VALID(s_hold_tex)) {
             s_hold_valid = 0;
             return;
         }
@@ -706,10 +701,7 @@ static void swap_resize(void)
     if (s_overlay_on && s_overlay.release) s_overlay.release(s_overlay.user);
     /* The buffers are the swap chain's (borrowed): the resize drops them and
      * gets them again, with the buffer count and flags it was made with. */
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        s_d3d.swap_buffers[i] = NULL;
-        s_rc_swap_image[i].id = 0;
-    }
+    for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
     HRESULT hr = (HRESULT)gpu_swap_resize(s_rc_dev, s_rc_swap, w, h,
                                           hdr ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);
     if (SUCCEEDED(hr) && hdr != s_hdr.active) {

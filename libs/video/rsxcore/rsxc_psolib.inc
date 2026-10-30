@@ -17,7 +17,7 @@
  *                    be rebuilt without the guest (fixed-size records): the
  *                    d3d12 route's file, with the same records (the D3D12
  *                    description the GPU layer makes of a pipeline is
- *                    today's, gpu_d3d12_pipeline_d3d_desc).
+ *                    today's, rc_be_pipeline_desc).
  *   pso_blobs/       the shader bytecode those records name, by content hash.
  *
  * At startup, worker threads build every manifest record the library does not
@@ -367,7 +367,7 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
     }
 }
 /* A manifest record as the GPU layer's description: the inverse of the D3D12
- * description the GPU layer makes of vp_fp_desc's (gpu_d3d12_pipe_d3d_desc),
+ * description the GPU layer makes of vp_fp_desc's (rc_be_pipeline_desc),
  * so the record's pipeline gets the name a draw's gets. 0 for a record no
  * vp_fp_desc makes. */
 static int pso_rec_desc(const pso_rec* r, gpu_shader vs, gpu_shader ps, gpu_pipeline_desc* pd)
@@ -464,7 +464,7 @@ static int pso_prebuild_one(const pso_rec* r)
     if (!pso_rec_desc(r, sh[0], sh[1], &pd)) goto out;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
     D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-    gpu_d3d12_pipeline_d3d_desc(s_rc_dev, &pd, &dd, il);
+    rc_be_pipeline_desc(s_rc_dev, &pd, &dd, il);   /* (rsxc_d3d12.c) */
     if (pso_desc_key(&dd) != r->name) goto out;   /* another build's layout, or a stale root signature */
     /* A record pipelines.n does not count may be in the library already:
      * one stored while the library was being saved, or a crash between the
@@ -552,8 +552,8 @@ static void pso_lib_tick(void)
 /* A guest-FP pipeline (vp_get_fp_pso, psj's workers): the GPU layer's, which
  * loads it from its library or compiles and stores it. One it compiled goes
  * into the manifest under today's name, pso_desc_key of the D3D12
- * description the GPU layer made of it (the bridge, on this miss path
- * only). None on failure. Thread-safe. */
+ * description the GPU layer made of it (rc_be_pipeline_desc, on this miss
+ * path only). None on failure. Thread-safe. */
 static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
 {
     uint32_t how = GPU_PIPELINE_FAILED;
@@ -567,7 +567,7 @@ static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
     }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
     D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-    gpu_d3d12_pipeline_d3d_desc(s_rc_dev, pd, &dd, il);
+    rc_be_pipeline_desc(s_rc_dev, pd, &dd, il);
     pso_manifest_add(pso_desc_key(&dd), &dd);
     return pso;
 }
