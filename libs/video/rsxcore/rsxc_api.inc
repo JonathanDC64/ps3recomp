@@ -479,10 +479,75 @@ static void*    rc_back_buffer(unsigned i)
     if (i >= s_rc_swap_n || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
     return rc_be_image(s_rc_dev, s_rc_swap_image[i]);
 }
+/* ---- step VM ---- */
+/* The overlay v2 (rsx_out.h): the menu on the core's own device. Its
+ * recorder is slot RC_OVERLAY_SLOT + the frame slot (init_d3d12 makes
+ * 2 * FRAME_COUNT), so the frame slot's wait (frame_slot_wait) covers it
+ * too; it is submitted after the frame's work, before the Present, with the
+ * swap chain's waits as every submit of the frame (frame_cmd_submit). */
+#include "rsx_out.h"
+#define RC_OVERLAY_SLOT FRAME_COUNT
+static rsx_out_overlay_gpu s_overlay_gpu;
+static volatile long       s_overlay_gpu_on;
+static gpu_cmd*            s_overlay_gpu_cmd;    /* open while frame_gpu runs */
+static u32                 s_overlay_gpu_slot;
+
+static void rc_set_overlay_gpu(const rsx_out_overlay_gpu* overlay)
+{
+    InterlockedExchange(&s_overlay_gpu_on, 0);
+    if (overlay && overlay->frame_gpu) {
+        s_overlay_gpu = *overlay;
+        InterlockedExchange(&s_overlay_gpu_on, 1);
+    }
+}
+static struct gpu_device* rc_gpu_device(void) { return s_d3d.initialized ? s_rc_dev : NULL; }
+
+static gpu_fence overlay_gpu_submit(uint32_t flags)
+{
+    gpu_submit_desc how;
+    how.swapchain = s_rc_swap;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL | flags;
+    gpu_cmd_end(s_rc_dev, s_overlay_gpu_cmd);
+    return gpu_submit(s_rc_dev, &s_overlay_gpu_cmd, 1, &how);
+}
+
+/* (A wait of 2 s at most, as frame_slot_wait's; 0 at once on a lost device.
+ * A slot the GPU may still run is not opened again: no recorder then.) */
+static struct gpu_cmd* rc_overlay_gpu_flush(void)
+{
+    if (!s_overlay_gpu_cmd) return NULL;
+    const gpu_fence f = overlay_gpu_submit(GPU_SUBMIT_SIGNAL);
+    s_overlay_gpu_cmd = NULL;
+    if (gpu_fence_wait(s_rc_dev, f, 2000)) {
+        printf("[D3D12] overlay: the GPU has not finished its work after 2 s (fence %llu)\n", (unsigned long long)f);
+        return NULL;
+    }
+    s_overlay_gpu_cmd = gpu_cmd_begin(s_rc_dev, s_overlay_gpu_slot);
+    return s_overlay_gpu_cmd;
+}
+
+static unsigned rc_back_buffer_format(void);
+static void overlay_gpu_frame(u32 fi)
+{
+    if (!s_rc_have_image) return;   /* (no image acquired: nothing to draw over) */
+    frame_slot_wait(fi);   /* (the slot's last frame: already passed in a frame's own order) */
+    s_overlay_gpu_slot = RC_OVERLAY_SLOT + fi;
+    s_overlay_gpu_cmd = gpu_cmd_begin(s_rc_dev, s_overlay_gpu_slot);
+    if (!s_overlay_gpu_cmd) return;
+    s_overlay_gpu.frame_gpu(s_overlay_gpu.user, s_overlay_gpu_cmd, s_rc_swap_image[s_rc_image].id,
+                            rc_back_buffer_format(), s_rc_image, s_d3d.win_w, s_d3d.win_h);
+    if (s_overlay_gpu_cmd) overlay_gpu_submit(0);
+    s_overlay_gpu_cmd = NULL;
+}
+
 /* The image the frame was drawn into (step VC1: the acquired one; frame
  * slot fi's on D3D12). */
 static void rc_overlay_frame(u32 fi)
 {
+    if (s_overlay_gpu_on) {   /* (step VM) */
+        overlay_gpu_frame(fi);
+        return;
+    }
     (void)fi;
     s_overlay.frame(s_overlay.user, rc_back_buffer(s_rc_image), s_rc_image, s_d3d.win_w, s_d3d.win_h);
 }

@@ -21,6 +21,7 @@
  *     shader, a read-only depth target, occlusion counts; a post pass with a
  *     static sampler;
  *   - the table memo, sampler and view caching, fences and a wait's timeout;
+ *     t20 switched between buffers from draw to draw (the set-0 memo);
  *   - the pipeline cache across two devices, a swap chain on a hidden window
  *     (Windows), breadcrumbs and the fault report.
  */
@@ -715,13 +716,18 @@ static void test_layouts(void)
         CHECK(l->push_size == 24 && l->slot[2].push_off == 16 && l->first == 1);
     }
 
-    /* A table not from register 0 is refused (its bindings could not match
-     * a pool's sets). */
+    /* A table from another register than 0 (step VM: the menu's t1): its
+     * entry 0 is that register, so it binds a pool's sets as one from 0. */
     memset(&ld, 0, sizeof ld);
-    ld.nslots = 1;
-    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
-    printf("  (a layout refused on purpose:)\n");
-    CHECK(!GPU_VALID(gpu_layout_create(g_d, &ld)));
+    ld.nslots = 2;
+    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
+    const gpu_layout t4 = gpu_layout_create(g_d, &ld);
+    CHECK(GPU_VALID(t4));
+    if (GPU_VALID(t4)) {
+        const gpu_vk_layout* l = &g_vk->layout[GPU_HANDLE_INDEX(t4.id)];
+        CHECK(l->slot[0].set != l->slot[1].set && l->slot[1].set < l->nsets);
+    }
 }
 
 /* ---- A draw on the guest layout ---- */
@@ -1293,6 +1299,69 @@ static void test_memo(const scene* s)
     CHECK(t0.v && t4.v && t8.v && t0.v != t4.v && t4.v != t8.v && t0.v != t8.v);
     CHECK(gpu_table_ref(g_d, pool, 3).v == 0 && gpu_fast_table_ref(g_d, pool, 9).v == 0);
     CHECK(gpu_fast_table_ref(g_d, pool, 8).v == t8.v);
+}
+
+/* Step V5v: t20 switched between two buffers and offsets from draw to draw,
+ * as the core's vertex-shader clamp does (its table's ring, then vf_buf):
+ * every draw reads its own, and the recorder's set-0 memo finds a set it had
+ * without the cache. The vertex shader scales the colour by raw[off + 4]. */
+static void test_raw_switch(scene* s)
+{
+    /* From 0: 0 (black); from 256 (the largest minStorageBufferOffsetAlignment): 1. */
+    float other[66];
+    memset(other, 0, sizeof other);
+    other[0] = other[65] = 1.0f;
+    const gpu_buffer b = buf_new(g_d, 512, GPU_MEM_UPLOAD, GPU_STATE_GENERIC_READ);
+    CHECK(GPU_VALID(b));
+    if (!GPU_VALID(b)) return;
+    memcpy(buf_ptr(b), other, sizeof other);
+    const gpu_addr k_at[3] = {gpu_fast_buffer_addr(g_d, s->raw), gpu_fast_buffer_addr(g_d, b),
+                              gpu_fast_buffer_addr(g_d, b) + 256};
+    const int k_lit[3] = {1, 0, 1};
+    /* Each recorder draws with s->raw first, then with seq[i]: the memo holds
+     * that pair, so a buffer comes from the cache (miss) when it is new or
+     * fell out of the memo (1 after 2), and not when it is still in it. */
+    static const int seq[] = {0, 1, 1, 0, 2, 2, 1, 1};
+    static const int miss[] = {0, 1, 0, 0, 1, 0, 1, 0};
+    const gpu_table t16 = gpu_fast_table_ref(g_d, s->tex_pool, 16);
+    const float zero[4] = {0, 0, 0, 0};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = s->rtv;
+    int ok = 1;
+    for (uint32_t i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+        readback rb;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_pass_begin(c, &pass);
+        gpu_cmd_clear_color(c, s->rtv, zero, NULL);
+        scene_binds(c, s, s->pso, t16, 0, 0);
+        gpu_cmd_draw(c, 3, 1, 0, 0);   /* s->raw's set: in the memo from the draw before */
+        gpu_cmd_bind_raw(c, 4, k_at[seq[i]]);
+        const uint32_t n0 = g_vk->n_set0_gets;
+        gpu_cmd_draw(c, 3, 1, 0, 0);
+        const uint32_t looked = g_vk->n_set0_gets - n0;
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        const int ran = run(g_d, c);
+        const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0);
+        char what[32];
+        snprintf(what, sizeof what, "raw switch %u", i);
+        const int lit = k_lit[seq[i]];
+        ok &= ran && tex_read(s->rt, &td, &rb) &&
+              px_is(&rb, 8, 8, lit ? 128 : 0, lit ? 128 : 0, lit ? 64 : 0, lit ? 255 : 0, what);
+        rb_done(&rb);
+        c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_COPY_SOURCE, GPU_STATE_RENDER_TARGET);
+        run(g_d, c);
+        if (i && looked != (uint32_t)miss[i]) {
+            printf("  raw switch %u: %u set-0 lookups, not %d\n", i, looked, miss[i]);
+            ok = 0;
+        }
+    }
+    CHECK(ok);
+    gpu_buffer_destroy(g_d, b, 0);
+    printf("  t20 switched between buffers and offsets: %u draws, each read its own; the memo held two\n",
+           (unsigned)(sizeof seq / sizeof seq[0]));
 }
 
 static void test_caches(void)
@@ -2053,6 +2122,7 @@ int main(void)
         test_draw(&s);
         test_post(&s);
         test_memo(&s);
+        test_raw_switch(&s);
     }
     test_caches();
     test_fences();

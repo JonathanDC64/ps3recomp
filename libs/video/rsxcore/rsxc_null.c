@@ -161,4 +161,8 @@ const rsx_route rsxc_route_null = {
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
 
+/* ---- step VM ---- */
+/* The overlay v2's calls (rsx_out.h; rsxc_api.inc). */
+const rsx_route_gpu rsxc_route_gpu_null = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
+
 #endif /* PS3RECOMP_RSX_HAL && (_WIN32 || __linux__) */

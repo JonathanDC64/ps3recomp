@@ -54,10 +54,64 @@ uint8_t* vm_base = NULL;
 /* Built with the portable renderer: RSX_BACKEND picks the renderer the
  * capture plays through (rsx_out.h). */
 #include "rsx_out.h"
+#include "rsx_d3d12_backend.h"   /* (rsx_d3d12_overlay, for RSX_REPLAY_OVERLAY_GPU) */
 #include <string.h>
 #define rsx_d3d12_backend_init          rsx_out_backend_init
 #define rsx_d3d12_backend_present       rsx_out_backend_present
 #define rsx_d3d12_backend_pump_messages rsx_out_backend_pump_messages
+#include "gpu/gpu.h"
+#include "gpu/gpu_vt_cmd.h"
+
+/* RSX_REPLAY_OVERLAY_GPU=1 on the new path's routes: overlay v2 (rsx_out.h)
+ * under test. Each frame's image gets a 64x64 square in its top left corner,
+ * its colour by frame, recorded into the core's recorder; every 4th frame the
+ * recording is flushed once in between, as a read back does. The last line
+ * says how many frames it drew in and what failed. */
+static unsigned s_ov_frames, s_ov_flushes, s_ov_failed;
+static void ov_overlay_v1(void* user, void* back_buffer, unsigned index, unsigned width, unsigned height)
+{
+    (void)user; (void)back_buffer; (void)index; (void)width; (void)height;
+    s_ov_failed++;   /* (v2 is set: the core must not call v1's frame) */
+}
+static void ov_frame(void* user, struct gpu_cmd* c, uint32_t target, uint32_t format, unsigned index,
+                     unsigned width, unsigned height)
+{
+    (void)user; (void)format; (void)index;
+    gpu_device* const d = rsx_out_gpu_device();
+    if (!d || !c || width < 64 || height < 64) { s_ov_failed++; return; }
+    const gpu_texture t = {target};
+    gpu_view_desc v;
+    memset(&v, 0, sizeof v);
+    v.texture = t;
+    v.kind = GPU_VIEW_RTV;
+    v.dim = GPU_DIM_2D;
+    const gpu_view rtv = gpu_view_get(d, &v);
+    if (!GPU_VALID(rtv)) { s_ov_failed++; return; }
+    const float k = (float)(s_ov_frames % 8) / 7.0f;
+    const float rgba[4] = {k, 1.0f - k, 0.5f, 1.0f};
+    const gpu_rect r = {0, 0, 64, 64};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = rtv;
+    gpu_cmd_barrier(c, t, GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
+    gpu_cmd_pass_begin(c, &pass);
+    gpu_cmd_clear_color(c, rtv, rgba, &r);
+    gpu_cmd_pass_end(c);
+    gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
+    if (s_ov_frames % 4 == 3) {
+        c = rsx_out_overlay_gpu_flush();
+        if (!c) { s_ov_failed++; return; }
+        s_ov_flushes++;
+        gpu_cmd_barrier(c, t, GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
+        gpu_cmd_pass_begin(c, &pass);
+        const gpu_rect r2 = {64, 0, 128, 64};
+        gpu_cmd_clear_color(c, rtv, rgba, &r2);
+        gpu_cmd_pass_end(c);
+        gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
+    }
+    s_ov_frames++;
+}
 #else
 int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 void rsx_d3d12_backend_present(void);
@@ -144,6 +198,16 @@ int main(int argc, char** argv)
           rsx_out_pso_index_ready(ready ? hash : 0);
           printf("[replay] pipeline index: %u rows handed over from %s\n", rows, ip);
       } }
+    char ovv[16] = "";
+    const int overlay_gpu = GetEnvironmentVariableA("RSX_REPLAY_OVERLAY_GPU", ovv, sizeof ovv) < sizeof ovv &&
+                            atoi(ovv) > 0 && strcmp(rsx_out_renderer(), "d3d12") != 0;
+    if (overlay_gpu) {
+        static const rsx_d3d12_overlay v1 = {NULL, NULL, ov_overlay_v1, NULL};   /* (v2 set beside it, as des_ui) */
+        static const rsx_out_overlay_gpu v2 = {NULL, ov_frame};
+        rsx_out_set_overlay(&v1);
+        rsx_out_set_overlay_gpu(&v2);
+        if (!rsx_out_gpu_device()) s_ov_failed++;
+    }
 #endif
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
@@ -176,6 +240,11 @@ int main(int argc, char** argv)
             printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame\n",
                    timed, wall_sum / timed, cpu_sum / timed);
     }
+#if defined(PS3RECOMP_RSX_HAL)
+    if (overlay_gpu)
+        printf("[replay] overlay v2: %u frames drawn over, %u flushes, %u failed\n", s_ov_frames, s_ov_flushes,
+               s_ov_failed);
+#endif
     fflush(stdout);
 #if defined(PS3RECOMP_RSX_HAL)
     /* RSX_REPLAY_SHUTDOWN=1 on the new path's routes: its shutdown first. */

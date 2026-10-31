@@ -168,7 +168,7 @@ static int init_d3d12(u32 width, u32 height)
         memset(&dd, 0, sizeof dd);
         if (rc_be_breadcrumbs()) dd.flags |= GPU_DEVICE_BREADCRUMBS;
         if (getenv("CELLMARK_IGPU")) dd.flags |= GPU_DEVICE_LOW_POWER;
-        dd.cmd_slots = FRAME_COUNT;
+        dd.cmd_slots = 2 * FRAME_COUNT;   /* (step VM: the overlay's, RC_OVERLAY_SLOT on) */
         s_rc_dev = rc_be_create(&dd);
         if (!start_step("device", s_rc_dev != NULL)) return -1;
     }

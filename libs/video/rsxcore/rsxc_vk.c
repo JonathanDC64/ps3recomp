@@ -258,4 +258,10 @@ const rsx_route rsxc_route_vk = {
  * start_step), NULL after none. */
 const char* rsxc_vk_start_failed(void) { return s_rc_start_failed; }
 
+/* ---- step VM ---- */
+/* The overlay v2's calls (rsx_out.h; rsxc_api.inc): the menu draws here on
+ * the core's own device (the port's render_gpu.cpp), as rc_be_device and
+ * the rest above have nothing for a D3D12 one. */
+const rsx_route_gpu rsxc_route_gpu_vk = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
+
 #endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && (_WIN32 || __linux__) */
