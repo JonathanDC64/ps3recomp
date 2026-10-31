@@ -865,3 +865,10 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   SRV pool's last region starts at slot 25) and + 2 stays the pool's
 #   null; the weights are made readable before the edge pass (they are
 #   made as a target).
+
+# After base14: fpk_extract_at (7877-7903) skips the memo hit's copy for a
+# program without constants and writes a new entry's k whole once. The CRT's
+# short copy is a masked load and store over 64 bytes, and a masked access
+# that reaches a page nothing has touched takes a microcode assist each time;
+# which entries end a page depends on where s_fpkm lands, so the cost came
+# and went with the binary's layout. The bytes written are the same.
