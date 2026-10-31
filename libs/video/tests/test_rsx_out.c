@@ -176,6 +176,16 @@ const rsx_route rsxc_route_vk = {.name = "vulkan", RSX_OUT_FUNCS(FIELD_V_, FIELD
 #undef vk_backend_present
 #undef TAB_PREFIX
 
+/* The overlay v2's tables (rsx_out.h, step VM): nothing to draw here. */
+#if defined(_WIN32)
+static void test_set_overlay_gpu(const rsx_out_overlay_gpu* overlay) { (void)overlay; }
+static struct gpu_device* test_gpu_device(void) { return NULL; }
+static struct gpu_cmd* test_overlay_gpu_flush(void) { return NULL; }
+const rsx_route_gpu rsxc_route_gpu_d3d12 = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+const rsx_route_gpu rsxc_route_gpu_null = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+const rsx_route_gpu rsxc_route_gpu_vk = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+#endif
+
 /* ---- the child: one case ---- */
 static int g_fail;
 static void check(int ok, const char* what)

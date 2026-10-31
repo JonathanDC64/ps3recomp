@@ -149,4 +149,70 @@ void rsx_out_route_presented(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* ---- step VM ---- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The overlay on the new path's own GPU device (overlay v2), so the menu
+ * draws on every route of it, Vulkan's included: with the core's gpu_device
+ * (gpu.h), on a recorder the core hands it, into the window's image as one
+ * of that device's textures. On d3d12 (today's renderer) set_overlay_gpu
+ * does nothing and gpu_device is NULL: rsx_d3d12_set_overlay's overlay runs
+ * as before.
+ *
+ * Set beside rsx_d3d12_set_overlay's overlay, which still gives wndproc and
+ * release, and whose frame must still be set: where the core would call
+ * that frame (each game frame before its Present, and the repaints), it
+ * calls frame_gpu instead, on the render thread, with
+ *   cmd     a recorder of the overlay's own, open and empty. The core ends
+ *           and submits it after the frame's own work and before the
+ *           Present, with the swap chain's waits (gpu.h's submit options).
+ *   target  the window's image, a gpu_texture id, in GPU_STATE_PRESENT;
+ *           leave it in that state.
+ *   format  its gpu_format: R8G8B8A8_UNORM, or R16G16B16A16_FLOAT (scRGB)
+ *           while rsx_out_hdr says HDR.
+ *   index   its number in the swap chain; width x height its size.
+ * The GPU may still run the overlay's work of the last frames: a fence from
+ * gpu_signal(device) in a later frame_gpu (or outside one) is past every
+ * recording handed back before it. The device lives until backend_shutdown,
+ * and frame_gpu is not called after it. */
+struct gpu_device;
+struct gpu_cmd;
+typedef struct rsx_out_overlay_gpu {
+    void* user;
+    void (*frame_gpu)(void* user, struct gpu_cmd* cmd, uint32_t target, uint32_t format, unsigned index,
+                      unsigned width, unsigned height);
+} rsx_out_overlay_gpu;
+/* Any thread; NULL takes it away (the old overlay's frame runs again). */
+void rsx_out_set_overlay_gpu(const rsx_out_overlay_gpu* overlay);
+/* The core's device, for the overlay's own objects: NULL before init and
+ * on d3d12. Its calls that gpu.h does not call thread-safe belong to the
+ * render thread (frame_gpu, the overlay's release). */
+struct gpu_device* rsx_out_gpu_device(void);
+/* Inside frame_gpu only (NULL elsewhere): submits what the recorder holds,
+ * waits until the GPU is done with it, and opens the recorder again, which
+ * it returns; record into that one from then on. For a read back of the
+ * window's image (a screenshot, a problem report's picture). */
+struct gpu_cmd* rsx_out_overlay_gpu_flush(void);
+
+/* The three, as each route of the new path has them (rsxc_d3d12.c,
+ * rsxc_null.c, rsxc_vk.c). */
+typedef struct rsx_route_gpu {
+    void (*set_overlay_gpu)(const rsx_out_overlay_gpu* overlay);
+    struct gpu_device* (*gpu_device)(void);
+    struct gpu_cmd* (*overlay_gpu_flush)(void);
+} rsx_route_gpu;
+#if defined(_WIN32)
+extern const rsx_route_gpu rsxc_route_gpu_d3d12;
+extern const rsx_route_gpu rsxc_route_gpu_null;
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+extern const rsx_route_gpu rsxc_route_gpu_vk;
+#endif
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 #endif
