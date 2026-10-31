@@ -1846,4 +1846,105 @@ ID3D12QueryHeap* gpu_d3d12_query_pool_heap(gpu_device* d, gpu_query_pool pool)
     return gpu_d3d12_slot_valid(&dd->qpool_slots, pool.id) ? dd->qpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
 }
 
+/* ---- step V4 ---- */
+
+/* device_init's objects over the caller's device and queue (gpu.h): the
+ * factory, the adapter found by the device's LUID (for gpu_adapter and the
+ * caps), and the device's own fence, recorders and CPU heaps. The device and
+ * the queue are AddRef'd here and released by device_free. 0 on failure (the
+ * caller frees what was made). */
+static int device_init_on(gpu_d3d12_device* dd, const gpu_device_desc* desc, ID3D12Device* device,
+                          ID3D12CommandQueue* queue)
+{
+    if (!tables_init(dd)) return 0;
+    device->lpVtbl->AddRef(device);
+    dd->device = device;
+    queue->lpVtbl->AddRef(queue);
+    dd->queue = queue;
+    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory4, (void**)&dd->factory))) {
+        dd->factory = NULL;
+        return 0;
+    }
+    LUID luid;
+    device->lpVtbl->GetAdapterLuid(device, &luid);
+    if (FAILED(dd->factory->lpVtbl->EnumAdapterByLuid(dd->factory, luid, &IID_IDXGIAdapter1,
+                                                      (void**)&dd->adapter)))
+        dd->adapter = NULL;
+    if (FAILED(device->lpVtbl->CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
+                                           (void**)&dd->fence))) {
+        dd->fence = NULL;
+        return 0;
+    }
+    dd->nslots = desc->cmd_slots ? desc->cmd_slots : 2;
+    if (dd->nslots > GPU_D3D12_MAX_CMD_SLOTS) dd->nslots = GPU_D3D12_MAX_CMD_SLOTS;
+    for (uint32_t i = 0; i < dd->nslots; i++) {
+        ID3D12CommandAllocator* alloc = NULL;
+        ID3D12GraphicsCommandList* cl = NULL;
+        if (FAILED(device->lpVtbl->CreateCommandAllocator(device, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                       &IID_ID3D12CommandAllocator, (void**)&alloc)))
+            return 0;
+        dd->slot[i].alloc = alloc;
+        if (FAILED(device->lpVtbl->CreateCommandList(device, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL,
+                       &IID_ID3D12GraphicsCommandList, (void**)&cl)))
+            return 0;
+        cl->lpVtbl->Close(cl);
+        gpu_d3d12_cmd_init(dd, &dd->slot[i], cl, alloc);
+    }
+    dd->srv_inc = device->lpVtbl->GetDescriptorHandleIncrementSize(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    dd->samp_inc = device->lpVtbl->GetDescriptorHandleIncrementSize(device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    if (!cpu_heap_init(dd, &dd->rtv_heap, D3D12_DESCRIPTOR_HEAP_TYPE_RTV) ||
+        !cpu_heap_init(dd, &dd->dsv_heap, D3D12_DESCRIPTOR_HEAP_TYPE_DSV))
+        return 0;
+    caps_read(dd, desc);
+    return 1;
+}
+
+gpu_device* gpu_d3d12_create_on(void* device, void* queue, const gpu_device_desc* desc)
+{
+    gpu_device_desc none;
+    if (!device || !queue) return NULL;
+    memset(&none, 0, sizeof none);
+    if (desc) {
+        none.cmd_slots = desc->cmd_slots;
+        none.cap_mask = desc->cap_mask;
+    }
+    gpu_d3d12_device* dd = (gpu_d3d12_device*)calloc(1, sizeof *dd);
+    if (!dd) return NULL;
+    InitializeSRWLock(&dd->lock);
+    InitializeSRWLock(&dd->signal_lock);
+    InitializeSRWLock(&dd->lib_lock);
+    InitializeSRWLock(&dd->pso_lock);
+    dd->base.vt = &k_d3d12_vt;
+    if (!device_init_on(dd, &none, (ID3D12Device*)device, (ID3D12CommandQueue*)queue)) {
+        device_free(dd);
+        return NULL;
+    }
+    return &dd->base;
+}
+
+/* gpu_d3d12_adopt_texture_of's reading of the resource (the bridge goes when
+ * the conversion ends; this stays). */
+gpu_texture gpu_d3d12_texture_on(gpu_device* d, void* resource, gpu_texture_desc* out)
+{
+    ID3D12Resource* const res = (ID3D12Resource*)resource;
+    D3D12_RESOURCE_DESC rd;
+    gpu_texture_desc td;
+    if (!d || !res) return (gpu_texture){0};
+    res->lpVtbl->GetDesc(res, &rd);
+    memset(&td, 0, sizeof td);
+    td.width = (uint32_t)rd.Width;
+    td.height = rd.Height;
+    td.layers = rd.DepthOrArraySize;
+    td.mips = rd.MipLevels;
+    td.format = (gpu_format)rd.Format;
+    td.samples = rd.SampleDesc.Count;
+    td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+    if (!(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) td.use |= GPU_USE_SAMPLED;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) td.use |= GPU_USE_RT;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) td.use |= GPU_USE_DS;
+    if (out) *out = td;
+    res->lpVtbl->AddRef(res);
+    return gpu_d3d12_tex_add(GPU_D3D12_DEV(d), res, &td, 0);
+}
+
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */

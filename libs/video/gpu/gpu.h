@@ -862,4 +862,33 @@ gpu_device* gpu_null_create(const gpu_device_desc* desc);
 #ifdef __cplusplus
 }
 #endif
+
+/* ---- step V4 ---- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The menu's renderer on the GPU layer (the port's render_gpu.cpp) over the
+ * D3D12 objects of a renderer that is not on it (today's): native handles
+ * as void*, so this file needs no D3D12 header. In builds with the D3D12
+ * backend; other backends have no such calls yet. */
+
+/* A device over the caller's ID3D12Device* and ID3D12CommandQueue*, which
+ * it AddRefs and releases at gpu_destroy. Its fence, recorders and
+ * descriptor heaps are its own; its submits go to that queue, in order with
+ * the caller's own work there. desc may be NULL; its cmd_slots and cap_mask
+ * count, its adapter flags do not, nor GPU_DEVICE_BREADCRUMBS (DRED is
+ * turned on before a device is made). NULL when a part cannot be made. */
+gpu_device* gpu_d3d12_create_on(void* device, void* queue, const gpu_device_desc* desc);
+
+/* A texture over the caller's ID3D12Resource* (a swap chain's buffer),
+ * AddRef'd and released when the handle is destroyed: destroy it before the
+ * swap chain's ResizeBuffers. out (may be NULL) gets its description as the
+ * resource has it: size, layers, mips, format, samples, and its target
+ * flags as use. Its state is the caller's to know. */
+gpu_texture gpu_d3d12_texture_on(gpu_device* d, void* resource, gpu_texture_desc* out);
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* PS3RECOMP_GPU_H */
