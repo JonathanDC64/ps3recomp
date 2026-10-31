@@ -1458,6 +1458,26 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
         if (!keep) out_remove(out);
         return 0;
     }
+    /* The child's last lines, but for the play marks and the decompiler's notes. */
+    char log[MAX_PATH];
+    snprintf(log, sizeof log, "%s/log.txt", da);
+    char* t = read_file(log, NULL);
+    if (t) {
+        const char* keep[24];
+        int nk = 0;
+        for (char* line = t; line && *line; ) {
+            char* next = strchr(line, '\n');
+            if (next) *next++ = 0;
+            if (strncmp(line, "[synth] play", 12) && strncmp(line, "[FP]", 4)) {
+                if (nk == 24) { memmove(keep, keep + 1, sizeof keep - sizeof keep[0]); nk--; }
+                keep[nk++] = line;
+            }
+            line = next;
+        }
+        printf("[synth] the child's last lines:\n");
+        for (int i = 0; i < nk; i++) printf("    %s\n", keep[i]);
+        free(t);
+    }
     printf("[synth] FAILED. The log and the captures are in %s\n", out);
     return 1;
 }
