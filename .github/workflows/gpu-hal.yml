@@ -150,9 +150,9 @@ jobs:
       - name: Build the synthetic scenes' test and the route switch's
         run: cmake --build build --target test_rsx_synth test_rsx_out
 
-      # As on Windows, against the same goldens.
+      # As on Windows, against the same goldens (-V: the PASS line says so).
       - name: Run the core on the synthetic scenes (null route)
-        run: ctest --test-dir build -R rsx_synth --output-on-failure
+        run: ctest --test-dir build -R rsx_synth -V
 
       - name: Keep the synthetic scenes' output
         if: failure()
@@ -164,7 +164,7 @@ jobs:
 
       # Linux's switch: today's renderer only (test_rsx_out.c's Linux cases).
       - name: Run the route switch's test
-        run: ctest --test-dir build -R rsx_out --output-on-failure
+        run: ctest --test-dir build -R rsx_out -V
 
   vulkan:
     name: Linux x64 Vulkan on lavapipe (${{ matrix.compiler }}, validation on)
