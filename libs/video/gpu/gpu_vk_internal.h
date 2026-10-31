@@ -20,7 +20,7 @@
  *     each static sampler s<n> at binding 48 + n (an immutable sampler, s0-s15);
  *   - set 1, 2, ...: the TABLE_TEX and TABLE_SAMPLER slots in slot order, one
  *     set each; entry j of a texture table is binding 16 + j (t<j>), of a
- *     sampler table binding 48 + j (s<j>). Tables start at register 0;
+ *     sampler table binding 48 + j (s<j>), counted from the slot's first register (step VM: any);
  *   - CONST32 slots: push constants, one block, the slots in slot order, each
  *     at 4 bytes times the counts before it;
  *   - vertex attribute k of gpu_vertex_layout is location k.

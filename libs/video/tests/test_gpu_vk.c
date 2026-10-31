@@ -715,13 +715,18 @@ static void test_layouts(void)
         CHECK(l->push_size == 24 && l->slot[2].push_off == 16 && l->first == 1);
     }
 
-    /* A table not from register 0 is refused (its bindings could not match
-     * a pool's sets). */
+    /* A table from another register than 0 (step VM: the menu's t1): its
+     * entry 0 is that register, so it binds a pool's sets as one from 0. */
     memset(&ld, 0, sizeof ld);
-    ld.nslots = 1;
-    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
-    printf("  (a layout refused on purpose:)\n");
-    CHECK(!GPU_VALID(gpu_layout_create(g_d, &ld)));
+    ld.nslots = 2;
+    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
+    const gpu_layout t4 = gpu_layout_create(g_d, &ld);
+    CHECK(GPU_VALID(t4));
+    if (GPU_VALID(t4)) {
+        const gpu_vk_layout* l = &g_vk->layout[GPU_HANDLE_INDEX(t4.id)];
+        CHECK(l->slot[0].set != l->slot[1].set && l->slot[1].set < l->nsets);
+    }
 }
 
 /* ---- A draw on the guest layout ---- */
