@@ -571,31 +571,56 @@ VkCommandBuffer gpu_vk_init_record(gpu_vk_device* dd, uint64_t value)
     memset(&di, 0, sizeof di);
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     di.pImageMemoryBarriers = ib;
-    uint32_t n = 0;
-    for (uint32_t j = 0; j <= dd->ninit; j++) {
-        if (n == 32 || (j == dd->ninit && n)) {
-            di.imageMemoryBarrierCount = n;
-            dd->vk.vkCmdPipelineBarrier2(cb, &di);
-            n = 0;
+    /* Step VC1: three passes. A texture to zero (GPU_VK_TEX_ZERO) goes to
+     * TRANSFER_DST first, is cleared, then goes to its layout; the others go
+     * to their layouts in the first pass, as before. */
+    for (uint32_t pass = 0; pass < 3; pass++) {
+        uint32_t n = 0;
+        for (uint32_t j = 0; j <= dd->ninit; j++) {
+            if (n == 32 || (j == dd->ninit && n)) {
+                di.imageMemoryBarrierCount = n;
+                dd->vk.vkCmdPipelineBarrier2(cb, &di);
+                n = 0;
+            }
+            if (j == dd->ninit) break;
+            const gpu_vk_init e = dd->init[j];
+            if (!gpu_vk_slot_valid(&dd->tex_slots, e.tex)) continue;
+            const gpu_vk_tex* const t = &dd->tex[GPU_HANDLE_INDEX(e.tex)];
+            const int zero = (t->flags & GPU_VK_TEX_ZERO) != 0;
+            if (pass && !zero) continue;
+            VkImageSubresourceRange all;
+            memset(&all, 0, sizeof all);
+            all.aspectMask = t->aspect;
+            all.levelCount = VK_REMAINING_MIP_LEVELS;
+            all.layerCount = VK_REMAINING_ARRAY_LAYERS;
+            if (pass == 1) {   /* every bit 0: 0.0, depth 0.0, stencil 0, as D3D12's zeroed memory */
+                if (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+                    VkClearColorValue cv;
+                    memset(&cv, 0, sizeof cv);
+                    dd->vk.vkCmdClearColorImage(cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &all);
+                } else {
+                    VkClearDepthStencilValue dv;
+                    memset(&dv, 0, sizeof dv);
+                    dd->vk.vkCmdClearDepthStencilImage(cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1,
+                                                       &all);
+                }
+                continue;
+            }
+            VkImageMemoryBarrier2* const b = &ib[n++];
+            memset(b, 0, sizeof *b);
+            b->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            b->srcStageMask = pass ? VK_PIPELINE_STAGE_2_CLEAR_BIT : VK_PIPELINE_STAGE_2_NONE;
+            b->srcAccessMask = pass ? VK_ACCESS_2_TRANSFER_WRITE_BIT : 0u;
+            b->dstStageMask = zero && !pass ? VK_PIPELINE_STAGE_2_CLEAR_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b->dstAccessMask = zero && !pass ? VK_ACCESS_2_TRANSFER_WRITE_BIT
+                                             : VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b->oldLayout = pass ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            b->newLayout = zero && !pass ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : e.layout;
+            b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b->image = t->image;
+            b->subresourceRange = all;
         }
-        if (j == dd->ninit) break;
-        const gpu_vk_init e = dd->init[j];
-        if (!gpu_vk_slot_valid(&dd->tex_slots, e.tex)) continue;
-        const gpu_vk_tex* const t = &dd->tex[GPU_HANDLE_INDEX(e.tex)];
-        VkImageMemoryBarrier2* const b = &ib[n++];
-        memset(b, 0, sizeof *b);
-        b->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        b->srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-        b->dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b->dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-        b->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b->newLayout = e.layout;
-        b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b->image = t->image;
-        b->subresourceRange.aspectMask = t->aspect;
-        b->subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
-        b->subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     }
     dd->ninit = 0;
     gpu_vk_unlock(&dd->lock);
@@ -762,7 +787,12 @@ gpu_texture gpu_vk_texture_create(gpu_device* d, const gpu_texture_desc* desc)
                  dd->vk.vkBindImageMemory(dd->device, image, m, 0) == VK_SUCCESS;
         }
     }
-    gpu_texture r = ok ? gpu_vk_tex_add(dd, image, m, desc, 0, !placed) : none;
+    /* Step VC1: a texture with memory of its own starts zeroed, as D3D12's
+     * committed resources do (the core writes targets back to guest memory,
+     * parts it never drew too); one that cannot be cleared (BC) keeps what
+     * the memory held. A placed one is what its heap held, on both. */
+    const uint32_t zero = !placed && f->bw == 1 && (ci.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? GPU_VK_TEX_ZERO : 0u;
+    gpu_texture r = ok ? gpu_vk_tex_add(dd, image, m, desc, zero, !placed) : none;
     if (!r.id) {
         dd->vk.vkDestroyImage(dd->device, image, NULL);
         if (m) dd->vk.vkFreeMemory(dd->device, m, NULL);

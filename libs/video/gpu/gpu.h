@@ -387,7 +387,9 @@ typedef struct gpu_texture_desc {
     uint32_t    samples;         /* 1, or the MSAA count */
     uint32_t    use;             /* GPU_USE_* */
     gpu_state   state;           /* the state it starts in */
-    gpu_heap    heap;            /* placed at heap_offset when set; else memory of its own */
+    gpu_heap    heap;            /* placed at heap_offset when set; else memory of its own,
+                                    which starts zeroed (step VC1: Vulkan too, as D3D12;
+                                    except BC formats there); placed: what the heap held */
     uint64_t    heap_offset;     /* aligned as gpu_texture_size says */
     gpu_format  clear_format;    /* the clear value it is fastest to clear to; 0 for none */
     float       clear_color[4];
@@ -453,7 +455,10 @@ typedef struct gpu_sampler_desc {
  * `first`. Regions may overlap; a write reaches every table holding the
  * entry. A table is a region's first entry plus a multiple of its size
  * (table_ref gives none elsewhere on Vulkan), and a table slot binds only
- * tables of its own count (the region's size), from register 0. */
+ * tables of its own count (the region's size), from register 0.
+ * ---- step VC1 ---- Up to 16 entries counts as 16 on both sides: a slot of
+ * up to 16 binds any table of up to 16 (a 1-texture blit slot binds a pool's
+ * 2-entry tables); past 16, only its own count. */
 enum { GPU_TABLE_TEX = 0, GPU_TABLE_SAMPLER = 1 };
 #define GPU_MAX_TABLE_REGIONS 4
 typedef struct gpu_table_region { uint32_t first, tables, size; } gpu_table_region;

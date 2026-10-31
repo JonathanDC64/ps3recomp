@@ -83,6 +83,19 @@ extern "C" {
 #define GPU_VK_BIND_T       16u
 #define GPU_VK_BIND_S       48u
 
+/* ---- step VC1 ---- */
+/* The entries a table's set layout has: tables of up to 16 entries share
+ * one 16-entry layout, so a table slot binds a table at least as long as
+ * its count (D3D12 lets a slot read the start of a longer table: the blit's
+ * one-entry slot binds the HDR blit's two-entry tables); a longer table's
+ * layout is its own size. The entries past a table's own are never written
+ * and never read (partially bound). */
+#define GPU_VK_TABLE_MIN 16u
+static inline uint32_t gpu_vk_table_entries(uint32_t size)
+{
+    return size < GPU_VK_TABLE_MIN ? GPU_VK_TABLE_MIN : size;
+}
+
 /* gpu_addr: the buffer's handle in the high 32 bits, the byte offset in the
  * low 32 (buffers are below 4 GB), so an address decodes with no lookup. */
 #define GPU_VK_ADDR(id)       ((uint64_t)(id) << 32)
@@ -162,6 +175,8 @@ const gpu_vk_format* gpu_vk_format_dev(const struct gpu_vk_device* dd, gpu_forma
 /* ---- Objects ---- */
 
 enum { GPU_VK_TEX_SWAP = 1u };   /* a swap chain's image */
+/* ---- step VC1 ---- */
+enum { GPU_VK_TEX_ZERO = 2u };   /* its own memory, zeroed before its first use (gpu_vk_init_record) */
 typedef struct gpu_vk_tex {
     VkImage            image;
     VkDeviceMemory     memory;    /* its own; none when placed or a swap chain's */
@@ -298,6 +313,14 @@ typedef struct gpu_vk_shader {
     uint32_t       stage;
     uint64_t       hash;          /* FNV-1a 64 of the code */
     char           entry[64];
+    /* Step VC1: its interface, for pipelines that do not use all of it (D3D12
+     * ignores what the other side does not take; Vulkan's validation says
+     * so): the Locations its Input and Output variables take (builtins left
+     * out), and a pixel shader's code, kept to make a copy without the
+     * outputs a pipeline has no target for (gpu_vk_pipe.c). */
+    uint32_t       in_mask, out_mask;
+    uint32_t*      words;
+    uint32_t       nwords;
 } gpu_vk_shader;
 
 /* A layout slot's place: a set, and in set 0 the dynamic offset's index (in

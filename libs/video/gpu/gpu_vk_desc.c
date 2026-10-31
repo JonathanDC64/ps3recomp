@@ -241,9 +241,12 @@ gpu_sampler gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc)
 
 /* Under lock: the set layout of a table of `size` entries, made once. Every
  * entry may be left unwritten and written while the set is in flight, as
- * long as the GPU does not read that entry (D3D12's tables). */
+ * long as the GPU does not read that entry (D3D12's tables). Step VC1: a
+ * short table's layout has 16 entries (gpu_vk_table_entries). */
 VkDescriptorSetLayout gpu_vk_table_layout(gpu_vk_device* dd, uint32_t kind, uint32_t size)
 {
+    if (!size) return VK_NULL_HANDLE;
+    size = gpu_vk_table_entries(size);
     for (uint32_t i = 0; i < dd->ntlayout; i++)
         if (dd->tlayout[i].kind == kind && dd->tlayout[i].size == size) return dd->tlayout[i].l;
     if (dd->ntlayout == 64 || !size || size > 64) return VK_NULL_HANDLE;
@@ -319,7 +322,7 @@ gpu_table_pool gpu_vk_table_pool_create(gpu_device* d, const gpu_table_pool_desc
         if (!g->tables || !g->size || g->size > 64 || (uint64_t)g->first + (uint64_t)g->tables * g->size > desc->count)
             return r;
         nsets += g->tables;
-        ndesc += g->tables * g->size;
+        ndesc += g->tables * gpu_vk_table_entries(g->size);   /* (step VC1: what each set's layout takes) */
     }
     VkDescriptorSetLayout lay[GPU_MAX_TABLE_REGIONS];
     gpu_vk_lock(&dd->lock);
