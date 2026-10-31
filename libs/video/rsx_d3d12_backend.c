@@ -7883,7 +7883,15 @@ static int fpk_extract_at(u32 off, float* out)
     if (!en) return rsx_fp_extract_consts(up, RSX_FP_MAX_BYTES, out, FPCB_KMAX);
     FpkMemo* m = &s_fpkm[((off >> 4) * 2654435761u) >> 22];
     if (m->bytes && m->off == off && !memcmp(m->bytes, up, m->size)) {
-        memcpy(out, m->k, sizeof(float) * 4 * (size_t)m->n);
+        /* A program without constants copies nothing. The CRT's short copy
+         * is a masked load and store over 64 bytes even for 0 bytes, and a
+         * masked access that reaches a page nothing has touched takes a
+         * microcode assist every time (AVX-512 fault suppression): an entry
+         * whose k starts near a page's end, with an unused neighbour, cost
+         * the FIFO thread ~6% at the Tutorial in the new path's build. A
+         * new entry's k is written whole once below, so a short copy's tail
+         * finds its page too. */
+        if (m->n) memcpy(out, m->k, sizeof(float) * 4 * (size_t)m->n);
         return m->n;
     }
     /* Into a cached buffer first: `out` is the upload heap, write-combined,
@@ -7895,6 +7903,7 @@ static int fpk_extract_at(u32 off, float* out)
     if (usz) {   /* no END: nothing bounds what the walk read */
         u8* b = (m->bytes && m->size >= usz) ? m->bytes : (u8*)realloc(m->bytes, usz);
         if (b) {
+            if (!m->bytes) memset(m->k, 0, sizeof m->k);   /* a new entry: see the hit's copy */
             memcpy(b, up, usz); m->bytes = b; m->off = off; m->size = usz; m->n = n;
             memcpy(m->k, k, sizeof(float) * 4 * (size_t)n);
         }
