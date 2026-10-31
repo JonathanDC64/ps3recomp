@@ -104,26 +104,27 @@ static int down_init(void)
         "float4 main(float4 p : SV_Position) : SV_Target {\n"
         "    return src.Load(int3(int2(p.xy * ratio), 0)).argb;\n"
         "}\n";
-    /* The shaders are the GPU layer's (step C3b), kept for down_pso's later
-     * formats: never freed. */
-    s_down_vs = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE);
-    if (GPU_VALID(s_down_vs))
-        s_down_ps = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE);
-    if (GPU_VALID(s_down_ps))
-        s_down_ps_argb = sc_shader(GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, GPU_SC_NO_CACHE);
-    if (!GPU_VALID(s_down_ps_argb)) {
-        if (t_sc_msg[0]) fprintf(stderr, "[D3D12] write-back downscale: %s%c", t_sc_msg, 10);
-        return 0;
-    }
     /* The GPU layer's layout: the t0 table, b0 = 2 constants. (Call map G12:
      * today's range has offset 0, the GPU layer's OFFSET_APPEND; the first
      * range of its table, it lands at 0 either way, so only the serialized
-     * bytes differ.) */
+     * bytes differ.) The shaders are compiled for it (step VC1). */
     gpu_layout_desc ld;
     memset(&ld, 0, sizeof ld);
     ld.nslots = 2;
     ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
     ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 2, GPU_VIS_PIXEL);
+    /* The shaders are the GPU layer's (step C3b), kept for down_pso's later
+     * formats: never freed. */
+    s_down_vs = sc_shader_for(&ld, GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_vs))
+        s_down_ps = sc_shader_for(&ld, GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_ps))
+        s_down_ps_argb = sc_shader_for(&ld, GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL,
+                                       GPU_SC_NO_CACHE);
+    if (!GPU_VALID(s_down_ps_argb)) {
+        if (t_sc_msg[0]) fprintf(stderr, "[D3D12] write-back downscale: %s%c", t_sc_msg, 10);
+        return 0;
+    }
     s_down_layout = lay_make(&ld);
     if (!GPU_VALID(s_down_layout)) return 0;
     {   /* the GPU layer's table pool, a 1-entry table each (step C4): shader

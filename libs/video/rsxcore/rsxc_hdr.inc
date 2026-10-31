@@ -121,7 +121,12 @@ static int hdr_want(void)
 static int swap_buffers_get(void)
 {
     memset(s_rc_swap_rtv, 0, sizeof s_rc_swap_rtv);
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
+    /* Every image the swap chain has (step VC1: FRAME_COUNT on D3D12, as
+     * many as the driver made on Vulkan). */
+    s_rc_swap_n = gpu_swap_image_count(s_rc_dev, s_rc_swap);
+    if (s_rc_swap_n > RC_SWAP_MAX) s_rc_swap_n = RC_SWAP_MAX;
+    if (s_rc_swap_n < FRAME_COUNT) return -1;
+    for (u32 i = 0; i < s_rc_swap_n; i++) {
         s_rc_swap_image[i] = gpu_swap_image(s_rc_dev, s_rc_swap, i);
         if (!GPU_VALID(s_rc_swap_image[i])) return -1;
         s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0);
@@ -146,23 +151,23 @@ static int of_ready(void)
     if (s_of.pso.v) return 1;
     if (s_of.failed || !s_rc_dev) return 0;
     s_of.failed = 1;   /* until it is made */
-    gpu_shader vb = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
-                              NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    /* The GPU layer's layout (step C3b): the t0 table, b0 = 8 constants.
+     * The shaders are compiled for it (step VC1). */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 2;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 8, GPU_VIS_PIXEL);
+    gpu_shader vb = sc_shader_for(&ld, GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
+                                  NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     gpu_shader pb = {0};
     if (GPU_VALID(vb))
-        pb = sc_shader(GPU_SC_PS, rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps",
-                       NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        pb = sc_shader_for(&ld, GPU_SC_PS, rsx_outfilter_ps, sizeof rsx_outfilter_ps - 1, "rsx_outfilter_ps",
+                           NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     if (!GPU_VALID(pb))
         printf("[D3D12] RSX_OUTFILTER shader compile failed: %s\n", sc_msg("?"));
-    else {
-        /* The GPU layer's layout (step C3b): the t0 table, b0 = 8 constants. */
-        gpu_layout_desc ld;
-        memset(&ld, 0, sizeof ld);
-        ld.nslots = 2;
-        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
-        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 8, GPU_VIS_PIXEL);
+    else
         s_of.layout = lay_make(&ld);
-    }
     if (GPU_VALID(s_of.layout)) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_of.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM, GPU_WRITE_ALL, 1);
@@ -191,22 +196,22 @@ static int blit_init(void)
         "Texture2D t : register(t0); SamplerState s : register(s0);\n"
         "float4 main(float4 p : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {\n"
         "  return float4(t.Sample(s, uv).rgb, 1); }\n";
-    gpu_shader vb = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "blit_vs", NULL, GPU_SC_NO_CACHE);
-    gpu_shader pb = {0};
-    if (GPU_VALID(vb)) pb = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "blit_ps", NULL, GPU_SC_NO_CACHE);
-    if (!GPU_VALID(pb)) {
-        printf("[D3D12] blit shader compile failed: %s\n", sc_msg("?"));
-        sc_shader_drop(&vb);
-        return -1;
-    }
     /* The GPU layer's layout and pipeline (step C3b): the t0 table and a
-     * linear clamp at s0. */
+     * linear clamp at s0. The shaders are compiled for it (step VC1). */
     gpu_layout_desc ld;
     memset(&ld, 0, sizeof ld);
     ld.nslots = 1;
     ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
     ld.nstatic = 1;
     ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+    gpu_shader vb = sc_shader_for(&ld, GPU_SC_VS, vs, sizeof vs - 1, "blit_vs", NULL, GPU_SC_NO_CACHE);
+    gpu_shader pb = {0};
+    if (GPU_VALID(vb)) pb = sc_shader_for(&ld, GPU_SC_PS, ps, sizeof ps - 1, "blit_ps", NULL, GPU_SC_NO_CACHE);
+    if (!GPU_VALID(pb)) {
+        printf("[D3D12] blit shader compile failed: %s\n", sc_msg("?"));
+        sc_shader_drop(&vb);
+        return -1;
+    }
     s_d3d.blit_layout = lay_make(&ld);
     HRESULT hr = GPU_VALID(s_d3d.blit_layout) ? S_OK : E_FAIL;
     if (SUCCEEDED(hr)) {
@@ -277,30 +282,30 @@ static int hdr_blit_ready(void)
         "  return float4(hw_map(of_main(pos).rgb, (pos.xy - vp_org) * scale / src_size), 1); }\n";
     static char sharp[sizeof rsx_outfilter_ps + sizeof sharp_tail + 64];
     snprintf(sharp, sizeof sharp, "#define main of_main\n%s\n%s", rsx_outfilter_ps, sharp_tail);
+    /* The GPU layer's layout (step C3b): the t0-t1 table, b0 and b1 = 8
+     * constants each, a linear clamp at s0. The shaders are compiled for it
+     * (step VC1). */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 3;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 2, GPU_VIS_PIXEL);
+    for (int i = 1; i <= 2; i++) ld.slot[i] = lay_slot(GPU_SLOT_CONST32, (u8)(i - 1), 8, GPU_VIS_PIXEL);
+    ld.nstatic = 1;
+    ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
     gpu_shader vb[2] = {{0}, {0}}, pb[2] = {{0}, {0}};
-    vb[0] = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "hdr_blit_vs", NULL, GPU_SC_NO_CACHE);
+    vb[0] = sc_shader_for(&ld, GPU_SC_VS, vs, sizeof vs - 1, "hdr_blit_vs", NULL, GPU_SC_NO_CACHE);
     if (GPU_VALID(vb[0]))
-        pb[0] = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "hdr_blit_ps", NULL, GPU_SC_NO_CACHE);
+        pb[0] = sc_shader_for(&ld, GPU_SC_PS, ps, sizeof ps - 1, "hdr_blit_ps", NULL, GPU_SC_NO_CACHE);
     if (GPU_VALID(pb[0]))
-        vb[1] = sc_shader(GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs", NULL,
-                          GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        vb[1] = sc_shader_for(&ld, GPU_SC_VS, rsx_outfilter_vs, sizeof rsx_outfilter_vs - 1, "rsx_outfilter_vs",
+                              NULL, GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     if (GPU_VALID(vb[1]))
-        pb[1] = sc_shader(GPU_SC_PS, sharp, strlen(sharp), "hdr_sharp_ps", NULL,
-                          GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        pb[1] = sc_shader_for(&ld, GPU_SC_PS, sharp, strlen(sharp), "hdr_sharp_ps", NULL,
+                              GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     if (!GPU_VALID(pb[1]))
         printf("[D3D12] HDR blit shader compile failed: %s\n", sc_msg("?"));
-    else {
-        /* The GPU layer's layout (step C3b): the t0-t1 table, b0 and b1 = 8
-         * constants each, a linear clamp at s0. */
-        gpu_layout_desc ld;
-        memset(&ld, 0, sizeof ld);
-        ld.nslots = 3;
-        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 2, GPU_VIS_PIXEL);
-        for (int i = 1; i <= 2; i++) ld.slot[i] = lay_slot(GPU_SLOT_CONST32, (u8)(i - 1), 8, GPU_VIS_PIXEL);
-        ld.nstatic = 1;
-        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+    else
         s_hdr_blit.layout = lay_make(&ld);
-    }
     for (int i = 0; i < 2 && GPU_VALID(s_hdr_blit.layout); i++) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_hdr_blit.layout, vb[i], pb[i], GPU_FORMAT_R16G16B16A16_FLOAT, GPU_WRITE_ALL, 1);
@@ -363,11 +368,11 @@ static void blit_to_window(u32 fi)
     b[0].before  = GPU_STATE_PRESENT;
     b[0].after   = GPU_STATE_PIXEL_SHADER_RESOURCE;
     b[1] = b[0];
-    b[1].texture = s_rc_swap_image[fi];
+    b[1].texture = s_rc_swap_image[s_rc_image];   /* (the acquired image: fi on D3D12, step VC1) */
     b[1].after   = GPU_STATE_RENDER_TARGET;
     gpu_cmd_barrier_n(c, 2, b);
 
-    const gpu_view rtv = s_rc_swap_rtv[fi];   /* image fi's view (step C5a) */
+    const gpu_view rtv = s_rc_swap_rtv[s_rc_image];   /* its view (step C5a) */
     gpu_pass pass;
     memset(&pass, 0, sizeof pass);
     pass.nrt = 1;
@@ -627,7 +632,7 @@ static void swap_resize(void)
     if (s_overlay_on && s_overlay.release) s_overlay.release(s_overlay.user);
     /* The buffers are the swap chain's (borrowed): the resize drops them and
      * gets them again, with the buffer count and flags it was made with. */
-    for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
+    for (u32 i = 0; i < RC_SWAP_MAX; i++) s_rc_swap_image[i].id = 0;
     HRESULT hr = (HRESULT)gpu_swap_resize(s_rc_dev, s_rc_swap, w, h,
                                           hdr ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);
     if (SUCCEEDED(hr) && hdr != s_hdr.active) {
@@ -657,6 +662,6 @@ static void swap_resize(void)
     /* The back buffer index starts over. The GPU is idle, so every frame
      * slot's fence is passed already, and the timeline only goes up: nothing
      * to move (today's code moved every frame's fence value to the highest). */
-    s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
+    rc_acquire();   /* (step VC1: the image, and the slot it falls in) */
 }
 

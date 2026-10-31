@@ -1510,7 +1510,7 @@ skip_dump_consider: ;
       if (e && *e && strcmp(e, last) && s_present_this_frame && s_hdr.active) {
           snprintf(last, sizeof last, "%s", e);
           s_cap_raw = 1;
-          cap_readback_write(s_rc_swap_image[fi], s_d3d.win_w, s_d3d.win_h, GPU_FORMAT_R16G16B16A16_FLOAT,
+          cap_readback_write(s_rc_swap_image[s_rc_image], s_d3d.win_w, s_d3d.win_h, GPU_FORMAT_R16G16B16A16_FLOAT,
                              GPU_STATE_PRESENT, fi, e);
           s_cap_raw = 0;
       } }

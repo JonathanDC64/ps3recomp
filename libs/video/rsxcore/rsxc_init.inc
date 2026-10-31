@@ -160,7 +160,7 @@ static int init_d3d12(u32 width, u32 height)
         if (!GPU_VALID(s_rc_swap)) return -1;
     }
 
-    s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
+    rc_acquire();   /* (step VC1: the image, and the slot it falls in) */
 
     /* The display targets' and the swap chain images' RTVs and the depth
      * DSV are the GPU layer's views (step C5a): no RTV or DSV heap here, nor
