@@ -782,7 +782,8 @@ static int scene_make(scene* s)
     draw_desc(&s->desc, s->layout, s->vs, s->ps);
     uint32_t cached = 7;
     s->pso = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
-    CHECK(s->pso.v != 0 && cached == GPU_PIPELINE_STORED);   /* the device's cache, empty before it */
+    /* the device's cache, empty before it; with the cache masked (RSX_VK_MASK), compiled only */
+    CHECK(s->pso.v != 0 && cached == (has(GPU_CAP_PIPELINE_CACHE) ? GPU_PIPELINE_STORED : GPU_PIPELINE_COMPILED));
     gpu_pipeline_desc pd = s->desc;
     pd.depth_clip = 1;
     s->pso_clip = gpu_pipeline_create(g_d, &pd, 0, NULL);
@@ -1365,11 +1366,19 @@ static void test_pipeline_cache(void)
     memset(&dd, 0, sizeof dd);
     dd.flags = g_flags;
     dd.cmd_slots = 1;
-    int hits = 1;
+    int hits = 1, cache = 1;
     for (int run_no = 0; run_no < 2; run_no++) {
         gpu_device* d = gpu_vk_create(&dd);
         CHECK(d != NULL);
         if (!d) break;
+        /* With the cache masked (RSX_VK_MASK, as CI's run with every cap
+         * off), only the no-cache case below applies. */
+        if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE)) {
+            printf("  pipeline cache: masked; the two-device round trip is skipped\n");
+            gpu_destroy(d);
+            cache = 0;
+            break;
+        }
         const int loaded = gpu_pipeline_cache_load(d, path);
         /* none the first time, the first device's the second */
         CHECK(loaded == (run_no ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW));
@@ -1413,7 +1422,7 @@ static void test_pipeline_cache(void)
         gpu_destroy(d);
     }
     /* A file from something else is not loaded. */
-    {
+    if (cache) {
         FILE* f = fopen(path, "r+b");
         if (f) {
             fputc('X', f);
