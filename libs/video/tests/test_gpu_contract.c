@@ -258,6 +258,13 @@ GPU_STATIC_ASSERT(sizeof(gpu_view_desc) == 20, "gpu_view_desc's size");
 GPU_STATIC_ASSERT(sizeof(gpu_vertex_attr) == 28, "gpu_vertex_attr's size");
 GPU_STATIC_ASSERT(sizeof(gpu_pipeline) == 8 && sizeof(gpu_table) == 8, "the native handles");
 GPU_STATIC_ASSERT(sizeof(gpu_buffer) == 4 && sizeof(gpu_texture) == 4, "the small handles");
+/* What pipeline_create and pipeline_cache_load say: FAILED is 0, so a zeroed
+ * answer is none; NONE is below the old 0 / 1 answers. */
+GPU_STATIC_ASSERT(GPU_PIPELINE_FAILED == 0 && GPU_PIPELINE_LOADED == 1 && GPU_PIPELINE_COMPILED == 2 &&
+                  GPU_PIPELINE_STORED == 3, "pipeline_create's answers");
+GPU_STATIC_ASSERT(GPU_PIPELINE_CACHE_NONE == -1 && GPU_PIPELINE_CACHE_NEW == 0 && GPU_PIPELINE_CACHE_LOADED == 1,
+                  "pipeline_cache_load's answers");
+GPU_STATIC_ASSERT(GPU_NATIVE_PIPELINE == 9, "gpu_native's kinds");
 
 /* ---- Every command, with the list's parameters ---- */
 GPU_CMD_CHECK(vt_c);
@@ -404,12 +411,25 @@ int gpu_contract_c_run(void)
         /* The per-draw device calls through gpu_vt_cmd.h. */
         gpu_fast_table_write_tex(d, pool, 7, NULL); CHECK(g_vt_last == VT_table_write_tex);
         gpu_fast_table_write_sampler(d, pool, 7, smp); CHECK(g_vt_last == VT_table_write_sampler);
+        {
+            const gpu_table_writer w = gpu_table_writer_get(d, pool);
+            CHECK(w.v == 0);                      CHECK(g_vt_last == VT_table_writer_get);
+            gpu_fast_table_writer_tex(d, w, 7, NULL); CHECK(g_vt_last == VT_table_writer_tex);
+        }
         CHECK(gpu_fast_table_ref(d, pool, 7).v == 0); CHECK(g_vt_last == VT_table_ref);
         CHECK(gpu_fast_buffer_addr(d, buf) == 0); CHECK(g_vt_last == VT_buffer_addr);
         (void)gpu_signal(d);                      CHECK(g_vt_last == VT_signal);
         (void)gpu_fence_wait(d, 1, 2000);         CHECK(g_vt_last == VT_fence_wait);
         CHECK(gpu_cmd_begin(d, 0) == NULL);       CHECK(g_vt_last == VT_cmd_begin);
         CHECK(gpu_native(d, GPU_NATIVE_DEVICE, 0) == NULL); CHECK(g_vt_last == VT_native);
+        {
+            gpu_pipeline_desc pd;
+            uint32_t how = 7;
+            memset(&pd, 0, sizeof pd);
+            CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+            CHECK(g_vt_last == VT_pipeline_create);
+            CHECK(gpu_pipeline_cache_load(d, "x") == 0); CHECK(g_vt_last == VT_pipeline_cache_load);
+        }
         gpu_destroy(d);                           CHECK(g_vt_last == VT_destroy);
     }
 

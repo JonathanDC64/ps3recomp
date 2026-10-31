@@ -514,6 +514,35 @@ if(PS3RECOMP_RSX_HAL)
     enable_testing()
     add_test(NAME gpu_contract COMMAND test_gpu_contract)
 
+    # The compile service's spv target (PS3RECOMP_RSX_HAL_SPV from gpu_deps.cmake): glslang and SPIRV-Tools, static.
+    # Public, as PS3RECOMP_RSX_HAL is: a backend or setup asks gpu_sc_available(GPU_SC_SPV) at run time anyway.
+    # Its test puts the seeded generator's programs and the built-in passes through it: every module compiles and
+    # validates, its bindings and locations are the binding model's, it is the same twice, and the edits' output
+    # matches their goldens. --corpus <dir> runs the same checks over kept texts (PS3_SHADER_CACHE_HLSL=1).
+    #   cmake --build build --target test_gpu_sc_spv
+    #   ctest --test-dir build -R gpu_sc_spv
+    if(PS3RECOMP_RSX_HAL_SPV)
+        target_sources(ps3recomp_runtime PRIVATE
+            libs/video/gpu/gpu_shader_spv.cpp
+            libs/video/gpu/gpu_shader_spv_edit.cpp)
+        target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_HAL_SPV=1)
+        target_link_libraries(ps3recomp_runtime PRIVATE
+            glslang glslang-default-resource-limits SPIRV-Tools-opt SPIRV-Tools-static)
+        add_executable(test_gpu_sc_spv EXCLUDE_FROM_ALL
+            libs/video/tests/test_gpu_sc_spv.c
+            runtime/host/host_stubs.c
+        )
+        target_compile_definitions(test_gpu_sc_spv PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_gpu_sc_spv PRIVATE ps3recomp_runtime)
+        target_include_directories(test_gpu_sc_spv PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        set_target_properties(test_gpu_sc_spv PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME gpu_sc_spv COMMAND test_gpu_sc_spv)
+    endif()
+
     # The D3D12 backend's test: on WARP, so it needs no GPU; GPU_TEST_HW=1
     # runs it on the real one. Built on demand:
     #   cmake --build build --target test_gpu_d3d12
@@ -712,6 +741,28 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
     set_target_properties(test_shader_text_identity PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
+# The portable renderer's core on the null backend, over synthetic scenes: libs/video/tests/test_rsx_synth.c.
+# Seeded programs (rsx_prog_gen.h), vertex data, textures and surfaces written as captures and played as
+# rsx_replay plays a chain, in two processes; each scene's stream hash against its golden, no failed null
+# check. Windows only, as the null route. Built on demand:
+#   cmake --build build --target test_rsx_synth
+#   ctest --test-dir build -R rsx_synth
+if(PS3RECOMP_RSX_HAL AND WIN32)
+    add_executable(test_rsx_synth EXCLUDE_FROM_ALL
+        libs/video/tests/test_rsx_synth.c
+        runtime/host/host_stubs.c
+    )
+    target_compile_definitions(test_rsx_synth PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(test_rsx_synth PRIVATE ps3recomp_runtime dxguid)
+    target_include_directories(test_rsx_synth PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(test_rsx_synth PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME rsx_synth COMMAND test_rsx_synth)
 endif()
 
 # ---------------------------------------------------------------------------

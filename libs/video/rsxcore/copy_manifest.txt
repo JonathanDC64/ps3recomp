@@ -57,20 +57,23 @@ libs/video/gpu/gpu_shader.c 5619-5619 uvclamp_gs
 # Exported as gpu_sc_put and gpu_sc_cache_dir.
 libs/video/gpu/gpu_shader.c 16388-16402 rsx_d3d12_shader_cache_put
 libs/video/gpu/gpu_shader.c 16404-16404 rsx_d3d12_shader_cache_path
+# The read-ahead, exported as gpu_sc_warm (step C3a).
+libs/video/gpu/gpu_shader.c 4057-4147 shader_cache_warm shader_cache_warm_files shader_cache_warm_worker shader_cache_warm_lister
 
 # Not copied from 5241-5860 (the draw-state half, for the record's package):
 # vp_pso_knobs_check 5372-5395, dr_uvclamp 5564-5575, hdr_scene_limit
 # 5672-5700, dr_hdrv 5706-5725, hdr_batch_start 5785-5806, hdr_mark_scan
-# 5808-5859. From 3948-4160: the read-ahead (shader_cache_warm, 4057-4147).
+# 5808-5859.
 
 # ---------------------------------------------------------------------------
 # Step 1.0: the whole renderer, copied as it is, so that RSX_BACKEND=hal-d3d12
 # (libs/video/rsx_out.c) draws exactly what today's renderer draws. The
 # fragments below are compiled only by libs/video/rsxcore/rsxc_d3d12.c, which
-# includes them in this order (the CMake glob takes *.c, not *.inc). It keeps
-# its own static copy of everything, the shader texts too: it does not use
-# rsxc_shader.c or gpu_shader.c yet. Later steps convert the fragments to the
-# GPU layer one piece at a time, and note each change here.
+# includes them in this order (the CMake glob takes *.c, not *.inc). It kept
+# its own static copy of everything, the shader texts too, until step C3a
+# moved those onto rsxc_shader.c and gpu_shader.c (below). Later steps
+# convert the fragments to the GPU layer one piece at a time, and note each
+# change here.
 #
 # A fragment is its range run through this sed -E script (the lines that
 # start "#sed "), and nothing else:
@@ -125,6 +128,96 @@ libs/video/rsxcore/rsxc_record.inc 13040-13402 rsx_backend callbacks: init, pres
 libs/video/rsxcore/rsxc_vertex.inc 13403-15040 vertex reads and uploads, the vertex jobs, the GPU fetch path
 libs/video/rsxcore/rsxc_record2.inc 15041-15742 draw_arrays, draw_indexed, bind_texture, vertex attribs, shader, blend, depth
 libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutdown, display timing, the overlay, the exports
+
+# ---------------------------------------------------------------------------
+# Step C1: the device, recording, fences and the swap chain on the GPU layer.
+# The fragments below are no longer verbatim at these legacy lines: a fix
+# there needs a hand port. The rest of each fragment is still its range run
+# through the #sed script. s_d3d.device, cmd_queue, swap_chain, swap_buffers
+# and cmd_list hold the GPU layer's objects, borrowed (gpu_native); s_d3d's
+# fence, fence_event, fence_values and cmd_allocators are unused.
+#  rsxc_d3d12.c: includes gpu_d3d12_cmd.h and gpu_d3d12_bridge.h after
+#    rsxc_head.inc.
+#  rsxc_state.inc, after s_d3d (598): s_rc_dev, s_rc_swap, s_rc_swap_image,
+#    s_rc_cmd, s_rc_frame_fence.
+#  rsxc_hdr.inc: swap_color_space 1721-1726 (gpu_swap_hdr); swap_buffers_get
+#    1745-1753 (the swap chain's images through gpu_d3d12_swap_image, the RTVs
+#    as before); display_note 2240-2246 (gpu_swap_stats); check_device
+#    2298-2299 (gpu_lost); swap_present 2321-2322 (gpu_swap_present);
+#    swap_resize 2343-2351, 2358-2359, 2377-2382 (gpu_swap_resize,
+#    gpu_swap_acquire; no fence values to move on one timeline).
+#  rsxc_init.inc: frame_cmd_begin and frame_cmd_submit, new after fnv_bytes
+#    (2397); init_d3d12 2483-2609: the debug layer is never enabled on this
+#    route (D3D12_DBG and debug builds included); DRED, the factory, the
+#    adapter, the device and the queue are gpu_d3d12_create's (D3D12_DRED:
+#    GPU_DEVICE_BREADCRUMBS, CELLMARK_IGPU: GPU_DEVICE_LOW_POWER, FRAME_COUNT
+#    cmd slots), pso_lib_open and shader_cache_warm after it; the swap chain
+#    is gpu_swap_create's, tearing from GPU_CAP_TEARING; init_d3d12 2612-2647
+#    and 2699-2723: the recorders and the fence are the device's (slot 0
+#    begun and ended once, so s_d3d.cmd_list is a closed list after init).
+#  rsxc_sync.inc: dred_list and dred_report 3223-3334 (gpu_fault_report);
+#    wait_for_gpu 3339-3367 and move_to_next_frame 3413-3436 (the device's
+#    timeline: gpu_signal, gpu_fence_wait 2000 ms, gpu_fence_completed,
+#    gpu_lost; s_rc_frame_fence per frame slot); lose_device_test 3403-3404
+#    (gpu_native).
+#  rsxc_cap.inc: cap_readback_write 3650-3651, 3690-3692 (frame_cmd_begin,
+#    frame_cmd_submit).
+#  rsxc_diag.inc: frame_log 10473-10474, 10482 (gpu_swap_stats).
+#  rsxc_frame.inc: render_frame 11230-11231, 12775-12777 (frame_cmd_begin,
+#    frame_cmd_submit).
+#  rsxc_api.inc: rc_backend_shutdown 15856-15862, 15877-15879 (the GPU
+#    layer's objects go with gpu_destroy; the borrowed pointers are cleared
+#    first); present_queued 16056-16062 (gpu_swap_stats); rc_overlay_tick
+#    16105-16108, 16115, 16138-16140 (frame_cmd_begin, gpu_cmd_end,
+#    frame_cmd_submit); a comment before rc_device (16167).
+
+# Step C3a: the shader texts and compiles. The core's copies of the text
+# builders and of the .dxbc cache are gone; it calls rsxc_shader.c's texts
+# and gpu_shader.c's compile service, whose dxbc target is today's FXC call
+# and cache (the same keys and files). A legacy fix in one of these regions
+# goes to rsxc_shader.c or gpu_shader.c (their lines above), not to the
+# fragment. rsxc_d3d12.c includes rsxc_shadercache.inc right after
+# rsxc_state.inc, before the first fragment that compiles.
+#  rsxc_head.inc 143-152: rsx_path_last_sep is gpu_shader.c's.
+#  rsxc_shadercache.inc 3955-3966, 3970-4148: the cache, its key, store,
+#   compile and read-ahead are gpu_shader.c's (gpu_sc_*); s_perf_fxc,
+#   s_perf_fxc_n and s_perf_sc_hits are its counters (gpu_sc_stats_take;
+#   each compile sets gpu_sc_perf from perf_on()). The fragment keeps
+#   3949-3954 and the pipeline counters (3967-3969), and holds the bridge:
+#   sc_compile (a
+#   compile with D3DCompile's results), sc_load (a cached program by key)
+#   and, TEMPORARY until the pipeline step makes gpu_shader handles,
+#   sc_d3d_blob: the service's bytecode copied into an ID3DBlob, so the
+#   pipeline code (VPVSEntry.vs, vp_vs_blob, the FP and built-in shaders'
+#   blobs) reads the same bytes as before. shader_cache_dir,
+#   shader_cache_warm and shader_compile_cached are one-line forwards.
+#  rsxc_vs.inc 4663-4669, 4698-4700, 4767-4776, 4802-4803, 4822-4858,
+#   4865-4870: vp_hash_ucode and vp_get_vs_mode's sizing, hash, decompile,
+#   VP_W_ONE, VP_BYPASS, uses_c03 and code64 are rsxc_vs_locate,
+#   rsxc_vs_text and rsxc_vs_code64; its compile is sc_compile. The start
+#   (VP_START_OFF, which the memo needs first), the memo, the VS cache and
+#   the dumps stay; the dumps now see the text after VP_W_ONE / VP_BYPASS.
+#  rsxc_fp.inc 5242-5370, 5397-5539, 5626-5670, 5727-5783: the b1 binding,
+#   the variants list, fp_build_hlsl, the program memo (fp_hash_at,
+#   fp_units_at, fp_seen_note), fp_inject_uvclamp and the HDR edits are
+#   rsxc_shader.c's; fp_out_anchor, fp_set_out, fp_build_hlsl, fp_hash_at,
+#   fp_units_at, fp_inject_uvclamp and rc_shader_hdr are forwards to them.
+#   uvclamp_gs 5577-5625 compiles rsxc_uvclamp_gs_hlsl (GPU_SC_NO_CACHE).
+#  rsxc_writeback.inc 8783-8791: s_fp_seen is rsxc_shader.c's; the
+#   RSX_WRITE_COLOR_LOG loop (9284-9285) reads it through rsxc_fp_seen.
+#  rsxc_pipeline.inc 6183-6187 (pxi_build_one's loads: sc_load) and 6060
+#   (rsxc_fp_baked()).
+#  rsxc_diag.inc 10240-10241, rsxc_frame.inc 12470-12475: the fxc and disk
+#   counters come from gpu_sc_stats_take.
+#  rsxc_api.inc 16310-16420: the offline exports are forwards to
+#   rsxc_shader_hlsl, rsxc_program_hash64, rsxc_shader_key,
+#   rsxc_shader_fp_variants, gpu_sc_put and gpu_sc_cache_dir.
+#  Every other D3DCompile is gpu_sc_compile_entry through sc_compile, with
+#   GPU_SC_NO_CACHE (none was cached), GPU_SC_OPTIMIZE where the original
+#   passes D3DCOMPILE_OPTIMIZATION_LEVEL3, and SMAA's entry points:
+#   rsxc_hdr.inc 1778-1782, 1849-1850, 1954-1962; rsxc_init.inc 2826-2835,
+#   2935-2937; rsxc_cap.inc 3841-3843, 3907-3908 (compile_vp);
+#   rsxc_writeback.inc 8876-8878; rsxc_post.inc 10625-10629, 10791-10792.
 
 # ---- The D3D12 backend (libs/video/gpu/gpu_d3d12*, package S2) ----
 # Today's device calls with their parameters, onto handles: the D3D12 calls
@@ -221,3 +314,549 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 # 12796-12820), the debug pipelines' root signature and pipelines
 # (2734-2791, 2879-2972), the shutdown order (rsx_d3d12_backend_shutdown:
 # gpu_destroy releases what the device made), SetName.
+
+# ---------------------------------------------------------------------------
+# Step C4: the shader-visible descriptor heaps, the texture pool, staging and
+# uploads, every SRV write and the samplers on the GPU layer. The regions
+# below are no longer verbatim at these legacy lines: a fix there needs a
+# hand port.
+# The four shader-visible heaps are table pools (gpu_table_pool_create; the
+# backend fills a new pool with today's R8_UNORM null SRVs). s_d3d.srv_heap,
+# samp_heap, blit_srv_heap and writeback's s_down_srv hold the pools' heaps,
+# borrowed (gpu_d3d12_table_pool_heap), for SetDescriptorHeaps and the
+# native table binds that are still the core's. The RTV and DSV heaps are
+# not converted (step C5).
+# Textures that get SRVs carry a GPU layer handle next to the native field
+# (gpu_texture tex): the pool's slot textures are gpu_texture_create's (res
+# is gpu_native); every other one is adopted at its creation site
+# (rc_tex_set: gpu_d3d12_adopt_texture_of) and dropped at its release
+# (rc_tex_drop). SrvMemo and its knob RSX_SRV_MEMO are gone: the SRV pool's
+# memo (gpu_fast_table_write_tex) skips an unchanged entry everywhere.
+#  rsxc_state.inc 294, 307 (OffRT tex, snap_tex), 359, 364 (VPTexSlot tex;
+#   blk, the TexBlock's gpu_heap; blk_heap is unused), 677 (s_subvp tex),
+#   715 (subvp_capture adopts), and the step C4 statics after 796:
+#   s_rc_srv_pool, s_rc_samp_pool, s_rc_blit_pool, s_rc_down_pool,
+#   s_rc_rt_tex, s_rc_screen_copy_tex, k_rc_no_tex, rc_tex_set, rc_tex_drop.
+#  rsxc_init.inc 2424 (display_targets_make adopts render_targets[i]);
+#   init_d3d12 2985-3009: srv_heap is s_rc_srv_pool, regions per draw window
+#   (DRAW_SRV_BASE, MAX_DRAWS x RSX_FP_UNITS), 21, 22 and 24 (SMAA's three
+#   tables); the null fill and its s_res_gen++ are the backend's; 3098-3103:
+#   samp_heap is s_rc_samp_pool (VP_SAMP_TABLES tables of RSX_FP_UNITS).
+#  rsxc_hdr.inc blit_init 1891-1897 (blit_srv_heap is s_rc_blit_pool, a table
+#   of 2 per frame); blit_srvs_write 2026-2042 and blit_to_window 2096-2111:
+#   gpu_table_write_tex; blit_srv_none is the empty RGBA16F entry.
+#  rsxc_texture.inc 6910-6982: the staging ring is gpu_buffer upload buffers
+#   (gpu_buffer_create, mapped once); a replaced one is destroyed at the next
+#   tex_stage_frame, after render_frame's wait (it was off_rt_defer_release);
+#   tex_stage_alloc stays for smaa_luts_load (gpu_native). 6985-7088: the
+#   pool's chunks are gpu_heap_create, its textures gpu_texture_create placed
+#   at the block (committed when there is none), the aliasing barrier on a
+#   reused block is gpu_cmd_barrier_n. vp_upload_tex_slot 7290-7303,
+#   7621-7671: the copies and barriers are gpu_cmd_copy_buf_to_tex and
+#   gpu_cmd_barrier on s_rc_cmd, the SRV gpu_table_write_tex.
+#  rsxc_targets.inc 8367-8407: vp_sampler_table's keys, LRU and hint stay;
+#   each unit is gpu_sampler_get then gpu_fast_table_write_sampler.
+#   vp_bind_sampler_table 8410-8414: gpu_fast_table_ref, gpu_cmd_bind_table.
+#   ZetaRT 8458 (tex); zeta_get 8525, 8533, 8552 and off_rt_get 8597, 8621,
+#   8640: adopt and drop lines; off_rt_get's SRV 8748-8756:
+#   gpu_table_write_tex.
+#  rsxc_writeback.inc down_init 8906-8912 (s_down_srv is s_rc_down_pool);
+#   off_rt_downscale 8988-8995 (gpu_table_write_tex, gpu_table_ref);
+#   off_rt_drop_rewritten 9365 (drops); srv_write_ex and srv_write 9379-9422
+#   take a gpu_texture and are gpu_fast_table_write_tex (SrvMemo removed);
+#   off_rt_snapshot 9452, 9465 and screen_copy_capture 9533: adopt and drop.
+#  rsxc_diag.inc rsx_scale_apply 10504-10514: drops with the releases.
+#  rsxc_post.inc s_aa 10590 (disp_tex), s_smaa 10738-10742 (area_tex,
+#   search_tex, edges_tex, weights_tex); aa_draw 10697-10698, smaa_draw
+#   10956-10964, aa_filter_for 11013, aa_run_rt 11031 and aa_run_display
+#   11045-11081 take the source's handle; smaa_ready 10866, smaa_targets
+#   10930, 10946 and aa_run_display adopt and drop.
+#  rsxc_frame.inc 11593-11723, 12266, 12284: the window writes pass the
+#   handles (k_rc_no_tex for none).
+#  rsxc_api.inc rc_backend_shutdown 15869 and after 15879: the pools' heaps
+#   go with gpu_destroy; the borrowed pointers are cleared first.
+#  Not converted: the atlas path's SRV at srv_heap index 0 (rsxc_frame.inc
+#   11240-11308) and the SetDescriptorHeaps and table binds of frame, post,
+#   hdr and writeback (native on the frame's list).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C4 blocks):
+#   gpu_d3d12_adopt_texture_of (adopt with the resource's own description)
+#   and gpu_d3d12_table_pool_heap (a pool's heap, borrowed).
+
+# Step C3b: root signatures, pipelines, the pipeline library and the shaders
+# on the GPU layer. Every root signature the copy makes, but the debug
+# pipelines', is gpu_layout_create's, every pipeline gpu_pipeline_create's
+# (rc_pipeline), every shader a gpu_shader (gpu_shader_create; C3a's
+# TEMPORARY sc_d3d_blob is gone). The ID3D12RootSignature* and
+# ID3D12PipelineState* fields hold the GPU layer's objects, borrowed
+# (gpu_native GPU_NATIVE_LAYOUT; a pipeline's handle is its pointer,
+# gpu_pipeline.v) for the binds that stay native until C6/C7; the core never
+# releases them (gpu_destroy does). Each layout's handle sits beside its
+# field (vp_layout, blit_layout, s_of/s_hdr_blit/s_aa/s_smaa.layout,
+# s_down_layout). The D3D12 descriptions are today's byte for byte (call map
+# F, G8), and so are the serialized root signatures but one: down_init's
+# (call map G12: its SRV range's offset is 0 where the GPU layer writes
+# D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND; the first range of its table, it
+# lands at 0 either way, so only the serialized bytes differ).
+#  rsxc_state.inc: VPVSEntry.vs (394) and vp_vs_blob (546, now
+#   vp_vs_shader) are gpu_shader; blit_layout after blit_rs (475),
+#   vp_layout after vp_root_sig (529); s_rc_pipe_loaded and s_rc_pipe_made
+#   after s_rc_frame_fence.
+#  rsxc_shadercache.inc 4004-4029: sc_compile gives the service's blob,
+#   sc_shader / sc_load / shader_compile_cached a gpu_shader, sc_shader_drop
+#   frees one where the original released its blob once its pipeline was
+#   made (G5); new beside them: rc_pipeline, pass_desc (the built-in passes'
+#   pipeline), lay_slot, pass_sampler, lay_make.
+#  rsxc_hdr.inc: s_of (1770) and s_hdr_blit (1932) hold a layout; of_ready
+#   1777-1828, blit_init 1848-1889 and 1900-1904 (the heap's lines between,
+#   1890-1899, are as they were), hdr_blit_ready 1953-2018.
+#  rsxc_init.inc 2822-2978: the debug pipelines' shaders are the service's
+#   blobs (their root signature and pipelines stay native, unconverted);
+#   vp_root_sig 3065-3132 is gpu_layout_create's, and s_vp_root_hash its
+#   serialized bytes' hash (gpu_d3d12_layout_hash: the same value).
+#  rsxc_cap.inc: compile_vp 3840-3925.
+#  rsxc_psolib.inc 4155-4171, 4280-4369, 4514-4580, 4605-4658: the library
+#   is the GPU layer's (gpu_pipeline_cache_load / _save; gpu_pipeline_create
+#   loads from it and stores in it under G9's names), so it is its own file:
+#   <shader cache>/gpu/d3d12/pipelines.lib, with pipelines.n and the index's
+#   index.built beside it; this route never reads or writes pso_library.bin,
+#   pso_library.n or pso_index.built. pso_manifest.bin and pso_blobs/ keep
+#   their names and records: a record is the D3D12 description the GPU layer
+#   makes (gpu_d3d12_pipeline_d3d_desc, on the miss path only) under
+#   pso_desc_key, as today. pso_lib_store is gone; pso_prebuild_one turns a
+#   record back into a gpu_pipeline_desc (pso_rec_desc) and checks its name
+#   against the description the GPU layer makes of it; pso_create_cached
+#   takes a gpu_pipeline_desc and returns the pipeline. PS3_PSO_LOG=1 prints
+#   the run's pipeline counts after each present that made one
+#   (pso_count_print; rc_backend_shutdown prints them once).
+#  rsxc_vs.inc 4671-4863: the VS cache holds gpu_shader (never freed).
+#  rsxc_fp.inc 5086-5228: a psj job holds a gpu_pipeline_desc and its pixel
+#   shader, freed in psj_finish; uvclamp_gs 5577-5622 is a gpu_shader.
+#  rsxc_pipeline.inc: vp_fp_desc 5863-5948 fills a gpu_pipeline_desc (with
+#   no colour target its write mask is every channel, the D3D12
+#   description's, so one description is one name); pxi_build_one,
+#   pxi_build_thread, pso_index_build_start 6180-6269; vp_get_fp_pso
+#   6288-6595.
+#  rsxc_writeback.inc: s_down_* 8844-8851, down_init 8875-8905, down_pso
+#   8930-8946.
+#  rsxc_post.inc: s_aa and s_smaa (a layout after rs), aa_ready
+#   10624-10685, smaa_ready 10783-10848 and 10868-10869.
+#  rsxc_api.inc: rc_backend_shutdown 15833, 15840 (pso_count_print),
+#   15866-15867 (the passes' borrowed pointers cleared, so the releases
+#   after them find NULL).
+
+# Step C2: the buffers and rings on the GPU layer. The regions below are no
+# longer verbatim at these legacy lines: a fix there needs a hand port.
+# The fixed-function vertex buffer, the per-draw rings (vp_vb, vp_ib, vp_cb,
+# vp_fpcb, vf_buf), the dump's readback buffer, guest_fb's upload buffer and
+# RTT_SAVERT's readback buffer are gpu_buffer_create's (rc_buf_make: upload
+# ones mapped once, for their life). s_d3d.vertex_buffer, vp_vb, vp_ib, vp_cb,
+# vp_fpcb, vf_buf and readback_buf (and guest_fb_present's up, render_frame's
+# s_rtsave_buf) hold the same buffers, borrowed (gpu_native), for the binds
+# and copies that are still the core's; their GPU addresses are
+# gpu_buffer_addr's, per draw gpu_fast_buffer_addr's, plus today's offsets.
+#  rsxc_state.inc after 646: the step C2 statics (s_rc_vertex_buf, s_rc_vp_vb,
+#   s_rc_vp_ib, s_rc_vp_cb, s_rc_vp_fpcb, s_rc_vf_buf, s_rc_readback_buf,
+#   s_rc_ring_old) and rc_buf_make, rc_ring_retire, rc_ring_release.
+#  rsxc_init.inc 3027-3048 (vertex_buffer and its view's address), 3134-3206
+#   (the rings: rc_buf_make; the sizes and the log lines as before).
+#  rsxc_present.inc dump_backbuffer_bmp 3450-3452, 3468-3469, 3525-3526:
+#   gpu_buffer_map over the rows read, gpu_buffer_unmap.
+#  rsxc_writeback.inc guest_fb_present 9692-9731 (rc_buf_make; the mapped
+#   pointer, gpu_buffer_unmap); vp_vb_grow and vp_ib_grow 9762-9838: the new
+#   buffer is rc_buf_make's, the old one goes to rc_ring_retire (it was
+#   off_rt_defer_release) and is destroyed with the fence of the frame that
+#   last drew from it at the next render_frame's start (rc_ring_release, after
+#   off_rt_release_deferred), where today's release let it go. The growth sizes
+#   and when it grows are unchanged.
+#  rsxc_diag.inc rsx_scale_apply 10512: readback_buf is destroyed at once (the
+#   GPU is idle there; it was off_rt_defer_release).
+#  rsxc_frame.inc after 11193 (rc_ring_release); 11215-11226 (readback_buf);
+#   11927, 11935, 11942, 11950, 12004 (gpu_buffer_addr) and 12294, 12298 (per
+#   draw: gpu_fast_buffer_addr): only the addresses, the binds stay native;
+#   12550-12603 (s_rtsave_buf: rc_buf_make, destroyed at once when too small, as
+#   it was released), 12843-12844, 12914 (gpu_buffer_map, gpu_buffer_unmap over
+#   the whole buffer for today's NULL range).
+#  rsxc_api.inc rc_backend_shutdown 15846-15849: the buffers go with
+#   gpu_destroy; the borrowed pointers, the mapped pointers and the handles are
+#   cleared first.
+
+# Step C5a: the colour and depth targets and their RTVs and DSVs on the GPU
+# layer. The regions below are no longer verbatim at these legacy lines: a
+# fix there needs a hand port.
+# The display targets, the shared depth buffer, the zeta surfaces and the
+# offscreen pool are gpu_texture_create's (today's descriptions, states and
+# clear values); render_targets[i], depth_buffer, ZetaRT.res and OffRT.res
+# borrow them (gpu_native), and OffRT.up borrows the init staging, a GPU
+# layer upload buffer (OffRT.up_buf). Their RTVs and DSVs are gpu_view_get's:
+# the RTV and DSV heaps (s_d3d.rtv_heap, swap_rtv_heap, dsv_heap, rt_rtv_heap
+# and zeta's) are not made. Each view's CPU descriptor is read once where the
+# view is made (gpu_d3d12_view_cpu) and kept beside it, for the binds and
+# clears that are still native (frame.inc, blit_to_window, the AA pass). A
+# dropped target and its staging go into a grave of handles, which
+# off_rt_release_deferred destroys with the last frame's fence (their views
+# go with them); the native grave for the other resources is unchanged.
+#  rsxc_state.inc 294-295 (OffRT rtv, rtv_cpu, up_buf) and the step C5a
+#   statics after C4's: s_rc_rt_rtv(_cpu), s_rc_depth_tex,
+#   s_rc_depth_dsv(_cpu), s_rc_swap_rtv(_cpu), rc_target_view.
+#  rsxc_hdr.inc swap_buffers_get 1745-1756 (the images' RTVs are views);
+#   blit_to_window 2065-2067 (image fi's view's descriptor).
+#  rsxc_init.inc display_targets_make 2398-2431 and depth_buffer_make
+#   2433-2477 (texture_create, view_get); init_d3d12 2649-2670 and 2682-2692
+#   (no RTV, swap RTV or DSV heap; rtv_descriptor_size stays for the
+#   downscale's and SMAA's heaps) and 3012-3020 (no offscreen RTV heap).
+#  rsxc_targets.inc 8421-8440 (off_rt_release_deferred also empties the
+#   handles' grave; rc_last_frame_fence, rc_grave_put, rc_grave_tex and
+#   off_rt_drop_target beside it); ZetaRT 8457-8481 (dsv, dsv_ro and their
+#   descriptors, no DSV heap; zeta_dsv and zeta_dsv_ro are loads; zeta_drop);
+#   zeta_transition 8494-8500 (gpu_cmd_barrier); zeta_get 8511-8563
+#   (texture_create, two view_get DSVs, gpu_cmd_clear_depth); off_rt_get
+#   8568-8572, 8597-8598, 8621-8622, 8627-8640 (texture_create), 8664-8675
+#   (the staging: buffer_create, buffer_map), 8714-8725
+#   (gpu_cmd_copy_buf_to_tex), 8730-8739 (gpu_cmd_barrier), 8742-8746 (the
+#   RTV: view_get) and 8749.
+#  Outside the targets, for the objects above: rsxc_writeback.inc
+#   off_rt_drop_rewritten 9362-9363 (off_rt_drop_target) and off_rt_rtv
+#   9370-9377 (the stored descriptor); rsxc_diag.inc rsx_scale_apply
+#   10501-10502, 10508 and 10513-10516 (the drops); rsxc_frame.inc
+#   render_frame 11760-11767 (the display target's RTV and the depth DSV:
+#   the stored descriptors); rsxc_api.inc rc_backend_shutdown 15853-15854,
+#   15861 and 15864-15865 (the borrowed pointers are cleared, not Released:
+#   they go with gpu_destroy).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C5a blocks):
+#   gpu_d3d12_view_cpu (a view's CPU descriptor).
+
+# Step C5b: the colour write-back (the host import included), its downscale
+# pass, the snapshots, the screen copy, the composite and guest_fb's
+# barriers, and ZPASS's query pool and readback, on the GPU layer. The
+# regions below are no longer verbatim at these legacy lines: a fix there
+# needs a hand port. The textures made here (OffRT.down, OffRT.snap,
+# s_screen_copy) are gpu_texture_create's in the handle fields (down_tex,
+# snap_tex, s_rc_screen_copy_tex), and the ID3D12Resource* fields hold
+# their resources, borrowed (gpu_native); one dropped while a frame is
+# recorded waits in wb_tex_retire's grave and is destroyed (after 0) at a
+# later render_frame's pre-pass, after its opening wait_for_gpu: where
+# off_rt_defer_release let it go. The readback buffers (OffRT.rb, ZPASS's
+# s_zq_rb) are gpu_buffer_create's (rb_buf, s_zq_rb_buf), read with
+# gpu_buffer_map / gpu_buffer_unmap (today's Map(0, {0, n}), Unmap(0,
+# {0, 0})); the buffer over RSX local memory is gpu_buffer_import_host's
+# (the core keeps the VirtualQuery check, its line, and the commit). Every
+# command in these regions is a gpu_cmd_* on s_rc_cmd (barrier, barrier_n,
+# copy_texture, copy_texture_whole, copy_tex_to_buf; the downscale pass's
+# pass_begin with a gpu_view_get RTV, set_layout, set_pipeline,
+# set_table_pools, bind_table, push_const, viewport, scissor, topology,
+# draw), but two copies into or from step C2's buffers (guest_fb's upload
+# buffer, frame.inc's readback_buf for SCREENCOPY_DUMP), native until those
+# have handles. ZPASS's pool is gpu_query_pool_create's (s_zq_pool);
+# s_zq_heap is its heap, borrowed (gpu_d3d12_query_pool_heap), for the
+# queries and the resolve frame.inc records natively until step C7.
+#  rsxc_writeback.inc: the grave (wb_tex_retire, wb_tex_bury), new after
+#   rt_guest_bpp (8830-8834); s_down_pso 8845 (gpu_pipeline) and s_down_rtv
+#   8848 (gone); down_init 8913-8917 (the RTV heap gone); down_pso
+#   8922-8948; off_rt_downscale 8951-9022; s_wbg 9038 and wbg_ready
+#   9062-9083; wbg_record 9106-9119; rt_writeback_record 9143-9173;
+#   wbg_check 9213-9214, 9222-9223; rt_writeback_store 9294-9295, 9313,
+#   9325-9326; off_rt_drop_rewritten 9351 (wb_tex_bury every frame) and
+#   9364-9365 (the snapshot and the downscale copy retired);
+#   off_rt_transition 9425-9437 (gpu_cmd_barrier with OffRT.tex, inline);
+#   off_rt_snapshot 9450-9492 (it still returns the resource, which its
+#   callers test); screen_copy_capture 9521-9586; composite_present
+#   9658-9684; guest_fb_present 9733-9739, 9753-9755 (its buffer, map and
+#   copy are as they were).
+#  rsxc_zpass.inc: s_zq_heap and s_zq_rb 9863-9864 (s_zq_pool, s_zq_rb_buf
+#   beside them); zq_ready 9897-9919; zq_finish 9929-9935.
+#  rsxc_state.inc: OffRT rb_buf after rb (303), down_tex after down (310),
+#   snap_tex's comment; s_rc_screen_copy_tex's comment (step C4's block).
+#  rsxc_diag.inc: rsx_scale_apply 10503-10505, 10511 (retired, not
+#   released).
+#  rsxc_api.inc: rc_backend_shutdown 15843-15845 (gpu_buffer_destroy).
+#  libs/video/gpu/gpu_d3d12_bridge.h, gpu_d3d12.c (step C5b blocks):
+#   gpu_d3d12_query_pool_heap (a query pool's heap, borrowed).
+
+# Step C3c: pipelines made only for the library, and the pipeline contract's
+# gaps. gpu.h: gpu_pipeline_create takes flags and says what it did (*how:
+# GPU_PIPELINE_LOADED, _COMPILED, _STORED); GPU_PIPELINE_STORE_ONLY loads, or
+# compiles and stores, then frees the pipeline and returns none (D3D12:
+# StorePipeline then Release, as today; Vulkan: made with the VkPipelineCache,
+# then vkDestroyPipeline); gpu_pipeline_cache_load returns
+# GPU_PIPELINE_CACHE_NONE, _NEW or _LOADED; GPU_NATIVE_PIPELINE.
+#  rsxc_shadercache.inc rc_pipeline: *how in place of *loaded, the pointer
+#   from gpu_native (GPU_NATIVE_PIPELINE).
+#  rsxc_psolib.inc pso_lib_open 4277-4338: no library possible (NONE) leaves
+#   the library off with the manifest unread, as today's s_pso_lib NULL;
+#   rc_pipeline_store and s_rc_pipe_store_only before pso_prebuild_one;
+#   pso_prebuild_one 4539-4583 (4571-4580: the load-or-build, the Releases)
+#   is rc_pipeline_store; pso_create_cached 4635-4659 counts a new pipeline
+#   (s_pso_lib_new, s_pso_lib_quiet) only when it was stored, as
+#   pso_lib_store's 1; pso_count_print also prints
+#   "[D3D12] pipelines resident: N; only stored in the library: S".
+#  rsxc_pipeline.inc pxi_build_one 6181-6226 (6200-6221: the load-or-build,
+#   the Release) is rc_pipeline_store.
+
+# Step C7: render_frame's commands on the GPU layer. From its display
+# target's barrier to the submit, every command render_frame records itself
+# is a gpu_cmd_* of gpu_d3d12_cmd.h (static inline: the same D3D12 call, call
+# map I) on the frame's recorder, held in a local (rc = s_rc_cmd), with the
+# handles the earlier steps made: s_rc_rt_tex, s_rc_rt_rtv, s_rc_depth_dsv,
+# OffRT.rtv, ZetaRT.dsv/dsv_ro, OffRT.tex, s_d3d.vp_layout, s_rc_srv_pool,
+# s_rc_samp_pool, s_zq_pool, s_rc_readback_buf, s_rtsave_b. A pipeline field
+# (ID3D12PipelineState*) becomes its handle through RC_PIPE, no lookup. The
+# regions below are no longer verbatim at these legacy lines: a fix there
+# needs a hand port. Still native, as they were: the font atlas upload and
+# the non-VP pass (11233-11317, 11787-11893: "not copied" in the call map,
+# left as they are; its binds still run, but no capture draws through it),
+# and what other steps' functions take (aa_run_display's
+# descriptor, cap_readback_write's and the overlay's swap buffer, the state
+# and format numbers of off_rt_transition, zeta_transition and srv_write).
+#  rsxc_state.inc: RC_PIPE, after C3b's statics.
+#  rsxc_frame.inc render_frame 11751-11785 (the display target's barrier,
+#   its pass, clears, viewport and scissor), 11904-11907 and 11916 (vpso),
+#   11921-11953 (the VP pass's layout, pipeline, topology, CB, table pools,
+#   tables, vertex and index buffers, the fetch buffer), 11999-12019 (the
+#   state put back after the in-frame AA pass), 12035-12036, 12071-12110
+#   (a retarget's pass, viewport, scissor and depth clear), 12122-12126,
+#   12151, 12159-12190 (the clears), 12200-12224 (the draw's pipeline),
+#   12232-12255 (its viewport and scissor), 12283, 12288-12299 (its tables
+#   and CBs: the device, the texture pool and the two CB addresses are read
+#   once before the loop, so a draw's binds look nothing up), 12307-12308 (an unused native handle, gone), 12327-12334
+#   (RT_REBIND), 12340-12364 (the occlusion query, reset before the batch's
+#   first: nothing on D3D12; b2, topology, the DRED marker, the draw),
+#   12372, 12381-12388, 12608-12619 (RTT_SAVERT's copy), 12729-12758 (the
+#   dump's copy and the display target's barriers), 12764-12765 (the query
+#   resolve); 12792-12821 (D3D12_IQ's drain of the debug layer's queue) is
+#   not copied (call map G16: this route never enables the debug layer).
+#  rsxc_targets.inc: dred_mark 7781-7814 records on the frame's recorder
+#   (gpu_cmd_marker: today's words; no list argument); zeta_dsv and
+#   zeta_dsv_ro 8468-8481 return the views (gpu_view).
+#  libs/video/gpu/gpu_d3d12_cmd.h: the memo compare of
+#   gpu_fast_table_write_tex reads the description's fields and the entry's
+#   20 bytes as three words (no copy of the description on the stack but for
+#   a write); its D3D12 calls are unchanged.
+
+# Step C6: the passes that run a few times a frame on the GPU layer: the
+# blit to the window (the output filter's and the HDR blit's pipelines
+# included), the repaint hold, FXAA and SMAA, and the captures' readbacks.
+# The regions below are no longer verbatim at these legacy lines: a fix there
+# needs a hand port. Every command in them is a gpu_cmd_* on s_rc_cmd
+# (barrier, barrier_n, copy_texture_whole, copy_buf_to_tex, copy_tex_to_buf,
+# pass_begin with the targets' views, clear_color, set_layout, set_pipeline,
+# set_table_pools, bind_table with gpu_table_ref, push_const, viewport,
+# scissor, topology, draw). The textures made here (the hold, the AA display
+# copy, SMAA's lookup textures and its edges and weights targets) are
+# gpu_texture_create's with today's descriptions, states and clear values,
+# and their ID3D12Resource* fields borrow them (gpu_native); the SMAA
+# targets' RTVs are gpu_view_get's (no RTV heap). A target dropped while a
+# frame is recorded goes into step C5a's grave (rc_grave_tex), where today's
+# off_rt_defer_release put it; the hold is destroyed at once, as it was
+# Released. The pipelines are bound by their pointers' handles (rc_pipe) and
+# the layouts by the handles step C3b keeps beside the root signatures.
+#  rsxc_state.inc: rc_pipe, new at the end (after 796).
+#  rsxc_hdr.inc: swap_buffers_get 1745-1753 (the images by index are
+#   gpu_swap_image's); blit_to_window 2048-2140; s_hold 2145 (s_hold_tex
+#   beside it); hold_copy 2160-2207 (hold_barriers, new before it).
+#  rsxc_cap.inc: cap_readback_write 3628-3703 takes a gpu_texture; its
+#   readback buffer is rc_buf_make's (READBACK, COPY_DEST), read with
+#   gpu_buffer_map and gpu_buffer_unmap (today's Map(0, {0, n}), Unmap(0,
+#   {0, 0})), destroyed at once after the wait; rsx_capture_frame 3787-3796
+#   (the handles); compile_vp 3930-3945: the drain of the debug layer's
+#   message queue is not copied (call map G16: with the debug layer never on
+#   there is no info queue, so it printed nothing).
+#  rsxc_post.inc: s_aa 10590 (disp_tex is the copy's own handle); aa_draw
+#   10692-10717 (aa_target, new before it); s_smaa 10732-10745 (edges_rtv and
+#   weights_rtv in place of the RTV heap); smaa_rtv 10747-10754 (gone);
+#   smaa_state 10756-10767; smaa_ready 10851-10867 (no RTV heap; the lookup
+#   textures); smaa_luts_load 10883-10922 (tex_stage_alloc_buf, step C4's
+#   note); smaa_targets 10924-10952; smaa_draw 10954-10999; aa_filter
+#   11013-11017; aa_run_rt 11019-11033 (the target's view); aa_run_display
+#   11035-11082 (no rtv argument: the display target's view).
+#  rsxc_frame.inc: 12711 (aa_run_display(fi)) and 12954 (the HDR snap reads
+#   s_rc_swap_image[fi]).
+#  rsxc_api.inc: rc_backend_shutdown 15866-15875 (the AA display copy and the
+#   hold go with gpu_destroy; their borrowed pointers are cleared first);
+#   rc_overlay_tick 16106 and 16119-16134 (hold_barriers and the copy).
+#  Not converted, and why: rsxc_present.inc has no command left
+#   (dump_backbuffer_bmp's copy and barriers are rsxc_frame.inc's); the HDR
+#   display queries (rsxc_hdr.inc 1668-1715, call map G14) stay core as they
+#   are; rsxc_diag.inc's rsx_scale_apply releases s_subvp natively, as
+#   subvp_capture (rsxc_state.inc 704-715) still makes it; the menu renderer
+#   still gets the device, the queue and the swap chain's buffers as native
+#   objects (rc_device, rc_queue, rc_back_buffer, the overlay's frame).
+
+# Step C8a: the core holds no native object. Every field, local and
+# parameter that held an ID3D12* or IDXGI* object holds the GPU layer's
+# handle it was borrowed from, and nothing is borrowed through gpu_native but
+# the menu's exports (rsxc_api.inc). The regions below are no longer verbatim
+# at these legacy lines: a fix there needs a hand port.
+#  Removed, not converted: the pass of the draws recorded without a vertex
+#   program and the font atlas it sampled. No capture draws through them:
+#   with base11 the gate's legacy column is "none" on capset0 (warm and
+#   cold), capsetk and capsetaa (no DRAWPRINT line names a legacy draw), and
+#   no replay log says "atlas uploaded". Gone are:
+#   rsx_d3d12_backend.c 198-199 (D3D12DrawRecord.textured), 487-491, 499,
+#   513-523 but 516 (the root signature, the triangle, line, point and atlas
+#   pipelines, vb_view, the atlas's texture, upload buffer and state),
+#   2481 (init's hr), 2725-2979 (their root signature, shaders and
+#   pipelines; draws record from there on, pipeline_ready = 1), 3047-3050
+#   (vb_view), 9591-9606 (topo_to_d3d), 11233-11317 (the atlas upload),
+#   11787-11893 (the pass), 15082, 15157, 15216, 15303, 15434 (textured),
+#   15582-15586 and 15653-15665 (a B8 texture recorded as the atlas),
+#   15850-15852 and 15855 (their Releases). The VP pass's base pipeline
+#   (11902-11907) is the colour PS's, the atlas PS's when there is none, as
+#   it was with no atlas uploaded.
+#  Pipelines and layouts: every pipeline field, local, parameter and return
+#   is a gpu_pipeline (made? is .v), every root signature only its layout
+#   (made? is GPU_VALID); rc_pipeline returns the handle and lay_make only
+#   the layout (no gpu_native), and RC_PIPE and rc_pipe are gone. None is
+#   k_rc_no_pipe (rsxc_state.inc, new at the end). Pipelines still live as
+#   long as the device. At these legacy lines: 287 and 433 (the record's and
+#   the cache entry's pso), 475-476, 529-533 (blit_rs and vp_root_sig gone),
+#   1770-1830 (s_of, of_ready), 1838-1930 (blit_init), 1932-2000
+#   (s_hdr_blit, hdr_blit_ready), 2051-2140 (blit_to_window's binds), 2391
+#   and 3209 (the init's log prints the layout's id where it printed the
+#   root signature), 3803-3880 (compile_vp), 4610, 4635-4660
+#   (pso_create_cached), 5039-5060 (vp_fp_insert), 5094 (PsjJob.pso),
+#   5161-5250 (psj_add, psj_finish), 6275-6700 (vp_get_fp_pso returns none
+#   where it returned NULL), 8844-8930 (s_down_rs gone, down_init,
+#   down_pso), 10585-10700 (s_aa, aa_ready), 10732-10900 (s_smaa,
+#   smaa_ready), 11004-11012 (aa_filter_for), 11730, 11902-11925 (the VP
+#   pass's base pipeline; VPPASS prints the layout's id), 12202-12210,
+#   15074, 15180, 15330 (vp_layout made? in place of vp_root_sig), and
+#   15866-15876 (rc_backend_shutdown: the dead Releases of the passes'
+#   pipelines, root signatures and the AA copy go).
+#  The sub-viewport captures (SUBVP_RTT=1): each is gpu_texture_create's
+#   (today's committed RGBA8 texture, no flags, in PIXEL_SHADER_RESOURCE),
+#   and subvp_capture's barriers and copy are gpu_cmd_barrier_n and
+#   gpu_cmd_copy_texture with today's box on the frame's recorder;
+#   rsx_scale_apply puts them in step C5a's grave (rc_grave_tex), where
+#   off_rt_defer_release put them. With that, nothing native is made,
+#   adopted or released in the core: d3d_create_committed and s_res_gen
+#   (340-348), step C4's rc_tex_set and rc_tex_drop, and the native grave
+#   (8418-8440: s_rt_grave, off_rt_defer_release, the Release loop of
+#   off_rt_release_deferred) go. At these legacy lines: 677-752 (s_subvp,
+#   subvp_note, subvp_capture; s_rc_rt_tex is declared with step C1's
+#   statics, before them), 10510 (rsx_scale_apply), 11659 (a sampler that
+#   reads a capture: made? is its handle). capsetv (scratch: capset0 with
+#   SUBVP_RTT=1, and RSX_SCALE=150 on the fogwall) passes the gate exact.
+#  Resources and the device: no field, local or parameter holds an
+#   ID3D12Resource, ID3D12Device, queue, swap chain or command list. The
+#   textures and buffers are their handles (made? is GPU_VALID): OffRT.tex,
+#   up_buf, rb_buf, snap_tex, down_tex (294-330: res, up, rb, snap, down
+#   gone), VPTexSlot.tex and blk (359-364: res and blk_heap gone), ZetaRT.tex
+#   (8458), s_rc_rt_tex, s_rc_depth_tex, s_rc_swap_image, the rings and
+#   buffers s_rc_vertex_buf .. s_rc_readback_buf, s_rtsave_b (12550),
+#   s_hold_tex (2145), s_aa.disp_tex (10590), s_smaa's four (10738-10750),
+#   s_rc_screen_copy_tex (662), s_zq_rb_buf (9863-9866: s_zq_made in place of
+#   the borrowed pointers' test). s_d3d's device, cmd_queue, swap_chain,
+#   render_targets, swap_buffers, cmd_list, depth_buffer, vertex_buffer,
+#   readback_buf, vf_buf, vp_vb, vp_ib, vp_cb, vp_fpcb go (461-540), with
+#   the unused rtv_heap, swap_rtv_heap, cmd_allocators, fence, fence_event,
+#   fence_values, dsv_heap, and the descriptor sizes nothing read
+#   (rtv_descriptor_size, srv_inc, samp_inc: init_d3d12 2479-3215 no longer
+#   asks the device for them). rc_buf_make takes no resource out-parameter;
+#   off_rt_snapshot (9446) returns the copy's handle; tex_stage_alloc (6933)
+#   goes. The last native copies are the GPU layer's: screen_copy_capture's
+#   SCREENCOPY_DUMP copy (9516-9600) is gpu_cmd_copy_tex_to_buf, and
+#   guest_fb_present's (9688-9760) gpu_cmd_copy_buf_to_tex, each with today's
+#   footprint at offset 0. Two debug prints that showed a native pointer
+#   (VP path resources at init, RTT_SAVERT's rt=) show the handle's id.
+#  The device, the queue and the swap chain's buffers reach the menu only
+#   through rsxc_api.inc's block (rc_device, rc_queue, rc_back_buffer,
+#   rc_overlay_frame: gpu_native, at 16141, 16180-16193 and 12965), and
+#   what the core needs of the backend beyond gpu.h is the instance file's
+#   (rsxc_d3d12.c: rc_be_create for gpu_d3d12_create, rc_be_layout_hash,
+#   rc_be_pipeline_desc for pso_manifest.bin's D3D12 records, and
+#   rc_be_lose_device for lose_device_test's RemoveDevice, 3395-3410).
+#  Heaps and views: no descriptor heap or CPU descriptor is borrowed. The
+#   shader-visible heaps were the table pools' (s_d3d.srv_heap 516,
+#   samp_heap 557, blit_srv_heap 477, writeback's s_down_srv 8847, read
+#   through gpu_d3d12_table_pool_heap since step C4): each goes, and made?
+#   (2992, 3103, 1897, 8912, 7106, 8572, 10622, 10774) is GPU_VALID of the
+#   pool. rt_rtv_heap (571) goes too: the offscreen RTVs are views. The CPU
+#   descriptors kept beside the views for the native binds go with them:
+#   rc_target_view's cpu parameter (gpu_d3d12_view_cpu), the display
+#   targets', the depth target's and the swap chain's (s_rc_rt_rtv_cpu,
+#   s_rc_depth_dsv_cpu, s_rc_swap_rtv_cpu: 2404, 2473, 11762-11767),
+#   OffRT.rtv_cpu with off_rt_rtv (9370), ZetaRT's dsv_cpu and dsv_ro_cpu
+#   (8466-8520), and render_frame's rtv_handle (12711's aa_run_display
+#   takes the view). Every bind and clear names the view.
+#  One grave: today's off_rt_defer_release (8418-8440) let a resource
+#   dropped while a frame is recorded go at the next render_frame's start,
+#   after its opening wait. Steps C5a and C5b kept two lists for that
+#   (the handles' grave, and the write-back's s_wb_grave with wb_tex_retire
+#   and wb_tex_bury, freed at a later render_frame's pre-pass): now one,
+#   rc_grave_put / rc_grave_tex into s_rc_grave, emptied by
+#   rc_grave_release (off_rt_release_deferred's place in render_frame),
+#   where each handle goes to gpu_texture_destroy or gpu_buffer_destroy
+#   with the fence of the last frame submitted (passed by then, so the GPU
+#   layer frees it at once). The write-back's copies, snapshots and screen
+#   copy go into it as the targets do. The staging buffers' list
+#   (s_ts_grave, tex_stage_frame) and the rings' old halves
+#   (rc_ring_retire, rc_ring_release) are freed at the same point, two
+#   lines later, and stay as they are.
+#  Shutdown (rsx_d3d12_backend_shutdown, 15828-15897): the vertex jobs'
+#   queued work is finished first (vpj_sync), then the GPU waited for:
+#   the rings they write are the GPU layer's buffers, which gpu_destroy
+#   frees (today's leaked, mapped for life). The grave and the staging
+#   buffers' list are emptied before gpu_destroy, which frees what they
+#   hold, so a device made again never destroys by an old handle.
+#  Per draw: srv_write_ex (today's SrvMemo writes, 16 calls a draw) went
+#   through gpu_fast_table_write_tex(s_rc_dev, s_rc_srv_pool, ...), which
+#   found the pool's record from its handle on every call. The pool is
+#   found once at init now (gpu_table_writer_get into s_rc_srv_w, emptied
+#   at shutdown) and the calls go through gpu_fast_table_writer_tex: the
+#   same memo compare and the same write, without the lookup.
+#
+# Step C8b: no fragment names D3D12 or DXGI; a second instance, null.
+#  Values: the fragments name gpu.h's formats, states, swizzles, blend
+#   factors and ops, address modes and comparisons (the same numbers as
+#   DXGI's and D3D12's), and the helpers that map guest values return them
+#   (rt_target_format, rsx_surface_format, rsx_texfmt_format,
+#   rsx_wrap_to_address, rsx_remap_to_swizzle, gl_blend_factor_gpu,
+#   gl_blend_op_gpu); srv_write_ex, srv_write, off_rt_transition,
+#   zeta_transition, down_pso, cap_readback_write, cap_write_bmp and the AA
+#   helpers take gpu_format and gpu_state. The RSX_CAP manifest keeps its
+#   "dxgi=" field.
+#  rsxc_core.inc lists the fragments in order; each instance file includes
+#   rsxc_head.inc, its backend's command header, its rc_be_* hooks, then it.
+#   rsxc_head.inc includes no D3D12, DXGI or D3DCompiler header and no
+#   initguid.h (the GUIDs come from dxguid.lib, as before), and links only
+#   wtsapi32 itself.
+#  The hooks (rsxc_d3d12.c, rsxc_null.c): rc_be_create; rc_be_headless (no
+#   window: rc_backend_init opens none); rc_be_breadcrumbs (D3D12_DRED, for
+#   init_d3d12's GPU_DEVICE_BREADCRUMBS and dred_mark); rc_be_lost_text and
+#   rc_be_lost_hint (check_device's line: removed_reason_text, 2284-2294,
+#   moved into rsxc_d3d12.c); rc_be_lose_device; rc_be_device, rc_be_queue,
+#   rc_be_image (the menu's objects: rc_device, rc_queue, rc_back_buffer;
+#   gpu_native on D3D12, none on null); rc_be_cache_files (shader_cache_dir
+#   is "" without, so no cache file is read or written, and fp_build_hlsl
+#   notes no variant); rc_be_lib_dir (<cache>/gpu/<dir>/); rc_be_sc_compile,
+#   rc_be_sc_load, rc_be_shader_code, rc_be_cache_put (the compile service's
+#   dxbc target on D3D12; on null the text's key K, GPU_CODE_KEY);
+#   rc_be_layout_hash; rc_be_pso_desc, rc_be_pso_record, rc_be_pso_name,
+#   rc_be_pso_unrecord (pso_manifest.bin's records: pso_rec's body, made,
+#   named and read back by the instance; pso_desc_key, 4197-4221, moved into
+#   rsxc_d3d12.c; rc_be_pipeline_desc goes); rc_be_presented (after
+#   swap_present's gpu_swap_present: null prints the stream's hash).
+#  The display's HDR: hdr_sdr_white and hdr_display_query's DXGI output
+#   walk (1627-1700) are rsxc_display_win.c's, behind rsxc_display.h
+#   (rsxc_display_hdr_query, rsxc_display_hdr_current); no window is no
+#   HDR. hdr_display_check (1706-1715) asks rsxc_display_hdr_current where
+#   it compared the factory, the monitor and IsCurrent.
+#  frame_cmd_submit passes the swap chain with GPU_SUBMIT_ACQUIRE_WAIT and
+#   GPU_SUBMIT_PRESENT_SIGNAL (gpu.h's rule; the D3D12 backend ignores
+#   both), which the null backend checks.
+#  rsxc_null.c: the route RSX_BACKEND=null (rsx_out.c), for developers and
+#   CI only.
+#  The null backend's checks found two binds in render_frame's VP pass
+#   (11921-11933) that break gpu.h's rules (Vulkan's), now changed:
+#   slot 1's table before the first draw was the pool's entry 0
+#   (11931-11933), where no table starts: it is the first draw's window
+#   (DRAW_SRV_BASE; each draw binds its own before it draws, as before);
+#   and slot 5 (b2, the fetch draws' descriptor) is set to 0 once after
+#   the layout, since only fetch draws set it and every slot is set
+#   before a draw. D3D12 draws the same.
+#  SMAA's windows (10720-10730, smaa_draw 10956-10999): the edge pass's
+#   window held the edges target it draws into (+ 2), so the edges,
+#   AreaTex and SearchTex are at + 3..5 (the weight pass's window; the
+#   SRV pool's last region starts at slot 25) and + 2 stays the pool's
+#   null; the weights are made readable before the edge pass (they are
+#   made as a target).

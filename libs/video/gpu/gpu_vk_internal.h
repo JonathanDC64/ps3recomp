@@ -622,7 +622,7 @@ void           gpu_vk_desc_release(gpu_vk_device* dd);
 gpu_shader   gpu_vk_shader_create(gpu_device* d, const gpu_shader_desc* desc);
 void         gpu_vk_shader_destroy(gpu_device* d, gpu_shader s);
 gpu_layout   gpu_vk_layout_create(gpu_device* d, const gpu_layout_desc* desc);
-gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache);
+gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how);
 int          gpu_vk_pipeline_cache_load(gpu_device* d, const char* path);
 int          gpu_vk_pipeline_cache_save(gpu_device* d, const char* path);
 void         gpu_vk_pipe_release(gpu_vk_device* dd);

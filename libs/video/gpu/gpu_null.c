@@ -1550,6 +1550,15 @@ void gpu_null_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t 
     nd->counts.table_writes++;
 }
 
+/* Through a writer (its v the pool's id): the pool's write, the same checks
+ * and the same records in the stream. */
+void gpu_null_fast_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_table_pool pool;
+    pool.id = (uint32_t)w.v;
+    gpu_null_fast_table_write_tex(d, pool, index, srv);
+}
+
 void gpu_null_fast_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)
 {
     gpu_null_device* const nd = GPU_NULL_DEV(d);
@@ -1605,6 +1614,20 @@ static void nl_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t inde
 static void nl_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)
 {
     gpu_fast_table_write_sampler(d, pool, index, s);
+}
+
+/* The pool's id (a stale one is caught at the write, as the pool's is). */
+static gpu_table_writer nl_table_writer_get(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_table_writer w;
+    (void)d;
+    w.v = pool.id;
+    return w;
+}
+
+static void nl_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_fast_table_writer_tex(d, w, index, srv);
 }
 
 static gpu_table nl_table_ref(gpu_device* d, gpu_table_pool pool, uint32_t index)
@@ -1724,12 +1747,15 @@ static uint64_t pipe_name(gpu_null_device* nd, const gpu_pipeline_desc* desc)
 }
 
 /* One pipeline per contents: the same description again is the same
- * pipeline (never from_cache: there is no cache file). Thread-safe. */
-static gpu_pipeline nl_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache)
+ * pipeline (always GPU_PIPELINE_COMPILED: there is no cache). A
+ * GPU_PIPELINE_STORE_ONLY one is checked as any other, counted, and keeps
+ * nothing: no entry, so no handle can name it (a bind of one is a never-made
+ * pipeline, a HANDLE failure). Thread-safe. */
+static gpu_pipeline nl_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how)
 {
     gpu_null_device* const nd = GPU_NULL_DEV(d);
     gpu_pipeline r = {0};
-    if (from_cache) *from_cache = 0;
+    if (how) *how = GPU_PIPELINE_FAILED;
     const char* bad = NULL;
     nl_lock(nd);
     const gpu_shader sh[3] = { desc->vs, desc->gs, desc->ps };
@@ -1743,6 +1769,12 @@ static gpu_pipeline nl_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
     }
     if (!bad && desc->nrt > 4) bad = "more than 4 colour targets";
     uint32_t idx1 = 0;
+    if (!bad && (flags & GPU_PIPELINE_STORE_ONLY)) {
+        nd->stored_only++;
+        nl_unlock(nd);
+        if (how) *how = GPU_PIPELINE_COMPILED;
+        return r;
+    }
     if (!bad) {
         const uint64_t name = pipe_name(nd, desc);
         const uint32_t mask = 2u * GPU_NULL_MAX_PIPELINES - 1u;
@@ -1779,6 +1811,7 @@ static gpu_pipeline nl_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
         free(v.a);
         return r;
     }
+    if (idx1 && how) *how = GPU_PIPELINE_COMPILED;
     r.v = idx1;
     return r;
 }
@@ -1786,7 +1819,7 @@ static gpu_pipeline nl_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
 static int nl_pipeline_cache_load(gpu_device* d, const char* path)
 {
     (void)d; (void)path;
-    return 0;
+    return GPU_PIPELINE_CACHE_NONE;
 }
 
 static int nl_pipeline_cache_save(gpu_device* d, const char* path)
@@ -3534,6 +3567,12 @@ static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
     s->acquired = s->waited = s->used = s->signalled = 0;
     s->presents++;
     nd->counts.presents++;
+    /* The dump on disk up to here: a run may end without gpu_destroy
+     * (rsx_replay ends its process). The stream's order is the same. */
+    if (nd->dump) {
+        flush_events(nd);
+        fflush((FILE*)nd->dump);
+    }
     return 0;
 }
 
@@ -3750,7 +3789,12 @@ const char* gpu_null_error_name(int kind)
 
 void gpu_null_counts_get(gpu_device* d, gpu_null_counts* out)
 {
-    *out = GPU_NULL_DEV(d)->counts;
+    gpu_null_device* const nd = GPU_NULL_DEV(d);
+    *out = nd->counts;
+    nl_lock(nd);
+    out->pipelines = nd->npipe;
+    out->stored_only = nd->stored_only;
+    nl_unlock(nd);
 }
 
 void gpu_null_test_lose(gpu_device* d, uint32_t reason)

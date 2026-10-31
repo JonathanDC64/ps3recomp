@@ -9,10 +9,15 @@
  *   hal-d3d12  the new path on its own D3D12 backend (libs/video/rsxcore/,
  *              Windows only), for developers' A/Bs. Step 1.0 is today's
  *              renderer copied as it is, so it draws the same frames.
+ *   null       the new path on the null backend (gpu_null.c, Windows only
+ *              for now): no window and no GPU; every command is checked
+ *              against gpu.h and hashed. For developers and CI only, never
+ *              in Settings (rsxc_null.c says what it prints).
  * Anything else (vulkan, metal, auto, a typo) is not in this build yet and
  * runs d3d12. The pick prints one line, on every route:
  *   [rsx_out] route d3d12
  *   [rsx_out] route hal-d3d12 (the new path on its own D3D12 backend)
+ *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
  *   [rsx_out] route d3d12 (RSX_BACKEND=vulkan is not in this build)
  *
  * The functions are rsx_d3d12_backend.h's, with the same parameters and
@@ -88,12 +93,14 @@ RSX_OUT_FUNCS(RSX_OUT_DECL_V_, RSX_OUT_DECL_R_)
 #undef RSX_OUT_DECL_V_
 #undef RSX_OUT_DECL_R_
 
-/* The route that runs: "d3d12" or "hal-d3d12". Picks it if no call has. */
+/* The route that runs: "d3d12", "hal-d3d12" or "null". Picks it if no call
+ * has. */
 const char* rsx_out_renderer(void);
 
 /* A renderer other than today's, as a table of the functions above. The
  * new path's core defines one per backend it is compiled for:
- * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows). */
+ * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows) and
+ * rsxc_route_null (rsxc_null.c, Windows for now). */
 #define RSX_OUT_FIELD_V_(name, legacy, params, args)      void (*name) params;
 #define RSX_OUT_FIELD_R_(ret, name, legacy, params, args) ret (*name) params;
 typedef struct rsx_route {
@@ -105,6 +112,7 @@ typedef struct rsx_route {
 
 #if defined(_WIN32)
 extern const rsx_route rsxc_route_d3d12;
+extern const rsx_route rsxc_route_null;
 #endif
 
 #ifdef __cplusplus

@@ -43,12 +43,14 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
                  title ? title : "ps3recomp");
     }
-    s_d3d.hwnd = open_window(width, height, title);
-    if (!s_d3d.hwnd) {
+    /* (A headless backend, rc_be_headless, presents into its swap chain's
+     * images with no window: step C8b.) */
+    s_d3d.hwnd = rc_be_headless ? NULL : open_window(width, height, title);
+    if (!s_d3d.hwnd && !rc_be_headless) {
         printf("[D3D12] ERROR: Window creation failed\n");
         return -1;
     }
-    session_lock_init(s_d3d.hwnd);
+    if (s_d3d.hwnd) session_lock_init(s_d3d.hwnd);
 
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
@@ -87,8 +89,13 @@ static void rc_backend_shutdown(void)
 {
     if (!s_d3d.initialized) return;
 
+    /* Step C8a: the vertex jobs' queued work first. The rings they write are
+     * the GPU layer's buffers, and gpu_destroy below frees them (today's
+     * leaked, mapped for life): a job still writing then would write freed
+     * memory. */
+    vpj_sync();
     wait_for_gpu();
-    if (s_pso_lib) {
+    if (s_pso_lib_on) {
         InterlockedExchange(&s_pso_pre_abort, 1);
         while (s_pso_lib_saving || s_pso_pre_live || s_pxb_live) Sleep(1);
         pso_manifest_flush();
@@ -96,45 +103,48 @@ static void rc_backend_shutdown(void)
     }
     while (s_pxr_writing) Sleep(1);
     pso_index_flush();
+    pso_count_print("this run");
 
     /* Release D3D12 resources */
-    if (s_wbg.buf)  { s_wbg.buf->lpVtbl->Release(s_wbg.buf);   s_wbg.buf = NULL; }
-    if (s_wbg.heap) { s_wbg.heap->lpVtbl->Release(s_wbg.heap); s_wbg.heap = NULL; }
+    /* The write-back's buffer over guest memory (the GPU layer's, step C5b)
+     * goes here, as today, while guest memory is there; the GPU is idle. */
+    if (GPU_VALID(s_wbg.buf)) gpu_buffer_destroy(s_rc_dev, s_wbg.buf, 0);
+    s_wbg.buf.id = 0;
     s_wbg.state = -1;
-    if (s_d3d.vertex_buffer) {
-        s_d3d.vertex_buffer->lpVtbl->Unmap(s_d3d.vertex_buffer, 0, NULL);
-        s_d3d.vertex_buffer->lpVtbl->Release(s_d3d.vertex_buffer);
-    }
-    if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
-    if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
-    if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
-    if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
-    if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
-    if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
-    if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
-    if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
-    if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
-        if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
-        if (s_d3d.swap_buffers[i]) s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
-    }
-    if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
-    if (s_d3d.swap_rtv_heap) s_d3d.swap_rtv_heap->lpVtbl->Release(s_d3d.swap_rtv_heap);
-    if (s_of.pso) s_of.pso->lpVtbl->Release(s_of.pso);
-    if (s_of.rs) s_of.rs->lpVtbl->Release(s_of.rs);
+    /* Step C2: the buffers are the GPU layer's and go with gpu_destroy; the
+     * pointers into them were borrowed. */
+    s_d3d.vb_mapped = s_d3d.vp_vb_mapped = s_d3d.vp_ib_mapped = NULL;
+    s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
+    s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
+    s_rc_vf_buf.id = s_rc_readback_buf.id = s_rc_ring_old[0].id = s_rc_ring_old[1].id = 0;
+    /* The passes' layouts and pipelines are the GPU layer's (step C3b) and go
+     * with gpu_destroy. */
+    s_d3d.blit_pso = k_rc_no_pipe;
+    /* Step C6: the AA display copy, SMAA's textures and the repaint hold are
+     * the GPU layer's and go with gpu_destroy. */
+    s_aa.disp_tex.id = 0;
+    s_hold_tex.id = 0; s_hold_valid = 0;
     memset(&s_of, 0, sizeof s_of);
-    if (s_d3d.blit_srv_heap) s_d3d.blit_srv_heap->lpVtbl->Release(s_d3d.blit_srv_heap);
-    if (s_d3d.blit_pso) s_d3d.blit_pso->lpVtbl->Release(s_d3d.blit_pso);
-    if (s_d3d.blit_rs) s_d3d.blit_rs->lpVtbl->Release(s_d3d.blit_rs);
-    if (s_aa.pso) s_aa.pso->lpVtbl->Release(s_aa.pso);
-    if (s_aa.pso16) s_aa.pso16->lpVtbl->Release(s_aa.pso16);
-    if (s_aa.rs) s_aa.rs->lpVtbl->Release(s_aa.rs);
-    if (s_aa.disp) s_aa.disp->lpVtbl->Release(s_aa.disp);
     memset(&s_aa, 0, sizeof s_aa);
-    if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
-    if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
-    if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
+    /* The swap chain and its buffers, the recorders, the fence, the queue and
+     * the device are the GPU layer's: gpu_destroy frees them once the GPU is
+     * idle. */
+    for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
+    s_rc_cmd = NULL;
+    s_rc_swap.id = 0;
+    /* Step C4: the table pools, the texture slots, the staging buffers and
+     * the pool's heaps go with the device. */
+    s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
+    s_rc_srv_w.v = 0;
+    /* Step C5a: the display targets, the depth buffer, zeta and the
+     * offscreen targets with their views (no RTV or DSV heap is made) go
+     * with the device too, and so do the handles waiting in the grave and
+     * the staging buffers' list (step C8a: emptied, so a device made again
+     * never destroys one of its own by an old handle). */
+    s_rc_grave_n = 0;
+    s_ts_grave_n = 0;
+    if (s_rc_dev) gpu_destroy(s_rc_dev);
+    s_rc_dev = NULL;
 
     /* A window belongs to the thread that made it: the window thread
      * destroys its own and then leaves its message loop. */
@@ -311,13 +321,11 @@ static int rc_display_shown_mhz(void)
  * chain's statistics cannot say. */
 static int present_queued(void)
 {
-    UINT last = 0;
-    DXGI_FRAME_STATISTICS fs;
-    memset(&fs, 0, sizeof fs);
-    if (FAILED(s_d3d.swap_chain->lpVtbl->GetLastPresentCount(s_d3d.swap_chain, &last)) ||
-        FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)) || !fs.PresentCount)
+    gpu_present_stats st;
+    memset(&st, 0, sizeof st);
+    if (gpu_swap_stats(s_rc_dev, s_rc_swap, &st) || !st.present_count)
         return -1;
-    const UINT ahead = last - fs.PresentCount;
+    const UINT ahead = st.last_present_count - st.present_count;
     if (ahead > FRAME_COUNT + 1) return -1;   /* (statistics that do not follow this swap chain) */
     return ahead != 0;
 }
@@ -361,42 +369,27 @@ static void rc_overlay_tick(void)
     /* The held frame into the game's buffer for this index (cleared by the
      * next batch anyway), then into the window's as for any frame. */
     const u32 fi = s_d3d.frame_index;
-    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
-    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
-    cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
+    frame_cmd_begin(fi);
     if (!held) {
         /* The last frame shown is still in its render target: a frame index
          * moves only at a Present, so every batch since has drawn into the
          * other one. */
         hold_copy(s_shown_fi);
         if (!s_hold_valid) {
-            cl->lpVtbl->Close(cl);
+            gpu_cmd_end(s_rc_dev, s_rc_cmd);
             return;
         }
     }
-    D3D12_RESOURCE_BARRIER b[2] = {0};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[1].Transition.pResource   = s_hold;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
-    cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    /* (On the recorder just begun, step C6: the hold's handle and the
+     * display target's.) */
+    hold_barriers(fi, GPU_STATE_PRESENT, GPU_STATE_COPY_DEST, GPU_STATE_COMMON, GPU_STATE_COPY_SOURCE);
+    gpu_cmd_copy_texture_whole(s_rc_cmd, s_rc_rt_tex[fi], s_hold_tex);
+    hold_barriers(fi, GPU_STATE_COPY_DEST, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE, GPU_STATE_COMMON);
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
     blit_to_window(fi);
     s_shown_fi = fi;
-    cl->lpVtbl->Close(cl);
-    ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
-    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
-    s_overlay.frame(s_overlay.user, s_d3d.swap_buffers[fi], fi, s_d3d.win_w, s_d3d.win_h);
+    frame_cmd_submit();
+    rc_overlay_frame(fi);
     swap_present(0);
     s_repaints++;
     move_to_next_frame();
@@ -423,13 +416,28 @@ static void rc_set_borderless(int on)
 #endif
 }
 static int      rc_borderless(void)   { return s_borderless; }
-static void*    rc_device(void)       { return s_d3d.device; }
+/* The menu renderer takes the device, the queue and the swap chain's
+ * buffers as the backend's own objects, and the overlay's frame callback
+ * the buffer it draws over: the instance file's hooks (step C8b:
+ * rc_be_device, rc_be_queue, rc_be_image; on D3D12 the GPU layer's own,
+ * borrowed as today's were; none where the menu has no renderer). */
+static void*    rc_device(void)       { return s_rc_dev ? rc_be_device(s_rc_dev) : NULL; }
+static void*    rc_queue(void)        { return s_rc_dev ? rc_be_queue(s_rc_dev) : NULL; }
+static void*    rc_back_buffer(unsigned i)
+{
+    if (i >= FRAME_COUNT || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
+    return rc_be_image(s_rc_dev, s_rc_swap_image[i]);
+}
+static void rc_overlay_frame(u32 fi)
+{
+    s_overlay.frame(s_overlay.user, rc_back_buffer(fi), fi, s_d3d.win_w, s_d3d.win_h);
+}
+/* (The end of the menu's objects.) */
 static long     rc_device_lost(long long* qpc)
 {
     if (qpc) *qpc = s_device_lost_qpc;
     return s_device_lost;
 }
-static void*    rc_queue(void)        { return s_d3d.cmd_queue; }
 static void*    rc_hwnd(void)         { return s_d3d.hwnd; }
 
 static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
@@ -448,11 +456,10 @@ static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
     SDL_PushEvent(&e);
 #endif
 }
-static void*    rc_back_buffer(unsigned i) { return i < FRAME_COUNT ? s_d3d.swap_buffers[i] : NULL; }
 static unsigned rc_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
 static unsigned rc_back_buffer_format(void)
 {
-    return (unsigned)(s_hdr.active ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
+    return (unsigned)(s_hdr.active ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);
 }
 static int rc_hdr(float* ui_scale, int* srgb)
 {
@@ -565,116 +572,28 @@ static void rc_backend_present(void)
     }
 }
 
-/* Offline warm-up of the shader disk cache (rsx_shader_precompile). */
+/* The offline exports (rsx_shader_precompile, setup's shader pass): the
+ * texts are rsxc_shader.c's and the cache is the instance file's
+ * (rc_be_cache_put; on D3D12 the compile service's, step C3a, which is
+ * today's .dxbc cache; none on null). */
 static int rc_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
                           int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap)
 {
-    extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
-    extern int rsx_vp_decompile_fetch(const uint8_t*, u32, char*, u32);
-    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
-    extern void rsx_vp_set_branch_base(u32);
-    if (!ucode || !out || cap < 2) return 0;
-    if (fragment == 1 || fragment == 3) {
-        /* The decompiler may read up to RSX_FP_MAX_BYTES, as it does from
-         * guest memory; give it a zero tail. */
-        u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-        if (!buf) return 0;
-        memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-        int n = fp_build_hlsl(buf, exp32, cube_mask, d2c_mask, out, cap, 0, 0);
-        free(buf);
-        /* 3: as a draw without a depth test on a scaled target has it (the
-         * sprite-edge clamp, vp_get_fp_pso). */
-        if (fragment == 3 && n > 0 && !fp_inject_uvclamp(out, cap)) n = 0;
-        return n;
-    }
-    /* The binary holds big-endian words; rsx_state keeps the words
-     * SET_TRANSFORM_PROGRAM delivered, little-endian. Then as vp_get_vs_mode:
-     * trimmed to the END instruction, branch targets made relative to the
-     * slot the program is loaded at. */
-    u32 vlen = ucode_len & ~3u;
-    u8* w = (u8*)malloc(vlen ? vlen : 4);
-    if (!w) return 0;
-    for (u32 i = 0; i < vlen; i += 4) {
-        w[i] = ucode[i + 3]; w[i + 1] = ucode[i + 2]; w[i + 2] = ucode[i + 1]; w[i + 3] = ucode[i];
-    }
-    { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
-      if (instrs) vlen = instrs * 16u; }
-    rsx_vp_set_branch_base(vp_start_slot);
-    const int n = fragment == 2 ? rsx_vp_decompile_fetch(w, vlen, out, cap)
-                                : rsx_vp_decompile(w, vlen, out, cap);
-    rsx_vp_set_branch_base(0);
-    free(w);
-    return n;
+    return rsxc_shader_hlsl(fragment, ucode, ucode_len, vp_start_slot, exp32, cube_mask, d2c_mask, out, cap);
 }
-
-/* The pipeline index's fingerprint of a program, from its ucode as a Cg
- * binary holds it (big-endian words): what pso_index_note takes from the
- * guest. A fragment program: rsx_fp_code_hash64. A vertex program: FNV-1a 64
- * of its words as the transform program store holds them (little-endian), up
- * to its END instruction. */
 static u64 rc_program_hash64(int fragment, const u8* ucode, u32 ucode_len)
 {
-    extern u32 rsx_vp_program_size_instrs(const u8*, u32);
-    if (!ucode || !ucode_len) return 0;
-    if (fragment) {
-        u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-        if (!buf) return 0;
-        memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-        const u64 h = rsx_fp_code_hash64(buf, RSX_FP_MAX_BYTES);
-        free(buf);
-        return h;
-    }
-    u32 vlen = ucode_len & ~3u;
-    u8* w = (u8*)malloc(vlen ? vlen : 4);
-    if (!w) return 0;
-    for (u32 i = 0; i < vlen; i += 4) {
-        w[i] = ucode[i + 3]; w[i + 1] = ucode[i + 2]; w[i + 2] = ucode[i + 1]; w[i + 3] = ucode[i];
-    }
-    { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
-      if (instrs) vlen = instrs * 16u; }
-    const u64 h = fnv_bytes(14695981039346656037ull, w, vlen);
-    free(w);
-    return h;
+    return rsxc_program_hash64(fragment, ucode, ucode_len);
 }
-
-static u64 rc_shader_key(int fragment, const char* hlsl)
-{
-    const char* profile = fragment ? "ps_5_0" : "vs_5_0";
-    return hlsl ? shader_key(hlsl, strlen(hlsl), profile) : 0;
-}
-
+static u64 rc_shader_key(int fragment, const char* hlsl) { return rsxc_shader_key(fragment, hlsl); }
 static int rc_shader_cache_put(int fragment, const char* hlsl)
 {
-    const char* profile = fragment ? "ps_5_0" : "vs_5_0";
-    if (!shader_cache_dir()[0] || !hlsl) return 0;
-    char path[MAX_PATH + 64];
-    snprintf(path, sizeof path, "%s/%s_%016llx.dxbc", shader_cache_dir(), profile,
-             (unsigned long long)shader_key(hlsl, strlen(hlsl), profile));
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return 1;
-    ID3DBlob* b = NULL; ID3DBlob* e = NULL;
-    HRESULT hr = shader_compile_cached(hlsl, strlen(hlsl), fragment ? "guest_fp" : "guest_vp2",
-                                       profile, &b, &e);
-    if (e) e->lpVtbl->Release(e);
-    if (b) b->lpVtbl->Release(b);
-    return SUCCEEDED(hr) && b ? 2 : 0;
+    gpu_sc_perf(perf_on());
+    return rc_be_cache_put(fragment ? GPU_SC_PS : GPU_SC_VS, hlsl);
 }
-
 static const char* rc_shader_cache_path(void) { return shader_cache_dir(); }
-
 static int rc_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max)
 {
-    u8* buf = (u8*)calloc(1, RSX_FP_MAX_BYTES);
-    if (!buf) return 0;
-    memcpy(buf, ucode, ucode_len < RSX_FP_MAX_BYTES ? ucode_len : RSX_FP_MAX_BYTES);
-    const u32 hash = rsx_fp_code_hash(buf, RSX_FP_MAX_BYTES);
-    free(buf);
-    fpv_load();
-    int n = 0;
-    for (int i = 0; i < s_fpv_n && n < max; i++)
-        if (s_fpv[i].hash == hash) {
-            out[n * 3 + 0] = s_fpv[i].exp32; out[n * 3 + 1] = s_fpv[i].cube;
-            out[n * 3 + 2] = s_fpv[i].d2c; n++;
-        }
-    return n;
+    return rsxc_shader_fp_variants(ucode, ucode_len, out, max);
 }
 

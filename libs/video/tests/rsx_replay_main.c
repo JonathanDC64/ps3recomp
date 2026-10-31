@@ -32,6 +32,13 @@
  *   [replay] times: 199 frames after the first: wall 5.140 ms, cpu 4.981 ms a frame
  * Windows counts a thread's time in clock ticks (about 15.6 ms), so one
  * frame's cpu figure is coarse; the mean over many frames is not.
+ *
+ * The process ends without the renderer's shutdown. RSX_REPLAY_SHUTDOWN=1,
+ * on the new path's routes only (RSX_BACKEND=hal-d3d12 or null), runs it
+ * after the last frame first: the GPU idle, every object freed and the
+ * device destroyed, which the null backend checks (its last line counts
+ * the failed checks; GPU_NULL_DUMP's file ends with the stream's hash).
+ *   [replay] shutdown: done
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +51,7 @@ uint8_t* vm_base = NULL;
 /* Built with the portable renderer: RSX_BACKEND picks the renderer the
  * capture plays through (rsx_out.h). */
 #include "rsx_out.h"
+#include <string.h>
 #define rsx_d3d12_backend_init          rsx_out_backend_init
 #define rsx_d3d12_backend_present       rsx_out_backend_present
 #define rsx_d3d12_backend_pump_messages rsx_out_backend_pump_messages
@@ -137,6 +145,16 @@ int main(int argc, char** argv)
                    timed, wall_sum / timed, cpu_sum / timed);
     }
     fflush(stdout);
+#if defined(PS3RECOMP_RSX_HAL)
+    /* RSX_REPLAY_SHUTDOWN=1 on the new path's routes: its shutdown first. */
+    { char sv[16] = "";
+      if (GetEnvironmentVariableA("RSX_REPLAY_SHUTDOWN", sv, sizeof sv) < sizeof sv && atoi(sv) > 0 &&
+          strcmp(rsx_out_renderer(), "d3d12") != 0) {
+          rsx_out_backend_shutdown();
+          printf("[replay] shutdown: done\n");
+          fflush(stdout);
+      } }
+#endif
     /* The backend's threads and device are torn down with the process. */
     TerminateProcess(GetCurrentProcess(), 0);
     return 0;

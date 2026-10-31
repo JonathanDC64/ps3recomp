@@ -1248,6 +1248,21 @@ static void d12_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t
     gpu_fast_table_write_sampler(d, pool, index, s);
 }
 
+/* The pool's tpool entry: pools live as long as the device. */
+static gpu_table_writer d12_table_writer_get(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    gpu_table_writer w;
+    w.v = gpu_d3d12_slot_valid(&dd->tpool_slots, pool.id)
+              ? (uint64_t)(uintptr_t)&dd->tpool[GPU_HANDLE_INDEX(pool.id)] : 0;
+    return w;
+}
+
+static void d12_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_fast_table_writer_tex(d, w, index, srv);
+}
+
 static gpu_table d12_table_ref(gpu_device* d, gpu_table_pool pool, uint32_t index)
 {
     return gpu_fast_table_ref(d, pool, index);
@@ -1647,6 +1662,7 @@ static void* d12_native(gpu_device* d, uint32_t kind, uint64_t handle)
     case GPU_NATIVE_TEXTURE:  return gpu_d3d12_slot_valid(&dd->tex_slots, id) ? dd->tex_res[i] : NULL;
     case GPU_NATIVE_LAYOUT:   return gpu_d3d12_slot_valid(&dd->layout_slots, id) ? dd->layout_rs[i] : NULL;
     case GPU_NATIVE_SWAPCHAIN: return gpu_d3d12_slot_valid(&dd->swap_slots, id) ? dd->swap[i].sc : NULL;
+    case GPU_NATIVE_PIPELINE: return (void*)(uintptr_t)handle;   /* (the handle is the pointer) */
     default:                  return NULL;
     }
 }
@@ -1782,6 +1798,52 @@ uint64_t gpu_d3d12_layout_hash(gpu_device* d, gpu_layout layout)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
     return gpu_d3d12_slot_valid(&dd->layout_slots, layout.id) ? dd->layout_hash[GPU_HANDLE_INDEX(layout.id)] : 0;
+}
+
+/* ---- step C4 ---- */
+
+gpu_texture gpu_d3d12_adopt_texture_of(gpu_device* d, ID3D12Resource* res)
+{
+    D3D12_RESOURCE_DESC rd;
+    gpu_texture_desc td;
+    if (!res) return (gpu_texture){0};
+    res->lpVtbl->GetDesc(res, &rd);
+    memset(&td, 0, sizeof td);
+    td.width = (uint32_t)rd.Width;
+    td.height = rd.Height;
+    td.layers = rd.DepthOrArraySize;
+    td.mips = rd.MipLevels;
+    td.format = (gpu_format)rd.Format;
+    td.samples = rd.SampleDesc.Count;
+    td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+    if (!(rd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) td.use |= GPU_USE_SAMPLED;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) td.use |= GPU_USE_RT;
+    if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) td.use |= GPU_USE_DS;
+    return gpu_d3d12_adopt_texture(d, res, &td);
+}
+
+ID3D12DescriptorHeap* gpu_d3d12_table_pool_heap(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    return gpu_d3d12_slot_valid(&dd->tpool_slots, pool.id) ? dd->tpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
+}
+
+/* ---- step C5a ---- */
+
+D3D12_CPU_DESCRIPTOR_HANDLE gpu_d3d12_view_cpu(gpu_device* d, gpu_view v)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    h.ptr = gpu_d3d12_slot_valid(&dd->view_slots, v.id) ? (SIZE_T)dd->view_cpu[GPU_HANDLE_INDEX(v.id)] : 0;
+    return h;
+}
+
+/* ---- step C5b ---- */
+
+ID3D12QueryHeap* gpu_d3d12_query_pool_heap(gpu_device* d, gpu_query_pool pool)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    return gpu_d3d12_slot_valid(&dd->qpool_slots, pool.id) ? dd->qpool[GPU_HANDLE_INDEX(pool.id)].heap : NULL;
 }
 
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */

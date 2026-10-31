@@ -31,7 +31,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          * UNtextured cube to the fixed-function fallback, which never applies the
          * VP's MVP transform, so the cube was drawn in object space and clipped
          * off-screen. Untextured VP draws now render via the colour PSO. */
-        if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
+        if (s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout)) {
             u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
             if (emitted && draw_room()) {
@@ -39,7 +39,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->vb_byte_offset = rec; dr->index_count = 0;
                 dr->vertex_count   = emitted;
                 dr->topology       = RSX_TOPOLOGY_TRIANGLES;
-                dr->textured       = s_d3d.tex_bound;
                 dr->is_vp          = 1;
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
@@ -114,7 +113,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draws[s_d3d.draw_count].index_count = 0;
             s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
             s_d3d.draws[s_d3d.draw_count].topology       = RSX_TOPOLOGY_TRIANGLES;
-            s_d3d.draws[s_d3d.draw_count].textured       = s_d3d.tex_bound;
             s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
             s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
             s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
@@ -137,7 +135,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * go down the fixed-function passthrough below instead. */
     if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
-        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
+        s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout) &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
         u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
@@ -173,7 +171,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->vb_byte_offset = rec; dr->index_count = 0;
             dr->vertex_count   = emitted;
             dr->topology       = RSX_TOPOLOGY_TRIANGLES;
-            dr->textured       = s_d3d.tex_bound;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_exp32 = s_d3d.current_rsx_state ?
@@ -260,7 +257,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             s_d3d.draws[s_d3d.draw_count].index_count = 0;
         s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
         s_d3d.draws[s_d3d.draw_count].topology       = topo;
-        s_d3d.draws[s_d3d.draw_count].textured       = 0;
         s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
         s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
         s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
@@ -287,7 +283,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     }
     if (!s_d3d.pipeline_ready) return;
     if (count == 0 || count > MAX_VERTICES) return;
-    if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
+    if (!s_d3d.vp_vb_mapped || !GPU_VALID(s_d3d.vp_layout)) return;
 
     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
      * triangles per quad, TRIANGLES straight through, STRIP/FAN -> triangle
@@ -391,7 +387,6 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->index_count = s_up_icount; dr->ib_first = s_up_ifirst;
         dr->vertex_count   = emitted;
         dr->topology       = RSX_TOPOLOGY_TRIANGLES;
-        dr->textured       = s_d3d.tex_bound;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_exp32 = s_d3d.current_rsx_state ?
@@ -539,11 +534,6 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                     ea_l, nz_l, ea_m, nz_m, span / 13, 10);
         } } }
 
-    /* Record the currently-bound atlas so subsequent quad draws sample it. The
-     * actual GPU upload happens in render_frame (we have no open command list
-     * here). Only the 8-bit single-channel font atlas (B8, RSX fmt base 0x81 /
-     * as-seen 0xA1 with the LN flag) is wired up so far; other formats fall
-     * back to untextured. */
     u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
     /* TEXFMTDBG=1 (live): one line per new unit/format/width, including the
      * formats the VP path below does not take -- those units end up sampling
@@ -610,19 +600,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;
     }
-    if (base_fmt == 0x81 /* B8 */) {
-        s_d3d.tex_src_offset = cellGcmResolveLocated((tex->format & 3) == 1, offset);
-        if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
-            /* dims changed -> resource must be (re)created in render_frame */
-            s_d3d.tex_ready = 0;
-        }
-        s_d3d.tex_w     = width;
-        s_d3d.tex_h     = height;
-        s_d3d.tex_bound = 1;
-        s_d3d.tex_dirty = 1;
-    } else {
-        s_d3d.tex_bound = 0;
-    }
+    /* (The font atlas a B8 texture was recorded as is gone with its pass:
+     * step C8a.) */
 }
 
 static void d3d12_set_vertex_attribs(void* ud, const rsx_state* state)

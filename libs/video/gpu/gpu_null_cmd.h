@@ -9,8 +9,9 @@
  * as it does on D3D12 and Vulkan.
  *
  * gpu_pipeline.v is the pipeline's index + 1, gpu_table.v its pool's id
- * times 2^32 plus its first entry, gpu_addr its buffer's slot and
- * generation over a 40-bit offset (gpu_null.c). Plain C99; every system.
+ * times 2^32 plus its first entry, gpu_table_writer.v its pool's id,
+ * gpu_addr its buffer's slot and generation over a 40-bit offset
+ * (gpu_null.c). Plain C99; every system.
  */
 #ifndef PS3RECOMP_GPU_NULL_CMD_H
 #define PS3RECOMP_GPU_NULL_CMD_H

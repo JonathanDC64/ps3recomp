@@ -1,0 +1,26 @@
+/* The core's fragments, in order (copy_manifest.txt). Each instance file
+ * (rsxc_d3d12.c, rsxc_null.c) includes rsxc_head.inc, then its backend's
+ * static inline command header and its rc_be_* hooks, then this. */
+#include "rsxc_state.inc"
+#include "rsxc_shadercache.inc"   /* (before the first fragment that compiles a shader) */
+#include "rsxc_window.inc"
+#include "rsxc_hdr.inc"
+#include "rsxc_init.inc"
+#include "rsxc_sync.inc"
+#include "rsxc_present.inc"
+#include "rsxc_cap.inc"
+#include "rsxc_psolib.inc"
+#include "rsxc_vs.inc"
+#include "rsxc_fp.inc"
+#include "rsxc_pipeline.inc"
+#include "rsxc_texture.inc"
+#include "rsxc_targets.inc"
+#include "rsxc_writeback.inc"
+#include "rsxc_zpass.inc"
+#include "rsxc_diag.inc"
+#include "rsxc_post.inc"
+#include "rsxc_frame.inc"
+#include "rsxc_record.inc"
+#include "rsxc_vertex.inc"
+#include "rsxc_record2.inc"
+#include "rsxc_api.inc"
