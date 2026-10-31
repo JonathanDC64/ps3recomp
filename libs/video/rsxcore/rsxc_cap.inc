@@ -9,7 +9,7 @@
 /* Shared 24-bit BMP writer for readbacks. R8G8B8A8_UNORM straight; the half/
  * float RT formats are |v|-tonemapped so signed/HDR data is visible. */
 static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
-                          u32 pitch, u32 dxgi)
+                          u32 pitch, gpu_format fmt)
 {
     FILE* f = fopen(path, "wb");
     if (!f) return;
@@ -26,7 +26,7 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
         memset(line, 0, rowb);
         for (u32 x = 0; x < w; x++) {
             float rv, gv, bv;
-            if (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            if (fmt == GPU_FORMAT_R16G16B16A16_FLOAT) {
                 const u16* hp = (const u16*)(srow + (u64)x * 8);
                 float v[3];
                 for (int c = 0; c < 3; c++) {
@@ -36,7 +36,7 @@ static void cap_write_bmp(const char* path, const void* mapped, u32 w, u32 h,
                     v[c] = fv;
                 }
                 rv = v[0]; gv = v[1]; bv = v[2];
-            } else if (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+            } else if (fmt == GPU_FORMAT_R32G32B32A32_FLOAT) {
                 const float* fp = (const float*)(srow + (u64)x * 16);
                 rv = fp[0]; gv = fp[1]; bv = fp[2];
             } else {
@@ -100,12 +100,12 @@ static void cap_write_raw(const char* path, const void* mapped, u32 w, u32 h, u3
 /* (Step C6: tex is the GPU layer's handle of the resource; the readback
  * buffer is gpu_buffer_create's, today's committed READBACK buffer in
  * COPY_DEST, and the barriers and the copy are on the recorder begun here.) */
-static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
-                               D3D12_RESOURCE_STATES prior, u32 fi, const char* path)
+static void cap_readback_write(gpu_texture tex, u32 w, u32 h, gpu_format fmt,
+                               gpu_state prior, u32 fi, const char* path)
 {
     if (!GPU_VALID(tex) || !w || !h) return;
-    u32 bpp = (dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
-              (dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
+    u32 bpp = (fmt == GPU_FORMAT_R16G16B16A16_FLOAT) ? 8 :
+              (fmt == GPU_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
     u32 pitch = (w * bpp + 255) & ~255u;
 
     gpu_buffer rb = {0};
@@ -115,12 +115,12 @@ static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
     wait_for_gpu();
     frame_cmd_begin(fi);
 
-    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE)
-        gpu_cmd_barrier(s_rc_cmd, tex, (gpu_state)prior, GPU_STATE_COPY_SOURCE);
+    if (prior != GPU_STATE_COPY_SOURCE)
+        gpu_cmd_barrier(s_rc_cmd, tex, prior, GPU_STATE_COPY_SOURCE);
 
     gpu_footprint fp;
     memset(&fp, 0, sizeof fp);
-    fp.format = (gpu_format)dxgi;
+    fp.format = fmt;
     fp.width = w; fp.height = h; fp.depth = 1; fp.row_pitch = pitch;
     gpu_cmd_copy_tex_to_buf(s_rc_cmd, rb, &fp, tex, 0, NULL);
         /* TEXUP_DBG=1: texture uploads per second. A cache that misses every
@@ -136,8 +136,8 @@ static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
                           n, bytes / 1048576.0);
                   n = 0; bytes = 0; t0 = now; } } }
 
-    if (prior != D3D12_RESOURCE_STATE_COPY_SOURCE)
-        gpu_cmd_barrier(s_rc_cmd, tex, GPU_STATE_COPY_SOURCE, (gpu_state)prior);
+    if (prior != GPU_STATE_COPY_SOURCE)
+        gpu_cmd_barrier(s_rc_cmd, tex, GPU_STATE_COPY_SOURCE, prior);
 
     frame_cmd_submit();
     wait_for_gpu();
@@ -145,7 +145,7 @@ static void cap_readback_write(gpu_texture tex, u32 w, u32 h, u32 dxgi,
     void* mp = gpu_buffer_map(s_rc_dev, rb, 0, (u64)pitch * h);   /* Map(0, {0, n}) */
     if (mp) {
         if (s_cap_raw) cap_write_raw(path, mp, w, h, pitch);
-        else cap_write_bmp(path, mp, w, h, pitch, dxgi);
+        else cap_write_bmp(path, mp, w, h, pitch, fmt);
         gpu_buffer_unmap(s_rc_dev, rb, 0, 0);   /* Unmap(0, {0, 0}) */
     }
     gpu_buffer_destroy(s_rc_dev, rb, 0);   /* the GPU is idle */
@@ -237,7 +237,7 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
      * (Step C6: their handles, s_rc_rt_tex[fi] and r->tex.) */
     snprintf(path, sizeof path, "%s/backbuffer.bmp", dir);
     cap_readback_write(s_rc_rt_tex[fi], s_d3d.host_w, s_d3d.host_h,
-                       DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_PRESENT, fi, path);
+                       GPU_FORMAT_R8G8B8A8_UNORM, GPU_STATE_PRESENT, fi, path);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!GPU_VALID(r->tex) || !r->used) continue;

@@ -15,7 +15,7 @@
  * RPCS3's equivalent is "Write Color Buffers". RSX_WRITE_COLOR=0 turns it off
  * (it costs a GPU wait plus a CPU conversion per frame).
  * -----------------------------------------------------------------------*/
-static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
+static void off_rt_transition(int slot, gpu_state to);
 static int write_color_on(void)
 {
     static int on = -1;
@@ -56,8 +56,8 @@ static void rt_pitch_record(D3D12DrawRecord* dr)
 
 static u32 rt_guest_bpp(u32 dxgi)
 {
-    return dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u :
-           dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 4u;
+    return dxgi == GPU_FORMAT_R16G16B16A16_FLOAT ? 8u :
+           dxgi == GPU_FORMAT_R32G32B32A32_FLOAT ? 16u : 4u;
 }
 
 /* Step C5b: the textures made here (the downscale copies, the snapshots, the
@@ -141,7 +141,7 @@ static int down_init(void)
     return 1;
 }
 
-static gpu_pipeline down_pso(DXGI_FORMAT f, int argb)
+static gpu_pipeline down_pso(gpu_format f, int argb)
 {
     const gpu_pipeline none = {0};
     const u32 key = (u32)f | (argb ? 1u << 31 : 0u);
@@ -168,7 +168,7 @@ static gpu_texture off_rt_downscale(int i, int argb)
     const gpu_texture none = {0};
     OffRT* r = &s_d3d.off_rt[i];
     if (!down_init()) return none;
-    const gpu_pipeline pso = down_pso((DXGI_FORMAT)r->gdxgi, argb);
+    const gpu_pipeline pso = down_pso((gpu_format)r->gdxgi, argb);
     if (!pso.v) return none;
     if (GPU_VALID(r->down_tex) && (r->down_w != r->w || r->down_h != r->h || r->down_dxgi != r->gdxgi))
         rc_grave_tex(&r->down_tex);   /* the open list may still use it */
@@ -184,13 +184,13 @@ static gpu_texture off_rt_downscale(int i, int argb)
         r->down_tex = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(r->down_tex)) return none;
         r->down_w = r->w; r->down_h = r->h; r->down_dxgi = r->gdxgi;
-        r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        r->down_st = GPU_STATE_RENDER_TARGET;
     }
     gpu_cmd* const c = s_rc_cmd;
-    off_rt_transition(i, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (r->down_st != D3D12_RESOURCE_STATE_RENDER_TARGET) {
-        gpu_cmd_barrier(c, r->down_tex, (gpu_state)r->down_st, GPU_STATE_RENDER_TARGET);
-        r->down_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    off_rt_transition(i, GPU_STATE_PIXEL_SHADER_RESOURCE);
+    if (r->down_st != GPU_STATE_RENDER_TARGET) {
+        gpu_cmd_barrier(c, r->down_tex, r->down_st, GPU_STATE_RENDER_TARGET);
+        r->down_st = GPU_STATE_RENDER_TARGET;
     }
     /* The source's default view (today's NULL description) in the down pool,
      * and its table (step C4). */
@@ -228,7 +228,7 @@ static gpu_texture off_rt_downscale(int i, int argb)
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     gpu_cmd_barrier(c, r->down_tex, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
-    r->down_st = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    r->down_st = GPU_STATE_COPY_SOURCE;
     return r->down_tex;
 }
 
@@ -295,7 +295,7 @@ static int wbg_record(int i)
 {
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     OffRT* r = &s_d3d.off_rt[i];
-    if (r->gdxgi != DXGI_FORMAT_R8G8B8A8_UNORM || ((r->gfmt >> 8) & 0xF) == 2 ||
+    if (r->gdxgi != GPU_FORMAT_R8G8B8A8_UNORM || ((r->gfmt >> 8) & 0xF) == 2 ||
         r->gdma == CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER || !wbg_ready()) return 0;
     { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
       if (lg) return 0; }   /* the log compares the CPU store's bytes */
@@ -303,7 +303,7 @@ static int wbg_record(int i)
     if (dst < WBG_BASE || dst - WBG_BASE >= WBG_SIZE || ((dst - WBG_BASE) & 511u) || (gp & 255u) ||
         gp < r->w * 4u || gp > 0x10000 || !r->h ||
         (u64)(dst - WBG_BASE) + (u64)gp * (r->h - 1) + r->w * 4u > WBG_SIZE) return 0;
-    D3D12_RESOURCE_STATES prior = r->st;
+    gpu_state prior = r->st;
     const gpu_texture from = off_rt_downscale(i, 1);
     if (!GPU_VALID(from)) return 0;
     gpu_footprint to;   /* the target's place in the buffer over RSX local memory */
@@ -356,10 +356,10 @@ static void rt_writeback_record(void)
             if (!GPU_VALID(r->rb_buf)) continue;
             r->rb_size = need;
         }
-        D3D12_RESOURCE_STATES prior = r->st;
+        gpu_state prior = r->st;
         gpu_texture from = r->tex;
         if (scaled) { if (!GPU_VALID(from = off_rt_downscale(i, 0))) continue; }
-        else off_rt_transition(i, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        else off_rt_transition(i, GPU_STATE_COPY_SOURCE);
         gpu_footprint fp;
         memset(&fp, 0, sizeof fp);
         fp.format    = (gpu_format)r->gdxgi;
@@ -499,8 +499,8 @@ static void rt_writeback_store(void)
          * FP16 swaps the bytes of each half, 32-bit lanes swap all four.
          * Byte by byte, this was 3.5-6 ms of each Demon's Souls frame (about
          * 25 MB: a 1280x720 target several times per frame, and others). */
-        const int kind = r->gdxgi == DXGI_FORMAT_R8G8B8A8_UNORM ? 0 :
-                         r->gdxgi == DXGI_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
+        const int kind = r->gdxgi == GPU_FORMAT_R8G8B8A8_UNORM ? 0 :
+                         r->gdxgi == GPU_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
         const u32 wpt = bpp / 4;                     /* words per texel */
         if (!swz) {
             for (u32 y = 0; y < r->h; y++)
@@ -582,8 +582,8 @@ static void off_rt_drop_rewritten(void)
  * (RSX_SRV_MEMO=0 is gone). Inline: the compare is gpu_d3d12_cmd.h's, only
  * a write calls out. Through the pool's writer, found once at init (step
  * C8a): the 16 calls of a draw look nothing up before the memo. */
-static void srv_write_ex(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt,
-                         UINT mapping, int cube)
+static void srv_write_ex(u32 heap_slot, gpu_texture tex, gpu_format fmt,
+                         u32 swizzle, int cube)
 {
     gpu_view_desc sv;
     sv.texture = tex;
@@ -591,25 +591,25 @@ static void srv_write_ex(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt,
     sv.dim = cube ? GPU_DIM_CUBE : GPU_DIM_2D;   /* a cube must match the TextureCube declaration in the HLSL */
     sv.flags = 0;
     sv.mips = 1;
-    sv.format = (gpu_format)fmt;
-    sv.swizzle = mapping;
+    sv.format = fmt;
+    sv.swizzle = swizzle;
     sv.mip = 0;
     sv.layer = 0;
     gpu_fast_table_writer_tex(s_rc_dev, s_rc_srv_w, heap_slot, &sv);
 }
 
-static void srv_write(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt, UINT mapping)
+static void srv_write(u32 heap_slot, gpu_texture tex, gpu_format fmt, u32 swizzle)
 {
-    srv_write_ex(heap_slot, tex, fmt, mapping, 0);
+    srv_write_ex(heap_slot, tex, fmt, swizzle, 0);
 }
 
 /* On the frame's recorder (step C5b). Inline (gpu_d3d12_cmd.h), so a draw's
  * transition is today's one call. */
-static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
+static void off_rt_transition(int slot, gpu_state to)
 {
     OffRT* r = &s_d3d.off_rt[slot];
     if (r->st == to) return;
-    gpu_cmd_barrier(s_rc_cmd, r->tex, (gpu_state)r->st, (gpu_state)to);
+    gpu_cmd_barrier(s_rc_cmd, r->tex, r->st, to);
     r->st = to;
 }
 
@@ -639,15 +639,15 @@ static gpu_texture off_rt_snapshot(int slot)
         r->snap_tex = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(r->snap_tex)) return k_rc_no_tex;
         r->snap_w = r->hw; r->snap_h = r->hh; r->snap_dxgi = r->dxgi;
-        r->snap_st = D3D12_RESOURCE_STATE_COPY_DEST;
+        r->snap_st = GPU_STATE_COPY_DEST;
     }
-    const D3D12_RESOURCE_STATES back = r->st;
-    off_rt_transition(slot, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (r->snap_st != D3D12_RESOURCE_STATE_COPY_DEST)
-        gpu_cmd_barrier(s_rc_cmd, r->snap_tex, (gpu_state)r->snap_st, GPU_STATE_COPY_DEST);
+    const gpu_state back = r->st;
+    off_rt_transition(slot, GPU_STATE_COPY_SOURCE);
+    if (r->snap_st != GPU_STATE_COPY_DEST)
+        gpu_cmd_barrier(s_rc_cmd, r->snap_tex, r->snap_st, GPU_STATE_COPY_DEST);
     gpu_cmd_copy_texture_whole(s_rc_cmd, r->snap_tex, r->tex);
     gpu_cmd_barrier(s_rc_cmd, r->snap_tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
-    r->snap_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    r->snap_st = GPU_STATE_PIXEL_SHADER_RESOURCE;
     off_rt_transition(slot, back);
     return r->snap_tex;
 }
@@ -778,7 +778,7 @@ static void composite_present(u32 fi)
     if (i < 0 || !GPU_VALID(s_d3d.off_rt[i].tex)) return;
     OffRT* r = &s_d3d.off_rt[i];
     /* Same-format copy only; a half-float source would need a converting draw. */
-    if (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM) {
+    if (r->dxgi != GPU_FORMAT_R8G8B8A8_UNORM) {
         static int w1 = 0;
         if (w1 < 2 && ++w1)
             fprintf(stderr, "[COMPOSITE] RT 0x%08X is dxgi=%u, not R8G8B8A8 -- needs a draw%c",
@@ -799,7 +799,7 @@ static void composite_present(u32 fi)
     b[0].type    = GPU_BARRIER_TRANSITION;
     b[0].texture = r->tex;
     b[0].sub     = GPU_SUB_ALL;
-    b[0].before  = (gpu_state)r->st;
+    b[0].before  = r->st;
     b[0].after   = GPU_STATE_COPY_SOURCE;
     b[1] = b[0];
     b[1].texture = s_rc_rt_tex[fi];
@@ -811,7 +811,7 @@ static void composite_present(u32 fi)
     gpu_cmd_copy_texture(s_rc_cmd, s_rc_rt_tex[fi], 0, 0, 0, 0, r->tex, 0, &box);
 
     b[0].before = GPU_STATE_COPY_SOURCE;
-    b[0].after  = (gpu_state)r->st;
+    b[0].after  = r->st;
     b[1].before = GPU_STATE_COPY_DEST;
     b[1].after  = GPU_STATE_RENDER_TARGET;
     gpu_cmd_barrier_n(s_rc_cmd, 2, b);

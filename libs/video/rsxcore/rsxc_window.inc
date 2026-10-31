@@ -3,8 +3,8 @@
  * -----------------------------------------------------------------------*/
 
 /* The Windows session is locked. Behind the lock screen DWM holds each back
- * buffer for 250-500 ms while Present still returns S_OK (not
- * DXGI_STATUS_OCCLUDED), and the frame rate fell to 4 fps waiting for them.
+ * buffer for 250-500 ms while Present still returns S_OK (not the
+ * occluded status), and the frame rate fell to 4 fps waiting for them.
  * Frames are rendered but not presented while this is set. Written by the
  * window thread (WM_WTSSESSION_CHANGE, and once at window creation), read
  * at the flip. */

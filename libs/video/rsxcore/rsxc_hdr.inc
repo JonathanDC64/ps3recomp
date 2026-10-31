@@ -16,7 +16,7 @@
  * adding bloom; the port names it). While HDR is on and one is named:
  *   - T, the scene target (the largest target the frame's display copy
  *     samples, as RSX_AA finds it), and each target a draw copies T into
- *     after that program, are made FP16 (rt_dxgi). They still go back to
+ *     after that program, are made FP16 (rt_target_format). They still go back to
  *     guest memory in the format the title set (OffRT.gdxgi).
  *   - That program, drawing into T, clamps at <limit> instead of 1 (dr_hdrv;
  *     with no limit, not at all).
@@ -406,7 +406,7 @@ static void blit_srvs_write(void)
     }
 }
 
-static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
+static void off_rt_transition(int slot, gpu_state to);
 
 /* Records the scale of the game's frame fi into the window's buffer fi: the
  * largest rectangle with the frame's aspect ratio (RSX_ASPECT's, when set),
@@ -463,8 +463,8 @@ static void blit_to_window(u32 fi)
         const int t = s_hdr.frame_t;
         gpu_view_desc v;
         blit_srv_none(&v);
-        if (t >= 0 && GPU_VALID(s_d3d.off_rt[t].tex) && s_d3d.off_rt[t].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-            off_rt_transition(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (t >= 0 && GPU_VALID(s_d3d.off_rt[t].tex) && s_d3d.off_rt[t].dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
+            off_rt_transition(t, GPU_STATE_PIXEL_SHADER_RESOURCE);
             memset(&v, 0, sizeof v);   /* the default view */
             v.texture = s_d3d.off_rt[t].tex;
             use_t = 1;

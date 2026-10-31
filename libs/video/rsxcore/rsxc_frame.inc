@@ -337,8 +337,8 @@ rtt_dump_done:;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
             if (!(_used & (1u << _u))) {
-                srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
-                          D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                srv_write(wslot, k_rc_no_tex, GPU_FORMAT_R8G8B8A8_UNORM,
+                          GPU_SWIZZLE_IDENTITY);
                 continue;
             }
             /* An A8R8G8B8 / D8R8G8B8 unit over a depth surface reads the depth
@@ -356,8 +356,8 @@ rtt_dump_done:;
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
                     dr->d2c_mask |= 1u << _u;
-                    srv_write(wslot, s_zeta[zs].tex, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    srv_write(wslot, s_zeta[zs].tex, GPU_FORMAT_R24_UNORM_X8_TYPELESS,
+                              GPU_SWIZZLE_IDENTITY);
                     continue;
                 }
             }
@@ -367,11 +367,11 @@ rtt_dump_done:;
                 int zs = zeta_find(dr->tex[_u].raw);
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
-                    srv_write(wslot, s_zeta[zs].tex, DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    srv_write(wslot, s_zeta[zs].tex, GPU_FORMAT_R24_UNORM_X8_TYPELESS,
+                              GPU_SWIZZLE_IDENTITY);
                 } else
-                    srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    srv_write(wslot, k_rc_no_tex, GPU_FORMAT_R8G8B8A8_UNORM,
+                              GPU_SWIZZLE_IDENTITY);
                 continue;
             }
             /* Display-sized sampler source -> the rendered frame. Only when no
@@ -393,8 +393,8 @@ rtt_dump_done:;
                         fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
                                         " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
                                 dr->tex[_u].w, dr->tex[_u].h, 10); }
-                    srv_write(wslot, s_rc_screen_copy_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    srv_write(wslot, s_rc_screen_copy_tex, GPU_FORMAT_R8G8B8A8_UNORM,
+                              GPU_SWIZZLE_IDENTITY);
                     continue;
                 }
             }
@@ -414,8 +414,8 @@ rtt_dump_done:;
                         { static int _n = 0; if (getenv("SUBVP_DBG") && _n < 8 && ++_n)
                             fprintf(stderr, "[SUBVP] unit %d fp=0x%X <- captured %ux%u%c",
                                     _u, dr->fp_addr, dr->tex[_u].w, dr->tex[_u].h, 10); }
-                        srv_write(wslot, s_subvp[hit].tex, DXGI_FORMAT_R8G8B8A8_UNORM,
-                                  D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                        srv_write(wslot, s_subvp[hit].tex, GPU_FORMAT_R8G8B8A8_UNORM,
+                                  GPU_SWIZZLE_IDENTITY);
                         continue;
                     }
                 }
@@ -424,8 +424,8 @@ rtt_dump_done:;
                 int rt = off_rt_find(dr->tex[_u].raw);
                 if (rt >= 0) {
                     dr->tex_rt[_u] = rt;
-                    srv_write(wslot, s_d3d.off_rt[rt].tex, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    srv_write(wslot, s_d3d.off_rt[rt].tex, (gpu_format)s_d3d.off_rt[rt].dxgi,
+                              GPU_SWIZZLE_IDENTITY);
                     continue;
                 }
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
@@ -449,10 +449,10 @@ rtt_dump_done:;
                          * ones are viewed as stored, like an offscreen RT. */
                         const int _x8 = _tl.fmt == RSX_TEXFMT_R8G8B8A8 ||
                                         _tl.fmt == RSX_TEXFMT_R8G8 || _tl.compressed;
-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].tex, rsx_texfmt_dxgi(_tl.fmt),
+                        srv_write_ex(wslot, s_d3d.vp_tex[ts].tex, rsx_texfmt_format(_tl.fmt),
                                   (_bf == 0x81) ? 0x1000
-                                  : _x8 ? rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf)
-                                        : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                  : _x8 ? rsx_remap_to_swizzle(dr->tex[_u].ctrl1, _bf)
+                                        : GPU_SWIZZLE_IDENTITY,
                                   _cube);
                         continue;
                     }
@@ -467,8 +467,8 @@ rtt_dump_done:;
                 fprintf(stderr, "[TEXBIND] null SRV unit=%d raw=0x%X off=0x%X %ux%u fmt=0x%02X%c",
                         _u, dr->tex[_u].raw, dr->tex[_u].off, dr->tex[_u].w,
                         dr->tex[_u].h, dr->tex[_u].fmt, 10); } }
-            srv_write(wslot, k_rc_no_tex, DXGI_FORMAT_R8G8B8A8_UNORM,
-                      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+            srv_write(wslot, k_rc_no_tex, GPU_FORMAT_R8G8B8A8_UNORM,
+                      GPU_SWIZZLE_IDENTITY);
         }
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
@@ -476,8 +476,8 @@ rtt_dump_done:;
         if (dr->fp_addr) {
             dr->pso = vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                     dr_num_rts(dr),
-                                    dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
-                                               : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                    dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
+                                               : GPU_FORMAT_R8G8B8A8_UNORM,
                                     dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                     _cmask, dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
             dr->pso_serial = s_rf_serial;
@@ -694,13 +694,13 @@ rtt_dump_done:;
                     gpu_pass tp;   /* the op's targets (views: step C5a) */
                     tp.ds = wz < 0 ? s_rc_depth_dsv : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
                     if (wz >= 0) zeta_transition(wz, wro ? ZETA_READ_STATE
-                                                         : D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                                                         : GPU_STATE_DEPTH_WRITE);
                     tp.nrt = 1;
                     tp.rt[0] = s_rc_rt_rtv[fi];
                     gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
                     float gw = (float)s_d3d.width, gh = (float)s_d3d.height;   /* the guest's size of it */
                     if (want >= 0) {
-                        off_rt_transition(want, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        off_rt_transition(want, GPU_STATE_RENDER_TARGET);
                         tp.rt[0] = s_d3d.off_rt[want].rtv;
                         vp.width  = (float)s_d3d.off_rt[want].hw;
                         vp.height = (float)s_d3d.off_rt[want].hh;
@@ -708,7 +708,7 @@ rtt_dump_done:;
                         gh = (float)s_d3d.off_rt[want].h;
                     }
                     for (int _m = 0; _m < 3 && wantm[_m] >= 0; _m++) {
-                        off_rt_transition(wantm[_m], D3D12_RESOURCE_STATE_RENDER_TARGET);
+                        off_rt_transition(wantm[_m], GPU_STATE_RENDER_TARGET);
                         tp.rt[tp.nrt++] = s_d3d.off_rt[wantm[_m]].rtv;
                     }
                     if (nocol) {
@@ -819,8 +819,8 @@ rtt_dump_done:;
                         const gpu_pipeline look =
                             vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                           dr_num_rts(dr),
-                                          dr->rt_off ? rt_dxgi(dr->rt_off, dr->rt_fmt)
-                                                     : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                          dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
+                                                     : GPU_FORMAT_R8G8B8A8_UNORM,
                                           dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                           dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
                         if (dpso.v && look.v != dpso.v) {
@@ -878,25 +878,25 @@ rtt_dump_done:;
                             ;
                         else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
                             srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, k_rc_no_tex,
-                                      DXGI_FORMAT_R8G8B8A8_UNORM,
-                                      D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                                      GPU_FORMAT_R8G8B8A8_UNORM,
+                                      GPU_SWIZZLE_IDENTITY);
                             fpwatch_unreadable(dr->fp_addr);
                         }
                         else
-                            zeta_transition(tz, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                            zeta_transition(tz, GPU_STATE_PIXEL_SHADER_RESOURCE);
                         continue;
                     }
                     int rt = dr->tex_rt[_u];
                     if (rt < 0) continue;
                     if (rt != cur_rt &&
                         rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2]) {
-                        off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                        off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
                         continue;
                     }
                     /* Sampling a bound colour target: read a copy (above). */
                     srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, off_rt_snapshot(rt),
-                              (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
-                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                              (gpu_format)s_d3d.off_rt[rt].dxgi,
+                              GPU_SWIZZLE_IDENTITY);
                 }
                 gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, DRAW_SRV_BASE + d * RSX_FP_UNITS));
                 vp_bind_sampler_table(dr);
@@ -1186,8 +1186,8 @@ rtt_dump_done:;
                 rt >= 0 ? (void*)(uintptr_t)s_d3d.off_rt[rt].tex.id : NULL);
         if (rt >= 0 && GPU_VALID(s_d3d.off_rt[rt].tex)) {
             OffRT* r = &s_d3d.off_rt[rt];
-            u32 bpp = (r->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 :
-                      (r->dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
+            u32 bpp = (r->dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) ? 8 :
+                      (r->dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
             u32 pitch = (r->hw * bpp + 255) & ~255u;
             fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
                     rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
@@ -1200,7 +1200,7 @@ rtt_dump_done:;
             }
             if (!GPU_VALID(s_rtsave_b)) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
             if (GPU_VALID(s_rtsave_b)) {
-                off_rt_transition(rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                off_rt_transition(rt, GPU_STATE_COPY_SOURCE);
                 gpu_footprint cfp;
                 memset(&cfp, 0, sizeof cfp);
                 cfp.format    = (gpu_format)r->dxgi;
@@ -1209,7 +1209,7 @@ rtt_dump_done:;
                 cfp.depth     = 1;
                 cfp.row_pitch = pitch;
                 gpu_cmd_copy_tex_to_buf(rc, s_rtsave_b, &cfp, r->tex, 0, NULL);
-                off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
                 s_rtsave_state = 1;
                 s_rtsave_w = r->hw; s_rtsave_h = r->hh;
                 s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
@@ -1411,7 +1411,7 @@ skip_dump_consider: ;
                     memset(line, 0, rowb);
                     for (u32 x = 0; x < w; x++) {
                         float rv, gv, bv;
-                        if (s_rtsave_dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
                             const u16* hp16 = (const u16*)(srow + (u64)x * 8);
                             /* crude half->float: sign|exp|mant */
                             float v[3];
@@ -1425,7 +1425,7 @@ skip_dump_consider: ;
                                 v[c2] = fv;
                             }
                             rv = v[0]; gv = v[1]; bv = v[2];
-                        } else if (s_rtsave_dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                        } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
                             const float* fp32 = (const float*)(srow + (u64)x * 16);
                             rv = fp32[0]; gv = fp32[1]; bv = fp32[2];
                         } else {
@@ -1436,14 +1436,14 @@ skip_dump_consider: ;
                          * like wave's mask.w live there). */
                         if (getenv("RTT_SAVEA")) {
                             float av;
-                            if (s_rtsave_dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                            if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
                                 const u16* hp16 = (const u16*)(srow + (u64)x * 8);
                                 u16 hv = hp16[3];
                                 u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
                                 if (exp == 0) av = (float)man / 16777216.0f;
                                 else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
                                        memcpy(&av, &fb, 4); }
-                            } else if (s_rtsave_dxgi == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                            } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
                                 av = ((const float*)(srow + (u64)x * 16))[3];
                             } else {
                                 av = (srow + (u64)x * 4)[3] / 255.0f;
@@ -1503,8 +1503,8 @@ skip_dump_consider: ;
       if (e && *e && strcmp(e, last) && s_present_this_frame && s_hdr.active) {
           snprintf(last, sizeof last, "%s", e);
           s_cap_raw = 1;
-          cap_readback_write(s_rc_swap_image[fi], s_d3d.win_w, s_d3d.win_h, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                             D3D12_RESOURCE_STATE_PRESENT, fi, e);
+          cap_readback_write(s_rc_swap_image[fi], s_d3d.win_w, s_d3d.win_h, GPU_FORMAT_R16G16B16A16_FLOAT,
+                             GPU_STATE_PRESENT, fi, e);
           s_cap_raw = 0;
       } }
 

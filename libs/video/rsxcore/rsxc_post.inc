@@ -64,7 +64,7 @@ static struct {
     int                   failed;     /* the pipeline could not be made: stay off */
     gpu_texture           disp_tex;   /* RSX_AA_AT=present: copy of the display buffer (step C6) */
     u32                   disp_w, disp_h;
-    D3D12_RESOURCE_STATES disp_st;
+    gpu_state disp_st;
     u32                   fp[AA_FP_MAX];   /* RSX_AA_BEFORE_FP */
     int                   fp_n;
     unsigned              fp_gen;
@@ -152,10 +152,10 @@ static void aa_target(gpu_view rtv)
  * rewrite. src is the copy's handle (step C4: the SRV pool's write). On the
  * frame's recorder (step C6): rtv is the target's view, the table the SRV
  * pool's at AA_SRV_SLOT. */
-static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h)
+static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     gpu_cmd* const c = s_rc_cmd;
-    srv_write(AA_SRV_SLOT, src, fmt, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    srv_write(AA_SRV_SLOT, src, fmt, GPU_SWIZZLE_IDENTITY);
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
     const gpu_viewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
     const gpu_rect sc = {0, 0, (int32_t)w, (int32_t)h};
@@ -163,7 +163,7 @@ static void aa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h
     gpu_cmd_set_viewport(c, &vp);
     gpu_cmd_set_scissor(c, &sc);
     gpu_cmd_set_layout(c, s_aa.layout);
-    gpu_cmd_set_pipeline(c, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
+    gpu_cmd_set_pipeline(c, fmt == GPU_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
     gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_srv_pool, AA_SRV_SLOT));
     gpu_cmd_push_const(c, 1, 4, k, 0);
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
@@ -197,15 +197,15 @@ static struct {
     gpu_view              edges_rtv;   /* its RTV (today's NULL description) */
     gpu_texture           weights_tex; /* the GPU layer's (step C6) */
     gpu_view              weights_rtv;
-    D3D12_RESOURCE_STATES edges_st, weights_st;
+    gpu_state edges_st, weights_st;
     u32                   w, h;        /* of edges and weights */
 } s_smaa;
 
 /* On the frame's recorder (step C6). */
-static void smaa_state(gpu_texture t, D3D12_RESOURCE_STATES* st, D3D12_RESOURCE_STATES to)
+static void smaa_state(gpu_texture t, gpu_state* st, gpu_state to)
 {
     if (*st == to) return;
-    gpu_cmd_barrier(s_rc_cmd, t, (gpu_state)*st, (gpu_state)to);
+    gpu_cmd_barrier(s_rc_cmd, t, *st, to);
     *st = to;
 }
 
@@ -368,7 +368,7 @@ static int smaa_targets(u32 w, u32 h)
         rv.kind = GPU_VIEW_RTV;
         *(k ? &s_smaa.weights_rtv : &s_smaa.edges_rtv) = gpu_view_get(s_rc_dev, &rv);
     }
-    s_smaa.edges_st = s_smaa.weights_st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s_smaa.edges_st = s_smaa.weights_st = GPU_STATE_RENDER_TARGET;
     s_smaa.w = w; s_smaa.h = h;
     return 1;
 }
@@ -377,15 +377,15 @@ static int smaa_targets(u32 w, u32 h)
  * in RENDER_TARGET. Needs smaa_targets(w, h) and smaa_luts_load() first. On
  * the frame's recorder (step C6): the tables are the SRV pool's windows at
  * SMAA_SRV_SLOT and SMAA_SRV_SLOT + 2 (its regions of three). */
-static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h)
+static void smaa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     gpu_cmd* const c = s_rc_cmd;
-    const UINT map = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    const u32 map = GPU_SWIZZLE_IDENTITY;
     srv_write(SMAA_SRV_SLOT + 0, src, fmt, map);
-    srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights_tex, DXGI_FORMAT_R8G8B8A8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges_tex, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area_tex, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search_tex, DXGI_FORMAT_R8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights_tex, GPU_FORMAT_R8G8B8A8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search_tex, GPU_FORMAT_R8_UNORM, map);
     const gpu_table g0 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT);
     const gpu_table g2 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT + 2);
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
@@ -398,23 +398,23 @@ static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32
     gpu_cmd_push_const(c, 1, 4, k, 0);
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
     /* 1. Edges, into a cleared target: the pass discards pixels without one. */
-    smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, GPU_STATE_RENDER_TARGET);
     gpu_cmd_clear_color(c, s_smaa.edges_rtv, zero, NULL);
     aa_target(s_smaa.edges_rtv);
     gpu_cmd_set_pipeline(c, s_smaa.pso[0]);
     gpu_cmd_bind_table(c, 0, g0);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     /* 2. Blending weights: every pixel is written. */
-    smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, GPU_STATE_PIXEL_SHADER_RESOURCE);
+    smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, GPU_STATE_RENDER_TARGET);
     aa_target(s_smaa.weights_rtv);
     gpu_cmd_set_pipeline(c, s_smaa.pso[1]);
     gpu_cmd_bind_table(c, 0, g2);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     /* 3. The colour blended along the edges, into the target. */
-    smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, GPU_STATE_PIXEL_SHADER_RESOURCE);
     aa_target(rtv);
-    gpu_cmd_set_pipeline(c, fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? s_smaa.blend16 : s_smaa.pso[2]);
+    gpu_cmd_set_pipeline(c, fmt == GPU_FORMAT_R16G16B16A16_FLOAT ? s_smaa.blend16 : s_smaa.pso[2]);
     gpu_cmd_bind_table(c, 0, g0);
     gpu_cmd_draw(c, 3, 1, 0, 0);
 }
@@ -422,16 +422,16 @@ static void smaa_draw(gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32
 /* The filter a w x h target in format fmt (RGBA8 or FP16) gets now: 2 SMAA
  * (RSX_AA=2), 1 FXAA (RSX_AA=1, or SMAA could not be had), 0 none. What it
  * needs that is missing is made here, before the caller's snapshot. */
-static int aa_filter_for(u32 w, u32 h, DXGI_FORMAT fmt)
+static int aa_filter_for(u32 w, u32 h, gpu_format fmt)
 {
-    const int fp16 = fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const int fp16 = fmt == GPU_FORMAT_R16G16B16A16_FLOAT;
     if (aa_mode() == 2 && smaa_ready() && (!fp16 || s_smaa.blend16.v) && smaa_targets(w, h) && smaa_luts_load())
         return 2;
     if (!aa_ready() || (fp16 && !s_aa.pso16.v)) return 0;
     return 1;
 }
 
-static void aa_filter(int f, gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32 w, u32 h)
+static void aa_filter(int f, gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     if (f == 2) smaa_draw(src, fmt, rtv, w, h);
     else aa_draw(src, fmt, rtv, w, h);
@@ -442,13 +442,13 @@ static void aa_filter(int f, gpu_texture src, DXGI_FORMAT fmt, gpu_view rtv, u32
 static int aa_run_rt(int t)
 {
     OffRT* r = &s_d3d.off_rt[t];
-    if (!GPU_VALID(r->tex) || (r->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && r->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT))
+    if (!GPU_VALID(r->tex) || (r->dxgi != GPU_FORMAT_R8G8B8A8_UNORM && r->dxgi != GPU_FORMAT_R16G16B16A16_FLOAT))
         return 0;
-    const int f = aa_filter_for(r->hw, r->hh, (DXGI_FORMAT)r->dxgi);
+    const int f = aa_filter_for(r->hw, r->hh, (gpu_format)r->dxgi);
     if (!f) return 0;
     if (!GPU_VALID(off_rt_snapshot(t))) return 0;
-    off_rt_transition(t, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    aa_filter(f, r->snap_tex, (DXGI_FORMAT)r->dxgi, r->rtv, r->hw, r->hh);
+    off_rt_transition(t, GPU_STATE_RENDER_TARGET);
+    aa_filter(f, r->snap_tex, (gpu_format)r->dxgi, r->rtv, r->hw, r->hh);
     return 1;
 }
 
@@ -462,7 +462,7 @@ static void aa_run_display(u32 fi)
 {
     gpu_cmd* const c = s_rc_cmd;
     const u32 w = s_d3d.host_w, h = s_d3d.host_h;
-    const int f = aa_filter_for(w, h, DXGI_FORMAT_R8G8B8A8_UNORM);
+    const int f = aa_filter_for(w, h, GPU_FORMAT_R8G8B8A8_UNORM);
     if (!f) return;
     if (GPU_VALID(s_aa.disp_tex) && (s_aa.disp_w != w || s_aa.disp_h != h))
         rc_grave_tex(&s_aa.disp_tex);   /* the open list may still use it */
@@ -476,7 +476,7 @@ static void aa_run_display(u32 fi)
         s_aa.disp_tex = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(s_aa.disp_tex)) return;
         s_aa.disp_w = w; s_aa.disp_h = h;
-        s_aa.disp_st = D3D12_RESOURCE_STATE_COPY_DEST;
+        s_aa.disp_st = GPU_STATE_COPY_DEST;
     }
     gpu_barrier b[2];
     memset(b, 0, sizeof b);
@@ -487,18 +487,18 @@ static void aa_run_display(u32 fi)
     b[0].after   = GPU_STATE_COPY_SOURCE;
     b[1] = b[0];
     b[1].texture = s_aa.disp_tex;
-    b[1].before  = (gpu_state)s_aa.disp_st;
+    b[1].before  = s_aa.disp_st;
     b[1].after   = GPU_STATE_COPY_DEST;
-    gpu_cmd_barrier_n(c, s_aa.disp_st != D3D12_RESOURCE_STATE_COPY_DEST ? 2 : 1, b);
+    gpu_cmd_barrier_n(c, s_aa.disp_st != GPU_STATE_COPY_DEST ? 2 : 1, b);
     gpu_cmd_copy_texture_whole(c, s_aa.disp_tex, s_rc_rt_tex[fi]);
     b[0].before = GPU_STATE_COPY_SOURCE;
     b[0].after  = GPU_STATE_RENDER_TARGET;
     b[1].before = GPU_STATE_COPY_DEST;
     b[1].after  = GPU_STATE_PIXEL_SHADER_RESOURCE;
     gpu_cmd_barrier_n(c, 2, b);
-    s_aa.disp_st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    s_aa.disp_st = GPU_STATE_PIXEL_SHADER_RESOURCE;
     gpu_cmd_set_table_pools(c, s_rc_srv_pool, s_rc_samp_pool);   /* the sampler pool when there is one */
-    aa_filter(f, s_aa.disp_tex, DXGI_FORMAT_R8G8B8A8_UNORM, s_rc_rt_rtv[fi], w, h);
+    aa_filter(f, s_aa.disp_tex, GPU_FORMAT_R8G8B8A8_UNORM, s_rc_rt_rtv[fi], w, h);
 }
 
 /* Where this batch's pass goes (see the top of this section): returns T's
@@ -524,7 +524,7 @@ static int aa_pick(u32* before, int* why)
     if (t < 0) { *why = AA_NO_COPY; return -1; }
     const OffRT* T = &s_d3d.off_rt[t];
     if ((u64)T->w * T->h * 4u < (u64)s_d3d.width * s_d3d.height) { *why = AA_SMALL; return -1; }
-    if (T->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM && T->dxgi != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+    if (T->dxgi != GPU_FORMAT_R8G8B8A8_UNORM && T->dxgi != GPU_FORMAT_R16G16B16A16_FLOAT) {
         *why = AA_FORMAT; return -1;
     }
     aa_before_fp_load();

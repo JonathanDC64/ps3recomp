@@ -143,10 +143,10 @@ typedef struct {
     gpu_buffer            up_buf;      /* init-upload staging (kept alive): the GPU layer's (step C5a) */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
-    u32                   dxgi;        /* DXGI_FORMAT of the resource */
-    u32                   gdxgi;       /* the guest format's (refill, write-back): FP16 dxgi for an
-                                        * RGBA8 target HDR promotes (rt_dxgi) */
-    D3D12_RESOURCE_STATES st;          /* tracked resource state */
+    u32                   dxgi;        /* gpu_format of the resource */
+    u32                   gdxgi;       /* the guest format's (refill, write-back): FP16 for an
+                                        * RGBA8 target HDR promotes (rt_target_format) */
+    gpu_state             st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
     gpu_buffer            rb_buf;      /* colour write-back readback buffer: the GPU layer's (step C5b) */
     u64                   rb_size;
@@ -154,10 +154,10 @@ typedef struct {
     u32                   gdma;        /* guest context DMA (local / main) */
     gpu_texture           snap_tex;    /* copy sampled by draws that also render here (step C5b) */
     u32                   snap_w, snap_h, snap_dxgi;
-    D3D12_RESOURCE_STATES snap_st;
+    gpu_state             snap_st;
     gpu_texture           down_tex;    /* guest-size copy of a scaled target (write-back, step C5b) */
     u32                   down_w, down_h, down_dxgi;
-    D3D12_RESOURCE_STATES down_st;
+    gpu_state             down_st;
     /* Guest bytes after our last write-back (tex_csum over [gaddr, +glen)).
      * If they differ later, the title put something else there. */
     u32                   gaddr, glen, gsum;

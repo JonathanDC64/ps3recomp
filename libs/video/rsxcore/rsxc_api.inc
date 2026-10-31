@@ -456,7 +456,7 @@ static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
 static unsigned rc_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
 static unsigned rc_back_buffer_format(void)
 {
-    return (unsigned)(s_hdr.active ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM);
+    return (unsigned)(s_hdr.active ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);
 }
 static int rc_hdr(float* ui_scale, int* srgb)
 {

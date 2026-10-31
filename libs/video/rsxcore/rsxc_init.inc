@@ -112,7 +112,7 @@ static int init_d3d12(u32 width, u32 height)
      * window. A windowed flip-model swap chain presenting with sync interval 0
      * is still paced by the compositor at the display's refresh unless it may
      * tear: it is made with ALLOW_TEARING when the system has it, and each such
-     * Present passes DXGI_PRESENT_ALLOW_TEARING (RSX_VSYNC=0, swap_present). A
+     * Present passes GPU_PRESENT_TEARING (RSX_VSYNC=0, swap_present). A
      * system without it (no variable refresh support in the driver or OS)
      * presents with vsync. */
     s_d3d.tearing = (s_rc_dev->caps.bits & GPU_CAP_TEARING) ? 1 : 0;
@@ -146,7 +146,7 @@ static int init_d3d12(u32 width, u32 height)
 
     /* ---------------------------------------------------------------
      * Depth/stencil buffer
-     * 24-bit depth + 8-bit stencil (DXGI_FORMAT_D24_UNORM_S8_UINT).
+     * 24-bit depth + 8-bit stencil (GPU_FORMAT_D24_UNORM_S8_UINT).
      * One shared depth texture across both frames — RSX games on PS3
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/

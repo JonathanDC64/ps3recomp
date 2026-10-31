@@ -10,7 +10,7 @@
  *
  * out[] arrives in the crossbar's field order A,R,G,B; D3D12 wants
  * destR | destG<<3 | destB<<6 | destA<<9 | valid<<12. */
-static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
+static u32 rsx_remap_to_swizzle(u32 c1, u32 basef)
 {
     u8 out[4];
     rsx_texture_component_remap(c1, basef, out);
@@ -88,23 +88,23 @@ static int tex_guest_written(u32 off, u32 nbytes)
     return 0;
 }
 
-/* The DXGI format of a decoded guest texture (rsx_texture_layout's class). The
+/* The format of a decoded guest texture (rsx_texture_layout's class). The
  * upload creates the resource with it and the SRV views it with it. */
-static DXGI_FORMAT rsx_texfmt_dxgi(rsx_texfmt f)
+static gpu_format rsx_texfmt_format(rsx_texfmt f)
 {
     switch (f) {
-    case RSX_TEXFMT_R8G8B8A8:      return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case RSX_TEXFMT_R8G8:          return DXGI_FORMAT_R8G8_UNORM;
-    case RSX_TEXFMT_BC1:           return DXGI_FORMAT_BC1_UNORM;
-    case RSX_TEXFMT_BC2:           return DXGI_FORMAT_BC2_UNORM;
-    case RSX_TEXFMT_BC3:           return DXGI_FORMAT_BC3_UNORM;
-    case RSX_TEXFMT_R16:           return DXGI_FORMAT_R16_UNORM;
-    case RSX_TEXFMT_R16G16:        return DXGI_FORMAT_R16G16_UNORM;
-    case RSX_TEXFMT_R16G16F:       return DXGI_FORMAT_R16G16_FLOAT;
-    case RSX_TEXFMT_R16G16B16A16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case RSX_TEXFMT_R32F:          return DXGI_FORMAT_R32_FLOAT;
-    case RSX_TEXFMT_R32G32B32A32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    default:                       return DXGI_FORMAT_R8_UNORM;
+    case RSX_TEXFMT_R8G8B8A8:      return GPU_FORMAT_R8G8B8A8_UNORM;
+    case RSX_TEXFMT_R8G8:          return GPU_FORMAT_R8G8_UNORM;
+    case RSX_TEXFMT_BC1:           return GPU_FORMAT_BC1_UNORM;
+    case RSX_TEXFMT_BC2:           return GPU_FORMAT_BC2_UNORM;
+    case RSX_TEXFMT_BC3:           return GPU_FORMAT_BC3_UNORM;
+    case RSX_TEXFMT_R16:           return GPU_FORMAT_R16_UNORM;
+    case RSX_TEXFMT_R16G16:        return GPU_FORMAT_R16G16_UNORM;
+    case RSX_TEXFMT_R16G16F:       return GPU_FORMAT_R16G16_FLOAT;
+    case RSX_TEXFMT_R16G16B16A16F: return GPU_FORMAT_R16G16B16A16_FLOAT;
+    case RSX_TEXFMT_R32F:          return GPU_FORMAT_R32_FLOAT;
+    case RSX_TEXFMT_R32G32B32A32F: return GPU_FORMAT_R32G32B32A32_FLOAT;
+    default:                       return GPU_FORMAT_R8_UNORM;
     }
 }
 
@@ -540,7 +540,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     /* The DECODED image's format, which is not always the guest's: the packed
      * 16-bit colour formats arrive here unpacked to RGBA8, and DEPTH24_D8 as a
      * float. rsx_texture_layout.h says which class each format byte lands in. */
-    DXGI_FORMAT dxfmt = rsx_texfmt_dxgi(tl.fmt);
+    gpu_format dxfmt = rsx_texfmt_format(tl.fmt);
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;

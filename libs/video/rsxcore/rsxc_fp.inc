@@ -5,35 +5,35 @@
  * [15:11] srcA, [20:16] dstA, [23:21] opC, [26:24] opA. DeferredShading's
  * light accumulation is additive (ONE,ONE) -- the old hardcoded straight-
  * alpha PSO turned each light pass into a screen-blanking flash. */
-static u8 gl_blend_factor_d3d(u32 f, int is_alpha)
+static u8 gl_blend_factor_gpu(u32 f, int is_alpha)
 {
     switch (f & 0xFFFF) {
-    case 0x0000: return D3D12_BLEND_ZERO;
-    case 0x0001: return D3D12_BLEND_ONE;
-    case 0x0300: return is_alpha ? D3D12_BLEND_SRC_ALPHA     : D3D12_BLEND_SRC_COLOR;
-    case 0x0301: return is_alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
-    case 0x0302: return D3D12_BLEND_SRC_ALPHA;
-    case 0x0303: return D3D12_BLEND_INV_SRC_ALPHA;
-    case 0x0304: return D3D12_BLEND_DEST_ALPHA;
-    case 0x0305: return D3D12_BLEND_INV_DEST_ALPHA;
-    case 0x0306: return is_alpha ? D3D12_BLEND_DEST_ALPHA     : D3D12_BLEND_DEST_COLOR;
-    case 0x0307: return is_alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
-    case 0x0308: return D3D12_BLEND_SRC_ALPHA_SAT;
-    case 0x8001: return D3D12_BLEND_BLEND_FACTOR;       /* CONSTANT_COLOR   */
-    case 0x8002: return D3D12_BLEND_INV_BLEND_FACTOR;
-    case 0x8003: return D3D12_BLEND_BLEND_FACTOR;       /* CONSTANT_ALPHA ~ */
-    case 0x8004: return D3D12_BLEND_INV_BLEND_FACTOR;
-    default:     return D3D12_BLEND_ONE;
+    case 0x0000: return GPU_BLEND_ZERO;
+    case 0x0001: return GPU_BLEND_ONE;
+    case 0x0300: return is_alpha ? GPU_BLEND_SRC_ALPHA     : GPU_BLEND_SRC_COLOR;
+    case 0x0301: return is_alpha ? GPU_BLEND_INV_SRC_ALPHA : GPU_BLEND_INV_SRC_COLOR;
+    case 0x0302: return GPU_BLEND_SRC_ALPHA;
+    case 0x0303: return GPU_BLEND_INV_SRC_ALPHA;
+    case 0x0304: return GPU_BLEND_DEST_ALPHA;
+    case 0x0305: return GPU_BLEND_INV_DEST_ALPHA;
+    case 0x0306: return is_alpha ? GPU_BLEND_DEST_ALPHA     : GPU_BLEND_DEST_COLOR;
+    case 0x0307: return is_alpha ? GPU_BLEND_INV_DEST_ALPHA : GPU_BLEND_INV_DEST_COLOR;
+    case 0x0308: return GPU_BLEND_SRC_ALPHA_SAT;
+    case 0x8001: return GPU_BLEND_BLEND_FACTOR;       /* CONSTANT_COLOR   */
+    case 0x8002: return GPU_BLEND_INV_BLEND_FACTOR;
+    case 0x8003: return GPU_BLEND_BLEND_FACTOR;       /* CONSTANT_ALPHA ~ */
+    case 0x8004: return GPU_BLEND_INV_BLEND_FACTOR;
+    default:     return GPU_BLEND_ONE;
     }
 }
-static u8 gl_blend_op_d3d(u32 e)
+static u8 gl_blend_op_gpu(u32 e)
 {
     switch (e & 0xFFFF) {
-    case 0x8007: return D3D12_BLEND_OP_MIN;
-    case 0x8008: return D3D12_BLEND_OP_MAX;
-    case 0x800A: return D3D12_BLEND_OP_SUBTRACT;
-    case 0x800B: return D3D12_BLEND_OP_REV_SUBTRACT;
-    default:     return D3D12_BLEND_OP_ADD;   /* 0x8006 FUNC_ADD / unset */
+    case 0x8007: return GPU_BLEND_OP_MIN;
+    case 0x8008: return GPU_BLEND_OP_MAX;
+    case 0x800A: return GPU_BLEND_OP_SUBTRACT;
+    case 0x800B: return GPU_BLEND_OP_REV_SUBTRACT;
+    default:     return GPU_BLEND_OP_ADD;   /* 0x8006 FUNC_ADD / unset */
     }
 }
 /* Pack the guest's face-culling state for the PSO key.
@@ -52,7 +52,7 @@ static u32 rsx_cull_key(const rsx_state* st)
 
 /* Pack the guest's depth state for the PSO key: bit0 test enabled, bit1
  * writes on, bits 2-4 the compare function (GL enum 0x0200 NEVER .. 0x0207
- * ALWAYS, in the same order as D3D12_COMPARISON_FUNC minus one). */
+ * ALWAYS, in the same order as gpu.h's GPU_CMP_* minus one). */
 static u32 rsx_depth_key(const rsx_state* st)
 {
     if (!st || !st->depth_test_enable) return 0;
@@ -73,18 +73,18 @@ static u32 rsx_blend_key(const rsx_state* st, int enable)
      * (dbgfont-style text enables blending without setting factors). */
     if (!st || (st->blend_sfactor == 0 && st->blend_dfactor == 0))
         return 1u
-             | ((u32)D3D12_BLEND_SRC_ALPHA     << 1)
-             | ((u32)D3D12_BLEND_INV_SRC_ALPHA << 6)
-             | ((u32)D3D12_BLEND_ONE           << 11)
-             | ((u32)D3D12_BLEND_INV_SRC_ALPHA << 16)
-             | ((u32)D3D12_BLEND_OP_ADD << 21) | ((u32)D3D12_BLEND_OP_ADD << 24);
+             | ((u32)GPU_BLEND_SRC_ALPHA     << 1)
+             | ((u32)GPU_BLEND_INV_SRC_ALPHA << 6)
+             | ((u32)GPU_BLEND_ONE           << 11)
+             | ((u32)GPU_BLEND_INV_SRC_ALPHA << 16)
+             | ((u32)GPU_BLEND_OP_ADD << 21) | ((u32)GPU_BLEND_OP_ADD << 24);
     return 1u
-         | ((u32)gl_blend_factor_d3d(st->blend_sfactor,       0) << 1)
-         | ((u32)gl_blend_factor_d3d(st->blend_dfactor,       0) << 6)
-         | ((u32)gl_blend_factor_d3d(st->blend_sfactor >> 16, 1) << 11)
-         | ((u32)gl_blend_factor_d3d(st->blend_dfactor >> 16, 1) << 16)
-         | ((u32)gl_blend_op_d3d(st->blend_equation)       << 21)
-         | ((u32)gl_blend_op_d3d(st->blend_equation >> 16) << 24);
+         | ((u32)gl_blend_factor_gpu(st->blend_sfactor,       0) << 1)
+         | ((u32)gl_blend_factor_gpu(st->blend_dfactor,       0) << 6)
+         | ((u32)gl_blend_factor_gpu(st->blend_sfactor >> 16, 1) << 11)
+         | ((u32)gl_blend_factor_gpu(st->blend_dfactor >> 16, 1) << 16)
+         | ((u32)gl_blend_op_gpu(st->blend_equation)       << 21)
+         | ((u32)gl_blend_op_gpu(st->blend_equation >> 16) << 24);
 }
 
 /* Bound colour target count for a draw record: 1 (target A) + the contiguous
@@ -563,8 +563,8 @@ static void hdr_mark_scan(void)
     }
     if (t < 0) return;   /* not a frame that shows the scene: the marks stay */
     const OffRT* T = &s_d3d.off_rt[t];
-    if (T->w != s_d3d.width || T->h != s_d3d.height || T->gdxgi != DXGI_FORMAT_R8G8B8A8_UNORM) return;
-    if (T->dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) s_hdr.frame_t = t;
+    if (T->w != s_d3d.width || T->h != s_d3d.height || T->gdxgi != GPU_FORMAT_R8G8B8A8_UNORM) return;
+    if (T->dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) s_hdr.frame_t = t;
     u32 x[4] = {0, 0, 0, 0};
     int nx = 0, after = 0;
     for (u32 d = 0; d < dc; d++) {
@@ -581,7 +581,7 @@ static void hdr_mark_scan(void)
             int seen = 0;
             for (int i = 0; i < nx; i++) seen |= x[i] == dr->rt_off;
             if (k >= 0 && !seen && nx < 4 && s_d3d.off_rt[k].w == T->w && s_d3d.off_rt[k].h == T->h &&
-                s_d3d.off_rt[k].gdxgi == DXGI_FORMAT_R8G8B8A8_UNORM)
+                s_d3d.off_rt[k].gdxgi == GPU_FORMAT_R8G8B8A8_UNORM)
                 x[nx++] = dr->rt_off;
             break;
         }

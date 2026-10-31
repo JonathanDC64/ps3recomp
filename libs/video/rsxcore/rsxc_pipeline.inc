@@ -5,7 +5,7 @@
  * it is today's, byte for byte but the pointers (call map F, G8), so the
  * manifest's names (pso_desc_key of that) are today's too. */
 static void vp_fp_desc(gpu_pipeline_desc* pd, gpu_shader vs, int fetch, gpu_shader ps, gpu_shader gs,
-                       u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth)
+                       u32 blend, int nrt, gpu_format rtfmt, u32 cmask, u32 cull, u32 depth)
 {
     memset(pd, 0, sizeof *pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
     pd->layout = s_d3d.vp_layout;
@@ -189,7 +189,7 @@ static void pxr_load(void)
 }
 
 static void pso_index_note(const VPVSEntry* vs, const u8* fp_ucode, int exp32, u32 cube, u32 d2c, int clamp,
-                           u32 blend, int nrt, DXGI_FORMAT rtfmt, u32 cmask, u32 cull, u32 depth, u32 hdrv)
+                           u32 blend, int nrt, gpu_format rtfmt, u32 cmask, u32 cull, u32 depth, u32 hdrv)
 {
     if (!pso_index_on() || !vs->code64 || rsxc_fp_baked() || !shader_cache_dir()[0]) return;
     const u32 used = rsx_fp_texture_units(fp_ucode, RSX_FP_MAX_BYTES);
@@ -322,7 +322,7 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
         const gpu_shader none = {0};
         gpu_pipeline_desc pd;
         vp_fp_desc(&pd, vs, (int)it->fetch, ps, it->clamp ? gs : none,
-                   it->blend, (int)it->nrt, (DXGI_FORMAT)it->rtfmt, it->cmask, it->cull, it->depth);
+                   it->blend, (int)it->nrt, (gpu_format)it->rtfmt, it->cmask, it->cull, it->depth);
         /* Its manifest name: pso_desc_key of the D3D12 description the GPU
          * layer makes of it (today's). */
         D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
@@ -400,14 +400,14 @@ static void pso_index_build_start(void)
 
 /* Compiled guest-FP pipeline for a draw (VS by cache slot + the FP at fp_addr). */
 static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
-                                DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
+                                gpu_format rtfmt, int exp32, u32 cmask, u32 cull,
                                 u32 depth, u32 cube_mask, u32 d2c_mask, u32 uvclamp,
                                 u32 hdrv)
 {
     s_psj_last = -1;
     vp_pso_knobs_check();
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;
-    if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (rtfmt == 0) rtfmt = GPU_FORMAT_R8G8B8A8_UNORM;
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveOffset(u32);
     if (!fp_addr || !vm_base) return k_rc_no_pipe;

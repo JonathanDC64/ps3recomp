@@ -500,28 +500,28 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
     return raw;
 }
 
-/* RSX surface colour format (SET_SURFACE_FORMAT bits [4:0]) -> DXGI. Float
+/* RSX surface colour format (SET_SURFACE_FORMAT bits [4:0]) -> gpu_format. Float
  * targets matter: wave's water height maps store SIGNED values (F_W16..),
  * demosaic's differential planes likewise -- RGBA8 clamps them to zero. */
-static DXGI_FORMAT rsx_surface_dxgi(u32 fmt)
+static gpu_format rsx_surface_format(u32 fmt)
 {
     switch (fmt & 0x1F) {
-    case 0x0B: return DXGI_FORMAT_R16G16B16A16_FLOAT; /* F_W16Z16Y16X16 */
-    case 0x0C: return DXGI_FORMAT_R32G32B32A32_FLOAT; /* F_W32Z32Y32X32 */
-    case 0x0D: return DXGI_FORMAT_R32_FLOAT;          /* F_X32          */
-    default:   return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 0x0B: return GPU_FORMAT_R16G16B16A16_FLOAT; /* F_W16Z16Y16X16 */
+    case 0x0C: return GPU_FORMAT_R32G32B32A32_FLOAT; /* F_W32Z32Y32X32 */
+    case 0x0D: return GPU_FORMAT_R32_FLOAT;          /* F_X32          */
+    default:   return GPU_FORMAT_R8G8B8A8_UNORM;
     }
 }
 
-/* The format a target is made in: its own (rsx_surface_dxgi), or FP16 for an
+/* The format a target is made in: its own (rsx_surface_format), or FP16 for an
  * RGBA8 target HDR promotes (see HDR output). */
-static DXGI_FORMAT rt_dxgi(u32 off, u32 fmt)
+static gpu_format rt_target_format(u32 off, u32 fmt)
 {
-    const DXGI_FORMAT f = rsx_surface_dxgi(fmt);
-    if (!s_hdr.stage_b || !off || f != DXGI_FORMAT_R8G8B8A8_UNORM) return f;
-    if (off == s_hdr.t_off) return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const gpu_format f = rsx_surface_format(fmt);
+    if (!s_hdr.stage_b || !off || f != GPU_FORMAT_R8G8B8A8_UNORM) return f;
+    if (off == s_hdr.t_off) return GPU_FORMAT_R16G16B16A16_FLOAT;
     for (int i = 0; i < 4; i++)
-        if (off == s_hdr.x_off[i]) return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (off == s_hdr.x_off[i]) return GPU_FORMAT_R16G16B16A16_FLOAT;
     return f;
 }
 
@@ -545,15 +545,15 @@ static u16 half_of_byte(u8 b)
 }
 
 /* NV4097 TEXTURE_ADDRESS wrap field (S: bits 0-3, T: 8-11, R: 16-19). */
-static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap_to_d3d(u32 m)
+static u32 rsx_wrap_to_address(u32 m)
 {
     switch (m) {
-    case 2: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
-    case 3: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* CLAMP_TO_EDGE */
-    case 4: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    case 5: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;        /* GL CLAMP */
-    case 6: case 7: case 8: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
-    default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;        /* 1 = WRAP; 0 = never set */
+    case 2: return GPU_ADDRESS_MIRROR;
+    case 3: return GPU_ADDRESS_CLAMP;        /* CLAMP_TO_EDGE */
+    case 4: return GPU_ADDRESS_BORDER;
+    case 5: return GPU_ADDRESS_CLAMP;        /* GL CLAMP */
+    case 6: case 7: case 8: return GPU_ADDRESS_MIRROR_ONCE;
+    default: return GPU_ADDRESS_WRAP;        /* 1 = WRAP; 0 = never set */
     }
 }
 
@@ -682,9 +682,9 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         const int min_lin = (minf == 2 || minf == 4 || minf == 6 || minf == 7);
         const int mip_lin = (minf == 5 || minf == 6);
         const int mag_lin = (magf == 2 || magf == 4);
-        const D3D12_TEXTURE_ADDRESS_MODE au = rsx_wrap_to_d3d(a & 0xF),
-                                         av = rsx_wrap_to_d3d((a >> 8) & 0xF),
-                                         aw = rsx_wrap_to_d3d((a >> 16) & 0xF);
+        const u32 au = rsx_wrap_to_address(a & 0xF),
+                  av = rsx_wrap_to_address((a >> 8) & 0xF),
+                  aw = rsx_wrap_to_address((a >> 16) & 0xF);
         gpu_sampler_desc sd;
         memset(&sd, 0, sizeof sd);
         sd.filter = GPU_FILTER(
@@ -700,7 +700,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
             sd.filter = GPU_FILTER_ANISO(GPU_REDUCE_STANDARD);
             sd.max_aniso = f & 0x1Fu;
         }
-        /* zfunc uses the GL order (D3D12_COMPARISON_FUNC minus one), but the
+        /* zfunc uses the GL order (GPU_CMP_* minus one), but the
          * stored function is the reverse of the sampling compare: LESS means
          * "texel < reference" (RPCS3 swaps LESS/GREATER and LEQUAL/GEQUAL the
          * same way in its GL sampler). */
@@ -822,7 +822,7 @@ typedef struct {
     u32 off, w, h;      /* guest dims */
     u32 hw, hh;         /* the resource's dims (RSX_SCALE) */
     int used;
-    D3D12_RESOURCE_STATES st;   /* DEPTH_WRITE as a DSV, PIXEL_SHADER_RESOURCE sampled */
+    gpu_state st;   /* DEPTH_WRITE as a DSV, PIXEL_SHADER_RESOURCE sampled */
 } ZetaRT;
 #define MAX_ZETA 8
 static ZetaRT s_zeta[MAX_ZETA];
@@ -833,8 +833,7 @@ static gpu_view zeta_dsv(int slot) { return s_zeta[slot].dsv; }
 
 /* The same surface as a read-only depth-stencil view: depth-tested and
  * sampled by one draw. The resource is then in ZETA_READ_STATE. */
-#define ZETA_READ_STATE ((D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_DEPTH_READ | \
-                                                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+#define ZETA_READ_STATE ((gpu_state)(GPU_STATE_DEPTH_READ | GPU_STATE_PIXEL_SHADER_RESOURCE))
 static gpu_view zeta_dsv_ro(int slot) { return s_zeta[slot].dsv_ro; }
 
 /* A depth surface dropped (step C5a): its handle and views into the grave. */
@@ -851,11 +850,11 @@ static int zeta_find(u32 off)
     return -1;
 }
 
-static void zeta_transition(int slot, D3D12_RESOURCE_STATES to)
+static void zeta_transition(int slot, gpu_state to)
 {
     ZetaRT* z = &s_zeta[slot];
     if (z->st == to) return;
-    gpu_cmd_barrier(s_rc_cmd, z->tex, (gpu_state)z->st, (gpu_state)to);   /* (step C5a) */
+    gpu_cmd_barrier(s_rc_cmd, z->tex, z->st, to);   /* (step C5a) */
     z->st = to;
 }
 
@@ -900,7 +899,7 @@ static int zeta_get(u32 off, u32 w, u32 h)
     if (!GPU_VALID(z->tex)) return -1;
     z->off = off; z->w = w; z->h = h; z->used = 1;
     z->hw = td.width; z->hh = td.height;
-    z->st = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    z->st = GPU_STATE_DEPTH_WRITE;
     z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
     z->dsv_ro = rc_target_view(z->tex, GPU_VIEW_DSV, GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL,
                                GPU_FORMAT_D24_UNORM_S8_UINT);
@@ -916,8 +915,8 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     if (!off || !GPU_VALID(s_rc_srv_pool)) return -1;
     if (!w) w = s_d3d.width;
     if (!h) h = s_d3d.height;
-    DXGI_FORMAT want_fmt = rt_dxgi(off, rsx_fmt);
-    DXGI_FORMAT gfmt = rsx_surface_dxgi(rsx_fmt);   /* the guest's, for refill and write-back */
+    gpu_format want_fmt = rt_target_format(off, rsx_fmt);
+    gpu_format gfmt = rsx_surface_format(rsx_fmt);   /* the guest's, for refill and write-back */
     /* RT_FORCE_RGBA8=1: allocate every offscreen target as R8G8B8A8 rather than
      * its native format. A title whose final composite reads a half-float
      * surface cannot be shown with a plain CopyTextureRegion, and giving it an
@@ -925,7 +924,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
      * copy. A stopgap for looking at the frame, not a rendering fix. */
     { static int f8 = -1;
       PS3_KNOB(f8, ps3_env_int("RT_FORCE_RGBA8", 0));
-      if (f8) want_fmt = gfmt = DXGI_FORMAT_R8G8B8A8_UNORM; }
+      if (f8) want_fmt = gfmt = GPU_FORMAT_R8G8B8A8_UNORM; }
     int slot = off_rt_find(off);
     if (slot >= 0) {
         OffRT* r = &s_d3d.off_rt[slot];
@@ -979,7 +978,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     if (!GPU_VALID(r->tex)) return -1;
     r->off = off; r->w = w; r->h = h; r->hw = hw; r->hh = hh; r->dxgi = (u32)want_fmt;
     r->gdxgi = (u32)gfmt;
-    r->st = D3D12_RESOURCE_STATE_COPY_DEST;
+    r->st = GPU_STATE_COPY_DEST;
     r->used = 1;
     r->gsum_ok = 0;
 
@@ -991,9 +990,9 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     {
         extern uint8_t* vm_base;
         extern u32 cellGcmResolveOffset(u32);
-        u32 bpp = (want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u :
-                  (want_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16u :
-                  (want_fmt == DXGI_FORMAT_R32_FLOAT) ? 4u : 4u;
+        u32 bpp = (want_fmt == GPU_FORMAT_R16G16B16A16_FLOAT) ? 8u :
+                  (want_fmt == GPU_FORMAT_R32G32B32A32_FLOAT) ? 16u :
+                  (want_fmt == GPU_FORMAT_R32_FLOAT) ? 4u : 4u;
         const u32 sbpp = want_fmt == gfmt ? bpp : 4u;   /* a promoted target's guest texels: RGBA8 */
         /* A scaled target gets each guest texel repeated (nearest). */
         u32 pitch = (hw * bpp + 255) & ~255u;
@@ -1024,7 +1023,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                                                    half_of_byte(srow[x*4+3]), half_of_byte(srow[x*4+0])};
                                 memcpy(drow + (u64)x * 8, hv, 8);
                             }
-                        } else if (want_fmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                        } else if (want_fmt == GPU_FORMAT_R8G8B8A8_UNORM) {
                             /* guest A8R8G8B8 (bytes A,R,G,B) -> R,G,B,A */
                             for (u32 x = 0; x < w; x++) {
                                 drow[x*4+0] = srow[x*4+1];
@@ -1032,7 +1031,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                                 drow[x*4+2] = srow[x*4+3];
                                 drow[x*4+3] = srow[x*4+0];
                             }
-                        } else if (want_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        } else if (want_fmt == GPU_FORMAT_R16G16B16A16_FLOAT) {
                             for (u32 x = 0; x < w * 4; x++) {   /* u16 halves, BE */
                                 drow[x*2+0] = srow[x*2+1];
                                 drow[x*2+1] = srow[x*2+0];
@@ -1065,7 +1064,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         }
         free(wide);
         gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
-        r->st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        r->st = GPU_STATE_PIXEL_SHADER_RESOURCE;
     }
 
     r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0);   /* today's NULL description */

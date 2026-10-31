@@ -119,7 +119,7 @@ static void pass_desc(gpu_pipeline_desc* d, gpu_layout layout, gpu_shader vs, gp
 
 /* A layout slot, and the passes' static sampler at s<reg>: filter, clamped
  * on every axis, every mip, for the pixel shader (today's zeroed
- * D3D12_STATIC_SAMPLER_DESC with those set). */
+ * static sampler description with those set). */
 static gpu_layout_slot lay_slot(u8 kind, u8 reg, u8 count, u8 vis)
 {
     gpu_layout_slot s;
