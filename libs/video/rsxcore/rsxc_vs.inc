@@ -24,6 +24,8 @@ static int vp_vs_insert(u32 hash, gpu_shader vs, int uses_c03)
     s_d3d.vp_vs[slot].fetch    = 0;
     s_d3d.vp_vs[slot].code64   = 0;
     s_d3d.vp_vs[slot].start    = 0;
+    s_d3d.vp_vs[slot].vs_key   = 0;
+    s_d3d.vp_vs[slot].vs4_key  = 0;
     return GPU_VALID(vs) ? slot : -1;
 }
 
@@ -166,6 +168,7 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
     s_d3d.vp_vs[slot].fetch = fetch;
     s_d3d.vp_vs[slot].code64 = rsxc_vs_code64(&vp);
     s_d3d.vp_vs[slot].start = vstart / 16u;
+    s_d3d.vp_vs[slot].vs_key = rsxc_shader_key(0, hlsl);   /* (step P3S: the neutral manifest's) */
     /* Step V5: the clamp's vertex-shader form is made from the same bytes at
      * the program's first clamp draw (uvc_vs4), when the store may hold
      * another program: keep a copy. */

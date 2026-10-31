@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>   /* getpid */
+#endif
 
 /* ---- step VC1 ---- */
 /* A shader's interface, and a pixel shader without some of its outputs.
@@ -829,7 +832,8 @@ int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
     return GPU_PIPELINE_CACHE_LOADED;
 }
 
-/* Written to path.tmp, then moved over path, so a crash leaves the old file. */
+/* Written to a temporary file beside it, then moved over path, so a crash
+ * leaves the old file. */
 int gpu_vk_pipeline_cache_save(gpu_device* d, const char* path)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
@@ -858,8 +862,15 @@ int gpu_vk_pipeline_cache_save(gpu_device* d, const char* path)
     memcpy(h.uuid, dd->props.pipelineCacheUUID, VK_UUID_SIZE);
     h.size = size;
     h.fnv = gpu_vk_fnv(GPU_VK_FNV_BASIS, data, size);
+    /* (step P3S: named by the process and thread, so two saving at once,
+     * two games or the save thread and the shutdown, never share one) */
     char tmp[1024];
-    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+#ifdef _WIN32
+    snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)GetCurrentProcessId(),
+             (unsigned long)GetCurrentThreadId());
+#else
+    snprintf(tmp, sizeof tmp, "%s.%ld.%lu.tmp", path, (long)getpid(), (unsigned long)pthread_self());
+#endif
     FILE* f = fopen(tmp, "wb");
     int ok = f && fwrite(&h, sizeof h, 1, f) == 1 && fwrite(data, size, 1, f) == 1;
     if (f && fclose(f)) ok = 0;

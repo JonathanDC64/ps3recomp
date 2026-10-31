@@ -310,19 +310,38 @@ static void rc_pso_index_ready(u64 hash)
     InterlockedExchange(&s_pxb_ready, 1);
 }
 
-/* 1 built, 0 there already, -1 not built (a shader missing from the cache, or
- * the driver refused it). The shaders are the GPU layer's, made for the row
- * and freed after; gs is the uvclamp GS (never freed). */
+/* Step P3S: why a row or record was not built (pxi_build_one's -1 to -3). */
+static const char* const k_pxi_why[3] = {
+    "a shader is not in this target's cache", "the sprite-edge clamp's other form", "the driver refused it"
+};
+static int pso_log_on(void) { static int lg = -1; PS3_KNOB(lg, ps3_env_int("PS3_PSO_LOG", 0)); return lg; }
+/* A neutral manifest record as a row to build. */
+static PxiItem gm_item(const gm_rec* r)
+{
+    PxiItem it;
+    it.vs_key = r->vs_key; it.ps_key = r->ps_key;
+    it.fetch = r->fetch; it.clamp = r->clamp; it.blend = r->blend; it.nrt = r->nrt; it.rtfmt = r->rtfmt;
+    it.cmask = r->cmask; it.cull = r->cull; it.depth = r->depth;
+    return it;
+}
+/* 1 built, 0 there already, -1 not built: a shader missing from the cache,
+ * -2 a clamp row of the form this run does not draw (step V5; the index's
+ * rows are the GS form's; step P3S: the neutral manifest's clamp 2 is kind
+ * 4's), -3 the driver refused it. The shaders are the GPU layer's, made for
+ * the row and freed after; gs is the uvclamp GS (never freed). A row built,
+ * or there already, goes into the neutral manifest (step P3S). */
 static int pxi_build_one(const PxiItem* it, gpu_shader gs)
 {
+    if (it->clamp && (it->clamp == 2) != (s_uvc_vs != 0)) return -2;
     gpu_shader vs = sc_load(GPU_SC_VS, it->vs_key);
     gpu_shader ps = sc_load(GPU_SC_PS, it->ps_key);
     int r = -1;
-    if (GPU_VALID(vs) && GPU_VALID(ps) && (!it->clamp || GPU_VALID(gs))) {
+    if (GPU_VALID(vs) && GPU_VALID(ps) && (it->clamp != 1 || GPU_VALID(gs))) {
         const gpu_shader none = {0};
         gpu_pipeline_desc pd;
-        vp_fp_desc(&pd, vs, (int)it->fetch, ps, it->clamp ? gs : none,
+        vp_fp_desc(&pd, vs, (int)it->fetch, ps, it->clamp == 1 ? gs : none,
                    it->blend, (int)it->nrt, (gpu_format)it->rtfmt, it->cmask, it->cull, it->depth);
+        r = -3;
         /* Its manifest name (the instance file's: on D3D12 today's,
          * pso_desc_key of the D3D12 description the backend makes of it). */
         const u64 key = rc_be_pso_name(s_rc_dev, &pd, s_vp_root_hash);
@@ -341,10 +360,36 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
                 r = 1;
             }
         }
+        if (r >= 0) {
+            gm_rec rec;
+            memset(&rec, 0, sizeof rec);
+            rec.magic = GM_REC_MAGIC; rec.size = sizeof rec;
+            rec.vs_key = it->vs_key; rec.ps_key = it->ps_key;
+            rec.fetch = it->fetch; rec.clamp = it->clamp; rec.blend = it->blend; rec.nrt = it->nrt;
+            rec.rtfmt = it->rtfmt; rec.cmask = it->cmask; rec.cull = it->cull; rec.depth = it->depth;
+            gm_add(&rec);
+        }
     }
     sc_shader_drop(&vs);
     sc_shader_drop(&ps);
     return r;
+}
+
+/* Step P3S: a row or record not built, with PS3_PSO_LOG=1: which, and why. */
+static volatile LONG s_pxb_why[3], s_gmb_why[3];   /* the index's, the neutral manifest's */
+static void pxi_not_built(volatile LONG* why, const char* list, u32 i, const PxiItem* it, int r)
+{
+    InterlockedIncrement(&why[-r - 1]);
+    if (pso_log_on())
+        printf("[D3D12] %s %u not built: %s (vs %016llx, ps %016llx, clamp %u)\n", list, i, k_pxi_why[-r - 1],
+               (unsigned long long)it->vs_key, (unsigned long long)it->ps_key, it->clamp);
+}
+/* The reasons' counts, when some were not built. */
+static void pxi_why_print(const volatile LONG* why, const char* list, long failed)
+{
+    if (failed)
+        printf("[D3D12] %s: not built: %ld as %s, %ld as %s, %ld as %s\n", list, (long)why[0], k_pxi_why[0],
+               (long)why[1], k_pxi_why[1], (long)why[2], k_pxi_why[2]);
 }
 
 static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
@@ -357,11 +402,13 @@ static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
         if (i >= s_pxb_n || s_pso_pre_abort) break;
         const int r = pxi_build_one(&s_pxb[i], gs);
         InterlockedIncrement(r > 0 ? &s_pxb_built : r == 0 ? &s_pxb_had : &s_pxb_failed);
+        if (r < 0) pxi_not_built(s_pxb_why, "pipeline index row", i, &s_pxb[i], r);
     }
     if (InterlockedDecrement(&s_pxb_live) == 0) {
         const u32 done = (u32)(s_pxb_built + s_pxb_had + s_pxb_failed);
         printf("[D3D12] pipeline index: %ld built, %ld there already, %ld not built, of %u, in %.0f ms\n",
                s_pxb_built, s_pxb_had, s_pxb_failed, s_pxb_n, 1000.0 * (perf_now() - s_pxb_t0));
+        pxi_why_print(s_pxb_why, "pipeline index", s_pxb_failed);
         if (done == s_pxb_n && s_pxb_hash) {
             char path[MAX_PATH + 32], txt[24];
             pso_lib_path(path, sizeof path, "index.built");   /* (the GPU layer's library's own) */
@@ -370,6 +417,21 @@ static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
         }
     }
     return 0;
+}
+
+/* The uvclamp GS for a list's builds, if a row needs it (step V5: none in
+ * the vertex-shader form). Here: it compiles on its first call. */
+static gpu_shader pxi_gs_for(int any_gs_row)
+{
+    const gpu_shader none = {0};
+    return any_gs_row && !s_uvc_vs ? uvclamp_gs() : none;
+}
+/* Threads for a start's build (as the manifest's). */
+static int pxi_threads(void)
+{
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    const int nt = (int)si.dwNumberOfProcessors / 4;
+    return nt < 1 ? 1 : nt > 4 ? 4 : nt;
 }
 
 /* pso_lib_tick: the build, once the pass has handed over the list; on as many
@@ -381,19 +443,74 @@ static void pso_index_build_start(void)
     s_pxb_started = 1;
     ReleaseSRWLockExclusive(&s_pxb_lock);
     if (!s_pxb_n) return;
-    gpu_shader gs = {0};
-    for (u32 i = 0; i < s_pxb_n; i++)
-        if (s_pxb[i].clamp && !s_uvc_vs) { gs = uvclamp_gs(); break; }   /* here: it compiles on its first call */
+    int any = 0;
+    for (u32 i = 0; i < s_pxb_n && !any; i++) any = s_pxb[i].clamp == 1;
+    const gpu_shader gs = pxi_gs_for(any);
     /* (Step V5: in the vertex-shader form the rows with the clamp are not
      * built: their vertex shader is the program's kind 4, made at a draw.) */
-    SYSTEM_INFO si; GetSystemInfo(&si);
-    int nt = (int)si.dwNumberOfProcessors / 4;
-    if (nt < 1) nt = 1; if (nt > 4) nt = 4;
+    const int nt = pxi_threads();
     s_pxb_t0 = perf_now();
     s_pxb_live = nt;
     for (int t = 0; t < nt; t++) {
         HANDLE h = CreateThread(NULL, 0, pxi_build_thread, (LPVOID)(uintptr_t)gs.id, 0, NULL);
         if (h) CloseHandle(h); else InterlockedDecrement(&s_pxb_live);
+    }
+}
+
+/* Step P3S: the neutral manifest's build (rsxc_psolib.inc): the records
+ * after the loaded library's count, as the index's rows. */
+static DWORD WINAPI gm_build_thread(LPVOID gs_id)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    gpu_shader gs;
+    gs.id = (u32)(uintptr_t)gs_id;
+    const u32 n = s_gm_read - s_gm_have;
+    for (;;) {
+        const u32 i = (u32)(InterlockedIncrement(&s_gmb_next) - 1);
+        if (i >= n || s_pso_pre_abort) break;
+        const PxiItem it = gm_item(&s_gm[s_gm_have + i]);
+        const int r = pxi_build_one(&it, gs);
+        InterlockedIncrement(r > 0 ? &s_gmb_built : r == 0 ? &s_gmb_had : &s_gmb_failed);
+        if (r < 0) pxi_not_built(s_gmb_why, "pipeline manifest record", s_gm_have + i, &it, r);
+    }
+    if (InterlockedDecrement(&s_gmb_live) == 0) {
+        printf("[D3D12] pipeline manifest build: %ld built, %ld there already, %ld not built, of %u, in %.0f ms\n",
+               (long)s_gmb_built, (long)s_gmb_had, (long)s_gmb_failed, n, 1000.0 * (perf_now() - s_gmb_t0));
+        pxi_why_print(s_gmb_why, "pipeline manifest build", s_gmb_failed);
+        /* (the count moves on only once every record is in the library) */
+        s_gmb_complete = !s_pso_pre_abort && !s_gmb_failed && (u32)(s_gmb_built + s_gmb_had) == n;
+    }
+    return 0;
+}
+static void gm_build_start(void)
+{
+    if (s_gmb_started) return;
+    s_gmb_started = 1;
+    const u32 n = s_gm_read - s_gm_have;
+    if (!n || !ps3_env_int("PS3_PSO_PREBUILD", 1)) { s_gmb_complete = !n; return; }
+    int any = 0;
+    for (u32 i = s_gm_have; i < s_gm_read && !any; i++) any = s_gm[i].clamp == 1;
+    const gpu_shader gs = pxi_gs_for(any);
+    const int nt = pxi_threads();
+    s_gmb_t0 = perf_now();
+    s_gmb_live = nt;
+    for (int t = 0; t < nt; t++) {
+        HANDLE h = CreateThread(NULL, 0, gm_build_thread, (LPVOID)(uintptr_t)gs.id, 0, NULL);
+        if (h) CloseHandle(h); else InterlockedDecrement(&s_gmb_live);
+    }
+}
+
+/* PS3_PSO_WAIT=1 (tests and replays, which end soon after they start): the
+ * shutdown lets the start's builds run to their end, the index's too once
+ * the pass has handed it over, instead of stopping them. */
+static void pso_builds_finish(void)
+{
+    if (!s_pso_lib_on || !GPU_VALID(s_d3d.vp_layout)) return;
+    for (;;) {
+        pso_builds_step();
+        if (!s_pso_pre_live && s_gmb_started && !s_gmb_live && (!s_pxb_ready || (s_pxb_started && !s_pxb_live)))
+            break;
+        Sleep(1);
     }
 }
 
@@ -711,12 +828,27 @@ static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
         pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask,
                        GPU_VALID(gsb) || key.vs4, blend, nrt, rtfmt, cmask, cull, depth, hdrv);
     s_fp_vs4 = (int)key.vs4;
+    /* Step P3S: its record in the neutral manifest: the two texts' keys and
+     * vp_fp_desc's state (a draw on vp_vs_shader, which no key names, has
+     * none). */
+    gm_rec rec;
+    memset(&rec, 0, sizeof rec);
+    if (s_gm_on && vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
+        const VPVSEntry* const ve = &s_d3d.vp_vs[vs_idx];
+        rec.vs_key = key.vs4 ? ve->vs4_key : ve->vs_key;
+        rec.ps_key = rsxc_shader_key(1, hlsl);
+        rec.fetch = (key.vs4 || ve->fetch) ? 1u : 0u;
+        rec.clamp = key.vs4 ? 2u : GPU_VALID(gsb) ? 1u : 0u;
+        rec.blend = blend; rec.nrt = (u32)nrt; rec.rtfmt = (u32)rtfmt; rec.cmask = cmask & 0xFu;
+        rec.cull = cull; rec.depth = depth;
+        if (rec.vs_key && rec.ps_key) { rec.magic = GM_REC_MAGIC; rec.size = sizeof rec; }
+    }
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */
-    if (s_psj_defer && (s_psj_last = psj_add(&pd, pb, &key)) >= 0) return k_rc_no_pipe;
+    if (s_psj_defer && (s_psj_last = psj_add(&pd, pb, &rec, &key)) >= 0) return k_rc_no_pipe;
     const double cp_t0 = perf_on() ? perf_now() : 0.0;
-    const gpu_pipeline pso = pso_create_cached(&pd);
+    const gpu_pipeline pso = pso_create_cached(&pd, &rec);
     if (perf_on()) { s_perf_cpso += perf_now() - cp_t0; s_perf_cpso_n++; }
     sc_shader_drop(&pb);
     if (!pso.v) {
