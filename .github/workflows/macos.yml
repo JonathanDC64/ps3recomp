@@ -5,11 +5,13 @@
 # that stays fixed: it is the only thing preventing the next Windows-only commit
 # from silently re-breaking the POSIX paths.
 #
-# GitHub's macOS arm64 pool is short: jobs that never get a machine fail after
-# waiting ("not acquired by Runner"), with no step run. So this asks for as
-# little as it can: one build type on a pull request (both on master), a
-# newer push or PR update cancels the run it supersedes, and a job that hangs
-# stops at the timeout instead of holding a machine.
+# macos-14 is deprecated (longer queues since July 2026, failing brownouts, and
+# retired on November 2, 2026: actions/runner-images#13518), and its jobs often
+# never got a machine ("not acquired by Runner"), with no step run. macos-15
+# picked jobs up in seconds when measured. The job also asks for as little as
+# it can: one build type on a pull request (both on master), a newer push or
+# PR update cancels the run it supersedes, and a job that hangs stops at the
+# timeout instead of holding a machine.
 name: macOS
 
 on:
@@ -21,7 +23,7 @@ on:
       runner:
         description: Apple Silicon runner image
         type: choice
-        options: [ macos-15, macos-14 ]
+        options: [ macos-15, macos-26 ]
         default: macos-15
 
 concurrency:
