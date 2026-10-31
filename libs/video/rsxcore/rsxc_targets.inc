@@ -824,7 +824,8 @@ static int off_rt_find(u32 off)
  * and only the guest's own CLEAR_SURFACE Z/S bits reset it. A single shared
  * buffer cleared on every switch lost the scene's depth halfway through
  * Demon's Souls's frame, so later scene draws covered the player.
- * Created typeless (R24G8) so a later pass can sample one as a texture. */
+ * Created typeless (R24G8, or R32G8X24 with RSX_DEPTH_FORMAT=d32s8) so a
+ * later pass can sample one as a texture. */
 typedef struct {
     gpu_texture tex;    /* the GPU layer's texture (step C5a) */
     gpu_view dsv, dsv_ro;   /* its writable and read-only DSVs (step C5a) */

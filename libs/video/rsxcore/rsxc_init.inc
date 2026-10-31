@@ -198,7 +198,8 @@ static int init_d3d12(u32 width, u32 height)
 
     /* ---------------------------------------------------------------
      * Depth/stencil buffer
-     * 24-bit depth + 8-bit stencil (GPU_FORMAT_D24_UNORM_S8_UINT).
+     * 24-bit depth + 8-bit stencil (GPU_FORMAT_D24_UNORM_S8_UINT), or
+     * D32S8 with RSX_DEPTH_FORMAT=d32s8 (rc_ds_format, step V5).
      * One shared depth texture across both frames — RSX games on PS3
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
