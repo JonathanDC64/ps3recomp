@@ -4,6 +4,12 @@
 # "Full support" while the tree did not compile there at all. This job exists so
 # that stays fixed: it is the only thing preventing the next Windows-only commit
 # from silently re-breaking the POSIX paths.
+#
+# GitHub's macOS arm64 pool is short: jobs that never get a machine fail after
+# waiting ("not acquired by Runner"), with no step run. So this asks for as
+# little as it can: one build type on a pull request (both on master), a
+# newer push or PR update cancels the run it supersedes, and a job that hangs
+# stops at the timeout instead of holding a machine.
 name: macOS
 
 on:
@@ -11,15 +17,27 @@ on:
     branches: [ master, main ]
   pull_request:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Apple Silicon runner image
+        type: choice
+        options: [ macos-15, macos-14 ]
+        default: macos-15
+
+concurrency:
+  group: macos-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: macOS arm64 (${{ matrix.build_type }})
-    runs-on: macos-14          # Apple Silicon runner
+    runs-on: ${{ inputs.runner || 'macos-15' }}   # Apple Silicon
+    # A passing job takes 2-7 minutes; the queue before it does not count.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, Release]
+        build_type: ${{ github.event_name == 'pull_request' && fromJSON('["Release"]') || fromJSON('["Debug", "Release"]') }}
 
     steps:
       - uses: actions/checkout@v4
