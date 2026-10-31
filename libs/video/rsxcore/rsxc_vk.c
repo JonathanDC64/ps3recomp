@@ -17,7 +17,8 @@
  *     written (rc_be_cache_files 0, as on null). Their records are D3D12
  *     descriptions, and the manifest is shared with the d3d12 route. The
  *     pipeline library is a VkPipelineCache file of its own, by driver
- *     (rc_be_lib_file, step VC2), with no manifest to build ahead from;
+ *     (rc_be_lib_file, step VC2), built ahead from the neutral manifest
+ *     (gpu/manifest.bin, step P3S) and the pipeline index;
  *   - a frame slot is not a swap chain image (rc_be_frame_slot): the driver
  *     may make more images than FRAME_COUNT and hands them out in any order,
  *     so the slot (recorders, fences, display targets, the blit's tables)
@@ -154,8 +155,9 @@ static const int rc_be_cache_files = 0;
  * driver and GPU, so another driver's is never offered to this one (the
  * file's own header and Vulkan's are checked as well). Loaded at the start,
  * saved where the d3d12 route saves pipelines.lib: after a burst of new
- * pipelines has settled, and at shutdown. No manifest and no startup build:
- * the cache alone. */
+ * pipelines has settled, and at shutdown. pso_manifest.bin is not read;
+ * step P3S: the start builds the neutral manifest's records and the
+ * pipeline index's rows into the cache (rsxc_psolib.inc). */
 static const char rc_be_lib_dir[] = "vulkan";
 static const char* rc_be_lib_file(gpu_device* d)
 {

@@ -483,6 +483,11 @@ struct gpu_cmd {
     uint32_t                     dyn[GPU_VK_MAX_DYN];
     gpu_vk_set0_key              key;           /* set 0's buffers */
     uint32_t                     set0_stale;    /* key changed since sets[0] was found */
+    /* Step V5v: the last two sets 0 found, newest first, so a slot that goes
+     * back and forth between two buffers (the vertex-shader clamp's t20, twice
+     * a draw) finds its set without the cache's lock and hash. */
+    gpu_vk_set0_key              memo_key[2];
+    VkDescriptorSet              memo_set[2];
     uint32_t                     dirty;         /* bind before the next draw */
 
     /* The pass (targets) and its rendering. */
@@ -584,8 +589,9 @@ typedef struct gpu_vk_device {
     char*                      marks;
     volatile uint32_t          mark_next;
 
-    /* Test hooks: descriptors the table writes wrote, validation messages. */
-    volatile uint32_t          n_srv_writes, n_sampler_writes, n_validation;
+    /* Test hooks: descriptors the table writes wrote, validation messages,
+     * the set-0 cache's lookups (step V5v, under lock). */
+    volatile uint32_t          n_srv_writes, n_sampler_writes, n_validation, n_set0_gets;
 
     /* Step VC2: lost by hand (gpu_vk_lose_by_hand), not by the driver. The
      * pipelines made, those the pipeline cache had, and the driver's time

@@ -53,8 +53,8 @@ void rsx_d3d12_pso_index_ready(uint64_t hash);
 #if defined(PS3RECOMP_RSX_HAL)
 /* ---- The sinks (rsx_shader_precompile.h's targets) ----
  * d3d12 is the calls above, as the pass made them before the sinks, but for
- * the pipeline index's rows, which go to the renderer the route switch
- * picked (rsx_out.h). dxbc and spv take the new path's texts, the copies of
+ * the pipeline index's rows, which go through the route switch (rsx_out.h)
+ * as every target's do (rows_add). dxbc and spv take the new path's texts, the copies of
  * those calls in rsxcore/rsxc_shader.c, into the compile service. Below,
  * each of the calls above is renamed to the sink's, so the pass reads as it
  * did; a sink without rows to hand over leaves those two calls out. */
@@ -65,12 +65,35 @@ void rsx_d3d12_pso_index_ready(uint64_t hash);
 #include "gpu/gpu_shader_spv.h"   /* gpu_spv_tag */
 #endif
 
+/* Step P3S: a target's rows go to the renderer that draws with its files
+ * (the sink's route: d3d12's to today's renderer, dxbc's to the new path on
+ * D3D12, spv's to Vulkan), through the route switch, only when that is the
+ * route this process runs (asked at _index, s_rows_taken). A build without
+ * the route switch has no renderer to take them. */
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+static int s_rows_taken;
+static void rows_add(int vs_fetch, uint64_t vs_key, int clamp, uint64_t ps_key, uint32_t blend, int nrt,
+                     uint32_t rtfmt, uint32_t cmask, uint32_t cull, uint32_t depth)
+{
+    if (s_rows_taken) rsx_out_pso_index_add(vs_fetch, vs_key, clamp, ps_key, blend, nrt, rtfmt, cmask, cull, depth);
+}
+static void rows_ready(uint64_t hash)
+{
+    if (s_rows_taken) rsx_out_pso_index_ready(hash);
+}
+#define ROWS_ADD   rows_add
+#define ROWS_READY rows_ready
+#else
+#define ROWS_ADD   NULL
+#define ROWS_READY NULL
+#endif
+
 #ifdef _WIN32
 static const rsx_shader_precompile_sink s_sink_d3d12 = {
     "d3d12", "FXC", NULL,
     rsx_d3d12_shader_hlsl, rsx_d3d12_shader_hdr, rsx_d3d12_shader_key, rsx_d3d12_shader_cache_put,
     rsx_d3d12_shader_cache_path, rsx_d3d12_shader_fp_variants, rsx_d3d12_program_hash64,
-    rsx_out_pso_index_add, rsx_out_pso_index_ready
+    ROWS_ADD, ROWS_READY, "d3d12", NULL
 };
 
 static int dxbc_put(int fragment, const char* hlsl)
@@ -86,7 +109,7 @@ static const rsx_shader_precompile_sink s_sink_dxbc = {
     "dxbc", "FXC", dxbc_tag,
     rsxc_shader_hlsl, rsxc_shader_hdr, rsxc_shader_key, dxbc_put,
     gpu_sc_cache_dir, rsxc_shader_fp_variants, rsxc_program_hash64,
-    NULL, NULL
+    ROWS_ADD, ROWS_READY, "hal-d3d12", "gpu/d3d12/index.built"
 };
 #endif
 
@@ -117,7 +140,7 @@ static const rsx_shader_precompile_sink s_sink_spv = {
     "spv", "glslang", spv_tag,
     rsxc_shader_hlsl, rsxc_shader_hdr, rsxc_shader_key, spv_put,
     gpu_sc_cache_dir, rsxc_shader_fp_variants, rsxc_program_hash64,
-    NULL, NULL
+    ROWS_ADD, ROWS_READY, "vulkan", "gpu/vulkan/index.built"
 };
 #endif
 
@@ -517,9 +540,16 @@ int rsx_shader_precompile_index(const char* rows, size_t len, int index_only)
     free(s_rows);
     s_rows = NULL; s_nrows = 0;
 #if defined(PS3RECOMP_RSX_HAL)
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+    /* Step P3S: the target's renderer takes them when it is this process's. */
+    s_rows_taken = s_sink && s_sink->route && !strcmp(rsx_out_renderer(), s_sink->route);
+    const int taken = s_sink && s_sink->pso_index_add && s_rows_taken;
+#else
+    const int taken = s_sink && s_sink->pso_index_add;
+#endif
     /* Only the rows, for a target no renderer takes them from: nothing to do
      * (a full pass still makes their texts). */
-    if (index_only && !(s_sink && s_sink->pso_index_add)) { s_rows_hash = 0; s_index_only = 0; return 0; }
+    if (index_only && !taken) { s_rows_hash = 0; s_index_only = 0; return 0; }
 #endif
     unsigned cap = 0;
     for (size_t i = 0; rows && i < len; ) {
@@ -563,7 +593,12 @@ int rsx_shader_precompile_index_built(const char* rows, size_t len)
     const char* dir = rsx_d3d12_shader_cache_path();
     if (!rows || !dir || !dir[0]) return 0;
     char path[MAX_PATH + 32];
+#if defined(PS3RECOMP_RSX_HAL)
+    /* (step P3S: the target's renderer's own mark; d3d12's is today's) */
+    snprintf(path, sizeof path, "%s/%s", dir, s_sink->index_mark ? s_sink->index_mark : "pso_index.built");
+#else
     snprintf(path, sizeof path, "%s/pso_index.built", dir);
+#endif
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
     unsigned long long h = 0;
