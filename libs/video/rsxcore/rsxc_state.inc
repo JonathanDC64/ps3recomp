@@ -706,7 +706,8 @@ static gpu_view rc_target_view(gpu_texture t, u32 kind, u32 flags, gpu_format fo
 
 /* Step C8a: the core holds no native object. Every field that held one is
  * the handle it borrowed from (made? is GPU_VALID, or .v for a pipeline),
- * and none is borrowed through gpu_native but the menu's (rsxc_api.inc). */
+ * and nothing native is borrowed but the menu's objects (rsxc_api.inc,
+ * through the instance file's hooks). */
 static const gpu_pipeline k_rc_no_pipe = {0};      /* none */
 /* The overlay's frame callback with the window's buffer fi (the menu's,
  * rsxc_api.inc). */

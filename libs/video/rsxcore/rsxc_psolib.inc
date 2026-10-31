@@ -5,8 +5,9 @@
  * executable, so a rebuilt exe starts cold. Ours, in the shader cache dir:
  *
  *   gpu/d3d12/pipelines.lib  the GPU layer's pipeline library
- *                    (gpu_pipeline_cache_load/save; on D3D12 an
- *                    ID3D12PipelineLibrary): the compiled pipelines, named by
+ *                    (gpu_pipeline_cache_load/save; on D3D12 a D3D12
+ *                    pipeline library), in the instance's folder
+ *                    (rc_be_lib_dir): the compiled pipelines, named by
  *                    the GPU layer's hash of the whole description (call map
  *                    G9), so it is not the d3d12 route's pso_library.bin,
  *                    which this route never reads or writes. Only good for the
@@ -15,9 +16,9 @@
  *   gpu/d3d12/index.built    the pipeline index's build mark (rsxc_pipeline.inc).
  *   pso_manifest.bin every pipeline ever created, as a description that can
  *                    be rebuilt without the guest (fixed-size records): the
- *                    d3d12 route's file, with the same records (the D3D12
- *                    description the GPU layer makes of a pipeline is
- *                    today's, rc_be_pipeline_desc).
+ *                    d3d12 route's file, with the same records (the
+ *                    instance file's: rc_be_pso_record, the D3D12
+ *                    description the backend makes of a pipeline, today's).
  *   pso_blobs/       the shader bytecode those records name, by content hash.
  *
  * At startup, worker threads build every manifest record the library does not
@@ -39,8 +40,7 @@ typedef struct {
     u32 magic, size;
     u64 name, vs_hash, ps_hash;
     u32 vs_len, ps_len, nel, pad;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;   /* pointers zeroed */
-    struct { char sem[16]; D3D12_INPUT_ELEMENT_DESC e; } el[16];
+    rc_be_pso_desc d;   /* the backend's description of it (the instance file's) */
 } pso_rec;
 static pso_rec*      s_pso_man;             /* records read at startup */
 static u32           s_pso_man_n;           /* records in the file (read + appended) */
@@ -52,31 +52,9 @@ static volatile LONG s_pso_pre_next, s_pso_pre_live, s_pso_pre_built, s_pso_pre_
 static int           s_pso_pre_started;
 static double        s_pso_pre_t0;
 
-static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
-{
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC c;
-    memcpy(&c, pd, sizeof c);
-    c.pRootSignature = NULL;
-    c.VS.pShaderBytecode = c.PS.pShaderBytecode = c.DS.pShaderBytecode = NULL;
-    c.HS.pShaderBytecode = c.GS.pShaderBytecode = NULL;
-    c.StreamOutput.pSODeclaration = NULL; c.StreamOutput.pBufferStrides = NULL;
-    c.InputLayout.pInputElementDescs = NULL; c.CachedPSO.pCachedBlob = NULL;
-    /* The root signature by its serialized bytes: every caller passes
-     * vp_layout. Callers zero the whole description first, so padding hashes
-     * the same every run. */
-    u64 h = fnv_bytes(14695981039346656037ull, &s_vp_root_hash, sizeof s_vp_root_hash);
-    h = fnv_bytes(h, &c, sizeof c);
-    const D3D12_SHADER_BYTECODE* sh[5] = { &pd->VS, &pd->PS, &pd->DS, &pd->HS, &pd->GS };
-    for (int i = 0; i < 5; i++)
-        if (sh[i]->pShaderBytecode) h = fnv_bytes(h, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
-    for (UINT i = 0; i < pd->InputLayout.NumElements; i++) {
-        D3D12_INPUT_ELEMENT_DESC e = pd->InputLayout.pInputElementDescs[i];
-        h = fnv_bytes(h, e.SemanticName, strlen(e.SemanticName));
-        e.SemanticName = NULL;
-        h = fnv_bytes(h, &e, sizeof e);
-    }
-    return h;
-}
+/* A pipeline's name, its record's body and its shaders' code are the
+ * instance file's (rc_be_pso_name, rc_be_pso_record, rc_be_pso_unrecord:
+ * on D3D12 today's pso_desc_key of the D3D12 description, step C8b). */
 static void pso_path(char* out, size_t n, const char* leaf)
 {
     snprintf(out, n, "%s/%s", shader_cache_dir(), leaf);
@@ -135,7 +113,7 @@ static void pso_names_add(u64 k)
 /* The GPU layer's library's files (step C3b): <shader cache>/gpu/d3d12/. */
 static void pso_lib_path(char* out, size_t n, const char* leaf)
 {
-    snprintf(out, n, "%s/gpu/d3d12/%s", shader_cache_dir(), leaf);
+    snprintf(out, n, "%s/gpu/%s/%s", shader_cache_dir(), rc_be_lib_dir, leaf);
 }
 static long pso_file_size(const char* path)
 {
@@ -149,11 +127,11 @@ static long pso_file_size(const char* path)
 static void pso_lib_open(void)
 {
     if (!ps3_env_int("PS3_PSO_LIBRARY", 1) || !shader_cache_dir()[0]) return;
-    if (!(s_rc_dev->caps.bits & GPU_CAP_PIPELINE_CACHE)) return;   /* (no ID3D12Device1) */
+    if (!(s_rc_dev->caps.bits & GPU_CAP_PIPELINE_CACHE)) return;   /* (on D3D12: no Device1) */
     char path[MAX_PATH + 32];
     snprintf(path, sizeof path, "%s/gpu", shader_cache_dir());
     CreateDirectoryA(path, NULL);
-    snprintf(path, sizeof path, "%s/gpu/d3d12", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/gpu/%s", shader_cache_dir(), rc_be_lib_dir);
     CreateDirectoryA(path, NULL);
     pso_lib_path(path, sizeof path, "pipelines.lib");
     const long n = pso_file_size(path);
@@ -316,36 +294,26 @@ static void pso_manifest_flush(void)
     for (PsoManItem* it; (it = pso_manifest_pop(0)) != NULL; ) pso_manifest_done(it);
 }
 
-static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd)
+static void pso_manifest_add(const gpu_pipeline_desc* pd)
 {
-    if (pd->DS.pShaderBytecode || pd->HS.pShaderBytecode || pd->GS.pShaderBytecode ||
-        !pd->VS.pShaderBytecode || !pd->PS.pShaderBytecode || pd->InputLayout.NumElements > 16 ||
-        pd->StreamOutput.NumEntries)
-        return;
     PsoManItem* it = (PsoManItem*)calloc(1, sizeof *it);
     if (!it) return;
     pso_rec* r = &it->r;
-    r->magic = PSO_REC_MAGIC; r->size = sizeof *r; r->name = name;
-    memcpy(&r->desc, pd, sizeof r->desc);
-    r->desc.pRootSignature = NULL;
-    r->desc.VS.pShaderBytecode = r->desc.PS.pShaderBytecode = NULL;
-    r->desc.InputLayout.pInputElementDescs = NULL;
-    r->desc.CachedPSO.pCachedBlob = NULL; r->desc.CachedPSO.CachedBlobSizeInBytes = 0;
-    r->nel = pd->InputLayout.NumElements;
-    for (u32 i = 0; i < r->nel; i++) {
-        r->el[i].e = pd->InputLayout.pInputElementDescs[i];
-        snprintf(r->el[i].sem, sizeof r->el[i].sem, "%s", r->el[i].e.SemanticName);
-        r->el[i].e.SemanticName = NULL;
+    const void* code[2] = { NULL, NULL };
+    u32 len[2] = { 0, 0 };
+    if (!rc_be_pso_record(s_rc_dev, pd, s_vp_root_hash, &r->name, &r->d, &r->nel, code, len)) {
+        free(it);   /* (a pipeline no record holds) */
+        return;
     }
-    const D3D12_SHADER_BYTECODE* sh[2] = { &pd->VS, &pd->PS };
+    r->magic = PSO_REC_MAGIC; r->size = sizeof *r;
     u64* hs[2] = { &r->vs_hash, &r->ps_hash };
     u32* ls[2] = { &r->vs_len, &r->ps_len };
     for (int i = 0; i < 2; i++) {
-        *hs[i] = fnv_bytes(14695981039346656037ull, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
-        *ls[i] = (u32)sh[i]->BytecodeLength;
-        it->sh[i] = malloc(sh[i]->BytecodeLength ? sh[i]->BytecodeLength : 1);
+        *hs[i] = fnv_bytes(14695981039346656037ull, code[i], len[i]);
+        *ls[i] = len[i];
+        it->sh[i] = malloc(len[i] ? len[i] : 1);
         if (!it->sh[i]) { free(it->sh[0]); free(it); return; }
-        memcpy(it->sh[i], sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
+        memcpy(it->sh[i], code[i], len[i]);
     }
     InterlockedIncrement(&s_pso_man_pending);
     AcquireSRWLockExclusive(&s_pso_manq.lk);
@@ -366,49 +334,16 @@ static void pso_manifest_add(u64 name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
         }
     }
 }
-/* A manifest record as the GPU layer's description: the inverse of the D3D12
- * description the GPU layer makes of vp_fp_desc's (rc_be_pipeline_desc),
- * so the record's pipeline gets the name a draw's gets. 0 for a record no
+/* A manifest record as the GPU layer's description: the inverse of the
+ * record the instance makes of vp_fp_desc's (rc_be_pso_unrecord), so the
+ * record's pipeline gets the name a draw's gets. 0 for a record no
  * vp_fp_desc makes. */
 static int pso_rec_desc(const pso_rec* r, gpu_shader vs, gpu_shader ps, gpu_pipeline_desc* pd)
 {
-    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d = &r->desc;
-    const D3D12_RENDER_TARGET_BLEND_DESC* rt = &d->BlendState.RenderTarget[0];
-    if (r->nel > GPU_MAX_VERTEX_ATTRS || d->NumRenderTargets > 4) return 0;
-    memset(pd, 0, sizeof *pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    if (!rc_be_pso_unrecord(&r->d, r->nel, pd)) return 0;   /* (pd zeroed whole first) */
     pd->layout = s_d3d.vp_layout;
     pd->vs = vs;
     pd->ps = ps;
-    pd->vertex.count = r->nel;
-    pd->vertex.stride = r->nel ? 256 : 0;
-    for (u32 i = 0; i < r->nel; i++) {
-        snprintf(pd->vertex.attr[i].semantic, sizeof pd->vertex.attr[i].semantic, "%s", r->el[i].sem);
-        pd->vertex.attr[i].semantic_index = r->el[i].e.SemanticIndex;
-        pd->vertex.attr[i].format = (gpu_format)r->el[i].e.Format;
-        pd->vertex.attr[i].offset = r->el[i].e.AlignedByteOffset;
-    }
-    pd->topology_type = (u8)d->PrimitiveTopologyType;
-    pd->cull = (u8)d->RasterizerState.CullMode;
-    pd->front_ccw = d->RasterizerState.FrontCounterClockwise ? 1 : 0;
-    pd->depth_clip = d->RasterizerState.DepthClipEnable ? 1 : 0;
-    pd->multisample = d->RasterizerState.MultisampleEnable ? 1 : 0;
-    pd->depth_test = d->DepthStencilState.DepthEnable ? 1 : 0;
-    pd->depth_write = d->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 1 : 0;
-    pd->depth_func = (u8)d->DepthStencilState.DepthFunc;
-    pd->blend.enable = rt->BlendEnable ? 1 : 0;
-    pd->blend.src = (u8)rt->SrcBlend;
-    pd->blend.dst = (u8)rt->DestBlend;
-    pd->blend.op = (u8)rt->BlendOp;
-    pd->blend.src_alpha = (u8)rt->SrcBlendAlpha;
-    pd->blend.dst_alpha = (u8)rt->DestBlendAlpha;
-    pd->blend.op_alpha = (u8)rt->BlendOpAlpha;
-    pd->blend.write_mask = (u8)rt->RenderTargetWriteMask;
-    pd->nrt = d->NumRenderTargets;
-    for (u32 i = 0; i < pd->nrt; i++) pd->rt_format[i] = (gpu_format)d->RTVFormats[i];
-    pd->ds_format = (gpu_format)d->DSVFormat;
-    pd->samples = d->SampleDesc.Count;
-    pd->sample_mask = d->SampleMask;
-    pd->strip_cut = (u32)d->IBStripCutValue;
     return 1;
 }
 
@@ -462,10 +397,9 @@ static int pso_prebuild_one(const pso_rec* r)
     }
     gpu_pipeline_desc pd;
     if (!pso_rec_desc(r, sh[0], sh[1], &pd)) goto out;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
-    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-    rc_be_pipeline_desc(s_rc_dev, &pd, &dd, il);   /* (rsxc_d3d12.c) */
-    if (pso_desc_key(&dd) != r->name) goto out;   /* another build's layout, or a stale root signature */
+    /* (The instance file's name: another build's layout, or a stale root
+     * signature, names it otherwise.) */
+    if (rc_be_pso_name(s_rc_dev, &pd, s_vp_root_hash) != r->name) goto out;
     /* A record pipelines.n does not count may be in the library already:
      * one stored while the library was being saved, or a crash between the
      * two files. It is loaded then, not built. Either way only the library
@@ -551,8 +485,7 @@ static void pso_lib_tick(void)
 }
 /* A guest-FP pipeline (vp_get_fp_pso, psj's workers): the GPU layer's, which
  * loads it from its library or compiles and stores it. One it compiled goes
- * into the manifest under today's name, pso_desc_key of the D3D12
- * description the GPU layer made of it (rc_be_pipeline_desc, on this miss
+ * into the manifest under today's name (rc_be_pso_record, on this miss
  * path only). None on failure. Thread-safe. */
 static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
 {
@@ -565,10 +498,7 @@ static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
         InterlockedIncrement(&s_pso_lib_new);
         s_pso_lib_quiet = 0;
     }
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
-    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-    rc_be_pipeline_desc(s_rc_dev, pd, &dd, il);
-    pso_manifest_add(pso_desc_key(&dd), &dd);
+    pso_manifest_add(pd);
     return pso;
 }
 

@@ -42,6 +42,8 @@ static struct {
     int   frame_t;               /* T's slot for this batch's blit, -1: none */
 } s_hdr = { .frame_t = -1 };
 
+#include "rsxc_display.h"
+
 static int knob_hdr(void)       { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_HDR", 0)); return v; }
 static int knob_hdr_white(void) { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_HDR_WHITE", 0)); return v; }
 static int knob_hdr_peak(void)  { static int v = -1; PS3_KNOB(v, ps3_env_int("RSX_HDR_PEAK", 0)); return v; }
@@ -62,90 +64,26 @@ static float hdr_peak_nits(void)
 }
 
 #ifdef _WIN32
-/* DISPLAYCONFIG_SDR_WHITE_LEVEL, declared here: wingdi.h has it only for a
- * newer target Windows version than this file asks for. */
-typedef struct { DISPLAYCONFIG_DEVICE_INFO_HEADER header; ULONG level; } HdrSdrWhite;
-
-/* Windows' SDR white level ("SDR content brightness") on the display with
- * this GDI device name, in nits; 0 when not known. */
-static float hdr_sdr_white(const WCHAR* gdi)
-{
-    UINT32 np = 0, nm = 0;
-    float nits = 0.0f;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS || !np) return 0.0f;
-    DISPLAYCONFIG_PATH_INFO* pi = (DISPLAYCONFIG_PATH_INFO*)calloc(np, sizeof *pi);
-    DISPLAYCONFIG_MODE_INFO* mi = (DISPLAYCONFIG_MODE_INFO*)calloc(nm ? nm : 1, sizeof *mi);
-    if (pi && mi && QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, pi, &nm, mi, NULL) == ERROR_SUCCESS) {
-        for (UINT32 i = 0; i < np && nits == 0.0f; i++) {
-            DISPLAYCONFIG_SOURCE_DEVICE_NAME sn;
-            memset(&sn, 0, sizeof sn);
-            sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            sn.header.size = sizeof sn;
-            sn.header.adapterId = pi[i].sourceInfo.adapterId;
-            sn.header.id = pi[i].sourceInfo.id;
-            if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS || wcscmp(sn.viewGdiDeviceName, gdi))
-                continue;
-            HdrSdrWhite wl;
-            memset(&wl, 0, sizeof wl);
-            wl.header.type = (DISPLAYCONFIG_DEVICE_INFO_TYPE)11;   /* ..._GET_SDR_WHITE_LEVEL */
-            wl.header.size = sizeof wl;
-            wl.header.adapterId = pi[i].targetInfo.adapterId;
-            wl.header.id = pi[i].targetInfo.id;
-            if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS) nits = (float)wl.level / 1000.0f * 80.0f;
-        }
-    }
-    free(pi);
-    free(mi);
-    return nits;
-}
-
-/* What the display the window is on reports. A new factory each time: one
- * keeps describing the outputs as they were when it was made. */
-static IDXGIFactory1* s_hdr_factory;
-static HMONITOR s_hdr_mon;
+/* What the display the window is on reports (step C8b: the system's
+ * display code, rsxc_display_win.c, which reads DXGI's outputs for every
+ * backend on Windows; with no window, as on a headless backend, no HDR). */
 static void hdr_display_query(void)
 {
-    s_hdr.disp_hdr = 0;
-    s_hdr.disp_peak = s_hdr.disp_white = 0.0f;
+    rsxc_display_hdr dh;
+    rsxc_display_hdr_query(s_d3d.hwnd, &dh);
+    s_hdr.disp_hdr = dh.hdr;
+    s_hdr.disp_peak = dh.peak;
+    s_hdr.disp_white = dh.white;
     s_hdr.failed = 0;
-    if (s_hdr_factory) s_hdr_factory->lpVtbl->Release(s_hdr_factory);
-    s_hdr_factory = NULL;
-    s_hdr_mon = MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST);
-    if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) {
-        s_hdr_factory = NULL;
-        return;
-    }
-    IDXGIAdapter1* a = NULL;
-    for (UINT i = 0; s_hdr_factory->lpVtbl->EnumAdapters1(s_hdr_factory, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-        IDXGIOutput* o = NULL;
-        for (UINT k = 0; a->lpVtbl->EnumOutputs(a, k, &o) != DXGI_ERROR_NOT_FOUND; k++) {
-            DXGI_OUTPUT_DESC d;
-            IDXGIOutput6* o6 = NULL;
-            if (SUCCEEDED(o->lpVtbl->GetDesc(o, &d)) && d.Monitor == s_hdr_mon &&
-                SUCCEEDED(o->lpVtbl->QueryInterface(o, &IID_IDXGIOutput6, (void**)&o6))) {
-                DXGI_OUTPUT_DESC1 d1;
-                if (SUCCEEDED(o6->lpVtbl->GetDesc1(o6, &d1))) {
-                    s_hdr.disp_hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                    s_hdr.disp_peak = d1.MaxLuminance;
-                    s_hdr.disp_white = hdr_sdr_white(d1.DeviceName);
-                }
-                o6->lpVtbl->Release(o6);
-            }
-            o->lpVtbl->Release(o);
-        }
-        a->lpVtbl->Release(a);
-    }
 }
 
 /* Between frames, with RSX_HDR on: asks again when the window moved to
- * another display, the display setup changed (the factory is no longer
- * current: HDR switched in Windows, a display added), or the window was
- * activated (the SDR white level may have moved meanwhile). */
+ * another display, the display setup changed (HDR switched in Windows, a
+ * display added), or the window was activated (the SDR white level may
+ * have moved meanwhile). */
 static void hdr_display_check(void)
 {
-    if (!InterlockedExchange(&s_hdr_requery, 0) && s_hdr_factory &&
-        MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST) == s_hdr_mon &&
-        s_hdr_factory->lpVtbl->IsCurrent(s_hdr_factory))
+    if (!InterlockedExchange(&s_hdr_requery, 0) && rsxc_display_hdr_current(s_d3d.hwnd))
         return;
     hdr_display_query();
     printf("[D3D12] HDR: the window's display has HDR %s (peak %.0f nits, SDR white %.0f nits)\n",
@@ -634,22 +572,11 @@ static void dred_report(const char* where);
  * its last frame (Demon's Souls issue #205) and the overlay can make no
  * textures. Every fence reads as done at once, so no wait notices it, and
  * Present's result was never looked at: the only trace was the overlay's.
- * Said once, with Windows' reason; rc_device_lost() hands the reason
- * to the host (its problem report). */
+ * Said once, with Windows' reason (the instance file's rc_be_lost_text)
+ * and its breadcrumbs knob (rc_be_lost_hint); rc_device_lost() hands the
+ * reason to the host (its problem report). */
 static volatile LONG s_device_lost;      /* GetDeviceRemovedReason, 0 while the device works */
 static volatile LONG64 s_device_lost_qpc;
-
-static const char* removed_reason_text(HRESULT rr)
-{
-    switch ((unsigned long)rr) {
-    case 0x887A0006ul: return "the GPU stopped responding and the driver was reset (DXGI_ERROR_DEVICE_HUNG)";
-    case 0x887A0005ul: return "the GPU was removed or its driver changed (DXGI_ERROR_DEVICE_REMOVED)";
-    case 0x887A0007ul: return "the device was reset after a bad command (DXGI_ERROR_DEVICE_RESET)";
-    case 0x887A0020ul: return "an internal driver error (DXGI_ERROR_DRIVER_INTERNAL_ERROR)";
-    case 0x8007000Eul: return "the GPU ran out of memory (E_OUTOFMEMORY)";
-    default: return "an unknown reason";
-    }
-}
 
 static void check_device(const char* where)
 {
@@ -661,8 +588,8 @@ static void check_device(const char* where)
     InterlockedExchange64(&s_device_lost_qpc, q.QuadPart);
     if (InterlockedCompareExchange(&s_device_lost, (LONG)rr, 0) != 0) return;
     fprintf(stderr, "[D3D12] the graphics device was lost (seen at %s): %s, 0x%08lX. Nothing more can be"
-            " drawn, so the picture stays as it is; the game needs a restart. D3D12_DRED=1 on the next run"
-            " says where the GPU was.%c", where, removed_reason_text(rr), (unsigned long)rr, 10);
+            " drawn, so the picture stays as it is; the game needs a restart.%s%c", where,
+            rc_be_lost_text((u32)rr), (unsigned long)rr, rc_be_lost_hint, 10);
     dred_report(where);
 }
 

@@ -274,7 +274,7 @@ static int wbg_ready(void)
      * sees zeros in pages it never wrote, as it did on first touch). */
     if (!VirtualAlloc(win, WBG_SIZE, MEM_COMMIT, PAGE_READWRITE)) return 0;
     /* The heap over it and the buffer placed on it are the GPU layer's (step
-     * C5b), in COPY_DEST. Without GPU_CAP_HOST_IMPORT (no ID3D12Device3) it
+     * C5b), in COPY_DEST. Without GPU_CAP_HOST_IMPORT (on D3D12: no Device3) it
      * says nothing, as today; otherwise its own line says which call failed. */
     s_wbg.buf = gpu_buffer_import_host(s_rc_dev, win, WBG_SIZE);
     if (!GPU_VALID(s_wbg.buf)) {
@@ -579,7 +579,8 @@ static void off_rt_drop_rewritten(void)
  * names one texture for the device's life, so no stamp is needed: today's
  * memo rewrote every window after any resource was made, and those rewrites
  * of an unchanged view are the only ones skipped as well. It is always on
- * (RSX_SRV_MEMO=0 is gone). Inline: the compare is gpu_d3d12_cmd.h's, only
+ * (RSX_SRV_MEMO=0 is gone). Inline: the compare is the backend's command
+ * header's (the instance includes it), only
  * a write calls out. Through the pool's writer, found once at init (step
  * C8a): the 16 calls of a draw look nothing up before the memo. */
 static void srv_write_ex(u32 heap_slot, gpu_texture tex, gpu_format fmt,
@@ -603,7 +604,7 @@ static void srv_write(u32 heap_slot, gpu_texture tex, gpu_format fmt, u32 swizzl
     srv_write_ex(heap_slot, tex, fmt, swizzle, 0);
 }
 
-/* On the frame's recorder (step C5b). Inline (gpu_d3d12_cmd.h), so a draw's
+/* On the frame's recorder (step C5b). Inline (the backend's command header), so a draw's
  * transition is today's one call. */
 static void off_rt_transition(int slot, gpu_state to)
 {

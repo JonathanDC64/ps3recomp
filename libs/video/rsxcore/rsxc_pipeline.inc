@@ -323,12 +323,9 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
         gpu_pipeline_desc pd;
         vp_fp_desc(&pd, vs, (int)it->fetch, ps, it->clamp ? gs : none,
                    it->blend, (int)it->nrt, (gpu_format)it->rtfmt, it->cmask, it->cull, it->depth);
-        /* Its manifest name: pso_desc_key of the D3D12 description the GPU
-         * layer makes of it (today's). */
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
-        D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
-        rc_be_pipeline_desc(s_rc_dev, &pd, &dd, il);
-        const u64 key = pso_desc_key(&dd);
+        /* Its manifest name (the instance file's: on D3D12 today's,
+         * pso_desc_key of the D3D12 description the backend makes of it). */
+        const u64 key = rc_be_pso_name(s_rc_dev, &pd, s_vp_root_hash);
         AcquireSRWLockShared(&s_pso_man_lock);
         const int known = pso_names_has(key);   /* the manifest's: its startup build saw to it */
         ReleaseSRWLockShared(&s_pso_man_lock);
@@ -340,7 +337,7 @@ static int pxi_build_one(const PxiItem* it, gpu_shader gs)
             if (how == GPU_PIPELINE_LOADED) r = 0;
             else if (how != GPU_PIPELINE_FAILED) {
                 if (how == GPU_PIPELINE_STORED) InterlockedIncrement(&s_pso_lib_new);   /* stored in the library */
-                pso_manifest_add(key, &dd);
+                pso_manifest_add(&pd);
                 r = 1;
             }
         }

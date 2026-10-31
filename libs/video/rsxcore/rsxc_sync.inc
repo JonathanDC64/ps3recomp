@@ -2,7 +2,8 @@
  * Frame sync helpers
  * -----------------------------------------------------------------------*/
 
-/* D3D12_DRED=1: on the first device removal, the reason, the command history
+/* With the breadcrumbs knob (rc_be_breadcrumbs): on the first device
+ * removal, the reason, the command history
  * around the last completed breadcrumb and the page-fault address, printed by
  * the GPU layer (gpu_fault_report: today's dred_list and dred_report, in the
  * D3D12 backend), once. */
@@ -41,7 +42,7 @@ static void wait_for_gpu(void)
 /* RSX_HANG_GPU_AT_FRAME=<n> (a test): the first indexed draw of the n-th
  * batch is drawn over and over, about 4G vertices in all, so the GPU takes
  * far longer than Windows' 2 s and the driver resets it, as it does for a
- * GPU that hangs; then D3D12_DRED=1 shows what it says of a real hang (a
+ * GPU that hangs; then the breadcrumbs show what they say of a real hang (a
  * removed device, as RSX_LOSE_DEVICE_AT_FRAME makes, has no command
  * history). It resets the adapter: run it on a GPU no display needs
  * (CELLMARK_IGPU=1). Read once. */
@@ -60,7 +61,7 @@ static UINT hang_test_instances(u32 index_count)
 }
 
 /* RSX_LOSE_DEVICE_AT_FRAME=<n> (a test): the device is removed on purpose
- * (ID3D12Device5::RemoveDevice: the instance file's rc_be_lose_device) at
+ * (the instance file's rc_be_lose_device: on D3D12, RemoveDevice) at
  * the n-th frame, as a driver reset would lose it, to see what follows: the
  * log line, the host's dialog. Read once. */
 static void lose_device_test(void)

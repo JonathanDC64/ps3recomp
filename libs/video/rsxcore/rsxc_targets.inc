@@ -71,8 +71,9 @@ static u32 late_fp_sum(const D3D12DrawRecord* dr)
 }
 
 #ifdef _WIN32
-/* D3D12_DRED=1: a marker before each draw. DRED 1.2 keeps its text with the
- * command history, so dred_report can name the draw the GPU stopped on: its
+/* With the breadcrumbs knob (rc_be_breadcrumbs): a marker before each draw.
+ * DRED 1.2 keeps its text with the command history, so dred_report can
+ * name the draw the GPU stopped on: its
  * record, its two programs (the pipeline index's fingerprints, which match
  * the game's own shader files), its target, depth surface and size, and its
  * first texture. */
@@ -97,7 +98,7 @@ static u64 dred_fp64(u32 fp_addr)
 static void dred_mark(u32 d, const D3D12DrawRecord* dr)   /* on the frame's recorder (step C7) */
 {
     static int on = -1;
-    if (on < 0) on = getenv("D3D12_DRED") ? 1 : 0;
+    if (on < 0) on = rc_be_breadcrumbs();
     if (!on) return;
     const u64 vp = (dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[dr->vs_idx].code64 : 0;
     char a[256];

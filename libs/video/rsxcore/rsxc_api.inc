@@ -43,12 +43,14 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
                  title ? title : "ps3recomp");
     }
-    s_d3d.hwnd = open_window(width, height, title);
-    if (!s_d3d.hwnd) {
+    /* (A headless backend, rc_be_headless, presents into its swap chain's
+     * images with no window: step C8b.) */
+    s_d3d.hwnd = rc_be_headless ? NULL : open_window(width, height, title);
+    if (!s_d3d.hwnd && !rc_be_headless) {
         printf("[D3D12] ERROR: Window creation failed\n");
         return -1;
     }
-    session_lock_init(s_d3d.hwnd);
+    if (s_d3d.hwnd) session_lock_init(s_d3d.hwnd);
 
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
@@ -414,22 +416,23 @@ static void rc_set_borderless(int on)
 #endif
 }
 static int      rc_borderless(void)   { return s_borderless; }
-/* Step C8a: the menu renderer takes the device, the queue and the swap
- * chain's buffers as native objects, and the overlay's frame callback the
- * buffer it draws over: the GPU layer's own (gpu_native), borrowed as
- * today's were. This is the one place the core reaches a native object. */
-static void*    rc_device(void)       { return s_rc_dev ? gpu_native(s_rc_dev, GPU_NATIVE_DEVICE, 0) : NULL; }
-static void*    rc_queue(void)        { return s_rc_dev ? gpu_native(s_rc_dev, GPU_NATIVE_QUEUE, 0) : NULL; }
+/* The menu renderer takes the device, the queue and the swap chain's
+ * buffers as the backend's own objects, and the overlay's frame callback
+ * the buffer it draws over: the instance file's hooks (step C8b:
+ * rc_be_device, rc_be_queue, rc_be_image; on D3D12 the GPU layer's own,
+ * borrowed as today's were; none where the menu has no renderer). */
+static void*    rc_device(void)       { return s_rc_dev ? rc_be_device(s_rc_dev) : NULL; }
+static void*    rc_queue(void)        { return s_rc_dev ? rc_be_queue(s_rc_dev) : NULL; }
 static void*    rc_back_buffer(unsigned i)
 {
     if (i >= FRAME_COUNT || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
-    return gpu_native(s_rc_dev, GPU_NATIVE_TEXTURE, s_rc_swap_image[i].id);
+    return rc_be_image(s_rc_dev, s_rc_swap_image[i]);
 }
 static void rc_overlay_frame(u32 fi)
 {
     s_overlay.frame(s_overlay.user, rc_back_buffer(fi), fi, s_d3d.win_w, s_d3d.win_h);
 }
-/* (The end of the menu's native objects.) */
+/* (The end of the menu's objects.) */
 static long     rc_device_lost(long long* qpc)
 {
     if (qpc) *qpc = s_device_lost_qpc;

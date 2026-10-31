@@ -496,7 +496,8 @@ rtt_dump_done:;
     RF_CP(4); rf_pp_snap(s_rf_pp, s_rf_ppn);
 
     /* From here to the submit, the commands are the GPU layer's inline ones
-     * (gpu_d3d12_cmd.h: today's D3D12 calls) on the frame's recorder, rc
+     * (the backend's command header; on D3D12 today's calls) on the frame's
+     * recorder, rc
      * (step C7). Nothing between begins another. */
     gpu_cmd* const rc = s_rc_cmd;
 
@@ -1368,7 +1369,7 @@ skip_dump_consider: ;
     if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
     zq_finish();
 
-    /* (D3D12_IQ's drain of the debug layer's message queue is not copied:
+    /* (The drain of the debug layer's message queue is not copied:
      * this route never enables the debug layer, so the queue holds nothing;
      * call map G16.) */
 

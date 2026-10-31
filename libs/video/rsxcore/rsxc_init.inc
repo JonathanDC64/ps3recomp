@@ -87,18 +87,19 @@ static int depth_buffer_make(void)
 static int init_d3d12(u32 width, u32 height)
 {
     /* The device, its queue, a recorder per frame slot and the fence: the GPU
-     * layer's D3D12 backend, with today's choices. D3D12_DRED=1: Device
-     * Removed Extended Data (auto-breadcrumbs, page faults, the draws'
-     * markers), which gpu_fault_report prints once the device is lost.
+     * layer's backend, with today's choices. Its breadcrumbs knob
+     * (rc_be_breadcrumbs; on D3D12 Device Removed Extended Data:
+     * auto-breadcrumbs, page faults, the draws' markers), which
+     * gpu_fault_report prints once the device is lost.
      * CELLMARK_IGPU: the low-power adapter (for A/B testing a suspected
      * iGPU-driver stall); else the high-performance one, software adapters
      * skipped, the default adapter last. The debug layer is never enabled on
-     * this route (D3D12_DBG and debug builds included). The backend's device
-     * is made by the instance file (rc_be_create: rsxc_d3d12.c). */
+     * this route (its debug knob and debug builds included). The backend's
+     * device is made by the instance file (rc_be_create). */
     {
         gpu_device_desc dd;
         memset(&dd, 0, sizeof dd);
-        if (getenv("D3D12_DRED")) dd.flags |= GPU_DEVICE_BREADCRUMBS;
+        if (rc_be_breadcrumbs()) dd.flags |= GPU_DEVICE_BREADCRUMBS;
         if (getenv("CELLMARK_IGPU")) dd.flags |= GPU_DEVICE_LOW_POWER;
         dd.cmd_slots = FRAME_COUNT;
         s_rc_dev = rc_be_create(&dd);
@@ -256,7 +257,7 @@ static int init_d3d12(u32 width, u32 height)
          * s_vp_root_hash, and with it every pipeline's name in the manifest
          * (pso_desc_key), is today's too. */
         s_d3d.vp_layout = lay_make(&ld);
-        s_vp_root_hash = rc_be_layout_hash(s_rc_dev, s_d3d.vp_layout);   /* (rsxc_d3d12.c) */
+        s_vp_root_hash = rc_be_layout_hash(s_rc_dev, s_d3d.vp_layout);   /* (the instance file's) */
 
         /* raw float4 vertex buffer + constant bank (both UPLOAD, persistently
          * mapped): the GPU layer's upload buffers (step C2, rc_buf_make) */

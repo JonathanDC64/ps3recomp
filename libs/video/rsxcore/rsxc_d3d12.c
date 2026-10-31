@@ -5,9 +5,9 @@
  * portable renderer: today's renderer, libs/video/rsx_d3d12_backend.c, copied
  * word for word into the .inc fragments of this folder and compiled here as
  * one translation unit, so it draws exactly the frames the d3d12 route draws.
- * The steps after it move the fragments onto the GPU layer (gpu.h) one piece
- * at a time, checking the frames against captures after each; rsxc_vk.c and
- * rsxc_null.c will include the same fragments after their backend's own
+ * The steps after it moved the fragments onto the GPU layer (gpu.h) one piece
+ * at a time, checking the frames against captures after each. rsxc_null.c
+ * (and rsxc_vk.c, later) include the same fragments after their backend's own
  * static inline command header, so the draw loop makes direct calls on every
  * backend.
  *
@@ -18,31 +18,52 @@
  * the copy and owns them. Statics keep their names. So this file exports one
  * symbol, the route table at the end.
  *
+ * The fragments name no backend (step C8b): what the core needs of D3D12
+ * beyond gpu.h is in this file, as the rc_be_* hooks below, and only this
+ * file includes D3D12's headers (through the backend's).
+ *
  * Windows only for now: off Windows the new path's backend is Vulkan, later.
  */
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
 
 #include "rsxc_head.inc"
 /* The GPU layer, with the D3D12 backend's static inline commands (the draw
- * loop calls them directly) and, while the conversion runs, its bridges. */
+ * loop calls them directly), and the backend's own calls the hooks make. */
 #include "gpu_d3d12_cmd.h"
 #include "gpu_d3d12_bridge.h"
 
-/* What the core needs of its backend that gpu.h does not give (step C8a):
- * the fragments call these, and only this file names the backend. */
+/* ---------------------------------------------------------------------------
+ * The backend's hooks: what the fragments need of their backend that gpu.h
+ * does not give. Every instance defines the same set (rsxc_null.c too).
+ * -------------------------------------------------------------------------*/
+
 /* The device (init_d3d12). */
 static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_d3d12_create(dd); }
-/* A layout's serialized bytes' hash, part of every pipeline's name in
- * pso_manifest.bin (s_vp_root_hash, pso_desc_key). */
-static u64 rc_be_layout_hash(gpu_device* d, gpu_layout l) { return gpu_d3d12_layout_hash(d, l); }
-/* The D3D12 description the backend makes of pd: pso_manifest.bin's records
- * are these, shared with the d3d12 route (pso_desc_key, pso_rec). */
-static void rc_be_pipeline_desc(gpu_device* d, const gpu_pipeline_desc* pd,
-                                D3D12_GRAPHICS_PIPELINE_STATE_DESC* out,
-                                D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS])
+
+/* A window to present into (rc_backend_init): 0, today's window. */
+static const int rc_be_headless = 0;
+
+/* D3D12_DRED=1: Device Removed Extended Data, the device's breadcrumbs
+ * (auto-breadcrumbs, page faults and the draws' markers, which
+ * gpu_fault_report prints once the device is lost). rc_be_lost_hint ends
+ * check_device's line with the knob. */
+static int rc_be_breadcrumbs(void) { return getenv("D3D12_DRED") ? 1 : 0; }
+static const char rc_be_lost_hint[] = " D3D12_DRED=1 on the next run says where the GPU was.";
+
+/* Why the device was lost, from gpu_lost's reason (GetDeviceRemovedReason's
+ * HRESULT), for check_device's line. */
+static const char* rc_be_lost_text(u32 reason)
 {
-    gpu_d3d12_pipeline_d3d_desc(d, pd, out, il);
+    switch ((unsigned long)reason) {
+    case 0x887A0006ul: return "the GPU stopped responding and the driver was reset (DXGI_ERROR_DEVICE_HUNG)";
+    case 0x887A0005ul: return "the GPU was removed or its driver changed (DXGI_ERROR_DEVICE_REMOVED)";
+    case 0x887A0007ul: return "the device was reset after a bad command (DXGI_ERROR_DEVICE_RESET)";
+    case 0x887A0020ul: return "an internal driver error (DXGI_ERROR_DRIVER_INTERNAL_ERROR)";
+    case 0x8007000Eul: return "the GPU ran out of memory (E_OUTOFMEMORY)";
+    default: return "an unknown reason";
+    }
 }
+
 /* RSX_LOSE_DEVICE_AT_FRAME (lose_device_test): the device removed on purpose
  * at frame `frames`, as a driver reset would lose it. */
 static void rc_be_lose_device(gpu_device* d, int frames)
@@ -56,29 +77,146 @@ static void rc_be_lose_device(gpu_device* d, int frames)
     }
 }
 
-#include "rsxc_state.inc"
-#include "rsxc_shadercache.inc"   /* (before the first fragment that compiles a shader) */
-#include "rsxc_window.inc"
-#include "rsxc_hdr.inc"
-#include "rsxc_init.inc"
-#include "rsxc_sync.inc"
-#include "rsxc_present.inc"
-#include "rsxc_cap.inc"
-#include "rsxc_psolib.inc"
-#include "rsxc_vs.inc"
-#include "rsxc_fp.inc"
-#include "rsxc_pipeline.inc"
-#include "rsxc_texture.inc"
-#include "rsxc_targets.inc"
-#include "rsxc_writeback.inc"
-#include "rsxc_zpass.inc"
-#include "rsxc_diag.inc"
-#include "rsxc_post.inc"
-#include "rsxc_frame.inc"
-#include "rsxc_record.inc"
-#include "rsxc_vertex.inc"
-#include "rsxc_record2.inc"
-#include "rsxc_api.inc"
+/* The menu renderer (the port's, D3D12 only until it is ported) takes the
+ * device, the queue and the swap chain's images as native objects
+ * (rsxc_api.inc: rc_device, rc_queue, rc_back_buffer and the overlay's
+ * frame): the GPU layer's own, borrowed as today's were. */
+static void* rc_be_device(gpu_device* d) { return gpu_native(d, GPU_NATIVE_DEVICE, 0); }
+static void* rc_be_queue(gpu_device* d)  { return gpu_native(d, GPU_NATIVE_QUEUE, 0); }
+static void* rc_be_image(gpu_device* d, gpu_texture t) { return gpu_native(d, GPU_NATIVE_TEXTURE, t.id); }
+
+/* The pipeline library's folder in the shader cache: <cache>/gpu/d3d12/
+ * (pipelines.lib, pipelines.n, index.built: rsxc_psolib.inc). */
+static const char rc_be_lib_dir[] = "d3d12";
+
+/* A layout's serialized bytes' hash, part of every pipeline's name in
+ * pso_manifest.bin (s_vp_root_hash). */
+static u64 rc_be_layout_hash(gpu_device* d, gpu_layout l) { return gpu_d3d12_layout_hash(d, l); }
+
+/* pso_manifest.bin's records (rsxc_psolib.inc) hold the d3d12 route's
+ * description of a pipeline, so the two routes share the file: the D3D12
+ * description the backend makes of the GPU layer's (call map F, G8), with
+ * its pointers zeroed, and its input layout. The record's header is the
+ * core's. */
+typedef struct rc_be_pso_desc {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc;   /* pointers zeroed */
+    struct { char sem[16]; D3D12_INPUT_ELEMENT_DESC e; } el[16];
+} rc_be_pso_desc;
+
+/* A pipeline's name in the manifest, today's: FNV-1a 64 over the root
+ * signature's serialized bytes (layout_hash: every caller passes
+ * vp_layout's), the description without its pointers, the shaders' code and
+ * the input layout. Callers zero the whole description first, so padding
+ * hashes the same every run. */
+static u64 pso_desc_key(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, u64 layout_hash)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC c;
+    memcpy(&c, pd, sizeof c);
+    c.pRootSignature = NULL;
+    c.VS.pShaderBytecode = c.PS.pShaderBytecode = c.DS.pShaderBytecode = NULL;
+    c.HS.pShaderBytecode = c.GS.pShaderBytecode = NULL;
+    c.StreamOutput.pSODeclaration = NULL; c.StreamOutput.pBufferStrides = NULL;
+    c.InputLayout.pInputElementDescs = NULL; c.CachedPSO.pCachedBlob = NULL;
+    u64 h = gpu_d3d12_fnv(14695981039346656037ull, &layout_hash, sizeof layout_hash);
+    h = gpu_d3d12_fnv(h, &c, sizeof c);
+    const D3D12_SHADER_BYTECODE* sh[5] = { &pd->VS, &pd->PS, &pd->DS, &pd->HS, &pd->GS };
+    for (int i = 0; i < 5; i++)
+        if (sh[i]->pShaderBytecode) h = gpu_d3d12_fnv(h, sh[i]->pShaderBytecode, sh[i]->BytecodeLength);
+    for (UINT i = 0; i < pd->InputLayout.NumElements; i++) {
+        D3D12_INPUT_ELEMENT_DESC e = pd->InputLayout.pInputElementDescs[i];
+        h = gpu_d3d12_fnv(h, e.SemanticName, strlen(e.SemanticName));
+        e.SemanticName = NULL;
+        h = gpu_d3d12_fnv(h, &e, sizeof e);
+    }
+    return h;
+}
+
+/* pd's name in the manifest (pso_desc_key of the D3D12 description the
+ * backend makes of it). */
+static u64 rc_be_pso_name(gpu_device* d, const gpu_pipeline_desc* pd, u64 layout_hash)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
+    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
+    gpu_d3d12_pipeline_d3d_desc(d, pd, &dd, il);
+    return pso_desc_key(&dd, layout_hash);
+}
+
+/* pd as a manifest record: its name, its description (rec) and input
+ * layout's length (nel), and its two shaders' code (VS, PS: the backend's
+ * copies, valid while the shaders live). 0 when a record cannot hold it: a
+ * geometry, hull or domain shader, no vertex or pixel shader, more than 16
+ * input elements, stream output. */
+static int rc_be_pso_record(gpu_device* d, const gpu_pipeline_desc* pd, u64 layout_hash, u64* name,
+                            rc_be_pso_desc* rec, u32* nel, const void* code[2], u32 len[2])
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC dd;
+    D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
+    gpu_d3d12_pipeline_d3d_desc(d, pd, &dd, il);
+    if (dd.DS.pShaderBytecode || dd.HS.pShaderBytecode || dd.GS.pShaderBytecode ||
+        !dd.VS.pShaderBytecode || !dd.PS.pShaderBytecode || dd.InputLayout.NumElements > 16 ||
+        dd.StreamOutput.NumEntries)
+        return 0;
+    *name = pso_desc_key(&dd, layout_hash);
+    memcpy(&rec->desc, &dd, sizeof rec->desc);
+    rec->desc.pRootSignature = NULL;
+    rec->desc.VS.pShaderBytecode = rec->desc.PS.pShaderBytecode = NULL;
+    rec->desc.InputLayout.pInputElementDescs = NULL;
+    rec->desc.CachedPSO.pCachedBlob = NULL; rec->desc.CachedPSO.CachedBlobSizeInBytes = 0;
+    *nel = dd.InputLayout.NumElements;
+    for (u32 i = 0; i < *nel; i++) {
+        rec->el[i].e = dd.InputLayout.pInputElementDescs[i];
+        snprintf(rec->el[i].sem, sizeof rec->el[i].sem, "%s", rec->el[i].e.SemanticName);
+        rec->el[i].e.SemanticName = NULL;
+    }
+    code[0] = dd.VS.pShaderBytecode; len[0] = (u32)dd.VS.BytecodeLength;
+    code[1] = dd.PS.pShaderBytecode; len[1] = (u32)dd.PS.BytecodeLength;
+    return 1;
+}
+
+/* A record back as the GPU layer's description, all but its layout and
+ * shaders (the caller's): the inverse of the D3D12 description the backend
+ * makes of vp_fp_desc's, so the record's pipeline gets the name a draw's
+ * gets. pd is zeroed first. 0 for a record no vp_fp_desc makes. */
+static int rc_be_pso_unrecord(const rc_be_pso_desc* rec, u32 nel, gpu_pipeline_desc* pd)
+{
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d = &rec->desc;
+    const D3D12_RENDER_TARGET_BLEND_DESC* rt = &d->BlendState.RenderTarget[0];
+    if (nel > GPU_MAX_VERTEX_ATTRS || d->NumRenderTargets > 4) return 0;
+    memset(pd, 0, sizeof *pd);   /* zeroed whole: the GPU layer names the pipeline by its bytes */
+    pd->vertex.count = nel;
+    pd->vertex.stride = nel ? 256 : 0;
+    for (u32 i = 0; i < nel; i++) {
+        snprintf(pd->vertex.attr[i].semantic, sizeof pd->vertex.attr[i].semantic, "%s", rec->el[i].sem);
+        pd->vertex.attr[i].semantic_index = rec->el[i].e.SemanticIndex;
+        pd->vertex.attr[i].format = (gpu_format)rec->el[i].e.Format;
+        pd->vertex.attr[i].offset = rec->el[i].e.AlignedByteOffset;
+    }
+    pd->topology_type = (u8)d->PrimitiveTopologyType;
+    pd->cull = (u8)d->RasterizerState.CullMode;
+    pd->front_ccw = d->RasterizerState.FrontCounterClockwise ? 1 : 0;
+    pd->depth_clip = d->RasterizerState.DepthClipEnable ? 1 : 0;
+    pd->multisample = d->RasterizerState.MultisampleEnable ? 1 : 0;
+    pd->depth_test = d->DepthStencilState.DepthEnable ? 1 : 0;
+    pd->depth_write = d->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL ? 1 : 0;
+    pd->depth_func = (u8)d->DepthStencilState.DepthFunc;
+    pd->blend.enable = rt->BlendEnable ? 1 : 0;
+    pd->blend.src = (u8)rt->SrcBlend;
+    pd->blend.dst = (u8)rt->DestBlend;
+    pd->blend.op = (u8)rt->BlendOp;
+    pd->blend.src_alpha = (u8)rt->SrcBlendAlpha;
+    pd->blend.dst_alpha = (u8)rt->DestBlendAlpha;
+    pd->blend.op_alpha = (u8)rt->BlendOpAlpha;
+    pd->blend.write_mask = (u8)rt->RenderTargetWriteMask;
+    pd->nrt = d->NumRenderTargets;
+    for (u32 i = 0; i < pd->nrt; i++) pd->rt_format[i] = (gpu_format)d->RTVFormats[i];
+    pd->ds_format = (gpu_format)d->DSVFormat;
+    pd->samples = d->SampleDesc.Count;
+    pd->sample_mask = d->SampleMask;
+    pd->strip_cut = (u32)d->IBStripCutValue;
+    return 1;
+}
+
+#include "rsxc_core.inc"
 
 #include "rsx_out.h"
 
