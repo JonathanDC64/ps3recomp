@@ -256,9 +256,92 @@ static void chain_drop(gpu_vk_device* dd, gpu_vk_swap* s)
         s->image_sem[i] = s->done_sem[i] = VK_NULL_HANDLE;
         s->present_fence[i] = VK_NULL_HANDLE;
         s->fence_pending[i] = 0;
+        if (s->blit_fence[i]) dd->vk.vkDestroyFence(dd->device, s->blit_fence[i], NULL);
+        s->blit_fence[i] = VK_NULL_HANDLE;
+        s->blit_cb[i] = VK_NULL_HANDLE;
     }
+    if (s->blit_pool) dd->vk.vkDestroyCommandPool(dd->device, s->blit_pool, NULL);   /* (and its recorders) */
+    s->blit_pool = VK_NULL_HANDLE;
     s->nimages = 0;
     s->current = -1;
+}
+
+/* ---- step L1 ---- */
+/* Can an RGBA8 swap chain be a BGRA8 one with the frame blitted in: the
+ * surface has BGRA8 images that take a copy, and the device blits between
+ * the two. */
+static int shadow_ok(gpu_vk_device* dd, const gpu_vk_swap* s, const VkSurfaceCapabilitiesKHR* caps)
+{
+    VkFormatProperties src, dst;
+    if (s->vkfmt != VK_FORMAT_R8G8B8A8_UNORM || s->cs != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ||
+        !(caps->supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !surface_has(dd, s, VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR))
+        return 0;
+    vkGetPhysicalDeviceFormatProperties(dd->phys, VK_FORMAT_R8G8B8A8_UNORM, &src);
+    vkGetPhysicalDeviceFormatProperties(dd->phys, VK_FORMAT_B8G8R8A8_UNORM, &dst);
+    return (src.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) &&
+           (dst.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
+}
+
+/* The present's blit of image idx (the core's, GENERAL in its PRESENT state)
+ * into the swap chain's, which ends in PRESENT_SRC. Its last blit is done
+ * first (the image's fence), so its recorder is free. */
+static int shadow_record(gpu_vk_device* dd, gpu_vk_swap* s, uint32_t idx)
+{
+    const VkImage from = dd->tex[GPU_HANDLE_INDEX(s->image[idx].id)].image;
+    const VkCommandBuffer cb = s->blit_cb[idx];
+    dd->vk.vkWaitForFences(dd->device, 1, &s->blit_fence[idx], VK_TRUE, 2000000000ull);
+    dd->vk.vkResetFences(dd->device, 1, &s->blit_fence[idx]);
+    dd->vk.vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (dd->vk.vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return 0;
+    VkImageMemoryBarrier2 b[2];
+    VkDependencyInfo di;
+    memset(b, 0, sizeof b);
+    memset(&di, 0, sizeof di);
+    for (int i = 0; i < 2; i++) {
+        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b[i].subresourceRange.levelCount = b[i].subresourceRange.layerCount = 1;
+        b[i].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    }
+    b[0].image = from;   /* the frame's writes, then the blit reads */
+    b[0].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b[0].srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    b[0].oldLayout = b[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b[1].image = s->vkimage[idx];   /* after the acquire (this submit waits for it at the blit) */
+    b[1].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    b[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    di.imageMemoryBarrierCount = 2;
+    di.pImageMemoryBarriers = b;
+    dd->vk.vkCmdPipelineBarrier2(cb, &di);
+    VkImageBlit r;
+    memset(&r, 0, sizeof r);
+    r.srcSubresource.aspectMask = r.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.srcSubresource.layerCount = r.dstSubresource.layerCount = 1;
+    r.srcOffsets[1].x = r.dstOffsets[1].x = (int32_t)s->width;
+    r.srcOffsets[1].y = r.dstOffsets[1].y = (int32_t)s->height;
+    r.srcOffsets[1].z = r.dstOffsets[1].z = 1;
+    dd->vk.vkCmdBlitImage(cb, from, VK_IMAGE_LAYOUT_GENERAL, s->vkimage[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          1, &r, VK_FILTER_NEAREST);
+    b[1].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;   /* then the present */
+    b[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b[1].dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+    b[1].dstAccessMask = 0;
+    b[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b[1];
+    dd->vk.vkCmdPipelineBarrier2(cb, &di);
+    return dd->vk.vkEndCommandBuffer(cb) == VK_SUCCESS;
 }
 
 /* The swap chain, made (again) for the window's size now. */
@@ -281,6 +364,8 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     if (!ext.width || !ext.height) return -1;   /* (minimized: no images until it is shown again) */
 
     /* scRGB is RGBA16F's colour space where the surface has nothing else for it. */
+    VkFormat chain_fmt = s->vkfmt;
+    s->shadow = 0;
     if (!surface_has(dd, s, s->vkfmt, s->cs)) {
         if (s->vkfmt == VK_FORMAT_R16G16B16A16_SFLOAT && dd->has_colorspace &&
             surface_has(dd, s, s->vkfmt, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)) {
@@ -289,6 +374,13 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
         } else if (surface_has(dd, s, s->vkfmt, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) {
             s->cs = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
             s->colour_space = GPU_COLOR_SRGB;
+        } else if (shadow_ok(dd, s, &caps)) {   /* (step L1: BGRA8, the frame blitted in) */
+            static int said;
+            if (!said++) printf("[VK] the window takes no RGBA8 images: its swap chain is BGRA8, each frame copied in\n");
+            chain_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+            s->cs = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+            s->colour_space = GPU_COLOR_SRGB;
+            s->shadow = 1;
         } else {
             printf("[VK] the window takes no swap chain of format %u\n", (unsigned)s->format);
             return -1;
@@ -314,7 +406,7 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     ci.surface = s->surface;
     ci.minImageCount = count;
-    ci.imageFormat = s->vkfmt;
+    ci.imageFormat = chain_fmt;
     ci.imageColorSpace = s->cs;
     ci.imageExtent = ext;
     ci.imageArrayLayers = 1;
@@ -370,9 +462,31 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     VkFenceCreateInfo fi;
     memset(&fi, 0, sizeof fi);
     fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if (s->shadow) {   /* (step L1: the blits' recorders, one an image) */
+        VkCommandPoolCreateInfo pi;
+        VkCommandBufferAllocateInfo ai;
+        memset(&pi, 0, sizeof pi);
+        memset(&ai, 0, sizeof ai);
+        pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pi.queueFamilyIndex = dd->qfamily;
+        if (dd->vk.vkCreateCommandPool(dd->device, &pi, NULL, &s->blit_pool) != VK_SUCCESS) return -1;
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = s->blit_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = n;
+        if (dd->vk.vkAllocateCommandBuffers(dd->device, &ai, s->blit_cb) != VK_SUCCESS) return -1;
+        td.name = "swap chain image (RGBA8, blitted)";
+    }
     for (uint32_t i = 0; i < n; i++) {
         s->vkimage[i] = imgs[i];
-        s->image[i] = gpu_vk_tex_add(dd, imgs[i], VK_NULL_HANDLE, &td, GPU_VK_TEX_SWAP, 0);
+        if (s->shadow) {
+            VkFenceCreateInfo bf = fi;
+            bf.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            s->image[i] = gpu_vk_texture_create(&dd->base, &td);
+            if (dd->vk.vkCreateFence(dd->device, &bf, NULL, &s->blit_fence[i]) != VK_SUCCESS) return -1;
+        } else
+            s->image[i] = gpu_vk_tex_add(dd, imgs[i], VK_NULL_HANDLE, &td, GPU_VK_TEX_SWAP, 0);
         if (!GPU_VALID(s->image[i]) ||
             dd->vk.vkCreateSemaphore(dd->device, &si, NULL, &s->done_sem[i]) != VK_SUCCESS ||
             (dd->has_swap_maint1 && dd->vk.vkCreateFence(dd->device, &fi, NULL, &s->present_fence[i]) != VK_SUCCESS))
@@ -576,7 +690,9 @@ void gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* how, VkSe
     if (!how || !(how->flags & (GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL))) return;
     gpu_vk_swap* const s = swap_of(dd, how->swapchain);
     if (!s || s->current < 0) return;
-    if ((how->flags & GPU_SUBMIT_ACQUIRE_WAIT) && !s->waited) {
+    /* (step L1: with the frame blitted in, the blit waits for the acquire;
+     * the core's submits draw into images of the backend's) */
+    if ((how->flags & GPU_SUBMIT_ACQUIRE_WAIT) && !s->waited && !s->shadow) {
         memset(&wait[*nwait], 0, sizeof wait[*nwait]);
         wait[*nwait].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait[*nwait].semaphore = s->image_sem[s->current];
@@ -617,24 +733,31 @@ int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint
         s->fence_pending[idx] = 0;
     }
     if (s->present_fence[idx]) dd->vk.vkResetFences(dd->device, 1, &s->present_fence[idx]);
+    const int blit = s->shadow && !s->signalled && shadow_record(dd, s, idx);   /* (step L1) */
     gpu_vk_lock(&dd->qlock);
     if (!s->signalled) {   /* (step VC1: always, gpu_vk_swap_submit_sems says why) */
         VkSemaphoreSubmitInfo w, g;
+        VkCommandBufferSubmitInfo cbi;
         VkSubmitInfo2 si;
         memset(&w, 0, sizeof w);
         memset(&g, 0, sizeof g);
+        memset(&cbi, 0, sizeof cbi);
         memset(&si, 0, sizeof si);
         w.sType = g.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         w.semaphore = s->image_sem[idx];
-        w.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        w.stageMask = blit ? VK_PIPELINE_STAGE_2_BLIT_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         g.semaphore = s->done_sem[idx];
         g.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        cbi.commandBuffer = s->blit_cb[idx];
         si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
         si.waitSemaphoreInfoCount = s->waited ? 0u : 1u;
         si.pWaitSemaphoreInfos = &w;
+        si.commandBufferInfoCount = blit ? 1u : 0u;
+        si.pCommandBufferInfos = &cbi;
         si.signalSemaphoreInfoCount = 1;
         si.pSignalSemaphoreInfos = &g;
-        dd->vk.vkQueueSubmit2(dd->queue, 1, &si, VK_NULL_HANDLE);
+        dd->vk.vkQueueSubmit2(dd->queue, 1, &si, blit ? s->blit_fence[idx] : VK_NULL_HANDLE);
         s->waited = s->signalled = 1;
     }
     VkPresentInfoKHR pi;

@@ -425,6 +425,14 @@ typedef struct gpu_vk_swap {
     uint64_t         chain_id0;
     uint32_t         gate_miss, gate_n;
     int64_t          gate_ticks;
+    /* Step L1: a window with no RGBA8 images (X11's and Wayland's on Mesa
+     * and NVIDIA): the swap chain is BGRA8, image[] are RGBA8 textures of
+     * the backend's that the core draws into, and the present's own submit
+     * blits each into its vkimage[] (a blit swaps the channels' order). */
+    uint32_t         shadow;
+    VkCommandPool    blit_pool;
+    VkCommandBuffer  blit_cb[GPU_VK_MAX_IMAGES];
+    VkFence          blit_fence[GPU_VK_MAX_IMAGES];   /* the image's last blit done */
 } gpu_vk_swap;
 
 enum { GPU_VK_DEFER_BUFFER = 0, GPU_VK_DEFER_TEXTURE = 1 };
