@@ -32,6 +32,10 @@
  *
  * Decompiling is not thread-safe with draws: run it before the title draws.
  * Windows only (the D3D12 backend's cache); elsewhere every call is a no-op.
+ *
+ * Built with the portable renderer (PS3RECOMP_RSX_HAL), the pass makes its
+ * texts and fills its cache through a sink, one target a pass (the end of
+ * this file), and runs off Windows too, for the spv target.
  */
 #ifndef RSX_SHADER_PRECOMPILE_H
 #define RSX_SHADER_PRECOMPILE_H
@@ -105,6 +109,62 @@ float rsx_shader_precompile_fraction(void);
 /* Stop early: the shaders not yet compiled are compiled at draw time. */
 void rsx_shader_precompile_cancel(void);
 void rsx_shader_precompile_wait(void);
+
+#if defined(PS3RECOMP_RSX_HAL)
+/* ---- Targets (built with the portable renderer) ----
+ * A pass makes its texts and fills its cache through a sink: the calls it
+ * makes, as a table. One target a pass, each with its own files:
+ *   d3d12  today's renderer's calls (rsx_d3d12_*), the default: the pass as
+ *          it was, today's .dxbc files; its pipeline index rows go through
+ *          the route switch (rsx_out.h) to the renderer that runs. Windows.
+ *   dxbc   the new path's texts (rsxcore/rsxc_shader.c, copies of today's)
+ *          into the compile service's dxbc target (gpu/gpu_shader.h): FXC
+ *          with today's call, so today's .dxbc names and bytes. Windows.
+ *   spv    the same texts into its spv target, glslang, under
+ *          <cache>/gpu/spv/. Where PS3RECOMP_RSX_HAL_SPV is built.
+ * No renderer takes the rows of dxbc or spv yet (their pipeline stores come
+ * later): their pso_index_add/ready are NULL, so a pass hands no rows over,
+ * _index_built is 0 and an index_only pass has nothing to do (_index
+ * returns 0); a full pass still makes the rows' texts. */
+typedef struct rsx_shader_precompile_sink {
+    const char* name;       /* "d3d12", "dxbc", "spv" */
+    const char* compiler;   /* for the failure line: "FXC", "glslang" */
+    /* What the target's files depend on besides the programs (its compiler,
+     * flags and text edits), for a stamp; NULL for d3d12, whose stamp is
+     * today's. */
+    const char* (*tag)(char* buf, size_t cap);
+    /* Today's calls, with rsx_d3d12_backend.h's meanings. */
+    int         (*shader_hlsl)(int kind, const uint8_t* ucode, uint32_t ucode_len, uint32_t vp_start_slot,
+                               int exp32, uint32_t cube_mask, uint32_t d2c_mask, char* out, uint32_t cap);
+    int         (*shader_hdr)(char* hlsl, uint32_t cap, uint32_t hdrv);
+    uint64_t    (*shader_key)(int fragment, const char* hlsl);
+    int         (*shader_cache_put)(int fragment, const char* hlsl);   /* 1 there, 2 compiled, 0 failed */
+    const char* (*shader_cache_path)(void);
+    int         (*shader_fp_variants)(const uint8_t* ucode, uint32_t ucode_len, uint32_t* out, int max);
+    uint64_t    (*program_hash64)(int fragment, const uint8_t* ucode, uint32_t ucode_len);
+    void        (*pso_index_add)(int vs_fetch, uint64_t vs_key, int clamp, uint64_t ps_key, uint32_t blend,
+                                 int nrt, uint32_t rtfmt, uint32_t cmask, uint32_t cull, uint32_t depth);
+    void        (*pso_index_ready)(uint64_t hash);
+} rsx_shader_precompile_sink;
+
+#define RSX_PRECOMPILE_D3D12   0
+#define RSX_PRECOMPILE_DXBC    1
+#define RSX_PRECOMPILE_SPV     2
+#define RSX_PRECOMPILE_TARGETS 3
+
+/* A target's sink; NULL when this build does not have it. */
+const rsx_shader_precompile_sink* rsx_shader_precompile_sink_of(int target);
+/* The sink the next pass uses (the first target this build has until one is
+ * set; NULL if it has none, and _start fails). _use takes any sink that
+ * lives as long as the pass, e.g. a test's copy of one: 0 while a pass has
+ * started (_reset first) or for NULL. */
+const rsx_shader_precompile_sink* rsx_shader_precompile_current(void);
+int rsx_shader_precompile_use(const rsx_shader_precompile_sink* sink);
+/* Waits for a pass, lets go of everything it held (programs, texts, index,
+ * kinds, counts), and readies the next: _kinds, _add, _index and _start
+ * again. The sink stays. */
+void rsx_shader_precompile_reset(void);
+#endif
 
 #ifdef __cplusplus
 }
