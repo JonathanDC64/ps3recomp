@@ -47,6 +47,10 @@ static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_null_cre
 /* No window: the swap chain's images are presented to nothing. */
 static const int rc_be_headless = 1;
 
+/* Step V6: a frame buffer that cannot be made does not fail the start (as
+ * on D3D12; init_d3d12). */
+static const int rc_be_start_strict = 0;
+
 /* No breadcrumbs (the null backend keeps none). */
 static int rc_be_breadcrumbs(void) { return 0; }
 static const char rc_be_lost_hint[] = "";

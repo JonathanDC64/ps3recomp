@@ -113,6 +113,26 @@ static int depth_buffer_make(void)
     return 0;
 }
 
+/* Step V6: the start's steps, by name: loader, instance, adapter, features
+ * and device (the instance file's rc_be_create says which it can tell
+ * apart), window, swap chain, targets, shaders (the backend's own) and rings
+ * (the recorders and the frame's buffers). ok 0 is a step that failed; the
+ * first one is kept, for the route switch's line and the host's report
+ * (rsx_out.c falls back to today's renderer when the Vulkan start fails).
+ * RSX_FAIL_START_AT=<step> fails the start there on purpose, for tests, as
+ * RSX_LOSE_DEVICE_AT_FRAME loses the device. */
+static const char* s_rc_start_failed;   /* the step a failed start stopped at, NULL */
+static int start_step(const char* step, int ok)
+{
+    const char* f = getenv("RSX_FAIL_START_AT");
+    if (ok && f && !strcmp(f, step)) {
+        fprintf(stderr, "[rsx] RSX_FAIL_START_AT=%s: the start fails here (test)%c", step, 10);
+        ok = 0;
+    }
+    if (!ok && !s_rc_start_failed) s_rc_start_failed = step;
+    return ok;
+}
+
 static int init_d3d12(u32 width, u32 height)
 {
     /* The device, its queue, a recorder per frame slot and the fence: the GPU
@@ -132,7 +152,7 @@ static int init_d3d12(u32 width, u32 height)
         if (getenv("CELLMARK_IGPU")) dd.flags |= GPU_DEVICE_LOW_POWER;
         dd.cmd_slots = FRAME_COUNT;
         s_rc_dev = rc_be_create(&dd);
-        if (!s_rc_dev) return -1;
+        if (!start_step("device", s_rc_dev != NULL)) return -1;
     }
 
     pso_lib_open();
@@ -157,7 +177,7 @@ static int init_d3d12(u32 width, u32 height)
         sd.colour_space = GPU_COLOR_SRGB;
         sd.flags = s_d3d.tearing ? GPU_SWAP_TEARING : 0;
         s_rc_swap = gpu_swap_create(s_rc_dev, &sd);
-        if (!GPU_VALID(s_rc_swap)) return -1;
+        if (!start_step("swap chain", GPU_VALID(s_rc_swap))) return -1;
         /* Step VC2: read again, as Vulkan knows only from the window's
          * surface whether it has the IMMEDIATE mode (the same on D3D12). */
         s_d3d.tearing = (s_rc_dev->caps.bits & GPU_CAP_TEARING) ? 1 : 0;
@@ -169,13 +189,13 @@ static int init_d3d12(u32 width, u32 height)
      * DSV are the GPU layer's views (step C5a): no RTV or DSV heap here, nor
      * anywhere else now, so no descriptor size is read (step C8a). */
 
-    if (display_targets_make() != 0) return -1;
+    if (!start_step("targets", display_targets_make() == 0)) return -1;
 
     /* The window's buffers, with RTVs of their own (swap_buffers_get). */
     s_d3d.win_w = width;
     s_d3d.win_h = height;
-    if (swap_buffers_get() != 0) return -1;
-    if (blit_init() != 0) return -1;
+    if (!start_step("swap chain", swap_buffers_get() == 0)) return -1;
+    if (!start_step("shaders", blit_init() == 0)) return -1;
 
     /* ---------------------------------------------------------------
      * Depth/stencil buffer
@@ -184,7 +204,7 @@ static int init_d3d12(u32 width, u32 height)
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
     {
-        if (depth_buffer_make() != 0) return -1;
+        if (!start_step("targets", depth_buffer_make() == 0)) return -1;
 
         printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
     }
@@ -196,7 +216,7 @@ static int init_d3d12(u32 width, u32 height)
      * timeline over.) */
     memset(s_rc_frame_fence, 0, sizeof s_rc_frame_fence);
     frame_cmd_begin(0);
-    if (!s_rc_cmd) return -1;
+    if (!start_step("rings", s_rc_cmd != NULL)) return -1;
     gpu_cmd_end(s_rc_dev, s_rc_cmd);
 
     /* Draws record from here on (pipeline_ready). The root signature and the
@@ -353,6 +373,13 @@ static int init_d3d12(u32 width, u32 height)
                (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)s_rc_vp_vb.id,
                (void*)(uintptr_t)s_rc_vp_cb.id);
     }
+    /* Step V6: on a backend that starts strictly (rc_be_start_strict: Vulkan,
+     * whose route then starts today's renderer instead), a frame buffer that
+     * could not be made fails the start; elsewhere the start goes on without
+     * it, as today's does. */
+    if (!start_step("rings", !rc_be_start_strict || !ps3_env_int("RSX_VP_BUFFERS", 1) ||
+                                 (s_d3d.vb_mapped && s_d3d.vp_vb_mapped && s_d3d.vp_cb_mapped && s_d3d.vp_fpcb_mapped)))
+        return -1;
 
     printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",
            width, height, FRAME_COUNT,

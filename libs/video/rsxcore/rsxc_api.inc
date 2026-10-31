@@ -8,8 +8,12 @@ static rsx_backend s_d3d12_backend = {0};
  * Public API
  * -----------------------------------------------------------------------*/
 
+static void rc_release_device(void);
+static void rc_abort_init(void);
+
 static int rc_backend_init(u32 width, u32 height, const char* title)
 {
+    s_rc_start_failed = NULL;   /* (step V6: start_step's record of this start) */
     { extern void (*g_gcm_fifo_flip_hook)(void); g_gcm_fifo_flip_hook = d3d12_fifo_flip; }
     if (ps3_env_int("RSX_ZPASS", 1)) g_rsx_report_hook = zq_hook;
     { extern void (*g_rcap_mark_hook)(int end); g_rcap_mark_hook = cap_mark; }
@@ -46,8 +50,9 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
     /* (A headless backend, rc_be_headless, presents into its swap chain's
      * images with no window: step C8b.) */
     s_d3d.hwnd = rc_be_headless ? NULL : open_window(width, height, title);
-    if (!s_d3d.hwnd && !rc_be_headless) {
+    if (!start_step("window", s_d3d.hwnd || rc_be_headless)) {
         printf("[D3D12] ERROR: Window creation failed\n");
+        rc_abort_init();
         return -1;
     }
     if (s_d3d.hwnd) session_lock_init(s_d3d.hwnd);
@@ -55,6 +60,7 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
     /* Initialize D3D12 */
     if (init_d3d12(width, height) != 0) {
         printf("[D3D12] ERROR: D3D12 initialization failed\n");
+        rc_abort_init();
         return -1;
     }
 
@@ -105,6 +111,30 @@ static void rc_backend_shutdown(void)
     pso_index_flush();
     pso_count_print("this run");
 
+    rc_release_device();
+
+    /* A window belongs to the thread that made it: the window thread
+     * destroys its own and then leaves its message loop. */
+    InterlockedExchange(&s_overlay_on, 0);   /* (its device is gone; and this close must not ask first) */
+#ifdef _WIN32
+    if (s_d3d.hwnd) {
+        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
+        else DestroyWindow(s_d3d.hwnd);
+    }
+#else
+    if (s_d3d.hwnd) win_post(WIN_MAIL_CLOSE, 0);
+#endif
+
+    rsx_set_backend(NULL);
+    s_d3d.initialized = 0;
+
+    printf("[D3D12] Backend shut down\n");
+}
+
+/* The device and everything made on it (rc_backend_shutdown, and step V6's
+ * rc_abort_init), once the GPU has nothing of ours left to run. */
+static void rc_release_device(void)
+{
     /* Release D3D12 resources */
     /* The write-back's buffer over guest memory (the GPU layer's, step C5b)
      * goes here, as today, while guest memory is there; the GPU is idle. */
@@ -145,23 +175,42 @@ static void rc_backend_shutdown(void)
     s_ts_grave_n = 0;
     if (s_rc_dev) gpu_destroy(s_rc_dev);
     s_rc_dev = NULL;
+}
 
-    /* A window belongs to the thread that made it: the window thread
-     * destroys its own and then leaves its message loop. */
-    InterlockedExchange(&s_overlay_on, 0);   /* (its device is gone; and this close must not ask first) */
+/* Step V6: a start that failed (rc_backend_init's -1), undone, so that
+ * today's renderer can start in this process in its place (rsx_out.c): the
+ * hooks set to NULL, the device and all on it, and the window, gone before
+ * this returns, with its class, which today's renderer registers under the
+ * same name (a class left registered would give today's window this
+ * file's window procedure). */
+static void rc_abort_init(void)
+{
+    extern void (*g_gcm_fifo_flip_hook)(void);
+    extern void (*g_rcap_mark_hook)(int end);
+    g_gcm_fifo_flip_hook = NULL;
+    g_rsx_report_hook = NULL;
+    g_rcap_mark_hook = NULL;
+    s_d3d.pipeline_ready = 0;
+    s_pso_lib_on = 0;
+    rc_release_device();
+    InterlockedExchange(&s_overlay_on, 0);   /* (the close below must not reach the host, nor ask first) */
 #ifdef _WIN32
     if (s_d3d.hwnd) {
-        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
-        else DestroyWindow(s_d3d.hwnd);
+        HWND const w = s_d3d.hwnd;
+        if (s_window_thread) {
+            PostMessageA(w, WM_CLOSE, 0, 0);
+            for (int i = 0; i < 2000 && IsWindow(w); i++) Sleep(1);   /* (2 s at most) */
+        } else {
+            DestroyWindow(w);
+        }
+        if (IsWindow(w)) printf("[D3D12] the failed start's window did not close\n");
     }
+    if (!UnregisterClassA("ps3recomp_d3d12", GetModuleHandle(NULL)) && GetLastError() != ERROR_CLASS_DOES_NOT_EXIST)
+        printf("[D3D12] the failed start's window class stays registered (error %lu)\n", (unsigned long)GetLastError());
 #else
     if (s_d3d.hwnd) win_post(WIN_MAIL_CLOSE, 0);
 #endif
-
-    rsx_set_backend(NULL);
-    s_d3d.initialized = 0;
-
-    printf("[D3D12] Backend shut down\n");
+    s_d3d.hwnd = NULL;
 }
 
 static void rc_overlay_repaint(int on)
