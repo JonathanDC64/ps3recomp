@@ -5,7 +5,8 @@
  *
  *   test_rsx_synth [--update-golden] [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...
- *   test_rsx_synth --caps <dir>     only write the scenes' captures (for rsx_replay)
+ *   test_rsx_synth --route vulkan --fallback <step>|mark [...]   the start falls back to today's renderer
+ *   test_rsx_synth --caps <dir>    only write the scenes' captures (for rsx_replay)
  *   test_rsx_synth --run <dir>      the child the test starts: plays them
  *
  * Nothing here comes from a game. Each scene is a few frames, each frame a
@@ -62,11 +63,20 @@
  * (--no-validation runs without it) and it said nothing: any validation
  * message fails. --env RSX_VK_MASK=<bits> runs the backend's fallbacks.
  *
- * Windows and Linux, as the null route (rsxc_null.c). On Windows the child
- * plays through the route switch (rsx_out.c, RSX_BACKEND); on Linux, where
- * the switch has today's renderer only (in vkd3d builds), it calls the
- * route's table (rsxc_route_null, rsxc_route_vk) itself. The hashes are the
- * same on both: one golden list.
+ * --route vulkan --fallback <step> asks for Vulkan with the start made to
+ * fail at that step (RSX_FAIL_START_AT, rsxc_init.inc's steps), and
+ * --fallback mark with a start mark left (RSX_STATE_DIR/renderer_starting,
+ * a start that did not finish): the route switch must say why and start
+ * today's renderer in Vulkan's place (rsx_out.c, step V6), which plays the
+ * same chain; the mark must be gone at the end. Every Vulkan run has
+ * RSX_STATE_DIR, so the plain one checks the mark goes at the first present.
+ *
+ * Windows and Linux, as the null route (rsxc_null.c). The child plays
+ * through the route switch (rsx_out.c, RSX_BACKEND) on Windows and in
+ * Linux's vkd3d builds (PS3RECOMP_RSX_D3D12_VKD3D: the switch with today's
+ * renderer on vkd3d); a Linux build without vkd3d has no switch, and the
+ * child calls the route's table (rsxc_route_null, rsxc_route_vk) itself
+ * (no --fallback there). The hashes are the same on both: one golden list.
  */
 #if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__))
 
@@ -191,17 +201,25 @@ static int  self_exe(char* out, size_t cap)
 
 /* ---------------------------------------------------------------------------
  * The route the child plays on, as RSX_BACKEND names it: through the route
- * switch on Windows, the core's table itself on Linux (the file's comment
- * says why). ROUTE(f) is the route's function f.
+ * switch where the build has one, else the core's table itself (the file's
+ * comment says why). ROUTE(f) is the route's function f.
  * -------------------------------------------------------------------------*/
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern volatile uint32_t gpu_vk_n_validation_all;   /* gpu_vk.c: the layer's messages, every device's */
 #endif
-#ifdef _WIN32
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+#define SYNTH_SWITCH 1
 #define ROUTE(f) rsx_out_##f
 static int route_open(const char* name) { (void)name; return 1; }
 static const char* route_name(void) { return rsx_out_renderer(); }
+static const char* route_why(void)
+{
+    const char* why = NULL;
+    rsx_out_renderer_info(&why);
+    return why;
+}
 #else
+#define SYNTH_SWITCH 0
 extern const rsx_route rsxc_route_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern const rsx_route rsxc_route_vk;
@@ -217,6 +235,7 @@ static int route_open(const char* name)
     return g_route != NULL;
 }
 static const char* route_name(void) { return g_route->name; }
+static const char* route_why(void) { return NULL; }
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -1059,10 +1078,15 @@ static int child_main(const char* dir)
     snprintf(caps, sizeof caps, "%s/caps", dir);
     if (!caps_write(caps)) return 3;
     if (!vm_reserve()) { fprintf(stderr, "test_rsx_synth: cannot reserve the guest space\n"); return 3; }
-    if (ROUTE(backend_init)(DISP_W, DISP_H, "test_rsx_synth") != 0 || strcmp(route_name(), want)) {
-        fprintf(stderr, "test_rsx_synth: the %s route did not start\n", want);
+    /* SYNTH_ROUTE: the route the start must end on, when not the one asked
+     * for (--fallback: d3d12). */
+    const char* const end = getenv("SYNTH_ROUTE") ? getenv("SYNTH_ROUTE") : want;
+    if (ROUTE(backend_init)(DISP_W, DISP_H, "test_rsx_synth") != 0 || strcmp(route_name(), end)) {
+        fprintf(stderr, "test_rsx_synth: the %s route did not start\n", end);
         return 3;
     }
+    const char* const why = route_why();
+    printf("[synth] route %s%s%s\n", route_name(), why ? ": " : "", why ? why : "");
     for (int p = 1; p <= NPASSES; p++)
         for (int s = 0; s < NSCENES; s++)
             for (int k = 0; k < k_scene[s].frames; k++) {
@@ -1259,6 +1283,7 @@ typedef struct {
     int vk_seen, no_layer;   /* the Vulkan route: its count line; "no validation layer" */
     unsigned vk_msgs;        /* the validation layer's messages, by the count line */
     char first_vk[512];      /* the first message, and its text's line */
+    char route[256];         /* the child's route line, after "[synth] route " */
 } Run;
 
 static int frame_index(int s, int k)
@@ -1305,6 +1330,8 @@ static int run_parse(const char* dir, Run* r)
             }
         } else if (strstr(line, "RSX_VK_VALIDATION: no ")) {
             r->no_layer = 1;
+        } else if (!strncmp(line, "[synth] route ", 14)) {
+            snprintf(r->route, sizeof r->route, "%.*s", (int)strcspn(line + 14, "\r"), line + 14);
         } else if (!strncmp(line, "[synth] done", 12))
             r->done = 1;
         line = next;
@@ -1400,12 +1427,21 @@ static void out_remove(const char* out)
     dir_del(out);
 }
 
+static int file_there(const char* f)
+{
+    FILE* x = fopen(f, "rb");
+    if (x) fclose(x);
+    return x != NULL;
+}
+
 /* --route vulkan: one child on the Vulkan route, with the validation layer
  * unless validation is 0. The shader cache is off, so every program goes
- * through the spv target in every run. */
-static int vk_test(const char* exe, const char* out, const char* const* user, int nuser, int validation, int keep)
+ * through the spv target in every run. fallback (--fallback): NULL, a start
+ * step to fail at, or "mark"; the child must then end on d3d12, saying why. */
+static int vk_test(const char* exe, const char* out, const char* const* user, int nuser, int validation, int keep,
+                   const char* fallback)
 {
-    const char* e[56];
+    const char* e[60];
     int n = 0;
     e[n++] = "RSX_BACKEND=vulkan";
     e[n++] = "RSX_PRESENT=1";
@@ -1413,6 +1449,25 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
     if (validation) e[n++] = "RSX_VK_VALIDATION=1";
     e[n++] = "PSO_THREADS=4";
     e[n++] = "VP_FETCH_THREADS=2";
+    /* The start mark's folder (rsx_out.c): empty, or the mark alone with
+     * --fallback mark. */
+    char state[MAX_PATH], mark[MAX_PATH + 32], state_env[MAX_PATH + 16], fail_env[96];
+    snprintf(state, sizeof state, "%s/state", out);
+    snprintf(mark, sizeof mark, "%s/renderer_starting", state);
+    snprintf(state_env, sizeof state_env, "RSX_STATE_DIR=%s", state);
+    dir_make(state);
+    file_del(mark);
+    e[n++] = state_env;
+    if (fallback) {
+        e[n++] = "SYNTH_ROUTE=d3d12";
+        if (!strcmp(fallback, "mark")) {
+            FILE* f = fopen(mark, "wb");
+            if (f) fclose(f);
+        } else {
+            snprintf(fail_env, sizeof fail_env, "RSX_FAIL_START_AT=%s", fallback);
+            e[n++] = fail_env;
+        }
+    }
     const char* mask = "none";
     for (int i = 0; i < nuser; i++) {
         e[n++] = user[i];
@@ -1451,10 +1506,38 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
             printf("[synth] FAIL: %u validation messages; the first: %s\n", r.vk_msgs, r.first_vk);
             ok = 0;
         }
+        /* The route, and why when it is d3d12: the step's name in brackets
+         * (rsx_out.c's step_words), or the mark's reason. */
+        char want[96];
+        if (!fallback) snprintf(want, sizeof want, "vulkan");
+        else if (!strcmp(fallback, "mark")) snprintf(want, sizeof want, "d3d12: the last start on Vulkan did not finish");
+        else snprintf(want, sizeof want, "(%s)", fallback);
+        const int route_ok = !fallback ? !strcmp(r.route, "vulkan")
+                                       : !strncmp(r.route, "d3d12: ", 7) && strstr(r.route, want) != NULL;
+        if (!route_ok) {
+            printf("[synth] FAIL: the child's route is \"%s\", not %s\"%s\"\n", r.route[0] ? r.route : "(none)",
+                   fallback ? "d3d12 with " : "", want);
+            ok = 0;
+        }
+        if (file_there(mark)) {
+            printf("[synth] FAIL: the start mark %s is still there at the end\n", mark);
+            ok = 0;
+        }
+    }
+    file_del(mark);
+    dir_del(state);
+    if (ok && fallback) {
+        printf("[synth] PASS: RSX_BACKEND=vulkan with %s%s went to d3d12 (\"%s\"), which played %d scenes, %d frames a "
+               "pass, %d passes; the mark gone; %s\n", strcmp(fallback, "mark") ? "the start failing at " : "",
+               strcmp(fallback, "mark") ? fallback : "a start mark left", r.route + 7, NSCENES, nf, NPASSES,
+               validation ? "0 validation messages" : "validation off");
+        if (!keep) out_remove(out);
+        return 0;
     }
     if (ok) {
-        printf("[synth] PASS: the Vulkan route played %d scenes, %d frames a pass, %d passes; %s; RSX_VK_MASK %s\n",
-               NSCENES, nf, NPASSES, validation ? "0 validation messages" : "validation off", mask);
+        printf("[synth] PASS: the Vulkan route played %d scenes, %d frames a pass, %d passes; %s; RSX_VK_MASK %s%s\n",
+               NSCENES, nf, NPASSES, validation ? "0 validation messages" : "validation off", mask,
+               SYNTH_SWITCH ? "; through the route switch, the start mark gone" : "");
         if (!keep) out_remove(out);
         return 0;
     }
@@ -1486,6 +1569,7 @@ static int test_main(int argc, char** argv)
 {
     const char* out = "test_rsx_synth.out";
     int update = 0, keep = 0, verbose = 0, vulkan = 0, validation = 1;
+    const char* fallback = NULL;
     const char* extra[48];
     int nextra = 0;
     extra[nextra++] = "RSX_BACKEND=null";
@@ -1500,17 +1584,23 @@ static int test_main(int argc, char** argv)
                                                                  !strcmp(argv[i + 1], "vulkan")))
             vulkan = !strcmp(argv[++i], "vulkan");
         else if (!strcmp(argv[i], "--no-validation")) validation = 0;
+        else if (!strcmp(argv[i], "--fallback") && i + 1 < argc) fallback = argv[++i];
         else {
             fprintf(stderr, "usage: test_rsx_synth [--update-golden] [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
-                            "       test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --route vulkan [--no-validation] [--fallback <step>|mark] [--keep] [--out <dir>]\n"
+                            "                      [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --caps <dir> | --run <dir>\n");
             return 2;
         }
     }
+    if (fallback && (!vulkan || !SYNTH_SWITCH)) {
+        fprintf(stderr, "test_rsx_synth: --fallback is --route vulkan's, in a build with the route switch\n");
+        return 2;
+    }
     char exe[MAX_PATH];
     if (!self_exe(exe, sizeof exe)) return 2;
     dir_make(out);
-    if (vulkan) return vk_test(exe, out, extra + 2, nextra - 2, validation, keep);
+    if (vulkan) return vk_test(exe, out, extra + 2, nextra - 2, validation, keep, fallback);
     char da[MAX_PATH], db[MAX_PATH], dump[MAX_PATH], envdump[MAX_PATH + 16];
     snprintf(da, sizeof da, "%s/a", out);
     snprintf(db, sizeof db, "%s/b", out);

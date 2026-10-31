@@ -24,9 +24,9 @@
  *
  * On Linux the switch is built as a Linux host builds it, with today's
  * renderer on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D; rsx_out.c is empty without
- * it). It has no new-path route there yet, so its cases are its own (k_cases
- * below): every RSX_BACKEND runs today's renderer, says why when another was
- * asked for, and leaves the start mark alone.
+ * it). It has the null and vulkan routes there too, with the same fallback
+ * and start mark, and the same cases but one: hal-d3d12 is Windows' only, so
+ * on Linux it runs today's renderer and says why.
  */
 #if defined(_WIN32) || defined(__linux__)
 
@@ -113,8 +113,7 @@ static char g_mark[MAX_PATH + 32];
 static int g_mark_at_init = -1;      /* the mark during the Vulkan start; -1: no Vulkan start */
 static int mark_there(void) { return g_mark[0] && file_there(g_mark); }
 
-/* ---- the new path's tables, standing in (Windows: Linux's switch has none) ---- */
-#ifdef _WIN32
+/* ---- the new path's tables, standing in (hal-d3d12's on Windows only) ---- */
 #define TAB_V_(tag, name, params)     static void tag##_##name params { logc(#tag ":" #name); }
 #define TAB_R_(tag, ret, name, params) static ret tag##_##name params { logc(#tag ":" #name); return (ret)0; }
 #define HAL_V_(name, legacy, params, args)      TAB_V_(hal, name, params)
@@ -123,7 +122,9 @@ static int mark_there(void) { return g_mark[0] && file_there(g_mark); }
 #define NUL_R_(ret, name, legacy, params, args) TAB_R_(null, ret, name, params)
 #define VK_V_(name, legacy, params, args)       TAB_V_(vk, name, params)
 #define VK_R_(ret, name, legacy, params, args)  TAB_R_(vk, ret, name, params)
+#ifdef _WIN32
 RSX_OUT_FUNCS(HAL_V_, HAL_R_)
+#endif
 RSX_OUT_FUNCS(NUL_V_, NUL_R_)
 #define vk_backend_init    unused_vk_backend_init
 #define vk_backend_present unused_vk_backend_present
@@ -159,9 +160,11 @@ const char* rsxc_vk_start_failed(void) { return g_vk_failed; }
 
 #define FIELD_V_(name, legacy, params, args)      .name = TAB_PREFIX(name),
 #define FIELD_R_(ret, name, legacy, params, args) .name = TAB_PREFIX(name),
+#ifdef _WIN32
 #define TAB_PREFIX(name) hal_##name
 const rsx_route rsxc_route_d3d12 = {.name = "hal-d3d12", RSX_OUT_FUNCS(FIELD_V_, FIELD_R_)};
 #undef TAB_PREFIX
+#endif
 #define TAB_PREFIX(name) null_##name
 const rsx_route rsxc_route_null = {.name = "null", RSX_OUT_FUNCS(FIELD_V_, FIELD_R_)};
 #undef TAB_PREFIX
@@ -172,7 +175,6 @@ const rsx_route rsxc_route_vk = {.name = "vulkan", RSX_OUT_FUNCS(FIELD_V_, FIELD
 #undef vk_backend_init
 #undef vk_backend_present
 #undef TAB_PREFIX
-#endif /* _WIN32 */
 
 /* ---- the child: one case ---- */
 static int g_fail;
@@ -200,39 +202,18 @@ typedef struct {
     int mark_after;        /* the mark once the case is done */
 } test_case;
 
-#ifndef _WIN32
-/* Linux: today's renderer only, whatever is asked; the start mark is never
- * written, read or taken. */
-static const test_case k_cases[] = {
-    {"unset",        NULL,        NULL, 1, 0, 0, "d3d12", NULL, "d3d12:backend_init", -1, 0},
-    {"d3d12",        "d3d12",     NULL, 1, 0, 0, "d3d12", NULL, "d3d12:backend_init", -1, 0},
-    {"vulkan",       "vulkan",    NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"vulkan-case",  "VuLkAn",    NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=VuLkAn is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"vulkan-nodir", "vulkan",    NULL, 0, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=hal-d3d12 is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"null",         "null",      NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=null is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"metal",        "metal",     NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=metal is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"fail-loader",  "vulkan", "fail:loader", 1, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
-     "d3d12:backend_init", -1, 0},
-    /* A mark a Windows start would leave: neither read nor taken here. */
-    {"left-vulkan",  "vulkan",    NULL, 1, 0, 1, "d3d12", "RSX_BACKEND=vulkan is not in this build",
-     "d3d12:backend_init", -1, 1},
-    {"left-d3d12",   NULL,        NULL, 1, 0, 1, "d3d12", NULL, "d3d12:backend_init", -1, 1},
-};
-#else
 static const test_case k_cases[] = {
     {"unset",        NULL,        NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
     {"d3d12",        "d3d12",     NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
     {"vulkan",       "vulkan",    NULL, 1, 0, 0, "vulkan",    NULL, "vk:backend_init", 1, 0},
     {"vulkan-case",  "VuLkAn",    NULL, 1, 0, 0, "vulkan",    NULL, "vk:backend_init", 1, 0},
     {"vulkan-nodir", "vulkan",    NULL, 0, 0, 0, "vulkan",    NULL, "vk:backend_init", 0, 0},
+#ifdef _WIN32
     {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "hal-d3d12", NULL, "hal:backend_init", -1, 0},
+#else
+    {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "d3d12",     "RSX_BACKEND=hal-d3d12 is not in this build",
+     "d3d12:backend_init", -1, 0},
+#endif
     {"null",         "null",      NULL, 1, 0, 0, "null",      NULL, "null:backend_init", -1, 0},
     {"metal",        "metal",     NULL, 1, 0, 0, "d3d12",     "RSX_BACKEND=metal is not in this build",
      "d3d12:backend_init", -1, 0},
@@ -266,7 +247,6 @@ static const test_case k_cases[] = {
     /* A mark left, and d3d12 asked for: done with too. */
     {"left-d3d12",   NULL,     NULL, 1, 0, 1, "d3d12", NULL, "d3d12:backend_init", -1, 0},
 };
-#endif
 
 static const test_case* case_named(const char* name)
 {
