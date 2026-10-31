@@ -202,14 +202,6 @@ static int init_d3d12(u32 width, u32 height)
         s_d3d.tearing = (s_rc_dev->caps.bits & GPU_CAP_TEARING) ? 1 : 0;
     }
 
-    /* The window's buffers, with RTVs of their own (swap_buffers_get): none
-     * yet on Vulkan when the window starts minimized (step VW: taken at the
-     * first acquire after it shows, swap_follow; before the acquire here, so
-     * that acquire finds them). */
-    s_d3d.win_w = width;
-    s_d3d.win_h = height;
-    if (!start_step("swap chain", swap_buffers_get() == 0)) return -1;
-
     rc_acquire();   /* (step VC1: the image, and the slot it falls in) */
 
     /* The display targets' and the swap chain images' RTVs and the depth
@@ -217,6 +209,11 @@ static int init_d3d12(u32 width, u32 height)
      * anywhere else now, so no descriptor size is read (step C8a). */
 
     if (!start_step("targets", display_targets_make() == 0)) return -1;
+
+    /* The window's buffers, with RTVs of their own (swap_buffers_get). */
+    s_d3d.win_w = width;
+    s_d3d.win_h = height;
+    if (!start_step("swap chain", swap_buffers_get() == 0)) return -1;
     if (!start_step("shaders", blit_init() == 0)) return -1;
 
     /* ---------------------------------------------------------------
