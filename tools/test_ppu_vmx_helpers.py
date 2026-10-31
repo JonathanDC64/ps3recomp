@@ -261,7 +261,8 @@ def builds(tmp, cpp):
         if cxx:
             def gcc(tag, flags):
                 exe = os.path.join(tmp, f"vmx_{tag}")
-                return ([cxx, "-std=c++17", "-O2", "-w", "-I", inc, *flags, "-o", exe, cpp],
+                return ([cxx, "-std=c++17", "-O2", "-w", "-I", inc, "-I", os.path.join(ROOT, "include"),
+                         *flags, "-o", exe, cpp],
                         exe, None)
             if x86:
                 out.append((f"{os.path.basename(cxx)}, SSE4.1", *gcc("sse", ["-msse4.1"]), "sse41"))
