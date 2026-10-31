@@ -561,6 +561,7 @@ VkDescriptorSet gpu_vk_set0_get(gpu_vk_device* dd, const gpu_vk_layout* l, const
     const uint32_t h = (uint32_t)gpu_vk_fnv(GPU_VK_FNV_BASIS, key, sizeof *key);
     VkDescriptorSet s = VK_NULL_HANDLE;
     gpu_vk_lock(&dd->lock);
+    dd->n_set0_gets++;
     if (dd->set0_map)
         for (uint32_t k = h & (dd->set0_cap - 1);; k = (k + 1) & (dd->set0_cap - 1)) {
             const gpu_vk_set0_entry* const e = &dd->set0_map[k];
@@ -606,7 +607,15 @@ VkDescriptorSet gpu_vk_set0_get(gpu_vk_device* dd, const gpu_vk_layout* l, const
                 break;
             }
             uint64_t range = b->size - key->raw_off[k];
-            if (range > dd->props.limits.maxStorageBufferRange) range = dd->props.limits.maxStorageBufferRange;
+            if (range > dd->props.limits.maxStorageBufferRange) {
+                /* Step V5v: the fetch's loads (E3) read 0 past the cut, so a
+                 * vertex-shader clamp table past it loses its corners: say so. */
+                static int said;
+                if (!said++)
+                    printf("[VK] a raw buffer's range is cut at the device's %u MB (maxStorageBufferRange): "
+                           "reads past it give 0\n", (unsigned)(dd->props.limits.maxStorageBufferRange >> 20));
+                range = dd->props.limits.maxStorageBufferRange;
+            }
             bi[k].offset = key->raw_off[k];
             bi[k].range = range;
         } else {

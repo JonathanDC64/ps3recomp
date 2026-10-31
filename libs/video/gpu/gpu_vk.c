@@ -1245,7 +1245,17 @@ void gpu_vk_binds_slow(gpu_cmd* c)
     c->dirty = 0;
     if (!l) return;
     if (l->ndyn && c->set0_stale) {
-        const VkDescriptorSet s = gpu_vk_set0_get(c->dd, l, &c->key);
+        /* Sets and buffer handles live as long as the device, so a memo
+         * entry never goes stale. */
+        uint32_t m = 0;
+        while (m < 2 && !(c->memo_set[m] && !memcmp(&c->memo_key[m], &c->key, sizeof c->key))) m++;
+        const VkDescriptorSet s = m < 2 ? c->memo_set[m] : gpu_vk_set0_get(c->dd, l, &c->key);
+        if (s && m) {
+            c->memo_key[1] = c->memo_key[0];
+            c->memo_set[1] = c->memo_set[0];
+            c->memo_key[0] = c->key;
+            c->memo_set[0] = s;
+        }
         c->sets[0] = s;
         if (s) c->have |= 1u;
         else c->have &= ~1u;
