@@ -26,12 +26,16 @@
  *     writes the stream as text (flushed at each present);
  *   - the menu gets no native objects (its renderer is D3D12's until V4).
  *
- * Windows only for now, as the D3D12 instance: the core still calls Win32
- * (threads, locks, the window, DWM); the platform module (Phase 5) takes
- * those.
+ * Windows and Linux, as rsxc_vk.c: the core still calls Win32 (threads,
+ * locks, files, timing), which win32_compat.h gives it on Linux; the
+ * platform module (Phase 5) takes those.
  */
-#if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__))
 
+#ifndef _WIN32
+#include "../../../runtime/platform/win32_compat.h"
+#include "rsxc_posix.h"   /* (the few Windows names win32_compat.h leaves out) */
+#endif
 #include "rsxc_head.inc"
 /* The GPU layer, with the null backend's static inline commands, and its own
  * calls (gpu_null.h). */
@@ -157,4 +161,4 @@ const rsx_route rsxc_route_null = {
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
 
-#endif /* PS3RECOMP_RSX_HAL && _WIN32 */
+#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || __linux__) */
