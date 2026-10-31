@@ -26,13 +26,20 @@
  *   - the menu gets no native objects: its renderer is D3D12's until it is
  *     ported (step VC2).
  *
- * Windows only for now, as the other instances: the core still calls Win32
- * (threads, locks, the window, DWM); the platform module (Phase 5) takes
- * those. Built with PS3RECOMP_RSX_HAL_VULKAN; the route needs the spv target
+ * Windows and Linux (step VC2). The core still calls Win32 (threads, locks,
+ * files, timing); on Linux those come from runtime/platform/win32_compat.h,
+ * as for today's renderer on vkd3d (rsx_vkd3d_host.h), and the window is
+ * the core's SDL one (rsxc_head.inc's and rsxc_window.inc's other branches,
+ * copied with today's renderer). The platform module (Phase 5) takes them
+ * later. Built with PS3RECOMP_RSX_HAL_VULKAN; the route needs the spv target
  * (PS3RECOMP_RSX_HAL_SPV) at run time, and says so when it is not built.
  */
-#if defined(PS3RECOMP_RSX_HAL) && defined(PS3RECOMP_RSX_HAL_VULKAN) && defined(_WIN32)
+#if defined(PS3RECOMP_RSX_HAL) && defined(PS3RECOMP_RSX_HAL_VULKAN) && (defined(_WIN32) || defined(__linux__))
 
+#ifndef _WIN32
+#include "../../../runtime/platform/win32_compat.h"
+#include "rsxc_posix.h"   /* (the few Windows names win32_compat.h leaves out) */
+#endif
 #include "rsxc_head.inc"
 /* The GPU layer, with the Vulkan backend's static inline commands (the draw
  * loop calls them directly), and the compile service. */
@@ -217,4 +224,4 @@ const rsx_route rsxc_route_vk = {
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
 
-#endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && _WIN32 */
+#endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && (_WIN32 || __linux__) */
