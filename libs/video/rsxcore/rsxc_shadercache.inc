@@ -8,29 +8,32 @@
 #include "../gpu/gpu_shader.h"
 
 /* The core's shaders (step C3a). Their texts are rsxc_shader.c's, and every
- * compile goes through the compile service (gpu_shader.c), whose dxbc target
- * is today's FXC call and .dxbc cache: the same keys, files and knobs
+ * compile goes through the instance file's rc_be_sc_compile (step C8b). On
+ * D3D12 that is the compile service (gpu_shader.c), whose dxbc target is
+ * today's FXC call and .dxbc cache: the same keys, files and knobs
  * (PS3_SHADER_CACHE, PS3_SHADER_CACHE_HLSL, PS3_SHADER_CACHE_WARM), so this
- * path and today's renderer share the cache. The service keeps PERF=1's
- * compile counters (fxc, disk) while perf_on() is on; each compile sets its
- * switch from perf_on(), where the renderer read it. This fragment comes
- * right after the state, before the first one that compiles. */
+ * path and today's renderer share the cache; a backend without cache files
+ * (rc_be_cache_files 0: null) has no cache folder, so none of the files
+ * named after it is read or written. The service keeps PERF=1's compile
+ * counters (fxc, disk) while perf_on() is on; each compile sets its switch
+ * from perf_on(), where the renderer read it. This fragment comes right
+ * after the state, before the first one that compiles. */
 static double s_perf_cpso = 0.0;           /* CreateGraphicsPipelineState, guest-FP PSOs */
 static int    s_perf_cpso_n = 0;
 static double s_perf_pmiss = 0.0;          /* whole vp_get_fp_pso calls that missed */
-static const char* shader_cache_dir(void) { return gpu_sc_cache_dir(); }
-static void shader_cache_warm(void) { gpu_sc_warm(); }
+static const char* shader_cache_dir(void) { return rc_be_cache_files ? gpu_sc_cache_dir() : ""; }
+static void shader_cache_warm(void) { if (rc_be_cache_files) gpu_sc_warm(); }
 
-/* A compile on the service's dxbc target: 1 with the bytecode in *out (the
- * caller's to release, gpu_sc_blob_release), else 0 with the compiler's
- * message for sc_msg. entry NULL is "main". */
+/* A compile for the backend (rc_be_sc_compile; on D3D12 the service's dxbc
+ * target): 1 with the code in *out (the caller's to release,
+ * gpu_sc_blob_release), else 0 with the compiler's message for sc_msg.
+ * entry NULL is "main". */
 static __declspec(thread) char t_sc_msg[8192];
 static int sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name,
                       const char* entry, unsigned flags, gpu_sc_blob* out)
 {
     gpu_sc_perf(perf_on());
-    return gpu_sc_compile_entry(GPU_SC_DXBC, stage, src, n, name, entry, flags, out, t_sc_msg,
-                                sizeof t_sc_msg) == GPU_SC_OK;
+    return rc_be_sc_compile(stage, src, n, name, entry, flags, out, t_sc_msg, sizeof t_sc_msg);
 }
 /* The message of this thread's last compile that failed, or `none` when the
  * compiler gave none. */
@@ -45,7 +48,7 @@ static gpu_shader sc_shader_from(gpu_sc_stage stage, gpu_sc_blob* b)
     gpu_shader_desc sd;
     memset(&sd, 0, sizeof sd);
     sd.stage = stage == GPU_SC_PS ? GPU_STAGE_PS : stage == GPU_SC_GS ? GPU_STAGE_GS : GPU_STAGE_VS;
-    sd.code = GPU_CODE_DXBC;
+    sd.code = rc_be_shader_code;   /* (the instance file's: GPU_CODE_*) */
     sd.bytes = b->data;
     sd.size = b->size;
     const gpu_shader s = gpu_shader_create(s_rc_dev, &sd);
@@ -76,7 +79,7 @@ static gpu_shader shader_compile_cached(const char* src, size_t n, const char* n
 static gpu_shader sc_load(gpu_sc_stage stage, u64 key)
 {
     gpu_sc_blob b;
-    if (gpu_sc_load(GPU_SC_DXBC, stage, key, &b) != GPU_SC_OK) { const gpu_shader none = {0}; return none; }
+    if (!rc_be_sc_load(stage, key, &b)) { const gpu_shader none = {0}; return none; }
     return sc_shader_from(stage, &b);
 }
 

@@ -466,7 +466,8 @@ typedef struct gpu_table_pool_desc {
 
 /* A compiled stage. The compile service (gpu_shader.h) makes the code. */
 enum { GPU_STAGE_VS = 0, GPU_STAGE_GS = 1, GPU_STAGE_PS = 2 };
-enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4 };
+enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4,
+       GPU_CODE_KEY = 5 };   /* KEY: no code, a name for it (the null backend's: rsxc_null.c) */
 typedef struct gpu_shader_desc {
     uint32_t    stage;    /* GPU_STAGE_* */
     uint32_t    code;     /* GPU_CODE_* */

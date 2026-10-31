@@ -557,11 +557,17 @@ rtt_dump_done:;
             gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
             s_vp_topo_strip = 0;
             gpu_cmd_bind_cb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_cb));
+            /* b2 (the fetch draws' descriptor) set once, before any draw: a draw
+             * without fetch reads none, and every slot is set before a draw
+             * (gpu.h's rule, Vulkan's; step C8b). Each fetch draw sets its own. */
+            gpu_cmd_push_const1(rc, 5, 0, 0);
             /* The texture pool and, when there is one, the samplers', in today's
-             * order; then the samplers' table 0 and the pool's first entry. */
+             * order; then the samplers' table 0 and the first draw's window (a
+             * table on every backend, step C8b: today's bound the pool's first
+             * entry; each draw binds its own window before it draws). */
             gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
             vp_bind_sampler_table(NULL);
-            gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, 0));
+            gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, DRAW_SRV_BASE));
             gpu_cmd_set_vb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256,
                            s_vp_cap * 256, 256);   /* 16 float4 attrib slots */
             if (GPU_VALID(s_rc_vp_ib))

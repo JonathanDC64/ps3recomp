@@ -573,8 +573,9 @@ static void rc_backend_present(void)
 }
 
 /* The offline exports (rsx_shader_precompile, setup's shader pass): the
- * texts are rsxc_shader.c's and the cache is the compile service's (step
- * C3a), which is today's .dxbc cache. */
+ * texts are rsxc_shader.c's and the cache is the instance file's
+ * (rc_be_cache_put; on D3D12 the compile service's, step C3a, which is
+ * today's .dxbc cache; none on null). */
 static int rc_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
                           int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap)
 {
@@ -588,9 +589,9 @@ static u64 rc_shader_key(int fragment, const char* hlsl) { return rsxc_shader_ke
 static int rc_shader_cache_put(int fragment, const char* hlsl)
 {
     gpu_sc_perf(perf_on());
-    return gpu_sc_put(GPU_SC_DXBC, fragment ? GPU_SC_PS : GPU_SC_VS, hlsl);
+    return rc_be_cache_put(fragment ? GPU_SC_PS : GPU_SC_VS, hlsl);
 }
-static const char* rc_shader_cache_path(void) { return gpu_sc_cache_dir(); }
+static const char* rc_shader_cache_path(void) { return shader_cache_dir(); }
 static int rc_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max)
 {
     return rsxc_shader_fp_variants(ucode, ucode_len, out, max);

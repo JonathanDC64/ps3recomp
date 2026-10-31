@@ -3567,6 +3567,12 @@ static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
     s->acquired = s->waited = s->used = s->signalled = 0;
     s->presents++;
     nd->counts.presents++;
+    /* The dump on disk up to here: a run may end without gpu_destroy
+     * (rsx_replay ends its process). The stream's order is the same. */
+    if (nd->dump) {
+        flush_events(nd);
+        fflush((FILE*)nd->dump);
+    }
     return 0;
 }
 

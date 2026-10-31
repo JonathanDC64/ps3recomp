@@ -19,11 +19,18 @@ static void frame_cmd_begin(u32 slot)
     s_rc_cmd = gpu_cmd_begin(s_rc_dev, slot);
 }
 
-/* Today's Close and ExecuteCommandLists of the open recorder. */
+/* Today's Close and ExecuteCommandLists of the open recorder. Every submit
+ * may touch the acquired image (the frame's blit, the repaint's, a
+ * capture's readback), so each waits for it and lets the present wait for
+ * it, as gpu.h asks (step C8b: D3D12 needs neither; the null backend
+ * checks both, as Vulkan needs them). */
 static void frame_cmd_submit(void)
 {
+    gpu_submit_desc how;
+    how.swapchain = s_rc_swap;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL;
     gpu_cmd_end(s_rc_dev, s_rc_cmd);
-    gpu_submit(s_rc_dev, &s_rc_cmd, 1, NULL);
+    gpu_submit(s_rc_dev, &s_rc_cmd, 1, &how);
 }
 
 /* The display buffers and the shared depth buffer, at RSX_SCALE's size: made

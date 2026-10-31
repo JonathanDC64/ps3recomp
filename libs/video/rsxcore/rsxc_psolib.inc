@@ -389,7 +389,7 @@ static int pso_prebuild_one(const pso_rec* r)
         gpu_shader_desc sd;
         memset(&sd, 0, sizeof sd);
         sd.stage = i ? GPU_STAGE_PS : GPU_STAGE_VS;
-        sd.code = GPU_CODE_DXBC;
+        sd.code = rc_be_shader_code;
         sd.bytes = blob[i];
         sd.size = (size_t)len[i];
         sh[i] = gpu_shader_create(s_rc_dev, &sd);

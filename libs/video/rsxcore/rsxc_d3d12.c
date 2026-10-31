@@ -31,6 +31,7 @@
  * loop calls them directly), and the backend's own calls the hooks make. */
 #include "gpu_d3d12_cmd.h"
 #include "gpu_d3d12_bridge.h"
+#include "gpu_shader.h"
 
 /* ---------------------------------------------------------------------------
  * The backend's hooks: what the fragments need of their backend that gpu.h
@@ -85,9 +86,34 @@ static void* rc_be_device(gpu_device* d) { return gpu_native(d, GPU_NATIVE_DEVIC
 static void* rc_be_queue(gpu_device* d)  { return gpu_native(d, GPU_NATIVE_QUEUE, 0); }
 static void* rc_be_image(gpu_device* d, gpu_texture t) { return gpu_native(d, GPU_NATIVE_TEXTURE, t.id); }
 
+/* The shader cache's files (rsxc_shadercache.inc): today's, all of them
+ * (.dxbc, fp_variants.txt, pso_index_seen.tsv, pso_manifest.bin and the
+ * pipeline library). */
+static const int rc_be_cache_files = 1;
+
 /* The pipeline library's folder in the shader cache: <cache>/gpu/d3d12/
  * (pipelines.lib, pipelines.n, index.built: rsxc_psolib.inc). */
 static const char rc_be_lib_dir[] = "d3d12";
+
+/* The shaders: the compile service's dxbc target (gpu_shader.c), today's
+ * FXC call and .dxbc cache. A compile (sc_compile) is 1 with the code in
+ * *out, else 0 with FXC's message in msg; a load (sc_load) the program the
+ * cache holds under key K (the pipeline index's rows); a put
+ * (rc_shader_cache_put) compiles a text into the cache. */
+static const uint32_t rc_be_shader_code = GPU_CODE_DXBC;
+static int rc_be_sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
+                            unsigned flags, gpu_sc_blob* out, char* msg, size_t cap)
+{
+    return gpu_sc_compile_entry(GPU_SC_DXBC, stage, src, n, name, entry, flags, out, msg, cap) == GPU_SC_OK;
+}
+static int rc_be_sc_load(gpu_sc_stage stage, u64 key, gpu_sc_blob* out)
+{
+    return gpu_sc_load(GPU_SC_DXBC, stage, key, out) == GPU_SC_OK;
+}
+static int rc_be_cache_put(gpu_sc_stage stage, const char* hlsl) { return gpu_sc_put(GPU_SC_DXBC, stage, hlsl); }
+
+/* After each present (swap_present): nothing more on D3D12. */
+static void rc_be_presented(gpu_device* d) { (void)d; }
 
 /* A layout's serialized bytes' hash, part of every pipeline's name in
  * pso_manifest.bin (s_vp_root_hash). */

@@ -384,12 +384,13 @@ static void vp_pso_knobs_check(void)
 }
 
 /* The HLSL the draw path compiles for a fragment program, its variant noted
- * in fp_variants.txt with note = 1 (rsxc_fp_build_hlsl; rsxc_fp_baked() says
- * whether its constants are in its text). */
+ * in fp_variants.txt with note = 1 when the backend has cache files
+ * (rsxc_fp_build_hlsl; rsxc_fp_baked() says whether its constants are in
+ * its text). */
 static int fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask,
                          char* hlsl, size_t cap, u32 fp_addr, int note)
 {
-    return rsxc_fp_build_hlsl(ucode, exp32, cube_mask, d2c_mask, hlsl, cap, fp_addr, note);
+    return rsxc_fp_build_hlsl(ucode, exp32, cube_mask, d2c_mask, hlsl, cap, fp_addr, note && rc_be_cache_files);
 }
 
 /* rsx_fp_code_hash of the program at guest offset `off` and its size, and

@@ -604,6 +604,7 @@ static void swap_present(int game_frame)
     const int tear = !vsync && s_d3d.tearing;
     const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
     if (gpu_swap_present(s_rc_dev, s_rc_swap, interval, tear ? GPU_PRESENT_TEARING : 0)) check_device("present");
+    rc_be_presented(s_rc_dev);   /* (the instance file's: null prints the stream's hash) */
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     s_last_present_qpc = q.QuadPart;
