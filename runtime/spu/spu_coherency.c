@@ -393,7 +393,10 @@ static void spu_coh_hint_set(int i, uint32_t line_ea)
  * hints go to one SSE2 compare, so a notify over Demon's Souls' ~19 used
  * slots costs fewer instructions than the old loop over eight. The 16-byte
  * load reads each 4-byte hint whole, and x86 keeps it after the load of
- * s_coh_used. SPU_COH_HINT=0 in the callers takes every used slot. */
+ * s_coh_used. arm64 keeps the loop, not sse2neon: its loads are atomic in
+ * C, and a movemask there is several instructions, which a few groups of
+ * four do not pay back. SPU_COH_HINT=0 in the callers takes every used
+ * slot. */
 static inline uint64_t spu_coh_hint_match(uint32_t line, int n)
 {
     uint64_t m = 0;

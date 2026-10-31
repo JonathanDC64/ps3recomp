@@ -7,7 +7,7 @@
 
 int main(void)
 {
-#if !defined(__SSE4_1__)
+#if !defined(__SSE4_1__) && !defined(PS3_SSE2NEON)
     puts("test_spu_shufb: built without SSE4.1, nothing to compare");
     return 0;
 #else

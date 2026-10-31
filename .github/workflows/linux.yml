@@ -104,6 +104,12 @@ jobs:
             -std=gnu17 -I include -I runtime/spu \
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
+          # The SSE4.1 paths against their scalar forms (as arm64 runs them
+          # through sse2neon on macOS).
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -msse4.1 -I include -I runtime/spu \
+            -o /tmp/test_spu_simd_paths runtime/spu/tests/test_spu_simd_paths.c -lm
+          /tmp/test_spu_simd_paths
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.

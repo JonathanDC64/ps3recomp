@@ -1063,7 +1063,9 @@ static inline void mfc_repeat_check(mfc_engine* mfc, spu_context* spu, uint32_t 
  * call to memcpy spends more on choosing a strategy for than on copying.
  * Guest memory can change under the copy either way; 16-byte loads and
  * stores tear no less than memcpy's. (No byte array for the quadword: one
- * gives the function a /GS cookie check.) */
+ * gives the function a /GS cookie check.) arm64 takes the 8-byte copies, not
+ * sse2neon: they compile to one ldp/stp pair, as good as a quadword load and
+ * store. */
 static inline void mfc_copy(uint8_t* dst, const uint8_t* src, uint32_t size)
 {
     if (size <= 256 && !(size & 15)) {
