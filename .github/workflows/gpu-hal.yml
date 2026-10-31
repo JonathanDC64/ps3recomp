@@ -8,14 +8,19 @@
 # WARP, the software adapter, so it needs no GPU. On both, the null backend's test (libs/video/tests/test_gpu_null.c):
 # the backend that records and checks and draws nothing, its operation stream's hash against a golden.
 #
-# On Windows (the null route's system for now), the new path's core (libs/video/rsxcore) runs on that backend over
-# synthetic scenes (libs/video/tests/test_rsx_synth.c): seeded programs and written vertex data, textures and
-# surfaces, played as captures in two processes, each scene's stream hash against its golden. Then every external
-# symbol of the new path's objects has to start with gpu_, rsxc_ or rsx_out_ (.github/scripts/check_hal_symbols.py).
+# On both, the new path's core (libs/video/rsxcore) runs on that backend over synthetic scenes
+# (libs/video/tests/test_rsx_synth.c): seeded programs and written vertex data, textures and surfaces, played as
+# captures in two processes, each scene's stream hash against its golden. The goldens are one list: a hash that
+# differs on Linux is a portability bug in the core. The route switch's test (libs/video/tests/test_rsx_out.c) runs on
+# both too, against the switch as each system builds it. On Windows every external symbol of the new path's objects
+# then has to start with gpu_, rsxc_ or rsx_out_ (.github/scripts/check_hal_symbols.py).
 #
 # The Vulkan backend's test (libs/video/tests/test_gpu_vk.c) is built on both, and runs on Linux on lavapipe, Mesa's
 # CPU device, with the Khronos validation layer on: any message it gives fails the test. Windows runners have no
-# Vulkan device, so there it is only built.
+# Vulkan device, so there it is only built. On lavapipe the core plays the same synthetic scenes on the Vulkan route
+# too (test_rsx_synth --route vulkan, in an X server of its own), under the validation layer with synchronization
+# validation: every frame plays and any message fails. The vulkan-masks job then plays them once per GPU_CAP_* bit
+# the device has, with that bit off (RSX_VK_MASK: its fallback), and with every bit off.
 #
 # Both also build the shader compile service's spv target (PS3RECOMP_RSX_HAL_SPV, on by default with the option:
 # glslang and SPIRV-Tools fetched at their pins) and run its test (libs/video/tests/test_gpu_sc_spv.c): the seeded
@@ -75,8 +80,8 @@ jobs:
       - name: Run the spv target's test
         run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
 
-      - name: Build the synthetic scenes' test
-        run: cmake --build build --target test_rsx_synth
+      - name: Build the synthetic scenes' test and the route switch's
+        run: cmake --build build --target test_rsx_synth test_rsx_out
 
       # The new path's core on the null route over synthetic scenes, in two processes: each scene's stream hash
       # against its golden, with no failed check (libs/video/tests/test_rsx_synth.c).
@@ -91,6 +96,10 @@ jobs:
           name: rsx-synth-windows
           path: build/test_rsx_synth.out/
           if-no-files-found: ignore
+
+      # The route switch's choice: RSX_BACKEND, the Vulkan start's fallback and its start mark.
+      - name: Run the route switch's test
+        run: ctest --test-dir build -R rsx_out --output-on-failure
 
       # Every external symbol of the new path's objects starts with gpu_, rsxc_ or rsx_out_ (the script lists
       # what else it allows, and why).
@@ -138,6 +147,25 @@ jobs:
       - name: Run the spv target's test
         run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
 
+      - name: Build the synthetic scenes' test and the route switch's
+        run: cmake --build build --target test_rsx_synth test_rsx_out
+
+      # As on Windows, against the same goldens (-V: the PASS line says so).
+      - name: Run the core on the synthetic scenes (null route)
+        run: ctest --test-dir build -R rsx_synth -V
+
+      - name: Keep the synthetic scenes' output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-synth-linux-${{ matrix.compiler }}
+          path: build/test_rsx_synth.out/
+          if-no-files-found: ignore
+
+      # Linux's switch: today's renderer only (test_rsx_out.c's Linux cases).
+      - name: Run the route switch's test
+        run: ctest --test-dir build -R rsx_out -V
+
   vulkan:
     name: Linux x64 Vulkan on lavapipe (${{ matrix.compiler }}, validation on)
     runs-on: ubuntu-latest
@@ -148,11 +176,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # SDL2 as above; lavapipe (mesa-vulkan-drivers), the loader and the validation layer for the test.
+      # SDL2 as above; lavapipe (mesa-vulkan-drivers), the loader and the validation layer for the test; an X
+      # server (Xvfb) for the core's window.
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
+          sudo apt-get install -y ninja-build libsdl2-dev clang mesa-vulkan-drivers libvulkan1 vulkan-validationlayers xvfb
 
       - name: Configure
         run: |
@@ -164,7 +193,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON
 
       - name: Build
-        run: cmake --build build --target ps3recomp_runtime test_gpu_vk
+        run: cmake --build build --target ps3recomp_runtime test_gpu_vk test_rsx_synth
 
       # The test picks the CPU device and turns the validation layer on itself.
       - name: Run the Vulkan backend's test (lavapipe)
@@ -173,3 +202,74 @@ jobs:
       # Every fallback at once: the caps all off (RSX_VK_MASK).
       - name: Run it again with every cap off
         run: RSX_VK_MASK=0xFFFFFF ctest --test-dir build -R gpu_vk --output-on-failure
+
+      # The core on the Vulkan route over the synthetic scenes, the validation layer on: every frame plays, no
+      # message. lavapipe is the runner's only device. The window is SDL's, in Xvfb.
+      - name: Run the core on the synthetic scenes (Vulkan route, lavapipe)
+        working-directory: build
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan
+
+      - name: Keep the synthetic scenes' output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-synth-vulkan-${{ matrix.compiler }}
+          path: build/test_rsx_synth.out/
+          if-no-files-found: ignore
+
+  vulkan-masks:
+    name: Linux x64 Vulkan on lavapipe, the core with each fallback (gcc, validation on)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev mesa-vulkan-drivers libvulkan1 vulkan-validationlayers xvfb
+
+      - name: Configure
+        run: CC=gcc CXX=g++ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON
+
+      - name: Build
+        run: cmake --build build --target ps3recomp_runtime test_gpu_vk test_rsx_synth
+
+      # The device's GPU_CAP_* bits (gpu.h), as the backend's test prints them; then the scenes once per bit it
+      # has, with that bit off (RSX_VK_MASK), and once with every bit off. A bit the device lacks has no fallback
+      # to try here. Every run is listed; the step fails if any did.
+      - name: Run the core on the synthetic scenes with each cap off
+        working-directory: build
+        run: |
+          caps=$(./test_gpu_vk | sed -n 's/.*, caps 0x\([0-9A-Fa-f]*\),.*/\1/p' | head -1)
+          [ -n "$caps" ] || { echo "no caps line from test_gpu_vk"; exit 1; }
+          echo "device caps 0x$caps"
+          masks=""
+          for b in $(seq 0 23); do
+            if [ $(( 0x$caps >> b & 1 )) = 1 ]; then masks="$masks $(printf '0x%X' $((1 << b)))"; fi
+          done
+          masks="$masks 0xFFFFFF"
+          # To come here, one more run each, once they land (ps3recomp #194, lane V5v):
+          #   --env RSX_CLAMP_FORM=vs        the vertex-shader clamp
+          #   --env RSX_DEPTH_FORMAT=d32s8   D32S8 depth
+          mkdir -p masks.out
+          fail=0; table=""
+          for m in $masks; do
+            out=masks.out/$m
+            if xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --out "$out" --env RSX_VK_MASK=$m > "$m.txt" 2>&1; then
+              table="$table\n  RSX_VK_MASK $m: pass"
+            else
+              table="$table\n  RSX_VK_MASK $m: FAIL"; fail=1
+              cat "$m.txt"
+            fi
+            tail -1 "$m.txt"
+          done
+          printf "the fallbacks:$table\n"
+          exit $fail
+
+      - name: Keep the failed runs' output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-synth-vulkan-masks
+          path: build/masks.out/
+          if-no-files-found: ignore

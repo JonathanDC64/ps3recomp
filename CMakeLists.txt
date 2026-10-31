@@ -749,16 +749,21 @@ endif()
 # The portable renderer's core on the null backend, over synthetic scenes: libs/video/tests/test_rsx_synth.c.
 # Seeded programs (rsx_prog_gen.h), vertex data, textures and surfaces written as captures and played as
 # rsx_replay plays a chain, in two processes; each scene's stream hash against its golden, no failed null
-# check. Windows only, as the null route. Built on demand:
+# check. Windows and Linux, as the null route, with one golden list. test_rsx_synth --route vulkan plays the
+# chain on the Vulkan route under the validation layer instead (builds with PS3RECOMP_RSX_HAL_VULKAN; it needs
+# a Vulkan device and a display, so it is no ctest: gpu-hal.yml runs it on lavapipe). Built on demand:
 #   cmake --build build --target test_rsx_synth
 #   ctest --test-dir build -R rsx_synth
-if(PS3RECOMP_RSX_HAL AND WIN32)
+if(PS3RECOMP_RSX_HAL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_executable(test_rsx_synth EXCLUDE_FROM_ALL
         libs/video/tests/test_rsx_synth.c
         runtime/host/host_stubs.c
     )
     target_compile_definitions(test_rsx_synth PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(test_rsx_synth PRIVATE ps3recomp_runtime dxguid)
+    target_link_libraries(test_rsx_synth PRIVATE ps3recomp_runtime)
+    if(WIN32)
+        target_link_libraries(test_rsx_synth PRIVATE dxguid)
+    endif()
     target_include_directories(test_rsx_synth PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -769,7 +774,9 @@ if(PS3RECOMP_RSX_HAL AND WIN32)
 
     # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the Vulkan start's fallback to today's renderer
     # and its start mark), built here against stand-ins for both renderers: libs/video/tests/test_rsx_out.c. No GPU,
-    # no window, and the Vulkan route's code whether or not this build has it. Built on demand:
+    # no window, and the Vulkan route's code whether or not this build has it. On Linux the switch is built as a
+    # host with today's renderer on vkd3d builds it (PS3RECOMP_RSX_D3D12_VKD3D; nothing of vkd3d is used). Built
+    # on demand:
     #   cmake --build build --target test_rsx_out
     #   ctest --test-dir build -R rsx_out
     add_executable(test_rsx_out EXCLUDE_FROM_ALL
@@ -778,6 +785,9 @@ if(PS3RECOMP_RSX_HAL AND WIN32)
     )
     target_compile_definitions(test_rsx_out PRIVATE
         PS3RECOMP_RSX_HAL=1 PS3RECOMP_RSX_HAL_VULKAN=1 _CRT_SECURE_NO_WARNINGS)
+    if(NOT WIN32)
+        target_compile_definitions(test_rsx_out PRIVATE PS3RECOMP_RSX_D3D12_VKD3D=1)
+    endif()
     target_include_directories(test_rsx_out PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/include"

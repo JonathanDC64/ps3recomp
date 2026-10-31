@@ -24,4 +24,12 @@ int rsxc_display_hdr_current(void* window)
     return 1;
 }
 
+/* The two globals today's renderer defines and the core names as extern
+ * (copy_manifest.txt), where today's renderer is not built: off Windows,
+ * it is only with vkd3d. */
+#if !defined(PS3RECOMP_RSX_D3D12_VKD3D)
+char g_rsx_title_base[128] = "ps3recomp";
+volatile long g_rsx_prof_toggle;   /* bumped per F11 press; boot_main starts/stops */
+#endif
+
 #endif /* PS3RECOMP_RSX_HAL && !_WIN32 */
