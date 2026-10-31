@@ -101,8 +101,9 @@ jobs:
           .\test_spu_helpers.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
           # The SSE4.1 paths against their scalar forms (as arm64 runs them
-          # through sse2neon on macOS).
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS -msse4.1 /I include /I runtime/spu /Fe:test_spu_simd_paths.exe runtime/spu/tests/test_spu_simd_paths.c
+          # through sse2neon on macOS). Quoted: PowerShell splits a bare
+          # -msse4.1 at the dot, and the test then stops at its #error.
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS '-msse4.1' /I include /I runtime/spu /Fe:test_spu_simd_paths.exe runtime/spu/tests/test_spu_simd_paths.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_spu_simd_paths.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
