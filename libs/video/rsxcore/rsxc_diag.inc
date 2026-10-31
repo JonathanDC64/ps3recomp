@@ -163,7 +163,7 @@ static void fpwatch_batch(void)
 static u32 vp_tex_decoded_hash(const VPTexSlot* t)
 {
     extern uint8_t* vm_base;
-    if (!t->res || !vm_base) return 0;
+    if (!GPU_VALID(t->tex) || !vm_base) return 0;
     rsx_tex_layout tl;
     rsx_texture_layout(t->fmt, t->w, t->h, &tl);
     const u32 pitch = (tl.dst_row_bytes + 255) & ~255u;
@@ -275,9 +275,11 @@ static long long s_rf_cp[RF_CPS];
 static double s_rf_pp[6], s_rf_pp0[6]; static int s_rf_ppn[3], s_rf_ppn0[3];
 static void rf_pp_snap(double* d, int* n)
 {
+    gpu_sc_stats sc;   /* the shader compiles: the compile service's counters */
+    gpu_sc_stats_take(&sc, 0);
     d[0] = s_perf_tex; d[1] = s_perf_srv; d[2] = s_perf_pso; d[3] = s_perf_cpso;
-    d[4] = s_perf_fxc; d[5] = s_perf_pmiss;
-    n[0] = s_perf_ntex; n[1] = s_perf_cpso_n; n[2] = s_perf_fxc_n;
+    d[4] = sc.compile_s; d[5] = s_perf_pmiss;
+    n[0] = s_perf_ntex; n[1] = s_perf_cpso_n; n[2] = sc.compiles;
 }
 #define RF_CP(i) do { LARGE_INTEGER _c; QueryPerformanceCounter(&_c); s_rf_cp[i] = _c.QuadPart; } while (0)
 static void rf_slow_report(void)
@@ -509,8 +511,8 @@ static void frame_log(long long q0, long long q1)
     extern volatile long long g_gcm_flip_word_qpc;
     if (!first) first = q0;
     const double ms = 1000.0 / (double)freq;
-    DXGI_FRAME_STATISTICS fs; memset(&fs, 0, sizeof fs);
-    if (FAILED(s_d3d.swap_chain->lpVtbl->GetFrameStatistics(s_d3d.swap_chain, &fs)))
+    gpu_present_stats fs; memset(&fs, 0, sizeof fs);
+    if (gpu_swap_stats(s_rc_dev, s_rc_swap, &fs))
         memset(&fs, 0, sizeof fs);
     const u32 fw = g_gcm_flip_words;
     const long long fq = g_gcm_flip_word_qpc;
@@ -518,7 +520,7 @@ static void frame_log(long long q0, long long q1)
             (q0 - first) * ms, prev ? (q0 - prev) * ms : 0.0,
             s_rf_entry_qpc ? (q0 - s_rf_entry_qpc) * ms : 0.0, (q1 - q0) * ms,
             fq ? (q0 - fq) * ms : -1.0, fw - fw_prev, s_dbg_last_draws,
-            fs.PresentCount, fs.PresentRefreshCount, fs.SyncRefreshCount,
+            fs.present_count, fs.present_refresh_count, fs.sync_refresh_count,
             s_fl_wait_ms, s_fl_store_ms);
     prev = q0; fw_prev = fw;
     { static int n = 0; if (++n % 64 == 0) fflush(f); }
@@ -537,22 +539,19 @@ static void rsx_scale_apply(void)
     printf("[D3D12] RSX_SCALE: render targets at %u%%%c", want, 10);
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
-        off_rt_defer_release(r->res);  r->res = NULL;
-        off_rt_defer_release(r->up);   r->up = NULL;
-        off_rt_defer_release(r->snap); r->snap = NULL;
-        off_rt_defer_release(r->down); r->down = NULL;
+        off_rt_drop_target(r);   /* the target and its staging (step C5a) */
+        rc_grave_tex(&r->snap_tex);   /* step C5b */
+        rc_grave_tex(&r->down_tex);
         r->gsum_ok = 0; r->used = 0;
     }
     for (int i = 0; i < MAX_ZETA; i++) {
-        off_rt_defer_release(s_zeta[i].res); s_zeta[i].res = NULL; s_zeta[i].used = 0;
+        zeta_drop(&s_zeta[i]); s_zeta[i].used = 0;   /* step C5a */
     }
-    for (int i = 0; i < SUBVP_SLOTS; i++) { off_rt_defer_release(s_subvp[i].res); s_subvp[i].res = NULL; }
-    off_rt_defer_release(s_screen_copy);      s_screen_copy = NULL;
-    off_rt_defer_release(s_d3d.readback_buf); s_d3d.readback_buf = NULL;
-    for (u32 i = 0; i < FRAME_COUNT; i++) {
-        off_rt_defer_release(s_d3d.render_targets[i]); s_d3d.render_targets[i] = NULL;
-    }
-    off_rt_defer_release(s_d3d.depth_buffer); s_d3d.depth_buffer = NULL;
+    for (int i = 0; i < SUBVP_SLOTS; i++) rc_grave_tex(&s_subvp[i].tex);   /* step C8a */
+    rc_grave_tex(&s_rc_screen_copy_tex);   /* step C5b */
+    gpu_buffer_destroy(s_rc_dev, s_rc_readback_buf, 0); s_rc_readback_buf.id = 0;   /* step C2 (GPU idle) */
+    for (u32 i = 0; i < FRAME_COUNT; i++) rc_grave_tex(&s_rc_rt_tex[i]);   /* with their views (step C5a) */
+    rc_grave_tex(&s_rc_depth_tex);
     s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
     s_d3d.host_h = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.height);
     if (display_targets_make() != 0 || depth_buffer_make() != 0) {

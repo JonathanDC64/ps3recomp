@@ -203,7 +203,8 @@ typedef struct gpu_d3d12_device {
     gpu_d3d12_defer*     defer;              /* under lock */
     uint32_t             ndefer, defer_cap;
 
-    /* Pipelines: kept until the device goes; the library is today's
+    /* Pipelines: kept until the device goes (but GPU_PIPELINE_STORE_ONLY
+     * ones, released once stored); the library is today's
      * ID3D12PipelineLibrary, under its own lock. */
     SRWLOCK                lib_lock;
     ID3D12PipelineLibrary* lib;
@@ -243,7 +244,7 @@ void        gpu_d3d12_write_sampler(gpu_d3d12_device* dd, gpu_d3d12_tpool* p, ui
                                     gpu_sampler s);
 
 /* gpu_d3d12_pipe.c */
-gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache);
+gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how);
 int          gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path);
 int          gpu_d3d12_pipeline_cache_save(gpu_device* d, const char* path);
 void         gpu_d3d12_pipe_d3d_desc(gpu_d3d12_device* dd, const gpu_pipeline_desc* desc,

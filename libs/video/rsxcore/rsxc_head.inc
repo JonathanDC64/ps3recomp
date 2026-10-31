@@ -96,38 +96,13 @@ static float rsx_aspect(void)
 #include <wtsapi32.h>         /* session lock notifications (s_session_locked) */
 #include <dwmapi.h>           /* DWM_TIMING_INFO (dwmapi.dll is loaded, not linked) */
 
-/* D3D12 headers */
-#include <d3d12.h>
-#include <d3d12sdklayers.h>   /* ID3D12Debug / ID3D12InfoQueue */
-#include <dxgi1_4.h>
-#include <dxgi1_6.h>
-#include <d3dcompiler.h>
-
-/* We need these GUIDs — define them here to avoid uuid.lib dependency */
-#include <initguid.h>
-
-/* Link libraries */
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "d3dcompiler.lib")
+/* No graphics API's header (step C8b): the instance file includes its
+ * backend's, and the display's HDR is rsxc_display_win.c's. */
 #pragma comment(lib, "wtsapi32.lib")
 #else
-#define RSX_VKD3D_DEFINE_GUIDS   /* the interface GUIDs live in this file */
-#include "rsx_vkd3d_host.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <glob.h>
 #endif
 #include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */
-
-/* Paths are joined with '/' on every host (Windows takes it too); one that
- * comes from the host may hold either separator. */
-static char* rsx_path_last_sep(char* path)
-{
-    char* fwd = strrchr(path, '/');
-    char* back = strrchr(path, '\\');
-    if (!fwd) return back;
-    if (!back) return fwd;
-    return fwd > back ? fwd : back;
-}
 

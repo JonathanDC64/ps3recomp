@@ -97,6 +97,12 @@ typedef struct gpu_swapchain  { uint32_t id; } gpu_swapchain;   /* a window's im
 typedef struct gpu_pipeline { uint64_t v; } gpu_pipeline;
 typedef struct gpu_table    { uint64_t v; } gpu_table;
 
+/* A table pool as its backend keeps it, for the per-draw writes
+ * (table_writer_get, table_writer_tex): the record a write reaches, found
+ * once. On D3D12 and Vulkan a pointer to it, on the null backend the pool's
+ * id. It lives as long as the device, as pools do. */
+typedef struct gpu_table_writer { uint64_t v; } gpu_table_writer;
+
 /* A point on the device's timeline: work submitted before gpu_signal()
  * returned it is done when gpu_fence_completed() reaches it. A lost device
  * reads UINT64_MAX, as D3D12's fences do. */
@@ -460,7 +466,8 @@ typedef struct gpu_table_pool_desc {
 
 /* A compiled stage. The compile service (gpu_shader.h) makes the code. */
 enum { GPU_STAGE_VS = 0, GPU_STAGE_GS = 1, GPU_STAGE_PS = 2 };
-enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4 };
+enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4,
+       GPU_CODE_KEY = 5 };   /* KEY: no code, a name for it (the null backend's: rsxc_null.c) */
 typedef struct gpu_shader_desc {
     uint32_t    stage;    /* GPU_STAGE_* */
     uint32_t    code;     /* GPU_CODE_* */
@@ -566,6 +573,25 @@ typedef struct gpu_pipeline_desc {
     uint32_t          strip_cut;         /* GPU_STRIP_CUT_* */
 } gpu_pipeline_desc;
 
+/* pipeline_create's flags. STORE_ONLY: a pipeline made only for the cache,
+ * as the start's builds make the pipelines a later draw loads: loaded, or
+ * compiled and stored, then freed at once (nothing has recorded it), and no
+ * handle is returned. Without a cache it is compiled and freed. */
+enum { GPU_PIPELINE_STORE_ONLY = 1u << 0 };
+/* What pipeline_create did (*how). */
+enum {
+    GPU_PIPELINE_FAILED   = 0,   /* nothing made: a bad description or handle, or the driver refused it */
+    GPU_PIPELINE_LOADED   = 1,   /* from the cache */
+    GPU_PIPELINE_COMPILED = 2,   /* compiled, not stored: no cache, or another thread stored it first */
+    GPU_PIPELINE_STORED   = 3    /* compiled and stored in the cache: new there, for the next save */
+};
+/* What pipeline_cache_load found. */
+enum {
+    GPU_PIPELINE_CACHE_NONE   = -1,   /* no cache on this device: pipelines are compiled, never stored */
+    GPU_PIPELINE_CACHE_NEW    = 0,    /* an empty cache: no file, or another driver's or GPU's */
+    GPU_PIPELINE_CACHE_LOADED = 1     /* the file's pipelines */
+};
+
 /* The targets of a pass: OMSetRenderTargets. ds none for no depth target;
  * a depth view made with GPU_VIEW_READ_ONLY_* binds it for reading. */
 typedef struct gpu_pass {
@@ -649,7 +675,8 @@ enum {
     GPU_NATIVE_BUFFER = 5,    /* handle gpu_buffer.id: ID3D12Resource* / VkBuffer */
     GPU_NATIVE_TEXTURE = 6,   /* handle gpu_texture.id: ID3D12Resource* / VkImage */
     GPU_NATIVE_LAYOUT = 7,    /* handle gpu_layout.id: ID3D12RootSignature* / VkPipelineLayout */
-    GPU_NATIVE_SWAPCHAIN = 8  /* handle gpu_swapchain.id: IDXGISwapChain3* / VkSwapchainKHR */
+    GPU_NATIVE_SWAPCHAIN = 8, /* handle gpu_swapchain.id: IDXGISwapChain3* / VkSwapchainKHR */
+    GPU_NATIVE_PIPELINE = 9   /* handle gpu_pipeline.v: ID3D12PipelineState* / VkPipeline */
 };
 
 /* Creating a device. Each backend has its own create function (below). */
@@ -724,22 +751,33 @@ typedef struct gpu_device_desc {
      * holding this description is left as it is (today's memo). */ \
     X(table_write_tex,   V, void,           (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
     X(table_write_sampler, V, void,         (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
+    /* The pool found once, for table_writer_tex, which skips the lookup of the pool's record \
+     * table_write_tex makes on each call (pool: one this device made). */ \
+    X(table_writer_get,  R, gpu_table_writer, (gpu_device* d, gpu_table_pool pool), (d, pool)) \
+    /* table_write_tex through a writer: the same memo, the same write. */ \
+    X(table_writer_tex,  V, void,           (gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv), (d, w, index, srv)) \
     /* The table starting at index, for bind_table: a table's first entry (the regions above; \
      * Vulkan gives none for any other index). */ \
     X(table_ref,         R, gpu_table,      (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \
     /* The compile service's hook for this device's shader target. request and result are \
      * gpu_shader.h's; opaque here. Returns nonzero on success. Thread-safe. */ \
     X(compile_hook,      R, int,            (gpu_device* d, const void* request, void* result), (d, request, result)) \
+    /* A shader from compiled code (copied). Thread-safe: the start's pipeline workers make and \
+     * free shaders beside the render thread. */ \
     X(shader_create,     R, gpu_shader,     (gpu_device* d, const gpu_shader_desc* desc), (d, desc)) \
     /* Frees a shader's code (today's code drops a blob once its pipeline is built); pipelines \
      * made from it keep working. Not while a pipeline_create that uses it runs. Vulkan: \
      * vkDestroyShaderModule. Thread-safe. */ \
     X(shader_destroy,    V, void,           (gpu_device* d, gpu_shader s), (d, s)) \
     X(layout_create,     R, gpu_layout,     (gpu_device* d, const gpu_layout_desc* desc), (d, desc)) \
-    /* A pipeline, from the cache when it has it (then *from_cache = 1; may be NULL). \
-     * Thread-safe: the start's pipeline workers call it beside the render thread. */ \
-    X(pipeline_create,   R, gpu_pipeline,   (gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache), (d, desc, from_cache)) \
-    /* The pipeline cache's file: read it (1 = used, 0 = none or another driver's) and write it. */ \
+    /* A pipeline, from the cache when it has it, else compiled (and stored in the cache). flags \
+     * GPU_PIPELINE_*: with STORE_ONLY it is only stored, and none is returned. *how (may be \
+     * NULL) says which (GPU_PIPELINE_LOADED, ...). A pipeline returned lives as long as the \
+     * device. Thread-safe: the start's pipeline workers call it beside the render thread. */ \
+    X(pipeline_create,   R, gpu_pipeline,   (gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how), (d, desc, flags, how)) \
+    /* The pipeline cache's file. Load once, before pipelines are made: GPU_PIPELINE_CACHE_* \
+     * (NONE on a device without GPU_CAP_PIPELINE_CACHE, or when the API cannot make one). Save \
+     * may run on a thread of its own while pipelines are made: 1 when written. */ \
     X(pipeline_cache_load, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(pipeline_cache_save, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(query_pool_create, R, gpu_query_pool, (gpu_device* d, uint32_t type, uint32_t count), (d, type, count)) \

@@ -46,6 +46,8 @@
 
 #include "gpu.h"
 
+#include <string.h>   /* memcpy: gpu_view_memo_same */
+
 #ifdef __cplusplus
 #include <type_traits>   /* GPU_CMD_CHECK */
 extern "C" {
@@ -119,13 +121,41 @@ extern "C" {
     X(marker,          V, void, (gpu_cmd* c, const char* text, uint32_t len), (c, text, len))
 
 /* The per-draw device calls: gpu_fast_<name>, the gpu_vt function <name>
- * with the same parameters. Vulkan has the same four: its memo in front of
- * vkUpdateDescriptorSets, a set from the pool's region, a device address. */
+ * with the same parameters. Vulkan has the same five: its memo in front of
+ * vkUpdateDescriptorSets (by the pool, or by a writer: the pool found once),
+ * a set from the pool's region, a device address. */
 #define GPU_FAST_FUNCS(X) \
     X(table_write_tex,     V, void,      (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
+    X(table_writer_tex,    V, void,      (gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv), (d, w, index, srv)) \
     X(table_write_sampler, V, void,      (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
     X(table_ref,           R, gpu_table, (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \
     X(buffer_addr,         R, gpu_addr,  (gpu_device* d, gpu_buffer b), (d, b))
+
+/* The table memo's compare, for the backends that keep what each entry holds
+ * as its gpu_view_desc (D3D12, Vulkan): nonzero when entry e holds s with
+ * swizzle (s's, with 0 made the identity). s's fields are read as they are
+ * (inline, the caller's values in registers) and packed as e's 20 bytes lie:
+ * three words, read from e with three loads. A copy of s built on the stack
+ * with narrow stores and read back with a wide load stalled store forwarding
+ * on every call (step C7). Little-endian (every target of these backends). */
+typedef char gpu_view_memo_layout_[(sizeof(gpu_view_desc) == 20 && offsetof(gpu_view_desc, kind) == 4 &&
+                                    offsetof(gpu_view_desc, dim) == 5 && offsetof(gpu_view_desc, flags) == 6 &&
+                                    offsetof(gpu_view_desc, mips) == 7 && offsetof(gpu_view_desc, format) == 8 &&
+                                    offsetof(gpu_view_desc, swizzle) == 12 && offsetof(gpu_view_desc, mip) == 16 &&
+                                    offsetof(gpu_view_desc, layer) == 18) ? 1 : -1];
+static inline int gpu_view_memo_same(const gpu_view_desc* e, const gpu_view_desc* s, uint32_t swizzle)
+{
+    const uint64_t w0 = (uint64_t)s->texture.id | (uint64_t)s->kind << 32 | (uint64_t)s->dim << 40 |
+                        (uint64_t)s->flags << 48 | (uint64_t)s->mips << 56;
+    const uint64_t w1 = (uint64_t)s->format | (uint64_t)swizzle << 32;
+    const uint32_t w2 = (uint32_t)s->mip | (uint32_t)s->layer << 16;
+    uint64_t m0, m1;
+    uint32_t m2;
+    memcpy(&m0, e, 8);             /* texture, kind, dim, flags, mips */
+    memcpy(&m1, &e->format, 8);    /* format, swizzle */
+    memcpy(&m2, &e->mip, 4);       /* mip, layer */
+    return !((m0 ^ w0) | (m1 ^ w1) | (uint64_t)(m2 ^ w2));
+}
 
 /* The recorder's command table, in the list's order. */
 #define GPU__CMD_MEMBER(name, form, ret, params, args) ret (*name) params;

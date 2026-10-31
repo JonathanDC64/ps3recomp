@@ -271,12 +271,15 @@ static void stencil_of(const gpu_stencil_face* f, const gpu_pipeline_desc* desc,
  * primitive restart, stencil reference, blend constants, and depth writes
  * when the pipeline writes depth. depth_clip 0 is depth clamping (without
  * GPU_CAP_DEPTH_CLAMP, clipping). The vertex input's stride is the
- * description's (set_vb's is not used). */
-gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache)
+ * description's (set_vb's is not used). From the cache: the creation
+ * feedback's cache hit; with no hit (or no feedback) the driver has put it
+ * in the cache. GPU_PIPELINE_STORE_ONLY: made with the cache, so the cache
+ * has it, then destroyed at once (nothing has recorded it) and not kept. */
+gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     gpu_pipeline r = {0};
-    if (from_cache) *from_cache = 0;
+    if (how) *how = GPU_PIPELINE_FAILED;
     VkPipelineShaderStageCreateInfo st[3];
     uint32_t nst = 0;
     const gpu_shader sh[3] = {desc->vs, desc->gs, desc->ps};
@@ -431,10 +434,19 @@ gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc
     gi.pDynamicState = &dy;
     gi.layout = pl;
     gpu_vk_lock(&dd->pso_lock);
-    cache = dd->pcache;
+    cache = (dd->base.caps.bits & GPU_CAP_PIPELINE_CACHE) ? dd->pcache : VK_NULL_HANDLE;
     gpu_vk_unlock(&dd->pso_lock);
     VkPipeline p = VK_NULL_HANDLE;
     if (dd->vk.vkCreateGraphicsPipelines(dd->device, cache, 1, &gi, NULL, &p) != VK_SUCCESS) return r;
+    const uint32_t made = !cache ? GPU_PIPELINE_COMPILED
+                        : (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+                          (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
+                        ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED;
+    if (flags & GPU_PIPELINE_STORE_ONLY) {
+        dd->vk.vkDestroyPipeline(dd->device, p, NULL);
+        if (how) *how = made;
+        return r;
+    }
     uint32_t idx = UINT32_MAX;
     gpu_vk_lock(&dd->pso_lock);
     if (dd->npso < GPU_VK_MAX_PIPELINES) {
@@ -447,9 +459,7 @@ gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc
         dd->vk.vkDestroyPipeline(dd->device, p, NULL);
         return r;
     }
-    if (from_cache && (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
-        (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))
-        *from_cache = 1;
+    if (how) *how = made;
     r.v = (uint64_t)idx + 1u;
     return r;
 }
@@ -467,14 +477,18 @@ typedef struct pcache_head {
     uint64_t size, fnv;
 } pcache_head;
 
-/* 1 when the file was this driver's and now seeds the cache. The old cache
- * is kept until the device goes (a pipeline worker may be using it). */
+/* GPU_PIPELINE_CACHE_LOADED when the file was this driver's and now seeds
+ * the cache, else _NEW: the device's own cache, made with it (empty before
+ * the first pipeline), stays. _NONE with the cap masked: pipelines are made
+ * without the cache. The old cache is kept until the device goes (a
+ * pipeline worker may be using it). */
 int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
+    if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE)) return GPU_PIPELINE_CACHE_NONE;
     FILE* f = path ? fopen(path, "rb") : NULL;
     pcache_head h;
-    if (!f) return 0;
+    if (!f) return GPU_PIPELINE_CACHE_NEW;
     void* data = NULL;
     int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "PS3VKPC1", 8) && h.vendor == dd->props.vendorID &&
              h.device == dd->props.deviceID && h.driver == dd->props.driverVersion &&
@@ -494,7 +508,7 @@ int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
         ok = dd->vk.vkCreatePipelineCache(dd->device, &ci, NULL, &nc) == VK_SUCCESS;
     }
     free(data);
-    if (!ok) return 0;
+    if (!ok) return GPU_PIPELINE_CACHE_NEW;
     gpu_vk_lock(&dd->pso_lock);
     if (dd->nold_caches < 8) {
         dd->old_caches[dd->nold_caches++] = dd->pcache;
@@ -504,16 +518,16 @@ int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
     gpu_vk_unlock(&dd->pso_lock);
     if (nc) {   /* (eight loads already: keep the cache there is) */
         dd->vk.vkDestroyPipelineCache(dd->device, nc, NULL);
-        return 0;
+        return GPU_PIPELINE_CACHE_NEW;
     }
-    return 1;
+    return GPU_PIPELINE_CACHE_LOADED;
 }
 
 /* Written to path.tmp, then moved over path, so a crash leaves the old file. */
 int gpu_vk_pipeline_cache_save(gpu_device* d, const char* path)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
-    if (!path) return 0;
+    if (!path || !(d->caps.bits & GPU_CAP_PIPELINE_CACHE)) return 0;
     VkPipelineCache cache;
     gpu_vk_lock(&dd->pso_lock);
     cache = dd->pcache;

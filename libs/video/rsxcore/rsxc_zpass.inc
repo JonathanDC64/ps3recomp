@@ -20,8 +20,12 @@ extern void (*g_rsx_report_hook)(u32 method, u32 data);
 #define ZQ_MAX     256    /* counted draws per batch */
 #define ZQ_EV_MAX  256    /* report events per batch */
 enum { ZQ_OFF = 0, ZQ_ON = 1, ZQ_CLEAR = 2, ZQ_REPORT = 3 };
-static ID3D12QueryHeap* s_zq_heap;
-static ID3D12Resource*  s_zq_rb;
+/* The query pool and its readback buffer are the GPU layer's (step C5b), kept
+ * for the device's life, and bound by their handles (step C7). s_zq_made:
+ * both are made (step C8a: in place of the native pointers' test). */
+static gpu_query_pool   s_zq_pool;
+static gpu_buffer       s_zq_rb_buf;
+static int              s_zq_made;
 static int  s_zq_on;                       /* counting enabled, as of the stream */
 static int  s_zq_on_start;                 /* ... when the current batch began */
 static struct { u32 at, kind, idx; } s_zq_ev[ZQ_EV_MAX];
@@ -56,25 +60,23 @@ static int zq_counted(u32 slot)
 
 static int zq_ready(void)
 {
-    if (s_zq_heap) return 1;
-    D3D12_QUERY_HEAP_DESC qd = {0};
-    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-    qd.Count = ZQ_MAX;
-    if (FAILED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd,
-            &IID_ID3D12QueryHeap, (void**)&s_zq_heap))) { s_zq_heap = NULL; return 0; }
-    D3D12_HEAP_PROPERTIES hp = {0};
-    hp.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rd = {0};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = ZQ_MAX * sizeof(u64);
-    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
-            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&s_zq_rb))) {
-        s_zq_heap->lpVtbl->Release(s_zq_heap); s_zq_heap = NULL; s_zq_rb = NULL; return 0;
+    if (s_zq_made) return 1;
+    /* Today's: an OCCLUSION heap of ZQ_MAX, and a READBACK buffer of ZQ_MAX
+     * counts in COPY_DEST. Either failing is tried again next time (the pool
+     * made is kept: pools live as long as the device). */
+    if (!GPU_VALID(s_zq_pool)) s_zq_pool = gpu_query_pool_create(s_rc_dev, GPU_QUERY_OCCLUSION, ZQ_MAX);
+    if (!GPU_VALID(s_zq_pool)) return 0;
+    if (!GPU_VALID(s_zq_rb_buf)) {
+        gpu_buffer_desc bd;
+        memset(&bd, 0, sizeof bd);
+        bd.size = ZQ_MAX * sizeof(u64);
+        bd.use = GPU_USE_QUERY | GPU_USE_COPY_DST;
+        bd.memory = GPU_MEM_READBACK;
+        bd.state = GPU_STATE_COPY_DEST;
+        s_zq_rb_buf = gpu_buffer_create(s_rc_dev, &bd);
+        if (!GPU_VALID(s_zq_rb_buf)) return 0;
     }
+    s_zq_made = 1;
     return 1;
 }
 
@@ -86,12 +88,12 @@ static void zq_finish(void)
     u64 cnt[ZQ_MAX];
     memset(cnt, 0, sizeof cnt);
     if (s_zq_n) {
-        void* mp = NULL;
-        D3D12_RANGE rr = {0, (SIZE_T)s_zq_n * sizeof(u64)};
-        if (SUCCEEDED(s_zq_rb->lpVtbl->Map(s_zq_rb, 0, &rr, &mp)) && mp) {
+        /* The GPU layer's map and unmap (step C5b): today's Map(0, {0, n})
+         * and Unmap(0, {0, 0}). */
+        const void* mp = gpu_buffer_map(s_rc_dev, s_zq_rb_buf, 0, (u64)s_zq_n * sizeof(u64));
+        if (mp) {
             memcpy(cnt, mp, (size_t)s_zq_n * sizeof(u64));
-            D3D12_RANGE wr = {0, 0};
-            s_zq_rb->lpVtbl->Unmap(s_zq_rb, 0, &wr);
+            gpu_buffer_unmap(s_rc_dev, s_zq_rb_buf, 0, 0);
         }
         /* A scaled target covers more samples; report what the guest's size would,
          * rounded up so a sliver that showed is never reported as hidden. */

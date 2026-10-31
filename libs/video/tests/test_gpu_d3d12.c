@@ -16,8 +16,9 @@
  *   - the table memo, sampler and view caching, fences and a wait's timeout;
  *   - root signatures and pipeline descriptions against today's, byte for
  *     byte (its recipes are copied here: rsx_d3d12_backend.c);
- *   - the pipeline cache across two devices, a swap chain on a hidden
- *     window, and the conversion's bridges (gpu_d3d12_bridge.h);
+ *   - the pipeline cache across two devices, pipelines made only for it
+ *     (GPU_PIPELINE_STORE_ONLY) and a device without one, a swap chain on a
+ *     hidden window, and the conversion's bridges (gpu_d3d12_bridge.h);
  *   - DRED (GPU_DEVICE_BREADCRUMBS) and, on WARP, a device lost on purpose.
  */
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
@@ -847,8 +848,8 @@ static int scene_make(scene* s)
     if (!GPU_VALID(s->vs) || !GPU_VALID(s->ps)) return 0;
     draw_desc(&s->desc, s->layout, s->vs, s->ps);
     uint32_t cached = 7;
-    s->pso = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(s->pso.v != 0 && cached == 0);
+    s->pso = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    CHECK(s->pso.v != 0 && cached == GPU_PIPELINE_COMPILED);   /* no library yet */
 
     gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
                                    GPU_STATE_RENDER_TARGET);
@@ -1020,8 +1021,8 @@ static void test_draw(scene* s)
     /* The same description again: the pipeline is the library's when the
      * device has one (none until gpu_pipeline_cache_load). */
     uint32_t cached = 7;
-    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(again.v != 0 && cached == 0);
+    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    CHECK(again.v != 0 && cached == GPU_PIPELINE_COMPILED);
 }
 
 /* ---- The memo, caches, fences ---- */
@@ -1057,6 +1058,15 @@ static void test_memo(const scene* s)
     gpu_fast_table_write_tex(g_d, pool, 5, NULL); CHECK(g_dd->n_srv_writes == n0 + 4);
     e.format = GPU_FORMAT_R8G8B8A8_UNORM;
     gpu_fast_table_write_tex(g_d, pool, 5, &e);   CHECK(g_dd->n_srv_writes == n0 + 4);   /* NULL's own */
+    /* Through a writer (the pool found once): the same memo. */
+    const gpu_table_writer w = gpu_table_writer_get(g_d, pool);
+    CHECK(w.v != 0);
+    gpu_fast_table_writer_tex(g_d, w, 4, &a);     CHECK(g_dd->n_srv_writes == n0 + 4);   /* entry 4 holds a */
+    gpu_table_writer_tex(g_d, w, 4, &a);          CHECK(g_dd->n_srv_writes == n0 + 4);   /* through the table too */
+    gpu_fast_table_writer_tex(g_d, w, 5, NULL);   CHECK(g_dd->n_srv_writes == n0 + 4);
+    a.swizzle = 0;
+    gpu_fast_table_writer_tex(g_d, w, 4, &a);     CHECK(g_dd->n_srv_writes == n0 + 5);   /* changed: written */
+    gpu_fast_table_write_tex(g_d, pool, 4, &a);   CHECK(g_dd->n_srv_writes == n0 + 5);   /* the pool's memo has it */
 
     gpu_table_pool_desc sd;
     memset(&sd, 0, sizeof sd);
@@ -1155,27 +1165,68 @@ static void test_pipeline_cache(void)
         CHECK(d != NULL);
         if (!d) break;
         const int loaded = gpu_pipeline_cache_load(d, path);
-        CHECK(loaded == run_no);   /* none the first time, the first device's the second */
-        if (!GPU_D3D12_DEV(d)->lib) {
+        if (loaded == GPU_PIPELINE_CACHE_NONE) {
+            CHECK(GPU_D3D12_DEV(d)->lib == NULL);
             printf("  pipeline cache: skipped (no pipeline library on this device)\n");
             gpu_destroy(d);
             break;
         }
+        /* none the first time, the first device's the second */
+        CHECK(loaded == (run_no ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW));
+        CHECK(GPU_D3D12_DEV(d)->lib != NULL);
         /* The layout and shaders made again on each device: the name is their
          * content's, not their handles'. */
         const gpu_layout l = guest_layout(d);
         const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
         const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
-        gpu_pipeline_desc pd;
+        gpu_pipeline_desc pd, pd2;
         draw_desc(&pd, l, vs, ps);
+        pd2 = pd;
+        pd2.depth_clip = 1;
+        const gpu_d3d12_device* const g = GPU_D3D12_DEV(d);
+        const uint32_t kept = g->npso;
+        /* Made only for the library (today's startup builds): stored, or
+         * loaded, then released; no handle, nothing kept. */
+        uint32_t how = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == (run_no ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED) && g->npso == kept);
+        how = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == GPU_PIPELINE_LOADED && g->npso == kept);   /* the library has it */
+        /* A draw's is kept, loaded from the library the build filled. */
+        how = 7;
+        const gpu_pipeline p0 = gpu_pipeline_create(d, &pd2, 0, &how);
+        CHECK(p0.v != 0 && how == GPU_PIPELINE_LOADED && g->npso == kept + 1);
+        CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, p0.v) == (void*)(uintptr_t)p0.v);
         uint32_t cached = 7;
-        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, &cached);
-        CHECK(p1.v != 0 && cached == (uint32_t)run_no);
-        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, &cached);
-        CHECK(p2.v != 0 && cached == 1);   /* stored by the first */
+        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, 0, &cached);
+        CHECK(p1.v != 0 && cached == (run_no ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED));
+        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, 0, &cached);
+        CHECK(p2.v != 0 && cached == GPU_PIPELINE_LOADED);   /* stored by the first */
+        CHECK(g->npso == kept + 3);
         gpu_shader_destroy(d, vs);          /* pipelines outlive their shaders */
         gpu_shader_destroy(d, ps);
         if (run_no == 0) CHECK(gpu_pipeline_cache_save(d, path) == 1);
+        gpu_destroy(d);
+    }
+    /* No library (the cap masked, as a fallback would): pipelines are
+     * compiled and never stored; a store-only one is compiled and released. */
+    dd.cap_mask = GPU_CAP_PIPELINE_CACHE;
+    gpu_device* const d = gpu_d3d12_create(&dd);
+    CHECK(d != NULL);
+    if (d) {
+        CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NONE && GPU_D3D12_DEV(d)->lib == NULL);
+        const gpu_layout l = guest_layout(d);
+        const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+        const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+        gpu_pipeline_desc pd;
+        draw_desc(&pd, l, vs, ps);
+        uint32_t how = 7;
+        CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+        CHECK(how == GPU_PIPELINE_COMPILED && GPU_D3D12_DEV(d)->npso == 0);
+        how = 7;
+        CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_COMPILED);
+        CHECK(gpu_pipeline_cache_save(d, path) == 0);
         gpu_destroy(d);
     }
     DeleteFileA(path);
@@ -1210,6 +1261,9 @@ static void test_swapchain(void)
         gpu_texture img;
         const uint32_t i = gpu_swap_acquire(g_d, sc, &img);
         CHECK(i < 2 && GPU_VALID(img));
+        /* The bridge's image by index: the current one is acquire's; the other is another; none past 2. */
+        CHECK(gpu_d3d12_swap_image(g_d, sc, i).id == img.id && GPU_VALID(gpu_d3d12_swap_image(g_d, sc, 1 - i)) &&
+              gpu_d3d12_swap_image(g_d, sc, 1 - i).id != img.id && !GPU_VALID(gpu_d3d12_swap_image(g_d, sc, 2)));
         gpu_view_desc vd;
         memset(&vd, 0, sizeof vd);
         vd.texture = img;
@@ -1234,8 +1288,8 @@ static void test_swapchain(void)
         CHECK(gpu_swap_resize(g_d, sc, 96, 64, GPU_FORMAT_R8G8B8A8_UNORM) == 0);
         CHECK(!gpu_d3d12_slot_valid(&g_dd->tex_slots, img.id) && !gpu_d3d12_slot_valid(&g_dd->view_slots, rtv.id));
         gpu_texture img2;
-        gpu_swap_acquire(g_d, sc, &img2);
-        CHECK(GPU_VALID(img2) && img2.id != img.id);
+        const uint32_t i2 = gpu_swap_acquire(g_d, sc, &img2);
+        CHECK(GPU_VALID(img2) && img2.id != img.id && gpu_d3d12_swap_image(g_d, sc, i2).id == img2.id);
         ID3D12Resource* r = (ID3D12Resource*)gpu_native(g_d, GPU_NATIVE_TEXTURE, img2.id);
         CHECK(r != NULL);
         if (r) {
@@ -1414,6 +1468,172 @@ static void test_bridges(const scene* s)
     }
 }
 
+/* ---- step C4 ---- */
+/* gpu_d3d12_adopt_texture_of (the description from the resource) and
+ * gpu_d3d12_table_pool_heap (a pool's heap, borrowed). */
+static void test_bridges_c4(const scene* s)
+{
+    {
+        D3D12_RESOURCE_DESC rd;
+        memset(&rd, 0, sizeof rd);
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = 16; rd.Height = 8; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ID3D12Resource* r = native_committed(&rd, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+        CHECK(r != NULL);
+        const gpu_texture t = gpu_d3d12_adopt_texture_of(g_d, r);
+        CHECK(GPU_VALID(t) && gpu_native(g_d, GPU_NATIVE_TEXTURE, t.id) == r);
+        CHECK(!GPU_VALID(gpu_d3d12_adopt_texture_of(g_d, NULL)));
+        if (GPU_VALID(t)) {
+            const gpu_d3d12_tex* x = &g_dd->tex[GPU_HANDLE_INDEX(t.id)];
+            CHECK(x->width == 16 && x->height == 8 && x->layers == 1 && x->mips == 1 && x->samples == 1 &&
+                  x->format == GPU_FORMAT_R16G16B16A16_FLOAT &&
+                  x->use == (GPU_USE_SAMPLED | GPU_USE_RT | GPU_USE_COPY_SRC | GPU_USE_COPY_DST));
+            const gpu_texture_desc td = tex_desc(16, 8, GPU_FORMAT_R16G16B16A16_FLOAT,
+                                                 GPU_USE_SAMPLED | GPU_USE_RT | GPU_USE_COPY_SRC |
+                                                 GPU_USE_COPY_DST, GPU_STATE_COPY_DEST);
+            if (r) r->lpVtbl->Release(r);
+            tex_roundtrip_on("adopted from its description", t, &td, 0);
+            gpu_texture_destroy(g_d, t, 0);
+        } else if (r) {
+            r->lpVtbl->Release(r);
+        }
+    }
+    {
+        ID3D12DescriptorHeap* h = gpu_d3d12_table_pool_heap(g_d, s->tex_pool);
+        CHECK(h != NULL);
+        if (h) {
+            D3D12_GPU_DESCRIPTOR_HANDLE g;
+            h->lpVtbl->GetGPUDescriptorHandleForHeapStart(h, &g);
+            CHECK(gpu_d3d12_wrap_table(g).v == gpu_table_ref(g_d, s->tex_pool, 0).v);
+        }
+        CHECK(gpu_d3d12_table_pool_heap(g_d, s->samp_pool) != NULL &&
+              gpu_d3d12_table_pool_heap(g_d, s->samp_pool) != h);
+        const gpu_table_pool none = {0};
+        CHECK(gpu_d3d12_table_pool_heap(g_d, none) == NULL);
+    }
+}
+
+/* ---- step C5a ---- */
+/* gpu_d3d12_view_cpu: a view's CPU descriptor is the one pass_begin binds,
+ * the old code's native bind and clear through it reach the texture, and it
+ * goes with the texture. */
+static void test_bridges_c5a(void)
+{
+    const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
+                                         GPU_STATE_RENDER_TARGET);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = t;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(g_d, &vd);
+    CHECK(GPU_VALID(t) && GPU_VALID(rtv));
+    const D3D12_CPU_DESCRIPTOR_HANDLE h = gpu_d3d12_view_cpu(g_d, rtv);
+    CHECK(h.ptr != 0 && GPU_VALID(rtv) && h.ptr == (SIZE_T)g_dd->view_cpu[GPU_HANDLE_INDEX(rtv.id)]);
+    const gpu_view none = {0};
+    CHECK(gpu_d3d12_view_cpu(g_d, none).ptr == 0);
+    if (GPU_VALID(t) && h.ptr) {
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        ID3D12GraphicsCommandList* cl =
+            (ID3D12GraphicsCommandList*)gpu_native(g_d, GPU_NATIVE_CMD, (uint64_t)(uintptr_t)c);
+        const float green[4] = {0, 1, 0, 1};
+        cl->lpVtbl->OMSetRenderTargets(cl, 1, &h, FALSE, NULL);
+        cl->lpVtbl->ClearRenderTargetView(cl, h, green, 0, NULL);
+        gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        CHECK(run(g_d, c));
+        readback rb;
+        CHECK(tex_read(t, &td, &rb));
+        if (rb.p) {
+            const uint8_t* a = px(&rb, 7, 9);
+            CHECK(a[0] == 0 && a[1] == 255 && a[2] == 0 && a[3] == 255);
+        }
+        rb_done(&rb);
+    }
+
+    /* A depth view's, the read-only one apart. */
+    gpu_texture_desc zd = tex_desc(16, 16, GPU_FORMAT_R24G8_TYPELESS, GPU_USE_DS | GPU_USE_SAMPLED,
+                                   GPU_STATE_DEPTH_WRITE);
+    zd.clear_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    zd.clear_depth = 1.0f;
+    const gpu_texture z = gpu_texture_create(g_d, &zd);
+    memset(&vd, 0, sizeof vd);
+    vd.texture = z;
+    vd.kind = GPU_VIEW_DSV;
+    vd.format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    const gpu_view dsv = gpu_view_get(g_d, &vd);
+    vd.flags = GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL;
+    const gpu_view ro = gpu_view_get(g_d, &vd);
+    const D3D12_CPU_DESCRIPTOR_HANDLE dh = gpu_d3d12_view_cpu(g_d, dsv), rh = gpu_d3d12_view_cpu(g_d, ro);
+    CHECK(GPU_VALID(z) && dh.ptr && rh.ptr && dh.ptr != rh.ptr && dh.ptr != h.ptr);
+
+    gpu_texture_destroy(g_d, t, 0);
+    gpu_texture_destroy(g_d, z, 0);
+    CHECK(gpu_d3d12_view_cpu(g_d, rtv).ptr == 0 && gpu_d3d12_view_cpu(g_d, dsv).ptr == 0);
+}
+
+/* ---- step C5b ---- */
+/* gpu_d3d12_query_pool_heap (a pool's heap, borrowed): the one the commands
+ * record with, none for a handle that names no pool. */
+static void test_bridges_c5b(const scene* s)
+{
+    ID3D12QueryHeap* h = gpu_d3d12_query_pool_heap(g_d, s->queries);
+    CHECK(h != NULL);
+    if (GPU_VALID(s->queries)) CHECK(h == g_dd->qpool[GPU_HANDLE_INDEX(s->queries.id)].heap);
+    const gpu_query_pool none = {0};
+    CHECK(gpu_d3d12_query_pool_heap(g_d, none) == NULL);
+}
+
+/* The write-back's GPU store (RSX_WB_GPU, wbg_record): a texture copied into
+ * a buffer over host memory at a 512-byte offset, with a row pitch (a
+ * multiple of 256) wider than its rows, lands there row by row, and the
+ * bytes around and between the rows stay as they were. */
+static void test_host_copy_c5b(void)
+{
+    if (!(g_d->caps.bits & GPU_CAP_HOST_IMPORT)) return;
+    const uint32_t w = 16, h = 8, gp = 512, at = 3 * 512;
+    const size_t n = 1u << 20;
+    uint8_t* host = (uint8_t*)VirtualAlloc(NULL, n, MEM_RESERVE, PAGE_READWRITE);
+    CHECK(host != NULL);
+    if (!host) return;
+    const gpu_buffer hb = gpu_buffer_import_host(g_d, host, n);
+    const gpu_texture_desc td = tex_desc(w, h, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC |
+                                         GPU_USE_COPY_DST, GPU_STATE_COPY_DEST);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    CHECK(GPU_VALID(hb) && GPU_VALID(t));
+    if (GPU_VALID(hb) && GPU_VALID(t)) {
+        gpu_footprint fp;
+        uint32_t rows = 0;
+        uint64_t row_bytes = 0;
+        const uint64_t total = gpu_texture_footprints(g_d, &td, 0, 1, 0, &fp, &rows, &row_bytes);
+        const gpu_buffer up = buf_new(g_d, total, GPU_MEM_UPLOAD, GPU_STATE_GENERIC_READ);
+        uint8_t* p = buf_ptr(up);
+        for (uint32_t r = 0; r < h; r++)
+            for (uint32_t k = 0; k < w * 4; k++) p[(uint64_t)r * fp.row_pitch + k] = (uint8_t)(r * 29u + k * 7u + 1u);
+        gpu_footprint to;
+        memset(&to, 0, sizeof to);
+        to.offset = at;
+        to.format = GPU_FORMAT_R8G8B8A8_UNORM;
+        to.width = w; to.height = h; to.depth = 1;
+        to.row_pitch = gp;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_copy_buf_to_tex(c, t, 0, 0, 0, 0, up, &fp);
+        gpu_cmd_barrier(c, t, GPU_STATE_COPY_DEST, GPU_STATE_COPY_SOURCE);
+        gpu_cmd_copy_tex_to_buf(c, hb, &to, t, 0, NULL);
+        CHECK(run(g_d, c));
+        int same = 1;
+        for (uint32_t r = 0; r < h; r++)
+            if (memcmp(host + at + (uint64_t)r * gp, p + (uint64_t)r * fp.row_pitch, w * 4)) same = 0;
+        CHECK(same);
+        CHECK(host[at - 1] == 0 && host[at + w * 4] == 0 && host[at + (uint64_t)(h - 1) * gp + w * 4] == 0);
+        gpu_buffer_destroy(g_d, up, 0);
+    }
+    if (GPU_VALID(t)) gpu_texture_destroy(g_d, t, 0);
+    if (GPU_VALID(hb)) gpu_buffer_destroy(g_d, hb, 0);
+    VirtualFree(host, 0, MEM_RELEASE);
+}
+
 /* GPU_DEVICE_BREADCRUMBS (DRED, not the debug layer): its feature bits, a
  * marker, and, on WARP only, a device removed on purpose (as today's
  * RSX_LOSE_DEVICE_AT_FRAME removes it): lost, its fence passing every value,
@@ -1480,7 +1700,11 @@ int main(void)
         test_draw(&s);
         test_memo(&s);
         test_bridges(&s);
+        test_bridges_c4(&s);
+        test_bridges_c5b(&s);
+        test_host_copy_c5b();
     }
+    test_bridges_c5a();
     test_caches();
     test_fences();
     test_swapchain();
