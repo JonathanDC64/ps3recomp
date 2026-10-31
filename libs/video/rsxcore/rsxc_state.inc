@@ -238,6 +238,7 @@ typedef struct {
     int fetch;              /* reads vf_buf (rsx_vp_decompile_fetch): no input layout */
     u64 code64;             /* the pipeline index's fingerprint: FNV-1a 64 of the words up to END */
     u32 start;              /* the transform program start it was decompiled at */
+    u64 vs_key, vs4_key;    /* step P3S: K of vs's and vs4's texts, for the neutral manifest (0: none) */
 } VPVSEntry;
 /* The per-draw VS cache grows and never evicts. Draws record a slot index
  * (vs_idx) and PSO keys carry it, so a slot must keep meaning the same

@@ -206,6 +206,7 @@ static VPFPEntry* vp_fp_find(const VPFPEntry* k)
 typedef struct {
     gpu_pipeline_desc pd;
     gpu_shader ps;                      /* the job's own, freed in psj_finish */
+    gm_rec rec;                         /* step P3S: its neutral manifest record (pso_create_cached) */
     int entry;                          /* its VPFPEntry */
     gpu_pipeline pso;
 } PsjJob;
@@ -245,7 +246,7 @@ static void psj_take(LONG n)
 {
     for (LONG i; (i = InterlockedIncrement(&s_psj_next) - 1) < n; ) {
         PsjJob* j = &s_psj[i];
-        j->pso = pso_create_cached(&j->pd);
+        j->pso = pso_create_cached(&j->pd, &j->rec);
         if (InterlockedDecrement(&s_psj_left) == 0) {
             AcquireSRWLockExclusive(&s_psjp.lk);   /* the render thread waits or has not looked yet */
             ReleaseSRWLockExclusive(&s_psjp.lk);
@@ -273,8 +274,9 @@ static DWORD WINAPI psj_worker(LPVOID arg)
 
 /* vp_get_fp_pso in the pre-pass, on a miss: the key goes into the cache as
  * pending and the pipeline into this frame's batch, which takes the caller's
- * ps (pd's pixel shader). The entry's index, or -1 (full: build it now). */
-static int psj_add(const gpu_pipeline_desc* pd, gpu_shader ps, const VPFPEntry* key)
+ * ps (pd's pixel shader), with its record (rec). The entry's index, or -1
+ * (full: build it now). */
+static int psj_add(const gpu_pipeline_desc* pd, gpu_shader ps, const gm_rec* rec, const VPFPEntry* key)
 {
     if (s_psj_n >= PSJ_MAX) return -1;
     const int at = s_d3d.vp_fp_n;
@@ -285,6 +287,7 @@ static int psj_add(const gpu_pipeline_desc* pd, gpu_shader ps, const VPFPEntry* 
     PsjJob* j = &s_psj[s_psj_n++];
     j->pd = *pd;
     j->ps = ps;
+    j->rec = *rec;
     j->entry = at;
     j->pso = k_rc_no_pipe;
     return at;
@@ -473,6 +476,7 @@ static gpu_shader uvc_vs4(int i)
     if (rsxc_vs_text(&vp, e->fetch, hlsl, sizeof hlsl, NULL) > 0 &&
         rsxc_vs_inject_uvclamp(hlsl, sizeof hlsl, e->fetch))
         e->vs4 = sc_shader(GPU_SC_VS, hlsl, strlen(hlsl), "guest_vp4", NULL, 0);
+    if (GPU_VALID(e->vs4)) e->vs4_key = rsxc_shader_key(0, hlsl);   /* (step P3S: the neutral manifest's) */
     if (!GPU_VALID(e->vs4)) {
         static int said;
         if (said < 4 && ++said)

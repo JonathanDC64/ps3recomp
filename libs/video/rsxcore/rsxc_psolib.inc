@@ -20,6 +20,10 @@
  *                    instance file's: rc_be_pso_record, the D3D12
  *                    description the backend makes of a pipeline, today's).
  *   pso_blobs/       the shader bytecode those records name, by content hash.
+ *   gpu/manifest.bin the neutral manifest (step P3S, below): the guest-FP
+ *                    pipelines as the pipeline index's rows, on every
+ *                    backend; gpu/<dir>/<library file>.n counts the records
+ *                    the library holds.
  *
  * At startup, worker threads build every manifest record the library does not
  * hold yet (all of them after a driver update), before the title asks for
@@ -124,6 +128,175 @@ static long pso_file_size(const char* path)
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return 0;
     return (long)(((u64)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
 }
+/* ---- The neutral manifest (step P3S) ----
+ * <cache>/gpu/manifest.bin, in the compile service's folder: every guest-FP
+ * pipeline the new path has made, on any backend, in the shape of the
+ * pipeline index's rows once the pass has found their programs: the keys K
+ * of its two shader texts (gpu_sc_key, one K for a text on every target)
+ * and the draw state vp_fp_desc makes it from. Fixed-size records,
+ * appended. pso_manifest.bin's records are D3D12 descriptions in today's
+ * file; these name no API, so Vulkan builds from them as well.
+ *
+ * Recording: a guest-FP pipeline's record is added once the pipeline is
+ * made (pso_create_cached), and an index row's once it is built
+ * (pxi_build_one); the records the file does not have are appended off the
+ * render thread (gm_tick), at a library save and at the shutdown.
+ * Building: at the start, after pso_manifest.bin's build, worker threads
+ * build the records the library does not hold yet (gm_build_start, as the
+ * index's rows: pxi_build_one), then the index's. <library file>.n beside
+ * the library counts the records it held when it was saved; it moves on
+ * only after a build that built every record it was given. A record whose
+ * shaders this target's cache does not have (one written on another
+ * backend, for texts this one never compiled) is not built. On with the
+ * library (PS3_PSO_LIBRARY); PS3_PSO_PREBUILD=0 skips the build. */
+#define GM_REC_MAGIC 0x314D4E47u            /* "GNM1" */
+typedef struct {
+    u32 magic, size;
+    u64 vs_key, ps_key;                     /* K of the vertex and the pixel shader's texts */
+    u32 fetch, clamp, blend, nrt, rtfmt, cmask, cull, depth;   /* clamp: 1 the GS form, 2 kind 4 */
+} gm_rec;
+static int           s_gm_on;
+static SRWLOCK       s_gm_lock = SRWLOCK_INIT;        /* the names, the records to write, s_gm_n */
+static SRWLOCK       s_gm_file_lock = SRWLOCK_INIT;   /* the file */
+static gm_rec*       s_gm;                  /* records read at the start */
+static u32           s_gm_read, s_gm_have;  /* read; of those, the loaded library's (<library>.n) */
+static u32           s_gm_n;                /* records in the file (read + written) */
+static gm_rec*       s_gm_pend;             /* records not written yet */
+static u32           s_gm_pend_n, s_gm_pend_cap, s_gm_quiet;
+static u64*          s_gm_names;            /* open-addressed set of record names */
+static u32           s_gm_names_cap, s_gm_names_n;
+static volatile LONG s_gm_writing;
+/* The start's build of the records (rsxc_pipeline.inc). */
+static volatile LONG s_gmb_live, s_gmb_next, s_gmb_built, s_gmb_had, s_gmb_failed;
+static int           s_gmb_started, s_gmb_complete;
+static double        s_gmb_t0;
+static void gm_build_start(void);
+
+static void gm_path(char* out, size_t n) { snprintf(out, n, "%s/gpu/manifest.bin", gpu_sc_cache_dir()); }
+/* <library file>.n in the library's folder. */
+static void gm_count_path(char* out, size_t n)
+{
+    char leaf[128];
+    snprintf(leaf, sizeof leaf, "%s.n", rc_be_lib_file(s_rc_dev));
+    pso_lib_path(out, n, leaf);
+}
+static u64 gm_name(const gm_rec* r)
+{
+    const u64 h = fnv_bytes(14695981039346656037ull, &r->vs_key, sizeof *r - offsetof(gm_rec, vs_key));
+    return h ? h : 1;
+}
+/* 1 if the name is new (and now in the set). With s_gm_lock. */
+static int gm_names_add(u64 k)
+{
+    if ((s_gm_names_n + 1) * 2 > s_gm_names_cap) {
+        const u32 cap = s_gm_names_cap ? s_gm_names_cap * 2 : 4096;
+        u64* nw = (u64*)calloc(cap, sizeof(u64));
+        if (!nw) return 0;
+        for (u32 i = 0; i < s_gm_names_cap; i++)
+            if (s_gm_names[i])
+                for (u32 j = (u32)s_gm_names[i] & (cap - 1);; j = (j + 1) & (cap - 1))
+                    if (!nw[j]) { nw[j] = s_gm_names[i]; break; }
+        free(s_gm_names);
+        s_gm_names = nw; s_gm_names_cap = cap;
+    }
+    u32 i = (u32)k & (s_gm_names_cap - 1);
+    for (; s_gm_names[i]; i = (i + 1) & (s_gm_names_cap - 1))
+        if (s_gm_names[i] == k) return 0;
+    s_gm_names[i] = k; s_gm_names_n++;
+    return 1;
+}
+/* The file, read when the library is opened (loaded: the file's library is
+ * this device's). Whole records only; a torn tail is cut off. */
+static void gm_open(int loaded)
+{
+    s_gm_on = 1;
+    char mp[MAX_PATH + 32];
+    gm_path(mp, sizeof mp);
+    long mn = 0;
+    gm_rec* m = (gm_rec*)pso_read_file(mp, &mn);
+    u32 cnt = 0;
+    if (m) {
+        const u32 whole = (u32)(mn / (long)sizeof(gm_rec));
+        while (cnt < whole && m[cnt].magic == GM_REC_MAGIC && m[cnt].size == sizeof(gm_rec)) cnt++;
+        if ((long)cnt * (long)sizeof(gm_rec) != mn) {
+            printf("[D3D12] pipeline manifest gpu/manifest.bin: keeping the first %u whole records\n", cnt);
+            pso_write_file(mp, m, (size_t)cnt * sizeof(gm_rec));
+        }
+        for (u32 i = 0; i < cnt; i++) gm_names_add(gm_name(&m[i]));
+    }
+    s_gm = m; s_gm_read = s_gm_n = cnt;
+    if (loaded) {
+        char np[MAX_PATH + 160];
+        gm_count_path(np, sizeof np);
+        FILE* f = fopen(np, "rb");
+        unsigned have = 0;
+        if (f) { if (fscanf(f, "%u", &have) != 1) have = 0; fclose(f); }
+        s_gm_have = have < cnt ? have : cnt;
+    }
+    printf("[D3D12] pipeline manifest gpu/manifest.bin: %u records, %u to build\n", cnt, cnt - s_gm_have);
+}
+/* A pipeline's record, once the pipeline is made (a record with no magic
+ * is none). Thread-safe. */
+static void gm_add(const gm_rec* r)
+{
+    if (!s_gm_on || !r || r->magic != GM_REC_MAGIC) return;
+    const u64 k = gm_name(r);
+    AcquireSRWLockExclusive(&s_gm_lock);
+    if (gm_names_add(k)) {
+        if (s_gm_pend_n == s_gm_pend_cap) {
+            const u32 cap = s_gm_pend_cap ? s_gm_pend_cap * 2 : 256;
+            gm_rec* g = (gm_rec*)realloc(s_gm_pend, sizeof *g * cap);
+            if (g) { s_gm_pend = g; s_gm_pend_cap = cap; }
+        }
+        if (s_gm_pend_n < s_gm_pend_cap) s_gm_pend[s_gm_pend_n++] = *r;
+        s_gm_quiet = 0;
+    }
+    ReleaseSRWLockExclusive(&s_gm_lock);
+}
+/* The records not written yet, to the end of the file. */
+static void gm_flush(void)
+{
+    AcquireSRWLockExclusive(&s_gm_file_lock);
+    AcquireSRWLockExclusive(&s_gm_lock);
+    gm_rec* const t = s_gm_pend;
+    const u32 n = s_gm_pend_n;
+    s_gm_pend = NULL; s_gm_pend_n = s_gm_pend_cap = 0;
+    ReleaseSRWLockExclusive(&s_gm_lock);
+    u32 put = 0;
+    if (n) {
+        char mp[MAX_PATH + 32];
+        gm_path(mp, sizeof mp);
+        FILE* f = fopen(mp, "ab");
+        if (f) {
+            put = (u32)fwrite(t, sizeof *t, n, f);
+            fclose(f);
+        }
+    }
+    free(t);
+    AcquireSRWLockExclusive(&s_gm_lock);
+    s_gm_n += put;
+    ReleaseSRWLockExclusive(&s_gm_lock);
+    ReleaseSRWLockExclusive(&s_gm_file_lock);
+}
+static DWORD WINAPI gm_flush_thread(LPVOID unused)
+{
+    (void)unused;
+    gm_flush();
+    InterlockedExchange(&s_gm_writing, 0);
+    return 0;
+}
+/* Once per present (pso_lib_tick): new records are written once 240
+ * presents have passed with none. */
+static void gm_tick(void)
+{
+    if (!s_gm_pend_n || ++s_gm_quiet < 240) return;
+    s_gm_quiet = 0;
+    if (InterlockedCompareExchange(&s_gm_writing, 1, 0) == 0) {
+        HANDLE t = CreateThread(NULL, 0, gm_flush_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t); else InterlockedExchange(&s_gm_writing, 0);
+    }
+}
+
 /* The library is the GPU layer's (gpu_pipeline_create loads from it and
  * stores in it): its file read here, before any pipeline is made, or a new
  * one when the file is another driver's or GPU's, or there is none. */
@@ -144,6 +317,7 @@ static void pso_lib_open(void)
     if (lib == GPU_PIPELINE_CACHE_NONE) return;
     const int loaded = lib == GPU_PIPELINE_CACHE_LOADED;
     s_pso_lib_on = 1;
+    gm_open(loaded);   /* (step P3S: the neutral manifest, on every backend) */
     if (!rc_be_cache_files) {   /* (step VC2: Vulkan: the pipeline cache alone, no manifest) */
         if (!loaded) {
             char ip[MAX_PATH + 32];
@@ -182,9 +356,9 @@ static void pso_lib_open(void)
         /* A new library (none yet, or another driver's): the pipeline index's
          * pipelines with a geometry shader are in no manifest, so the index is
          * built again. The start's shader pass may have looked already; then
-         * the next start does it. (The pass reads the d3d12 route's
-         * pso_index.built, rsx_shader_precompile_index_built; this route's
-         * mark is its own and today's file is left alone.) */
+         * the next start does it. (This route's mark is its own and today's
+         * pso_index.built is left alone; step P3S: the dxbc target's pass
+         * reads this one, rsx_shader_precompile_index_built.) */
         char ip[MAX_PATH + 32];
         pso_lib_path(ip, sizeof ip, "index.built");
         DeleteFileA(ip);
@@ -209,13 +383,23 @@ static void pso_lib_save(void)
     AcquireSRWLockShared(&s_pso_man_lock);
     const u32 recs = s_pso_man_n;
     ReleaseSRWLockShared(&s_pso_man_lock);
+    /* Step P3S: the neutral manifest's records written first, so its count
+     * names only records whose pipelines were made before the library is
+     * read below; the start's count again while its build has not built
+     * every record it was given. */
+    gm_flush();
+    AcquireSRWLockShared(&s_gm_lock);
+    const u32 gm_recs = s_gmb_complete ? s_gm_n : s_gm_have;
+    ReleaseSRWLockShared(&s_gm_lock);
     char path[MAX_PATH + 32];
     pso_lib_path(path, sizeof path, rc_be_lib_file(s_rc_dev));   /* (step VC2: the instance file's name) */
     if (!gpu_pipeline_cache_save(s_rc_dev, path)) return;
-    char np[MAX_PATH + 32], txt[16];
+    char np[MAX_PATH + 160], txt[16];
     pso_lib_path(np, sizeof np, "pipelines.n");
     if (rc_be_cache_files)   /* (step VC2: no manifest on Vulkan, so no count of its records) */
         pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
+    gm_count_path(np, sizeof np);
+    pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", gm_recs));
     InterlockedExchangeAdd(&s_pso_lib_new, -pending);
     printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
            (unsigned long)(pso_file_size(path) >> 10), recs, (unsigned)s_pso_lib_hits, (unsigned)s_pso_lib_live);
@@ -468,15 +652,12 @@ static void pso_count_print(const char* when)
     printf("[D3D12] pipelines resident: %ld; only stored in the library: %ld\n",
            (long)(s_rc_pipe_loaded + s_rc_pipe_made), (long)s_rc_pipe_store_only);
 }
-static void pso_lib_tick(void)
+/* The start's builds, each once the one before it is done: the manifest's
+ * once the root signature exists, then the neutral manifest's (step P3S),
+ * then the pipeline index's. Each builds only what the library does not
+ * have by then. */
+static void pso_builds_step(void)
 {
-    /* PS3_PSO_LOG=1: those counts after each present that made pipelines (a
-     * replay ends without rc_backend_shutdown's line). */
-    { static int lg = -1; PS3_KNOB(lg, ps3_env_int("PS3_PSO_LOG", 0));
-      static LONG seen = -1;
-      const LONG t = s_rc_pipe_loaded + s_rc_pipe_made + s_rc_pipe_store_only;
-      if (lg && t != seen) { seen = t; pso_count_print("so far"); } }
-    if (!s_pso_lib_on) return;
     if (!s_pso_pre_started && GPU_VALID(s_d3d.vp_layout)) {
         s_pso_pre_started = 1;
         if (s_pso_man_read > s_pso_lib_have && ps3_env_int("PS3_PSO_PREBUILD", 1)) {
@@ -491,11 +672,22 @@ static void pso_lib_tick(void)
             }
         }
     }
-    /* The index after the manifest: what the manifest holds is in the
-     * library by then, and the index builds only what is not. */
-    if (s_pso_pre_started && !s_pso_pre_live) pso_index_build_start();
+    if (s_pso_pre_started && !s_pso_pre_live) gm_build_start();
+    if (s_gmb_started && !s_gmb_live) pso_index_build_start();
+}
+static void pso_lib_tick(void)
+{
+    /* PS3_PSO_LOG=1: those counts after each present that made pipelines (a
+     * replay ends without rc_backend_shutdown's line). */
+    { static int lg = -1; PS3_KNOB(lg, ps3_env_int("PS3_PSO_LOG", 0));
+      static LONG seen = -1;
+      const LONG t = s_rc_pipe_loaded + s_rc_pipe_made + s_rc_pipe_store_only;
+      if (lg && t != seen) { seen = t; pso_count_print("so far"); } }
+    if (!s_pso_lib_on) return;
+    pso_builds_step();
     pso_index_tick();
-    if (!s_pso_lib_new || s_pso_lib_saving || s_pso_pre_live || s_pxb_live || s_pso_man_pending) return;
+    gm_tick();
+    if (!s_pso_lib_new || s_pso_lib_saving || s_pso_pre_live || s_gmb_live || s_pxb_live || s_pso_man_pending) return;
     if (++s_pso_lib_quiet < 120 && s_pso_lib_new < 256) return;
     if (InterlockedCompareExchange(&s_pso_lib_saving, 1, 0) == 0) {
         HANDLE t = CreateThread(NULL, 0, pso_lib_save_thread, NULL, 0, NULL);
@@ -505,12 +697,15 @@ static void pso_lib_tick(void)
 /* A guest-FP pipeline (vp_get_fp_pso, psj's workers): the GPU layer's, which
  * loads it from its library or compiles and stores it. One it compiled goes
  * into the manifest under today's name (rc_be_pso_record, on this miss
- * path only). None on failure. Thread-safe. */
-static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd)
+ * path only). Step P3S: rec, its record in the neutral manifest (no magic:
+ * none), is added once it is made, however it was. None on failure.
+ * Thread-safe. */
+static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd, const gm_rec* rec)
 {
     uint32_t how = GPU_PIPELINE_FAILED;
     const gpu_pipeline pso = rc_pipeline(pd, &how);
     if (!s_pso_lib_on || !pso.v) return pso;
+    gm_add(rec);
     if (how == GPU_PIPELINE_LOADED) { InterlockedIncrement(&s_pso_lib_hits); return pso; }
     InterlockedIncrement(&s_pso_lib_live);
     if (how == GPU_PIPELINE_STORED) {   /* new in the library (step C3c: only then, as today's) */

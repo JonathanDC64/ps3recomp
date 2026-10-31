@@ -122,10 +122,16 @@ void rsx_shader_precompile_wait(void);
  *          with today's call, so today's .dxbc names and bytes. Windows.
  *   spv    the same texts into its spv target, glslang, under
  *          <cache>/gpu/spv/. Where PS3RECOMP_RSX_HAL_SPV is built.
- * No renderer takes the rows of dxbc or spv yet (their pipeline stores come
- * later): their pso_index_add/ready are NULL, so a pass hands no rows over,
- * _index_built is 0 and an index_only pass has nothing to do (_index
- * returns 0); a full pass still makes the rows' texts. */
+ * A target's pipeline index rows go to the renderer that draws with its
+ * files (route: d3d12's to today's renderer, dxbc's to hal-d3d12, spv's to
+ * vulkan), through the route switch, when that is the route the process
+ * runs; each renderer marks the index built in a file of its own
+ * (index_mark: today's pso_index.built, gpu/d3d12/index.built,
+ * gpu/vulkan/index.built), which _index_built reads. For a target whose
+ * renderer is not the one that runs, the pass hands no rows over and an
+ * index_only pass has nothing to do (_index returns 0); a full pass still
+ * makes the rows' texts. Without the route switch (a build with neither
+ * Windows nor vkd3d) no sink takes rows. */
 typedef struct rsx_shader_precompile_sink {
     const char* name;       /* "d3d12", "dxbc", "spv" */
     const char* compiler;   /* for the failure line: "FXC", "glslang" */
@@ -145,6 +151,8 @@ typedef struct rsx_shader_precompile_sink {
     void        (*pso_index_add)(int vs_fetch, uint64_t vs_key, int clamp, uint64_t ps_key, uint32_t blend,
                                  int nrt, uint32_t rtfmt, uint32_t cmask, uint32_t cull, uint32_t depth);
     void        (*pso_index_ready)(uint64_t hash);
+    const char* route;        /* the route (rsx_out_renderer) whose renderer takes the rows */
+    const char* index_mark;   /* its mark that the index is built, under the cache; NULL: pso_index.built */
 } rsx_shader_precompile_sink;
 
 #define RSX_PRECOMPILE_D3D12   0
