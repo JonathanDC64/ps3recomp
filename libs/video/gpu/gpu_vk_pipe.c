@@ -333,7 +333,7 @@ static VkBorderColor border_of(const gpu_sampler_desc* s)
 /* gpu_layout_desc as a pipeline layout (gpu_vk_internal.h's rules): set 0
  * the CB and RAW slots as dynamic buffers and the static samplers as
  * immutable ones, a set per table slot, the CONST32 slots one push
- * constant block. Table slots start at register 0. */
+ * constant block. A table slot may start at any register (step VM). */
 gpu_layout gpu_vk_layout_create(gpu_device* d, const gpu_layout_desc* desc)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
@@ -372,10 +372,9 @@ gpu_layout gpu_vk_layout_create(gpu_device* d, const gpu_layout_desc* desc)
             break;
         case GPU_SLOT_TABLE_TEX:
         case GPU_SLOT_TABLE_SAMPLER:
-            if (s->reg != 0) {
-                printf("[VK] layout: a table slot must start at register 0 (slot %u)\n", i);
-                return r;
-            }
+            /* (Any first register: the set's entry 0 is it. The compile
+             * service binds the shader's registers so; step VM, the menu's
+             * t1 is a table of its own.) */
             l.slot[i].set = (uint8_t)l.nsets++;
             break;
         default:

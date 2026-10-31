@@ -458,7 +458,9 @@ typedef struct gpu_sampler_desc {
  * tables of its own count (the region's size), from register 0.
  * ---- step VC1 ---- Up to 16 entries counts as 16 on both sides: a slot of
  * up to 16 binds any table of up to 16 (a 1-texture blit slot binds a pool's
- * 2-entry tables); past 16, only its own count. */
+ * 2-entry tables); past 16, only its own count.
+ * ---- step VM ---- A table slot may start at any register (Vulkan too): its
+ * entry 0 is that register (the menu's t0 and t1 are two slots). */
 enum { GPU_TABLE_TEX = 0, GPU_TABLE_SAMPLER = 1 };
 #define GPU_MAX_TABLE_REGIONS 4
 typedef struct gpu_table_region { uint32_t first, tables, size; } gpu_table_region;
