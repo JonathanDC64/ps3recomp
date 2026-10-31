@@ -966,3 +966,27 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #  init_d3d12 (rsxc_init.inc) makes the device with 2 * FRAME_COUNT
 #   command slots (was FRAME_COUNT): the overlay's beside the frames'. An
 #   unused slot is never begun.
+
+# Step P3S: the new path's pipeline stores. New code, not copies; with no
+# gpu/manifest.bin and no index rows handed over, every copied line does what
+# it did, but for the start's build order below.
+#  The neutral manifest (rsxc_psolib.inc, gm_*): <cache>/gpu/manifest.bin, on
+#   every backend with a pipeline library, records shaped as the pipeline
+#   index's rows (gm_rec: the texts' keys K and vp_fp_desc's state; clamp 2 is
+#   kind 4's). A guest-FP pipeline's record is added once it is made
+#   (pso_create_cached takes it from vp_get_fp_pso, and psj's jobs carry it:
+#   PsjJob.rec, psj_add), an index row's once it is built (pxi_build_one).
+#   VPVSEntry keeps vs_key and vs4_key (rsxc_vs.inc, uvc_vs4) for that. Read
+#   at pso_lib_open (gm_open), written by gm_tick, pso_lib_save and the
+#   shutdown; <library file>.n beside the library counts its records.
+#  The start's builds (pso_builds_step, out of pso_lib_tick): pso_manifest.bin's
+#   (pso_prebuild_thread, as before), then the neutral manifest's
+#   (gm_build_start, rsxc_pipeline.inc, through pxi_build_one), then the index's.
+#   pxi_build_one returns -2 for a clamp row of the other form and -3 for the
+#   driver's refusal (-1 is still a shader not in the cache); PS3_PSO_LOG=1
+#   names each row not built. PS3_PSO_WAIT=1 lets the shutdown finish the
+#   builds (rc_backend_shutdown, pso_builds_finish).
+#  Vulkan (rsxc_vk.c) builds from the neutral manifest and takes index rows
+#   (the spv target's pass hands them over, rsx_shader_precompile.c); its
+#   pipeline cache's file is written under a per-process temporary name
+#   (gpu_vk_pipe.c).

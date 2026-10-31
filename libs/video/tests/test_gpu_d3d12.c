@@ -1209,6 +1209,48 @@ static void test_pipeline_cache(void)
         if (run_no == 0) CHECK(gpu_pipeline_cache_save(d, path) == 1);
         gpu_destroy(d);
     }
+    /* A file the driver refuses (step P3S: another driver's or GPU's, or no
+     * library at all; here the saved one cut to half, then a text): a new,
+     * empty library, which pipelines are stored in. */
+    {
+        FILE* f = fopen(path, "rb");   /* (none when the device has no library: skipped above) */
+        const int saved = f != NULL;
+        uint8_t* good = NULL;
+        long n = 0;
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            good = n > 0 ? (uint8_t*)malloc((size_t)n) : NULL;
+            if (good && fread(good, 1, (size_t)n, f) != (size_t)n) n = 0;
+            fclose(f);
+        }
+        if (good && n > 0) {
+            static const char k_text[] = "not a pipeline library";
+            for (int k = 0; k < 2; k++) {
+                f = fopen(path, "wb");
+                if (f) {
+                    if (k == 0) fwrite(good, 1, (size_t)n / 2, f);
+                    else fwrite(k_text, 1, sizeof k_text - 1, f);
+                    fclose(f);
+                }
+                gpu_device* d = gpu_d3d12_create(&dd);
+                CHECK(d != NULL);
+                if (!d) break;
+                CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);
+                const gpu_layout l = guest_layout(d);
+                const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+                const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+                gpu_pipeline_desc pd;
+                draw_desc(&pd, l, vs, ps);
+                uint32_t how = 7;
+                CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_STORED);
+                gpu_destroy(d);
+            }
+        } else if (saved)
+            CHECK(!"the saved library could not be read back");
+        free(good);
+    }
     /* No library (the cap masked, as a fallback would): pipelines are
      * compiled and never stored; a store-only one is compiled and released. */
     dd.cap_mask = GPU_CAP_PIPELINE_CACHE;
