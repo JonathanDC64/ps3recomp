@@ -13,7 +13,8 @@ bit for bit across the whole context, so a stray write shows too.
 
 On x86 the driver is built once as the game builds it (the SSE4.1 path) and
 once with PPU_VMX_NO_SSE41 (the loops), and with clang-cl as well when it is
-there (the game's compiler). Elsewhere only the loops exist.
+there (the game's compiler). On arm64 the SSE4.1 path is built through
+sse2neon (ps3emu/ps3_sse.h), and the loops as on x86.
 
 Run: python tools/test_ppu_vmx_helpers.py
 """
@@ -219,7 +220,9 @@ def emit(path):
         label = f"{insn.mnemonic} {insn.operands}"
         runs.append(f'    run("{label}", {k}, {vd}, new_{i}, old_{i});')
     out.append("int main(void) {")
-    out.append("#ifdef PPU_VMX_SSE41")
+    out.append("#if defined(PPU_VMX_SSE41) && defined(PS3_SSE2NEON)")
+    out.append('    printf("path: sse2neon\\n");')
+    out.append("#elif defined(PPU_VMX_SSE41)")
     out.append('    printf("path: sse41\\n");')
     out.append("#else")
     out.append('    printf("path: loops\\n");')
@@ -237,6 +240,7 @@ def emit(path):
 def builds(tmp, cpp):
     """(label, command, expected path) for each compiler this host has."""
     x86 = platform.machine().lower() in ("amd64", "x86_64", "x64")
+    arm64 = platform.machine().lower() in ("arm64", "aarch64")
     inc = os.path.join(ROOT, "runtime", "ppu")
     out = []
     if os.name == "nt":
@@ -266,6 +270,8 @@ def builds(tmp, cpp):
                         exe, None)
             if x86:
                 out.append((f"{os.path.basename(cxx)}, SSE4.1", *gcc("sse", ["-msse4.1"]), "sse41"))
+            if arm64:
+                out.append((f"{os.path.basename(cxx)}, sse2neon", *gcc("neon", []), "sse2neon"))
             out.append((f"{os.path.basename(cxx)}, loops", *gcc("loops", ["-DPPU_VMX_NO_SSE41"]), "loops"))
     return out
 
