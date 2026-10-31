@@ -64,7 +64,7 @@ static void vp_fp_desc(gpu_pipeline_desc* pd, gpu_shader vs, int fetch, gpu_shad
      * there, as the D3D12 description's target 0 has it, so that one D3D12
      * description is one name in the GPU layer's library (pso_rec_desc). */
     pd->blend.write_mask = nrt ? (u8)(cmask & 0xF) : (u8)GPU_WRITE_ALL;
-    pd->ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    pd->ds_format = rc_ds_format();   /* (step V5: D24S8, or D32S8) */
     /* Guest depth state (rsx_depth_key). With the test off RSX neither tests
      * nor writes depth, which is D3D's DepthEnable FALSE as well. */
     pd->depth_test = (depth & 1u) ? 1 : 0;
@@ -383,7 +383,9 @@ static void pso_index_build_start(void)
     if (!s_pxb_n) return;
     gpu_shader gs = {0};
     for (u32 i = 0; i < s_pxb_n; i++)
-        if (s_pxb[i].clamp) { gs = uvclamp_gs(); break; }   /* here: it compiles on its first call */
+        if (s_pxb[i].clamp && !s_uvc_vs) { gs = uvclamp_gs(); break; }   /* here: it compiles on its first call */
+    /* (Step V5: in the vertex-shader form the rows with the clamp are not
+     * built: their vertex shader is the program's kind 4, made at a draw.) */
     SYSTEM_INFO si; GetSystemInfo(&si);
     int nt = (int)si.dwNumberOfProcessors / 4;
     if (nt < 1) nt = 1; if (nt > 4) nt = 4;
@@ -402,6 +404,7 @@ static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                 u32 hdrv)
 {
     s_psj_last = -1;
+    s_fp_vs4 = 0;
     vp_pso_knobs_check();
     if (nrt < 0) nrt = 0; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = GPU_FORMAT_R8G8B8A8_UNORM;
@@ -454,6 +457,7 @@ static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
     { const VPFPEntry* hit = vp_fp_find(&key);
       if (hit) {
           if (hit->pending) s_psj_last = (int)(hit - s_d3d.vp_fp);
+          s_fp_vs4 = (int)hit->vs4;
           return hit->pso;
       } }
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -676,8 +680,15 @@ static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
           }
       } }
     gpu_shader gsb = {0};
-    if (uvclamp) gsb = uvclamp_gs();
+    if (uvclamp && !s_uvc_vs) gsb = uvclamp_gs();
     if (GPU_VALID(gsb) && !fp_inject_uvclamp(hlsl, sizeof hlsl)) gsb.id = 0;
+    /* Step V5: the vertex-shader form (kind 4) in place of the geometry
+     * shader: the program's clamp form, which reads its vertices itself (no
+     * input layout), and the same pixel shader. */
+    if (uvclamp && s_uvc_vs) {
+        const gpu_shader v4 = uvc_vs4(vs_idx);
+        if (GPU_VALID(v4) && fp_inject_uvclamp(hlsl, sizeof hlsl)) { vsb = v4; key.vs4 = 1; }
+    }
     if (hdrv) {
         const int sat = (hdrv & HDRV_SAT) != 0;
         const int k = rc_shader_hdr(hlsl, sizeof hlsl, hdrv);
@@ -694,11 +705,12 @@ static gpu_pipeline vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
     }
 
     gpu_pipeline_desc pd;
-    vp_fp_desc(&pd, vsb, vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].fetch, pb, gsb,
-               blend, nrt, rtfmt, cmask, cull, depth);
-    if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)   /* a row for the pipeline index */
-        pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask, GPU_VALID(gsb),
-                       blend, nrt, rtfmt, cmask, cull, depth, hdrv);
+    vp_fp_desc(&pd, vsb, key.vs4 || (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n && s_d3d.vp_vs[vs_idx].fetch),
+               pb, gsb, blend, nrt, rtfmt, cmask, cull, depth);
+    if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)   /* a row for the pipeline index (either clamp form's) */
+        pso_index_note(&s_d3d.vp_vs[vs_idx], vm_base + off, exp32, cube_mask, d2c_mask,
+                       GPU_VALID(gsb) || key.vs4, blend, nrt, rtfmt, cmask, cull, depth, hdrv);
+    s_fp_vs4 = (int)key.vs4;
 
     /* In the draw pre-pass: built with the frame's other missing pipelines
      * (psj_finish), which has pb from here. */

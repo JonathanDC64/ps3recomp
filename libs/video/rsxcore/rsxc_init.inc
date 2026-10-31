@@ -82,6 +82,24 @@ static int display_targets_make(void)
     return 0;
 }
 
+/* Step V5: the forms for what the device lacks (rsxc_state.inc), from its
+ * feature bits and RSX_CLAMP_FORM / RSX_DEPTH_FORMAT; a line says which when
+ * it is not today's. */
+static void rc_forms_pick(void)
+{
+    const u32 caps = s_rc_dev->caps.bits;
+    const char* cf = getenv("RSX_CLAMP_FORM");
+    s_uvc_vs = !(caps & GPU_CAP_GS) || (cf && !strcmp(cf, "vs"));
+    if (s_uvc_vs)
+        printf("[D3D12] sprite-edge clamp: in the vertex shader (%s)\n",
+               (caps & GPU_CAP_GS) ? "RSX_CLAMP_FORM=vs" : "no geometry shaders");
+    const char* df = getenv("RSX_DEPTH_FORMAT");
+    s_rc_d32 = !(caps & GPU_CAP_D24S8) || (df && !strcmp(df, "d32s8"));
+    if (s_rc_d32)
+        printf("[D3D12] depth surfaces: D32S8 (%s)\n",
+               (caps & GPU_CAP_D24S8) ? "RSX_DEPTH_FORMAT=d32s8" : "no D24S8");
+}
+
 static int depth_buffer_make(void)
 {
     gpu_texture_desc td;
@@ -95,11 +113,11 @@ static int depth_buffer_make(void)
     td.height        = rt_host_dim(2048, 2048, 2048);
     td.layers        = 1;
     td.mips          = 1;
-    td.format        = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.format        = rc_ds_format();   /* (step V5: D24S8, or D32S8) */
     td.samples       = 1;
     td.use           = GPU_USE_DS;
     td.state         = GPU_STATE_DEPTH_WRITE;
-    td.clear_format  = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.clear_format  = rc_ds_format();
     td.clear_depth   = 1.0f;
     td.clear_stencil = 0;
     s_rc_depth_tex = gpu_texture_create(s_rc_dev, &td);
@@ -108,8 +126,8 @@ static int depth_buffer_make(void)
         return -1;
     }
 
-    /* The DSV: D24S8, 2D, mip 0, no flags. */
-    s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
+    /* The DSV: D24S8 (or D32S8), 2D, mip 0, no flags. */
+    s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, rc_ds_format());
     return 0;
 }
 
@@ -154,6 +172,7 @@ static int init_d3d12(u32 width, u32 height)
         s_rc_dev = rc_be_create(&dd);
         if (!start_step("device", s_rc_dev != NULL)) return -1;
     }
+    rc_forms_pick();
 
     pso_lib_open();
     shader_cache_warm();
@@ -199,14 +218,15 @@ static int init_d3d12(u32 width, u32 height)
 
     /* ---------------------------------------------------------------
      * Depth/stencil buffer
-     * 24-bit depth + 8-bit stencil (GPU_FORMAT_D24_UNORM_S8_UINT).
+     * 24-bit depth + 8-bit stencil (GPU_FORMAT_D24_UNORM_S8_UINT), or
+     * D32S8 with RSX_DEPTH_FORMAT=d32s8 (rc_ds_format, step V5).
      * One shared depth texture across both frames — RSX games on PS3
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
     {
         if (!start_step("targets", depth_buffer_make() == 0)) return -1;
 
-        printf("[D3D12] Depth buffer created (%ux%u D24S8)\n", width, height);
+        printf("[D3D12] Depth buffer created (%ux%u %s)\n", width, height, s_rc_d32 ? "D32S8" : "D24S8");
     }
 
     /* The recorders and the fence are the device's (one fence, the device's
@@ -344,7 +364,9 @@ static int init_d3d12(u32 width, u32 height)
          * MAX_VERTICES * 256 * 2 bytes and grows fast. */
         fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
                 (unsigned long long)(bytes >> 20), (unsigned)s_vp_cap, 10);
-        if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &s_rc_vp_vb, &s_d3d.vp_vb_mapped))
+        /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
+        if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD,
+                         &s_rc_vp_vb, &s_d3d.vp_vb_mapped))
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
         bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */

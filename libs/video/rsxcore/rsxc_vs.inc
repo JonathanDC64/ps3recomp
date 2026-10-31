@@ -17,6 +17,9 @@ static int vp_vs_insert(u32 hash, gpu_shader vs, int uses_c03)
     const int slot = s_d3d.vp_vs_n++;
     s_d3d.vp_vs[slot].hash     = hash;
     s_d3d.vp_vs[slot].vs       = vs;
+    s_d3d.vp_vs[slot].vs4      = (gpu_shader){0};
+    s_d3d.vp_vs[slot].vs4_code = NULL;
+    s_d3d.vp_vs[slot].vs4_len  = 0;
     s_d3d.vp_vs[slot].uses_c03 = uses_c03;
     s_d3d.vp_vs[slot].fetch    = 0;
     s_d3d.vp_vs[slot].code64   = 0;
@@ -163,6 +166,13 @@ static int vp_get_vs_mode(const rsx_state* st, int fetch)
     s_d3d.vp_vs[slot].fetch = fetch;
     s_d3d.vp_vs[slot].code64 = rsxc_vs_code64(&vp);
     s_d3d.vp_vs[slot].start = vstart / 16u;
+    /* Step V5: the clamp's vertex-shader form is made from the same bytes at
+     * the program's first clamp draw (uvc_vs4), when the store may hold
+     * another program: keep a copy. */
+    if (s_uvc_vs && (s_d3d.vp_vs[slot].vs4_code = (u8*)malloc(vlen)) != NULL) {
+        memcpy(s_d3d.vp_vs[slot].vs4_code, vuc, vlen);
+        s_d3d.vp_vs[slot].vs4_len = vlen;
+    }
     { static int _n=0; if (_n < 6 && ++_n) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
      * trigger reads s_d3d.current_rsx_state, which by frame end no longer has

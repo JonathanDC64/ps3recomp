@@ -310,6 +310,10 @@ static void pso_manifest_flush(void)
 
 static void pso_manifest_add(const gpu_pipeline_desc* pd)
 {
+    /* Step V5: with either form for a missing feature (rc_forms_pick) the
+     * pipelines are ones the d3d12 route never makes (kind 4's, D32S8's), and
+     * the manifest is that route's file too: they go into the library only. */
+    if (s_uvc_vs || s_rc_d32) return;
     PsoManItem* it = (PsoManItem*)calloc(1, sizeof *it);
     if (!it) return;
     pso_rec* r = &it->r;
@@ -414,6 +418,7 @@ static int pso_prebuild_one(const pso_rec* r)
     /* (The instance file's name: another build's layout, or a stale root
      * signature, names it otherwise.) */
     if (rc_be_pso_name(s_rc_dev, &pd, s_vp_root_hash) != r->name) goto out;
+    pd.ds_format = rc_ds_format();   /* (step V5: the records are D24S8's; a D32S8 run builds its own) */
     /* A record pipelines.n does not count may be in the library already:
      * one stored while the library was being saved, or a crash between the
      * two files. It is loaded then, not built. Either way only the library

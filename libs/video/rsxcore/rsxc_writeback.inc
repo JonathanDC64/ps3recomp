@@ -898,7 +898,7 @@ static void vp_vb_grow(u64 want)
     }
     const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
     gpu_buffer nb; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
+    if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
         if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
                 (unsigned long long)cap, s_vp_cap, 10);
