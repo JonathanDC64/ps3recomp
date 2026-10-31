@@ -606,6 +606,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # The guest system-time clock (sys_time_get_system_time, and the flip
     # time cellGcmGetLastFlipTime reports) counts microseconds.
     add_subdirectory(tests/lv2_time)
+    # runtime/platform/plat.h's threads, events and mutex, and the SPU async
+    # job pool written once on them for every platform.
+    add_subdirectory(tests/plat_threads)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)

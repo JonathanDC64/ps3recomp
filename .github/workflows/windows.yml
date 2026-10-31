@@ -233,6 +233,18 @@ jobs:
           ctest --test-dir build-sync-stress --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # runtime/platform/plat.h's threads, events and mutex, and the SPU async
+      # job pool on them. On Windows plat.h is the Win32 calls the pool made
+      # before it moved, so this checks the same rules the other hosts do.
+      - name: Build and run plat_threads
+        run: |
+          cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build-plat-threads
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build-plat-threads --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       - name: Run self-contained RSX tests
         # NOT shell: bash. Git Bash rewrites a leading-slash argument into a
         # Windows path, so /nologo arrived at the linker as an .obj under the

@@ -364,6 +364,17 @@ jobs:
           cmake --build build-sync-stress
           ctest --test-dir build-sync-stress --output-on-failure
 
+      # runtime/platform/plat.h's threads, events and mutex, and the SPU async
+      # job pool written once on them. Off Windows the pool used to be a thread
+      # per job; this shows it reuses workers, keeps no queue, lets idle ones
+      # go and reserves the 256 MB stacks, on this host's own pthreads.
+      - name: Build and run plat_threads
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang; else export CC=gcc; fi
+          cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-plat-threads
+          ctest --test-dir build-plat-threads --output-on-failure
+
       # cellFiber's cooperative switching on ucontext. glibc's ucontext_t is
       # not the one that bites, but running the suite on both hosts is what
       # tells a Darwin header problem from a logic error in the switch.
@@ -420,6 +431,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
@@ -437,6 +449,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_taskset_wake
@@ -462,6 +475,7 @@ jobs:
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
             runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+            runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lifted_start
@@ -484,6 +498,7 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
