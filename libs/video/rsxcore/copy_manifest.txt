@@ -159,7 +159,12 @@ libs/video/rsxcore/rsxc_api.inc 15743-16422 backend registration, init and shutd
 #    wait_for_gpu 3339-3367 and move_to_next_frame 3413-3436 (the device's
 #    timeline: gpu_signal, gpu_fence_wait 2000 ms, gpu_fence_completed,
 #    gpu_lost; s_rc_frame_fence per frame slot); lose_device_test 3403-3404
-#    (gpu_native).
+#    (gpu_native). move_to_next_frame waits for the new slot's point from
+#    before this frame, as today's does in effect: its fence value for the
+#    slot is the opening wait_for_gpu's, already reached, so with
+#    RSX_PRESENT=0 (one slot) the GPU runs the frame while the next batch
+#    records. frame_cmd_begin (rsxc_init.inc) waits for the slot's point
+#    first, so a repaint never resets a recorder still in flight.
 #  rsxc_cap.inc: cap_readback_write 3650-3651, 3690-3692 (frame_cmd_begin,
 #    frame_cmd_submit).
 #  rsxc_diag.inc: frame_log 10473-10474, 10482 (gpu_swap_stats).
