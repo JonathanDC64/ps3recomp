@@ -110,10 +110,13 @@ static void pso_names_add(u64 k)
     for (u32 i = (u32)k & (s_pso_names_cap - 1);; i = (i + 1) & (s_pso_names_cap - 1))
         if (!s_pso_names[i]) { s_pso_names[i] = k; s_pso_names_n++; return; }
 }
-/* The GPU layer's library's files (step C3b): <shader cache>/gpu/d3d12/. */
+/* The GPU layer's library's files (step C3b): <shader cache>/gpu/d3d12/.
+ * Step VC2: under the compile service's folder, the shader cache's on
+ * D3D12; Vulkan, which keeps none of today's files (rc_be_cache_files 0),
+ * keeps its own there all the same (gpu/spv/, and gpu/vulkan/ here). */
 static void pso_lib_path(char* out, size_t n, const char* leaf)
 {
-    snprintf(out, n, "%s/gpu/%s/%s", shader_cache_dir(), rc_be_lib_dir, leaf);
+    snprintf(out, n, "%s/gpu/%s/%s", gpu_sc_cache_dir(), rc_be_lib_dir, leaf);
 }
 static long pso_file_size(const char* path)
 {
@@ -126,14 +129,14 @@ static long pso_file_size(const char* path)
  * one when the file is another driver's or GPU's, or there is none. */
 static void pso_lib_open(void)
 {
-    if (!ps3_env_int("PS3_PSO_LIBRARY", 1) || !shader_cache_dir()[0]) return;
+    if (!ps3_env_int("PS3_PSO_LIBRARY", 1) || !gpu_sc_cache_dir()[0]) return;
     if (!(s_rc_dev->caps.bits & GPU_CAP_PIPELINE_CACHE)) return;   /* (on D3D12: no Device1) */
     char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s/gpu", shader_cache_dir());
+    snprintf(path, sizeof path, "%s/gpu", gpu_sc_cache_dir());
     CreateDirectoryA(path, NULL);
-    snprintf(path, sizeof path, "%s/gpu/%s", shader_cache_dir(), rc_be_lib_dir);
+    snprintf(path, sizeof path, "%s/gpu/%s", gpu_sc_cache_dir(), rc_be_lib_dir);
     CreateDirectoryA(path, NULL);
-    pso_lib_path(path, sizeof path, "pipelines.lib");
+    pso_lib_path(path, sizeof path, rc_be_lib_file(s_rc_dev));   /* (step VC2: the instance file's name) */
     const long n = pso_file_size(path);
     /* Step C3c: no library possible (today's s_pso_lib NULL) leaves it all
      * off, the manifest unread; else the file's library, or a new one. */
@@ -141,6 +144,16 @@ static void pso_lib_open(void)
     if (lib == GPU_PIPELINE_CACHE_NONE) return;
     const int loaded = lib == GPU_PIPELINE_CACHE_LOADED;
     s_pso_lib_on = 1;
+    if (!rc_be_cache_files) {   /* (step VC2: Vulkan: the pipeline cache alone, no manifest) */
+        if (!loaded) {
+            char ip[MAX_PATH + 32];
+            pso_lib_path(ip, sizeof ip, "index.built");
+            DeleteFileA(ip);
+        }
+        printf("[D3D12] pipeline library: %s (%ld KB), %s\n", loaded ? "loaded" : "new", n >> 10,
+               rc_be_lib_file(s_rc_dev));
+        return;
+    }
 
     /* The manifest: whole records only; a torn tail is cut off. */
     char mp[MAX_PATH + 32];
@@ -197,11 +210,12 @@ static void pso_lib_save(void)
     const u32 recs = s_pso_man_n;
     ReleaseSRWLockShared(&s_pso_man_lock);
     char path[MAX_PATH + 32];
-    pso_lib_path(path, sizeof path, "pipelines.lib");
+    pso_lib_path(path, sizeof path, rc_be_lib_file(s_rc_dev));   /* (step VC2: the instance file's name) */
     if (!gpu_pipeline_cache_save(s_rc_dev, path)) return;
     char np[MAX_PATH + 32], txt[16];
     pso_lib_path(np, sizeof np, "pipelines.n");
-    pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
+    if (rc_be_cache_files)   /* (step VC2: no manifest on Vulkan, so no count of its records) */
+        pso_write_file(np, txt, (size_t)snprintf(txt, sizeof txt, "%u", recs));
     InterlockedExchangeAdd(&s_pso_lib_new, -pending);
     printf("[D3D12] pipeline library saved: %lu KB, %u pipelines; draws so far: %u loaded, %u compiled\n",
            (unsigned long)(pso_file_size(path) >> 10), recs, (unsigned)s_pso_lib_hits, (unsigned)s_pso_lib_live);

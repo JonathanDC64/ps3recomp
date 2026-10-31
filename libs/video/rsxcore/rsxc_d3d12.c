@@ -65,6 +65,10 @@ static const char* rc_be_lost_text(u32 reason)
     }
 }
 
+/* A window's surface lost for good (gpu.h's GPU_PRESENT_SURFACE_LOST, step
+ * VC2): never on D3D12, whose swap chains have no surface of their own. */
+static const u32 rc_be_surface_lost = 0;
+
 /* RSX_LOSE_DEVICE_AT_FRAME (lose_device_test): the device removed on purpose
  * at frame `frames`, as a driver reset would lose it. */
 static void rc_be_lose_device(gpu_device* d, int frames)
@@ -94,6 +98,8 @@ static const int rc_be_cache_files = 1;
 /* The pipeline library's folder in the shader cache: <cache>/gpu/d3d12/
  * (pipelines.lib, pipelines.n, index.built: rsxc_psolib.inc). */
 static const char rc_be_lib_dir[] = "d3d12";
+/* The library's file there (step VC2: Vulkan's is named by its driver). */
+static const char* rc_be_lib_file(gpu_device* d) { (void)d; return "pipelines.lib"; }
 
 /* The shaders: the compile service's dxbc target (gpu_shader.c), today's
  * FXC call and .dxbc cache. A compile (sc_compile) is 1 with the code in

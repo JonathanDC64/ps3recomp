@@ -187,13 +187,16 @@ gpu_texture gpu_d3d12_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t i)
     return s && i < s->buffers ? s->image[i] : none;
 }
 
-/* 0, or the failed Present's HRESULT (for the caller's check_device). */
+/* GPU_PRESENTED, or what a failed Present means (gpu.h, step VC2): the
+ * device lost when GetDeviceRemovedReason says so (DXGI_ERROR_DEVICE_REMOVED,
+ * _RESET, _HUNG), else a failure. DXGI has no surface of its own to lose. */
 int gpu_d3d12_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags)
 {
     gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
-    if (!s) return -1;
+    if (!s) return GPU_PRESENT_FAILED;
     const HRESULT hr = s->sc->lpVtbl->Present(s->sc, interval, flags);
-    return FAILED(hr) ? (int)hr : 0;
+    if (!FAILED(hr)) return GPU_PRESENTED;
+    return gpu_lost(d) ? GPU_PRESENT_LOST : GPU_PRESENT_FAILED;
 }
 
 /* GetFrameStatistics (display_note) and GetLastPresentCount

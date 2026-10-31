@@ -1357,6 +1357,96 @@ static void test_fences(void)
 
 /* ---- The pipeline cache, across two devices ---- */
 
+/* Step VC2: the file's checks. A bad file (path holds one) is ignored and the
+ * next save replaces it; then every way of spoiling that good file is
+ * refused before the driver sees it: one byte short or long, our header's
+ * version, its length, the driver, a byte of the data (its sum), and
+ * Vulkan's own header's vendor (with the sum made right again). The layout
+ * (gpu_vk_pipe.c's pcache_head): magic 0, version 8, header length 12,
+ * vendor 16, device 20, driver 24, UUID 28, data length 48, sum 56, data
+ * from 64. */
+static int pcache_load_on_new(const gpu_device_desc* dd, const char* path)
+{
+    gpu_device* d = gpu_vk_create(dd);
+    if (!d) return -2;
+    const int r = gpu_pipeline_cache_load(d, path);
+    CHECK(GPU_VK_DEV(d)->n_validation == 0);
+    gpu_destroy(d);
+    return r;
+}
+
+static void pcache_write(const char* path, const uint8_t* p, size_t n)
+{
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fwrite(p, 1, n, f);
+        fclose(f);
+    }
+}
+
+static void test_pipeline_cache_file(const gpu_device_desc* dd, const char* path)
+{
+    gpu_device* d = gpu_vk_create(dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);   /* (the bad file: ignored) */
+    const gpu_layout l = guest_layout(d);
+    const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
+    const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
+    gpu_pipeline_desc pd;
+    draw_desc(&pd, l, vs, ps);
+    uint32_t how = 7;
+    CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0);
+    CHECK(gpu_pipeline_cache_save(d, path) == 1);   /* replaces it */
+    gpu_destroy(d);
+    CHECK(pcache_load_on_new(dd, path) == GPU_PIPELINE_CACHE_LOADED);
+
+    FILE* f = fopen(path, "rb");
+    uint8_t* good = NULL;
+    long n = 0;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        good = n > 64 ? (uint8_t*)malloc((size_t)n + 1) : NULL;
+        if (good && fread(good, 1, (size_t)n, f) != (size_t)n) n = 0;
+        fclose(f);
+    }
+    uint64_t size = 0;
+    if (good) memcpy(&size, good + 48, 8);
+    CHECK(good && n > 64 && size == (uint64_t)n - 64 && !memcmp(good, "PS3VKPC", 7));
+    if (!good || size != (uint64_t)n - 64) {
+        free(good);
+        return;
+    }
+    uint8_t* bad = (uint8_t*)malloc((size_t)n + 1);
+    static const struct { const char* what; int at; } k[] = {
+        {"one byte short", -1}, {"one byte long", -2}, {"the version", 8}, {"the header's length", 12},
+        {"the driver", 24}, {"a byte of the data", -3}, {"Vulkan's header's vendor", 64 + 8},
+    };
+    int refused = 0;
+    for (size_t i = 0; bad && i < sizeof k / sizeof k[0]; i++) {
+        memcpy(bad, good, (size_t)n);
+        size_t len = (size_t)n;
+        if (k[i].at == -1) len--;
+        else if (k[i].at == -2) bad[len++] = 0;
+        else if (k[i].at == -3) bad[len - 1] ^= 0x5A;
+        else bad[k[i].at] ^= 0x01;
+        if (k[i].at >= 64) {   /* the sum made right again: only Vulkan's header can refuse it */
+            const uint64_t fnv = gpu_vk_fnv(GPU_VK_FNV_BASIS, bad + 64, (size_t)size);
+            memcpy(bad + 56, &fnv, 8);
+        }
+        pcache_write(path, bad, len);
+        const int r = pcache_load_on_new(dd, path);
+        if (r != GPU_PIPELINE_CACHE_NEW) printf("  pipeline cache file: %s was not refused (%d)\n", k[i].what, r);
+        else refused++;
+    }
+    CHECK(refused == (int)(sizeof k / sizeof k[0]));
+    printf("  pipeline cache file: %ld bytes; a bad one replaced; %d spoilt ones refused\n", n, refused);
+    free(bad);
+    free(good);
+}
+
 static void test_pipeline_cache(void)
 {
     char path[512];
@@ -1434,6 +1524,7 @@ static void test_pipeline_cache(void)
             gpu_destroy(d);
         }
     }
+    if (cache) test_pipeline_cache_file(&dd, path);
     /* No cache (the cap masked, as RSX_VK_MASK would): pipelines are made
      * without it and never stored; a store-only one is made and destroyed. */
     {
@@ -1568,6 +1659,332 @@ static void test_swapchain(void)
 }
 #endif
 
+/* ---- step VC2: presenting as the core does, and a lost device ---- */
+
+#ifdef _WIN32
+/* A borderless window of w x h client pixels, never shown. */
+static HWND vc2_window(int w, int h)
+{
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "ps3r_test_gpu_vk_vc2";
+    RegisterClassA(&wc);   /* (once: a second time fails, harmlessly) */
+    return CreateWindowExA(0, wc.lpszClassName, "test_gpu_vk", WS_POPUP, 0, 0, w, h, NULL, NULL, wc.hInstance, NULL);
+}
+
+static gpu_swapchain vc2_swap(gpu_device* d, HWND w)
+{
+    gpu_swapchain_desc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.window = w;
+    sd.width = 64;
+    sd.height = 64;
+    sd.format = GPU_FORMAT_R8G8B8A8_UNORM;
+    sd.buffers = 2;
+    sd.colour_space = GPU_COLOR_SRGB;
+    sd.flags = (d->caps.bits & GPU_CAP_TEARING) ? GPU_SWAP_TEARING : 0;
+    return gpu_swap_create(d, &sd);
+}
+
+static void vc2_submit(gpu_device* d, gpu_cmd* c, gpu_swapchain sc, uint32_t more)
+{
+    gpu_submit_desc how;
+    memset(&how, 0, sizeof how);
+    how.swapchain = sc;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL | more;   /* (on every submit, as the core) */
+    gpu_cmd_end(d, c);
+    (void)gpu_submit(d, &c, 1, &how);
+}
+
+static gpu_fence vc2_submit_signal(gpu_device* d, gpu_cmd* c, gpu_swapchain sc)
+{
+    gpu_submit_desc how;
+    memset(&how, 0, sizeof how);
+    how.swapchain = sc;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL | GPU_SUBMIT_SIGNAL;
+    gpu_cmd_end(d, c);
+    return gpu_submit(d, &c, 1, &how);
+}
+
+/* The window's image cleared to rgba, in PRESENT before and after: the blit. */
+static void vc2_blit(gpu_device* d, gpu_cmd* c, gpu_texture img, const float rgba[4], const gpu_rect* rect)
+{
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = img;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(d, &vd);
+    gpu_cmd_barrier(c, img, GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
+    gpu_cmd_clear_color(c, rtv, rgba, rect);
+    gpu_cmd_barrier(c, img, GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
+}
+
+/* Frames as the core presents them, on a device of their own with two frames
+ * in flight and three recorders each: every submit says ACQUIRE_WAIT and
+ * PRESENT_SIGNAL (the present semaphore: VC1's gap 4, on a real present).
+ * The first submit has the frame's own work and, on even frames, the blit
+ * into the window's image; the second, on odd frames, the blit (after a
+ * submit that waited for the acquire), and a copy of the image (a capture's
+ * readback); the third the overlay, a corner of the image. The present
+ * modes go FIFO (interval 1), IMMEDIATE (interval 0 with tearing:
+ * RSX_VSYNC=0), FIFO, then interval 2 (RSX_VSYNC=2, present_gate). Every
+ * present is FIFO or IMMEDIATE, never MAILBOX. Validation, with
+ * synchronization validation, says nothing. */
+static void test_present_frames(void)
+{
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags;
+    dd.cmd_slots = 6;
+    gpu_device* d = gpu_vk_create(&dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    gpu_vk_device* const v = GPU_VK_DEV(d);
+    HWND w = vc2_window(64, 64);
+    CHECK(w != NULL);
+    const gpu_swapchain sc = w ? vc2_swap(d, w) : (gpu_swapchain){0};
+    CHECK(GPU_VALID(sc));
+    if (!GPU_VALID(sc)) {
+        if (w) DestroyWindow(w);
+        gpu_destroy(d);
+        return;
+    }
+    gpu_vk_swap* const s = &v->swap[GPU_HANDLE_INDEX(sc.id)];
+    const int tear = (d->caps.bits & GPU_CAP_TEARING) != 0;
+
+    /* The frame's own target, and the capture's buffer for the image. */
+    gpu_texture_desc otd = tex_desc(64, 64, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT, GPU_STATE_RENDER_TARGET);
+    const gpu_texture off = gpu_texture_create(d, &otd);
+    gpu_view_desc ovd;
+    memset(&ovd, 0, sizeof ovd);
+    ovd.texture = off;
+    ovd.kind = GPU_VIEW_RTV;
+    const gpu_view off_rtv = gpu_view_get(d, &ovd);
+    gpu_texture_desc itd = tex_desc(s->width, s->height, GPU_FORMAT_R8G8B8A8_UNORM, 0, GPU_STATE_PRESENT);
+    gpu_footprint fp;
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+    const uint64_t total = gpu_texture_footprints(d, &itd, 0, 1, 0, &fp, &rows, &row_bytes);
+    const gpu_buffer rb = buf_new(d, total, GPU_MEM_READBACK, GPU_STATE_COPY_DEST);
+    CHECK(GPU_VALID(off) && GPU_VALID(rb));
+
+    enum { N = 32 };
+    const int64_t f0 = ms_now();
+    gpu_fence fence[2] = {0, 0};
+    uint32_t done = 0, gate0 = 0, gate_ok = 1;
+    int64_t gate_t0 = 0, last_shown = 0, min_gap = INT64_MAX;
+    uint8_t want[4] = {0, 0, 0, 0};
+    for (uint32_t f = 0; f < N && GPU_VALID(off) && GPU_VALID(rb); f++) {
+        const uint32_t half = f % 2, phase = f / 8;
+        uint32_t interval = phase == 1 ? 0u : phase == 3 ? 2u : 1u;
+        if (interval == 0 && !tear) interval = 1;   /* (the core's: no tearing, vsync) */
+        const uint32_t flags = interval == 0 ? GPU_PRESENT_TEARING : 0;
+        if (fence[half]) CHECK(gpu_fence_wait(d, fence[half], 5000) == 0);
+        gpu_texture img;
+        gpu_swap_acquire(d, sc, &img);
+        CHECK(GPU_VALID(img));
+        if (!GPU_VALID(img)) break;
+        const float c8 = (float)(f * 8 % 256) / 255.0f;
+        const float colour[4] = {c8, 1.0f - c8, 0.25f, 1.0f}, white[4] = {1, 1, 1, 1}, grey[4] = {0.5f, 0.5f, 0.5f, 1};
+        const gpu_rect corner = {0, 0, 8, 8};
+
+        gpu_cmd* c = gpu_cmd_begin(d, half * 3 + 0);
+        gpu_cmd_clear_color(c, off_rtv, grey, NULL);
+        if (!(f & 1)) vc2_blit(d, c, img, colour, NULL);
+        vc2_submit(d, c, sc, 0);
+
+        c = gpu_cmd_begin(d, half * 3 + 1);
+        if (f & 1) vc2_blit(d, c, img, colour, NULL);
+        gpu_cmd_barrier(c, img, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE);
+        gpu_cmd_copy_tex_to_buf(c, rb, &fp, img, 0, NULL);
+        gpu_cmd_barrier(c, img, GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT);
+        vc2_submit(d, c, sc, 0);
+
+        c = gpu_cmd_begin(d, half * 3 + 2);
+        vc2_blit(d, c, img, white, &corner);
+        fence[half] = vc2_submit_signal(d, c, sc);
+
+        if (phase == 3 && !gate_t0) {
+            gate0 = s->gate_n;
+            gate_t0 = (int64_t)s->gate_ticks;
+        }
+        const int pr = gpu_swap_present(d, sc, interval, flags);
+        CHECK(pr == GPU_PRESENTED);
+        if (pr == GPU_PRESENTED) done++;
+        /* The mode the present had: per present with swapchain_maintenance1,
+         * else from the next acquire (the swap chain made again). */
+        const VkPresentModeKHR m = interval == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        CHECK(s->mode == VK_PRESENT_MODE_FIFO_KHR || s->mode == VK_PRESENT_MODE_IMMEDIATE_KHR);
+        if (s->modes_switch) CHECK(s->mode == m);
+        else CHECK(s->mode == m || s->recreate);
+        if (phase == 3 && s->gate_n > gate0 && s->done_qpc && s->done_qpc != last_shown) {
+            if (last_shown && s->done_qpc - last_shown < min_gap) min_gap = s->done_qpc - last_shown;
+            last_shown = s->done_qpc;
+        }
+        want[0] = (uint8_t)(c8 * 255.0f + 0.5f);
+        want[1] = (uint8_t)((1.0f - c8) * 255.0f + 0.5f);
+        want[2] = 64;
+        want[3] = 255;
+    }
+    gpu_wait_idle(d);
+    /* The last frame's capture: its blit's colour, the overlay not yet in it. */
+    const uint8_t* p = (const uint8_t*)gpu_buffer_map(d, rb, 0, total);
+    if (p) {
+        const uint8_t* q = p + 32ull * fp.row_pitch + 32ull * 4;
+        CHECK(close_to(q[0], want[0]) && close_to(q[1], want[1]) && close_to(q[2], want[2]) && q[3] == 255);
+        q = p;   /* (the corner: the frame before's overlay is gone, the blit covered it) */
+        CHECK(close_to(q[0], want[0]) && close_to(q[1], want[1]));
+        gpu_buffer_unmap(d, rb, 0, 0);
+    }
+    CHECK(done == N);
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const int64_t tps = (int64_t)qf.QuadPart;   /* (now_ticks' units on Windows) */
+    const uint32_t gates = s->gate_n - gate0;
+    if ((d->caps.bits & GPU_CAP_PRESENT_WAIT) && s->period) {
+        /* Interval 2: each present waited (present_wait and the hold),
+         * unless the window is not shown (the compositor never says). */
+        if (s->gate_miss) printf("  present gate: the hidden window's presents are never seen; no gate\n");
+        else {
+            CHECK(gates >= 6);
+            /* Each frame shown two refreshes after the one before, less the
+             * gate's quarter (a display that shows a frame at once) and some. */
+            if (min_gap != INT64_MAX) gate_ok = min_gap >= 2 * s->period - s->period / 2;
+            CHECK(gate_ok);
+        }
+        printf("  present gate: %u waits, %.2f ms a frame, refresh %.2f ms, shortest time between frames %.2f ms\n",
+               gates, gates ? 1000.0 * (double)(s->gate_ticks - gate_t0) / (double)tps / gates : 0.0,
+               1000.0 * (double)s->period / (double)tps,
+               min_gap != INT64_MAX ? 1000.0 * (double)min_gap / (double)tps : 0.0);
+    } else {
+        CHECK(gates == 0);
+        printf("  present gate: no present_wait (or no refresh rate): interval 2 is FIFO's 1\n");
+    }
+    printf("  presents as the core does: %u frames, 3 submits each, in %lld ms; modes %s, tearing %s\n", done,
+           (long long)(ms_now() - f0), s->modes_switch ? "switched per present" : "by a new swap chain",
+           tear ? "IMMEDIATE" : "none (FIFO)");
+    CHECK(v->n_validation == 0);
+    gpu_buffer_destroy(d, rb, 0);
+    gpu_swap_destroy(d, sc);
+    gpu_destroy(d);
+    DestroyWindow(w);
+}
+#endif
+
+/* gpu.h's codes (step VC2): every VkResult a present or an acquire gives, and
+ * what a lost device leaves, on a device of its own noted lost as a driver
+ * reset would leave it. (A real loss would need a GPU hang: a TDR resets the
+ * driver for every program on the machine, so the test does not make one.)
+ * On Windows also the window's surface lost: the window destroyed under its
+ * swap chain, which the backend cannot make a surface for again. */
+static void test_lost(void)
+{
+    static const struct { VkResult r; int code; } k[] = {
+        {VK_SUCCESS, GPU_PRESENTED},
+        {VK_SUBOPTIMAL_KHR, GPU_PRESENTED},
+        {VK_ERROR_OUT_OF_DATE_KHR, GPU_PRESENTED},
+        {VK_ERROR_DEVICE_LOST, GPU_PRESENT_LOST},
+        {VK_ERROR_SURFACE_LOST_KHR, GPU_PRESENT_SURFACE_LOST},
+        {VK_ERROR_OUT_OF_HOST_MEMORY, GPU_PRESENT_FAILED},
+        {VK_ERROR_OUT_OF_DEVICE_MEMORY, GPU_PRESENT_FAILED},
+        {VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT, GPU_PRESENT_FAILED},
+        {VK_ERROR_UNKNOWN, GPU_PRESENT_FAILED},
+        {VK_TIMEOUT, GPU_PRESENT_FAILED},
+        {VK_NOT_READY, GPU_PRESENT_FAILED},
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) CHECK(gpu_vk_present_code(k[i].r) == k[i].code);
+
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags | GPU_DEVICE_BREADCRUMBS;
+    dd.cmd_slots = 1;
+    gpu_device* d = gpu_vk_create(&dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    gpu_vk_device* const v = GPU_VK_DEV(d);
+#ifdef _WIN32
+    gpu_swapchain sc = {0};
+    HWND w = vc2_window(64, 64);
+    if (w) sc = vc2_swap(d, w);
+    CHECK(GPU_VALID(sc));
+    if (GPU_VALID(sc)) {   /* an image acquired and drawn into, left for the present after the loss */
+        gpu_texture img;
+        gpu_swap_acquire(d, sc, &img);
+        const float red[4] = {1, 0, 0, 1};
+        gpu_cmd* c = gpu_cmd_begin(d, 0);
+        gpu_cmd_marker(c, "before the loss", 15);
+        vc2_blit(d, c, img, red, NULL);
+        vc2_submit(d, c, sc, 0);
+    }
+#endif
+    gpu_wait_idle(d);   /* (the GPU idle: a lost device's fences read as passed, and frees come at once) */
+    CHECK(gpu_lost(d) == 0);
+    gpu_vk_lost_note(v, VK_ERROR_OUT_OF_HOST_MEMORY);
+    gpu_vk_lost_note(v, VK_ERROR_SURFACE_LOST_KHR);   /* (a surface's: the device works) */
+    CHECK(gpu_lost(d) == 0);
+    gpu_vk_lose_by_hand(v);   /* (gpu_vk_lost_note's VK_ERROR_DEVICE_LOST, the driver not asked) */
+    CHECK(gpu_lost(d) == (uint32_t)VK_ERROR_DEVICE_LOST && v->lost_by_hand == 1);
+    gpu_vk_lost_note(v, VK_ERROR_OUT_OF_DATE_KHR);
+    gpu_vk_lost_note(v, VK_ERROR_DEVICE_LOST);
+    CHECK(gpu_lost(d) == (uint32_t)VK_ERROR_DEVICE_LOST);   /* the first reason stays */
+    CHECK(gpu_fence_completed(d) == UINT64_MAX);
+    const int64_t t0 = ms_now();
+    CHECK(gpu_fence_wait(d, gpu_signal(d) + 1000000, 2000) == 0);   /* never signalled, but lost: at once */
+    CHECK(ms_now() - t0 < 1000);
+#ifdef _WIN32
+    if (GPU_VALID(sc)) CHECK(gpu_swap_present(d, sc, 1, 0) == GPU_PRESENT_LOST);
+#endif
+    gpu_fault_report(d, "test_gpu_vk's noted loss");   /* (the line, the checkpoints; device_fault not asked) */
+    CHECK(v->fault_done == 1);
+#ifdef _WIN32
+    if (GPU_VALID(sc)) gpu_swap_destroy(d, sc);
+    if (w) DestroyWindow(w);
+#endif
+    CHECK(v->n_validation == 0);
+    gpu_destroy(d);
+
+#ifdef _WIN32
+    /* The surface: presents until the window's surface is given up on. */
+    w = vc2_window(64, 64);
+    sc = w ? vc2_swap(g_d, w) : (gpu_swapchain){0};
+    CHECK(GPU_VALID(sc));
+    if (!GPU_VALID(sc)) return;
+    gpu_vk_swap* const s = &g_vk->swap[GPU_HANDLE_INDEX(sc.id)];
+    int pr = GPU_PRESENTED, frames = 0;
+    for (; frames < 6 && pr != GPU_PRESENT_SURFACE_LOST; frames++) {
+        if (frames == 1) DestroyWindow(w);   /* after one frame shown */
+        gpu_texture img;
+        gpu_swap_acquire(g_d, sc, &img);
+        if (GPU_VALID(img)) {
+            const float blue[4] = {0, 0, 1, 1};
+            gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+            vc2_blit(g_d, c, img, blue, NULL);
+            const gpu_fence f = vc2_submit_signal(g_d, c, sc);
+            pr = gpu_swap_present(g_d, sc, 1, 0);
+            CHECK(f && gpu_fence_wait(g_d, f, 5000) == 0);
+        } else {
+            pr = gpu_swap_present(g_d, sc, 1, 0);   /* (no image: SURFACE_LOST once given up, else FAILED) */
+            CHECK(pr == GPU_PRESENT_SURFACE_LOST || pr == GPU_PRESENT_FAILED);
+        }
+        if (frames == 0) CHECK(pr == GPU_PRESENTED);
+    }
+    if (pr == GPU_PRESENT_SURFACE_LOST) {
+        CHECK(s->surface_dead && gpu_lost(g_d) == 0);   /* the device works on */
+        gpu_texture img;
+        gpu_swap_acquire(g_d, sc, &img);
+        CHECK(!GPU_VALID(img));   /* no more images */
+        printf("  surface lost: given up after %d frames (the window destroyed after the first)\n", frames);
+    } else {
+        printf("  surface lost: the driver went on presenting to a destroyed window (%d frames); not reached\n",
+               frames);
+    }
+    gpu_swap_destroy(g_d, sc);
+    CHECK(g_vk->n_validation == 0);
+#endif
+}
+
 /* ---- Breadcrumbs and the fault report ---- */
 
 static void test_breadcrumbs(void)
@@ -1641,9 +2058,11 @@ int main(void)
     test_fences();
 #ifdef _WIN32
     test_swapchain();
+    test_present_frames();
 #else
     printf("  swap chain: skipped (Windows only here)\n");
 #endif
+    test_lost();
     CHECK(gpu_lost(g_d) == 0);
     CHECK(g_vk->n_validation == 0);
     gpu_destroy(g_d);

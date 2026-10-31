@@ -716,6 +716,11 @@ gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc
                         : (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
                           (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
                         ? GPU_PIPELINE_LOADED : GPU_PIPELINE_STORED;
+    gpu_vk_lock(&dd->pso_lock);   /* (step VC2: PS3_PSO_LOG's figures, gpu_vk_pipe_release) */
+    dd->pso_made++;
+    if (made == GPU_PIPELINE_LOADED) dd->pso_hits++;
+    if (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) dd->pso_ns += fb.duration;
+    gpu_vk_unlock(&dd->pso_lock);
     if (flags & GPU_PIPELINE_STORE_ONLY) {
         dd->vk.vkDestroyPipeline(dd->device, p, NULL);
         if (how) *how = made;
@@ -742,20 +747,44 @@ gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc
  * The pipeline cache's file
  * -------------------------------------------------------------------------*/
 
-/* A header names the driver the data is for (Vulkan's own header says so
- * too, but a file is checked before the driver sees it). */
+/* A header names the driver the data is for, and says how long the data is
+ * and what it sums to (step VC2: with a version and its own length, so a
+ * later layout is told apart). Vulkan's own header, at the data's start, is
+ * checked too (pcache_vk_ok): a file is checked whole before the driver sees
+ * any of it. */
+#define PCACHE_MAGIC   "PS3VKPC\0"
+#define PCACHE_VERSION 2u
 typedef struct pcache_head {
-    char     magic[8];        /* "PS3VKPC1" */
+    char     magic[8];        /* PCACHE_MAGIC */
+    uint32_t version;         /* PCACHE_VERSION */
+    uint32_t head_size;       /* sizeof(pcache_head) */
     uint32_t vendor, device, driver;
     uint8_t  uuid[VK_UUID_SIZE];
-    uint64_t size, fnv;
+    uint32_t pad;             /* (zero) */
+    uint64_t size, fnv;       /* the driver's data after it: its bytes, their FNV-1a 64 */
 } pcache_head;
+
+/* Step VC2: the data starts with Vulkan's header for this device
+ * (VkPipelineCacheHeaderVersionOne: its length, version 1, vendor, device,
+ * the pipeline cache's UUID). */
+static int pcache_vk_ok(const gpu_vk_device* dd, const uint8_t* data, uint64_t size)
+{
+    VkPipelineCacheHeaderVersionOne vh;
+    if (size < sizeof vh) return 0;
+    memcpy(&vh, data, sizeof vh);
+    return vh.headerSize >= sizeof vh && vh.headerSize <= size &&
+           vh.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && vh.vendorID == dd->props.vendorID &&
+           vh.deviceID == dd->props.deviceID && !memcmp(vh.pipelineCacheUUID, dd->props.pipelineCacheUUID, VK_UUID_SIZE);
+}
 
 /* GPU_PIPELINE_CACHE_LOADED when the file was this driver's and now seeds
  * the cache, else _NEW: the device's own cache, made with it (empty before
- * the first pipeline), stays. _NONE with the cap masked: pipelines are made
- * without the cache. The old cache is kept until the device goes (a
- * pipeline worker may be using it). */
+ * the first pipeline), stays, and the next save replaces the file. A file
+ * is this driver's when every check holds: our header (magic, version,
+ * length, the driver, the data's length to the file's end, its sum) and
+ * Vulkan's. _NONE with the cap masked: pipelines are made without the
+ * cache. The old cache is kept until the device goes (a pipeline worker may
+ * be using it). */
 int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
@@ -764,12 +793,15 @@ int gpu_vk_pipeline_cache_load(gpu_device* d, const char* path)
     pcache_head h;
     if (!f) return GPU_PIPELINE_CACHE_NEW;
     void* data = NULL;
-    int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, "PS3VKPC1", 8) && h.vendor == dd->props.vendorID &&
-             h.device == dd->props.deviceID && h.driver == dd->props.driverVersion &&
-             !memcmp(h.uuid, dd->props.pipelineCacheUUID, VK_UUID_SIZE) && h.size && h.size < (1ull << 31);
+    int ok = fread(&h, sizeof h, 1, f) == 1 && !memcmp(h.magic, PCACHE_MAGIC, 8) && h.version == PCACHE_VERSION &&
+             h.head_size == sizeof h && h.vendor == dd->props.vendorID && h.device == dd->props.deviceID &&
+             h.driver == dd->props.driverVersion && !memcmp(h.uuid, dd->props.pipelineCacheUUID, VK_UUID_SIZE) &&
+             h.size && h.size < (1ull << 31);
     if (ok) {
-        data = malloc((size_t)h.size);
-        ok = data && fread(data, (size_t)h.size, 1, f) == 1 && gpu_vk_fnv(GPU_VK_FNV_BASIS, data, (size_t)h.size) == h.fnv;
+        data = malloc((size_t)h.size + 1);
+        ok = data && fread(data, (size_t)h.size, 1, f) == 1 && fgetc(f) == EOF &&   /* (no more, no less) */
+             gpu_vk_fnv(GPU_VK_FNV_BASIS, data, (size_t)h.size) == h.fnv &&
+             pcache_vk_ok(dd, (const uint8_t*)data, h.size);
     }
     fclose(f);
     VkPipelineCache nc = VK_NULL_HANDLE;
@@ -817,7 +849,9 @@ int gpu_vk_pipeline_cache_save(gpu_device* d, const char* path)
     }
     pcache_head h;
     memset(&h, 0, sizeof h);
-    memcpy(h.magic, "PS3VKPC1", 8);
+    memcpy(h.magic, PCACHE_MAGIC, 8);
+    h.version = PCACHE_VERSION;
+    h.head_size = sizeof h;
     h.vendor = dd->props.vendorID;
     h.device = dd->props.deviceID;
     h.driver = dd->props.driverVersion;
@@ -846,6 +880,9 @@ int gpu_vk_pipeline_cache_save(gpu_device* d, const char* path)
 /* With the device: every pipeline, cache and layout. */
 void gpu_vk_pipe_release(gpu_vk_device* dd)
 {
+    if (dd->pso_made && getenv("PS3_PSO_LOG"))   /* (step VC2: what the pipeline cache's file saves) */
+        printf("[VK] pipelines made on this device: %u, %u of them from the pipeline cache; %.1f ms in the driver\n",
+               dd->pso_made, dd->pso_hits, (double)dd->pso_ns / 1e6);
     if (dd->pso)
         for (uint32_t i = 0; i < dd->npso; i++) dd->vk.vkDestroyPipeline(dd->device, dd->pso[i].p, NULL);
     dd->npso = 0;

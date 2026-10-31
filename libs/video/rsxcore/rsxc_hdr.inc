@@ -359,6 +359,7 @@ static void off_rt_transition(int slot, gpu_state to);
  * the pipelines and layouts bound are the passes' handles. */
 static void blit_to_window(u32 fi)
 {
+    if (!s_rc_have_image) return;   /* (step VC2: no image acquired, rc_acquire) */
     gpu_cmd* const c = s_rc_cmd;
     gpu_barrier b[2];
     memset(b, 0, sizeof b);
@@ -583,11 +584,21 @@ static void dred_report(const char* where);
 static volatile LONG s_device_lost;      /* GetDeviceRemovedReason, 0 while the device works */
 static volatile LONG64 s_device_lost_qpc;
 
+/* Step VC2: the line, the report's reason and the breadcrumbs for a loss of
+ * reason rr: the device's (check_device), or the window's surface's, which
+ * nothing reaches again either (the instance file's rc_be_surface_lost:
+ * Vulkan's VK_ERROR_SURFACE_LOST_KHR, when the backend could not make it
+ * again; gpu.h's GPU_PRESENT_SURFACE_LOST). */
+static void device_lost_say(const char* where, HRESULT rr);
 static void check_device(const char* where)
 {
     if (s_device_lost || !s_rc_dev) return;
     const HRESULT rr = (HRESULT)gpu_lost(s_rc_dev);
     if (rr == S_OK) return;
+    device_lost_say(where, rr);
+}
+static void device_lost_say(const char* where, HRESULT rr)
+{
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     InterlockedExchange64(&s_device_lost_qpc, q.QuadPart);
@@ -608,7 +619,12 @@ static void swap_present(int game_frame)
     }
     const int tear = !vsync && s_d3d.tearing;
     const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
-    if (gpu_swap_present(s_rc_dev, s_rc_swap, interval, tear ? GPU_PRESENT_TEARING : 0)) check_device("present");
+    const int pr = gpu_swap_present(s_rc_dev, s_rc_swap, interval, tear ? GPU_PRESENT_TEARING : 0);
+    if (pr == GPU_PRESENT_SURFACE_LOST) {   /* (step VC2: gpu.h's codes; never on D3D12) */
+        if (!s_device_lost) device_lost_say("present", (HRESULT)rc_be_surface_lost);
+    } else if (pr) {
+        check_device("present");
+    }
     rc_be_presented(s_rc_dev);   /* (the instance file's: null prints the stream's hash) */
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
