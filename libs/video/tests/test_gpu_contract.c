@@ -411,6 +411,11 @@ int gpu_contract_c_run(void)
         /* The per-draw device calls through gpu_vt_cmd.h. */
         gpu_fast_table_write_tex(d, pool, 7, NULL); CHECK(g_vt_last == VT_table_write_tex);
         gpu_fast_table_write_sampler(d, pool, 7, smp); CHECK(g_vt_last == VT_table_write_sampler);
+        {
+            const gpu_table_writer w = gpu_table_writer_get(d, pool);
+            CHECK(w.v == 0);                      CHECK(g_vt_last == VT_table_writer_get);
+            gpu_fast_table_writer_tex(d, w, 7, NULL); CHECK(g_vt_last == VT_table_writer_tex);
+        }
         CHECK(gpu_fast_table_ref(d, pool, 7).v == 0); CHECK(g_vt_last == VT_table_ref);
         CHECK(gpu_fast_buffer_addr(d, buf) == 0); CHECK(g_vt_last == VT_buffer_addr);
         (void)gpu_signal(d);                      CHECK(g_vt_last == VT_signal);

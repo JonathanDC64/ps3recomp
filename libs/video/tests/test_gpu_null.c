@@ -461,6 +461,7 @@ static void frame(world* w, uint32_t f, int variant)
     gpu_cmd_query_reset(c, w->queries, 0, 4);
     gpu_fast_table_write_sampler(d, w->samp_pool, 0, w->samp[0]);
     gpu_fast_table_write_sampler(d, w->samp_pool, 1, w->samp[1]);
+    const gpu_table_writer tw = gpu_table_writer_get(d, w->tex_pool);
     for (uint32_t i = 0; i < 4; i++) {
         /* The draw's table: a texture that changes with the frame, the BC
          * one, and empty entries (memoised after the first frame). */
@@ -469,7 +470,8 @@ static void frame(world* w, uint32_t f, int variant)
         gpu_fast_table_write_tex(d, w->tex_pool, table, &t);
         t = srv(w->bc);
         gpu_fast_table_write_tex(d, w->tex_pool, table + 1, &t);
-        for (uint32_t k = 2; k < 16; k++) gpu_fast_table_write_tex(d, w->tex_pool, table + k, NULL);
+        /* (Through a writer: the same records, so the stream is the same.) */
+        for (uint32_t k = 2; k < 16; k++) gpu_fast_table_writer_tex(d, tw, table + k, NULL);
 
         const int fetch = i % 2;
         char text[32];
@@ -1136,7 +1138,7 @@ static void neg_table(void)
     gpu_fast_table_write_tex(d, m.tp, 0, &a);                      /* 1: a recorded draw reads it */
     gpu_fast_table_write_tex(d, m.tp, 1, &a);                      /* (the slot reads entry 0 only) */
     CHECK(submit(d, c, GPU_SUBMIT_SIGNAL, none) == 1);
-    gpu_fast_table_write_tex(d, m.tp, 0, &b);                      /* 2: fence 1 not seen to pass */
+    gpu_fast_table_writer_tex(d, gpu_table_writer_get(d, m.tp), 0, &b);   /* 2: fence 1 not seen to pass */
     gpu_fast_table_ref(d, m.tp, 5);                                /* 3: no table starts at 5 */
     CHECK(gpu_fence_wait(d, 1, 0) == 0);
     gpu_fast_table_write_tex(d, m.tp, 0, &a);                      /* (fine now) */

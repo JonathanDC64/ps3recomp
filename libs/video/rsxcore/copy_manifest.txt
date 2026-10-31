@@ -798,3 +798,9 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   frees (today's leaked, mapped for life). The grave and the staging
 #   buffers' list are emptied before gpu_destroy, which frees what they
 #   hold, so a device made again never destroys by an old handle.
+#  Per draw: srv_write_ex (today's SrvMemo writes, 16 calls a draw) went
+#   through gpu_fast_table_write_tex(s_rc_dev, s_rc_srv_pool, ...), which
+#   found the pool's record from its handle on every call. The pool is
+#   found once at init now (gpu_table_writer_get into s_rc_srv_w, emptied
+#   at shutdown) and the calls go through gpu_fast_table_writer_tex: the
+#   same memo compare and the same write, without the lookup.

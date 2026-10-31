@@ -133,6 +133,7 @@ static void rc_backend_shutdown(void)
     /* Step C4: the table pools, the texture slots, the staging buffers and
      * the pool's heaps go with the device. */
     s_rc_srv_pool.id = s_rc_samp_pool.id = s_rc_blit_pool.id = s_rc_down_pool.id = 0;
+    s_rc_srv_w.v = 0;
     /* Step C5a: the display targets, the depth buffer, zeta and the
      * offscreen targets with their views (no RTV or DSV heap is made) go
      * with the device too, and so do the handles waiting in the grave and

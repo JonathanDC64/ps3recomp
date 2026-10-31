@@ -1550,6 +1550,15 @@ void gpu_null_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t 
     nd->counts.table_writes++;
 }
 
+/* Through a writer (its v the pool's id): the pool's write, the same checks
+ * and the same records in the stream. */
+void gpu_null_fast_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_table_pool pool;
+    pool.id = (uint32_t)w.v;
+    gpu_null_fast_table_write_tex(d, pool, index, srv);
+}
+
 void gpu_null_fast_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)
 {
     gpu_null_device* const nd = GPU_NULL_DEV(d);
@@ -1605,6 +1614,20 @@ static void nl_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t inde
 static void nl_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)
 {
     gpu_fast_table_write_sampler(d, pool, index, s);
+}
+
+/* The pool's id (a stale one is caught at the write, as the pool's is). */
+static gpu_table_writer nl_table_writer_get(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_table_writer w;
+    (void)d;
+    w.v = pool.id;
+    return w;
+}
+
+static void nl_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_fast_table_writer_tex(d, w, index, srv);
 }
 
 static gpu_table nl_table_ref(gpu_device* d, gpu_table_pool pool, uint32_t index)

@@ -97,6 +97,12 @@ typedef struct gpu_swapchain  { uint32_t id; } gpu_swapchain;   /* a window's im
 typedef struct gpu_pipeline { uint64_t v; } gpu_pipeline;
 typedef struct gpu_table    { uint64_t v; } gpu_table;
 
+/* A table pool as its backend keeps it, for the per-draw writes
+ * (table_writer_get, table_writer_tex): the record a write reaches, found
+ * once. On D3D12 and Vulkan a pointer to it, on the null backend the pool's
+ * id. It lives as long as the device, as pools do. */
+typedef struct gpu_table_writer { uint64_t v; } gpu_table_writer;
+
 /* A point on the device's timeline: work submitted before gpu_signal()
  * returned it is done when gpu_fence_completed() reaches it. A lost device
  * reads UINT64_MAX, as D3D12's fences do. */
@@ -744,6 +750,11 @@ typedef struct gpu_device_desc {
      * holding this description is left as it is (today's memo). */ \
     X(table_write_tex,   V, void,           (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
     X(table_write_sampler, V, void,         (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
+    /* The pool found once, for table_writer_tex, which skips the lookup of the pool's record \
+     * table_write_tex makes on each call (pool: one this device made). */ \
+    X(table_writer_get,  R, gpu_table_writer, (gpu_device* d, gpu_table_pool pool), (d, pool)) \
+    /* table_write_tex through a writer: the same memo, the same write. */ \
+    X(table_writer_tex,  V, void,           (gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv), (d, w, index, srv)) \
     /* The table starting at index, for bind_table: a table's first entry (the regions above; \
      * Vulkan gives none for any other index). */ \
     X(table_ref,         R, gpu_table,      (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \

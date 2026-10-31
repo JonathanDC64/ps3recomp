@@ -660,13 +660,14 @@ static u32    s_lock_n  = 0;
 
 /* Step C4: the shader-visible descriptor heaps are the GPU layer's table
  * pools, and every SRV and sampler write goes through them, the memo
- * included (gpu_table_write_tex; per draw gpu_fast_table_write_tex), and
+ * included (gpu_table_write_tex; per draw gpu_fast_table_writer_tex), and
  * every bind names a pool (step C8a: no heap pointer is borrowed; made? is
  * the pool's handle). Every resource an SRV names
  * is a texture of the GPU layer's, by its handle (step C8a: the last ones
  * adopted, the sub-viewport captures, are its own now), so no write looks a
  * handle up. */
 static gpu_table_pool s_rc_srv_pool;    /* the textures' (the draws, the passes) */
+static gpu_table_writer s_rc_srv_w;     /* s_rc_srv_pool found once, for srv_write_ex (step C8a) */
 static gpu_table_pool s_rc_samp_pool;   /* the guest's samplers */
 static gpu_table_pool s_rc_blit_pool;   /* the blit's: one SRV per display target */
 static gpu_table_pool s_rc_down_pool;   /* the write-back downscale's (rsxc_writeback.inc) */

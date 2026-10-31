@@ -969,6 +969,21 @@ static void vkb_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t
     gpu_fast_table_write_sampler(d, pool, index, s);
 }
 
+/* The pool's tpool entry: pools live as long as the device. */
+static gpu_table_writer vkb_table_writer_get(gpu_device* d, gpu_table_pool pool)
+{
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    gpu_table_writer w;
+    w.v = gpu_vk_slot_valid(&dd->tpool_slots, pool.id)
+              ? (uint64_t)(uintptr_t)&dd->tpool[GPU_HANDLE_INDEX(pool.id)] : 0;
+    return w;
+}
+
+static void vkb_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv)
+{
+    gpu_fast_table_writer_tex(d, w, index, srv);
+}
+
 static gpu_table vkb_table_ref(gpu_device* d, gpu_table_pool pool, uint32_t index)
 {
     return gpu_fast_table_ref(d, pool, index);

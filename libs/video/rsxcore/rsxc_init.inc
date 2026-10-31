@@ -192,6 +192,7 @@ static int init_d3d12(u32 width, u32 height)
             pd.region[3].first = 24; pd.region[3].tables = 1; pd.region[3].size = 3;
             s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
             if (!GPU_VALID(s_rc_srv_pool)) printf("[D3D12] SRV heap creation failed\n");
+            else s_rc_srv_w = gpu_table_writer_get(s_rc_dev, s_rc_srv_pool);
         }
 
         /* The offscreen targets' RTVs are views of their textures (off_rt_get,

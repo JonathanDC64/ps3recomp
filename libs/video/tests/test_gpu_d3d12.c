@@ -1058,6 +1058,15 @@ static void test_memo(const scene* s)
     gpu_fast_table_write_tex(g_d, pool, 5, NULL); CHECK(g_dd->n_srv_writes == n0 + 4);
     e.format = GPU_FORMAT_R8G8B8A8_UNORM;
     gpu_fast_table_write_tex(g_d, pool, 5, &e);   CHECK(g_dd->n_srv_writes == n0 + 4);   /* NULL's own */
+    /* Through a writer (the pool found once): the same memo. */
+    const gpu_table_writer w = gpu_table_writer_get(g_d, pool);
+    CHECK(w.v != 0);
+    gpu_fast_table_writer_tex(g_d, w, 4, &a);     CHECK(g_dd->n_srv_writes == n0 + 4);   /* entry 4 holds a */
+    gpu_table_writer_tex(g_d, w, 4, &a);          CHECK(g_dd->n_srv_writes == n0 + 4);   /* through the table too */
+    gpu_fast_table_writer_tex(g_d, w, 5, NULL);   CHECK(g_dd->n_srv_writes == n0 + 4);
+    a.swizzle = 0;
+    gpu_fast_table_writer_tex(g_d, w, 4, &a);     CHECK(g_dd->n_srv_writes == n0 + 5);   /* changed: written */
+    gpu_fast_table_write_tex(g_d, pool, 4, &a);   CHECK(g_dd->n_srv_writes == n0 + 5);   /* the pool's memo has it */
 
     gpu_table_pool_desc sd;
     memset(&sd, 0, sizeof sd);

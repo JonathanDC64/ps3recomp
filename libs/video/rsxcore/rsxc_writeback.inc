@@ -580,7 +580,8 @@ static void off_rt_drop_rewritten(void)
  * memo rewrote every window after any resource was made, and those rewrites
  * of an unchanged view are the only ones skipped as well. It is always on
  * (RSX_SRV_MEMO=0 is gone). Inline: the compare is gpu_d3d12_cmd.h's, only
- * a write calls out. */
+ * a write calls out. Through the pool's writer, found once at init (step
+ * C8a): the 16 calls of a draw look nothing up before the memo. */
 static void srv_write_ex(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt,
                          UINT mapping, int cube)
 {
@@ -594,7 +595,7 @@ static void srv_write_ex(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt,
     sv.swizzle = mapping;
     sv.mip = 0;
     sv.layer = 0;
-    gpu_fast_table_write_tex(s_rc_dev, s_rc_srv_pool, heap_slot, &sv);
+    gpu_fast_table_writer_tex(s_rc_dev, s_rc_srv_w, heap_slot, &sv);
 }
 
 static void srv_write(u32 heap_slot, gpu_texture tex, DXGI_FORMAT fmt, UINT mapping)

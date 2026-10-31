@@ -308,41 +308,34 @@ static inline void gpu_cmd_marker(gpu_cmd* c, const char* text, uint32_t len)
 /* ---- The per-draw device calls (GPU_FAST_FUNCS) ---- */
 
 /* The memo (today's SrvMemo): an entry already holding this description is
- * left as it is. srv NULL is today's per-draw empty slot.
- * The compare reads srv's fields as they are (inline, the caller's values in
- * registers) and packs them as the entry's 20 bytes lie: three words, read
- * from the memo with three loads. A copy of srv built on the stack with
- * narrow stores and read back with a wide load stalled store forwarding on
- * every call; the copy is now made only for a write. */
-typedef char gpu_d3d12_memo_layout_[(sizeof(gpu_view_desc) == 20 && offsetof(gpu_view_desc, kind) == 4 &&
-                                     offsetof(gpu_view_desc, dim) == 5 && offsetof(gpu_view_desc, flags) == 6 &&
-                                     offsetof(gpu_view_desc, mips) == 7 && offsetof(gpu_view_desc, format) == 8 &&
-                                     offsetof(gpu_view_desc, swizzle) == 12 && offsetof(gpu_view_desc, mip) == 16 &&
-                                     offsetof(gpu_view_desc, layer) == 18) ? 1 : -1];
-static inline void gpu_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t index,
+ * left as it is (gpu_view_memo_same, gpu_cmd_ops.h: srv's fields packed into
+ * the entry's words, no copy on the stack). srv NULL is today's per-draw
+ * empty slot. The copy is made only for a write. */
+static inline void gpu_d3d12_memo_write_tex(gpu_device* d, gpu_d3d12_tpool* p, uint32_t index,
                                             const gpu_view_desc* srv)
 {
     static const gpu_view_desc none = { {0}, GPU_VIEW_SRV, GPU_DIM_2D, 0, 1, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0, 0 };
-    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
-    gpu_d3d12_tpool* const p = &dd->tpool[GPU_HANDLE_INDEX(pool.id)];
     const gpu_view_desc* const s = srv ? srv : &none;
     const uint32_t swizzle = s->swizzle ? s->swizzle : GPU_SWIZZLE_IDENTITY;
-    /* Little-endian (every target of this backend). */
-    const uint64_t w0 = (uint64_t)s->texture.id | (uint64_t)s->kind << 32 | (uint64_t)s->dim << 40 |
-                        (uint64_t)s->flags << 48 | (uint64_t)s->mips << 56;
-    const uint64_t w1 = (uint64_t)s->format | (uint64_t)swizzle << 32;
-    const uint32_t w2 = (uint32_t)s->mip | (uint32_t)s->layer << 16;
-    const gpu_view_desc* const e = &((const gpu_view_desc*)p->memo)[index];
-    uint64_t m0, m1;
-    uint32_t m2;
     gpu_view_desc v;
-    memcpy(&m0, e, 8);             /* texture, kind, dim, flags, mips */
-    memcpy(&m1, &e->format, 8);    /* format, swizzle */
-    memcpy(&m2, &e->mip, 4);       /* mip, layer */
-    if (!((m0 ^ w0) | (m1 ^ w1) | (uint64_t)(m2 ^ w2))) return;
+    if (gpu_view_memo_same(&((const gpu_view_desc*)p->memo)[index], s, swizzle)) return;
     v = *s;
     v.swizzle = swizzle;
-    gpu_d3d12_write_srv(dd, p, index, &v);
+    gpu_d3d12_write_srv(GPU_D3D12_DEV(d), p, index, &v);
+}
+
+static inline void gpu_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t index,
+                                            const gpu_view_desc* srv)
+{
+    gpu_d3d12_memo_write_tex(d, &GPU_D3D12_DEV(d)->tpool[GPU_HANDLE_INDEX(pool.id)], index, srv);
+}
+
+/* The same through a writer: w.v is the pool's record (its tpool entry),
+ * found once, so a write looks nothing up before the memo. */
+static inline void gpu_fast_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index,
+                                             const gpu_view_desc* srv)
+{
+    gpu_d3d12_memo_write_tex(d, (gpu_d3d12_tpool*)(uintptr_t)w.v, index, srv);
 }
 
 static inline void gpu_fast_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)
