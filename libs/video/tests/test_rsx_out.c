@@ -20,19 +20,48 @@
  * after that (Vulkan again); a mark left and d3d12 asked for; no
  * RSX_STATE_DIR (no mark). Each child gets the system's environment and the
  * case's variables only. Prints a line a case and "test_rsx_out: N passed,
- * M failed"; exit 1 on a failure. Windows only, as the Vulkan route.
+ * M failed"; exit 1 on a failure.
+ *
+ * On Linux the switch is built as a Linux host builds it, with today's
+ * renderer on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D; rsx_out.c is empty without
+ * it). It has no new-path route there yet, so its cases are its own (k_cases
+ * below): every RSX_BACKEND runs today's renderer, says why when another was
+ * asked for, and leaves the start mark alone.
  */
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include "rsx_out.h"
 #include "rsx_d3d12_backend.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#define MAX_PATH 4096
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ---- the few system calls, on both systems ---- */
+#ifdef _WIN32
+#define SEP "\\"
+static int  file_there(const char* p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
+static void file_del(const char* p) { DeleteFileA(p); }
+static void dir_del(const char* p) { RemoveDirectoryA(p); }
+static void env_put(const char* name, const char* v) { SetEnvironmentVariableA(name, v); }
+#else
+#define SEP "/"
+static int  file_there(const char* p) { return access(p, F_OK) == 0; }
+static void file_del(const char* p) { unlink(p); }
+static void dir_del(const char* p) { rmdir(p); }
+static void env_put(const char* name, const char* v) { if (v) setenv(name, v, 1); else unsetenv(name); }
+#endif
 
 /* ---- what each renderer was asked, in order ---- */
 static char g_log[8192];
@@ -79,8 +108,14 @@ void rsx_d3d12_pso_index_game(const char* game)
     snprintf(g_d3d12_game, sizeof g_d3d12_game, "%s", game ? game : "");
 }
 
-/* ---- the new path's tables, standing in ---- */
-#define TAB_V_(tag, name, params)      static void tag##_##name params { logc(#tag ":" #name); }
+/* The start mark: RSX_STATE_DIR/renderer_starting, "" without the knob. */
+static char g_mark[MAX_PATH + 32];
+static int g_mark_at_init = -1;      /* the mark during the Vulkan start; -1: no Vulkan start */
+static int mark_there(void) { return g_mark[0] && file_there(g_mark); }
+
+/* ---- the new path's tables, standing in (Windows: Linux's switch has none) ---- */
+#ifdef _WIN32
+#define TAB_V_(tag, name, params)     static void tag##_##name params { logc(#tag ":" #name); }
 #define TAB_R_(tag, ret, name, params) static ret tag##_##name params { logc(#tag ":" #name); return (ret)0; }
 #define HAL_V_(name, legacy, params, args)      TAB_V_(hal, name, params)
 #define HAL_R_(ret, name, legacy, params, args) TAB_R_(hal, ret, name, params)
@@ -99,10 +134,7 @@ RSX_OUT_FUNCS(VK_V_, VK_R_)
 /* The Vulkan stand-in's start: TEST_VK_INIT=fail:<step> fails it at that
  * step, as the core's start_step does. It notes whether the start mark was
  * there while it ran. */
-static char g_mark[MAX_PATH + 32];   /* RSX_STATE_DIR\renderer_starting, "" without the knob */
-static int g_mark_at_init = -1;      /* the mark during the Vulkan start; -1: no Vulkan start */
 static const char* g_vk_failed;
-static int mark_there(void) { return g_mark[0] && GetFileAttributesA(g_mark) != INVALID_FILE_ATTRIBUTES; }
 
 static int test_vk_backend_init(uint32_t width, uint32_t height, const char* title)
 {
@@ -140,6 +172,7 @@ const rsx_route rsxc_route_vk = {.name = "vulkan", RSX_OUT_FUNCS(FIELD_V_, FIELD
 #undef vk_backend_init
 #undef vk_backend_present
 #undef TAB_PREFIX
+#endif /* _WIN32 */
 
 /* ---- the child: one case ---- */
 static int g_fail;
@@ -167,6 +200,32 @@ typedef struct {
     int mark_after;        /* the mark once the case is done */
 } test_case;
 
+#ifndef _WIN32
+/* Linux: today's renderer only, whatever is asked; the start mark is never
+ * written, read or taken. */
+static const test_case k_cases[] = {
+    {"unset",        NULL,        NULL, 1, 0, 0, "d3d12", NULL, "d3d12:backend_init", -1, 0},
+    {"d3d12",        "d3d12",     NULL, 1, 0, 0, "d3d12", NULL, "d3d12:backend_init", -1, 0},
+    {"vulkan",       "vulkan",    NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"vulkan-case",  "VuLkAn",    NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=VuLkAn is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"vulkan-nodir", "vulkan",    NULL, 0, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=hal-d3d12 is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"null",         "null",      NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=null is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"metal",        "metal",     NULL, 1, 0, 0, "d3d12", "RSX_BACKEND=metal is not in this build",
+     "d3d12:backend_init", -1, 0},
+    {"fail-loader",  "vulkan", "fail:loader", 1, 0, 0, "d3d12", "RSX_BACKEND=vulkan is not in this build",
+     "d3d12:backend_init", -1, 0},
+    /* A mark a Windows start would leave: neither read nor taken here. */
+    {"left-vulkan",  "vulkan",    NULL, 1, 0, 1, "d3d12", "RSX_BACKEND=vulkan is not in this build",
+     "d3d12:backend_init", -1, 1},
+    {"left-d3d12",   NULL,        NULL, 1, 0, 1, "d3d12", NULL, "d3d12:backend_init", -1, 1},
+};
+#else
 static const test_case k_cases[] = {
     {"unset",        NULL,        NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
     {"d3d12",        "d3d12",     NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
@@ -207,6 +266,7 @@ static const test_case k_cases[] = {
     /* A mark left, and d3d12 asked for: done with too. */
     {"left-d3d12",   NULL,     NULL, 1, 0, 1, "d3d12", NULL, "d3d12:backend_init", -1, 0},
 };
+#endif
 
 static const test_case* case_named(const char* name)
 {
@@ -241,7 +301,7 @@ static int run_case(const char* name)
         return 2;
     }
     const char* dir = getenv("RSX_STATE_DIR");
-    if (dir && *dir) snprintf(g_mark, sizeof g_mark, "%s\\renderer_starting", dir);
+    if (dir && *dir) snprintf(g_mark, sizeof g_mark, "%s" SEP "renderer_starting", dir);
 
     const char* why = "x";
     check(rsx_out_renderer_info(&why) == NULL && why == NULL, "no route before the first call");
@@ -254,7 +314,11 @@ static int run_case(const char* name)
     const int r = rsx_out_backend_init(1280, 720, "test_rsx_out");
     if (c->die_after_init) {
         fflush(stdout);
+#ifdef _WIN32
         TerminateProcess(GetCurrentProcess(), 3);   /* (a start that never reaches its first frame) */
+#else
+        _exit(3);
+#endif
     }
     rsx_out_backend_present();
 
@@ -295,10 +359,24 @@ static int run_case(const char* name)
 /* ---- the parent ---- */
 static int run_child(const char* exe, const test_case* c, const char* dir)
 {
-    SetEnvironmentVariableA("RSX_BACKEND", c->backend);
-    SetEnvironmentVariableA("TEST_VK_INIT", c->vk_init);
-    SetEnvironmentVariableA("RSX_STATE_DIR", c->state_dir ? dir : NULL);
-    SetEnvironmentVariableA("RSX_FAIL_START_AT", NULL);
+    env_put("RSX_BACKEND", c->backend);
+    env_put("TEST_VK_INIT", c->vk_init);
+    env_put("RSX_STATE_DIR", c->state_dir ? dir : NULL);
+    env_put("RSX_FAIL_START_AT", NULL);
+#ifndef _WIN32
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        alarm(30);   /* (as the Windows wait's 30 s) */
+        char* const argv[] = { (char*)exe, (char*)"--case", (char*)c->name, NULL };
+        execv(exe, argv);
+        _exit(127);
+    }
+    if (pid < 0) return -1;
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+#else
     char cmd[MAX_PATH * 2];
     snprintf(cmd, sizeof cmd, "\"%s\" --case %s", exe, c->name);
     STARTUPINFOA si;
@@ -312,6 +390,7 @@ static int run_child(const char* exe, const test_case* c, const char* dir)
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return (int)code;
+#endif
 }
 
 int main(int argc, char** argv)
@@ -319,16 +398,25 @@ int main(int argc, char** argv)
     if (argc >= 3 && !strcmp(argv[1], "--case")) return run_case(argv[2]);
 
     char exe[MAX_PATH], tmp[MAX_PATH], dir[MAX_PATH], mark[MAX_PATH + 32];
+#ifdef _WIN32
     GetModuleFileNameA(NULL, exe, sizeof exe);
     GetTempPathA(sizeof tmp, tmp);
     snprintf(dir, sizeof dir, "%stest_rsx_out_%lu", tmp, (unsigned long)GetCurrentProcessId());
     CreateDirectoryA(dir, NULL);
-    snprintf(mark, sizeof mark, "%s\\renderer_starting", dir);
+#else
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    exe[n > 0 ? n : 0] = 0;
+    const char* const t = getenv("TMPDIR");
+    snprintf(tmp, sizeof tmp, "%s", t && *t ? t : "/tmp");
+    snprintf(dir, sizeof dir, "%s/test_rsx_out_%lu", tmp, (unsigned long)getpid());
+    mkdir(dir, 0777);
+#endif
+    snprintf(mark, sizeof mark, "%s" SEP "renderer_starting", dir);
     int passed = 0, failed = 0;
     for (size_t i = 0; i < sizeof k_cases / sizeof k_cases[0]; i++) {
         const test_case* c = &k_cases[i];
         if (c->mark_before >= 0) {
-            DeleteFileA(mark);
+            file_del(mark);
             if (c->mark_before) {
                 FILE* f = fopen(mark, "wb");
                 if (f) fclose(f);
@@ -338,15 +426,15 @@ int main(int argc, char** argv)
         const int code = run_child(exe, c, dir);
         int ok = c->die_after_init ? code == 3 : code == 0;
         if (c->die_after_init) {
-            const int left = GetFileAttributesA(mark) != INVALID_FILE_ATTRIBUTES;
+            const int left = file_there(mark);
             if (!left) printf("    FAIL: the start mark is not there after a start that died\n");
             ok = ok && left;
         }
         printf("%s %s\n", ok ? "PASS" : "FAIL", c->name);
         if (ok) passed++; else failed++;
     }
-    DeleteFileA(mark);
-    RemoveDirectoryA(dir);
+    file_del(mark);
+    dir_del(dir);
     printf("test_rsx_out: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;
 }
@@ -355,7 +443,7 @@ int main(int argc, char** argv)
 #include <stdio.h>
 int main(void)
 {
-    printf("test_rsx_out: Windows only (the Vulkan route)\n");
+    printf("test_rsx_out: Windows and Linux only\n");
     return 0;
 }
 #endif
