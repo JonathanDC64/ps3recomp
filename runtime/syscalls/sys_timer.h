@@ -37,16 +37,15 @@ uint64_t ppu_timebase_now(void);
  * cellGcmGetLastFlipTime, reads this clock too. */
 uint64_t lv2_system_time_usec(void);
 
-#ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,
  * and the OS then rounds that up to the timer tick -- a 30 us guest timeout
  * inflates ~50x even with timeBeginPeriod(1). Waits under 1 ms must instead
- * poll their wake predicate and yield to a QueryPerformanceCounter deadline
- * (same approach sys_timer_usleep already uses). */
-int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
-int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
-#endif
+ * poll their wake predicate and yield to a monotonic clock deadline
+ * (same approach sys_timer_usleep already uses). Only Windows' waits use
+ * them so far. */
+int64_t lv2_usec_deadline(uint64_t usec);      /* plat_clock_now 'usec' from now */
+int     lv2_deadline_passed(int64_t deadline); /* 1 once plat_clock_now >= deadline */
 
 #define SYS_TIMER_MAX  64
 

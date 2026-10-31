@@ -367,13 +367,25 @@ jobs:
       # runtime/platform/plat.h's threads, events and mutex, and the SPU async
       # job pool written once on them. Off Windows the pool used to be a thread
       # per job; this shows it reuses workers, keeps no queue, lets idle ones
-      # go and reserves the 256 MB stacks, on this host's own pthreads.
+      # go and reserves the 256 MB stacks, on this host's own pthreads. Its
+      # plat_time test checks plat.h's clock and precise sleep.
       - name: Build and run plat_threads
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang; else export CC=gcc; fi
           cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-plat-threads
           ctest --test-dir build-plat-threads --output-on-failure
+
+      # The guest clocks and the guest's usleep (runtime/syscalls/sys_timer.c,
+      # on plat.h's clock and precise sleep): both clocks count from their
+      # first reading, as on Windows, and a one-off usleep under a millisecond
+      # never ends early. -V prints requested against measured sleeps.
+      - name: Build and run lv2_time
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang; else export CC=gcc; fi
+          cmake -S tests/lv2_time -B build-lv2-time -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-lv2-time
+          ctest --test-dir build-lv2-time --output-on-failure -V
 
       # cellFiber's cooperative switching on ucontext. glibc's ucontext_t is
       # not the one that bites, but running the suite on both hosts is what

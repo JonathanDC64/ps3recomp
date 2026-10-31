@@ -236,6 +236,7 @@ jobs:
       # runtime/platform/plat.h's threads, events and mutex, and the SPU async
       # job pool on them. On Windows plat.h is the Win32 calls the pool made
       # before it moved, so this checks the same rules the other hosts do.
+      # Its plat_time test checks plat.h's clock and precise sleep.
       - name: Build and run plat_threads
         run: |
           cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
