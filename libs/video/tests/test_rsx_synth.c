@@ -5,6 +5,8 @@
  *
  *   test_rsx_synth [--update-golden] [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...
+ *   test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...
+ *                                   the new path's pipeline stores (stores_test says how)
  *   test_rsx_synth --caps <dir>     only write the scenes' captures (for rsx_replay)
  *   test_rsx_synth --run <dir>      the child the test starts: plays them
  *
@@ -1050,7 +1052,8 @@ static int child_main(const char* dir)
 {
     setvbuf(stdout, NULL, _IONBF, 0);   /* in order with the backend's stderr */
     const char* be = getenv("RSX_BACKEND");
-    const char* const want = be && !strcmp(be, "vulkan") ? "vulkan" : "null";
+    const char* const want = be && !strcmp(be, "vulkan") ? "vulkan" : be && !strcmp(be, "hal-d3d12") ? "hal-d3d12"
+                                                                                                     : "null";
     env_set("RSX_BACKEND", want);
     if (!getenv("RSX_PRESENT")) env_set("RSX_PRESENT", "1");
     if (!route_open(want)) { fprintf(stderr, "test_rsx_synth: no %s route in this build\n", want); return 3; }
@@ -1063,7 +1066,32 @@ static int child_main(const char* dir)
         fprintf(stderr, "test_rsx_synth: the %s route did not start\n", want);
         return 3;
     }
-    for (int p = 1; p <= NPASSES; p++)
+    /* --stores: pipeline index rows to hand over (RSX_SYNTH_ROWS, a rows
+     * file as rsx_replay's RSX_REPLAY_INDEX takes), and RSX_SYNTH_PLAY=0: no
+     * frames, only the start's builds (with PS3_PSO_WAIT=1). */
+    if (getenv("RSX_SYNTH_ROWS")) {
+        FILE* f = fopen(getenv("RSX_SYNTH_ROWS"), "rb");
+        if (!f) { fprintf(stderr, "test_rsx_synth: cannot read %s\n", getenv("RSX_SYNTH_ROWS")); return 3; }
+        char line[256];
+        unsigned rows = 0;
+        unsigned long long hash = 0;
+        while (fgets(line, sizeof line, f)) {
+            int fetch, clamp, nrt;
+            unsigned long long vk, pk;
+            unsigned blend, rtfmt, cmask, cull, depth;
+            if (sscanf(line, "add %d %llx %d %llx %x %d %x %x %x %x", &fetch, &vk, &clamp, &pk, &blend, &nrt, &rtfmt,
+                       &cmask, &cull, &depth) == 10) {
+                ROUTE(pso_index_add)(fetch, vk, clamp, pk, blend, nrt, rtfmt, cmask, cull, depth);
+                rows++;
+            } else
+                (void)sscanf(line, "ready %llx", &hash);
+        }
+        fclose(f);
+        ROUTE(pso_index_ready)(hash);
+        printf("[synth] rows %u\n", rows);
+    }
+    const int nplay = getenv("RSX_SYNTH_PLAY") && !atoi(getenv("RSX_SYNTH_PLAY")) ? 0 : NPASSES;
+    for (int p = 1; p <= nplay; p++)
         for (int s = 0; s < NSCENES; s++)
             for (int k = 0; k < k_scene[s].frames; k++) {
                 char path[MAX_PATH];
@@ -1482,10 +1510,311 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
     return 1;
 }
 
+#ifdef _WIN32
+/* ---------------------------------------------------------------------------
+ * --stores <vulkan|hal-d3d12>: the new path's pipeline stores (step P3S) on a
+ * real device, over the same chain, in seven children with
+ * PS3_SHADER_CACHE set and PS3_PSO_WAIT=1 (the start's builds run to their
+ * end). The cache's library is gpu/d3d12/pipelines.lib, or Vulkan's
+ * gpu/vulkan/<driver>.vkpc; the neutral manifest gpu/manifest.bin
+ * (rsxc_psolib.inc's records: 56 bytes, "GNM1").
+ *   A  an empty cache: the chain makes pipelines; the manifest holds M
+ *      records, all whole, none twice.
+ *   B  A's cache, its manifest with a torn record at its end: the tail is
+ *      cut (M records again) and the chain compiles no pipeline.
+ *   C  a cache with A's shaders and manifest only, no frames: the start
+ *      builds the M records, none fails.
+ *   D  C's cache: the chain compiles no guest-FP pipeline (the records are
+ *      the draws' pipelines), and nothing is left to build.
+ *   E  A's shaders only, and A's records handed over as pipeline index rows,
+ *      no frames: all M rows map to a pipeline (none not built), and the
+ *      index is marked built (gpu/<dir>/index.built).
+ *   F  E's cache: no guest-FP pipeline compiled.
+ *   G  A's cache, its library made another driver's (a byte of the file
+ *      changed), no frames: the library starts empty, and the M records are
+ *      built again.
+ * -------------------------------------------------------------------------*/
+#define GM_SIZE  56u
+#define GM_MAGIC 0x314D4E47u
+
+typedef struct {
+    int code, done;
+    long loaded, compiled, fp_loaded, fp_compiled;    /* "pipelines this run" (-1: no line) */
+    long mb[4], ix[4];         /* the manifest's and the index's builds: built, there already, not built, of */
+    long gm_recs, gm_build;    /* "pipeline manifest gpu/manifest.bin: %u records, %u to build" */
+    long torn;                 /* "keeping the first %u whole records" */
+    int lib_new;
+} StoreRun;
+
+static void store_parse(const char* dir, StoreRun* r)
+{
+    char log[MAX_PATH];
+    snprintf(log, sizeof log, "%s/log.txt", dir);
+    r->loaded = r->compiled = r->fp_loaded = r->fp_compiled = -1;
+    r->gm_recs = r->gm_build = r->torn = -1;
+    for (int i = 0; i < 4; i++) r->mb[i] = r->ix[i] = -1;
+    char* t = read_file(log, NULL);
+    for (char* line = t; line && *line; ) {
+        char* next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        unsigned a, b;
+        if (sscanf(line, "[D3D12] pipelines this run: %ld loaded from the library, %ld compiled; guest FP: %ld loaded, "
+                         "%ld compiled", &r->loaded, &r->compiled, &r->fp_loaded, &r->fp_compiled) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline manifest build: %ld built, %ld there already, %ld not built, of %ld",
+                          &r->mb[0], &r->mb[1], &r->mb[2], &r->mb[3]) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline index: %ld built, %ld there already, %ld not built, of %ld",
+                          &r->ix[0], &r->ix[1], &r->ix[2], &r->ix[3]) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline manifest gpu/manifest.bin: %u records, %u to build", &a, &b) == 2) {
+            r->gm_recs = a; r->gm_build = b;
+        } else if (sscanf(line, "[D3D12] pipeline manifest gpu/manifest.bin: keeping the first %u whole", &a) == 1) {
+            r->torn = a;
+        } else if (!strncmp(line, "[D3D12] pipeline library: new", 29)) {
+            r->lib_new = 1;
+        } else if (!strncmp(line, "[synth] done", 12))
+            r->done = 1;
+        line = next;
+    }
+    free(t);
+}
+
+/* The manifest's records (NULL with *n -1 when the file is not whole). */
+static uint8_t* gm_read(const char* cache, long* n)
+{
+    char p[MAX_PATH];
+    snprintf(p, sizeof p, "%s/gpu/manifest.bin", cache);
+    size_t len = 0;
+    char* b = read_file(p, &len);
+    *n = -1;
+    if (!b) return NULL;
+    if (len % GM_SIZE) { free(b); return NULL; }
+    for (size_t o = 0; o < len; o += GM_SIZE) {
+        uint32_t m, s;
+        memcpy(&m, b + o, 4);
+        memcpy(&s, b + o + 4, 4);
+        if (m != GM_MAGIC || s != GM_SIZE) { free(b); return NULL; }
+        for (size_t q = 0; q < o; q += GM_SIZE)
+            if (!memcmp(b + q, b + o, GM_SIZE)) { free(b); return NULL; }   /* (none twice) */
+    }
+    *n = (long)(len / GM_SIZE);
+    return (uint8_t*)b;
+}
+
+/* Copies dir src's files matching pat into dst (made). */
+static int copy_files(const char* src, const char* pat, const char* dst)
+{
+    char q[MAX_PATH];
+    snprintf(q, sizeof q, "%s/%s", src, pat);
+    dir_make(dst);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(q, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char a[MAX_PATH], b[MAX_PATH];
+        snprintf(a, sizeof a, "%s/%s", src, fd.cFileName);
+        snprintf(b, sizeof b, "%s/%s", dst, fd.cFileName);
+        if (CopyFileA(a, b, FALSE)) n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+/* A cache's shaders (the route's target's files) into a new cache. */
+static int copy_shaders(const char* route, const char* src, const char* dst)
+{
+    dir_make(dst);
+    if (strcmp(route, "vulkan")) return copy_files(src, "*.dxbc", dst);
+    char a[MAX_PATH], b[MAX_PATH];
+    snprintf(a, sizeof a, "%s/gpu/spv", src);
+    snprintf(b, sizeof b, "%s/gpu", dst);
+    dir_make(b);
+    snprintf(b, sizeof b, "%s/gpu/spv", dst);
+    return copy_files(a, "*.spv", b);
+}
+/* The library's file in a cache (the first of the route's), "" if none. */
+static void lib_file(const char* route, const char* cache, char* out, size_t cap)
+{
+    char d[MAX_PATH];
+    const int vk = !strcmp(route, "vulkan");
+    snprintf(d, sizeof d, "%s/gpu/%s", cache, vk ? "vulkan" : "d3d12");
+    char q[MAX_PATH];
+    snprintf(q, sizeof q, "%s/%s", d, vk ? "*.vkpc" : "pipelines.lib");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(q, &fd);
+    out[0] = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    snprintf(out, cap, "%s/%s", d, fd.cFileName);
+    FindClose(h);
+}
+
+static int g_store_ok;
+static void store_check(int ok, const char* child, const char* what)
+{
+    printf("[synth] %s %s: %s\n", ok ? "ok  " : "FAIL", child, what);
+    if (!ok) g_store_ok = 0;
+}
+
+/* One child on the route into out/<name>, cache PS3_SHADER_CACHE, with
+ * more NAME=VALUE (may be NULL). */
+static void store_child(const char* exe, const char* out, const char* name, const char* route, const char* cache,
+                        const char* const* user, int nuser, const char* more1, const char* more2, StoreRun* r)
+{
+    char dir[MAX_PATH], be[64], sc[MAX_PATH + 32];
+    snprintf(dir, sizeof dir, "%s/%s", out, name);
+    snprintf(be, sizeof be, "RSX_BACKEND=%s", route);
+    snprintf(sc, sizeof sc, "PS3_SHADER_CACHE=%s", cache);
+    const char* e[64];
+    int n = 0;
+    e[n++] = be;
+    e[n++] = sc;
+    e[n++] = "RSX_PRESENT=1";
+    e[n++] = "PS3_PSO_WAIT=1";
+    e[n++] = "PSO_THREADS=4";
+    for (int i = 0; i < nuser && n < 60; i++) e[n++] = user[i];
+    if (more1) e[n++] = more1;
+    if (more2) e[n++] = more2;
+    memset(r, 0, sizeof *r);
+    r->code = run_child(exe, dir, e, n);
+    store_parse(dir, r);
+    char what[160];
+    snprintf(what, sizeof what, "the child ended with %d, %s", r->code, r->done ? "done" : "not done");
+    store_check(r->code == 0 && r->done, name, what);
+}
+
+static int stores_test(const char* exe, const char* out, const char* route, const char* const* user, int nuser)
+{
+    g_store_ok = 1;
+    const int vk = !strcmp(route, "vulkan");
+    char ca[MAX_PATH], cc[MAX_PATH], ce[MAX_PATH], cg[MAX_PATH], p[MAX_PATH], q[MAX_PATH], what[256];
+    snprintf(ca, sizeof ca, "%s/cache_a", out);
+    snprintf(cc, sizeof cc, "%s/cache_c", out);
+    snprintf(ce, sizeof ce, "%s/cache_e", out);
+    snprintf(cg, sizeof cg, "%s/cache_g", out);
+    snprintf(p, sizeof p, "%s/cache_a/gpu", out);
+    if (GetFileAttributesA(ca) != INVALID_FILE_ATTRIBUTES) {
+        printf("[synth] %s is there from an earlier run: give another --out, or remove it\n", out);
+        return 2;
+    }
+    dir_make(ca);
+    StoreRun r;
+
+    store_child(exe, out, "A", route, ca, user, nuser, NULL, NULL, &r);
+    long m = -1;
+    uint8_t* recs = gm_read(ca, &m);
+    snprintf(what, sizeof what, "pipelines compiled %ld (guest FP %ld); the manifest holds %ld whole records, none twice",
+             r.compiled, r.fp_compiled, m);
+    store_check(r.compiled > 0 && m > 0 && m <= r.fp_loaded + r.fp_compiled, "A", what);
+    char lib[MAX_PATH];
+    lib_file(route, ca, lib, sizeof lib);
+    store_check(lib[0] != 0, "A", vk ? "the library gpu/vulkan/<driver>.vkpc is there" : "the library gpu/d3d12/pipelines.lib is there");
+    if (m <= 0) { free(recs); printf("[synth] FAILED: no manifest to go on with. Everything is in %s\n", out); return 1; }
+
+    /* The rows file: A's records as pipeline index rows. */
+    char rows[MAX_PATH], rows_env[MAX_PATH + 32];
+    snprintf(rows, sizeof rows, "%s/rows.txt", out);
+    FILE* f = fopen(rows, "wb");
+    for (long i = 0; f && i < m; i++) {
+        const uint8_t* b = recs + i * GM_SIZE;
+        uint64_t vs, ps;
+        uint32_t s[8];
+        memcpy(&vs, b + 8, 8);
+        memcpy(&ps, b + 16, 8);
+        memcpy(s, b + 24, 32);   /* fetch clamp blend nrt rtfmt cmask cull depth */
+        fprintf(f, "add %u %016llx %u %016llx %x %u %x %x %x %x\n", s[0], (unsigned long long)vs, s[1],
+                (unsigned long long)ps, s[2], s[3], s[4], s[5], s[6], s[7]);
+    }
+    if (f) { fprintf(f, "ready 00000000005d1e5e\n"); fclose(f); }
+    snprintf(rows_env, sizeof rows_env, "RSX_SYNTH_ROWS=%s", rows);
+
+    /* The caches C, E and G, from A's before B adds to it. */
+    copy_shaders(route, ca, cc);
+    snprintf(p, sizeof p, "%s/gpu/manifest.bin", ca);
+    snprintf(q, sizeof q, "%s/gpu", cc);
+    dir_make(q);
+    snprintf(q, sizeof q, "%s/gpu/manifest.bin", cc);
+    CopyFileA(p, q, FALSE);
+    copy_shaders(route, ca, ce);
+    copy_shaders(route, ca, cg);
+    snprintf(q, sizeof q, "%s/gpu", cg);
+    dir_make(q);
+    snprintf(q, sizeof q, "%s/gpu/manifest.bin", cg);
+    CopyFileA(p, q, FALSE);
+    snprintf(q, sizeof q, "%s/gpu/%s", cg, vk ? "vulkan" : "d3d12");
+    dir_make(q);
+    {   /* G's library: A's with one byte changed (Vulkan: our header's driver; D3D12: its first byte) */
+        char lg[MAX_PATH];
+        const char* leaf = strrchr(lib, '/');
+        snprintf(lg, sizeof lg, "%s%s", q, leaf ? leaf : "/pipelines.lib");
+        CopyFileA(lib, lg, FALSE);
+        FILE* g = fopen(lg, "r+b");
+        if (g) {
+            const long at = vk ? 24 : 0;
+            fseek(g, at, SEEK_SET);
+            const int c = fgetc(g);
+            fseek(g, at, SEEK_SET);
+            fputc(c ^ 0x5A, g);
+            fclose(g);
+        }
+    }
+
+    /* B: a torn record at the manifest's end first. */
+    f = fopen(p, "ab");
+    if (f) { fwrite("GNM1torn-tail", 1, 13, f); fclose(f); }
+    store_child(exe, out, "B", route, ca, user, nuser, NULL, NULL, &r);
+    long mb = -1;
+    free(gm_read(ca, &mb));
+    snprintf(what, sizeof what, "the torn tail cut (kept %ld, the file holds %ld of %ld)", r.torn, mb, m);
+    store_check(r.torn == m && mb == m, "B", what);
+    snprintf(what, sizeof what, "the second run compiles %ld pipelines (%ld loaded), %ld records to build", r.compiled,
+             r.loaded, r.gm_build);
+    store_check(r.compiled == 0 && r.loaded > 0 && r.gm_build == 0, "B", what);
+
+    store_child(exe, out, "C", route, cc, user, nuser, "RSX_SYNTH_PLAY=0", NULL, &r);
+    snprintf(what, sizeof what, "the manifest's build: %ld built, %ld there already, %ld not built, of %ld (of %ld records)",
+             r.mb[0], r.mb[1], r.mb[2], r.mb[3], m);
+    store_check(r.gm_recs == m && r.mb[3] == m && r.mb[2] == 0 && r.mb[0] + r.mb[1] == m, "C", what);
+
+    store_child(exe, out, "D", route, cc, user, nuser, NULL, NULL, &r);
+    snprintf(what, sizeof what, "guest-FP pipelines compiled %ld (loaded %ld); %ld records to build", r.fp_compiled,
+             r.fp_loaded, r.gm_build);
+    store_check(r.fp_compiled == 0 && r.fp_loaded > 0 && r.gm_build == 0, "D", what);
+
+    store_child(exe, out, "E", route, ce, user, nuser, "RSX_SYNTH_PLAY=0", rows_env, &r);
+    snprintf(what, sizeof what, "index rows mapped: %ld built, %ld there already, %ld not built, of %ld (of %ld rows)",
+             r.ix[0], r.ix[1], r.ix[2], r.ix[3], m);
+    store_check(r.ix[3] == m && r.ix[2] == 0 && r.ix[0] + r.ix[1] == m, "E", what);
+    snprintf(q, sizeof q, "%s/gpu/%s/index.built", ce, vk ? "vulkan" : "d3d12");
+    {
+        char* t = read_file(q, NULL);
+        store_check(t && !strncmp(t, "00000000005d1e5e", 16), "E", "the index is marked built (gpu/<dir>/index.built)");
+        free(t);
+    }
+
+    store_child(exe, out, "F", route, ce, user, nuser, NULL, NULL, &r);
+    snprintf(what, sizeof what, "guest-FP pipelines compiled %ld (loaded %ld)", r.fp_compiled, r.fp_loaded);
+    store_check(r.fp_compiled == 0 && r.fp_loaded > 0, "F", what);
+
+    store_child(exe, out, "G", route, cg, user, nuser, "RSX_SYNTH_PLAY=0", NULL, &r);
+    snprintf(what, sizeof what, "another driver's library: %s; the manifest's build: %ld built, %ld there already, "
+             "%ld not built, of %ld", r.lib_new ? "a new one" : "not refused", r.mb[0], r.mb[1], r.mb[2], r.mb[3]);
+    store_check(r.lib_new && r.gm_build == m && r.mb[2] == 0 && r.mb[0] + r.mb[1] == m, "G", what);
+
+    free(recs);
+    if (g_store_ok) {
+        printf("[synth] PASS: the pipeline stores on %s: %ld records, every one built from the manifest and as an "
+               "index row; the second run compiled none. Everything is in %s\n", route, m, out);
+        return 0;
+    }
+    printf("[synth] FAILED. Everything is in %s\n", out);
+    return 1;
+}
+#endif
+
 static int test_main(int argc, char** argv)
 {
     const char* out = "test_rsx_synth.out";
     int update = 0, keep = 0, verbose = 0, vulkan = 0, validation = 1;
+    const char* stores = NULL;
     const char* extra[48];
     int nextra = 0;
     extra[nextra++] = "RSX_BACKEND=null";
@@ -1500,9 +1829,13 @@ static int test_main(int argc, char** argv)
                                                                  !strcmp(argv[i + 1], "vulkan")))
             vulkan = !strcmp(argv[++i], "vulkan");
         else if (!strcmp(argv[i], "--no-validation")) validation = 0;
+        else if (!strcmp(argv[i], "--stores") && i + 1 < argc && (!strcmp(argv[i + 1], "vulkan") ||
+                                                                  !strcmp(argv[i + 1], "hal-d3d12")))
+            stores = argv[++i];
         else {
             fprintf(stderr, "usage: test_rsx_synth [--update-golden] [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --caps <dir> | --run <dir>\n");
             return 2;
         }
@@ -1510,6 +1843,14 @@ static int test_main(int argc, char** argv)
     char exe[MAX_PATH];
     if (!self_exe(exe, sizeof exe)) return 2;
     dir_make(out);
+    if (stores) {
+#ifdef _WIN32
+        return stores_test(exe, out, stores, extra + 2, nextra - 2);
+#else
+        printf("[synth] --stores runs on Windows only for now\n");
+        return 0;
+#endif
+    }
     if (vulkan) return vk_test(exe, out, extra + 2, nextra - 2, validation, keep);
     char da[MAX_PATH], db[MAX_PATH], dump[MAX_PATH], envdump[MAX_PATH + 16];
     snprintf(da, sizeof da, "%s/a", out);

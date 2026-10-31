@@ -751,7 +751,8 @@ endif()
 # rsx_replay plays a chain, in two processes; each scene's stream hash against its golden, no failed null
 # check. Windows and Linux, as the null route, with one golden list. test_rsx_synth --route vulkan plays the
 # chain on the Vulkan route under the validation layer instead (builds with PS3RECOMP_RSX_HAL_VULKAN; it needs
-# a Vulkan device and a display, so it is no ctest: gpu-hal.yml runs it on lavapipe). Built on demand:
+# a Vulkan device and a display, so it is no ctest: gpu-hal.yml runs it on lavapipe). test_rsx_synth --stores
+# vulkan|hal-d3d12 checks the new path's pipeline stores on a GPU (Windows; no ctest either). Built on demand:
 #   cmake --build build --target test_rsx_synth
 #   ctest --test-dir build -R rsx_synth
 if(PS3RECOMP_RSX_HAL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
