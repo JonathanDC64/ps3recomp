@@ -23,7 +23,12 @@ struct rsx_state;
  *  rsxc_shader_hlsl   rsx_d3d12_shader_hlsl: kind 0 vertex, 1 fragment,
  *                     2 vertex in fetch form, 3 fragment with the sprite-edge
  *                     clamp. Returns the instruction count, <= 0 on failure.
- *                     Not thread-safe (the decompilers' statics).
+ *                     Not thread-safe (the decompilers' statics). The new
+ *                     path's own kinds (no export has them): 4 vertex and 5
+ *                     vertex in fetch form, with the clamp's geometry half
+ *                     (rsxc_vs_inject_uvclamp), for a GPU without geometry
+ *                     shaders; their key is a vertex shader's
+ *                     (rsxc_shader_key(0, ...)).
  *  rsxc_shader_hdr    rsx_d3d12_shader_hdr: the HDR variant hdrv, in place.
  *  rsxc_shader_key    rsx_d3d12_shader_key: the .dxbc cache key of a text.
  *  rsxc_program_hash64  rsx_d3d12_program_hash64: the pipeline index's
@@ -47,6 +52,11 @@ int rsxc_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max);
  *  rsxc_fp_inject_uvclamp  the pixel half of the sprite-edge clamp; 0 leaves
  *                       the text as it was.
  *  rsxc_uvclamp_gs_hlsl the geometry half's source (gs_5_0, entry "main").
+ *  rsxc_vs_inject_uvclamp  kind 4: a vertex text (rsxc_vs_text's, fetch
+ *                       form or not) made to do the geometry half itself, for
+ *                       a draw the core turns into a list of triangles read
+ *                       from a table (rsxc_shader.c says how); 0 leaves the
+ *                       text as it was.
  *  rsxc_fp_out_anchor / rsxc_fp_set_out  colour 0's expression, for the
  *                       debug rewrites.
  *  rsxc_fp_hash_at / rsxc_fp_units_at  rsx_fp_code_hash, size and sampled
@@ -59,6 +69,7 @@ int rsxc_fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask,
 int rsxc_fp_baked(void);
 int rsxc_fp_inject_uvclamp(char* hlsl, size_t cap);
 const char* rsxc_uvclamp_gs_hlsl(size_t* len);
+int rsxc_vs_inject_uvclamp(char* hlsl, size_t cap, int fetch);
 char* rsxc_fp_out_anchor(char* hlsl, char** end, int want_stmt);
 int rsxc_fp_set_out(char* hlsl, size_t cap, const char* expr);
 u32 rsxc_fp_hash_at(u32 off, u32* size_out);

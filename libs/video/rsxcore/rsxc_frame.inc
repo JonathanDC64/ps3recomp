@@ -356,7 +356,7 @@ rtt_dump_done:;
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
                     dr->d2c_mask |= 1u << _u;
-                    srv_write(wslot, s_zeta[zs].tex, GPU_FORMAT_R24_UNORM_X8_TYPELESS,
+                    srv_write(wslot, s_zeta[zs].tex, rc_ds_depth_srv(),
                               GPU_SWIZZLE_IDENTITY);
                     continue;
                 }
@@ -367,7 +367,7 @@ rtt_dump_done:;
                 int zs = zeta_find(dr->tex[_u].raw);
                 if (zs >= 0) {
                     dr->tex_z[_u] = zs;
-                    srv_write(wslot, s_zeta[zs].tex, GPU_FORMAT_R24_UNORM_X8_TYPELESS,
+                    srv_write(wslot, s_zeta[zs].tex, rc_ds_depth_srv(),
                               GPU_SWIZZLE_IDENTITY);
                 } else
                     srv_write(wslot, k_rc_no_tex, GPU_FORMAT_R8G8B8A8_UNORM,
@@ -473,6 +473,7 @@ rtt_dump_done:;
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
         const int _pm0 = s_perf_pso_miss;
+        dr->uvc = 0;
         if (dr->fp_addr) {
             dr->pso = vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
                                     dr_num_rts(dr),
@@ -481,6 +482,16 @@ rtt_dump_done:;
                                     dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                     _cmask, dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
             dr->pso_serial = s_rf_serial;
+            /* Step V5: a clamp draw in the vertex-shader form gets its table
+             * of corners; with no room it is drawn without the clamp. */
+            if (s_fp_vs4) {
+                if (uvc_table(dr)) dr->uvc = 1;
+                else dr->pso = vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key, dr_num_rts(dr),
+                                             dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
+                                                        : GPU_FORMAT_R8G8B8A8_UNORM,
+                                             dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                             _cmask, dr->d2c_mask, 0, dr_hdrv(dr));
+            }
             if (s_psj_last >= 0) {   /* filled in by psj_finish */
                 s_psj_fix[s_psj_fix_n].draw = _d;
                 s_psj_fix[s_psj_fix_n].entry = s_psj_last;
@@ -621,6 +632,12 @@ rtt_dump_done:;
             const gpu_table_pool rsrv = s_rc_srv_pool;
             const gpu_addr cb_va = gpu_fast_buffer_addr(rdev, s_rc_vp_cb);
             const gpu_addr fpcb_va = GPU_VALID(s_rc_vp_fpcb) ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
+            /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
+             * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
+            const gpu_addr uvc_vb_va = s_uvc_vs && GPU_VALID(s_rc_vp_vb)
+                ? gpu_fast_buffer_addr(rdev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256 : 0;
+            const gpu_addr uvc_vf_va = s_uvc_vs && GPU_VALID(s_rc_vf_buf)
+                ? gpu_fast_buffer_addr(rdev, s_rc_vf_buf) + (u64)s_d3d.vp_parity * s_vf_cap : 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -829,7 +846,8 @@ rtt_dump_done:;
                                           dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
                                                      : GPU_FORMAT_R8G8B8A8_UNORM,
                                           dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                          dr_cube_mask(dr), dr->d2c_mask, dr_uvclamp(dr), dr_hdrv(dr));
+                                          dr_cube_mask(dr), dr->d2c_mask,
+                                          s_uvc_vs && !dr->uvc ? 0u : dr_uvclamp(dr), dr_hdrv(dr));
                         if (dpso.v && look.v != dpso.v) {
                             static int n = 0;
                             if (n < 8) {
@@ -957,19 +975,43 @@ rtt_dump_done:;
                       if (!zq) gpu_cmd_query_reset(rc, s_zq_pool, 0, ZQ_MAX);
                       gpu_cmd_query_begin(rc, s_zq_pool, (u32)zq);
                   }
-                if (dr->fetch)
-                    gpu_cmd_push_const1(rc, 5, dr->fdesc, 0);
-                /* A strip draw's indices are a strip (vf_strip_native). */
-                if ((dr->fetch == 2) != s_vp_topo_strip) {
-                    s_vp_topo_strip = dr->fetch == 2;
-                    gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
+                if (dr->uvc) {
+                    /* Step V5: the clamp's vertex-shader form, a list of its
+                     * triangles' corners (uvc_table); t20 as the table's ring,
+                     * and back to vf_buf for the draws after. With no
+                     * pipeline it is not drawn (the fallback reads vertices). */
+                    if (!dr->fetch) gpu_cmd_bind_raw(rc, 4, uvc_vb_va);
+                    gpu_cmd_push_const1(rc, 5, dr->uvc_tab, 0);
+                    if (s_vp_topo_strip) {
+                        s_vp_topo_strip = 0;
+                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
+                    }
+                    dred_mark(d, dr);
+                    if (dpso.v && dr->uvc_n) gpu_cmd_draw(rc, dr->uvc_n, 1, 0, 0);
+                    if (!dr->fetch && uvc_vf_va) gpu_cmd_bind_raw(rc, 4, uvc_vf_va);
+                    { static u32 said;   /* the first of each kind */
+                      const u32 kind = 1u << (dr->fetch ? 1 + dr->fetch : dr->index_count ? 1 : 0);
+                      if (!(said & kind)) {
+                          said |= kind;
+                          printf("[D3D12] sprite-edge clamp in the vertex shader: a draw %s, %u vertices\n",
+                                 dr->fetch == 2 ? "of a fetch strip" : dr->fetch ? "of a fetch list"
+                                 : dr->index_count ? "indexed" : "not indexed", dr->uvc_n);
+                      } }
+                } else {
+                    if (dr->fetch)
+                        gpu_cmd_push_const1(rc, 5, dr->fdesc, 0);
+                    /* A strip draw's indices are a strip (vf_strip_native). */
+                    if ((dr->fetch == 2) != s_vp_topo_strip) {
+                        s_vp_topo_strip = dr->fetch == 2;
+                        gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
+                    }
+                    dred_mark(d, dr);
+                    if (dr->index_count)
+                        gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count),
+                                             dr->ib_first, (int32_t)(dr->vb_byte_offset / 256), 0);
+                    else
+                        gpu_cmd_draw(rc, dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                 }
-                dred_mark(d, dr);
-                if (dr->index_count)
-                    gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count), dr->ib_first,
-                                         (int32_t)(dr->vb_byte_offset / 256), 0);
-                else
-                    gpu_cmd_draw(rc, dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
                   if (zq >= 0)
                       gpu_cmd_query_end(rc, s_zq_pool, (u32)zq); }
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.

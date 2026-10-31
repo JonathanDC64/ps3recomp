@@ -443,6 +443,108 @@ static int fp_inject_uvclamp(char* hlsl, size_t cap)
     return 1;
 }
 
+/* Kind 4: the geometry half in the vertex shader, for a GPU without geometry
+ * shaders (RSX_CLAMP_FORM=vs). The draw is a triangle list of 3 n vertices
+ * with no index buffer (SV_VertexID from 0), and vertex 3t + c is corner c
+ * of triangle t. The shader runs the guest program on all three corners of
+ * its triangle, so every corner hands the pixel shader uvclamp_gs's bounds,
+ * with the same values whichever vertex the GPU takes flat attributes from,
+ * and outputs its own corner as the program did. The pixel half is
+ * fp_inject_uvclamp's, unchanged.
+ *
+ * The corners come from a table the core writes for the draw (t20, b2 its
+ * byte offset): three vertex numbers a triangle. The plain form (kind 0's
+ * program) reads the corners' 16 attributes from t20 too, 256 bytes a vertex
+ * as the input layout has them; b2 with its top bit set is a draw with no
+ * table, whose corners are the vertices from b2's low bits on. The fetch form
+ * (kind 2's) keeps its own fetch: the table starts with the draw's attribute
+ * records' offset (vf_desc), then the triples of guest vertex numbers.
+ * Returns 0, leaving hlsl as it was, if an anchor is missing or the buffer is
+ * too small. */
+static int vs_inject_uvclamp(char* hlsl, size_t cap, int fetch)
+{
+    static const char entry[] = "VSOutput main(VSInput input) {\n";
+    static const char vfd[] = "cbuffer VFDraw : register(b2) { uint vf_desc; };\n";
+    static const char vfd4[] = "cbuffer VFDraw : register(b2) { uint uvc_tab; };\nstatic uint vf_desc;\n";
+    char* m = strstr(hlsl, entry);
+    char* d = fetch ? strstr(hlsl, vfd) : NULL;
+    if (!m || strstr(m + 1, entry) || (fetch && (!d || d > m))) return 0;
+    char tail[8192];
+    int n = 0;
+    if (fetch)
+        n += snprintf(tail + n, sizeof tail - (size_t)n,
+            "VSInput uvc_in(uint i) { VSInput r; r.vid = i; return r; }\n");
+    else {
+        n += snprintf(tail + n, sizeof tail - (size_t)n,
+            "ByteAddressBuffer vf_raw : register(t20);\n"
+            "cbuffer VFDraw : register(b2) { uint uvc_tab; };\n"
+            "VSInput uvc_in(uint i) {\n"
+            "    VSInput r;\n"
+            "    const uint a = i * 256u;\n");
+        for (int k = 0; k < 16; k++)
+            n += snprintf(tail + n, sizeof tail - (size_t)n,
+                "    r.a%d = asfloat(vf_raw.Load4(a + %du));\n", k, k * 16);
+        n += snprintf(tail + n, sizeof tail - (size_t)n, "    return r;\n}\n");
+    }
+    n += snprintf(tail + n, sizeof tail - (size_t)n,
+        "struct UVCOut {\n"
+        "    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1; float4 fog:FOG;\n"
+        "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+        "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+        "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+        "    nointerpolation float4 b0:UVBOUND0; nointerpolation float4 b1:UVBOUND1;\n"
+        "    nointerpolation float4 b2:UVBOUND2; nointerpolation float4 b3:UVBOUND3;\n"
+        "    nointerpolation float4 b4:UVBOUND4; nointerpolation float4 b5:UVBOUND5;\n"
+        "    nointerpolation float4 b6:UVBOUND6; nointerpolation float4 b7:UVBOUND7;\n"
+        "};\n"
+        "float4 uvc_bnd(float2 a, float2 b, float2 c, bool on) {\n"
+        "    return on ? float4(min(min(a, b), c), max(max(a, b), c)) : float4(-1e30, -1e30, 1e30, 1e30);\n"
+        "}\n"
+        "UVCOut main(uint vid : SV_VertexID) {\n"
+        "    const uint t = vid / 3u, c = vid - t * 3u;\n");
+    if (fetch)
+        n += snprintf(tail + n, sizeof tail - (size_t)n,
+            "    vf_desc = vf_raw.Load(uvc_tab);\n"
+            "    const uint ta = uvc_tab + 16u + t * 12u;\n"
+            "    const uint3 ix = uint3(vf_raw.Load(ta), vf_raw.Load(ta + 4u), vf_raw.Load(ta + 8u));\n");
+    else
+        n += snprintf(tail + n, sizeof tail - (size_t)n,
+            "    uint3 ix;\n"
+            "    if (uvc_tab >= 0x80000000u) ix = (uvc_tab - 0x80000000u) + t * 3u + uint3(0u, 1u, 2u);\n"
+            "    else { const uint ta = uvc_tab + t * 12u;\n"
+            "           ix = uint3(vf_raw.Load(ta), vf_raw.Load(ta + 4u), vf_raw.Load(ta + 8u)); }\n");
+    n += snprintf(tail + n, sizeof tail - (size_t)n,
+        "    const VSOutput v0 = vp_main(uvc_in(ix.x));\n"
+        "    const VSOutput v1 = vp_main(uvc_in(ix.y));\n"
+        "    const VSOutput v2 = vp_main(uvc_in(ix.z));\n"
+        "    VSOutput v = v2;\n"
+        "    if (c == 0u) v = v0; else if (c == 1u) v = v1;\n"
+        "    const bool on = v0.pos.w == 1.0 && v1.pos.w == 1.0 && v2.pos.w == 1.0;\n"
+        "    UVCOut o;\n"
+        "    o.pos = v.pos; o.col0 = v.col0; o.col1 = v.col1; o.fog = v.fog;\n"
+        "    o.t0 = v.t0; o.t1 = v.t1; o.t2 = v.t2; o.t3 = v.t3; o.t4 = v.t4;\n"
+        "    o.t5 = v.t5; o.t6 = v.t6; o.t7 = v.t7; o.t8 = v.t8; o.t9 = v.t9;\n"
+        "    o.b0 = uvc_bnd(v0.t0.xy, v1.t0.xy, v2.t0.xy, on); o.b1 = uvc_bnd(v0.t1.xy, v1.t1.xy, v2.t1.xy, on);\n"
+        "    o.b2 = uvc_bnd(v0.t2.xy, v1.t2.xy, v2.t2.xy, on); o.b3 = uvc_bnd(v0.t3.xy, v1.t3.xy, v2.t3.xy, on);\n"
+        "    o.b4 = uvc_bnd(v0.t4.xy, v1.t4.xy, v2.t4.xy, on); o.b5 = uvc_bnd(v0.t5.xy, v1.t5.xy, v2.t5.xy, on);\n"
+        "    o.b6 = uvc_bnd(v0.t6.xy, v1.t6.xy, v2.t6.xy, on); o.b7 = uvc_bnd(v0.t7.xy, v1.t7.xy, v2.t7.xy, on);\n"
+        "    return o;\n"
+        "}\n");
+    if (n <= 0 || (size_t)n >= sizeof tail) return 0;
+    const size_t len = strlen(hlsl), grow = (fetch ? sizeof vfd4 - sizeof vfd : 0) + 3 + (size_t)n;
+    if (len + grow + 1 > cap) return 0;
+    if (fetch) {   /* b2 is the table now; vf_desc is read from it */
+        memmove(d + sizeof vfd4 - 1, d + sizeof vfd - 1, len - (size_t)(d - hlsl) - (sizeof vfd - 1) + 1);
+        memcpy(d, vfd4, sizeof vfd4 - 1);
+        m += sizeof vfd4 - sizeof vfd;
+    }
+    m += 9;   /* "VSOutput " */
+    memmove(m + 3, m, strlen(m) + 1);
+    memcpy(m, "vp_", 3);
+    memcpy(hlsl + strlen(hlsl), tail, (size_t)n + 1);
+    return 1;
+}
+
 /* The HDR variant of a draw (PSO key): a named scene program drawing into T
  * (its clamp limit's float bits), or a draw into an unpromoted target that
  * samples a promoted one (HDRV_SAT and the units). */
@@ -642,10 +744,12 @@ int rsxc_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_
     { const u32 instrs = rsx_vp_program_size_instrs(w, vlen);
       if (instrs) vlen = instrs * 16u; }
     rsx_vp_set_branch_base(vp_start_slot);
-    const int n = fragment == 2 ? rsx_vp_decompile_fetch(w, vlen, out, cap)
-                                : rsx_vp_decompile(w, vlen, out, cap);
+    int n = fragment == 2 || fragment == 5 ? rsx_vp_decompile_fetch(w, vlen, out, cap)
+                                           : rsx_vp_decompile(w, vlen, out, cap);
     rsx_vp_set_branch_base(0);
     free(w);
+    /* 4, 5: kind 0's or 2's with the sprite-edge clamp (vs_inject_uvclamp). */
+    if (fragment >= 4 && n > 0 && !vs_inject_uvclamp(out, cap, fragment == 5)) n = 0;
     return n;
 }
 
@@ -710,6 +814,7 @@ int rsxc_fp_build_hlsl(const u8* ucode, int exp32, u32 cube_mask, u32 d2c_mask,
 }
 int rsxc_fp_baked(void) { return s_fp_baked; }
 int rsxc_fp_inject_uvclamp(char* hlsl, size_t cap) { return fp_inject_uvclamp(hlsl, cap); }
+int rsxc_vs_inject_uvclamp(char* hlsl, size_t cap, int fetch) { return vs_inject_uvclamp(hlsl, cap, fetch); }
 const char* rsxc_uvclamp_gs_hlsl(size_t* len) { return uvclamp_gs_src(len); }
 char* rsxc_fp_out_anchor(char* hlsl, char** end, int want_stmt) { return fp_out_anchor(hlsl, end, want_stmt); }
 int rsxc_fp_set_out(char* hlsl, size_t cap, const char* expr) { return fp_set_out(hlsl, cap, expr); }

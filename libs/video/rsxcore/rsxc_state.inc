@@ -127,6 +127,9 @@ typedef struct {
      * offset of the draw's attribute records in vf_buf's half. fetch is 1
      * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
     u32   fetch, fdesc;
+    /* Step V5: 1 when the pre-pass drew it in the clamp's vertex-shader form
+     * (kind 4): uvc_n vertices from the table at uvc_tab (uvc_table). */
+    u32   uvc, uvc_tab, uvc_n;
     /* The pre-pass's vp_get_fp_pso result, and the render_frame it was made
      * in (s_rf_serial). The VP pass binds it instead of looking the pipeline
      * up a second time (RSX_PSO_IN_REC); a draw the pre-pass skipped keeps an
@@ -228,6 +231,9 @@ typedef struct {
 typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
     gpu_shader vs;          /* the compiled program (step C3b: the GPU layer's; never freed) */
+    gpu_shader vs4;         /* step V5: its clamp form (kind 4), made at its first clamp draw */
+    u8* vs4_code;           /* step V5: a copy of the program's bytes for that (s_uvc_vs); freed once made */
+    u32 vs4_len;
     int uses_c03;
     int fetch;              /* reads vf_buf (rsx_vp_decompile_fetch): no input layout */
     u64 code64;             /* the pipeline index's fingerprint: FNV-1a 64 of the words up to END */
@@ -265,6 +271,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     u32 uvclamp;            /* 1 with the sprite-edge clamp (dr_uvclamp), else 0 (PSO key) */
+    u32 vs4;                /* step V5: built in the clamp's vertex-shader form (kind 4) */
     u32 hdrv;               /* HDR: a scene program's clamp limit (dr_hdrv), float bits, or 0 (PSO key) */
     gpu_pipeline pso;       /* none: this key failed to build; not retried */
     int pending;            /* psj: in this frame's batch, pso not built yet */
@@ -733,5 +740,32 @@ static void rc_acquire(void)
     s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, &img);
     s_rc_have_image = GPU_VALID(img);
     s_d3d.frame_index = rc_be_frame_slot(s_d3d.frame_index, s_rc_image);
+}
+
+/* Step V5: two forms for GPUs that lack a feature, picked once a device is
+ * made (rc_forms_pick, rsxc_init.inc).
+ * The sprite-edge clamp (dr_uvclamp): s_uvc_vs 0 is today's geometry shader
+ * (uvclamp_gs), 1 its vertex-shader form (kind 4, rsxc_vs_inject_uvclamp),
+ * where the draw becomes a list of triangles from a table (uvc_table).
+ * RSX_CLAMP_FORM=gs|vs, by default gs where the device has GPU_CAP_GS.
+ * The depth surfaces: s_rc_d32 0 is today's D24S8, 1 D32S8 (32-bit float
+ * depth). RSX_DEPTH_FORMAT=d24s8|d32s8, by default d24s8 where the device has
+ * GPU_CAP_D24S8. Nothing writes depth back to guest memory; a program that
+ * reads depth as colour gets its 24 bits from rsx_d2c, which rounds the
+ * float it samples to 24 bits either way. */
+static int s_uvc_vs;
+static int s_fp_vs4;      /* vp_get_fp_pso: the pipeline it returned is kind 4's */
+static int s_rc_d32;
+static gpu_format rc_ds_format(void)      /* the depth target and its views */
+{
+    return s_rc_d32 ? GPU_FORMAT_D32_FLOAT_S8X24_UINT : GPU_FORMAT_D24_UNORM_S8_UINT;
+}
+static gpu_format rc_ds_typeless(void)    /* a depth surface that is also sampled */
+{
+    return s_rc_d32 ? GPU_FORMAT_R32G8X24_TYPELESS : GPU_FORMAT_R24G8_TYPELESS;
+}
+static gpu_format rc_ds_depth_srv(void)   /* its depth, sampled */
+{
+    return s_rc_d32 ? GPU_FORMAT_R32_FLOAT_X8X24_TYPELESS : GPU_FORMAT_R24_UNORM_X8_TYPELESS;
 }
 

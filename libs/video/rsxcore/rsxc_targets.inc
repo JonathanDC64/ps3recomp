@@ -894,24 +894,25 @@ static int zeta_get(u32 off, u32 w, u32 h)
     ZetaRT* z = &s_zeta[slot];
     /* The GPU layer's texture (step C5a): typeless R24G8,
      * cleared to depth 1.0 fastest, sampled as depth (the SRV writes). Its
-     * DSVs are D24S8 views, writable and read-only. */
+     * DSVs are D24S8 views, writable and read-only (step V5: R32G8X24 and
+     * D32S8 with RSX_DEPTH_FORMAT=d32s8, rc_ds_typeless). */
     gpu_texture_desc td;
     memset(&td, 0, sizeof td);
     td.width = rt_host_dim(w, h, w); td.height = rt_host_dim(w, h, h);
     td.layers = 1; td.mips = 1;
-    td.format = GPU_FORMAT_R24G8_TYPELESS; td.samples = 1;
+    td.format = rc_ds_typeless(); td.samples = 1;
     td.use = GPU_USE_DS | GPU_USE_SAMPLED;
     td.state = GPU_STATE_DEPTH_WRITE;
-    td.clear_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.clear_format = rc_ds_format();
     td.clear_depth = 1.0f;
     z->tex = gpu_texture_create(s_rc_dev, &td);
     if (!GPU_VALID(z->tex)) return -1;
     z->off = off; z->w = w; z->h = h; z->used = 1;
     z->hw = td.width; z->hh = td.height;
     z->st = GPU_STATE_DEPTH_WRITE;
-    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
+    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, rc_ds_format());
     z->dsv_ro = rc_target_view(z->tex, GPU_VIEW_DSV, GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL,
-                               GPU_FORMAT_D24_UNORM_S8_UINT);
+                               rc_ds_format());
     gpu_cmd_clear_depth(s_rc_cmd, z->dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0, NULL);
     printf("[ZETA] depth surface 0x%08X %ux%u (host %ux%u, slot %d)\n", off, w, h, z->hw, z->hh, slot);
     return slot;

@@ -927,3 +927,28 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   HRESULT and its codes, __declspec(thread), GetFileAttributesExA's size)
 #   in place of <windows.h>, the core's SDL window, and rsxc_display_none.c
 #   for the display's HDR (none known).
+
+# Step V5: the forms for a GPU without geometry shaders or D24S8, picked once
+# a device is made (rc_forms_pick, rsxc_init.inc; s_uvc_vs, s_rc_d32 and
+# rc_ds_* at the end of rsxc_state.inc). With neither (RSX_CLAMP_FORM and
+# RSX_DEPTH_FORMAT unset on a device that has both) every line below does
+# what the legacy line did.
+#  The sprite-edge clamp's vertex-shader form (kind 4, RSX_CLAMP_FORM=vs):
+#   rsxc_shader.c's vs_inject_uvclamp (rsxc_vs_inject_uvclamp, kinds 4 and 5
+#   of rsxc_shader_hlsl) is new, not a copy. rsxc_fp.inc adds uvc_vs4 (a VS
+#   cache slot's kind 4, from the copy of its bytes rsxc_vs.inc keeps in
+#   VPVSEntry.vs4_code) and uvc_table (a draw's table of corners, after the
+#   frame's data in vp_vb or vf_buf). vp_get_fp_pso (rsxc_pipeline.inc)
+#   takes kind 4 and no geometry shader for a clamp draw (VPFPEntry.vs4,
+#   s_fp_vs4); the pipeline index's start build skips its rows with the
+#   clamp. The frame's pre-pass (rsxc_frame.inc) writes the table
+#   (D3D12DrawRecord.uvc, uvc_tab, uvc_n) and the draw loop draws such a draw
+#   as a list from it, t20 on its ring. vp_vb is also a raw buffer then
+#   (rsxc_init.inc, vp_vb_grow in rsxc_writeback.inc).
+#  D32S8 (RSX_DEPTH_FORMAT=d32s8): the depth buffer (depth_buffer_make), the
+#   zeta surfaces (zeta_get), their depth as a texture (rsxc_frame.inc's two
+#   srv_writes) and the pipelines' ds_format (vp_fp_desc, rsxc_cap.inc's
+#   fixed pipelines, pso_prebuild_one) take rc_ds_*.
+#  pso_manifest_add (rsxc_psolib.inc) adds nothing with either form: the
+#   manifest is the d3d12 route's file too, and it never makes those
+#   pipelines.

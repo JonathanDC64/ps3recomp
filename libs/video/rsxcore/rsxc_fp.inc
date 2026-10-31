@@ -455,6 +455,105 @@ static gpu_shader uvclamp_gs(void)
 }
 static int fp_inject_uvclamp(char* hlsl, size_t cap) { return rsxc_fp_inject_uvclamp(hlsl, cap); }
 
+/* Step V5: the geometry half in the vertex shader, for a device without
+ * geometry shaders (s_uvc_vs: RSX_CLAMP_FORM=vs). The vertex shader is VS
+ * cache slot i's program in kind 4 (rsxc_vs_inject_uvclamp), made from the
+ * copy of its bytes at its first clamp draw (the frame's pre-pass) and never
+ * freed; none if it does not build, and the draw then has no clamp, as when
+ * fp_inject_uvclamp fails. */
+static gpu_shader uvc_vs4(int i)
+{
+    if (i < 0 || i >= s_d3d.vp_vs_n) return (gpu_shader){0};
+    VPVSEntry* e = &s_d3d.vp_vs[i];
+    if (GPU_VALID(e->vs4) || !e->vs4_code) return e->vs4;
+    static char hlsl[262144];
+    rsxc_vs_program vp;
+    memset(&vp, 0, sizeof vp);
+    vp.code = e->vs4_code; vp.vlen = e->vs4_len; vp.vstart = e->start * 16u; vp.hash = e->hash;
+    if (rsxc_vs_text(&vp, e->fetch, hlsl, sizeof hlsl, NULL) > 0 &&
+        rsxc_vs_inject_uvclamp(hlsl, sizeof hlsl, e->fetch))
+        e->vs4 = sc_shader(GPU_SC_VS, hlsl, strlen(hlsl), "guest_vp4", NULL, 0);
+    if (!GPU_VALID(e->vs4)) {
+        static int said;
+        if (said < 4 && ++said)
+            printf("[VP] RSX_CLAMP_FORM=vs: slot %d's clamp form did not build%s%s\n", i,
+                   t_sc_msg[0] ? ": " : "", t_sc_msg);
+    }
+    free(e->vs4_code);
+    e->vs4_code = NULL;
+    return e->vs4;
+}
+
+/* Step V5: a kind-4 draw's corners (the table rsxc_vs_inject_uvclamp reads),
+ * after the frame's own data in the ring its vertex shader reads at t20:
+ * vp_vb for a draw of converted vertices, vf_buf for a fetch draw (there
+ * after the draw's attribute records' offset). Three vertex numbers a
+ * triangle, in the order the input assembler gives the geometry shader: a
+ * list's own, and a strip's (fetch 2) triangle i of a run between cuts as
+ * (i, i+1, i+2), or (i, i+2, i+1) for odd i. The indices are read back from
+ * vp_ib, which is write-combined and slow to read, but only for these draws,
+ * a 2D pass's. A draw of converted vertices with no indices needs no table
+ * (b2's top bit). Sets uvc_tab (b2) and uvc_n (vertices to draw); 0 when
+ * the ring has no room (vp_vb grows for the next frame, s_vp_want). */
+static int uvc_table(D3D12DrawRecord* dr)
+{
+    const u32 base = dr->vb_byte_offset / 256u;   /* 256: VP_VERT_STRIDE (rsxc_vertex.inc) */
+    if (!dr->fetch && !dr->index_count) {
+        if (base >= 0x80000000u) return 0;
+        dr->uvc_tab = 0x80000000u | base;
+        dr->uvc_n = dr->vertex_count - dr->vertex_count % 3u;
+        return 1;
+    }
+    if (!s_d3d.vp_ib_mapped) return 0;
+    const u32* ib = (const u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * s_vp_icap + dr->ib_first;
+    const u32 ni = dr->index_count;
+    const u32 head = dr->fetch ? 16u : 0u;   /* the fetch draw's vf_desc, padded */
+    const u64 most = dr->fetch == 2 ? (ni > 2 ? 3ull * (ni - 2) : 0) : ni - ni % 3u;   /* corners */
+    u8* dst;
+    u32 at;
+    if (dr->fetch) {
+        if (!s_d3d.vf_mapped || (u64)s_vf_off + head + most * 4 > s_vf_cap) return 0;
+        at = s_vf_off;
+        dst = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + at;
+    } else {
+        const u64 units = (most * 4 + 255u) / 256u;
+        s_vp_want += units;
+        if ((u64)s_d3d.vp_vb_offset + units * 256u > (u64)s_vp_cap * 256u ||
+            s_d3d.vp_vb_offset >= 0x80000000u)
+            return 0;
+        at = s_d3d.vp_vb_offset;
+        dst = (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * s_vp_cap * 256u + at;
+    }
+    u32* o = (u32*)(dst + head);
+    u32 n = 0;
+    if (dr->fetch == 2) {
+        u32 m = 0, p0 = 0, p1 = 0;
+        for (u32 k = 0; k < ni; k++) {
+            const u32 ix = ib[k];
+            if (ix == 0xFFFFFFFFu) { m = 0; continue; }   /* a cut (vf_strip_native) */
+            if (m >= 2) {
+                const u32 odd = (m - 2) & 1u;
+                o[n] = p0; o[n + 1] = odd ? ix : p1; o[n + 2] = odd ? p1 : ix;
+                n += 3;
+            }
+            p0 = p1; p1 = ix; m++;
+        }
+    } else {
+        const u32 add = dr->fetch ? 0 : base;   /* converted vertices: numbered from the draw's first */
+        n = (u32)most;
+        for (u32 k = 0; k < n; k++) o[k] = ib[k] + add;
+    }
+    if (dr->fetch) {
+        const u32 h[4] = { dr->fdesc, 0, 0, 0 };
+        memcpy(dst, h, sizeof h);
+        s_vf_off += head + n * 4;
+    } else
+        s_d3d.vp_vb_offset += (n * 4 + 255u) / 256u * 256u;
+    dr->uvc_tab = at;
+    dr->uvc_n = n;
+    return 1;
+}
+
 /* RSX_HDR_SCENE_FP (see HDR output): the clamp limit for this program, 0 if it
  * is not named; with fp 0, how many are named. */
 #define HDR_SCENE_MAX 8
