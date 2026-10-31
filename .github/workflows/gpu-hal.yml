@@ -8,9 +8,19 @@
 # WARP, the software adapter, so it needs no GPU. On both, the null backend's test (libs/video/tests/test_gpu_null.c):
 # the backend that records and checks and draws nothing, its operation stream's hash against a golden.
 #
+# On Windows (the null route's system for now), the new path's core (libs/video/rsxcore) runs on that backend over
+# synthetic scenes (libs/video/tests/test_rsx_synth.c): seeded programs and written vertex data, textures and
+# surfaces, played as captures in two processes, each scene's stream hash against its golden. Then every external
+# symbol of the new path's objects has to start with gpu_, rsxc_ or rsx_out_ (.github/scripts/check_hal_symbols.py).
+#
 # The Vulkan backend's test (libs/video/tests/test_gpu_vk.c) is built on both, and runs on Linux on lavapipe, Mesa's
 # CPU device, with the Khronos validation layer on: any message it gives fails the test. Windows runners have no
 # Vulkan device, so there it is only built.
+#
+# Both also build the shader compile service's spv target (PS3RECOMP_RSX_HAL_SPV, on by default with the option:
+# glslang and SPIRV-Tools fetched at their pins) and run its test (libs/video/tests/test_gpu_sc_spv.c): the seeded
+# generator's programs and the built-in passes compile, validate, bind where the Vulkan backend's layout says, and
+# compile to the same bytes twice; the edits match their goldens; the cache round trip holds.
 #
 # windows.yml and linux.yml build the runtime with the option off, today's build.
 name: GPU layer
@@ -59,6 +69,34 @@ jobs:
       - name: Run the null backend's test
         run: ctest --test-dir build -R gpu_null --output-on-failure
 
+      - name: Build the spv target's test
+        run: cmake --build build --target test_gpu_sc_spv
+
+      - name: Run the spv target's test
+        run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
+
+      - name: Build the synthetic scenes' test
+        run: cmake --build build --target test_rsx_synth
+
+      # The new path's core on the null route over synthetic scenes, in two processes: each scene's stream hash
+      # against its golden, with no failed check (libs/video/tests/test_rsx_synth.c).
+      - name: Run the core on the synthetic scenes (null route)
+        run: ctest --test-dir build -R rsx_synth --output-on-failure
+
+      # On a failure: both children's logs, the first one's stream dump (dump.txt) and the scenes' captures.
+      - name: Keep the synthetic scenes' output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-synth-windows
+          path: build/test_rsx_synth.out/
+          if-no-files-found: ignore
+
+      # Every external symbol of the new path's objects starts with gpu_, rsxc_ or rsx_out_ (the script lists
+      # what else it allows, and why).
+      - name: Check the new path's symbols
+        run: python .github/scripts/check_hal_symbols.py build
+
   linux:
     name: Linux x64 (HAL on, ${{ matrix.compiler }})
     runs-on: ubuntu-latest
@@ -92,6 +130,13 @@ jobs:
 
       - name: Run the null backend's test
         run: ctest --test-dir build -R gpu_null --output-on-failure
+
+
+      - name: Build the spv target's test
+        run: cmake --build build --target test_gpu_sc_spv
+
+      - name: Run the spv target's test
+        run: ctest --test-dir build -R gpu_sc_spv --output-on-failure
 
   vulkan:
     name: Linux x64 Vulkan on lavapipe (${{ matrix.compiler }}, validation on)
