@@ -354,20 +354,18 @@ int rsx_out_backend_init(uint32_t width, uint32_t height, const char* title)
 /* ---- step VM ---- */
 /* The overlay v2 (rsx_out.h): the route's own calls on the new path, none
  * on d3d12. */
-#if defined(_WIN32)
 static const rsx_route_gpu* route_gpu(void)
 {
     const rsx_route* const t = route_table();
+#if defined(_WIN32)
     if (t == &rsxc_route_d3d12) return &rsxc_route_gpu_d3d12;
+#endif
     if (t == &rsxc_route_null) return &rsxc_route_gpu_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
     if (t == &rsxc_route_vk) return &rsxc_route_gpu_vk;
 #endif
     return NULL;
 }
-#else
-static const rsx_route_gpu* route_gpu(void) { (void)route_hal(); return NULL; }
-#endif
 
 void rsx_out_set_overlay_gpu(const rsx_out_overlay_gpu* overlay)
 {

@@ -206,6 +206,8 @@ typedef struct rsx_route_gpu {
 } rsx_route_gpu;
 #if defined(_WIN32)
 extern const rsx_route_gpu rsxc_route_gpu_d3d12;
+#endif
+#if defined(_WIN32) || defined(__linux__)
 extern const rsx_route_gpu rsxc_route_gpu_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern const rsx_route_gpu rsxc_route_gpu_vk;
