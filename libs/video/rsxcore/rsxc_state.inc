@@ -723,9 +723,15 @@ static void rc_overlay_frame(u32 fi);
  * the driver may make more images and hands them out in any order. */
 static u32 s_rc_image;    /* the image the last acquire gave */
 static u32 s_rc_swap_n;   /* the swap chain's images (swap_buffers_get) */
+/* Step VC2: the acquire gave an image. Always on D3D12; Vulkan gives none
+ * while the window is minimized or its surface is lost, and blit_to_window
+ * draws into nothing then (an image not acquired is not the core's). */
+static int s_rc_have_image;
 static void rc_acquire(void)
 {
-    s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
+    gpu_texture img;
+    s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, &img);
+    s_rc_have_image = GPU_VALID(img);
     s_d3d.frame_index = rc_be_frame_slot(s_d3d.frame_index, s_rc_image);
 }
 

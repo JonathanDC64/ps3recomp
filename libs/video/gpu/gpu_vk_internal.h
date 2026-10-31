@@ -411,6 +411,20 @@ typedef struct gpu_vk_swap {
     uint32_t         waited, signalled;
     uint64_t         present_id, done_id;
     int64_t          done_qpc;
+    /* Step VC2: the window's surface lost (made again at the next acquire),
+     * and given up on (it could not be: GPU_PRESENT_SURFACE_LOST). */
+    uint32_t         surface_lost, surface_dead;
+    /* Step VC2: intervals 2-4 held by present_wait (present_gate). The
+     * display's refresh period and a vblank it was seen at, in now_ticks
+     * units (0: not known); when the last present was queued; a wait that
+     * timed out (the window is not shown: no gate until a present is seen);
+     * the gate's waits and the ticks they took (test hooks). chain_id0: the
+     * last present id before this swap chain was made (ids up to it were
+     * another's, and no wait may name them). */
+    int64_t          period, vblank, queued_at;
+    uint64_t         chain_id0;
+    uint32_t         gate_miss, gate_n;
+    int64_t          gate_ticks;
 } gpu_vk_swap;
 
 enum { GPU_VK_DEFER_BUFFER = 0, GPU_VK_DEFER_TEXTURE = 1 };
@@ -564,6 +578,14 @@ typedef struct gpu_vk_device {
 
     /* Test hooks: descriptors the table writes wrote, validation messages. */
     volatile uint32_t          n_srv_writes, n_sampler_writes, n_validation;
+
+    /* Step VC2: lost by hand (gpu_vk_lose_by_hand), not by the driver. The
+     * pipelines made, those the pipeline cache had, and the driver's time
+     * for them (creation feedback, ns), under pso_lock: PS3_PSO_LOG=1 prints
+     * them when the device goes. */
+    volatile uint32_t          lost_by_hand;
+    uint32_t                   pso_made, pso_hits;
+    uint64_t                   pso_ns;
 } gpu_vk_device;
 
 #define GPU_VK_DEV(d) ((gpu_vk_device*)(void*)(d))
@@ -665,6 +687,15 @@ void          gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* 
                                       uint32_t* nwait, VkSemaphoreSubmitInfo* sig, uint32_t* nsig);
 /* The instance extensions a surface needs here (NULL-terminated). */
 const char* const* gpu_vk_surface_extensions(void);
+
+/* ---- step VC2 ---- */
+/* A present's VkResult as gpu.h's GPU_PRESENT_* (out of date and suboptimal
+ * are GPU_PRESENTED: the swap chain is made again). */
+int           gpu_vk_present_code(VkResult r);
+/* The device noted lost as a driver reset leaves it, without the driver
+ * saying so (RSX_LOSE_DEVICE_AT_FRAME, the tests): the fault report then
+ * asks the driver nothing (device_fault is for a device the driver lost). */
+void          gpu_vk_lose_by_hand(gpu_vk_device* dd);
 
 #ifdef __cplusplus
 }

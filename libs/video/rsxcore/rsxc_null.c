@@ -61,6 +61,8 @@ static void rc_be_lose_device(gpu_device* d, int frames)
     fprintf(stderr, "[null] RSX_LOSE_DEVICE_AT_FRAME: losing the device at frame %d%c", frames, 10);
     gpu_null_test_lose(d, 0x887A0005u);   /* (the number a removed D3D12 device gives) */
 }
+/* No surface to lose (step VC2). */
+static const u32 rc_be_surface_lost = 0;
 
 /* The menu's renderer has nothing to draw with here. */
 static void* rc_be_device(gpu_device* d) { (void)d; return NULL; }
@@ -70,6 +72,7 @@ static void* rc_be_image(gpu_device* d, gpu_texture t) { (void)d; (void)t; retur
 /* No shader cache: none of its files (rsxc_shadercache.inc). */
 static const int rc_be_cache_files = 0;
 static const char rc_be_lib_dir[] = "null";   /* (never used: no pipeline library) */
+static const char* rc_be_lib_file(gpu_device* d) { (void)d; return "pipelines.lib"; }   /* (nor this) */
 static int rc_be_cache_put(gpu_sc_stage stage, const char* hlsl) { (void)stage; (void)hlsl; return 0; }
 
 /* A shader's "code": K as 8 bytes, little-endian, then the entry point's

@@ -814,7 +814,8 @@ typedef struct gpu_device_desc {
     /* Image index, the texture swap_acquire hands back with that index (none past the count): \
      * for making every image's view up front. Valid until the next swap_resize or swap_destroy. */ \
     X(swap_image,        R, gpu_texture,    (gpu_device* d, gpu_swapchain sc, uint32_t index), (d, sc, index)) \
-    /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). 0 on success. */ \
+    /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). GPU_PRESENTED (0) on \
+     * success, else a GPU_PRESENT_* code (step VC2, at the end). */ \
     X(swap_present,      R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags), (d, sc, interval, flags)) \
     /* 0 with *out filled; else nonzero (no statistics yet). Vulkan has them with \
      * GPU_CAP_PRESENT_WAIT: the last present seen on the display, sync_qpc when it was seen, \
@@ -897,4 +898,30 @@ gpu_texture gpu_d3d12_texture_on(gpu_device* d, void* resource, gpu_texture_desc
 #ifdef __cplusplus
 }
 #endif
+
+/* ---- step VC2 ---- */
+/* A lost device and a present that failed, with one meaning on every
+ * backend (each maps its API's results to these):
+ *   - lost: 0 while the device works. Once it is lost (a driver reset, the
+ *     GPU gone), never 0 again: the API's own code for why, which the caller
+ *     names (rsxcore's rc_be_lost_text): D3D12's GetDeviceRemovedReason
+ *     HRESULT, Vulkan's VkResult (VK_ERROR_DEVICE_LOST) as a uint32_t. A
+ *     lost device's fences read UINT64_MAX, so fence_wait returns 0 at once.
+ *   - fence_wait: 0 once the GPU has passed the fence or the device is lost,
+ *     1 after the timeout or any other failure of the wait (never "passed"
+ *     unless it is).
+ *   - swap_present: GPU_PRESENTED when the image went to the display queue,
+ *     a swap chain the window no longer fits included (Vulkan's out of date
+ *     and suboptimal: the backend makes it again at the next acquire);
+ *     GPU_PRESENT_LOST when the device is lost (lost says why);
+ *     GPU_PRESENT_SURFACE_LOST when the window's surface is gone and could
+ *     not be made again (the device still works; nothing reaches this
+ *     window again: Vulkan's VK_ERROR_SURFACE_LOST_KHR); GPU_PRESENT_FAILED
+ *     for anything else (no image acquired, out of memory). */
+enum {
+    GPU_PRESENTED            = 0,
+    GPU_PRESENT_LOST         = 1,
+    GPU_PRESENT_SURFACE_LOST = 2,
+    GPU_PRESENT_FAILED       = 3
+};
 #endif /* PS3RECOMP_GPU_H */

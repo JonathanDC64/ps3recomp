@@ -13,11 +13,11 @@
  *     cached under <cache>/gpu/spv/ by the service. The post-passes the
  *     device cannot run are left out (rc_vk_spv_options);
  *   - none of today's cache files: no .dxbc, fp_variants.txt,
- *     pso_index_seen.tsv, pso_manifest.bin or pipeline library is read or
+ *     pso_index_seen.tsv, pso_manifest.bin or pso_library.bin is read or
  *     written (rc_be_cache_files 0, as on null). Their records are D3D12
- *     descriptions, and the manifest is shared with the d3d12 route. So
- *     there is no pipeline library yet: every pipeline is compiled on its
- *     first use in a run (the driver's own disk cache takes most of that);
+ *     descriptions, and the manifest is shared with the d3d12 route. The
+ *     pipeline library is a VkPipelineCache file of its own, by driver
+ *     (rc_be_lib_file, step VC2), with no manifest to build ahead from;
  *   - a frame slot is not a swap chain image (rc_be_frame_slot): the driver
  *     may make more images than FRAME_COUNT and hands them out in any order,
  *     so the slot (recorders, fences, display targets, the blit's tables)
@@ -91,16 +91,24 @@ static const char* rc_be_lost_text(u32 reason)
     case VK_ERROR_DEVICE_LOST: return "the GPU stopped responding or its driver was reset (VK_ERROR_DEVICE_LOST)";
     case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "the GPU ran out of memory (VK_ERROR_OUT_OF_DEVICE_MEMORY)";
     case VK_ERROR_OUT_OF_HOST_MEMORY: return "the system ran out of memory (VK_ERROR_OUT_OF_HOST_MEMORY)";
+    case VK_ERROR_SURFACE_LOST_KHR:
+        return "the window's surface was lost and could not be made again (VK_ERROR_SURFACE_LOST_KHR)";
     default: return "an unknown reason";
     }
 }
 
+/* Step VC2: the reason check_device's line and the host's report give when
+ * the window's surface is lost for good (gpu.h's GPU_PRESENT_SURFACE_LOST):
+ * the device works on, but nothing reaches the window again. */
+static const u32 rc_be_surface_lost = (u32)VK_ERROR_SURFACE_LOST_KHR;
+
 /* RSX_LOSE_DEVICE_AT_FRAME: Vulkan cannot remove its device on purpose, so
- * the backend notes it lost, as a driver reset would leave it. */
+ * the backend notes it lost, as a driver reset would leave it (by hand,
+ * step VC2: the fault report asks the driver nothing then). */
 static void rc_be_lose_device(gpu_device* d, int frames)
 {
     fprintf(stderr, "[VK] RSX_LOSE_DEVICE_AT_FRAME: noting the device lost at frame %d%c", frames, 10);
-    gpu_vk_lost_note(GPU_VK_DEV(d), VK_ERROR_DEVICE_LOST);
+    gpu_vk_lose_by_hand(GPU_VK_DEV(d));
 }
 
 /* The menu's renderer (D3D12's, until it is ported) has nothing to draw with
@@ -112,7 +120,30 @@ static void* rc_be_image(gpu_device* d, gpu_texture t) { (void)d; (void)t; retur
 /* None of today's cache files (rsxc_shadercache.inc; the file's comment
  * says why). The spv target keeps its own, in <cache>/gpu/spv/. */
 static const int rc_be_cache_files = 0;
-static const char rc_be_lib_dir[] = "vulkan";   /* (never used: no pipeline library yet) */
+
+/* Step VC2: the pipeline library is the device's VkPipelineCache
+ * (rsxc_psolib.inc, the backend's gpu_pipeline_cache_load/_save), in
+ * <cache>/gpu/vulkan/<vendor>_<device>_<driver>_<uuid>.vkpc: one file per
+ * driver and GPU, so another driver's is never offered to this one (the
+ * file's own header and Vulkan's are checked as well). Loaded at the start,
+ * saved where the d3d12 route saves pipelines.lib: after a burst of new
+ * pipelines has settled, and at shutdown. No manifest and no startup build:
+ * the cache alone. */
+static const char rc_be_lib_dir[] = "vulkan";
+static const char* rc_be_lib_file(gpu_device* d)
+{
+    static char name[96];
+    if (!name[0]) {
+        gpu_adapter_info ai;
+        memset(&ai, 0, sizeof ai);
+        gpu_adapter(d, &ai);
+        int n = snprintf(name, sizeof name, "%04x_%04x_%08x_", ai.vendor, ai.device, (unsigned)ai.driver_version);
+        for (int i = 0; i < 16 && n > 0 && n + 2 < (int)sizeof name; i++)
+            n += snprintf(name + n, sizeof name - (size_t)n, "%02x", ai.uuid[i]);
+        snprintf(name + n, sizeof name - (size_t)n, ".vkpc");
+    }
+    return name;
+}
 
 /* The shaders: the compile service's spv target. A compile (sc_compile)
  * places the text's resources where the layout puts them (NULL: the guest

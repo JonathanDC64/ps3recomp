@@ -158,6 +158,9 @@ static int init_d3d12(u32 width, u32 height)
         sd.flags = s_d3d.tearing ? GPU_SWAP_TEARING : 0;
         s_rc_swap = gpu_swap_create(s_rc_dev, &sd);
         if (!GPU_VALID(s_rc_swap)) return -1;
+        /* Step VC2: read again, as Vulkan knows only from the window's
+         * surface whether it has the IMMEDIATE mode (the same on D3D12). */
+        s_d3d.tearing = (s_rc_dev->caps.bits & GPU_CAP_TEARING) ? 1 : 0;
     }
 
     rc_acquire();   /* (step VC1: the image, and the slot it falls in) */

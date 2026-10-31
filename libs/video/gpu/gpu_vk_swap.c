@@ -9,7 +9,9 @@
  * Presenting: interval 0 is IMMEDIATE (tearing; RSX_VSYNC=0), 1 or more is
  * FIFO (RSX_VSYNC=1); never MAILBOX. With swapchain_maintenance1 the mode
  * changes per present; without it the swap chain is made again at the next
- * acquire. Statistics come from present_id and present_wait.
+ * acquire. Statistics come from present_id and present_wait. Intervals 2
+ * to 4 (RSX_VSYNC=2-4) hold the frame before that many refreshes, as DXGI's
+ * sync interval does, with present_wait (present_gate, step VC2).
  *
  * The semaphores: an acquire's semaphore is waited for by the first submit
  * with GPU_SUBMIT_ACQUIRE_WAIT; the present's own empty submit (after every
@@ -62,6 +64,102 @@ static int64_t now_ticks(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 #endif
+}
+
+/* ---- step VC2 ---- */
+static int64_t ticks_per_s(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return (int64_t)f.QuadPart;
+#else
+    return 1000000000ll;
+#endif
+}
+
+/* The refresh period of the display the window is on, in now_ticks units;
+ * 0 when the system does not say. Whole hertz, as the display mode has it
+ * (59.94 Hz reads 59): close enough for present_gate, which aims a quarter
+ * of a refresh before a vblank. */
+static int64_t refresh_ticks(void* window)
+{
+    int hz = 0;
+#ifdef _WIN32
+    MONITORINFOEXA mi;
+    DEVMODEA dm;
+    memset(&mi, 0, sizeof mi);
+    memset(&dm, 0, sizeof dm);
+    mi.cbSize = sizeof mi;
+    dm.dmSize = sizeof dm;
+    const HMONITOR m = MonitorFromWindow((HWND)window, MONITOR_DEFAULTTONEAREST);
+    if (m && GetMonitorInfoA(m, (MONITORINFO*)&mi) && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+        hz = (int)dm.dmDisplayFrequency;
+#else
+    SDL_DisplayMode dm;
+    const int i = SDL_GetWindowDisplayIndex((SDL_Window*)window);
+    if (i >= 0 && SDL_GetCurrentDisplayMode(i, &dm) == 0) hz = dm.refresh_rate;
+#endif
+    return hz >= 20 && hz <= 1000 ? ticks_per_s() / hz : 0;
+}
+
+/* Until now_ticks reaches t: sleeps, then yields for the last millisecond. */
+static void wait_until(int64_t t)
+{
+    const int64_t ms = ticks_per_s() / 1000;
+    for (;;) {
+        const int64_t left = t - now_ticks();
+        if (left <= 0) return;
+#ifdef _WIN32
+        if (left > 2 * ms) Sleep((DWORD)(left / ms - 1));
+        else SwitchToThread();
+#else
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = left > 2 * ms ? (long)(left - ms) : 0;
+        nanosleep(&ts, NULL);
+#endif
+    }
+}
+
+/* Interval n (2 to 4) before a FIFO present: the frame before stays on the
+ * display n refreshes, as DXGI's sync interval n holds it. The last
+ * present's time on the display comes from present_wait: waited for here,
+ * it is now; if it was up already, the first vblank on the grid of those
+ * seen at or after its present. This present is then queued n refreshes
+ * less a quarter after it, so FIFO shows it at the n-th vblank (a display
+ * with a variable refresh shows it at once: the frame before stayed n less
+ * a quarter). A window the compositor does not show never says: after one
+ * wait that timed out the gate is off until a present is seen again. Costs
+ * nothing below interval 2; at 2-4, one vkWaitForPresentKHR and the wait it
+ * is for. */
+static void present_gate(gpu_vk_device* dd, gpu_vk_swap* s, uint32_t n)
+{
+    if (!(dd->base.caps.bits & GPU_CAP_PRESENT_WAIT) || s->present_id <= s->chain_id0 || !s->period || !s->sc)
+        return;
+    const int64_t p = s->period, t0 = now_ticks();
+    const uint64_t ns = (uint64_t)((n + 2) * p) * 1000000000ull / (uint64_t)ticks_per_s();
+    const VkResult r = dd->vk.vkWaitForPresentKHR(dd->device, s->sc, s->present_id, s->gate_miss ? 0 : ns);
+    const int64_t t1 = now_ticks();
+    if (r != VK_SUCCESS) {
+        if (r == VK_TIMEOUT) s->gate_miss = 1;
+        else gpu_vk_lost_note(dd, r);
+        return;
+    }
+    s->gate_miss = 0;
+    int64_t shown = t1;
+    if (t1 - t0 > p / 16) {
+        s->vblank = t1;   /* (waited for: it went up just now) */
+    } else if (s->vblank && s->queued_at > s->vblank) {
+        const int64_t k = (s->queued_at - s->vblank + p - 1) / p;
+        shown = s->vblank + k * p;
+        if (shown > t1) shown = t1;
+    }
+    s->done_id = s->present_id;
+    s->done_qpc = shown;
+    wait_until(shown + (int64_t)n * p - p / 4);
+    s->gate_n++;
+    s->gate_ticks += now_ticks() - t0;
 }
 
 static VkFormat vkfmt_of(gpu_format f)
@@ -167,7 +265,12 @@ static void chain_drop(gpu_vk_device* dd, gpu_vk_swap* s)
 static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
 {
     VkSurfaceCapabilitiesKHR caps;
-    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dd->phys, s->surface, &caps) != VK_SUCCESS) return -1;
+    const VkResult capr = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dd->phys, s->surface, &caps);
+    if (capr != VK_SUCCESS) {
+        if (capr == VK_ERROR_SURFACE_LOST_KHR) s->surface_lost = 1;   /* (step VC2: surface_again) */
+        gpu_vk_lost_note(dd, capr);
+        return -1;
+    }
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
         ext.width = s->width < caps.minImageExtent.width ? caps.minImageExtent.width : s->width;
@@ -240,6 +343,7 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     if (s->sc) dd->vk.vkDestroySwapchainKHR(dd->device, s->sc, NULL);   /* (retired either way) */
     s->sc = VK_NULL_HANDLE;
     if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_SURFACE_LOST_KHR) s->surface_lost = 1;
         gpu_vk_lost_note(dd, r);
         return -1;
     }
@@ -283,6 +387,9 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     s->waited = s->signalled = 0;
     s->recreate = 0;
     if (!s->has_immediate) dd->base.caps.bits &= ~(uint32_t)GPU_CAP_TEARING;
+    s->period = refresh_ticks(s->window);   /* (step VC2: present_gate; a new chain, maybe a new display) */
+    s->vblank = 0;
+    s->chain_id0 = s->present_id;
     return 0;
 }
 
@@ -295,28 +402,61 @@ static int chain_again(gpu_vk_device* dd, gpu_vk_swap* s)
     return chain_make(dd, s);
 }
 
-gpu_swapchain gpu_vk_swap_create(gpu_device* d, const gpu_swapchain_desc* desc)
+/* The window's surface, one the queue can present to; none on failure. */
+static VkSurfaceKHR surface_make(gpu_vk_device* dd, void* window)
 {
-    gpu_vk_device* const dd = GPU_VK_DEV(d);
-    gpu_swapchain r = {0};
-    const VkFormat vkfmt = vkfmt_of(desc->format);
-    if (!dd->has_surface || !desc->window || !vkfmt) return r;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
 #ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR wi;
     memset(&wi, 0, sizeof wi);
     wi.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
     wi.hinstance = GetModuleHandleA(NULL);
-    wi.hwnd = (HWND)desc->window;
-    if (vkCreateWin32SurfaceKHR(dd->instance, &wi, NULL, &surface) != VK_SUCCESS) return r;
+    wi.hwnd = (HWND)window;
+    if (vkCreateWin32SurfaceKHR(dd->instance, &wi, NULL, &surface) != VK_SUCCESS) return VK_NULL_HANDLE;
 #else
-    if (!SDL_Vulkan_CreateSurface((SDL_Window*)desc->window, dd->instance, &surface)) return r;
+    if (!SDL_Vulkan_CreateSurface((SDL_Window*)window, dd->instance, &surface)) return VK_NULL_HANDLE;
 #endif
     VkBool32 ok = VK_FALSE;
     if (vkGetPhysicalDeviceSurfaceSupportKHR(dd->phys, dd->qfamily, surface, &ok) != VK_SUCCESS || !ok) {
         vkDestroySurfaceKHR(dd->instance, surface, NULL);
-        return r;
+        return VK_NULL_HANDLE;
     }
+    return surface;
+}
+
+/* Step VC2: the window's surface was lost (VK_ERROR_SURFACE_LOST_KHR): a
+ * new one from the same window, and a swap chain on it. 0 when made; -1 when
+ * not yet (a minimized window has no images), and then the next acquire
+ * tries again. When the surface or its swap chain cannot be made, the swap
+ * chain gives up: no image, and GPU_PRESENT_SURFACE_LOST from every present. */
+static int surface_again(gpu_vk_device* dd, gpu_vk_swap* s)
+{
+    dd->vk.vkDeviceWaitIdle(dd->device);
+    presents_wait(dd, s);
+    chain_drop(dd, s);
+    if (s->sc) dd->vk.vkDestroySwapchainKHR(dd->device, s->sc, NULL);   /* (before its surface) */
+    s->sc = VK_NULL_HANDLE;
+    if (s->surface) vkDestroySurfaceKHR(dd->instance, s->surface, NULL);
+    s->surface = surface_make(dd, s->window);
+    s->surface_lost = 0;
+    if (s->surface && chain_make(dd, s) == 0) {
+        printf("[VK] the window's surface was lost; made again\n");
+        return 0;
+    }
+    if (s->surface && !s->surface_lost) return -1;
+    s->surface_dead = 1;
+    printf("[VK] the window's surface was lost and cannot be made again: nothing more is shown in it\n");
+    return -1;
+}
+
+gpu_swapchain gpu_vk_swap_create(gpu_device* d, const gpu_swapchain_desc* desc)
+{
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    gpu_swapchain r = {0};
+    const VkFormat vkfmt = vkfmt_of(desc->format);
+    if (!dd->has_surface || !desc->window || !vkfmt) return r;
+    const VkSurfaceKHR surface = surface_make(dd, desc->window);
+    if (!surface) return r;
     gpu_vk_lock(&dd->lock);
     r.id = gpu_vk_slot_alloc(&dd->swap_slots);
     gpu_vk_unlock(&dd->lock);
@@ -385,7 +525,9 @@ uint32_t gpu_vk_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image
         if (image) *image = s->image[s->current];
         return (uint32_t)s->current;
     }
-    if (s->recreate || !s->sc) chain_again(dd, s);
+    if (s->surface_dead) return 0;   /* (step VC2: surface_again) */
+    if (!s->surface_lost && (s->recreate || !s->sc)) chain_again(dd, s);
+    if (s->surface_lost) surface_again(dd, s);
     for (int tries = 0; s->sc && tries < 2; tries++) {
         const VkSemaphore sem = s->acquire_sem[s->next_sem - 1];
         uint32_t idx = 0;
@@ -402,11 +544,15 @@ uint32_t gpu_vk_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image
             if (image) *image = s->image[idx];
             return idx;
         }
+        if (r == VK_ERROR_SURFACE_LOST_KHR) {
+            surface_again(dd, s);
+            continue;
+        }
         if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             gpu_vk_lost_note(dd, r);
             return 0;
         }
-        chain_again(dd, s);
+        if (chain_again(dd, s) && s->surface_lost) surface_again(dd, s);
     }
     return 0;
 }
@@ -447,18 +593,25 @@ void gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* how, VkSe
     (void)nsig;
 }
 
-/* 0 on success (out of date and suboptimal too: the next acquire makes it
- * again), else the VkResult. */
+/* gpu.h's codes (step VC2): GPU_PRESENTED (out of date and suboptimal too:
+ * the next acquire makes it again); GPU_PRESENT_LOST on a lost device;
+ * GPU_PRESENT_SURFACE_LOST once the window's surface cannot be made again
+ * (one lost is made again here, and this frame is GPU_PRESENT_FAILED);
+ * GPU_PRESENT_FAILED with no image acquired or another failure. */
 int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     gpu_vk_swap* const s = swap_of(dd, sc);
     (void)flags;
-    if (!s || s->current < 0 || !s->sc) return -1;
+    if (!s) return GPU_PRESENT_FAILED;
+    if (s->surface_dead) return GPU_PRESENT_SURFACE_LOST;
+    if (dd->lost) return GPU_PRESENT_LOST;
+    if (s->current < 0 || !s->sc) return GPU_PRESENT_FAILED;
     const uint32_t idx = (uint32_t)s->current;
     const int imm = interval == 0 && s->has_immediate && (dd->base.caps.bits & GPU_CAP_TEARING);
     VkPresentModeKHR mode = imm ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
     s->want_immediate = (uint32_t)imm;
+    if (interval >= 2) present_gate(dd, s, interval > 4 ? 4u : interval);   /* (step VC2: RSX_VSYNC=2-4) */
     if (s->fence_pending[idx]) {
         dd->vk.vkWaitForFences(dd->device, 1, &s->present_fence[idx], VK_TRUE, 2000000000ull);
         s->fence_pending[idx] = 0;
@@ -527,14 +680,35 @@ int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint
     }
     const VkResult r = dd->vk.vkQueuePresentKHR(dd->queue, &pi);
     gpu_vk_unlock(&dd->qlock);
+    s->queued_at = now_ticks();
     s->current = -1;
-    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) {
+    const int code = gpu_vk_present_code(r);
+    if (code == GPU_PRESENTED) {
         if (s->present_fence[idx]) s->fence_pending[idx] = 1;
         if (r != VK_SUCCESS) s->recreate = 1;
-        return 0;
+        return GPU_PRESENTED;
     }
     gpu_vk_lost_note(dd, r);
-    return (int)r;
+    if (code == GPU_PRESENT_SURFACE_LOST) {
+        s->surface_lost = 1;
+        return surface_again(dd, s) == 0 || !s->surface_dead ? GPU_PRESENT_FAILED : GPU_PRESENT_SURFACE_LOST;
+    }
+    return code;
+}
+
+/* ---- step VC2 ---- */
+/* What a present's (or an acquire's) VkResult means, as gpu.h's codes. */
+int gpu_vk_present_code(VkResult r)
+{
+    switch (r) {
+    case VK_SUCCESS:
+    case VK_SUBOPTIMAL_KHR:
+    case VK_ERROR_OUT_OF_DATE_KHR:   /* (made again at the next acquire) */
+        return GPU_PRESENTED;
+    case VK_ERROR_DEVICE_LOST:      return GPU_PRESENT_LOST;
+    case VK_ERROR_SURFACE_LOST_KHR: return GPU_PRESENT_SURFACE_LOST;
+    default:                        return GPU_PRESENT_FAILED;
+    }
 }
 
 /* present_wait: the newest present that reached the display, and when this
@@ -545,7 +719,7 @@ int gpu_vk_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out)
     gpu_vk_swap* const s = swap_of(dd, sc);
     if (!s || !s->sc || !(dd->base.caps.bits & GPU_CAP_PRESENT_WAIT) || !s->present_id) return 1;
     gpu_vk_lock(&dd->qlock);
-    for (uint64_t id = s->present_id; id > s->done_id && id + 4 > s->present_id; id--) {
+    for (uint64_t id = s->present_id; id > s->done_id && id > s->chain_id0 && id + 4 > s->present_id; id--) {
         const VkResult r = dd->vk.vkWaitForPresentKHR(dd->device, s->sc, id, 0);
         if (r == VK_SUCCESS) {
             s->done_id = id;

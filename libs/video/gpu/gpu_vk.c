@@ -1678,9 +1678,10 @@ static int vkb_fence_wait(gpu_device* d, gpu_fence f, uint32_t timeout_ms)
     wi.pValues = &f;
     const VkResult r = dd->vk.vkWaitSemaphores(dd->device, &wi, (uint64_t)timeout_ms * 1000000ull);
     if (r == VK_SUCCESS) return 0;
-    if (r == VK_TIMEOUT) return dd->lost ? 0 : 1;
-    gpu_vk_lost_note(dd, r);
-    return 0;
+    /* (step VC2, gpu.h: "passed" only when it has, or the device is lost;
+     * a wait that failed otherwise, out of memory, reads as a timeout) */
+    if (r != VK_TIMEOUT) gpu_vk_lost_note(dd, r);
+    return dd->lost ? 0 : 1;
 }
 
 static void vkb_wait_idle(gpu_device* d)
@@ -1753,7 +1754,9 @@ static void vkb_fault_report(gpu_device* d, const char* where)
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     if (!dd->lost || dd->fault_done || gpu_vk_cas32(&dd->fault_done, 1, 0) != 0) return;
     fprintf(stderr, "[VK] device lost at %s (VkResult %d)\n", where ? where : "?", (int)(int32_t)dd->lost);
-    if (dd->has_fault && dd->vk.vkGetDeviceFaultInfoEXT) {
+    if (dd->lost_by_hand)   /* (step VC2: the driver would say it works) */
+        fprintf(stderr, "[VK] fault: not asked (the device was noted lost by hand, not by the driver)\n");
+    else if (dd->has_fault && dd->vk.vkGetDeviceFaultInfoEXT) {
         VkDeviceFaultCountsEXT fc;
         memset(&fc, 0, sizeof fc);
         fc.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
@@ -1884,6 +1887,14 @@ gpu_device* gpu_vk_create(const gpu_device_desc* desc)
         return NULL;
     }
     return &dd->base;
+}
+
+/* ---- step VC2 ---- */
+void gpu_vk_lose_by_hand(gpu_vk_device* dd)
+{
+    if (dd->lost) return;   /* (lost already: by the driver, whose fault report stands) */
+    dd->lost_by_hand = 1;
+    gpu_vk_lost_note(dd, VK_ERROR_DEVICE_LOST);
 }
 
 #endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN */
