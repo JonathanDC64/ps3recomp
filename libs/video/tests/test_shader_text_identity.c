@@ -17,6 +17,9 @@
  *    the HDR variants, _key (and gpu_sc_key) for every text, and
  *    _program_hash64 and _fp_variants for every program; some calls get a
  *    buffer just too small, so the failure paths are compared too;
+ *  - kinds 4 and 5, the copy's own clamp form of a vertex program (no export
+ *    has them), for every 16th vertex program: kind 0's or 2's text with
+ *    only its renames, then the clamp's entry point, and FXC compiles it;
  *  - the draw path's vertex text (rsxc_vs_locate / rsxc_vs_text, from an
  *    rsx_state) must be the export's text, key and fingerprint, with
  *    VP_W_ONE, VP_BYPASS and VP_START_OFF acting as in vp_get_vs_mode; the
@@ -220,6 +223,64 @@ static void compare_fp_program(Rng* r, const u8* uc, u32 len, u32 index)
 
 static rsx_state g_st;
 
+/* Kinds 4 and 5, the new path's own (no export has them): kind 0's and 2's
+ * text with main renamed (and, in the fetch form, b2 renamed to the table
+ * with vf_desc a static), then the clamp's entry point; FXC must take it. */
+static unsigned long long g_clamp_ok, g_clamp_compiled, g_clamp_spv;
+static void clamp_vs_check(const u8* be, u32 len, u32 slot, u32 index)
+{
+    static const char vfd[] = "cbuffer VFDraw : register(b2) { uint vf_desc; };\n";
+    static const char vfd4[] = "cbuffer VFDraw : register(b2) { uint uvc_tab; };\nstatic uint vf_desc;\n";
+    for (int fetch = 0; fetch <= 1; fetch++) {
+        snprintf(g_ctx, sizeof g_ctx, "vp %u kind %d", index, 4 + fetch);
+        A[0] = 0; B[0] = 0;
+        const int n0 = rsxc_shader_hlsl(fetch ? 2 : 0, be, len, slot, 0, 0, 0, A, CAP);
+        const int n4 = rsxc_shader_hlsl(4 + fetch, be, len, slot, 0, 0, 0, B, CAP);
+        check_int("clamp form result", n4, n0);
+        if (n0 <= 0 || n4 <= 0) continue;
+        /* The expected head: A with the two renames. */
+        static char want[CAP];
+        const char* m = strstr(A, "VSOutput main(VSInput input) {\n");
+        const char* d = fetch ? strstr(A, vfd) : NULL;
+        if (!m || (fetch && !d)) { fail_at("clamp form anchors", NULL, NULL); continue; }
+        size_t w = 0;
+        const char* from = A;
+        if (fetch) {
+            memcpy(want + w, from, (size_t)(d - from)); w += (size_t)(d - from);
+            memcpy(want + w, vfd4, sizeof vfd4 - 1); w += sizeof vfd4 - 1;
+            from = d + sizeof vfd - 1;
+        }
+        memcpy(want + w, from, (size_t)(m - from) + 9); w += (size_t)(m - from) + 9;
+        memcpy(want + w, "vp_", 3); w += 3;
+        strcpy(want + w, m + 9);
+        w += strlen(m + 9);
+        check_int("clamp form head", strncmp(B, want, w) == 0, 1);
+        check_int("clamp form entry", strstr(B + w, "UVCOut main(uint vid : SV_VertexID) {") != NULL, 1);
+        g_clamp_ok++;
+        ID3DBlob* code = NULL;
+        ID3DBlob* err = NULL;
+        const HRESULT hr = D3DCompile(B, strlen(B), "kind4", NULL, NULL, "main", "vs_5_0", 0, 0, &code, &err);
+        check_int("clamp form compiles", SUCCEEDED(hr), 1);
+        if (FAILED(hr) && err && g_fail <= 12)
+            printf("  %.400s\n", (const char*)err->lpVtbl->GetBufferPointer(err));
+        if (SUCCEEDED(hr)) g_clamp_compiled++;
+        if (code) code->lpVtbl->Release(code);
+        if (err) err->lpVtbl->Release(err);
+#if defined(PS3RECOMP_RSX_HAL_SPV)
+        /* The spv target takes it too, with its edits (E1-E4), for the
+         * guest programs' layout; without the cache. */
+        gpu_sc_blob blob;
+        char msg[512] = "";
+        const int rs = gpu_sc_compile(GPU_SC_SPV, GPU_SC_VS, B, strlen(B), "kind4", GPU_SC_NO_CACHE, &blob,
+                                      msg, sizeof msg);
+        check_int("clamp form compiles to spv", rs, GPU_SC_OK);
+        if (rs != GPU_SC_OK && g_fail <= 12) printf("  %.400s\n", msg);
+        if (rs == GPU_SC_OK) g_clamp_spv++;
+        gpu_sc_blob_release(&blob);
+#endif
+    }
+}
+
 static void compare_vp_program(Rng* r, u32 index)
 {
     static u32 w[4 * 200];
@@ -242,8 +303,9 @@ static void compare_vp_program(Rng* r, u32 index)
             }
         }
     }
+    if ((index % 16) == 0) clamp_vs_check(be, len, base, index);
     snprintf(g_ctx, sizeof g_ctx, "vp %u hash", index);
-    check_int("program_hash64 vp", (long long)rsx_d3d12_program_hash64(0, be, len), (long long)rsxc_program_hash64(0, be, len));
+    check_int("program_hash64 vp",(long long)rsx_d3d12_program_hash64(0, be, len), (long long)rsxc_program_hash64(0, be, len));
     check_int("program_hash64 vp, odd length", (long long)rsx_d3d12_program_hash64(0, be, len - 3),
               (long long)rsxc_program_hash64(0, be, len - 3));
     check_int("program_hash64 vp as fp", (long long)rsx_d3d12_program_hash64(1, be, len), (long long)rsxc_program_hash64(1, be, len));
@@ -671,6 +733,8 @@ int main(int argc, char** argv)
            "%llu HDR variants (%llu changed), %.1f s\n",
            g_fp_calls, g_vp_calls, g_texts, g_kind_ok[0], g_kind_ok[1], g_kind_ok[2], g_kind_ok[3],
            g_hdr_texts, g_hdr_changed, (GetTickCount() - t0) / 1000.0);
+    printf("clamp forms (kinds 4, 5): %llu texts, %llu compiled, %llu to spv\n", g_clamp_ok, g_clamp_compiled,
+           g_clamp_spv);
 
     memo_test(seed);
     cache_test(da, db);
