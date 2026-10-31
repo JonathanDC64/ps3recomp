@@ -6,11 +6,13 @@
  * from RSX_BACKEND; until then nothing of either renderer has run. On the
  * d3d12 route each rsx_out_X calls rsx_d3d12_X; on hal-d3d12, null and
  * vulkan it calls the new path's table for that backend, rsxc_route_d3d12,
- * rsxc_route_null or rsxc_route_vk (Windows only for now; vulkan in builds
- * with PS3RECOMP_RSX_HAL_VULKAN).
+ * rsxc_route_null or rsxc_route_vk (vulkan in builds with
+ * PS3RECOMP_RSX_HAL_VULKAN). hal-d3d12 is Windows' only; off Windows the
+ * build is vkd3d's, which CMakeLists.txt allows on Linux only, where the core
+ * builds null and vulkan too.
  *
  * Step V6: a Vulkan start that fails runs today's renderer instead (the
- * section "Vulkan's start" below says when and how).
+ * section "Vulkan's start" below says when and how), on both systems.
  */
 #if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D))
 
@@ -34,6 +36,8 @@ void rsx_prof_title(const char* note);
 #define RSX_OUT_CAS(p, old, val) _InterlockedCompareExchange((p), (val), (old))
 #else
 #define RSX_OUT_CAS(p, old, val) __sync_val_compare_and_swap((p), (old), (val))
+/* (as Windows spells it, for the section "Vulkan's start") */
+#define InterlockedExchange(p, val) __atomic_exchange_n((p), (val), __ATOMIC_SEQ_CST)
 #endif
 
 enum { ROUTE_NONE, ROUTE_D3D12, ROUTE_HAL_D3D12, ROUTE_NULL, ROUTE_VULKAN };
@@ -44,7 +48,7 @@ static volatile long s_route;   /* ROUTE_*: none until the first call */
 static const char* volatile s_why;
 static char s_why_text[160];
 
-#if defined(_WIN32) && defined(PS3RECOMP_RSX_HAL_VULKAN)
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
 static int mark_left(void);   /* Vulkan's start, below */
 #endif
 
@@ -73,16 +77,12 @@ static long route_pick(void)
 #if defined(_WIN32)
         want = ROUTE_HAL_D3D12;
 #else
-        other = 1;   /* the new path off Windows is Vulkan, later */
+        other = 1;   /* (the new path off Windows is null and Vulkan) */
 #endif
     } else if (same_name(e, "null")) {
-#if defined(_WIN32)
         want = ROUTE_NULL;   /* (developers and CI only: never in Settings) */
-#else
-        other = 1;
-#endif
     } else if (same_name(e, "vulkan")) {
-#if defined(_WIN32) && defined(PS3RECOMP_RSX_HAL_VULKAN)
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
         want = ROUTE_VULKAN;   /* (Settings > Display > Renderer in the port) */
         if (mark_left()) {     /* (step V6: the last Vulkan start never finished) */
             want = ROUTE_D3D12;
@@ -134,7 +134,6 @@ const char* rsx_out_renderer_info(const char** why)
     return route_name(r);
 }
 
-#if defined(_WIN32)
 /* The new path's table on hal-d3d12, null and vulkan, NULL on d3d12. One
  * load and up to three compares once the route is picked. */
 static const rsx_route* route_table(void)
@@ -144,7 +143,11 @@ static const rsx_route* route_table(void)
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
     if (r == ROUTE_VULKAN) return &rsxc_route_vk;
 #endif
+#if defined(_WIN32)
     return r == ROUTE_HAL_D3D12 ? &rsxc_route_d3d12 : r == ROUTE_NULL ? &rsxc_route_null : NULL;
+#else
+    return r == ROUTE_NULL ? &rsxc_route_null : NULL;
+#endif
 }
 
 const char* rsx_out_renderer(void)
@@ -157,28 +160,8 @@ const char* rsx_out_renderer(void)
     void rsx_out_##name params { const rsx_route* const t_ = route_table(); if (t_) t_->name args; else legacy args; }
 #define RSX_OUT_R_(ret, name, legacy, params, args) \
     ret rsx_out_##name params { const rsx_route* const t_ = route_table(); return t_ ? t_->name args : legacy args; }
-#else
-/* Nonzero on hal-d3d12 (never here). One load and a compare once the route is picked. */
-static int route_hal(void)
-{
-    long r = s_route;
-    if (r == ROUTE_NONE) r = route_pick();
-    return r == ROUTE_HAL_D3D12;
-}
 
-const char* rsx_out_renderer(void)
-{
-    return route_hal() ? "hal-d3d12" : "d3d12";
-}
-
-/* No new path in this build yet: every call is today's renderer's. */
-#define RSX_OUT_V_(name, legacy, params, args) \
-    void rsx_out_##name params { (void)route_hal(); legacy args; }
-#define RSX_OUT_R_(ret, name, legacy, params, args) \
-    ret rsx_out_##name params { (void)route_hal(); return legacy args; }
-#endif
-
-#if defined(_WIN32) && defined(PS3RECOMP_RSX_HAL_VULKAN)
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
 /* Step V6: three of the functions are written out in the section below (the
  * Vulkan start, and what today's renderer needs again if it falls back).
  * The table makes them under these names, file-local, for those to call. */
@@ -190,7 +173,7 @@ static void rsx_out_plain_pso_index_game(const char* game);
 #define rsx_out_pso_index_game rsx_out_plain_pso_index_game
 #endif
 RSX_OUT_FUNCS(RSX_OUT_V_, RSX_OUT_R_)
-#if defined(_WIN32) && defined(PS3RECOMP_RSX_HAL_VULKAN)
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
 #undef rsx_out_backend_init
 #undef rsx_out_set_overlay
 #undef rsx_out_pso_index_game
@@ -214,7 +197,10 @@ RSX_OUT_FUNCS(RSX_OUT_V_, RSX_OUT_R_)
  *     d3d12 (route_pick's line), and any start not on Vulkan removes it, so
  *     the next one tries Vulkan again. A process that never starts the
  *     renderer leaves it. Without RSX_STATE_DIR (test runs) there is no mark.
+ * On Linux the same, with the file calls POSIX's (RSX_STATE_DIR is a path
+ * as the system takes it) and today's renderer the one on vkd3d.
  * -------------------------------------------------------------------------*/
+#if defined(_WIN32)
 #include <windows.h>
 
 /* RSX_STATE_DIR/renderer_starting (RSX_STATE_DIR in UTF-8): 1 with its path
@@ -255,6 +241,47 @@ static void mark_take(void)
     wchar_t p[MAX_PATH + 32];
     if (mark_path(p, MAX_PATH + 32)) DeleteFileW(p);
 }
+#else
+#include <errno.h>
+#include <unistd.h>
+
+/* RSX_STATE_DIR/renderer_starting: 1 with its path in p, 0 without the knob
+ * (or a path too long). */
+static int mark_path(char* p, size_t cap)
+{
+    const char* d = getenv("RSX_STATE_DIR");
+    if (!d || !*d) return 0;
+    const int n = snprintf(p, cap, "%s/renderer_starting", d);
+    return n > 0 && (size_t)n < cap;
+}
+
+static int mark_left(void)
+{
+    char p[4096];
+    return mark_path(p, sizeof p) && access(p, F_OK) == 0;
+}
+
+/* 1 once the mark is written. */
+static int mark_put(void)
+{
+    static const char text[] = "A Vulkan start is under way; the renderer removes this file at its first frame.\n";
+    char p[4096];
+    if (!mark_path(p, sizeof p)) return 0;
+    FILE* f = fopen(p, "wb");
+    if (!f) {
+        printf("[rsx_out] could not write the start mark in RSX_STATE_DIR (error %d)\n", errno);
+        return 0;
+    }
+    const int ok = fwrite(text, 1, sizeof text - 1, f) == sizeof text - 1;
+    return fclose(f) == 0 && ok;
+}
+
+static void mark_take(void)
+{
+    char p[4096];
+    if (mark_path(p, sizeof p)) unlink(p);
+}
+#endif
 
 static volatile long s_marked;   /* 1 while this process's mark is there */
 
@@ -322,6 +349,6 @@ int rsx_out_backend_init(uint32_t width, uint32_t height, const char* title)
     if (s_pre_game[0]) rsx_d3d12_pso_index_game(s_pre_game);
     return rsx_d3d12_backend_init(width, height, title);
 }
-#endif /* _WIN32 && PS3RECOMP_RSX_HAL_VULKAN */
+#endif /* PS3RECOMP_RSX_HAL_VULKAN */
 
 #endif /* PS3RECOMP_RSX_HAL && (_WIN32 || PS3RECOMP_RSX_D3D12_VKD3D) */
