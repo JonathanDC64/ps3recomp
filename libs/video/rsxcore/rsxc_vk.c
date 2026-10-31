@@ -70,13 +70,29 @@ static void rc_vk_spv_options(gpu_device* d)
     gpu_sc_spv_set_options(opts);
 }
 
-/* The device, once the spv target is there to give it shaders. */
+/* Step V6: the start's steps (rsxc_init.inc). */
+static int start_step(const char* step, int ok);
+
+/* The device, once the spv target is there to give it shaders. Step V6: the
+ * start's steps it tells apart: shaders (no spv target), loader (no Vulkan
+ * 1.3 library), and instance, adapter and features only when
+ * RSX_FAIL_START_AT names them (the backend's own line says which failed,
+ * and init_d3d12 calls any other failure to make the device "device"). */
 static gpu_device* rc_be_create(const gpu_device_desc* dd)
 {
     if (!gpu_sc_available(GPU_SC_SPV)) {
+        start_step("shaders", 0);
         printf("[VK] this build has no SPIR-V compiler (PS3RECOMP_RSX_HAL_SPV): no Vulkan renderer\n");
         return NULL;
     }
+    if (volkInitialize() != VK_SUCCESS || volkGetInstanceVersion() < VK_API_VERSION_1_3) {
+        start_step("loader", 0);
+        printf("[VK] no Vulkan 1.3 library: no Vulkan renderer\n");
+        return NULL;
+    }
+    if (!start_step("loader", 1) || !start_step("instance", 1) || !start_step("adapter", 1) ||
+        !start_step("features", 1))
+        return NULL;
     gpu_device* const d = gpu_vk_create(dd);
     if (d) rc_vk_spv_options(d);
     return d;
@@ -84,6 +100,10 @@ static gpu_device* rc_be_create(const gpu_device_desc* dd)
 
 /* A window to present into. */
 static const int rc_be_headless = 0;
+
+/* Step V6: a frame buffer that cannot be made fails the start (init_d3d12),
+ * and the route switch then starts today's renderer instead (rsx_out.c). */
+static const int rc_be_start_strict = 1;
 
 /* RSX_VK_BREADCRUMBS=1: the draws' markers as checkpoints (NVIDIA's
  * diagnostic checkpoints) and the device fault's report, which
@@ -188,11 +208,19 @@ static int rc_be_pso_unrecord(const rc_be_pso_desc* rec, u32 nel, gpu_pipeline_d
     return 0;
 }
 
-/* After each present: counted, for the frame slot. */
+/* After each present: counted, for the frame slot. Step V6: the first ends
+ * the start for the route switch, which takes its start mark away
+ * (rsx_out.c; the route is Windows' only for now). */
 static u32 s_rc_vk_presents, s_rc_vk_slot_presents;
+#if defined(_WIN32)
+void rsx_out_route_presented(void);   /* rsx_out.h */
+#endif
 static void rc_be_presented(gpu_device* d)
 {
     (void)d;
+#if defined(_WIN32)
+    if (!s_rc_vk_presents) rsx_out_route_presented();
+#endif
     s_rc_vk_presents++;
 }
 
@@ -223,5 +251,9 @@ const rsx_route rsxc_route_vk = {
 };
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
+
+/* Step V6: the step the last failed start stopped at (rsxc_init.inc's
+ * start_step), NULL after none. */
+const char* rsxc_vk_start_failed(void) { return s_rc_start_failed; }
 
 #endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && (_WIN32 || __linux__) */

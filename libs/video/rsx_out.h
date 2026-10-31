@@ -14,8 +14,8 @@
  *              against gpu.h and hashed. For developers and CI only, never
  *              in Settings (rsxc_null.c says what it prints).
  *   vulkan     the new path on its Vulkan backend (gpu_vk*.c, Windows only
- *              for now, in builds with PS3RECOMP_RSX_HAL_VULKAN), for
- *              developers' A/Bs until it is in Settings (rsxc_vk.c).
+ *              for now, in builds with PS3RECOMP_RSX_HAL_VULKAN): the
+ *              port's Settings > Display > Renderer (rsxc_vk.c).
  * Anything else (metal, auto, a typo, vulkan in a build without it) is not
  * in this build and runs d3d12. The pick prints one line, on every route:
  *   [rsx_out] route d3d12
@@ -23,6 +23,12 @@
  *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
  *   [rsx_out] route vulkan (the new path on its Vulkan backend)
  *   [rsx_out] route d3d12 (RSX_BACKEND=metal is not in this build)
+ * Step V6: a Vulkan start that fails, or that did not finish last time,
+ * runs d3d12 instead and says why in a line of its own (rsx_out.c,
+ * "Vulkan's start"):
+ *   [rsx_out] route d3d12 (Vulkan failed to start: no Vulkan 1.3 driver (loader); this start uses D3D12)
+ *   [rsx_out] route d3d12 (RSX_BACKEND=vulkan, but the last start on Vulkan did not finish, ...)
+ * The second needs RSX_STATE_DIR: a folder of the host's for the start mark.
  *
  * The functions are rsx_d3d12_backend.h's, with the same parameters and
  * meaning (see there), plus the profile sessions (rsx_prof_*, boot_main's
@@ -101,6 +107,13 @@ RSX_OUT_FUNCS(RSX_OUT_DECL_V_, RSX_OUT_DECL_R_)
  * no call has. */
 const char* rsx_out_renderer(void);
 
+/* Step V6: the same, without picking one: NULL while no call has (a process
+ * that never used the renderer, such as a host's crash dialog). *why, when
+ * why is not NULL: NULL, or why the route is d3d12 although RSX_BACKEND
+ * asked for another, in plain words for a report ("Vulkan failed to start:
+ * the window's swap chain could not be made (swap chain)"). */
+const char* rsx_out_renderer_info(const char** why);
+
 /* A renderer other than today's, as a table of the functions above. The
  * new path's core defines one per backend it is compiled for:
  * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows),
@@ -120,6 +133,11 @@ extern const rsx_route rsxc_route_d3d12;
 extern const rsx_route rsxc_route_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern const rsx_route rsxc_route_vk;   /* rsxc_vk.c */
+/* Step V6: the step a failed Vulkan start stopped at (rsxc_vk.c), NULL;
+ * and the route's first present (rsxc_vk.c calls it): its start is done,
+ * and its start mark goes (rsx_out.c). */
+const char* rsxc_vk_start_failed(void);
+void rsx_out_route_presented(void);
 #endif
 #endif
 

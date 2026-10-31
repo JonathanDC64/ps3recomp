@@ -44,6 +44,10 @@ static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_d3d12_cr
 /* A window to present into (rc_backend_init): 0, today's window. */
 static const int rc_be_headless = 0;
 
+/* Step V6: a frame buffer that cannot be made does not fail the start (as
+ * today's; init_d3d12). */
+static const int rc_be_start_strict = 0;
+
 /* D3D12_DRED=1: Device Removed Extended Data, the device's breadcrumbs
  * (auto-breadcrumbs, page faults and the draws' markers, which
  * gpu_fault_report prints once the device is lost). rc_be_lost_hint ends

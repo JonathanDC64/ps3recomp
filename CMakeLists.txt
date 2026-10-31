@@ -766,6 +766,23 @@ if(PS3RECOMP_RSX_HAL AND WIN32)
     )
     set_target_properties(test_rsx_synth PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME rsx_synth COMMAND test_rsx_synth)
+
+    # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the Vulkan start's fallback to today's renderer
+    # and its start mark), built here against stand-ins for both renderers: libs/video/tests/test_rsx_out.c. No GPU,
+    # no window, and the Vulkan route's code whether or not this build has it. Built on demand:
+    #   cmake --build build --target test_rsx_out
+    #   ctest --test-dir build -R rsx_out
+    add_executable(test_rsx_out EXCLUDE_FROM_ALL
+        libs/video/tests/test_rsx_out.c
+        libs/video/rsx_out.c
+    )
+    target_compile_definitions(test_rsx_out PRIVATE
+        PS3RECOMP_RSX_HAL=1 PS3RECOMP_RSX_HAL_VULKAN=1 _CRT_SECURE_NO_WARNINGS)
+    target_include_directories(test_rsx_out PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME rsx_out COMMAND test_rsx_out)
 endif()
 
 # Setup's shader pass (libs/video/rsx_shader_precompile.c) over a game's
