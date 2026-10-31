@@ -44,10 +44,8 @@
  * renderer's window after the present of each frame named (frames count on
  * across captures, from 0): min (minimized, not activated), restore and show
  * (shown at its last size, not activated), hide, size=<w>x<h> (that client
- * size), border=1|0 (borderless on or off), look (the share of the
- * window's pixels that are not black, as the compositor shows them: a
- * picture got there). Each step prints a line, and the last line counts
- * them:
+ * size), border=1|0 (borderless on or off). Each step prints a line, and the
+ * last line counts them:
  *   [replay] window at frame 4: min (client 0x0, minimized 1, visible 1)
  *   [replay] window: 6 steps, 0 not understood
  */
@@ -122,49 +120,15 @@ static void ov_frame(void* user, struct gpu_cmd* c, uint32_t target, uint32_t fo
 }
 #define rsx_d3d12_hwnd           rsx_out_hwnd
 #define rsx_d3d12_set_borderless rsx_out_set_borderless
+#define rsx_d3d12_borderless     rsx_out_borderless
 #else
 int   rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 void  rsx_d3d12_backend_present(void);
 int   rsx_d3d12_backend_pump_messages(void);
 void* rsx_d3d12_hwnd(void);
 void  rsx_d3d12_set_borderless(int on);
+int   rsx_d3d12_borderless(void);
 #endif
-
-/* RSX_REPLAY_WINDOW's look: the share of the window's client pixels, as
- * the compositor has them (PrintWindow), that are not black; -1 when it
- * cannot say. */
-static int window_lit(HWND w, LONG cw, LONG ch)
-{
-    if (cw <= 0 || ch <= 0) return -1;
-    HDC wdc = GetDC(w);
-    HDC dc = CreateCompatibleDC(wdc);
-    BITMAPINFO bi;
-    memset(&bi, 0, sizeof bi);
-    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-    bi.bmiHeader.biWidth = cw;
-    bi.bmiHeader.biHeight = -ch;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    void* bits = NULL;
-    HBITMAP bm = CreateDIBSection(wdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    int lit = -1;
-    if (dc && bm && bits) {
-        HGDIOBJ old = SelectObject(dc, bm);
-        if (PrintWindow(w, dc, 1 | 2)) {   /* (PW_CLIENTONLY | PW_RENDERFULLCONTENT) */
-            GdiFlush();
-            const uint8_t* px = (const uint8_t*)bits;
-            long long n = 0;
-            for (long long i = 0; i < (long long)cw * ch; i++)
-                if (px[4 * i] > 16 || px[4 * i + 1] > 16 || px[4 * i + 2] > 16) n++;
-            lit = (int)(n * 100 / ((long long)cw * ch));
-        }
-        SelectObject(dc, old);
-    }
-    if (bm) DeleteObject(bm);
-    if (dc) DeleteDC(dc);
-    ReleaseDC(w, wdc);
-    return lit;
-}
 
 /* RSX_REPLAY_WINDOW: the steps after frame `frame`'s present (see the top). */
 static const char* s_win_steps;
@@ -185,10 +149,8 @@ static void window_steps(int frame)
         char* x = NULL;
         const unsigned long sw = len > 5 && !strncmp(step, "size=", 5) ? strtoul(step + 5, &x, 10) : 0;
         const unsigned long sh = sw && x && *x == 'x' ? strtoul(x + 1, NULL, 10) : 0;
-        int ok = w != NULL, look = 0;
+        int ok = w != NULL;
         if (!ok) {
-        } else if (len == 4 && !strncmp(step, "look", 4)) {
-            look = 1;
         } else if (len == 3 && !strncmp(step, "min", 3)) {
             ShowWindow(w, SW_SHOWMINNOACTIVE);
         } else if ((len == 7 && !strncmp(step, "restore", 7)) || (len == 4 && !strncmp(step, "show", 4))) {
@@ -200,20 +162,20 @@ static void window_steps(int frame)
             AdjustWindowRectEx(&r, (DWORD)GetWindowLongA(w, GWL_STYLE), FALSE, (DWORD)GetWindowLongA(w, GWL_EXSTYLE));
             SetWindowPos(w, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         } else if (len == 8 && (!strncmp(step, "border=1", 8) || !strncmp(step, "border=0", 8))) {
-            rsx_d3d12_set_borderless(step[7] == '1');
-            /* (posted to the window's thread: a message sent after it is
-             * handled after it) */
-            SendMessageA(w, WM_NULL, 0, 0);
+            /* (posted to the window's thread, which says it is done once
+             * the window has its new place: 2 s at most) */
+            const int on = step[7] == '1';
+            rsx_d3d12_set_borderless(on);
+            for (int t = 0; t < 2000 && rsx_d3d12_borderless() != on; t++) Sleep(1);
+            ok = rsx_d3d12_borderless() == on;
         } else {
             ok = 0;
         }
         RECT cr = {0, 0, 0, 0};
         if (w) GetClientRect(w, &cr);
-        char lit[32] = "";
-        if (look) snprintf(lit, sizeof lit, ", lit %d%%", window_lit(w, cr.right - cr.left, cr.bottom - cr.top));
-        printf("[replay] window at frame %d: %.*s%s (client %ldx%ld, minimized %d, visible %d%s)\n", frame, (int)len,
+        printf("[replay] window at frame %d: %.*s%s (client %ldx%ld, minimized %d, visible %d)\n", frame, (int)len,
                step, ok ? "" : " (not understood)", cr.right - cr.left, cr.bottom - cr.top, w && IsIconic(w) ? 1 : 0,
-               w && IsWindowVisible(w) ? 1 : 0, lit);
+               w && IsWindowVisible(w) ? 1 : 0);
         if (ok) s_win_done++;
         else s_win_bad++;
     }
