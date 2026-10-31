@@ -39,6 +39,9 @@
  * device destroyed, which the null backend checks (its last line counts
  * the failed checks; GPU_NULL_DUMP's file ends with the stream's hash).
  *   [replay] shutdown: done
+ * It also saves the new path's pipeline stores and prints its "pipelines
+ * this run" line. RSX_REPLAY_INDEX=<rows file> hands the renderer pipeline
+ * index rows to build (below).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -113,6 +116,35 @@ int main(int argc, char** argv)
     if (rsx_d3d12_backend_init(1280, 720, "rsx_replay") != 0) {
         fprintf(stderr, "rsx_replay: backend init failed\n"); return 1;
     }
+#if defined(PS3RECOMP_RSX_HAL)
+    /* RSX_REPLAY_INDEX=<file>: pipeline index rows for the renderer to build,
+     * as setup's pass hands them over, from the rows file precompile_compare
+     * --rows writes ("add <vfetch> <vs key> <clamp> <ps key> <blend> <nrt>
+     * <rtfmt> <cmask> <cull> <depth>", then "ready <hash>"). With
+     * PS3_PSO_WAIT=1 and RSX_REPLAY_SHUTDOWN=1 the build runs to its end. */
+    { char ip[MAX_PATH] = "";
+      const DWORD il = GetEnvironmentVariableA("RSX_REPLAY_INDEX", ip, sizeof ip);
+      FILE* fi = il && il < sizeof ip ? fopen(ip, "rb") : NULL;
+      if (il && !fi) { fprintf(stderr, "rsx_replay: cannot read %s\n", ip); return 1; }
+      if (fi) {
+          char line[256];
+          unsigned rows = 0, ready = 0;
+          unsigned long long hash = 0;
+          while (fgets(line, sizeof line, fi)) {
+              int fetch, clamp, nrt;
+              unsigned long long vk, pk;
+              unsigned blend, rtfmt, cmask, cull, depth;
+              if (sscanf(line, "add %d %llx %d %llx %x %d %x %x %x %x", &fetch, &vk, &clamp, &pk, &blend, &nrt,
+                         &rtfmt, &cmask, &cull, &depth) == 10) {
+                  rsx_out_pso_index_add(fetch, vk, clamp, pk, blend, nrt, rtfmt, cmask, cull, depth);
+                  rows++;
+              } else if (sscanf(line, "ready %llx", &hash) == 1) ready = 1;
+          }
+          fclose(fi);
+          rsx_out_pso_index_ready(ready ? hash : 0);
+          printf("[replay] pipeline index: %u rows handed over from %s\n", rows, ip);
+      } }
+#endif
     LARGE_INTEGER f, t0, t1;
     QueryPerformanceFrequency(&f);
     char tv[16] = "";
