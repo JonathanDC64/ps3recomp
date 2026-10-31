@@ -25,7 +25,8 @@ on:
         default: macos-15
 
 concurrency:
-  group: macos-${{ github.event.pull_request.number || github.ref }}
+  # the runner too, so manual runs on both images can run side by side
+  group: macos-${{ github.event.pull_request.number || github.ref }}-${{ inputs.runner }}
   cancel-in-progress: true
 
 jobs:
