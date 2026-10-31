@@ -6,6 +6,7 @@
 #include "ps3emu/ps3_knob.h"
 #include "sys_event.h"
 #include "../memory/vm.h"
+#include "../platform/plat.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
@@ -15,34 +16,25 @@
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
-#ifdef _WIN32
-static LARGE_INTEGER s_qpc_freq;
-static int           s_qpc_init = 0;
-
-static void ensure_qpc_init(void)
-{
-    if (!s_qpc_init) {
-        QueryPerformanceFrequency(&s_qpc_freq);
-        s_qpc_init = 1;
-    }
-}
-
 int64_t lv2_usec_deadline(uint64_t usec)
 {
-    LARGE_INTEGER now;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&now);
-    return now.QuadPart +
-        (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+    const uint64_t q = (uint64_t)plat_clock_freq();
+    return plat_clock_now() + (int64_t)((usec * q) / 1000000ULL);
 }
 
 int lv2_deadline_passed(int64_t deadline)
 {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return now.QuadPart >= deadline;
+    return plat_clock_now() >= deadline;
 }
-#endif
+
+/* ---------------------------------------------------------------------------
+ * The guest clocks below have one origin rule on every platform: each counts
+ * from its own first reading, as both always have on Windows. A PS3 title
+ * starts seconds after the console boots, so it sees small values; counting
+ * from the host's boot, as Linux and macOS did, gave it days of uptime, and
+ * a title that keeps system time in 32 bits of microseconds wraps 71 minutes
+ * into that.
+ * -----------------------------------------------------------------------*/
 
 /* ---------------------------------------------------------------------------
  * PPU timebase (mftb/mftbu) -- THE guest clock.
@@ -52,26 +44,16 @@ int lv2_deadline_passed(int64_t deadline)
  * static that advanced 16667 ticks PER READ -- not a clock at all: every
  * guest timing loop (media pacers, throttles, profilers) computed garbage
  * from it, and each call site had a PRIVATE counter that only moved when
- * polled. Overflow-safe split multiply (rem < qpf, so
- * rem * 79.8e6 < ~8e14 << 2^63).
+ * polled. Overflow-safe split multiply (rem < freq, so rem * 79.8e6 stays
+ * under 2^63 for any clock up to 100 GHz).
  * -----------------------------------------------------------------------*/
 uint64_t ppu_timebase_now(void)
 {
-#ifdef _WIN32
-    static LONGLONG t0 = 0;
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
-    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
-           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
-#endif
+    static int64_t t0 = 0;
+    const uint64_t q = (uint64_t)plat_clock_freq();
+    const int64_t now = plat_clock_now();
+    if (!t0) t0 = now;   /* benign race: same anchor either way */
+    return plat_ticks_scale((uint64_t)(now - t0), q, PS3_TIMEBASE_FREQ);
 }
 
 /* ---------------------------------------------------------------------------
@@ -80,30 +62,20 @@ uint64_t ppu_timebase_now(void)
  * sys_time_get_system_time (runtime/ppu/ppu_sysprx.cpp) returns this, and so
  * does every guest-visible timestamp that is meant to be compared with it:
  * cellGcmGetLastFlipTime on hardware is the system time of the last flip.
- * On Windows it counts from the first call, as sys_time_get_system_time
- * always has; the compare-exchange keeps two first callers on one origin.
- * Elsewhere it is CLOCK_MONOTONIC, also as before.
+ * It counts from the first call, as sys_time_get_system_time always has on
+ * Windows; the compare-exchange keeps two first callers on one origin.
  * -----------------------------------------------------------------------*/
 uint64_t lv2_system_time_usec(void)
 {
-#ifdef _WIN32
-    static volatile LONGLONG s_origin = 0;
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    LONGLONG origin = s_origin;
+    static volatile int64_t s_origin = 0;
+    const uint64_t q = (uint64_t)plat_clock_freq();
+    const int64_t now = plat_clock_now();
+    int64_t origin = s_origin;
     if (!origin) {
-        LONGLONG prev = InterlockedCompareExchange64(&s_origin, now.QuadPart, 0);
-        origin = prev ? prev : now.QuadPart;
+        int64_t prev = plat_atomic_cas64(&s_origin, now, 0);
+        origin = prev ? prev : now;
     }
-    uint64_t d = (uint64_t)(now.QuadPart - origin);
-    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    return (d / q) * 1000000ull + (d % q) * 1000000ull / q;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-#endif
+    return plat_ticks_scale((uint64_t)(now - origin), q, 1000000ull);
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -151,8 +123,7 @@ static uint64_t usleep_yield_us(void)
 }
 
 /* Such a yield waits in place, as RPCS3's does. USLEEP_SHORT_SWITCH=1 is the
- * old behaviour: it hands the core to another ready thread (SwitchToThread on
- * Windows, nanosleep elsewhere). */
+ * old behaviour: it hands the core to another ready thread (plat_yield). */
 static int usleep_short_in_place(void)
 {
     static int s_on = -1;
@@ -160,24 +131,10 @@ static int usleep_short_in_place(void)
     return s_on;
 }
 
-static inline void usleep_relax(void)
-{
-#if defined(_WIN32)
-    YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-    __asm__ __volatile__("yield" ::: "memory");
-#endif
-}
-
-#ifdef _WIN32
 /* Short-usleep idle detection (see the sub-millisecond branch below). */
-static __declspec(thread) int64_t t_last_end;
-static __declspec(thread) unsigned t_streak;
-static __declspec(thread) HANDLE t_timer;
-static __declspec(thread) int t_timer_hr;   /* t_timer is high-resolution */
-#endif
+static PLAT_THREAD_LOCAL int64_t t_last_end;
+static PLAT_THREAD_LOCAL unsigned t_streak;
+static PLAT_THREAD_LOCAL plat_timer t_timer;   /* opened on first use */
 
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
@@ -323,37 +280,27 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
 
-#ifdef _WIN32
-    /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-        if (timer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
-            SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
-            WaitForSingleObject(timer, INFINITE);
-            CloseHandle(timer);
-        } else {
-            Sleep((DWORD)(usec / 1000));
-        }
+        plat_sleep_us(usec);
     } else if (usec > 0) {
-        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
-         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
-         * on accurate microsecond pacing -- a short usleep() spin waiting on
+        /* Sub-millisecond sleep. A plain sleep rounds up to the ~0.5-1 ms
+         * scheduler quantum on Windows (and adds the timer slack, 50 us by
+         * default, on Linux), far too coarse for a guest that relies on
+         * accurate microsecond pacing -- a short usleep() spin waiting on
          * another thread to make progress otherwise collapses to a single yield
          * and busy-spins at full speed (so the wait is effectively a no-op).
-         * Busy-wait to a precise QPC deadline, yielding inside the spin
-         * (SwitchToThread) so a sibling host thread the guest may be waiting on
+         * Busy-wait to a precise clock deadline, yielding inside the spin
+         * (plat_yield) so a sibling host thread the guest may be waiting on
          * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
          *
          * ...but a thread that does nothing BUT short sleeps is idle-polling a
          * flag, and spinning pinned a core per poller (Demon's Souls'
          * HighGraphics waits out each frame in usleep(30) loops). After 64
          * back-to-back short sleeps -- each starting within 200 us of the
-         * previous one's end -- sleep for real on a high-resolution waitable
-         * timer (~0.5 ms granularity) until the thread does something else.
-         * Short one-off waits keep the precise spin. USLEEP_SPIN=1 restores
-         * the old always-spin behaviour.
+         * previous one's end -- sleep for real on the thread's timer
+         * (~0.5 ms granularity on Windows) until the thread does something
+         * else. Short one-off waits keep the precise spin. USLEEP_SPIN=1
+         * restores the old always-spin behaviour.
          *
          * A sleep of a few microseconds is a yield, not idling: Havok's job
          * queue polls its SPU jobs with usleep(1) while the main thread waits
@@ -362,78 +309,42 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * (21 at most with the spin). Sleeps of at most USLEEP_YIELD_US
          * (default 10; 0 = off) keep the spin in a streak too.
          *
-         * Those yields also wait in place, without SwitchToThread. A yield
-         * hands the core to any thread ready on it, and Havok's poller then
-         * waited behind it for a whole quantum: about 1 in 40 of its
+         * Those yields also wait in place, without a yield to the scheduler.
+         * A yield hands the core to any thread ready on it, and Havok's poller
+         * then waited behind it for a whole quantum: about 1 in 40 of its
          * usleep(1) calls took 0.05-1.7 ms, and the SPU tasks it feeds jobs
          * to waited with it. */
-        ensure_qpc_init();
-        LARGE_INTEGER qpc_start, qpc_now;
-        QueryPerformanceCounter(&qpc_start);
+        const int64_t start = plat_clock_now();
         { static int s_spin = -1;
           PS3_KNOB(s_spin, getenv("USLEEP_SPIN") ? 1 : 0);
-          const int64_t gap_ticks = (int64_t)(200 * (uint64_t)s_qpc_freq.QuadPart / 1000000ULL);
-          if (t_last_end && qpc_start.QuadPart - t_last_end <= gap_ticks) t_streak++;
+          const int64_t gap_ticks = (int64_t)(200 * (uint64_t)plat_clock_freq() / 1000000ULL);
+          if (t_last_end && start - t_last_end <= gap_ticks) t_streak++;
           else t_streak = 0;
-          if (!s_spin && !t_timer) {
-              /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+). */
-              t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u, TIMER_ALL_ACCESS);
-              t_timer_hr = t_timer != NULL;
-              if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-          }
+          if (!s_spin) plat_timer_open(&t_timer);
           if (!s_spin && t_streak >= 64 && usec > usleep_yield_us()) {
-              if (t_timer) {
-                  LARGE_INTEGER due;
-                  due.QuadPart = -((LONGLONG)usec * 10);
-                  SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE);
-                  WaitForSingleObject(t_timer, INFINITE);
-                  QueryPerformanceCounter(&qpc_now);
-                  t_last_end = qpc_now.QuadPart;
+              if (plat_timer_is_open(&t_timer)) {
+                  plat_timer_sleep_us(&t_timer, usec);
+                  t_last_end = plat_clock_now();
                   return CELL_OK;
               }
           }
           /* A long sub-ms sleep that is not part of a streak (Demon's Souls'
            * audio streamer: usleep(800) x3 between event-flag waits, ~330/s)
            * spun its whole length in SwitchToThread -- half a core in the
-           * kernel. Sleep all but the last USLEEP_SPIN_TAIL_US on the
-           * high-resolution timer, then spin the tail to the same QPC
-           * deadline. The tail covers the timer's wake latency: it fires on
-           * ~0.5 ms boundaries here, so a 250 us tail let usleep(800) average
-           * 1040 us; 500 gives ~830 us at ~13% of a core (was 50%). -1
-           * disables the timer part. Needs the high-resolution timer; a plain
-           * one rounds to the 1 ms tick and would oversleep. */
+           * kernel. plat_sleep_precise sleeps all but the last
+           * USLEEP_SPIN_TAIL_US on the timer, then spins the tail to the same
+           * deadline. The tail covers the timer's wake latency: Windows'
+           * fires on ~0.5 ms boundaries, so a 250 us tail let usleep(800)
+           * average 1040 us; 500 gives ~830 us at ~13% of a core (was 50%).
+           * -1 disables the timer part. Needs a precise timer; Windows'
+           * plain one rounds to the 1 ms tick and would oversleep. */
           { static int s_tail = -1;
             PS3_KNOB(s_tail, getenv("USLEEP_SPIN_TAIL_US") ? atoi(getenv("USLEEP_SPIN_TAIL_US")) : 500);
-            if (!s_spin && t_timer_hr && s_tail >= 0 && usec > (uint64_t)s_tail + 100) {
-                LARGE_INTEGER due;
-                due.QuadPart = -((LONGLONG)(usec - (uint64_t)s_tail) * 10);
-                SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE);
-                WaitForSingleObject(t_timer, INFINITE);
-            } }
+            const int in_place = usec <= usleep_yield_us() && usleep_short_in_place();
+            t_last_end = plat_sleep_precise(&t_timer, start, usec, s_spin ? -1 : s_tail, in_place);
+          }
         }
-        const int64_t qpc_deadline = qpc_start.QuadPart +
-            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        const int in_place = usec <= usleep_yield_us() && usleep_short_in_place();
-        do {
-            if (in_place) usleep_relax();
-            else SwitchToThread();
-            QueryPerformanceCounter(&qpc_now);
-        } while (qpc_now.QuadPart < qpc_deadline);
-        t_last_end = qpc_now.QuadPart;
     }
-#else
-    if (usec > 0 && usec <= usleep_yield_us() && usleep_short_in_place()) {
-        /* A yield, as above. nanosleep would add the timer slack, 50 us by
-         * default, to every one. */
-        const uint64_t end = lv2_system_time_usec() + usec;
-        while (lv2_system_time_usec() < end) usleep_relax();
-    } else if (usec > 0) {
-        struct timespec ts;
-        ts.tv_sec  = (time_t)(usec / 1000000);
-        ts.tv_nsec = (long)((usec % 1000000) * 1000);
-        nanosleep(&ts, NULL);
-    }
-#endif
 
     return CELL_OK;
 }
@@ -470,14 +381,15 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
+    /* The performance counter, not the time of day: what this has always
+     * returned on Windows. */
+    const int64_t freq = plat_clock_freq();
+    const int64_t now = plat_clock_now();
 
     /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    sec  = (uint64_t)(now / freq);
+    uint64_t remainder = (uint64_t)(now % freq);
+    nsec = (remainder * 1000000000ULL) / (uint64_t)freq;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -837,9 +749,7 @@ void sys_timer_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_timers, 0, sizeof(g_sys_timers));
 
-#ifdef _WIN32
-    ensure_qpc_init();
-#endif
+    (void)plat_clock_freq();   /* read and kept, before any thread asks */
 
     lv2_syscall_register(tbl, SYS_TIMER_CREATE,                   sys_timer_create);
     lv2_syscall_register(tbl, SYS_TIMER_DESTROY,                  sys_timer_destroy);
