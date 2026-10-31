@@ -1094,12 +1094,15 @@ static int child_main(const char* dir)
 #ifdef _WIN32
 static int env_cmp(const void* a, const void* b) { return _stricmp(*(const char* const*)a, *(const char* const*)b); }
 
-/* The child's environment: the system's variables from ours, then extra
- * (NAME=VALUE each). */
+/* The child's environment: the system's variables from ours (with what finds
+ * the Vulkan driver and layers, such as the SDK's VK_ADD_LAYER_PATH), then
+ * extra (NAME=VALUE each). */
 static char* env_block(const char* const* extra, int nextra)
 {
     static const char* const keep[] = { "SystemRoot", "SystemDrive", "windir", "PATH", "PATHEXT", "TEMP", "TMP",
-                                        "ComSpec", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE" };
+                                        "ComSpec", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+                                        "VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH",
+                                        "VK_LOADER_LAYERS_DISABLE" };
     enum { NKEEP = sizeof keep / sizeof keep[0] };
     char* items[NKEEP + 64];
     int n = 0;
