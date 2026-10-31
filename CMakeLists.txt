@@ -868,6 +868,66 @@ if(UNIX)
 endif()
 
 # ---------------------------------------------------------------------------
+# What a host that imports the runtime links besides it
+# ---------------------------------------------------------------------------
+# A host that links ps3recomp_runtime.lib (libps3recomp_runtime.a) from this
+# build as an imported library, as a port does, also needs the static
+# libraries built here that the runtime links: glslang and SPIRV-Tools with
+# PS3RECOMP_RSX_HAL_SPV, the Metal path's MSL translation. A static library
+# doesn't contain them, and an imported one doesn't know them.
+# ps3recomp_runtime_deps.cmake, beside the library, sets PS3RECOMP_RUNTIME_DEPS
+# to their files in link order (each before the libraries it uses). Libraries
+# from outside this build (ws2_32, SDL2, a system glslang, the frameworks)
+# aren't listed: a host names those itself. This comes after every
+# target_link_libraries(ps3recomp_runtime ...).
+function(_ps3recomp_static_deps tgt stack)
+    get_target_property(_libs ${tgt} INTERFACE_LINK_LIBRARIES)
+    if(NOT _libs)
+        return()
+    endif()
+    foreach(_l IN LISTS _libs)
+        # A static library's private dependencies show as $<LINK_ONLY:x>.
+        foreach(_pass RANGE 1)
+            string(REGEX REPLACE "^\\$<(LINK_ONLY|BUILD_INTERFACE):(.*)>$" "\\2" _l "${_l}")
+        endforeach()
+        if(NOT TARGET "${_l}")
+            continue()
+        endif()
+        get_target_property(_aliased "${_l}" ALIASED_TARGET)
+        if(_aliased)
+            set(_l "${_aliased}")
+        endif()
+        get_target_property(_imported "${_l}" IMPORTED)
+        if(_imported OR "${_l}" IN_LIST stack)
+            continue()
+        endif()
+        get_target_property(_type "${_l}" TYPE)
+        if(_type STREQUAL "STATIC_LIBRARY")
+            set_property(GLOBAL APPEND PROPERTY _PS3RECOMP_RUNTIME_DEPS "${_l}")
+        endif()
+        _ps3recomp_static_deps("${_l}" "${stack};${_l}")
+    endforeach()
+endfunction()
+set_property(GLOBAL PROPERTY _PS3RECOMP_RUNTIME_DEPS "")
+get_target_property(_ps3_rt_type ps3recomp_runtime TYPE)
+if(_ps3_rt_type STREQUAL "STATIC_LIBRARY")
+    _ps3recomp_static_deps(ps3recomp_runtime "ps3recomp_runtime")
+endif()
+get_property(_ps3_rt_deps GLOBAL PROPERTY _PS3RECOMP_RUNTIME_DEPS)
+# A library reached twice keeps its last place, after everything that uses it.
+list(REVERSE _ps3_rt_deps)
+list(REMOVE_DUPLICATES _ps3_rt_deps)
+list(REVERSE _ps3_rt_deps)
+set(_ps3_rt_files "")
+foreach(_d IN LISTS _ps3_rt_deps)
+    string(APPEND _ps3_rt_files "\n    \"$<TARGET_LINKER_FILE:${_d}>\"")
+endforeach()
+file(GENERATE OUTPUT "$<TARGET_FILE_DIR:ps3recomp_runtime>/ps3recomp_runtime_deps.cmake"
+     CONTENT "# The static libraries built with this runtime that it links (written by ps3recomp's configure).\nset(PS3RECOMP_RUNTIME_DEPS${_ps3_rt_files})\n")
+list(LENGTH _ps3_rt_deps _ps3_rt_n)
+message(STATUS "  Link:         ${_ps3_rt_n} static libraries a host links with the runtime (ps3recomp_runtime_deps.cmake)")
+
+# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 install(TARGETS ps3recomp_runtime
