@@ -10720,14 +10720,17 @@ static void aa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR_H
  * one. The lookup textures (AreaTex, SearchTex) are uploaded once; the edges
  * (R8G8) and weights (RGBA8) targets follow the size asked for. Descriptors,
  * all written again each run: SMAA_SRV_SLOT + 0 the colour, + 1 the weights,
- * + 2 the edges, + 3 AreaTex, + 4 SearchTex. A pass's t0-t2 is a window of
- * three of them: the edge and blend passes' starts at + 0, the weight pass's
- * at + 2. */
+ * + 3 the edges, + 4 AreaTex, + 5 SearchTex (+ 2 keeps the heap's null view
+ * from its creation: no pass reads its t2 there). A pass's
+ * t0-t2 is a window of three of them: the edge and blend passes' starts at
+ * + 0, the weight pass's at + 3. So no window holds the target its pass
+ * draws into: the edges used to sit at + 2, in the edge pass's window,
+ * bound while in RENDER_TARGET. */
 #include "rsx_smaa.h"
 #include "rsx_smaa_src.h"
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SearchTex.h"
-#define SMAA_SRV_SLOT 22   /* SRV heap slots 22-26, after AA_SRV_SLOT */
+#define SMAA_SRV_SLOT 22   /* SRV heap slots 22-27, after AA_SRV_SLOT */
 
 static struct {
     ID3D12RootSignature*  rs;
@@ -10959,13 +10962,13 @@ static void smaa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR
     const UINT map = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv_write(SMAA_SRV_SLOT + 0, src, fmt, map);
     srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights, DXGI_FORMAT_R8G8B8A8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area, DXGI_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search, DXGI_FORMAT_R8_UNORM, map);
-    D3D12_GPU_DESCRIPTOR_HANDLE g0, g2;
+    srv_write(SMAA_SRV_SLOT + 3, s_smaa.edges, DXGI_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 4, s_smaa.area, DXGI_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 5, s_smaa.search, DXGI_FORMAT_R8_UNORM, map);
+    D3D12_GPU_DESCRIPTOR_HANDLE g0, g3;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &g0);
     g0.ptr += (u64)SMAA_SRV_SLOT * s_d3d.srv_inc;
-    g2.ptr = g0.ptr + 2u * (u64)s_d3d.srv_inc;
+    g3.ptr = g0.ptr + 3u * (u64)s_d3d.srv_inc;
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
     const D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
     const D3D12_RECT sc = {0, 0, (LONG)w, (LONG)h};
@@ -10976,7 +10979,10 @@ static void smaa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR
     cl->lpVtbl->SetGraphicsRootSignature(cl, s_smaa.rs);
     cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, k, 0);
     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    /* 1. Edges, into a cleared target: the pass discards pixels without one. */
+    /* 1. Edges, into a cleared target: the pass discards pixels without one.
+     * Its window holds the weights too, readable from the first run on
+     * (made as a target; after that the blend pass leaves them so). */
+    smaa_state(s_smaa.weights, &s_smaa.weights_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     smaa_state(s_smaa.edges, &s_smaa.edges_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cl->lpVtbl->ClearRenderTargetView(cl, er, zero, 0, NULL);
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &er, FALSE, NULL);
@@ -10988,7 +10994,7 @@ static void smaa_draw(ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_CPU_DESCRIPTOR
     smaa_state(s_smaa.weights, &s_smaa.weights_st, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cl->lpVtbl->OMSetRenderTargets(cl, 1, &wr, FALSE, NULL);
     cl->lpVtbl->SetPipelineState(cl, s_smaa.pso[1]);
-    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g2);
+    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g3);
     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
     /* 3. The colour blended along the edges, into the target. */
     smaa_state(s_smaa.weights, &s_smaa.weights_st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
