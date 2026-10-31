@@ -743,6 +743,31 @@ if(WIN32)
     set_target_properties(test_shader_text_identity PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
+# Setup's shader pass (libs/video/rsx_shader_precompile.c) over a game's
+# programs as the port feeds them, one target a run, and checks of what it
+# wrote (the same files as another run, the spv target's modules):
+# libs/video/tests/precompile_compare.c. Where the pass runs: Windows, and
+# with the spv target. A game's files go in and out, so it is no ctest.
+# Built on demand:
+#   cmake --build build --target precompile_compare
+if(WIN32 OR PS3RECOMP_RSX_HAL_SPV)
+    add_executable(precompile_compare EXCLUDE_FROM_ALL
+        libs/video/tests/precompile_compare.c
+        libs/video/tests/precompile_compare_today.c
+        runtime/host/host_stubs.c
+    )
+    target_compile_definitions(precompile_compare PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(precompile_compare PRIVATE ps3recomp_runtime)
+    if(WIN32)
+        target_link_libraries(precompile_compare PRIVATE dxguid)
+    endif()
+    target_include_directories(precompile_compare PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(precompile_compare PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 # ---------------------------------------------------------------------------
 # PPU boot smoke title
 # ---------------------------------------------------------------------------
