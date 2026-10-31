@@ -198,13 +198,19 @@ goes through `vm_read*`/`vm_write*`.
 
 ## Timers and Clocks
 
-### High-Resolution Timer
+### The monotonic clock (`runtime/platform/plat.h`)
 
 | Operation | Windows | POSIX |
 |-----------|---------|-------|
-| **Get current time** | `QueryPerformanceCounter(&li)` | `clock_gettime(CLOCK_MONOTONIC, &ts)` |
-| **Get frequency** | `QueryPerformanceFrequency(&li)` | Fixed: 1,000,000,000 (nanoseconds) |
-| **Convert to PS3 ticks** | `ticks = li.QuadPart * 79800000 / freq` | `ticks = ts.tv_sec * 79800000 + ts.tv_nsec * 79800000 / 1000000000` |
+| **`plat_clock_now()`** | `QueryPerformanceCounter` | `clock_gettime(CLOCK_MONOTONIC)`, in nanoseconds |
+| **`plat_clock_freq()`** | `QueryPerformanceFrequency`, read once per file | Fixed: 1,000,000,000 |
+| **`plat_ticks_scale(d, freq, per_sec)`** | Ticks to another unit: whole seconds and the rest apart, so it does not overflow | same |
+
+The guest clocks are written once on it (`runtime/syscalls/sys_timer.c`): the
+timebase (`mftb`, 79.8 MHz) and the system time (`sys_time_get_system_time`,
+microseconds, also what `cellGcmGetLastFlipTime` reports). Each counts from its
+own first reading on every platform, so a title sees small values, as it would
+seconds after a console boots.
 
 ### Wall Clock Time
 
@@ -216,8 +222,20 @@ goes through `vm_read*`/`vm_write*`.
 
 ### Sleep
 
-| Operation | Windows | POSIX |
-|-----------|---------|-------|
+The guest's `sys_timer_usleep` is one policy on every platform, on `plat.h`:
+
+| Request | What it does |
+|---------|--------------|
+| 1 ms or more | `plat_sleep_us`: a plain waitable timer made for the sleep on Windows (it wakes on the system tick), `nanosleep` elsewhere |
+| Up to `USLEEP_YIELD_US` (10 us) | Spins in place to the deadline (`plat_relax`, the CPU's pause) |
+| Under 1 ms, one-off | `plat_sleep_precise`: sleeps on the thread's timer (`plat_timer`: Windows' high-resolution waitable timer, `nanosleep` elsewhere) for all but the last `USLEEP_SPIN_TAIL_US` (500 us), then spins to the deadline with `plat_yield` |
+| Under 1 ms, the 64th back-to-back one and on | Sleeps on the thread's timer alone: an idle poll |
+
+A precise sleep never ends before its deadline; `tests/plat_threads`
+(`test_plat_time`) and `tests/lv2_time` print requested against measured.
+`sys_timer_sleep` (seconds) is `Sleep` on Windows and `sleep` elsewhere.
+
+-----------|---------|-------|
 | **Microsecond sleep** | `Sleep(usec / 1000)` (ms granularity) | `usleep(usec)` |
 | **Second sleep** | `Sleep(sec * 1000)` | `sleep(sec)` |
 
