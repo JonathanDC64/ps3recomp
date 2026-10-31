@@ -76,25 +76,22 @@ static void lose_device_test(void)
 }
 
 /* The end of a frame: a point on the timeline for its slot, the swap chain's
- * next buffer, and a wait (2 s at most) until the GPU is done with the frame
- * that used that slot last, so its allocator and its halves of the per-frame
- * buffers can be reused. */
+ * next buffer, and a wait (2 s at most) until the GPU is done with that
+ * buffer's slot's use before this frame. When the buffer does not change
+ * (RSX_PRESENT=0 presents nothing) that is the frame before, which
+ * render_frame's opening wait_for_gpu has already seen through: the GPU runs
+ * this frame while the next batch records, as in today's renderer (its slot's
+ * fence value there is the opening wait's, already reached). The batch's
+ * vertices go to the other parity half, and frame_cmd_begin waits for the
+ * slot before its recorder is reset. */
 static void move_to_next_frame(void)
 {
-    s_rc_frame_fence[s_d3d.frame_index] = gpu_signal(s_rc_dev);
+    const u32 prev = s_d3d.frame_index;
+    const gpu_fence mine = gpu_signal(s_rc_dev);
 
     s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
 
     lose_device_test();
-    const gpu_fence want = s_rc_frame_fence[s_d3d.frame_index];
-    const u64 done = gpu_fence_completed(s_rc_dev);
-    if (done == UINT64_MAX) check_device("frame fence");   /* (what a lost device's fences read) */
-    if (done < want && gpu_fence_wait(s_rc_dev, want, 2000)) {
-        const u32 rr = gpu_lost(s_rc_dev);
-        printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
-               (unsigned long long)want,
-               (unsigned long long)gpu_fence_completed(s_rc_dev),
-               (unsigned long)rr);
-        if (rr != S_OK) check_device("frame fence wait");
-    }
+    frame_slot_wait(s_d3d.frame_index);
+    s_rc_frame_fence[prev] = mine;
 }

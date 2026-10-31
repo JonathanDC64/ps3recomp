@@ -11,11 +11,33 @@ static u64 fnv_bytes(u64 h, const void* p, size_t n)
     return h;
 }
 
+/* Until the GPU has reached a frame slot's point on the timeline (2 s at
+ * most, then the device's state is looked at). */
+static void frame_slot_wait(u32 slot)
+{
+    const gpu_fence want = s_rc_frame_fence[slot];
+    const u64 done = gpu_fence_completed(s_rc_dev);
+    if (done == UINT64_MAX) check_device("frame fence");   /* (what a lost device's fences read) */
+    if (done < want && gpu_fence_wait(s_rc_dev, want, 2000)) {
+        const u32 rr = gpu_lost(s_rc_dev);
+        printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
+               (unsigned long long)want,
+               (unsigned long long)gpu_fence_completed(s_rc_dev),
+               (unsigned long)rr);
+        if (rr != S_OK) check_device("frame fence wait");
+    }
+}
+
 /* Recording on a frame slot's recorder (the GPU layer's, one allocator and
  * list per slot): today's allocator and list Reset. s_rc_cmd is the recorder
- * every command goes to (step C8a: there is no native list beside it). */
+ * every command goes to (step C8a: there is no native list beside it). The
+ * slot's last frame is done first: after render_frame's opening wait_for_gpu
+ * that is a read of the fence, but a repaint opens the slot right after a
+ * present, and a slot the present did not move on from is still in flight
+ * (move_to_next_frame waits only for its use before). */
 static void frame_cmd_begin(u32 slot)
 {
+    frame_slot_wait(slot);
     s_rc_cmd = gpu_cmd_begin(s_rc_dev, slot);
 }
 
@@ -167,11 +189,12 @@ static int init_d3d12(u32 width, u32 height)
     /* The recorders and the fence are the device's (one fence, the device's
      * timeline: s_rc_frame_fence holds each frame slot's point on it). Until
      * the first frame, slot 0's list is closed, as today's one list is after
-     * init. */
+     * init. (The slots' points first: a device made again starts its
+     * timeline over.) */
+    memset(s_rc_frame_fence, 0, sizeof s_rc_frame_fence);
     frame_cmd_begin(0);
     if (!s_rc_cmd) return -1;
     gpu_cmd_end(s_rc_dev, s_rc_cmd);
-    memset(s_rc_frame_fence, 0, sizeof s_rc_frame_fence);
 
     /* Draws record from here on (pipeline_ready). The root signature and the
      * fixed-function pipelines this made for the draws without a vertex
