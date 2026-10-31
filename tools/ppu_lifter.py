@@ -216,10 +216,16 @@ static inline void ppu_vstu4(void* v, const uint32_t in[4]) {
  * pshufb and a blend, vsldoi one palignr, lvlx/lvrx one pshufb; the float
  * ones swap each lane like ppu_vldf4. Lifted as the loops below (kept for
  * hosts without SSE4.1), vperm was about 100 x86 instructions and vsldoi a
- * store-forwarding stall through a temporary on the stack.
+ * store-forwarding stall through a temporary on the stack. On arm64 the same
+ * intrinsics come from sse2neon (ps3emu/ps3_sse.h).
  * tools/test_ppu_vmx_helpers.py checks each helper against its loop. */
-#if !defined(PPU_VMX_NO_SSE41) && (defined(__SSE4_1__) || (defined(_M_X64) && !defined(__clang__)))
+#if !defined(PPU_VMX_NO_SSE41) && defined(__aarch64__)
+#include "ps3emu/ps3_sse.h"
+#endif
+#if !defined(PPU_VMX_NO_SSE41) && (defined(__SSE4_1__) || defined(PS3_SSE2NEON) || (defined(_M_X64) && !defined(__clang__)))
+#ifndef PS3_SSE2NEON
 #include <smmintrin.h>
+#endif
 #define PPU_VMX_SSE41 1  /* which path this build took (the test checks it) */
 static inline void ppu_vperm(void* d, const void* a, const void* b, const void* c) {
     const __m128i A = _mm_loadu_si128((const __m128i*)a), B = _mm_loadu_si128((const __m128i*)b);

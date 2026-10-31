@@ -25,12 +25,12 @@
  * goes on at 0x7440). When the entry at the head goes to a handler it changes
  * nothing.
  *
- * On x86-64 each entry's test runs on SSE registers (scan_stop_sse: a load
- * and a shuffle a quadword, the lift's shufb, word compares), and only the
- * last skipped entry runs again on the lifted helpers for the registers it
- * leaves. On the helpers alone every entry built all its registers through
- * scalar lane loops and a 37-quadword struct, about as slow as the lifted
- * loop.
+ * On x86-64, and on arm64 through sse2neon, each entry's test runs on SSE
+ * registers (scan_stop_sse: a load and a shuffle a quadword, the lift's
+ * shufb, word compares), and only the last skipped entry runs again on the
+ * lifted helpers for the registers it leaves. On the helpers alone every
+ * entry built all its registers through scalar lane loops and a 37-quadword
+ * struct, about as slow as the lifted loop.
  *
  * It runs the lifted loop instead (returns 0) whenever the lifted loop would
  * leave its region at the next back edge (the knobs and the pending-interrupt
@@ -53,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/ps3_knob.h"
+#include "ps3emu/ps3_sse.h"   /* PS3_SSE2NEON: scan_run_sse on arm64 */
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_interp.h"
@@ -198,8 +199,10 @@ static uint32_t scan_run_u128(spu_context* ctx, int* done)
     return n;
 }
 
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
+#endif
 #define SCAN_HAVE_SSE 1
 
 /* spu_ls_read128 as one load and one shuffle: SPU byte P to host byte P^3,
