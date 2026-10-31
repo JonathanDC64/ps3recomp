@@ -187,7 +187,7 @@ static int init_d3d12(u32 width, u32 height)
         /* The GPU layer's table pool, its entries made as these R8_UNORM
          * null SRVs (step C4). The regions name its tables for Vulkan: the
          * per-draw windows, the AA source (AA_SRV_SLOT, rsxc_post.inc) and
-         * SMAA's two 3-wide windows (SMAA_SRV_SLOT + 0 and + 2). */
+         * SMAA's two 3-wide windows (SMAA_SRV_SLOT + 0 and + 3). */
         {
             gpu_table_pool_desc pd;
             memset(&pd, 0, sizeof pd);
@@ -197,7 +197,7 @@ static int init_d3d12(u32 width, u32 height)
             pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
             pd.region[1].first = 21; pd.region[1].tables = 1; pd.region[1].size = 1;
             pd.region[2].first = 22; pd.region[2].tables = 1; pd.region[2].size = 3;
-            pd.region[3].first = 24; pd.region[3].tables = 1; pd.region[3].size = 3;
+            pd.region[3].first = 25; pd.region[3].tables = 1; pd.region[3].size = 3;
             s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
             if (!GPU_VALID(s_rc_srv_pool)) printf("[D3D12] SRV heap creation failed\n");
             else s_rc_srv_w = gpu_table_writer_get(s_rc_dev, s_rc_srv_pool);

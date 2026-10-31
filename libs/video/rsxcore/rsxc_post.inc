@@ -174,14 +174,16 @@ static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
  * one. The lookup textures (AreaTex, SearchTex) are uploaded once; the edges
  * (R8G8) and weights (RGBA8) targets follow the size asked for. Descriptors,
  * all written again each run: SMAA_SRV_SLOT + 0 the colour, + 1 the weights,
- * + 2 the edges, + 3 AreaTex, + 4 SearchTex. A pass's t0-t2 is a window of
- * three of them: the edge and blend passes' starts at + 0, the weight pass's
- * at + 2. */
+ * + 3 the edges, + 4 AreaTex, + 5 SearchTex (+ 2 stays the pool's null). A
+ * pass's t0-t2 is a window of three of them: the edge and blend passes'
+ * starts at + 0, the weight pass's at + 3. So no window holds the target
+ * its pass draws into, as gpu.h asks of every texture in a bound table
+ * (step C8b: today's put the edges at + 2, in the edge pass's window). */
 #include "rsx_smaa.h"
 #include "rsx_smaa_src.h"
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SearchTex.h"
-#define SMAA_SRV_SLOT 22   /* SRV heap slots 22-26, after AA_SRV_SLOT */
+#define SMAA_SRV_SLOT 22   /* SRV heap slots 22-27, after AA_SRV_SLOT */
 
 static struct {
     gpu_layout            layout;      /* (step C3b) */
@@ -376,18 +378,18 @@ static int smaa_targets(u32 w, u32 h)
 /* SMAA's three passes: src (as aa_draw's) into the target behind rtv, w x h,
  * in RENDER_TARGET. Needs smaa_targets(w, h) and smaa_luts_load() first. On
  * the frame's recorder (step C6): the tables are the SRV pool's windows at
- * SMAA_SRV_SLOT and SMAA_SRV_SLOT + 2 (its regions of three). */
+ * SMAA_SRV_SLOT and SMAA_SRV_SLOT + 3 (its regions of three). */
 static void smaa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     gpu_cmd* const c = s_rc_cmd;
     const u32 map = GPU_SWIZZLE_IDENTITY;
     srv_write(SMAA_SRV_SLOT + 0, src, fmt, map);
     srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights_tex, GPU_FORMAT_R8G8B8A8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 2, s_smaa.edges_tex, GPU_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 3, s_smaa.area_tex, GPU_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 4, s_smaa.search_tex, GPU_FORMAT_R8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 3, s_smaa.edges_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 4, s_smaa.area_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(SMAA_SRV_SLOT + 5, s_smaa.search_tex, GPU_FORMAT_R8_UNORM, map);
     const gpu_table g0 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT);
-    const gpu_table g2 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT + 2);
+    const gpu_table g3 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT + 3);
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
     const gpu_viewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
     const gpu_rect sc = {0, 0, (int32_t)w, (int32_t)h};
@@ -397,7 +399,10 @@ static void smaa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 
     gpu_cmd_set_layout(c, s_smaa.layout);
     gpu_cmd_push_const(c, 1, 4, k, 0);
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
-    /* 1. Edges, into a cleared target: the pass discards pixels without one. */
+    /* 1. Edges, into a cleared target: the pass discards pixels without one.
+     * Its window holds the weights too, readable from the first run on
+     * (made as a target; after that the blend pass leaves them so). */
+    smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, GPU_STATE_PIXEL_SHADER_RESOURCE);
     smaa_state(s_smaa.edges_tex, &s_smaa.edges_st, GPU_STATE_RENDER_TARGET);
     gpu_cmd_clear_color(c, s_smaa.edges_rtv, zero, NULL);
     aa_target(s_smaa.edges_rtv);
@@ -409,7 +414,7 @@ static void smaa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 
     smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, GPU_STATE_RENDER_TARGET);
     aa_target(s_smaa.weights_rtv);
     gpu_cmd_set_pipeline(c, s_smaa.pso[1]);
-    gpu_cmd_bind_table(c, 0, g2);
+    gpu_cmd_bind_table(c, 0, g3);
     gpu_cmd_draw(c, 3, 1, 0, 0);
     /* 3. The colour blended along the edges, into the target. */
     smaa_state(s_smaa.weights_tex, &s_smaa.weights_st, GPU_STATE_PIXEL_SHADER_RESOURCE);
