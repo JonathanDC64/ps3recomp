@@ -760,7 +760,10 @@ static void device_free(gpu_vk_device* dd)
         for (uint32_t i = 0; i < dd->samp_slots.used; i++)
             if (dd->samp_slots.live[i]) dd->vk.vkDestroySampler(dd->device, dd->samp[i].s, NULL);
         for (uint32_t i = 0; i < dd->shader_slots.used; i++)
-            if (dd->shader_slots.live[i]) dd->vk.vkDestroyShaderModule(dd->device, dd->shader[i].module, NULL);
+            if (dd->shader_slots.live[i]) {
+                dd->vk.vkDestroyShaderModule(dd->device, dd->shader[i].module, NULL);
+                free(dd->shader[i].words);   /* (step VC1: a pixel shader's code, gpu_vk_pipe.c) */
+            }
         for (uint32_t i = 0; i < dd->qpool_slots.used; i++)
             if (dd->qpool_slots.live[i]) dd->vk.vkDestroyQueryPool(dd->device, dd->qpool[i].pool, NULL);
         for (uint32_t i = 0; i < dd->heap_slots.used; i++)

@@ -12,9 +12,10 @@
  * acquire. Statistics come from present_id and present_wait.
  *
  * The semaphores: an acquire's semaphore is waited for by the first submit
- * with GPU_SUBMIT_ACQUIRE_WAIT, a submit with GPU_SUBMIT_PRESENT_SIGNAL
- * signals the image's own done semaphore, and the present waits for that
- * (if no submit did either, the present does them in an empty submit).
+ * with GPU_SUBMIT_ACQUIRE_WAIT; the present's own empty submit (after every
+ * submit of the frame, GPU_SUBMIT_PRESENT_SIGNAL or not) signals the
+ * image's done semaphore, and the present waits for that (the empty submit
+ * waits for the acquire too if no submit did).
  *
  * From the render thread. Built with PS3RECOMP_RSX_HAL and
  * PS3RECOMP_RSX_HAL_VULKAN; the window is an HWND on Windows and an
@@ -437,14 +438,13 @@ void gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* how, VkSe
         (*nwait)++;
         s->waited = 1;
     }
-    if ((how->flags & GPU_SUBMIT_PRESENT_SIGNAL) && !s->signalled) {
-        memset(&sig[*nsig], 0, sizeof sig[*nsig]);
-        sig[*nsig].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-        sig[*nsig].semaphore = s->done_sem[s->current];
-        sig[*nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        (*nsig)++;
-        s->signalled = 1;
-    }
+    /* ---- step VC1 ---- */
+    /* PRESENT_SIGNAL signals nothing here: a binary semaphore is signalled
+     * once, and the first such submit need not be the last (the core says it
+     * on every submit of a frame). The present's own empty submit signals
+     * it, after all of them. */
+    (void)sig;
+    (void)nsig;
 }
 
 /* 0 on success (out of date and suboptimal too: the next acquire makes it
@@ -465,7 +465,7 @@ int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint
     }
     if (s->present_fence[idx]) dd->vk.vkResetFences(dd->device, 1, &s->present_fence[idx]);
     gpu_vk_lock(&dd->qlock);
-    if (!s->signalled) {
+    if (!s->signalled) {   /* (step VC1: always, gpu_vk_swap_submit_sems says why) */
         VkSemaphoreSubmitInfo w, g;
         VkSubmitInfo2 si;
         memset(&w, 0, sizeof w);

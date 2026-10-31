@@ -872,3 +872,30 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 # that reaches a page nothing has touched takes a microcode assist each time;
 # which entries end a page depends on where s_fpkm lands, so the cost came
 # and went with the binary's layout. The bytes written are the same.
+
+#
+# Step VC1: a third instance, Vulkan (rsxc_vk.c, the route RSX_BACKEND=vulkan).
+#  rsxc_vk.c: the hooks on gpu_vk*.c, in builds with PS3RECOMP_RSX_HAL_VULKAN
+#   (Windows for now). Shaders are the compile service's spv target, made
+#   per layout; no pipeline library and none of today's cache files
+#   (rc_be_cache_files 0, as on null: pso_manifest.bin's records are D3D12
+#   pipeline descriptions); the menu's objects (rc_be_device, rc_be_queue,
+#   rc_be_image) are none, so the menu does not draw on Vulkan yet.
+#  Shaders by layout: sc_compile takes the layout the shader is for, and
+#   sc_shader_for(layout, ...) is sc_shader with one (sc_shader passes none:
+#   the guest's layout). rc_be_sc_compile takes it too; dxbc and null do not
+#   use it. of_ready, blit_init and hdr_blit_ready (rsxc_hdr.inc), aa_ready
+#   and smaa_ready (rsxc_post.inc) and down_init (rsxc_writeback.inc) fill
+#   their gpu_layout_desc before they compile and pass it; lay_make still
+#   makes the layout where it did, after the compile.
+#  The frame slot and the swap image: a Vulkan swap chain may have more
+#   images than FRAME_COUNT and hands them out in any order, so the image
+#   the last acquire gave (s_rc_image) and the frame slot the per-frame
+#   resources use (s_d3d.frame_index) are two numbers. rc_acquire
+#   (rsxc_state.inc) takes both, in init_d3d12 and move_to_next_frame;
+#   rc_be_frame_slot is the instance's rule (D3D12 and null: the image, as
+#   before; Vulkan: the next slot after each present). The swap images are
+#   gpu_swap_image_count's (s_rc_swap_n, up to RC_SWAP_MAX 8):
+#   swap_buffers_get, blit_to_window, swap_resize, rc_back_buffer,
+#   rc_back_buffer_count, rc_overlay_frame, RSX_HDR_SNAP and shutdown name
+#   the image, not the slot.
