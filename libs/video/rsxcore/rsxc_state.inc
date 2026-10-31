@@ -3,6 +3,7 @@
  * -----------------------------------------------------------------------*/
 
 #define FRAME_COUNT         2   /* double buffering */
+#define RC_SWAP_MAX         8   /* the swap chain's images: Vulkan may make more than FRAME_COUNT (step VC1) */
 #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
 /* Fragment texture units a draw records and binds: all sixteen the RSX has.
@@ -397,7 +398,7 @@ static D3D12State s_d3d;
  * any of them; the menu's exports borrow them in rsxc_api.inc.) */
 static gpu_device*   s_rc_dev;
 static gpu_swapchain s_rc_swap;
-static gpu_texture   s_rc_swap_image[FRAME_COUNT];
+static gpu_texture   s_rc_swap_image[RC_SWAP_MAX];   /* by image index, s_rc_swap_n of them (step VC1) */
 static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
 static gpu_texture   s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a) */
@@ -682,7 +683,7 @@ static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
 static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
-static gpu_view       s_rc_swap_rtv[FRAME_COUNT];     /* the swap chain images' RTVs */
+static gpu_view       s_rc_swap_rtv[RC_SWAP_MAX];     /* the swap chain images' RTVs */
 
 /* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and
  * kept with t. Format 0 and flags 0 are today's NULL RTV description; DSVs
@@ -712,4 +713,19 @@ static const gpu_pipeline k_rc_no_pipe = {0};      /* none */
 /* The overlay's frame callback with the window's buffer fi (the menu's,
  * rsxc_api.inc). */
 static void rc_overlay_frame(u32 fi);
+
+/* Step VC1: a frame slot is not a swap chain image. The slot
+ * (s_d3d.frame_index: the recorders, s_rc_frame_fence, the display targets,
+ * the blit's tables) is the instance file's pick (rc_be_frame_slot); the
+ * image (s_rc_image, below s_rc_swap_n) picks only the window's image and
+ * its view. On D3D12 the two are the same number, as today: the swap chain
+ * has FRAME_COUNT buffers and its index moves only at a present. On Vulkan
+ * the driver may make more images and hands them out in any order. */
+static u32 s_rc_image;    /* the image the last acquire gave */
+static u32 s_rc_swap_n;   /* the swap chain's images (swap_buffers_get) */
+static void rc_acquire(void)
+{
+    s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
+    s_d3d.frame_index = rc_be_frame_slot(s_d3d.frame_index, s_rc_image);
+}
 

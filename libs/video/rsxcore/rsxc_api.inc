@@ -129,7 +129,7 @@ static void rc_backend_shutdown(void)
     /* The swap chain and its buffers, the recorders, the fence, the queue and
      * the device are the GPU layer's: gpu_destroy frees them once the GPU is
      * idle. */
-    for (u32 i = 0; i < FRAME_COUNT; i++) s_rc_swap_image[i].id = 0;
+    for (u32 i = 0; i < RC_SWAP_MAX; i++) s_rc_swap_image[i].id = 0;
     s_rc_cmd = NULL;
     s_rc_swap.id = 0;
     /* Step C4: the table pools, the texture slots, the staging buffers and
@@ -425,12 +425,15 @@ static void*    rc_device(void)       { return s_rc_dev ? rc_be_device(s_rc_dev)
 static void*    rc_queue(void)        { return s_rc_dev ? rc_be_queue(s_rc_dev) : NULL; }
 static void*    rc_back_buffer(unsigned i)
 {
-    if (i >= FRAME_COUNT || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
+    if (i >= s_rc_swap_n || !s_rc_dev || !GPU_VALID(s_rc_swap_image[i])) return NULL;
     return rc_be_image(s_rc_dev, s_rc_swap_image[i]);
 }
+/* The image the frame was drawn into (step VC1: the acquired one; frame
+ * slot fi's on D3D12). */
 static void rc_overlay_frame(u32 fi)
 {
-    s_overlay.frame(s_overlay.user, rc_back_buffer(fi), fi, s_d3d.win_w, s_d3d.win_h);
+    (void)fi;
+    s_overlay.frame(s_overlay.user, rc_back_buffer(s_rc_image), s_rc_image, s_d3d.win_w, s_d3d.win_h);
 }
 /* (The end of the menu's objects.) */
 static long     rc_device_lost(long long* qpc)
@@ -456,7 +459,7 @@ static void rc_post_message(unsigned msg, unsigned long long wp, long long lp)
     SDL_PushEvent(&e);
 #endif
 }
-static unsigned rc_back_buffer_count(void)  { return s_d3d.initialized ? FRAME_COUNT : 0; }
+static unsigned rc_back_buffer_count(void)  { return s_d3d.initialized ? s_rc_swap_n : 0; }   /* (step VC1) */
 static unsigned rc_back_buffer_format(void)
 {
     return (unsigned)(s_hdr.active ? GPU_FORMAT_R16G16B16A16_FLOAT : GPU_FORMAT_R8G8B8A8_UNORM);

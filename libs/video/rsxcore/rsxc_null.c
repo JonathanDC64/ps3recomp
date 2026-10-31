@@ -89,9 +89,9 @@ static int rc_be_key_blob(u64 key, const char* entry, gpu_sc_blob* out)
     return 1;
 }
 static int rc_be_sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
-                            unsigned flags, gpu_sc_blob* out, char* msg, size_t cap)
+                            unsigned flags, const gpu_layout_desc* layout, gpu_sc_blob* out, char* msg, size_t cap)
 {
-    (void)name; (void)flags;
+    (void)name; (void)flags; (void)layout;   /* (the key names the text; the layout is the pipeline's) */
     if (msg && cap) msg[0] = 0;
     if ((unsigned)stage >= GPU_SC_STAGE_COUNT || !src) return 0;
     return rc_be_key_blob(gpu_sc_key(src, n, k_rc_null_profile[stage]), entry, out);
@@ -132,6 +132,9 @@ static void rc_be_presented(gpu_device* d)
     printf("[null] present %u: stream %016llx, %u failed checks\n", s_rc_null_presents,
            (unsigned long long)gpu_null_stream_hash(d), gpu_null_errors(d, GPU_NULL_ERR_ALL));
 }
+
+/* The frame slot after an acquire: the image's index, as on D3D12. */
+static u32 rc_be_frame_slot(u32 prev, u32 image) { (void)prev; return image; }
 
 #include "rsxc_core.inc"
 

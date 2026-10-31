@@ -13,12 +13,16 @@
  *              for now): no window and no GPU; every command is checked
  *              against gpu.h and hashed. For developers and CI only, never
  *              in Settings (rsxc_null.c says what it prints).
- * Anything else (vulkan, metal, auto, a typo) is not in this build yet and
- * runs d3d12. The pick prints one line, on every route:
+ *   vulkan     the new path on its Vulkan backend (gpu_vk*.c, Windows only
+ *              for now, in builds with PS3RECOMP_RSX_HAL_VULKAN), for
+ *              developers' A/Bs until it is in Settings (rsxc_vk.c).
+ * Anything else (metal, auto, a typo, vulkan in a build without it) is not
+ * in this build and runs d3d12. The pick prints one line, on every route:
  *   [rsx_out] route d3d12
  *   [rsx_out] route hal-d3d12 (the new path on its own D3D12 backend)
  *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
- *   [rsx_out] route d3d12 (RSX_BACKEND=vulkan is not in this build)
+ *   [rsx_out] route vulkan (the new path on its Vulkan backend)
+ *   [rsx_out] route d3d12 (RSX_BACKEND=metal is not in this build)
  *
  * The functions are rsx_d3d12_backend.h's, with the same parameters and
  * meaning (see there), plus the profile sessions (rsx_prof_*, boot_main's
@@ -93,14 +97,15 @@ RSX_OUT_FUNCS(RSX_OUT_DECL_V_, RSX_OUT_DECL_R_)
 #undef RSX_OUT_DECL_V_
 #undef RSX_OUT_DECL_R_
 
-/* The route that runs: "d3d12", "hal-d3d12" or "null". Picks it if no call
- * has. */
+/* The route that runs: "d3d12", "hal-d3d12", "null" or "vulkan". Picks it if
+ * no call has. */
 const char* rsx_out_renderer(void);
 
 /* A renderer other than today's, as a table of the functions above. The
  * new path's core defines one per backend it is compiled for:
- * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows) and
- * rsxc_route_null (rsxc_null.c, Windows for now). */
+ * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows),
+ * rsxc_route_null (rsxc_null.c, Windows for now) and rsxc_route_vk
+ * (rsxc_vk.c, Windows for now, in builds with PS3RECOMP_RSX_HAL_VULKAN). */
 #define RSX_OUT_FIELD_V_(name, legacy, params, args)      void (*name) params;
 #define RSX_OUT_FIELD_R_(ret, name, legacy, params, args) ret (*name) params;
 typedef struct rsx_route {
@@ -113,6 +118,9 @@ typedef struct rsx_route {
 #if defined(_WIN32)
 extern const rsx_route rsxc_route_d3d12;
 extern const rsx_route rsxc_route_null;
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+extern const rsx_route rsxc_route_vk;   /* rsxc_vk.c */
+#endif
 #endif
 
 #ifdef __cplusplus
