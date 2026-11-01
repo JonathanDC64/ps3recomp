@@ -404,7 +404,7 @@ static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
         InterlockedIncrement(r > 0 ? &s_pxb_built : r == 0 ? &s_pxb_had : &s_pxb_failed);
         if (r < 0) pxi_not_built(s_pxb_why, "pipeline index row", i, &s_pxb[i], r);
     }
-    if (InterlockedDecrement(&s_pxb_live) == 0) {
+    if (InterlockedDecrement(&s_pxb_run) == 0) {
         const u32 done = (u32)(s_pxb_built + s_pxb_had + s_pxb_failed);
         printf("[D3D12] pipeline index: %ld built, %ld there already, %ld not built, of %u, in %.0f ms\n",
                s_pxb_built, s_pxb_had, s_pxb_failed, s_pxb_n, 1000.0 * (perf_now() - s_pxb_t0));
@@ -416,6 +416,7 @@ static DWORD WINAPI pxi_build_thread(LPVOID gs_id)
                                                        (unsigned long long)s_pxb_hash));
         }
     }
+    InterlockedDecrement(&s_pxb_live);
     return 0;
 }
 
@@ -450,10 +451,10 @@ static void pso_index_build_start(void)
      * built: their vertex shader is the program's kind 4, made at a draw.) */
     const int nt = pxi_threads();
     s_pxb_t0 = perf_now();
-    s_pxb_live = nt;
+    s_pxb_live = s_pxb_run = nt;
     for (int t = 0; t < nt; t++) {
         HANDLE h = CreateThread(NULL, 0, pxi_build_thread, (LPVOID)(uintptr_t)gs.id, 0, NULL);
-        if (h) CloseHandle(h); else InterlockedDecrement(&s_pxb_live);
+        if (h) CloseHandle(h); else { InterlockedDecrement(&s_pxb_run); InterlockedDecrement(&s_pxb_live); }
     }
 }
 
@@ -473,13 +474,14 @@ static DWORD WINAPI gm_build_thread(LPVOID gs_id)
         InterlockedIncrement(r > 0 ? &s_gmb_built : r == 0 ? &s_gmb_had : &s_gmb_failed);
         if (r < 0) pxi_not_built(s_gmb_why, "pipeline manifest record", s_gm_have + i, &it, r);
     }
-    if (InterlockedDecrement(&s_gmb_live) == 0) {
+    if (InterlockedDecrement(&s_gmb_run) == 0) {
         printf("[D3D12] pipeline manifest build: %ld built, %ld there already, %ld not built, of %u, in %.0f ms\n",
                (long)s_gmb_built, (long)s_gmb_had, (long)s_gmb_failed, n, 1000.0 * (perf_now() - s_gmb_t0));
         pxi_why_print(s_gmb_why, "pipeline manifest build", s_gmb_failed);
         /* (the count moves on only once every record is in the library) */
         s_gmb_complete = !s_pso_pre_abort && !s_gmb_failed && (u32)(s_gmb_built + s_gmb_had) == n;
     }
+    InterlockedDecrement(&s_gmb_live);   /* (after s_gmb_complete: the save reads it once this is 0) */
     return 0;
 }
 static void gm_build_start(void)
@@ -493,10 +495,10 @@ static void gm_build_start(void)
     const gpu_shader gs = pxi_gs_for(any);
     const int nt = pxi_threads();
     s_gmb_t0 = perf_now();
-    s_gmb_live = nt;
+    s_gmb_live = s_gmb_run = nt;
     for (int t = 0; t < nt; t++) {
         HANDLE h = CreateThread(NULL, 0, gm_build_thread, (LPVOID)(uintptr_t)gs.id, 0, NULL);
-        if (h) CloseHandle(h); else InterlockedDecrement(&s_gmb_live);
+        if (h) CloseHandle(h); else { InterlockedDecrement(&s_gmb_run); InterlockedDecrement(&s_gmb_live); }
     }
 }
 
