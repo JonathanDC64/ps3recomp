@@ -1288,6 +1288,19 @@ static void test_cache(void)
         gpu_spv_tag(NULL, tag, sizeof tag);
         if (g_verbose) printf("  tag: %s\n", tag);
         CHECK(strstr(tag, gpu_spv_compiler()) && strstr(tag, ";edits=") && strstr(tag, ";layout="), "tag %s", tag);
+        /* Without the fetch clamp E3 is left out, and its files are other ones. */
+        const unsigned was = gpu_sc_spv_options();
+        gpu_sc_spv_set_options(was | GPU_SC_SPV_FETCH_CLAMP);
+        const uint64_t with = gpu_spv_key(K, NULL);
+        CHECK(gpu_spv_edits() == GPU_SPV_EDITS_ALL, "the edits with the fetch clamp");
+        gpu_sc_spv_set_options(was & ~GPU_SC_SPV_FETCH_CLAMP);
+        char tag0[320], ed0[64];
+        gpu_spv_tag(NULL, tag0, sizeof tag0);
+        snprintf(ed0, sizeof ed0, ";edits=%d.%d.0.%d.%d;", GPU_SPV_E1_VERSION, GPU_SPV_E2_VERSION, GPU_SPV_E4_VERSION,
+                 GPU_SPV_E5_VERSION);
+        CHECK(gpu_spv_edits() == (GPU_SPV_EDITS_ALL & ~GPU_SPV_E3) && strstr(tag0, ed0) && strcmp(tag0, tag) &&
+              gpu_spv_key(K, NULL) != with, "the tag without the fetch clamp: %s", tag0);
+        gpu_sc_spv_set_options(was);
     }
     gpu_sc_perf(0);
 }

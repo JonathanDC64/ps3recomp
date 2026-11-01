@@ -1368,12 +1368,14 @@ static void test_raw_switch(scene* s)
 }
 
 /* The vertex fetch's loads (the core's fetch form, rsx_vp_decompile_fetch)
- * through the spv target, whose edit E3 keeps them inside t20: every byte of
- * t20 reads back, from the buffer's start and from an offset (the core's two
- * parity halves of vf_buf), and past its end reads 0. E3's first version took
- * glslang's GetDimensions (uints) for bytes, so a read past a quarter of the
- * range gave 0: the far half of a Demon's Souls frame's fetch ring. */
-static void test_fetch_bounds(scene* s)
+ * through the spv target, kept inside t20 by its edit E3 (clamp = 1, a
+ * device without robustBufferAccess2) or by robustBufferAccess2 alone: every
+ * byte of t20 reads back, from the buffer's start and from an offset (the
+ * core's two parity halves of vf_buf), and past its end reads 0. E3's first
+ * version took glslang's GetDimensions (uints) for bytes, so a read past a
+ * quarter of the range gave 0: the far half of a Demon's Souls frame's fetch
+ * ring. */
+static void fetch_bounds(scene* s, int clamp)
 {
     static const char k_vs[] =
         "ByteAddressBuffer vf_raw : register(t20);\n"
@@ -1402,6 +1404,7 @@ static void test_fetch_bounds(scene* s)
     unsigned opts = GPU_SC_SPV_DEFAULT & ~(GPU_SC_SPV_FLOAT_PRESERVE | GPU_SC_SPV_DENORM_PRESERVE);
     if (p12.shaderSignedZeroInfNanPreserveFloat32) opts |= GPU_SC_SPV_FLOAT_PRESERVE;
     if (p12.shaderDenormPreserveFloat32) opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    if (clamp) opts |= GPU_SC_SPV_FETCH_CLAMP;
     gpu_sc_spv_set_options(opts);
     gpu_sc_blob blob;
     char err[512];
@@ -1475,8 +1478,8 @@ static void test_fetch_bounds(scene* s)
         gpu_cmd_barrier(c, s->rt, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
         const int ran = run(g_d, c);
         const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0);
-        char what[64];
-        snprintf(what, sizeof what, "fetch bounds, %s", k[i].what);
+        char what[96];
+        snprintf(what, sizeof what, "fetch bounds (%s), %s", clamp ? "E3" : "robustness2", k[i].what);
         /* The ones times the texel (128, 255, 255, 255); 0 reads nothing. */
         const int lit = k[i].lit;
         ok &= ran && tex_read(s->rt, &td, &rb) &&
@@ -1488,8 +1491,15 @@ static void test_fetch_bounds(scene* s)
     }
     CHECK(ok);
     gpu_buffer_destroy(g_d, b, 0);
-    printf("  vertex fetch loads through the spv target: all of t20 read, from 0 and from %u KB; 0 past its end\n",
-           half >> 10);
+    printf("  vertex fetch loads through the spv target (%s): all of t20 read, from 0 and from %u KB; 0 past its end\n",
+           clamp ? "E3" : "robustness2", half >> 10);
+}
+
+static void test_fetch_bounds(scene* s)
+{
+    fetch_bounds(s, 1);
+    if (g_d->caps.bits & GPU_CAP_ROBUST2) fetch_bounds(s, 0);
+    else printf("  fetch bounds without E3: skipped (no robustBufferAccess2)\n");
 }
 
 static void test_caches(void)
