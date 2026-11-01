@@ -21,7 +21,8 @@
  *     shader, a read-only depth target, occlusion counts; a post pass with a
  *     static sampler;
  *   - the table memo, sampler and view caching, fences and a wait's timeout;
- *     t20 switched between buffers from draw to draw (the set-0 memo);
+ *     t20 switched between buffers from draw to draw (the set-0 memo); the
+ *     vertex fetch's loads through the spv target over all of t20;
  *   - the pipeline cache across two devices, a swap chain on a hidden window
  *     and one made on a minimized window, then minimized, hidden, shown and
  *     resized between frames (Windows), breadcrumbs and the fault report.
@@ -34,6 +35,7 @@
 #include "gpu_vk_internal.h"
 #include "gpu_vk_cmd.h"
 #include "test_gpu_vk_spv.h"
+#include "gpu_shader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1365,6 +1367,131 @@ static void test_raw_switch(scene* s)
            (unsigned)(sizeof seq / sizeof seq[0]));
 }
 
+/* The vertex fetch's loads (the core's fetch form, rsx_vp_decompile_fetch)
+ * through the spv target, whose edit E3 keeps them inside t20: every byte of
+ * t20 reads back, from the buffer's start and from an offset (the core's two
+ * parity halves of vf_buf), and past its end reads 0. E3's first version took
+ * glslang's GetDimensions (uints) for bytes, so a read past a quarter of the
+ * range gave 0: the far half of a Demon's Souls frame's fetch ring. */
+static void test_fetch_bounds(scene* s)
+{
+    static const char k_vs[] =
+        "ByteAddressBuffer vf_raw : register(t20);\n"
+        "cbuffer VFDraw : register(b2) { uint vf_desc; };\n"
+        "struct VO { float4 pos : SV_Position; float4 c : COLOR0; };\n"
+        "VO main(uint vid : SV_VertexID) {\n"
+        "    VO o; float2 t = float2((vid << 1) & 2, vid & 2);\n"
+        "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "    o.c = asfloat(vf_raw.Load4(vf_desc)) * asfloat(vf_raw.Load(vf_desc + 16u));\n"
+        "    return o; }\n";
+    if (!gpu_sc_available(GPU_SC_SPV)) {
+        printf("  fetch bounds: skipped (no spv target in this build)\n");
+        return;
+    }
+    /* The float controls only where the device keeps them, as the core's
+     * rc_vk_spv_options sets them. */
+    VkPhysicalDeviceVulkan12Properties p12;
+    VkPhysicalDeviceProperties2 p2;
+    memset(&p12, 0, sizeof p12);
+    memset(&p2, 0, sizeof p2);
+    p12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &p12;
+    vkGetPhysicalDeviceProperties2(g_vk->phys, &p2);
+    const unsigned was = gpu_sc_spv_options();
+    unsigned opts = GPU_SC_SPV_DEFAULT & ~(GPU_SC_SPV_FLOAT_PRESERVE | GPU_SC_SPV_DENORM_PRESERVE);
+    if (p12.shaderSignedZeroInfNanPreserveFloat32) opts |= GPU_SC_SPV_FLOAT_PRESERVE;
+    if (p12.shaderDenormPreserveFloat32) opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    gpu_sc_spv_set_options(opts);
+    gpu_sc_blob blob;
+    char err[512];
+    const int rc = gpu_sc_compile_layout(GPU_SC_SPV, GPU_SC_VS, k_vs, sizeof k_vs - 1, "fetch_bounds", NULL, NULL,
+                                         GPU_SC_NO_CACHE, &blob, err, sizeof err);
+    gpu_sc_spv_set_options(was);
+    if (rc != GPU_SC_OK) printf("  fetch bounds: the vertex shader did not compile: %s\n", err);
+    CHECK(rc == GPU_SC_OK);
+    if (rc != GPU_SC_OK) return;
+    gpu_shader_desc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.stage = GPU_STAGE_VS;
+    sd.code = GPU_CODE_SPIRV;
+    sd.bytes = blob.data;
+    sd.size = blob.size;
+    const gpu_shader vs = gpu_shader_create(g_d, &sd);
+    gpu_sc_blob_release(&blob);
+    gpu_pipeline_desc pd = s->desc;
+    pd.vs = vs;
+    pd.vertex.count = 0;   /* SV_VertexID only, as the core's fetch pipelines */
+    const gpu_pipeline pso = GPU_VALID(vs) ? gpu_pipeline_create(g_d, &pd, 0, NULL) : (gpu_pipeline){0};
+    CHECK(GPU_VALID(vs) && pso.v != 0);
+
+    /* 1 MB of t20, the core's vf_buf use: at each place a float4 of ones,
+     * then a 1.0 (the draw's colour is their product). */
+    const uint32_t size = 1u << 20, half = size / 2;
+    gpu_buffer_desc bd;
+    memset(&bd, 0, sizeof bd);
+    bd.size = size;
+    bd.use = GPU_USE_RAW;
+    bd.memory = GPU_MEM_UPLOAD;
+    bd.state = GPU_STATE_GENERIC_READ;
+    const gpu_buffer b = gpu_buffer_create(g_d, &bd);
+    CHECK(GPU_VALID(b));
+    if (!GPU_VALID(b) || !pso.v) {
+        if (GPU_VALID(b)) gpu_buffer_destroy(g_d, b, 0);
+        return;
+    }
+    uint8_t* p = buf_ptr(b);
+    memset(p, 0, size);
+    static const struct { uint32_t base, at; int lit; const char* what; } k[] = {
+        {0, 16, 1, "start"},
+        {0, size / 4 + 16, 1, "past a quarter"},
+        {0, size * 3 / 4, 1, "three quarters"},
+        {0, size - 32, 1, "the last whole read"},
+        {0, size - 16, 0, "partly past the end"},
+        {0, size, 0, "past the end"},
+        {half, half / 4 + 64, 1, "the second half, past a quarter of it"},
+        {half, half - 32, 1, "the second half's last whole read"},
+        {half, half, 0, "past the second half's end"},
+    };
+    const float one4[5] = {1, 1, 1, 1, 1};
+    for (uint32_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (k[i].lit) memcpy(p + k[i].base + k[i].at, one4, sizeof one4);
+    const gpu_table t16 = gpu_fast_table_ref(g_d, s->tex_pool, 16);
+    const float zero[4] = {0, 0, 0, 0};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = s->rtv;
+    int ok = 1;
+    for (uint32_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        readback rb;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_pass_begin(c, &pass);
+        gpu_cmd_clear_color(c, s->rtv, zero, NULL);
+        scene_binds(c, s, pso, t16, 0, 0);
+        gpu_cmd_bind_raw(c, 4, gpu_fast_buffer_addr(g_d, b) + k[i].base);
+        gpu_cmd_push_const1(c, 5, k[i].at, 0);
+        gpu_cmd_draw(c, 3, 1, 0, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        const int ran = run(g_d, c);
+        const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0);
+        char what[64];
+        snprintf(what, sizeof what, "fetch bounds, %s", k[i].what);
+        /* The ones times the texel (128, 255, 255, 255); 0 reads nothing. */
+        const int lit = k[i].lit;
+        ok &= ran && tex_read(s->rt, &td, &rb) &&
+              px_is(&rb, 8, 8, lit ? 128 : 0, lit ? 255 : 0, lit ? 255 : 0, lit ? 255 : 0, what);
+        rb_done(&rb);
+        c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_COPY_SOURCE, GPU_STATE_RENDER_TARGET);
+        run(g_d, c);
+    }
+    CHECK(ok);
+    gpu_buffer_destroy(g_d, b, 0);
+    printf("  vertex fetch loads through the spv target: all of t20 read, from 0 and from %u KB; 0 past its end\n",
+           half >> 10);
+}
+
 static void test_caches(void)
 {
     gpu_sampler_desc sd;
@@ -2232,6 +2359,7 @@ int main(void)
         test_post(&s);
         test_memo(&s);
         test_raw_switch(&s);
+        test_fetch_bounds(&s);
     }
     test_caches();
     test_fences();

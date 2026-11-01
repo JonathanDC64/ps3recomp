@@ -502,7 +502,7 @@ static void check_idioms(const char* t, const gpu_layout_desc* L, JobResult* r)
         if (q && (!nl || q < nl)) { jr_fail(r, "E2 left a DIVSQ guard: %.60s", p); return; }
     }
     for (const char* p = strstr(t, "vf_raw.Load"); p; p = strstr(p + 11, "vf_raw.Load"))
-        if (strncmp(p + 11, "(min(a, max(n, 4u)", 18) && strncmp(p + 11, "4(min(a, max(n, 16u)", 20)) {
+        if (strncmp(p + 11, "(min(w, max(n, 1u)", 18) && strncmp(p + 11, "4(min(w, max(n, 4u)", 19)) {
             jr_fail(r, "E3 left a load: %.40s", p);
             return;
         }
@@ -742,6 +742,7 @@ static const Golden k_golden[] = {
     { GPU_SPV_E1, 1, 0x8c7dacc32c2289f1ull },
     { GPU_SPV_E2, 1, 0x65d091bd563b2df9ull },
     { GPU_SPV_E3, 1, 0x18b28b3bc5b2cfe8ull },
+    { GPU_SPV_E3, 2, 0x6c9898290b3d4902ull },   /* bounds in words: GetDimensions is glslang's uint count */
     { GPU_SPV_E4, 1, 0x20c7ec2a01ed1b62ull },
     { GPU_SPV_E5, 1, 0xd3c093dd4050a371ull },
 };
