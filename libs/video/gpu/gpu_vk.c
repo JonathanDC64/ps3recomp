@@ -694,6 +694,7 @@ static int tables_init(gpu_vk_device* dd)
              slots_init(&dd->tpool_slots, GPU_VK_MAX_TPOOLS) & slots_init(&dd->swap_slots, GPU_VK_MAX_SWAPS);
     dd->tex = (gpu_vk_tex*)calloc(GPU_VK_MAX_TEXTURES, sizeof *dd->tex);
     dd->tex_layout = (uint32_t*)calloc(GPU_VK_MAX_TEXTURES, sizeof *dd->tex_layout);
+    dd->tex_att = (uint64_t*)calloc(GPU_VK_MAX_TEXTURES, sizeof *dd->tex_att);
     dd->buf_vk = (VkBuffer*)calloc(GPU_VK_MAX_BUFFERS, sizeof *dd->buf_vk);
     dd->buf = (gpu_vk_buf*)calloc(GPU_VK_MAX_BUFFERS, sizeof *dd->buf);
     dd->view = (gpu_vk_view*)calloc(GPU_VK_MAX_VIEWS, sizeof *dd->view);
@@ -702,7 +703,7 @@ static int tables_init(gpu_vk_device* dd)
     dd->layout = (gpu_vk_layout*)calloc(GPU_VK_MAX_LAYOUTS, sizeof *dd->layout);
     dd->heap = (gpu_vk_heap*)calloc(GPU_VK_MAX_HEAPS, sizeof *dd->heap);
     dd->pso = (gpu_vk_pso*)calloc(GPU_VK_MAX_PIPELINES, sizeof *dd->pso);
-    return ok && dd->tex && dd->tex_layout && dd->buf_vk && dd->buf && dd->view && dd->samp && dd->shader &&
+    return ok && dd->tex && dd->tex_layout && dd->tex_att && dd->buf_vk && dd->buf && dd->view && dd->samp && dd->shader &&
            dd->layout && dd->heap && dd->pso;
 }
 
@@ -714,6 +715,7 @@ static void cmd_init(gpu_vk_device* dd, gpu_cmd* c)
     c->dd = dd;
     c->tex = dd->tex;
     c->tex_layout = dd->tex_layout;
+    c->tex_att = dd->tex_att;
     c->buf = dd->buf_vk;
     c->bufi = dd->buf;
     c->view = dd->view;
@@ -799,6 +801,7 @@ static void device_free(gpu_vk_device* dd)
     slots_fini(&dd->swap_slots);
     free(dd->tex);
     free(dd->tex_layout);
+    free(dd->tex_att);
     free(dd->buf_vk);
     free(dd->buf);
     free(dd->view);
@@ -1038,18 +1041,13 @@ static void barrier_global(gpu_cmd* c, VkPipelineStageFlags2 ss, VkAccessFlags2 
                            VkAccessFlags2 da)
 {
     VkMemoryBarrier2 mb;
-    VkDependencyInfo di;
     memset(&mb, 0, sizeof mb);
-    memset(&di, 0, sizeof di);
     mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     mb.srcStageMask = ss;
     mb.srcAccessMask = sa;
     mb.dstStageMask = ds;
     mb.dstAccessMask = da;
-    di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    di.memoryBarrierCount = 1;
-    di.pMemoryBarriers = &mb;
-    c->vk->vkCmdPipelineBarrier2(c->cb, &di);
+    gpu_vk_pend(c, NULL, 0, NULL, 0, &mb, 1);
 }
 
 /* Today's allocator and list Reset. Each recording starts with a barrier
@@ -1083,8 +1081,14 @@ static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
     c->dw = 1;
     c->pipe_dw = 0;
     c->restart = 0;
+    c->st_ok = c->vb_ok = c->pc_ok = 0;
+    c->pend_clr = 0;
+    c->last_dw = 2;
+    c->last_topo = GPU_TOPO_TRIANGLELIST;   /* as set below */
+    c->pend_ni = c->pend_nb = c->pend_nm = 0;
     barrier_global(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    c->att_order = dd->att_seq;
     {
         const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         dd->vk.vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
@@ -1100,9 +1104,10 @@ static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
 static void vkb_cmd_end(gpu_device* d, gpu_cmd* c)
 {
     (void)d;
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     barrier_global(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
                    VK_ACCESS_2_HOST_READ_BIT);
+    gpu_vk__sync(c);
     c->vk->vkEndCommandBuffer(c->cb);
 }
 
@@ -1125,20 +1130,67 @@ static void img_barrier(gpu_cmd* c, VkImageMemoryBarrier2* b, uint32_t i, VkImag
     b->subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
 }
 
-static void barriers_flush(gpu_cmd* c, const VkImageMemoryBarrier2* ib, uint32_t ni, const VkBufferMemoryBarrier2* bb,
-                           uint32_t nb, const VkMemoryBarrier2* mb, uint32_t nm)
+void gpu_vk_sync_slow(gpu_cmd* c)
 {
-    if (!ni && !nb && !nm) return;
     VkDependencyInfo di;
     memset(&di, 0, sizeof di);
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    di.memoryBarrierCount = nm;
-    di.pMemoryBarriers = mb;
-    di.bufferMemoryBarrierCount = nb;
-    di.pBufferMemoryBarriers = bb;
-    di.imageMemoryBarrierCount = ni;
-    di.pImageMemoryBarriers = ib;
+    di.memoryBarrierCount = c->pend_nm;
+    di.pMemoryBarriers = &c->pend_mem;
+    di.bufferMemoryBarrierCount = c->pend_nb;
+    di.pBufferMemoryBarriers = c->pend_buf;
+    di.imageMemoryBarrierCount = c->pend_ni;
+    di.pImageMemoryBarriers = c->pend_img;
     c->vk->vkCmdPipelineBarrier2(c->cb, &di);
+    c->pend_ni = c->pend_nb = c->pend_nm = 0;
+}
+
+static int ranges_meet(const VkImageSubresourceRange* a, const VkImageSubresourceRange* b)
+{
+    if (!(a->aspectMask & b->aspectMask)) return 0;
+    const uint32_t a_m1 = a->levelCount == VK_REMAINING_MIP_LEVELS ? UINT32_MAX : a->baseMipLevel + a->levelCount;
+    const uint32_t b_m1 = b->levelCount == VK_REMAINING_MIP_LEVELS ? UINT32_MAX : b->baseMipLevel + b->levelCount;
+    const uint32_t a_l1 = a->layerCount == VK_REMAINING_ARRAY_LAYERS ? UINT32_MAX : a->baseArrayLayer + a->layerCount;
+    const uint32_t b_l1 = b->layerCount == VK_REMAINING_ARRAY_LAYERS ? UINT32_MAX : b->baseArrayLayer + b->layerCount;
+    return a->baseMipLevel < b_m1 && b->baseMipLevel < a_m1 && a->baseArrayLayer < b_l1 && b->baseArrayLayer < a_l1;
+}
+
+/* Two barriers of one subresource in one call are unordered, so a second
+ * one sends what is held first; a memory barrier joins the held one (the
+ * union of their scopes orders at least as much). */
+void gpu_vk_pend(gpu_cmd* c, const VkImageMemoryBarrier2* ib, uint32_t ni, const VkBufferMemoryBarrier2* bb,
+                 uint32_t nb, const VkMemoryBarrier2* mb, uint32_t nm)
+{
+    for (uint32_t k = 0; k < ni; k++) {
+        int meet = c->pend_ni == GPU_VK_MAX_PENDING;
+        for (uint32_t j = 0; j < c->pend_ni && !meet; j++)
+            meet = c->pend_img[j].image == ib[k].image &&
+                   ranges_meet(&c->pend_img[j].subresourceRange, &ib[k].subresourceRange);
+        if (meet) gpu_vk_sync_slow(c);
+        c->pend_img[c->pend_ni++] = ib[k];
+    }
+    for (uint32_t k = 0; k < nb; k++) {
+        int meet = c->pend_nb == GPU_VK_MAX_PENDING;
+        for (uint32_t j = 0; j < c->pend_nb && !meet; j++) {
+            const VkBufferMemoryBarrier2* const p = &c->pend_buf[j];
+            const VkDeviceSize p1 = p->size == VK_WHOLE_SIZE ? ~(VkDeviceSize)0 : p->offset + p->size;
+            const VkDeviceSize k1 = bb[k].size == VK_WHOLE_SIZE ? ~(VkDeviceSize)0 : bb[k].offset + bb[k].size;
+            meet = p->buffer == bb[k].buffer && p->offset < k1 && bb[k].offset < p1;
+        }
+        if (meet) gpu_vk_sync_slow(c);
+        c->pend_buf[c->pend_nb++] = bb[k];
+    }
+    if (nm) {
+        if (!c->pend_nm) {
+            c->pend_mem = *mb;
+            c->pend_nm = 1;
+        } else {
+            c->pend_mem.srcStageMask |= mb->srcStageMask;
+            c->pend_mem.srcAccessMask |= mb->srcAccessMask;
+            c->pend_mem.dstStageMask |= mb->dstStageMask;
+            c->pend_mem.dstAccessMask |= mb->dstAccessMask;
+        }
+    }
 }
 
 void gpu_vk_tex_touch(gpu_cmd* c, uint32_t i)
@@ -1147,7 +1199,8 @@ void gpu_vk_tex_touch(gpu_cmd* c, uint32_t i)
     VkImageMemoryBarrier2 b;
     img_barrier(c, &b, i, VK_IMAGE_LAYOUT_UNDEFINED, c->tex[i].init_layout);
     c->tex_layout[i] = (uint32_t)b.newLayout;
-    barriers_flush(c, &b, 1, NULL, 0, NULL, 0);
+    c->tex_att[i] = 0;
+    gpu_vk_pend(c, &b, 1, NULL, 0, NULL, 0);
 }
 
 /* A subresource number's mip, layer and aspect (D3D12's planes: 0 depth,
@@ -1163,12 +1216,20 @@ static void sub_of(const gpu_vk_tex* t, uint32_t sub, uint32_t* mip, uint32_t* l
     else *aspect = t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
 }
 
-/* Between two passes of one recording: the first's target writes before
- * the second's loads and writes (D3D12 orders them; Vulkan orders only
- * within a pass). */
-static void pass_order(gpu_cmd* c)
+/* Between two passes: an earlier one's attachment reads and writes before
+ * this one's (D3D12 orders them; Vulkan orders only within a pass), when one
+ * of this pass's n textures was an attachment since the last barrier that
+ * orders it (a barrier of that texture, or this one, or the recording's
+ * start). Then this pass's textures are stamped with its number. */
+static void pass_order(gpu_cmd* c, const uint32_t* tex, uint32_t n)
 {
-    if (c->npasses++ == 0) return;
+    c->npasses++;
+    int need = 0;
+    for (uint32_t k = 0; k < n && !need; k++) need = c->tex_att[tex[k]] > c->att_order;
+    const uint64_t seq = ++c->dd->att_seq;
+    for (uint32_t k = 0; k < n; k++) c->tex_att[tex[k]] = seq;
+    if (!need) return;
+    c->att_order = seq - 1;
     const VkPipelineStageFlags2 st = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
                                      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -1195,16 +1256,22 @@ static void att_info(VkRenderingAttachmentInfo* a, VkImageView iv, VkImageLayout
 void gpu_vk_pass_open(gpu_cmd* c)
 {
     const VkPhysicalDeviceLimits* const lim = &c->dd->props.limits;
-    VkRenderingAttachmentInfo col[4], ds;
+    VkRenderingAttachmentInfo col[4], ds, st;
     VkRenderingInfo ri;
     uint32_t w = lim->maxFramebufferWidth, h = lim->maxFramebufferHeight;
-    VkImageAspectFlags ds_aspect = 0;
+    VkImageAspectFlags ds_aspect = 0, late = 0;
+    uint32_t used[5], nused = 0;
     for (uint32_t i = 0; i < 4; i++) {
         att_info(&col[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, 0);
         if (i < c->pass.nrt && GPU_VALID(c->pass.rt[i])) {
             const gpu_vk_view* const v = &c->view[GPU_HANDLE_INDEX(c->pass.rt[i].id)];
             gpu_vk_tex_touch(c, v->tex);
+            used[nused++] = v->tex;
             att_info(&col[i], v->iv, (VkImageLayout)c->tex_layout[v->tex], 0);
+            if (c->pend_clr & (1u << i)) {
+                col[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                col[i].clearValue = c->clr[i];
+            }
             if (v->width < w) w = v->width;
             if (v->height < h) h = v->height;
         }
@@ -1213,15 +1280,26 @@ void gpu_vk_pass_open(gpu_cmd* c)
     if (GPU_VALID(c->pass.ds)) {
         const gpu_vk_view* const v = &c->view[GPU_HANDLE_INDEX(c->pass.ds.id)];
         gpu_vk_tex_touch(c, v->tex);
+        used[nused++] = v->tex;
         const VkImageLayout l = (VkImageLayout)c->tex_layout[v->tex];
         const int ro = (v->desc.flags & GPU_VIEW_READ_ONLY_DEPTH) || l == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         att_info(&ds, v->iv, l, ro);
+        st = ds;
+        /* A read-only depth's clears stay inside the rendering, as before. */
+        if (c->pend_clr & 16u) {
+            if (ro) late |= VK_IMAGE_ASPECT_DEPTH_BIT;
+            else ds.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, ds.clearValue = c->clr[4];
+        }
+        if (c->pend_clr & 32u) {
+            if (ro) late |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            else st.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, st.clearValue = c->clr[4];
+        }
         ds_aspect = v->aspect;
         c->ro_depth = (uint32_t)ro;
         if (v->width < w) w = v->width;
         if (v->height < h) h = v->height;
     }
-    pass_order(c);
+    pass_order(c, used, nused);
     memset(&ri, 0, sizeof ri);
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     ri.renderArea.extent.width = w;
@@ -1230,11 +1308,14 @@ void gpu_vk_pass_open(gpu_cmd* c)
     ri.colorAttachmentCount = 4;
     ri.pColorAttachments = col;
     ri.pDepthAttachment = (ds_aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &ds : NULL;
-    ri.pStencilAttachment = (ds_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &ds : NULL;
+    ri.pStencilAttachment = (ds_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &st : NULL;
+    gpu_vk__sync(c);
     c->vk->vkCmdBeginRendering(c->cb, &ri);
     c->rendering = 1;
     c->area = ri.renderArea;
-    if (c->pipe_dw) c->vk->vkCmdSetDepthWriteEnable(c->cb, (c->dw && !c->ro_depth) ? VK_TRUE : VK_FALSE);
+    c->pend_clr = 0;
+    if (late) gpu_vk__clear(c, 0, late, &c->clr[4], NULL);
+    if (c->pipe_dw) gpu_vk__dw(c);
 }
 
 /* Set 0 found again when its buffers changed, then every set bound in runs
@@ -1283,9 +1364,9 @@ void gpu_vk_clear_unbound(gpu_cmd* c, gpu_view view, const VkClearValue* value, 
     const gpu_vk_view* const v = &c->view[GPU_HANDLE_INDEX(view.id)];
     VkRenderingAttachmentInfo a;
     VkRenderingInfo ri;
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_tex_touch(c, v->tex);
-    pass_order(c);
+    pass_order(c, &v->tex, 1);
     att_info(&a, v->iv, (VkImageLayout)c->tex_layout[v->tex], 0);
     memset(&ri, 0, sizeof ri);
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -1299,6 +1380,7 @@ void gpu_vk_clear_unbound(gpu_cmd* c, gpu_view view, const VkClearValue* value, 
         ri.pDepthAttachment = (v->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? &a : NULL;
         ri.pStencilAttachment = (v->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? &a : NULL;
     }
+    gpu_vk__sync(c);
     c->vk->vkCmdBeginRendering(c->cb, &ri);
     c->area = ri.renderArea;
     gpu_vk__clear(c, 0, aspects, value, rect);
@@ -1358,6 +1440,7 @@ void gpu_vk_rec_copy_texture(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, uint
     ci.dstImageLayout = (VkImageLayout)c->tex_layout[di];
     ci.regionCount = 1;
     ci.pRegions = &r;
+    gpu_vk__sync(c);
     c->vk->vkCmdCopyImage2(c->cb, &ci);
 }
 
@@ -1390,6 +1473,7 @@ void gpu_vk_rec_copy_whole(gpu_cmd* c, gpu_texture dst, gpu_texture src)
     ci.dstImageLayout = (VkImageLayout)c->tex_layout[di];
     ci.regionCount = n;
     ci.pRegions = r;
+    gpu_vk__sync(c);
     c->vk->vkCmdCopyImage2(c->cb, &ci);
 }
 
@@ -1433,6 +1517,7 @@ void gpu_vk_rec_buf_tex(gpu_cmd* c, int to_tex, gpu_texture tx, uint32_t sub, ui
         ci.dstImageLayout = (VkImageLayout)c->tex_layout[ti];
         ci.regionCount = 1;
         ci.pRegions = &r;
+        gpu_vk__sync(c);
         c->vk->vkCmdCopyBufferToImage2(c->cb, &ci);
     } else {
         if (box) {
@@ -1455,6 +1540,7 @@ void gpu_vk_rec_buf_tex(gpu_cmd* c, int to_tex, gpu_texture tx, uint32_t sub, ui
         ci.dstBuffer = c->buf[GPU_HANDLE_INDEX(b.id)];
         ci.regionCount = 1;
         ci.pRegions = &r;
+        gpu_vk__sync(c);
         c->vk->vkCmdCopyImageToBuffer2(c->cb, &ci);
     }
 }
@@ -1492,6 +1578,7 @@ void gpu_vk_rec_resolve(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, gpu_textu
     ri.dstImageLayout = (VkImageLayout)c->tex_layout[di];
     ri.regionCount = 1;
     ri.pRegions = &r;
+    gpu_vk__sync(c);
     c->vk->vkCmdResolveImage2(c->cb, &ri);
 }
 
@@ -1532,7 +1619,7 @@ void gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
     for (uint32_t k = 0; k < n; k++) {
         const gpu_barrier* const e = &list[k];
         if (ni == 32 || nb == 32) {
-            barriers_flush(c, ib, ni, bb, nb, &mb, nm);
+            gpu_vk_pend(c, ib, ni, bb, nb, &mb, nm);
             ni = nb = nm = 0;
         }
         if (e->type == GPU_BARRIER_ALIASING) {
@@ -1542,6 +1629,7 @@ void gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
                 img_barrier(c, &ib[ni], i, VK_IMAGE_LAYOUT_UNDEFINED,
                             cur != VK_IMAGE_LAYOUT_UNDEFINED ? cur : c->tex[i].init_layout);
                 c->tex_layout[i] = (uint32_t)ib[ni].newLayout;
+                c->tex_att[i] = 0;
                 ni++;
             } else if (!nm) {
                 memset(&mb, 0, sizeof mb);
@@ -1551,6 +1639,7 @@ void gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
                 mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
                 mb.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
                 nm = 1;
+                c->att_order = c->dd->att_seq;   /* everything before is ordered */
             }
         } else if (GPU_VALID(e->texture)) {
             const uint32_t i = GPU_HANDLE_INDEX(e->texture.id);
@@ -1571,6 +1660,7 @@ void gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
                 b->subresourceRange.layerCount = 1;
             }
             c->tex_layout[i] = (uint32_t)b->newLayout;
+            if (b->subresourceRange.levelCount == VK_REMAINING_MIP_LEVELS) c->tex_att[i] = 0;   /* all of it ordered */
         } else if (GPU_VALID(e->buffer)) {
             VkBufferMemoryBarrier2* const b = &bb[nb++];
             memset(b, 0, sizeof *b);
@@ -1583,7 +1673,7 @@ void gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
             b->size = VK_WHOLE_SIZE;
         }
     }
-    barriers_flush(c, ib, ni, bb, nb, &mb, nm);
+    gpu_vk_pend(c, ib, ni, bb, nb, &mb, nm);
 }
 
 /* ---------------------------------------------------------------------------

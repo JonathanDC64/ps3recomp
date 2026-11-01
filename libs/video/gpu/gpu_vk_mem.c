@@ -189,6 +189,7 @@ void gpu_vk_tex_free_now(gpu_vk_device* dd, uint32_t id)
     if (t->memory) dd->vk.vkFreeMemory(dd->device, t->memory, NULL);
     memset(t, 0, sizeof *t);
     dd->tex_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    dd->tex_att[i] = 0;
     gpu_vk_slot_free(&dd->tex_slots, id);
 }
 
@@ -446,11 +447,52 @@ void gpu_vk_buffer_unmap(gpu_device* d, gpu_buffer b, uint64_t written_offset, u
  * Textures
  * -------------------------------------------------------------------------*/
 
+/* The formats a TYPELESS colour format's views may take (its D3D12 family),
+ * so the driver need not give up the image's compression for any format. */
+typedef struct view_family {
+    uint16_t        dxgi;   /* the TYPELESS one */
+    uint8_t         n;
+    VkFormat        f[5];
+} view_family;
+
+static const view_family k_view_families[] = {
+    {1,  3, {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT}},
+    {9,  5, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UINT,
+             VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_SINT}},
+    {23, 2, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32}},
+    {27, 5, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SNORM,
+             VK_FORMAT_R8G8B8A8_SINT}},
+    {33, 4, {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SNORM}},
+    {39, 3, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}},
+    {48, 3, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SNORM}},
+    {53, 5, {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_SINT}},
+    {60, 4, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_SINT}},
+    {70, 2, {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK}},
+    {73, 2, {VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK}},
+    {76, 2, {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}},
+    {90, 2, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB}},
+};
+
+/* Filled in for the family of `format`, NULL for a format with none. */
+static const void* view_list(gpu_format format, VkImageFormatListCreateInfo* fl)
+{
+    for (size_t i = 0; i < sizeof k_view_families / sizeof k_view_families[0]; i++)
+        if (k_view_families[i].dxgi == (uint16_t)format) {
+            memset(fl, 0, sizeof *fl);
+            fl->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+            fl->viewFormatCount = k_view_families[i].n;
+            fl->pViewFormats = k_view_families[i].f;
+            return fl;
+        }
+    return NULL;
+}
+
 /* The image a description makes: every usage its format has (sampled and
  * both copies), plus the targets it asks for. A TYPELESS colour format's
- * views may reinterpret it; six square layers may be a cube. 0 when the
- * format cannot do what is asked. */
-static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu_vk_format* f, VkImageCreateInfo* ci)
+ * views may reinterpret it (as its family, in *fl, which ci points to); six
+ * square layers may be a cube. 0 when the format cannot do what is asked. */
+static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu_vk_format* f, VkImageCreateInfo* ci,
+                      VkImageFormatListCreateInfo* fl)
 {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(dd->phys, f->vk, &fp);
@@ -471,7 +513,10 @@ static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu
     if (!u) return 0;
     memset(ci, 0, sizeof *ci);
     ci->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    if (f->typeless && (f->aspect & GPU_VK_ASPECT_COLOR)) ci->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    if (f->typeless && (f->aspect & GPU_VK_ASPECT_COLOR)) {
+        ci->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        ci->pNext = view_list(desc->format, fl);
+    }
     if (desc->layers >= 6 && desc->layers % 6 == 0 && desc->width == desc->height && desc->samples <= 1)
         ci->flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     ci->imageType = VK_IMAGE_TYPE_2D;
@@ -529,6 +574,7 @@ gpu_texture gpu_vk_tex_add(gpu_vk_device* dd, VkImage image, VkDeviceMemory memo
         t->depth = (f->aspect & GPU_VK_ASPECT_DEPTH) != 0;
         t->init_layout = gpu_vk_state_layout(desc->state, t);
         dd->tex_layout[i] = init_now ? (uint32_t)t->init_layout : (uint32_t)VK_IMAGE_LAYOUT_UNDEFINED;
+        dd->tex_att[i] = 0;
         if (init_now) {
             dd->init[dd->ninit].tex = r.id;
             dd->init[dd->ninit].layout = t->init_layout;
@@ -637,13 +683,14 @@ gpu_heap gpu_vk_heap_create(gpu_device* d, const gpu_heap_desc* desc)
     gpu_heap r = {0};
     gpu_texture_desc td;
     VkImageCreateInfo ci;
+    VkImageFormatListCreateInfo fl;
     memset(&td, 0, sizeof td);
     td.width = td.height = 64;
     td.layers = td.mips = 1;
     td.samples = 1;
     td.format = GPU_FORMAT_R8G8B8A8_UNORM;
     td.use = GPU_USE_SAMPLED;
-    if (!desc->size || !image_info(dd, &td, gpu_vk_format_of(td.format, 0), &ci)) return r;
+    if (!desc->size || !image_info(dd, &td, gpu_vk_format_of(td.format, 0), &ci, &fl)) return r;
     VkDeviceImageMemoryRequirements ir;
     VkMemoryRequirements2 mr;
     memset(&ir, 0, sizeof ir);
@@ -680,9 +727,10 @@ void gpu_vk_texture_size(gpu_device* d, const gpu_texture_desc* desc, uint64_t* 
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     const gpu_vk_format* const f = tex_format(dd, desc->format, desc->use);
     VkImageCreateInfo ci;
+    VkImageFormatListCreateInfo fl;
     *size = 0;
     *align = 0;
-    if (!f || !image_info(dd, desc, f, &ci)) return;
+    if (!f || !image_info(dd, desc, f, &ci, &fl)) return;
     VkDeviceImageMemoryRequirements ir;
     VkMemoryRequirements2 mr;
     memset(&ir, 0, sizeof ir);
@@ -754,7 +802,8 @@ gpu_texture gpu_vk_texture_create(gpu_device* d, const gpu_texture_desc* desc)
     gpu_texture none = {0};
     const gpu_vk_format* const f = tex_format(dd, desc->format, desc->use);
     VkImageCreateInfo ci;
-    if (!f || !image_info(dd, desc, f, &ci)) return none;
+    VkImageFormatListCreateInfo fl;
+    if (!f || !image_info(dd, desc, f, &ci, &fl)) return none;
     VkImage image = VK_NULL_HANDLE;
     if (dd->vk.vkCreateImage(dd->device, &ci, NULL, &image) != VK_SUCCESS) return none;
     VkMemoryRequirements req;
