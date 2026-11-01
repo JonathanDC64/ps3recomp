@@ -619,6 +619,7 @@ static void legacy_vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPU
     pd->RasterizerState.CullMode = (cull & 1u) ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
                                                : D3D12_CULL_MODE_NONE;
     pd->RasterizerState.FrontCounterClockwise = (cull & 4u) ? TRUE : FALSE;
+    pd->RasterizerState.DepthClipEnable = (cull & 8u) ? FALSE : TRUE;
     pd->BlendState.RenderTarget[0].BlendEnable    = (blend & 1) ? TRUE : FALSE;
     pd->BlendState.RenderTarget[0].SrcBlend       = (blend & 1) ? (D3D12_BLEND)((blend >> 1)  & 0x1F) : D3D12_BLEND_ONE;
     pd->BlendState.RenderTarget[0].DestBlend      = (blend & 1) ? (D3D12_BLEND)((blend >> 6)  & 0x1F) : D3D12_BLEND_ZERO;
@@ -667,6 +668,7 @@ static void hal_vp_fp_desc(gpu_pipeline_desc* d, gpu_layout layout, gpu_shader v
     d->topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
     d->cull = (cull & 1u) ? ((cull & 2u) ? GPU_CULL_FRONT : GPU_CULL_BACK) : GPU_CULL_NONE;
     d->front_ccw = (cull & 4u) ? 1 : 0;
+    d->depth_clip = (cull & 8u) ? 0 : 1;
     d->depth_test = (uint8_t)(depth & 1u);
     d->depth_write = (uint8_t)((depth >> 1) & 1u);
     d->depth_func = (uint8_t)(((depth >> 2) & 7u) + 1u);
@@ -732,6 +734,7 @@ static void test_pipeline_descs(gpu_layout layout, gpu_shader vs, gpu_shader ps)
         {0, 2, GPU_FORMAT_R16G16B16A16_FLOAT, 0x7, 1u | 4u, 0, 1},
         {0, 4, GPU_FORMAT_R8G8B8A8_UNORM, 0x0, 3u, 1u | (6u << 2), 0},
         {0, 0, GPU_FORMAT_UNKNOWN, 0xF, 1u, 1u | 2u, 0},   /* depth only */
+        {0, 1, GPU_FORMAT_R8G8B8A8_UNORM, 0xF, 1u | 4u | 8u, 1u | 2u, 0},   /* depth clamped */
     };
     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
         const uint32_t blend = i == 1 ? alpha : i == 2 ? add : k[i].blend;
