@@ -201,6 +201,9 @@ extern "C" {
 #define NV4097_SET_CULL_FACE                    0x00001830
 #define NV4097_SET_FRONT_FACE                   0x00001834
 
+/* Depth clipping: bits 0-3 clip enable, 4-7 clamp enable, 8-11 ignore w */
+#define NV4097_SET_ZMIN_MAX_CONTROL             0x00001D78
+
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1
 #define RSX_PRIMITIVE_LINES              2
@@ -391,6 +394,13 @@ typedef struct rsx_state {
      * the offset is into the GCM label area; on release we write the label so PPU
      * label-polls (e.g. func_009F94A8 on label 255) complete. */
     u32 sema_offset;
+
+    /* Captures (.rcap, section RSXS) hold this struct as it is, and a replay
+     * reads an older capture's shorter copy over the reset state. New fields
+     * go here, at the end. */
+
+    /* SET_ZMIN_MAX_CONTROL: depth clip and clamp (reset 1, clip on) */
+    u32 zminmax_control;
 } rsx_state;
 
 /* ---------------------------------------------------------------------------

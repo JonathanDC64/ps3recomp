@@ -4283,7 +4283,13 @@ int cellGcm_replay_load(const char* file, u32** methods)
         if (!memcmp(tag, "END ", 4)) break;
         u8* b = (u8*)malloc(sz ? sz : 1);
         if (!b || fread(b, 1, sz, f) != sz) { free(b); break; }
-        rcap_put("RSXS", tag, &s_state, sizeof s_state, b, sz);
+        /* A capture from before fields were added to rsx_state (they go at
+         * its end): what it has, over the reset state. */
+        if (!memcmp(tag, "RSXS", 4) && sz && sz < sizeof s_state) {
+            rsx_state_init(&s_state);
+            memcpy(&s_state, b, sz);
+        }
+        else rcap_put("RSXS", tag, &s_state, sizeof s_state, b, sz);
         rcap_put("CONF", tag, &s_config, sizeof s_config, b, sz);
         rcap_put("EATB", tag, s_ea_address_table, sizeof s_ea_address_table, b, sz);
         rcap_put("IOTB", tag, s_io_address_table, sizeof s_io_address_table, b, sz);

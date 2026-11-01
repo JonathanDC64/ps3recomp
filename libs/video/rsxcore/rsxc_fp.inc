@@ -37,14 +37,25 @@ static u8 gl_blend_op_gpu(u32 e)
     }
 }
 /* Pack the guest's face-culling state for the PSO key.
- * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW.
+ * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW,
+ * bit3 = depth is clamped, not clipped.
  * RSX/GL enums: CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408;
  * FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds the reset state, BACK
- * and CCW. */
+ * and CCW.
+ *
+ * Depth: SET_ZMIN_MAX_CONTROL bit 0 clips, bit 4 clamps; clamping wins, and
+ * no clipping means clamping (as RPCS3 sets depth clamp). Its reset value
+ * clips. The guest pipelines used to clamp always, so a shadow map kept
+ * casters outside the light's depth range, squashed onto its near or far
+ * plane: the floor above, or things behind the light, threw shadows where
+ * nothing stands (issue #286). */
 static u32 rsx_cull_key(const rsx_state* st)
 {
-    if (!st || !st->cull_face_enable) return 0;
-    u32 k = 1u;
+    if (!st) return 0;
+    const u32 z = st->zminmax_control;
+    u32 k = ((z & 0xF0u) || !(z & 0xFu)) ? 8u : 0u;
+    if (!st->cull_face_enable) return k;
+    k |= 1u;
     if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) k |= 2u;  /* FRONT */
     if (st->front_face == 0x0901u) k |= 4u;                             /* CCW */
     return k;

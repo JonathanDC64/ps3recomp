@@ -604,13 +604,26 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* A unit addresses with a border (TEXTURE_ADDRESS wrap 4 on S, T or R), so
+ * its sampler needs the unit's border colour (TEXTURE_BORDER_COLOR); every
+ * border used to read transparent black. The game's shadow maps are
+ * border-addressed with a white border: past the map's edge is lit. */
+static int addr_has_border(u32 a)
+{
+    return (a & 0xF) == 4 || ((a >> 8) & 0xF) == 4 || ((a >> 16) & 0xF) == 4;
+}
+
+/* A sampler key is three words a unit: TEXTURE_ADDRESS, tex_filter_key, and
+ * the border colour (0 when no axis uses it, so those units still share). */
+#define SAMP_KEY_W 3
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
 static u32 samp_key_slot(const u32* k)
 {
     u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
-    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+    for (int i = 0; i < RSX_FP_UNITS * SAMP_KEY_W; i += 4) {
         a = (a ^ k[i])     * 0x01000193u;
         b = (b ^ k[i + 1]) * 0x01000193u;
         c = (c ^ k[i + 2]) * 0x01000193u;
@@ -623,13 +636,15 @@ static u32 samp_key_slot(const u32* k)
 
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
-    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
+    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
-    u32 k[RSX_FP_UNITS * 2];
+    u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * 2 + 1] = dr && dr->tex[u].set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
-                                            : (u ? 0x02060001u : 0x01010001u);
+        const int set = dr && dr->tex[u].set;
+        k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
+        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+                                    : (u ? 0x02060001u : 0x01010001u);
+        k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
     const u64 now = s_d3d.frame_count;
     /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
@@ -684,7 +699,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
      * (gpu_sampler_get), written into table t of the sampler pool; an entry
      * that already holds it is left as it is (step C4). */
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        const u32 a = k[u * 2], f = k[u * 2 + 1];
+        const u32 a = k[u * SAMP_KEY_W], f = k[u * SAMP_KEY_W + 1], bc = k[u * SAMP_KEY_W + 2];
         const u32 minf = (f >> 16) & 7, magf = (f >> 24) & 7;
         /* min: 1 NEAREST, 2 LINEAR, 3 N_MIP_N, 4 L_MIP_N, 5 N_MIP_L, 6 L_MIP_L,
          * 7 convolution; mag: 1 NEAREST, 2 LINEAR, 4 convolution. */
@@ -715,6 +730,10 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
          * same way in its GL sampler). */
         static const u8 zrev[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
         sd.compare = (f & 0x80000000u) ? (u32)(zrev[(a >> 28) & 7u] + 1u) : (u32)GPU_CMP_NEVER;
+        sd.border[0] = (float)((bc >> 16) & 0xFF) / 255.0f;   /* ARGB8, as RPCS3 decodes it */
+        sd.border[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+        sd.border[2] = (float)(bc & 0xFF) / 255.0f;
+        sd.border[3] = (float)(bc >> 24) / 255.0f;
         sd.min_lod = 0.0f;
         sd.max_lod = (minf == 1 || minf == 2) ? 0.0f : GPU_LOD_MAX;  /* no mipmapping */
         gpu_fast_table_write_sampler(s_rc_dev, s_rc_samp_pool, t * RSX_FP_UNITS + (u32)u,

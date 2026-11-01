@@ -724,7 +724,7 @@ VkCommandBuffer gpu_vk_init_record(gpu_vk_device* dd, uint64_t value);
 gpu_view       gpu_vk_view_get(gpu_device* d, const gpu_view_desc* desc);
 uint32_t       gpu_vk_view_find(gpu_vk_device* dd, const gpu_view_desc* desc, uint32_t kind);  /* under lock: index + 1 */
 gpu_sampler    gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc);
-VkSampler      gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, VkBorderColor border);
+VkSampler      gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc);
 gpu_table_pool gpu_vk_table_pool_create(gpu_device* d, const gpu_table_pool_desc* desc);
 VkDescriptorSetLayout gpu_vk_table_layout(gpu_vk_device* dd, uint32_t kind, uint32_t size);   /* under lock */
 void           gpu_vk_write_tex(gpu_vk_device* dd, gpu_vk_tpool* p, uint32_t index, const gpu_view_desc* v);

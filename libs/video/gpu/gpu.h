@@ -273,7 +273,9 @@ enum { GPU_STRIP_CUT_NONE = 0, GPU_STRIP_CUT_FFFF = 1, GPU_STRIP_CUT_FFFFFFFF = 
 #define GPU_FILTER_IS_ANISO(f)      (((f) & 0x40u) != 0)
 enum { GPU_FILTER_POINT = 0, GPU_FILTER_LINEAR = 1 };
 enum { GPU_REDUCE_STANDARD = 0, GPU_REDUCE_COMPARE = 1 };
-/* Addressing (D3D12_TEXTURE_ADDRESS_MODE). A border is transparent black. */
+/* Addressing (D3D12_TEXTURE_ADDRESS_MODE). A border reads the description's
+ * border colour (on Vulkan the nearest of transparent black, opaque black and
+ * opaque white). */
 enum {
     GPU_ADDRESS_WRAP = 1, GPU_ADDRESS_MIRROR = 2, GPU_ADDRESS_CLAMP = 3,
     GPU_ADDRESS_BORDER = 4, GPU_ADDRESS_MIRROR_ONCE = 5
@@ -443,7 +445,7 @@ typedef struct gpu_sampler_desc {
     float    mip_lod_bias;
     uint32_t max_aniso;                       /* 1-16 */
     uint32_t compare;                         /* GPU_CMP_*, with a comparison filter; else GPU_CMP_NEVER */
-    float    border[4];                       /* transparent black: all 0 */
+    float    border[4];                       /* RGBA; transparent black: all 0 */
     float    min_lod, max_lod;                /* max_lod GPU_LOD_MAX: every mip */
 } gpu_sampler_desc;
 #define GPU_LOD_MAX 3.402823466e+38f          /* D3D12_FLOAT32_MAX */
@@ -560,8 +562,8 @@ typedef struct gpu_pipeline_desc {
     uint8_t           topology_type;     /* GPU_TOPOLOGY_TYPE_* */
     uint8_t           cull;              /* GPU_CULL_* */
     uint8_t           front_ccw;         /* counter-clockwise faces are front faces */
-    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0 (the guest pipelines): depth is
-                                          * clamped, not clipped (GPU_CAP_DEPTH_CLAMP) */
+    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0: depth is clamped, not clipped
+                                          * (GPU_CAP_DEPTH_CLAMP), as a guest pipeline asks for it */
     uint8_t           multisample;       /* D3D12's MultisampleEnable (the menu's MSAA layers) */
     uint8_t           depth_test;
     uint8_t           depth_write;
