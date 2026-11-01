@@ -284,14 +284,18 @@ bool edit_e2(const Text* in, Text* out)
 
 /* ---- E3: the vertex fetch's loads kept inside t20 ---- */
 
+/* glslang makes a ByteAddressBuffer's GetDimensions OpArrayLength: its
+ * length in uints, where D3D12's is in bytes. So the bounds are in words
+ * (version 1 took them as bytes and read 0 past a quarter of t20's range:
+ * the far half of a Demon's Souls frame's fetch ring). */
 bool edit_e3(const Text* in, Text* out)
 {
     static const char decl[] = "ByteAddressBuffer vf_raw : register(t20);\n";
     static const char helpers[] =
-        "uint gpu_spv_vf_ld(uint a) { uint n; vf_raw.GetDimensions(n);\n"
-        "    return (n >= 4u && a <= n - 4u) ? vf_raw.Load(min(a, max(n, 4u) - 4u)) : 0u; }\n"
-        "uint4 gpu_spv_vf_ld4(uint a) { uint n; vf_raw.GetDimensions(n);\n"
-        "    return (n >= 16u && a <= n - 16u) ? vf_raw.Load4(min(a, max(n, 16u) - 16u)) : (uint4)0; }\n";
+        "uint gpu_spv_vf_ld(uint a) { uint n; vf_raw.GetDimensions(n); uint w = a >> 2;\n"
+        "    return (n >= 1u && w <= n - 1u) ? vf_raw.Load(min(w, max(n, 1u) - 1u) << 2) : 0u; }\n"
+        "uint4 gpu_spv_vf_ld4(uint a) { uint n; vf_raw.GetDimensions(n); uint w = a >> 2;\n"
+        "    return (n >= 4u && w <= n - 4u) ? vf_raw.Load4(min(w, max(n, 4u) - 4u) << 2) : (uint4)0; }\n";
     const char* s = in->p;
     const char* end = s + in->n;
     const char* at = strstr(s, decl);

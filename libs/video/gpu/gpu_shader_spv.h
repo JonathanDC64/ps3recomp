@@ -59,7 +59,7 @@ extern "C" {
 #define GPU_SPV_EDITS_ALL 31u
 #define GPU_SPV_E1_VERSION 1
 #define GPU_SPV_E2_VERSION 1
-#define GPU_SPV_E3_VERSION 1
+#define GPU_SPV_E3_VERSION 2
 #define GPU_SPV_E4_VERSION 1
 #define GPU_SPV_E5_VERSION 1
 
