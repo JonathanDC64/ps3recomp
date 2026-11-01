@@ -1,0 +1,5 @@
+# Commits that changed today's renderer (libs/video/rsx_d3d12_backend.c) after
+# copy_manifest.txt's base, already dealt with in the copies (tools/des/core_sync.sh
+# in the port leaves them out). One line each: <full commit> ported|n/a <note>.
+# For a merged pull request, the merge commit (core_sync lists first parents).
+3550beba6082601f44955eabf2486e47492fbcb2 ported #208: depth clip (rsx_cull_key bit 3, rsxc_pipeline depth_clip) and border colours (rsxc_targets, rsxc_record2, rsxc_state), in the same pull request
