@@ -168,6 +168,10 @@ static u32           s_gm_names_cap, s_gm_names_n;
 static volatile LONG s_gm_writing;
 /* The start's build of the records (rsxc_pipeline.inc). */
 static volatile LONG s_gmb_live, s_gmb_next, s_gmb_built, s_gmb_had, s_gmb_failed;
+/* Threads still in the build's loop: the last one out finishes the build
+ * (s_gmb_complete) before it leaves s_gmb_live, which the shutdown's save and
+ * pso_lib_tick wait on. Likewise s_pxb_run and index.built. */
+static volatile LONG s_gmb_run;
 static int           s_gmb_started, s_gmb_complete;
 static double        s_gmb_t0;
 static void gm_build_start(void);
@@ -368,6 +372,7 @@ static void pso_lib_open(void)
 }
 /* The pipeline index (defined with vp_fp_desc). */
 static volatile LONG s_pxb_live;      /* index build threads running */
+static volatile LONG s_pxb_run;       /* of those, still in the loop (s_gmb_run) */
 static volatile LONG s_pxr_writing;   /* a thread writing new rows */
 static void pso_index_flush(void);
 static void pso_index_tick(void);
