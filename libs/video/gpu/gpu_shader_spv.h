@@ -9,7 +9,8 @@
  *        E1  [[vk::location(n)]] by semantic: COLOR0 0, COLOR1 1, FOG 2,
  *            TEXCOORDn 3 + n, UVBOUNDn 13 + n; vertex inputs ATTRn n
  *        E2  the NaN and zero guards as integer bit tests (asuint)
- *        E3  the vertex fetch's loads kept inside t20 (0 past its end)
+ *        E3  the vertex fetch's loads kept inside t20 (0 past its end), only
+ *            with GPU_SC_SPV_FETCH_CLAMP (robustBufferAccess2 does it otherwise)
  *        E4  the layout's CONST32 cbuffers as one push constant block, each
  *            slot at 4 bytes times the counts before it, its members at
  *            their HLSL offsets (packoffset)
@@ -63,6 +64,10 @@ extern "C" {
 #define GPU_SPV_E4_VERSION 1
 #define GPU_SPV_E5_VERSION 1
 
+/* The edits a compile makes now: all, but E3 only with the option
+ * GPU_SC_SPV_FETCH_CLAMP (gpu_sc_spv_set_options). */
+unsigned gpu_spv_edits(void);
+
 /* The guest programs' layout (gpu.h): the default of gpu_sc_compile. */
 const gpu_layout_desc* gpu_spv_guest_layout(void);
 
@@ -106,7 +111,8 @@ const char* gpu_spv_compiler(void);
 /* The cache key's tag for a layout (NULL: the guest's),
  * "spv;<compiler>;<flags>;edits=<E1>.<E2>.<E3>.<E4>.<E5>;layout=<16 hex>"
  * into buf, and key T of a text whose dxbc key is k: FNV-1a 64 of
- * "<tag>;<k, 16 hex digits>". */
+ * "<tag>;<k, 16 hex digits>". An edit gpu_spv_edits leaves out has version
+ * 0 there. */
 const char* gpu_spv_tag(const gpu_layout_desc* layout, char* buf, size_t cap);
 uint64_t gpu_spv_key(uint64_t k, const gpu_layout_desc* layout);
 

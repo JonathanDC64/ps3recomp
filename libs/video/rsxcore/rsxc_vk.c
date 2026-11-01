@@ -54,7 +54,9 @@
 /* The spv target's post-passes for this device: the float controls only
  * where the device keeps them (an execution mode the device lacks is
  * invalid SPIR-V for it), NoContraction and the invariant position always,
- * base vertex never (every draw starts at vertex 0, gpu_shader.h). */
+ * base vertex never (every draw starts at vertex 0, gpu_shader.h), and the
+ * fetch clamp (E3) only without robustBufferAccess2, which reads 0 past t20's
+ * end as D3D12 does. */
 static void rc_vk_spv_options(gpu_device* d)
 {
     VkPhysicalDeviceVulkan12Properties p12;
@@ -68,6 +70,7 @@ static void rc_vk_spv_options(gpu_device* d)
     unsigned opts = GPU_SC_SPV_DEFAULT & ~(GPU_SC_SPV_FLOAT_PRESERVE | GPU_SC_SPV_DENORM_PRESERVE);
     if (p12.shaderSignedZeroInfNanPreserveFloat32) opts |= GPU_SC_SPV_FLOAT_PRESERVE;
     if (p12.shaderDenormPreserveFloat32) opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    if (!(d->caps.bits & GPU_CAP_ROBUST2)) opts |= GPU_SC_SPV_FETCH_CLAMP;
     gpu_sc_spv_set_options(opts);
 }
 
