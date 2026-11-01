@@ -212,15 +212,16 @@ static int rc_be_pso_unrecord(const rc_be_pso_desc* rec, u32 nel, gpu_pipeline_d
 
 /* After each present: counted, for the frame slot. Step V6: the first ends
  * the start for the route switch, which takes its start mark away
- * (rsx_out.c; the route is Windows' only for now). */
+ * (rsx_out.c; on Linux the switch is in vkd3d builds only, and a build
+ * without it has no mark). */
 static u32 s_rc_vk_presents, s_rc_vk_slot_presents;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
 void rsx_out_route_presented(void);   /* rsx_out.h */
 #endif
 static void rc_be_presented(gpu_device* d)
 {
     (void)d;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
     if (!s_rc_vk_presents) rsx_out_route_presented();
 #endif
     s_rc_vk_presents++;

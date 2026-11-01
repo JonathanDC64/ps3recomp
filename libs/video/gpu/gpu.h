@@ -801,20 +801,24 @@ typedef struct gpu_device_desc {
     /* 0 once the GPU has passed f, 1 after timeout_ms without (never unbounded: a lost device \
      * never signals). */ \
     X(fence_wait,        R, int,            (gpu_device* d, gpu_fence f, uint32_t timeout_ms), (d, f, timeout_ms)) \
-    /* Swap chains. */ \
+    /* Swap chains. On Vulkan one made on a minimized window has no images until it is shown. */ \
     X(swap_create,       R, gpu_swapchain,  (gpu_device* d, const gpu_swapchain_desc* desc), (d, desc)) \
     X(swap_destroy,      V, void,           (gpu_device* d, gpu_swapchain sc), (d, sc)) \
     /* New size or format (ResizeBuffers). The GPU must be idle and the images unused. 0 on success. */ \
     X(swap_resize,       R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t height, gpu_format format), (d, sc, width, height, format)) \
     /* The image to draw next and its index (below swap_image_count); it starts in GPU_STATE_PRESENT. \
-     * Its size is the window's on Vulkan (the surface's); a minimized window gives none. */ \
+     * Its size is the window's on Vulkan (the surface's); a minimized window gives none. Vulkan \
+     * also makes the swap chain again inside an acquire (out of date, a restore after a minimize): \
+     * an image that is not the one swap_image gave at its index says so, and every image (and \
+     * view) is taken again. */ \
     X(swap_acquire,      R, uint32_t,       (gpu_device* d, gpu_swapchain sc, gpu_texture* image), (d, sc, image)) \
     /* The swap chain's images: D3D12 has the buffers asked; Vulkan at least that many (the driver \
      * may make more), so arrays by image index take this count, not FRAME_COUNT. Changes only \
-     * with swap_resize. */ \
+     * with swap_resize on D3D12; on Vulkan with an acquire too, and 0 while minimized. */ \
     X(swap_image_count,  R, uint32_t,       (gpu_device* d, gpu_swapchain sc), (d, sc)) \
     /* Image index, the texture swap_acquire hands back with that index (none past the count): \
-     * for making every image's view up front. Valid until the next swap_resize or swap_destroy. */ \
+     * for making every image's view up front. Valid until the next swap_resize or swap_destroy \
+     * (on Vulkan, or an acquire that made the swap chain again). */ \
     X(swap_image,        R, gpu_texture,    (gpu_device* d, gpu_swapchain sc, uint32_t index), (d, sc, index)) \
     /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). GPU_PRESENTED (0) on \
      * success, else a GPU_PRESENT_* code (step VC2, at the end). */ \

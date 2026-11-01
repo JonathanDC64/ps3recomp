@@ -42,10 +42,20 @@
  * It also saves the new path's pipeline stores and prints its "pipelines
  * this run" line. RSX_REPLAY_INDEX=<rows file> hands the renderer pipeline
  * index rows to build (below).
+ *
+ * RSX_REPLAY_WINDOW=<frame>:<step>[,...] (off by default) drives the
+ * renderer's window after the present of each frame named (frames count on
+ * across captures, from 0): min (minimized, not activated), restore and show
+ * (shown at its last size, not activated), hide, size=<w>x<h> (that client
+ * size), border=1|0 (borderless on or off). Each step prints a line, and the
+ * last line counts them:
+ *   [replay] window at frame 4: min (client 0x0, minimized 1, visible 1)
+ *   [replay] window: 6 steps, 0 not understood
  */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 
 uint8_t* vm_base = NULL;
@@ -55,7 +65,6 @@ uint8_t* vm_base = NULL;
  * capture plays through (rsx_out.h). */
 #include "rsx_out.h"
 #include "rsx_d3d12_backend.h"   /* (rsx_d3d12_overlay, for RSX_REPLAY_OVERLAY_GPU) */
-#include <string.h>
 #define rsx_d3d12_backend_init          rsx_out_backend_init
 #define rsx_d3d12_backend_present       rsx_out_backend_present
 #define rsx_d3d12_backend_pump_messages rsx_out_backend_pump_messages
@@ -112,11 +121,68 @@ static void ov_frame(void* user, struct gpu_cmd* c, uint32_t target, uint32_t fo
     }
     s_ov_frames++;
 }
+#define rsx_d3d12_hwnd           rsx_out_hwnd
+#define rsx_d3d12_set_borderless rsx_out_set_borderless
+#define rsx_d3d12_borderless     rsx_out_borderless
 #else
-int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
-void rsx_d3d12_backend_present(void);
-int  rsx_d3d12_backend_pump_messages(void);
+int   rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
+void  rsx_d3d12_backend_present(void);
+int   rsx_d3d12_backend_pump_messages(void);
+void* rsx_d3d12_hwnd(void);
+void  rsx_d3d12_set_borderless(int on);
+int   rsx_d3d12_borderless(void);
 #endif
+
+/* RSX_REPLAY_WINDOW: the steps after frame `frame`'s present (see the top). */
+static const char* s_win_steps;
+static unsigned s_win_done, s_win_bad;
+static void window_steps(int frame)
+{
+    if (!s_win_steps) return;
+    HWND w = (HWND)rsx_d3d12_hwnd();
+    for (const char* p = s_win_steps; *p;) {
+        char* end = NULL;
+        const long at = strtol(p, &end, 10);
+        const char* step = end && *end == ':' ? end + 1 : NULL;
+        const char* next = strchr(p, ',');
+        const size_t len = step ? (size_t)((next ? next : step + strlen(step)) - step) : 0;
+        p = next ? next + 1 : p + strlen(p);
+        if (!step || !len) { if (!frame) s_win_bad++; continue; }   /* (counted once) */
+        if (at != frame) continue;
+        char* x = NULL;
+        const unsigned long sw = len > 5 && !strncmp(step, "size=", 5) ? strtoul(step + 5, &x, 10) : 0;
+        const unsigned long sh = sw && x && *x == 'x' ? strtoul(x + 1, NULL, 10) : 0;
+        int ok = w != NULL;
+        if (!ok) {
+        } else if (len == 3 && !strncmp(step, "min", 3)) {
+            ShowWindow(w, SW_SHOWMINNOACTIVE);
+        } else if ((len == 7 && !strncmp(step, "restore", 7)) || (len == 4 && !strncmp(step, "show", 4))) {
+            ShowWindow(w, SW_SHOWNOACTIVATE);
+        } else if (len == 4 && !strncmp(step, "hide", 4)) {
+            ShowWindow(w, SW_HIDE);
+        } else if (sw && sh) {
+            RECT r = {0, 0, (LONG)sw, (LONG)sh};
+            AdjustWindowRectEx(&r, (DWORD)GetWindowLongA(w, GWL_STYLE), FALSE, (DWORD)GetWindowLongA(w, GWL_EXSTYLE));
+            SetWindowPos(w, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (len == 8 && (!strncmp(step, "border=1", 8) || !strncmp(step, "border=0", 8))) {
+            /* (posted to the window's thread, which says it is done once
+             * the window has its new place: 2 s at most) */
+            const int on = step[7] == '1';
+            rsx_d3d12_set_borderless(on);
+            for (int t = 0; t < 2000 && rsx_d3d12_borderless() != on; t++) Sleep(1);
+            ok = rsx_d3d12_borderless() == on;
+        } else {
+            ok = 0;
+        }
+        RECT cr = {0, 0, 0, 0};
+        if (w) GetClientRect(w, &cr);
+        printf("[replay] window at frame %d: %.*s%s (client %ldx%ld, minimized %d, visible %d)\n", frame, (int)len,
+               step, ok ? "" : " (not understood)", cr.right - cr.left, cr.bottom - cr.top, w && IsIconic(w) ? 1 : 0,
+               w && IsWindowVisible(w) ? 1 : 0);
+        if (ok) s_win_done++;
+        else s_win_bad++;
+    }
+}
 int  cellGcm_replay_load(const char* file, uint32_t** methods);
 void cellGcm_replay_reset(void);
 void cellGcm_replay_method(uint32_t mfull, uint32_t data);
@@ -213,6 +279,10 @@ int main(int argc, char** argv)
     QueryPerformanceFrequency(&f);
     char tv[16] = "";
     const int times = GetEnvironmentVariableA("RSX_REPLAY_TIMES", tv, sizeof tv) < sizeof tv && atoi(tv) > 0;
+    static char wv[1024] = "";
+    const DWORD wn = GetEnvironmentVariableA("RSX_REPLAY_WINDOW", wv, sizeof wv);
+    s_win_steps = wn && wn < sizeof wv ? wv : NULL;
+    int played = 0;   /* (frames across captures, for RSX_REPLAY_WINDOW) */
     for (int c = 0; c < ncaps; c++) {
         uint32_t* m = NULL;
         const int n = cellGcm_replay_load(argv[1 + c], &m);
@@ -234,6 +304,7 @@ int main(int argc, char** argv)
                 if (k > 0) { wall_sum += wall; cpu_sum += cpu; timed++; }
             } else if (k < 3 || frames == 0 && k % 120 == 0)
                 printf("[replay] frame %d: %.1f ms\n", k, 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart);
+            window_steps(played++);
             if (rsx_d3d12_backend_pump_messages() != 0) { c = ncaps; break; }
         }
         if (timed)
@@ -245,6 +316,7 @@ int main(int argc, char** argv)
         printf("[replay] overlay v2: %u frames drawn over, %u flushes, %u failed\n", s_ov_frames, s_ov_flushes,
                s_ov_failed);
 #endif
+    if (s_win_steps) printf("[replay] window: %u steps, %u not understood\n", s_win_done, s_win_bad);
     fflush(stdout);
 #if defined(PS3RECOMP_RSX_HAL)
     /* RSX_REPLAY_SHUTDOWN=1 on the new path's routes: its shutdown first. */

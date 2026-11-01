@@ -125,13 +125,41 @@ static int swap_buffers_get(void)
      * many as the driver made on Vulkan). */
     s_rc_swap_n = gpu_swap_image_count(s_rc_dev, s_rc_swap);
     if (s_rc_swap_n > RC_SWAP_MAX) s_rc_swap_n = RC_SWAP_MAX;
-    if (s_rc_swap_n < FRAME_COUNT) return -1;
+    /* (Step VW: none on Vulkan while the window is minimized, at the start
+     * too; swap_follow takes them once they come.) */
+    if (s_rc_swap_n && s_rc_swap_n < FRAME_COUNT) return -1;
     for (u32 i = 0; i < s_rc_swap_n; i++) {
         s_rc_swap_image[i] = gpu_swap_image(s_rc_dev, s_rc_swap, i);
         if (!GPU_VALID(s_rc_swap_image[i])) return -1;
         s_rc_swap_rtv[i] = rc_target_view(s_rc_swap_image[i], GPU_VIEW_RTV, 0, 0);
     }
     return 0;
+}
+
+/* Step VW: Vulkan makes its swap chain again by itself (out of date, a
+ * restore after a minimize, the first show of a window that started
+ * minimized), and its old images go with their views. An acquire that gives
+ * an image other than the core's at that index says so (rc_acquire): the
+ * images and their views are taken again, and the window's size is the one
+ * its last WM_SIZE gave, which is the surface's and so the new images'
+ * (swap_resize then has nothing to do). Never on D3D12, whose images change
+ * only in swap_resize, which takes them itself; nor in the start, which
+ * takes them after its acquire. */
+static void swap_follow(gpu_texture img)
+{
+    if (!s_d3d.initialized) return;
+    if (s_rc_image < s_rc_swap_n && s_rc_swap_image[s_rc_image].id == img.id) return;
+    if (swap_buffers_get() != 0 || s_rc_image >= s_rc_swap_n || s_rc_swap_image[s_rc_image].id != img.id) {
+        static int said;
+        if (!said++) printf("[D3D12] the swap chain's images could not be taken again; nothing is shown\n");
+        s_rc_have_image = 0;
+        return;
+    }
+    const LONG req = s_win_req;
+    if ((u32)req >> 16 && (req & 0xFFFF)) {
+        s_d3d.win_w = (u32)req >> 16;
+        s_d3d.win_h = (u32)req & 0xFFFF;
+    }
 }
 
 /* RSX_OUTFILTER (live): the filter blit_to_window scales the game's frame

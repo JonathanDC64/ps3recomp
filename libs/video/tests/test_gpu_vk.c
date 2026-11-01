@@ -24,7 +24,8 @@
  *     t20 switched between buffers from draw to draw (the set-0 memo); the
  *     vertex fetch's loads through the spv target over all of t20;
  *   - the pipeline cache across two devices, a swap chain on a hidden window
- *     (Windows), breadcrumbs and the fault report.
+ *     and one made on a minimized window, then minimized, hidden, shown and
+ *     resized between frames (Windows), breadcrumbs and the fault report.
  */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE   /* clock_gettime, setenv, MAP_ANONYMOUS under -std=c99 */
@@ -1853,6 +1854,114 @@ static void test_swapchain(void)
     DestroyWindow(w);
     UnregisterClassA(wc.lpszClassName, wc.hInstance);
 }
+
+/* ---- A swap chain on a minimized window, and a window minimized, hidden,
+ * shown and resized between frames ---- */
+
+static void win_pump(void)
+{
+    MSG m;
+    while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+}
+
+/* swap_frame, or 1 when the acquire gives no image (the present then fails,
+ * as gpu.h says). */
+static int win_frame(gpu_swapchain sc, gpu_texture* got)
+{
+    static const float grey[4] = {0.5f, 0.5f, 0.5f, 1};
+    gpu_texture img;
+    gpu_swap_acquire(g_d, sc, &img);
+    if (got) *got = img;
+    if (!GPU_VALID(img)) return gpu_swap_present(g_d, sc, 1, 0) == GPU_PRESENT_FAILED ? 1 : -3;
+    return swap_frame(sc, grey, 1, 0);
+}
+
+/* The image acquired is the one swap_image gives at its index, of the
+ * window's client size. */
+static int win_image_ok(gpu_swapchain sc, HWND w, gpu_texture img)
+{
+    RECT cr;
+    GetClientRect(w, &cr);
+    const uint32_t n = gpu_swap_image_count(g_d, sc);
+    uint32_t i = 0;
+    while (i < n && gpu_swap_image(g_d, sc, i).id != img.id) i++;
+    const gpu_vk_tex* const t = &g_vk->tex[GPU_HANDLE_INDEX(img.id)];
+    return GPU_VALID(img) && n >= 2 && i < n && t->width == (uint32_t)(cr.right - cr.left) &&
+           t->height == (uint32_t)(cr.bottom - cr.top);
+}
+
+static gpu_swapchain vc2_swap(gpu_device* d, HWND w);   /* (below) */
+
+static void test_window_states(void)
+{
+    const uint32_t v0 = g_vk->n_validation;
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "ps3r_test_gpu_vk_win";
+    RegisterClassA(&wc);
+    HWND w = CreateWindowExA(WS_EX_NOACTIVATE, wc.lpszClassName, "test_gpu_vk", WS_OVERLAPPEDWINDOW, 0, 0, 160, 120,
+                             NULL, NULL, wc.hInstance, NULL);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Made on a minimized window (as a program started minimized has it):
+     * no images until it is shown, and the present fails. */
+    ShowWindow(w, SW_SHOWMINNOACTIVE);
+    win_pump();
+    CHECK(IsIconic(w));
+    const gpu_swapchain sc = vc2_swap(g_d, w);
+    CHECK(GPU_VALID(sc));
+    int none_min = 0, again = 0, hid = 0, sized = 0;
+    if (GPU_VALID(sc)) {
+        gpu_texture img = {0}, before = {0};
+        CHECK(gpu_swap_image_count(g_d, sc) == 0);
+        CHECK(win_frame(sc, &img) == 1);
+        /* Shown: images of its size from the next acquire. */
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        win_pump();
+        CHECK(!IsIconic(w));
+        CHECK(win_frame(sc, &img) == 0 && win_image_ok(sc, w, img));
+        CHECK(win_frame(sc, &before) == 0);
+        /* Minimized while it presents: within a few frames no image, and no
+         * images at all; restored, new images (the swap chain made again). */
+        ShowWindow(w, SW_SHOWMINNOACTIVE);
+        win_pump();
+        for (int k = 0; k < 4; k++) {
+            const int r = win_frame(sc, &img);
+            CHECK(r == 0 || r == 1);
+            if (r == 1 && gpu_swap_image_count(g_d, sc) == 0) none_min = 1;
+        }
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        win_pump();
+        for (int k = 0; k < 3; k++) CHECK(win_frame(sc, &img) == 0);
+        CHECK(win_image_ok(sc, w, img));
+        again = img.id != before.id;
+        /* Hidden: it keeps its size, and frames present. */
+        ShowWindow(w, SW_HIDE);
+        win_pump();
+        for (int k = 0; k < 3; k++) hid += win_frame(sc, &img) == 0;
+        CHECK(hid >= 2 && win_image_ok(sc, w, img));
+        /* Shown and resized: images of the new size. */
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        SetWindowPos(w, NULL, 0, 0, 220, 170, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        win_pump();
+        for (int k = 0; k < 3; k++) CHECK(win_frame(sc, &img) == 0);
+        sized = win_image_ok(sc, w, img);
+        CHECK(sized);
+        gpu_wait_idle(g_d);
+        gpu_swap_destroy(g_d, sc);
+    }
+    printf("  window states: made minimized %s, none while minimized %s, made again at the restore %s, "
+           "hidden %d of 3 presented, resized %s\n", GPU_VALID(sc) ? "yes" : "NO", none_min ? "yes" : "no",
+           again ? "yes" : "no", hid, sized ? "yes" : "no");
+    DestroyWindow(w);
+    UnregisterClassA(wc.lpszClassName, wc.hInstance);
+    CHECK(g_vk->n_validation == v0);
+}
 #endif
 
 /* ---- step VC2: presenting as the core does, and a lost device ---- */
@@ -2256,6 +2365,7 @@ int main(void)
     test_fences();
 #ifdef _WIN32
     test_swapchain();
+    test_window_states();
     test_present_frames();
 #else
     printf("  swap chain: skipped (Windows only here)\n");
