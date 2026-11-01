@@ -74,6 +74,7 @@ extern "C" {
 #define GPU_VK_MAX_IMAGES     8u      /* a swap chain's */
 #define GPU_VK_MAX_SETS       (1u + GPU_MAX_SLOTS)
 #define GPU_VK_MAX_DYN        GPU_MAX_SLOTS
+#define GPU_VK_MAX_PENDING    64   /* barriers held for one vkCmdPipelineBarrier2 */
 #define GPU_VK_INIT_RING      8u      /* command buffers for new textures' first layouts */
 #define GPU_VK_MARKS          4096u   /* the checkpoint markers' ring (GPU_DEVICE_BREADCRUMBS) */
 #define GPU_VK_MARK_LEN       64u
@@ -461,6 +462,13 @@ typedef struct gpu_vk_set0_entry {
 } gpu_vk_set0_entry;
 
 /* A recorder: one command buffer, the device's arrays, and what is bound. */
+#define GPU_VK_MAX_VB         16u     /* vertex buffer slots whose binding is remembered */
+#define GPU_VK_PUSH_DW        32u     /* 128 bytes, Vulkan's least push-constant size */
+#define GPU_VK_ST_PIPE        1u      /* gpu_cmd.st_ok: the pipeline, viewport, scissor and index buffer known */
+#define GPU_VK_ST_VP          2u
+#define GPU_VK_ST_SC          4u
+#define GPU_VK_ST_IB          8u
+
 struct gpu_cmd {
     gpu_cmd_head                 head;
     VkCommandBuffer              cb;
@@ -468,6 +476,7 @@ struct gpu_cmd {
     struct gpu_vk_device*        dd;
     gpu_vk_tex*                  tex;
     uint32_t*                    tex_layout;   /* each texture's layout as recorded so far */
+    uint64_t*                    tex_att;      /* the last pass it was an attachment of (0: ordered since) */
     const VkBuffer*              buf;
     const gpu_vk_buf*            bufi;
     const gpu_vk_view*           view;
@@ -488,7 +497,7 @@ struct gpu_cmd {
      * a draw) finds its set without the cache's lock and hash. */
     gpu_vk_set0_key              memo_key[2];
     VkDescriptorSet              memo_set[2];
-    uint32_t                     dirty;         /* bind before the next draw */
+    uint32_t                     dirty;         /* the sets to bind before the next draw (~0: all) */
 
     /* The pass (targets) and its rendering. */
     gpu_pass                     pass;
@@ -499,6 +508,42 @@ struct gpu_cmd {
     uint32_t                     dw;            /* set_depth_write's */
     uint32_t                     pipe_dw;       /* the bound pipeline's depth writes are dynamic */
     uint32_t                     restart;
+    uint64_t                     att_order;     /* passes up to this one are ordered before the next */
+
+    /* What the last state calls set, so the same value is not sent again:
+     * D3D12's drivers drop repeats themselves, Vulkan's send each one. Known
+     * from cmd_begin; a pipeline bind keeps them (they are dynamic in every
+     * pipeline), but depth writes only in the pipelines that make them so. */
+    VkPipeline                   last_pipe;
+    VkViewport                   last_vp;
+    VkRect2D                     last_sc;
+    uint32_t                     last_topo;
+    uint32_t                     last_dw;       /* depth writes as set: 0, 1, or 2 when not known */
+    uint32_t                     st_ok;         /* GPU_VK_ST_* known */
+    VkBuffer                     vb_b[GPU_VK_MAX_VB];
+    VkDeviceSize                 vb_off[GPU_VK_MAX_VB], vb_sz[GPU_VK_MAX_VB];
+    uint32_t                     vb_ok;         /* the slots known */
+    VkBuffer                     ib_b;
+    VkDeviceSize                 ib_off;
+    uint32_t                     ib_type;
+    uint32_t                     pc[GPU_VK_PUSH_DW];   /* the push constants as pushed */
+    uint32_t                     pc_ok;         /* the dwords known */
+
+    /* Whole-target clears asked before the pass opened, done as its load
+     * ops (the driver's fast clear, as D3D12's Clear*View; a clear inside
+     * the rendering writes every pixel): bits 0-3 the colour slots, 4 depth,
+     * 5 stencil, with their values (4 holds depth and stencil). */
+    uint32_t                     pend_clr;
+    VkClearValue                 clr[5];
+
+    /* The barriers recorded since the last command that does work, sent as
+     * one vkCmdPipelineBarrier2 just before the next one (gpu_vk__sync).
+     * Nothing runs between them, so this is the same order, in one call
+     * instead of one per D3D12-style barrier. */
+    VkImageMemoryBarrier2        pend_img[GPU_VK_MAX_PENDING];
+    VkBufferMemoryBarrier2       pend_buf[GPU_VK_MAX_PENDING];
+    VkMemoryBarrier2             pend_mem;
+    uint32_t                     pend_ni, pend_nb, pend_nm;
 };
 
 typedef struct gpu_vk_device {
@@ -541,6 +586,8 @@ typedef struct gpu_vk_device {
                                layout_slots, qpool_slots, heap_slots, tpool_slots, swap_slots;
     gpu_vk_tex*                tex;
     uint32_t*                  tex_layout;
+    uint64_t*                  tex_att;
+    uint64_t                   att_seq;         /* passes opened, every recorder's */
     VkBuffer*                  buf_vk;
     gpu_vk_buf*                buf;
     gpu_vk_view*               view;
@@ -630,6 +677,16 @@ void        gpu_vk_rec_buf_tex(gpu_cmd* c, int to_tex, gpu_texture t, uint32_t s
 void        gpu_vk_rec_resolve(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, gpu_texture src, uint32_t src_sub);
 void        gpu_vk_rec_marker(gpu_cmd* c, const char* text, uint32_t len);
 void        gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list);
+/* Barriers held for the next command that does work: one that touches what a
+ * held one does (the same image or buffer, overlapping) sends those first. */
+void        gpu_vk_pend(gpu_cmd* c, const VkImageMemoryBarrier2* ib, uint32_t ni, const VkBufferMemoryBarrier2* bb,
+                        uint32_t nb, const VkMemoryBarrier2* mb, uint32_t nm);
+void        gpu_vk_sync_slow(gpu_cmd* c);
+/* Before a command that does work: the held barriers sent. */
+static inline void gpu_vk__sync(gpu_cmd* c)
+{
+    if (c->pend_ni | c->pend_nb | c->pend_nm) gpu_vk_sync_slow(c);
+}
 /* A placed texture's first use: UNDEFINED to its first state's layout. */
 void        gpu_vk_tex_touch(gpu_cmd* c, uint32_t index);
 /* A command buffer run at once and waited for (the empty entries' textures); NULL / 0 on failure. */
