@@ -621,6 +621,15 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    # Controller slots must survive SDL device-index changes and non-gamepad devices.
+    add_executable(test_pad_sdl_slots libs/input/tests/test_pad_sdl_slots.c)
+    target_include_directories(test_pad_sdl_slots PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_sdl_slots PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_sdl_slots PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_sdl_slots COMMAND test_pad_sdl_slots)
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so
