@@ -344,7 +344,9 @@ static int shadow_record(gpu_vk_device* dd, gpu_vk_swap* s, uint32_t idx)
     return dd->vk.vkEndCommandBuffer(cb) == VK_SUCCESS;
 }
 
-/* The swap chain, made (again) for the window's size now. */
+/* The swap chain, made (again) for the window's size now: 0, -1 on a
+ * failure, or 1 while the window is minimized (step VW): no swap chain and
+ * no images until it is shown again, when the next acquire makes them. */
 static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
 {
     VkSurfaceCapabilitiesKHR caps;
@@ -361,7 +363,13 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
         if (ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
         if (ext.height > caps.maxImageExtent.height) ext.height = caps.maxImageExtent.height;
     }
-    if (!ext.width || !ext.height) return -1;   /* (minimized: no images until it is shown again) */
+    if (!ext.width || !ext.height) {   /* (minimized) */
+        /* The old one goes too (its images went with chain_drop), so no
+         * acquire is made on it. */
+        if (s->sc) dd->vk.vkDestroySwapchainKHR(dd->device, s->sc, NULL);
+        s->sc = VK_NULL_HANDLE;
+        return 1;
+    }
 
     /* scRGB is RGBA16F's colour space where the surface has nothing else for it. */
     VkFormat chain_fmt = s->vkfmt;
@@ -507,12 +515,15 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     return 0;
 }
 
-/* Made again: the GPU idle first, and the presents done. */
+/* Made again: the GPU idle first, and the presents done (step VW: not while
+ * a minimized window has none, at each acquire then). */
 static int chain_again(gpu_vk_device* dd, gpu_vk_swap* s)
 {
-    dd->vk.vkDeviceWaitIdle(dd->device);
-    presents_wait(dd, s);
-    chain_drop(dd, s);
+    if (s->sc || s->nimages) {
+        dd->vk.vkDeviceWaitIdle(dd->device);
+        presents_wait(dd, s);
+        chain_drop(dd, s);
+    }
     return chain_make(dd, s);
 }
 
@@ -590,7 +601,7 @@ gpu_swapchain gpu_vk_swap_create(gpu_device* d, const gpu_swapchain_desc* desc)
     s->colour_space = desc->colour_space;
     s->cs = cs_of(desc->colour_space);
     s->current = -1;
-    if (chain_make(dd, s)) {
+    if (chain_make(dd, s) < 0) {   /* (step VW: a minimized window's has its images once it is shown) */
         gpu_vk_swap_destroy(d, r);
         r.id = 0;
     }
@@ -625,7 +636,7 @@ int gpu_vk_swap_resize(gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t
     s->height = height;
     s->format = format;
     s->vkfmt = vkfmt;
-    return chain_again(dd, s);
+    return chain_again(dd, s) < 0 ? -1 : 0;   /* (minimized: the images come at an acquire once it is shown) */
 }
 
 uint32_t gpu_vk_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image)
@@ -877,7 +888,7 @@ int gpu_vk_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, cons
         if (!surface_has(dd, s, s->vkfmt, cs)) return 0;
         s->colour_space = colour_space;
         s->cs = cs;
-        if (chain_again(dd, s)) return 0;
+        if (chain_again(dd, s) < 0) return 0;
     }
     if (meta) {
         if (!(dd->base.caps.bits & GPU_CAP_HDR_METADATA)) return 0;
