@@ -210,7 +210,7 @@ static void rc_abort_init(void)
     if (!UnregisterClassA("ps3recomp_d3d12", GetModuleHandle(NULL)) && GetLastError() != ERROR_CLASS_DOES_NOT_EXIST)
         printf("[D3D12] the failed start's window class stays registered (error %lu)\n", (unsigned long)GetLastError());
 #else
-    if (s_d3d.hwnd) win_post(WIN_MAIL_CLOSE, 0);
+    if (s_d3d.hwnd && !win_close_wait()) printf("[D3D12] the failed start's window did not close\n");
 #endif
     s_d3d.hwnd = NULL;
 }

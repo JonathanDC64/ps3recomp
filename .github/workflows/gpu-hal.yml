@@ -22,6 +22,12 @@
 # validation: every frame plays and any message fails. The vulkan-masks job then plays them once per GPU_CAP_* bit
 # the device has, with that bit off (RSX_VK_MASK: its fallback), and with every bit off.
 #
+# The linux-routes job builds the runtime as a Linux host with both routes has it: the HAL and today's renderer on
+# vkd3d (PS3RECOMP_RSX_D3D12_VKD3D) in one runtime, so the route switch (libs/video/rsx_out.c) has d3d12 (today's
+# renderer on vkd3d), null and vulkan. The synthetic scenes play through the switch on null (the goldens) and on
+# vulkan (lavapipe, Xvfb, the validation layer on: any message fails), and a Vulkan start made to fail at each of its
+# steps, or with a start mark left, must go to today's renderer on vkd3d in the same process and play them there.
+#
 # Both also build the shader compile service's spv target (PS3RECOMP_RSX_HAL_SPV, on by default with the option:
 # glslang and SPIRV-Tools fetched at their pins) and run its test (libs/video/tests/test_gpu_sc_spv.c): the seeded
 # generator's programs and the built-in passes compile, validate, bind where the Vulkan backend's layout says, and
@@ -162,7 +168,7 @@ jobs:
           path: build/test_rsx_synth.out/
           if-no-files-found: ignore
 
-      # Linux's switch: today's renderer only (test_rsx_out.c's Linux cases).
+      # Linux's switch, as a vkd3d build has it (test_rsx_out.c's stand-ins): null, vulkan and the fallback.
       - name: Run the route switch's test
         run: ctest --test-dir build -R rsx_out -V
 
@@ -272,4 +278,121 @@ jobs:
         with:
           name: rsx-synth-vulkan-masks
           path: build/masks.out/
+          if-no-files-found: ignore
+
+  linux-routes:
+    name: Linux x64, both routes (HAL and vkd3d on, ${{ matrix.compiler }}, lavapipe, validation on)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      # As linux-vkd3d.yml builds it (Ubuntu's 1.2 has no HLSL compiler), in the same cache.
+      VKD3D_VERSION: "2.1"
+      VKD3D_SHA256: 7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a
+      VKD3D_PREFIX: ${{ github.workspace }}/../vkd3d
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL2; vkd3d's build tools (flex, bison, Perl's JSON module, the SPIR-V headers) and the Vulkan headers and
+      # loader; lavapipe and the validation layer; Xvfb for the windows.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config clang libsdl2-dev libvulkan-dev libvulkan1 \
+            mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb
+
+      - name: Cache vkd3d
+        id: vkd3d-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.VKD3D_PREFIX }}
+          key: vkd3d-${{ env.VKD3D_VERSION }}-${{ runner.os }}-ubuntu-24.04-v1
+
+      - name: Build vkd3d
+        if: steps.vkd3d-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://dl.winehq.org/vkd3d/source/vkd3d-$VKD3D_VERSION.tar.xz"
+          echo "$VKD3D_SHA256  vkd3d-$VKD3D_VERSION.tar.xz" | sha256sum -c -
+          tar xf "vkd3d-$VKD3D_VERSION.tar.xz"
+          cd "vkd3d-$VKD3D_VERSION"
+          ./configure -q --prefix="$VKD3D_PREFIX" --disable-doxygen-doc
+          make -s -j"$(nproc)"
+          make -s install
+
+      # Both renderers in one runtime: the configure must say so for each.
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+          export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON \
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON | tee configure.log
+          grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure.log
+          grep -q "Renderer: *the GPU layer's Vulkan backend" configure.log
+          grep -q "Renderer: *the compile service's spv target" configure.log
+
+      - name: Build
+        run: cmake --build build --target ps3recomp_runtime test_rsx_synth test_rsx_out
+
+      # The switch's choice against its stand-ins, as Linux builds it (-V: each case's line).
+      - name: Run the route switch's test
+        run: ctest --test-dir build -R rsx_out -V
+
+      # The null route through the switch: the same goldens as everywhere.
+      - name: Run the core on the synthetic scenes (null route, through the switch)
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+        run: ctest --test-dir build -R rsx_synth -V
+
+      # The Vulkan route through the switch, in the core's SDL window on Xvfb: every frame plays, no validation
+      # message, and the switch's own line names the route. lavapipe is the runner's only device.
+      - name: Run the core on the synthetic scenes (vulkan route, through the switch)
+        working-directory: build
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+          SDL_AUDIODRIVER: dummy
+        run: |
+          set -o pipefail
+          mkdir -p routes.out
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --keep --out routes.out/vulkan
+          grep -F "[rsx_out] route vulkan (the new path on its Vulkan backend)" routes.out/vulkan/a/log.txt
+
+      # V6's fallback: a Vulkan start that fails at each step the core names (RSX_FAIL_START_AT), and one with a
+      # start mark left, must run today's renderer on vkd3d in the same process; it plays the same scenes. Every
+      # run is listed; the step fails if any did.
+      - name: Run the Vulkan start's fallback to today's renderer (each step, and a mark left)
+        working-directory: build
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+          SDL_AUDIODRIVER: dummy
+        run: |
+          mkdir -p routes.out
+          fail=0; table=""
+          for s in loader instance adapter features device window "swap chain" targets shaders rings mark; do
+            out="routes.out/fallback-${s// /_}"
+            if xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --fallback "$s" --keep \
+                 --out "$out" > "$out.txt" 2>&1 \
+               && grep -q "\[D3D12\] vkd3d: llvmpipe" "$out/a/log.txt" \
+               && ! grep -q "the failed start's window" "$out/a/log.txt"; then
+              table="$table\n  $s: pass"
+            else
+              table="$table\n  $s: FAIL"; fail=1
+              cat "$out.txt"
+            fi
+            tail -1 "$out.txt"
+            grep -F "[rsx_out] route" "$out/a/log.txt" || true
+          done
+          printf "the fallbacks:$table\n"
+          exit $fail
+
+      - name: Keep the runs' output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsx-routes-linux-${{ matrix.compiler }}
+          path: |
+            build/routes.out/
+            build/test_rsx_synth.out/
           if-no-files-found: ignore
