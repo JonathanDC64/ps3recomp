@@ -460,6 +460,7 @@ static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 static u32 s_vp_icap = 0;
 static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
 static u32 s_vf_off = 0;    /* bytes used in this frame's half */
+static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
 /* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
@@ -480,12 +481,12 @@ static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
 static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
 static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
 static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
-/* The rings vp_vb_grow and vp_ib_grow replaced ([0] vp_vb, [1] vp_ib), with
- * the frame slot that last drew from each: destroyed with that frame's fence
- * at the next render_frame's start (rc_ring_release), where today's deferred
- * release let them go. */
-static gpu_buffer s_rc_ring_old[2];
-static u32        s_rc_ring_old_slot[2];
+/* The rings vp_vb_grow, vp_ib_grow and vf_grow replaced ([0] vp_vb, [1] vp_ib,
+ * [2] vf_buf), with the frame slot that last drew from each: destroyed with
+ * that frame's fence at the next render_frame's start (rc_ring_release), where
+ * today's deferred release let them go. */
+static gpu_buffer s_rc_ring_old[3];
+static u32        s_rc_ring_old_slot[3];
 
 /* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
  * GPU_MEM_READBACK (COPY_DEST) memory, as *b and, with map, its pointer for
@@ -516,7 +517,7 @@ static void rc_ring_retire(int i, gpu_buffer old)
  * each with the fence of the frame that drew from it (passed by now). */
 static void rc_ring_release(void)
 {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (!GPU_VALID(s_rc_ring_old[i])) continue;
         gpu_buffer_destroy(s_rc_dev, s_rc_ring_old[i], s_rc_frame_fence[s_rc_ring_old_slot[i]]);
         s_rc_ring_old[i].id = 0;

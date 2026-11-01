@@ -939,3 +939,34 @@ static void vp_ib_grow(u64 want)
             s_vp_icap, (unsigned long long)(bytes >> 20), 10);
 }
 
+/* Grow the GPU fetch ring (vf_buf) to hold a frame of `want` bytes, with
+ * headroom, as vp_vb grows. A strip that does not fit takes the CPU path,
+ * which writes 256 bytes a vertex: on Demon's Souls' dragon bridge in 1-2 a
+ * frame asks for up to ~120 MB of ring, and with the ring at its 64 MB the
+ * CPU path wrote ~2 million vertices a frame and held the frame rate at ~77
+ * (issue #288). The old ring may still be read by the frame in flight, so it
+ * is destroyed with that frame's fence (rc_ring_retire). At most 1024 MB a
+ * half, as VP_FETCH_RING_MB. */
+static void vf_grow(u64 want)
+{
+    static u64 limit = 1024ull << 20;
+    u64 cap = s_vf_cap;
+    while (cap < want + want / 8 && cap < limit) cap *= 2;
+    if (cap > limit) cap = limit;
+    if (cap <= s_vf_cap) return;
+    const u64 bytes = cap * 2;   /* two parity halves */
+    gpu_buffer nb; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_RAW, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
+        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
+        fprintf(stderr, "[VF] growing the fetch ring to %llu MB a half failed; staying at %u MB%c",
+                (unsigned long long)(cap >> 20), s_vf_cap >> 20, 10);
+        limit = s_vf_cap;
+        return;
+    }
+    rc_ring_retire(2, s_rc_vf_buf);
+    s_rc_vf_buf = nb;
+    s_d3d.vf_mapped = mp; s_vf_cap = (u32)cap;
+    fprintf(stderr, "[VF] a frame asked for %llu MB of the fetch ring: grown to %u MB a half%c",
+            (unsigned long long)(want >> 20), s_vf_cap >> 20, 10);
+}
+

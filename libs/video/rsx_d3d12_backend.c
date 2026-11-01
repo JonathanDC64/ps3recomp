@@ -639,6 +639,7 @@ static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 static u32 s_vp_icap = 0;
 static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
 static u32 s_vf_off = 0;    /* bytes used in this frame's half */
+static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
 /* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
@@ -3195,8 +3196,9 @@ static int init_d3d12(u32 width, u32 height)
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
-         * once, default 64) per half; a draw that does not fit takes the CPU
-         * path. */
+         * once, default 64) per half to start with; a draw that does not fit
+         * takes the CPU path, and the ring grows at the frame's end
+         * (vf_grow). */
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
           s_vf_cap = (u32)mb << 20;
@@ -9871,6 +9873,44 @@ static void vp_ib_grow(u64 want)
             s_vp_icap, (unsigned long long)(bd.Width >> 20), 10);
 }
 
+/* Grow the GPU fetch ring (vf_buf) to hold a frame of `want` bytes, with
+ * headroom, as vp_vb grows. A strip that does not fit takes the CPU path,
+ * which writes 256 bytes a vertex: on Demon's Souls' dragon bridge in 1-2 a
+ * frame asks for up to ~120 MB of ring, and with the ring at its 64 MB the
+ * CPU path wrote ~2 million vertices a frame and held the frame rate at ~77
+ * (issue #288). The old ring may still be read by the frame in flight, so it
+ * is released with the deferred RT resources. At most 1024 MB a half, as
+ * VP_FETCH_RING_MB. */
+static void vf_grow(u64 want)
+{
+    static u64 limit = 1024ull << 20;
+    u64 cap = s_vf_cap;
+    while (cap < want + want / 8 && cap < limit) cap *= 2;
+    if (cap > limit) cap = limit;
+    if (cap <= s_vf_cap) return;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Width = cap * 2;                /* two parity halves */
+    ID3D12Resource* nb = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
+    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&nb)) ||
+        FAILED(nb->lpVtbl->Map(nb, 0, &nr, &mp)) || !mp) {
+        if (nb) nb->lpVtbl->Release(nb);
+        fprintf(stderr, "[VF] growing the fetch ring to %llu MB a half failed; staying at %u MB%c",
+                (unsigned long long)(cap >> 20), s_vf_cap >> 20, 10);
+        limit = s_vf_cap;
+        return;
+    }
+    off_rt_defer_release(s_d3d.vf_buf);
+    s_d3d.vf_buf = nb; s_d3d.vf_mapped = mp; s_vf_cap = (u32)cap;
+    fprintf(stderr, "[VF] a frame asked for %llu MB of the fetch ring: grown to %u MB a half%c",
+            (unsigned long long)(want >> 20), s_vf_cap >> 20, 10);
+}
+
 /* -------------------------------------------------------------------------
  * Occlusion queries (NV4097 ZPASS pixel counts)
  *
@@ -12531,7 +12571,9 @@ rtt_dump_done:;
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    const u64 vf_want = (u64)s_vf_off + s_vf_short;   /* what this frame's fetch draws asked for */
     s_vf_off = 0;
+    s_vf_short = 0;
     s_fx.valid = 0;
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
       PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
@@ -12552,6 +12594,7 @@ rtt_dump_done:;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
     if (!s_d3d.vp_ib || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
+    if (s_d3d.vf_buf && vf_want > s_vf_cap) vf_grow(vf_want);
 
     /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
      * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program
@@ -15019,7 +15062,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             }
             u64 total = 512;
             for (u32 j = 0; j < nsp; j++) total += g1[j] - g0[j];
-            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; return -1; }
+            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; s_vf_short += total; return -1; }
             u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
