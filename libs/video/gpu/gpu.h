@@ -560,8 +560,8 @@ typedef struct gpu_pipeline_desc {
     uint8_t           topology_type;     /* GPU_TOPOLOGY_TYPE_* */
     uint8_t           cull;              /* GPU_CULL_* */
     uint8_t           front_ccw;         /* counter-clockwise faces are front faces */
-    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0 (the guest pipelines): depth is
-                                          * clamped, not clipped (GPU_CAP_DEPTH_CLAMP) */
+    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0: depth is clamped, not clipped
+                                          * (GPU_CAP_DEPTH_CLAMP), as a guest pipeline asks for it */
     uint8_t           multisample;       /* D3D12's MultisampleEnable (the menu's MSAA layers) */
     uint8_t           depth_test;
     uint8_t           depth_write;

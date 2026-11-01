@@ -32,6 +32,7 @@ static void vp_fp_desc(gpu_pipeline_desc* pd, gpu_shader vs, int fetch, gpu_shad
        * CULL_FACE culls exactly the faces it should keep. */
       static int _cfl = -1; PS3_KNOB(_cfl, getenv("CULL_FLIP") ? 1 : 0);
       pd->front_ccw = (((cull & 4u) ? 1 : 0) ^ _cfl) ? 1 : 0; }
+    pd->depth_clip = (cull & 8u) ? 0 : 1;   /* rsx_cull_key */
     /* Blend per the guest's packed key (see rsx_blend_key): dbgfont text needs
      * straight alpha; demosaic's effect passes blend OFF; DeferredShading's
      * light accumulation is additive ONE,ONE. Every target takes it (the GPU
