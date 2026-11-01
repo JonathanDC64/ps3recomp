@@ -148,9 +148,20 @@ static VkSamplerAddressMode addr_mode(const gpu_vk_device* dd, uint32_t a)
     }
 }
 
+/* The border colour Vulkan has nearest to the description's, by RPCS3's rule
+ * when custom border colours are missing: white when the colour channels add
+ * up to more than 1.35, else opaque black when alpha is over half, else
+ * transparent black. Exact for those three, which is what the guest uses
+ * (the shadow maps' white border, the post passes' defaults). */
+static VkBorderColor border_color(const float b[4])
+{
+    if (b[0] + b[1] + b[2] > 1.35f) return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    return b[3] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+}
+
 /* D3D12_SAMPLER_DESC as a VkSampler. Anisotropy without GPU_CAP_ANISO16 is
  * capped at the device's (none without samplerAnisotropy). */
-VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, VkBorderColor border)
+VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc)
 {
     const uint32_t f = desc->filter;
     VkSamplerCreateInfo si;
@@ -175,7 +186,7 @@ VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, V
     si.minLod = desc->min_lod;
     si.maxLod = desc->max_lod >= GPU_LOD_MAX ? VK_LOD_CLAMP_NONE : desc->max_lod;
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
-    si.borderColor = border;
+    si.borderColor = border_color(desc->border);
     VkSampler s = VK_NULL_HANDLE;
     if (dd->vk.vkCreateSampler(dd->device, &si, NULL, &s) != VK_SUCCESS) return VK_NULL_HANDLE;
     return s;
@@ -216,8 +227,7 @@ gpu_sampler gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc)
             dd->samp_hash_cap = cap;
         }
     }
-    const VkSampler s = dd->samp_hash ? gpu_vk_sampler_make(dd, desc, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK)
-                                      : VK_NULL_HANDLE;
+    const VkSampler s = dd->samp_hash ? gpu_vk_sampler_make(dd, desc) : VK_NULL_HANDLE;
     if (s) {
         r.id = gpu_vk_slot_alloc(&dd->samp_slots);
         if (r.id) {

@@ -69,6 +69,8 @@ typedef struct {
         u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
                          * filt bits 20-22 (unused by the register) hold
                          * TEXTURE_CONTROL0's max anisotropy */
+        u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
+                         * address mode reads outside the texture */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -360,7 +362,7 @@ typedef struct {
     VPFPEntry*            vp_fp;                /* guest-FP PSO cache            */
     int                   vp_fp_n, vp_fp_cap;
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt, border; int cube; int set; } cur_texs[RSX_FP_UNITS];
     u32                   samp_n;               /* 4-sampler tables created so far */
 
     /* Render-to-texture: offscreen RT pool (their RTVs are views). */

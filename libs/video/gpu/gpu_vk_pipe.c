@@ -325,14 +325,6 @@ static VkShaderStageFlags stages_of(const gpu_vk_device* dd, uint32_t vis)
     }
 }
 
-/* A static sampler's border (gpu.h: transparent black, opaque black or
- * opaque white). */
-static VkBorderColor border_of(const gpu_sampler_desc* s)
-{
-    if (s->border[3] == 0.0f) return VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    return s->border[0] == 0.0f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-}
-
 /* gpu_layout_desc as a pipeline layout (gpu_vk_internal.h's rules): set 0
  * the CB and RAW slots as dynamic buffers and the static samplers as
  * immutable ones, a set per table slot, the CONST32 slots one push
@@ -400,7 +392,7 @@ gpu_layout gpu_vk_layout_create(gpu_device* d, const gpu_layout_desc* desc)
     for (uint32_t k = 0; k < desc->nstatic; k++) {
         const gpu_static_sampler* const ss = &desc->statics[k];
         if (ss->reg >= 16) goto fail;
-        l.statics[k] = gpu_vk_sampler_make(dd, &ss->desc, border_of(&ss->desc));
+        l.statics[k] = gpu_vk_sampler_make(dd, &ss->desc);
         if (!l.statics[k]) goto fail;
         l.nstatics++;
         b[nb].binding = GPU_VK_BIND_S + ss->reg;

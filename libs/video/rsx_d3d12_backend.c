@@ -221,6 +221,8 @@ typedef struct {
         u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
                          * filt bits 20-22 (unused by the register) hold
                          * TEXTURE_CONTROL0's max anisotropy */
+        u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
+                         * address mode reads outside the texture */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -553,7 +555,7 @@ typedef struct {
     int                   vp_fp_n, vp_fp_cap;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt, border; int cube; int set; } cur_texs[RSX_FP_UNITS];
     ID3D12DescriptorHeap* samp_heap;            /* shader-visible guest samplers */
     u32                   samp_inc;
     u32                   samp_n;               /* 4-sampler tables created so far */
@@ -8300,13 +8302,26 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* A unit addresses with a border (TEXTURE_ADDRESS wrap 4 on S, T or R), so
+ * its sampler needs the unit's border colour (TEXTURE_BORDER_COLOR); every
+ * border used to read transparent black. The game's shadow maps are
+ * border-addressed with a white border: past the map's edge is lit. */
+static int addr_has_border(u32 a)
+{
+    return (a & 0xF) == 4 || ((a >> 8) & 0xF) == 4 || ((a >> 16) & 0xF) == 4;
+}
+
+/* A sampler key is three words a unit: TEXTURE_ADDRESS, tex_filter_key, and
+ * the border colour (0 when no axis uses it, so those units still share). */
+#define SAMP_KEY_W 3
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
 static u32 samp_key_slot(const u32* k)
 {
     u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
-    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+    for (int i = 0; i < RSX_FP_UNITS * SAMP_KEY_W; i += 4) {
         a = (a ^ k[i])     * 0x01000193u;
         b = (b ^ k[i + 1]) * 0x01000193u;
         c = (c ^ k[i + 2]) * 0x01000193u;
@@ -8319,13 +8334,15 @@ static u32 samp_key_slot(const u32* k)
 
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
-    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
+    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
-    u32 k[RSX_FP_UNITS * 2];
+    u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * 2 + 1] = dr && dr->tex[u].set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
-                                            : (u ? 0x02060001u : 0x01010001u);
+        const int set = dr && dr->tex[u].set;
+        k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
+        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+                                    : (u ? 0x02060001u : 0x01010001u);
+        k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
     const u64 now = s_d3d.frame_count;
     /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
@@ -8379,7 +8396,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        const u32 a = k[u * 2], f = k[u * 2 + 1];
+        const u32 a = k[u * SAMP_KEY_W], f = k[u * SAMP_KEY_W + 1], bc = k[u * SAMP_KEY_W + 2];
         const u32 minf = (f >> 16) & 7, magf = (f >> 24) & 7;
         /* min: 1 NEAREST, 2 LINEAR, 3 N_MIP_N, 4 L_MIP_N, 5 N_MIP_L, 6 L_MIP_L,
          * 7 convolution; mag: 1 NEAREST, 2 LINEAR, 4 convolution. */
@@ -8408,6 +8425,10 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         static const u8 zrev[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
         sd.ComparisonFunc = (f & 0x80000000u) ? (D3D12_COMPARISON_FUNC)(zrev[(a >> 28) & 7u] + 1u)
                                               : D3D12_COMPARISON_FUNC_NEVER;
+        sd.BorderColor[0] = (float)((bc >> 16) & 0xFF) / 255.0f;   /* ARGB8, as RPCS3 decodes it */
+        sd.BorderColor[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+        sd.BorderColor[2] = (float)(bc & 0xFF) / 255.0f;
+        sd.BorderColor[3] = (float)(bc >> 24) / 255.0f;
         sd.MinLOD = 0.0f;
         sd.MaxLOD = (minf == 1 || minf == 2) ? 0.0f : D3D12_FLOAT32_MAX;  /* no mipmapping */
         D3D12_CPU_DESCRIPTOR_HANDLE hs = h;
@@ -15122,6 +15143,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15256,6 +15278,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15473,6 +15496,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15658,6 +15682,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].addr  = tex->address;
         s_d3d.cur_texs[unit].filt  = (tex->filter & ~0x00700000u) | (((tex->control0 >> 4) & 7u) << 20);
+        s_d3d.cur_texs[unit].border = tex->border_color;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;
