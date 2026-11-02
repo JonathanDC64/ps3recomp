@@ -97,6 +97,12 @@ typedef struct gpu_swapchain  { uint32_t id; } gpu_swapchain;   /* a window's im
 typedef struct gpu_pipeline { uint64_t v; } gpu_pipeline;
 typedef struct gpu_table    { uint64_t v; } gpu_table;
 
+/* A table pool as its backend keeps it, for the per-draw writes
+ * (table_writer_get, table_writer_tex): the record a write reaches, found
+ * once. On D3D12 and Vulkan a pointer to it, on the null backend the pool's
+ * id. It lives as long as the device, as pools do. */
+typedef struct gpu_table_writer { uint64_t v; } gpu_table_writer;
+
 /* A point on the device's timeline: work submitted before gpu_signal()
  * returned it is done when gpu_fence_completed() reaches it. A lost device
  * reads UINT64_MAX, as D3D12's fences do. */
@@ -267,7 +273,9 @@ enum { GPU_STRIP_CUT_NONE = 0, GPU_STRIP_CUT_FFFF = 1, GPU_STRIP_CUT_FFFFFFFF = 
 #define GPU_FILTER_IS_ANISO(f)      (((f) & 0x40u) != 0)
 enum { GPU_FILTER_POINT = 0, GPU_FILTER_LINEAR = 1 };
 enum { GPU_REDUCE_STANDARD = 0, GPU_REDUCE_COMPARE = 1 };
-/* Addressing (D3D12_TEXTURE_ADDRESS_MODE). A border is transparent black. */
+/* Addressing (D3D12_TEXTURE_ADDRESS_MODE). A border reads the description's
+ * border colour (on Vulkan the nearest of transparent black, opaque black and
+ * opaque white). */
 enum {
     GPU_ADDRESS_WRAP = 1, GPU_ADDRESS_MIRROR = 2, GPU_ADDRESS_CLAMP = 3,
     GPU_ADDRESS_BORDER = 4, GPU_ADDRESS_MIRROR_ONCE = 5
@@ -381,7 +389,9 @@ typedef struct gpu_texture_desc {
     uint32_t    samples;         /* 1, or the MSAA count */
     uint32_t    use;             /* GPU_USE_* */
     gpu_state   state;           /* the state it starts in */
-    gpu_heap    heap;            /* placed at heap_offset when set; else memory of its own */
+    gpu_heap    heap;            /* placed at heap_offset when set; else memory of its own,
+                                    which starts zeroed (step VC1: Vulkan too, as D3D12;
+                                    except BC formats there); placed: what the heap held */
     uint64_t    heap_offset;     /* aligned as gpu_texture_size says */
     gpu_format  clear_format;    /* the clear value it is fastest to clear to; 0 for none */
     float       clear_color[4];
@@ -435,7 +445,7 @@ typedef struct gpu_sampler_desc {
     float    mip_lod_bias;
     uint32_t max_aniso;                       /* 1-16 */
     uint32_t compare;                         /* GPU_CMP_*, with a comparison filter; else GPU_CMP_NEVER */
-    float    border[4];                       /* transparent black: all 0 */
+    float    border[4];                       /* RGBA; transparent black: all 0 */
     float    min_lod, max_lod;                /* max_lod GPU_LOD_MAX: every mip */
 } gpu_sampler_desc;
 #define GPU_LOD_MAX 3.402823466e+38f          /* D3D12_FLOAT32_MAX */
@@ -447,7 +457,12 @@ typedef struct gpu_sampler_desc {
  * `first`. Regions may overlap; a write reaches every table holding the
  * entry. A table is a region's first entry plus a multiple of its size
  * (table_ref gives none elsewhere on Vulkan), and a table slot binds only
- * tables of its own count (the region's size), from register 0. */
+ * tables of its own count (the region's size), from register 0.
+ * ---- step VC1 ---- Up to 16 entries counts as 16 on both sides: a slot of
+ * up to 16 binds any table of up to 16 (a 1-texture blit slot binds a pool's
+ * 2-entry tables); past 16, only its own count.
+ * ---- step VM ---- A table slot may start at any register (Vulkan too): its
+ * entry 0 is that register (the menu's t0 and t1 are two slots). */
 enum { GPU_TABLE_TEX = 0, GPU_TABLE_SAMPLER = 1 };
 #define GPU_MAX_TABLE_REGIONS 4
 typedef struct gpu_table_region { uint32_t first, tables, size; } gpu_table_region;
@@ -460,7 +475,8 @@ typedef struct gpu_table_pool_desc {
 
 /* A compiled stage. The compile service (gpu_shader.h) makes the code. */
 enum { GPU_STAGE_VS = 0, GPU_STAGE_GS = 1, GPU_STAGE_PS = 2 };
-enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4 };
+enum { GPU_CODE_DXBC = 0, GPU_CODE_DXIL = 1, GPU_CODE_SPIRV = 2, GPU_CODE_MSL = 3, GPU_CODE_METALLIB = 4,
+       GPU_CODE_KEY = 5 };   /* KEY: no code, a name for it (the null backend's: rsxc_null.c) */
 typedef struct gpu_shader_desc {
     uint32_t    stage;    /* GPU_STAGE_* */
     uint32_t    code;     /* GPU_CODE_* */
@@ -546,8 +562,8 @@ typedef struct gpu_pipeline_desc {
     uint8_t           topology_type;     /* GPU_TOPOLOGY_TYPE_* */
     uint8_t           cull;              /* GPU_CULL_* */
     uint8_t           front_ccw;         /* counter-clockwise faces are front faces */
-    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0 (the guest pipelines): depth is
-                                          * clamped, not clipped (GPU_CAP_DEPTH_CLAMP) */
+    uint8_t           depth_clip;        /* D3D12's DepthClipEnable. 0: depth is clamped, not clipped
+                                          * (GPU_CAP_DEPTH_CLAMP), as a guest pipeline asks for it */
     uint8_t           multisample;       /* D3D12's MultisampleEnable (the menu's MSAA layers) */
     uint8_t           depth_test;
     uint8_t           depth_write;
@@ -565,6 +581,25 @@ typedef struct gpu_pipeline_desc {
     uint32_t          sample_mask;       /* 0xFFFFFFFF */
     uint32_t          strip_cut;         /* GPU_STRIP_CUT_* */
 } gpu_pipeline_desc;
+
+/* pipeline_create's flags. STORE_ONLY: a pipeline made only for the cache,
+ * as the start's builds make the pipelines a later draw loads: loaded, or
+ * compiled and stored, then freed at once (nothing has recorded it), and no
+ * handle is returned. Without a cache it is compiled and freed. */
+enum { GPU_PIPELINE_STORE_ONLY = 1u << 0 };
+/* What pipeline_create did (*how). */
+enum {
+    GPU_PIPELINE_FAILED   = 0,   /* nothing made: a bad description or handle, or the driver refused it */
+    GPU_PIPELINE_LOADED   = 1,   /* from the cache */
+    GPU_PIPELINE_COMPILED = 2,   /* compiled, not stored: no cache, or another thread stored it first */
+    GPU_PIPELINE_STORED   = 3    /* compiled and stored in the cache: new there, for the next save */
+};
+/* What pipeline_cache_load found. */
+enum {
+    GPU_PIPELINE_CACHE_NONE   = -1,   /* no cache on this device: pipelines are compiled, never stored */
+    GPU_PIPELINE_CACHE_NEW    = 0,    /* an empty cache: no file, or another driver's or GPU's */
+    GPU_PIPELINE_CACHE_LOADED = 1     /* the file's pipelines */
+};
 
 /* The targets of a pass: OMSetRenderTargets. ds none for no depth target;
  * a depth view made with GPU_VIEW_READ_ONLY_* binds it for reading. */
@@ -649,7 +684,8 @@ enum {
     GPU_NATIVE_BUFFER = 5,    /* handle gpu_buffer.id: ID3D12Resource* / VkBuffer */
     GPU_NATIVE_TEXTURE = 6,   /* handle gpu_texture.id: ID3D12Resource* / VkImage */
     GPU_NATIVE_LAYOUT = 7,    /* handle gpu_layout.id: ID3D12RootSignature* / VkPipelineLayout */
-    GPU_NATIVE_SWAPCHAIN = 8  /* handle gpu_swapchain.id: IDXGISwapChain3* / VkSwapchainKHR */
+    GPU_NATIVE_SWAPCHAIN = 8, /* handle gpu_swapchain.id: IDXGISwapChain3* / VkSwapchainKHR */
+    GPU_NATIVE_PIPELINE = 9   /* handle gpu_pipeline.v: ID3D12PipelineState* / VkPipeline */
 };
 
 /* Creating a device. Each backend has its own create function (below). */
@@ -724,22 +760,33 @@ typedef struct gpu_device_desc {
      * holding this description is left as it is (today's memo). */ \
     X(table_write_tex,   V, void,           (gpu_device* d, gpu_table_pool pool, uint32_t index, const gpu_view_desc* srv), (d, pool, index, srv)) \
     X(table_write_sampler, V, void,         (gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s), (d, pool, index, s)) \
+    /* The pool found once, for table_writer_tex, which skips the lookup of the pool's record \
+     * table_write_tex makes on each call (pool: one this device made). */ \
+    X(table_writer_get,  R, gpu_table_writer, (gpu_device* d, gpu_table_pool pool), (d, pool)) \
+    /* table_write_tex through a writer: the same memo, the same write. */ \
+    X(table_writer_tex,  V, void,           (gpu_device* d, gpu_table_writer w, uint32_t index, const gpu_view_desc* srv), (d, w, index, srv)) \
     /* The table starting at index, for bind_table: a table's first entry (the regions above; \
      * Vulkan gives none for any other index). */ \
     X(table_ref,         R, gpu_table,      (gpu_device* d, gpu_table_pool pool, uint32_t index), (d, pool, index)) \
     /* The compile service's hook for this device's shader target. request and result are \
      * gpu_shader.h's; opaque here. Returns nonzero on success. Thread-safe. */ \
     X(compile_hook,      R, int,            (gpu_device* d, const void* request, void* result), (d, request, result)) \
+    /* A shader from compiled code (copied). Thread-safe: the start's pipeline workers make and \
+     * free shaders beside the render thread. */ \
     X(shader_create,     R, gpu_shader,     (gpu_device* d, const gpu_shader_desc* desc), (d, desc)) \
     /* Frees a shader's code (today's code drops a blob once its pipeline is built); pipelines \
      * made from it keep working. Not while a pipeline_create that uses it runs. Vulkan: \
      * vkDestroyShaderModule. Thread-safe. */ \
     X(shader_destroy,    V, void,           (gpu_device* d, gpu_shader s), (d, s)) \
     X(layout_create,     R, gpu_layout,     (gpu_device* d, const gpu_layout_desc* desc), (d, desc)) \
-    /* A pipeline, from the cache when it has it (then *from_cache = 1; may be NULL). \
-     * Thread-safe: the start's pipeline workers call it beside the render thread. */ \
-    X(pipeline_create,   R, gpu_pipeline,   (gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache), (d, desc, from_cache)) \
-    /* The pipeline cache's file: read it (1 = used, 0 = none or another driver's) and write it. */ \
+    /* A pipeline, from the cache when it has it, else compiled (and stored in the cache). flags \
+     * GPU_PIPELINE_*: with STORE_ONLY it is only stored, and none is returned. *how (may be \
+     * NULL) says which (GPU_PIPELINE_LOADED, ...). A pipeline returned lives as long as the \
+     * device. Thread-safe: the start's pipeline workers call it beside the render thread. */ \
+    X(pipeline_create,   R, gpu_pipeline,   (gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how), (d, desc, flags, how)) \
+    /* The pipeline cache's file. Load once, before pipelines are made: GPU_PIPELINE_CACHE_* \
+     * (NONE on a device without GPU_CAP_PIPELINE_CACHE, or when the API cannot make one). Save \
+     * may run on a thread of its own while pipelines are made: 1 when written. */ \
     X(pipeline_cache_load, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(pipeline_cache_save, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(query_pool_create, R, gpu_query_pool, (gpu_device* d, uint32_t type, uint32_t count), (d, type, count)) \
@@ -756,22 +803,27 @@ typedef struct gpu_device_desc {
     /* 0 once the GPU has passed f, 1 after timeout_ms without (never unbounded: a lost device \
      * never signals). */ \
     X(fence_wait,        R, int,            (gpu_device* d, gpu_fence f, uint32_t timeout_ms), (d, f, timeout_ms)) \
-    /* Swap chains. */ \
+    /* Swap chains. On Vulkan one made on a minimized window has no images until it is shown. */ \
     X(swap_create,       R, gpu_swapchain,  (gpu_device* d, const gpu_swapchain_desc* desc), (d, desc)) \
     X(swap_destroy,      V, void,           (gpu_device* d, gpu_swapchain sc), (d, sc)) \
     /* New size or format (ResizeBuffers). The GPU must be idle and the images unused. 0 on success. */ \
     X(swap_resize,       R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t height, gpu_format format), (d, sc, width, height, format)) \
     /* The image to draw next and its index (below swap_image_count); it starts in GPU_STATE_PRESENT. \
-     * Its size is the window's on Vulkan (the surface's); a minimized window gives none. */ \
+     * Its size is the window's on Vulkan (the surface's); a minimized window gives none. Vulkan \
+     * also makes the swap chain again inside an acquire (out of date, a restore after a minimize): \
+     * an image that is not the one swap_image gave at its index says so, and every image (and \
+     * view) is taken again. */ \
     X(swap_acquire,      R, uint32_t,       (gpu_device* d, gpu_swapchain sc, gpu_texture* image), (d, sc, image)) \
     /* The swap chain's images: D3D12 has the buffers asked; Vulkan at least that many (the driver \
      * may make more), so arrays by image index take this count, not FRAME_COUNT. Changes only \
-     * with swap_resize. */ \
+     * with swap_resize on D3D12; on Vulkan with an acquire too, and 0 while minimized. */ \
     X(swap_image_count,  R, uint32_t,       (gpu_device* d, gpu_swapchain sc), (d, sc)) \
     /* Image index, the texture swap_acquire hands back with that index (none past the count): \
-     * for making every image's view up front. Valid until the next swap_resize or swap_destroy. */ \
+     * for making every image's view up front. Valid until the next swap_resize or swap_destroy \
+     * (on Vulkan, or an acquire that made the swap chain again). */ \
     X(swap_image,        R, gpu_texture,    (gpu_device* d, gpu_swapchain sc, uint32_t index), (d, sc, index)) \
-    /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). 0 on success. */ \
+    /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). GPU_PRESENTED (0) on \
+     * success, else a GPU_PRESENT_* code (step VC2, at the end). */ \
     X(swap_present,      R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags), (d, sc, interval, flags)) \
     /* 0 with *out filled; else nonzero (no statistics yet). Vulkan has them with \
      * GPU_CAP_PRESENT_WAIT: the last present seen on the display, sync_qpc when it was seen, \
@@ -825,4 +877,59 @@ gpu_device* gpu_null_create(const gpu_device_desc* desc);
 #ifdef __cplusplus
 }
 #endif
+
+/* ---- step V4 ---- */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The menu's renderer on the GPU layer (the port's render_gpu.cpp) over the
+ * D3D12 objects of a renderer that is not on it (today's): native handles
+ * as void*, so this file needs no D3D12 header. In builds with the D3D12
+ * backend; other backends have no such calls yet. */
+
+/* A device over the caller's ID3D12Device* and ID3D12CommandQueue*, which
+ * it AddRefs and releases at gpu_destroy. Its fence, recorders and
+ * descriptor heaps are its own; its submits go to that queue, in order with
+ * the caller's own work there. desc may be NULL; its cmd_slots and cap_mask
+ * count, its adapter flags do not, nor GPU_DEVICE_BREADCRUMBS (DRED is
+ * turned on before a device is made). NULL when a part cannot be made. */
+gpu_device* gpu_d3d12_create_on(void* device, void* queue, const gpu_device_desc* desc);
+
+/* A texture over the caller's ID3D12Resource* (a swap chain's buffer),
+ * AddRef'd and released when the handle is destroyed: destroy it before the
+ * swap chain's ResizeBuffers. out (may be NULL) gets its description as the
+ * resource has it: size, layers, mips, format, samples, and its target
+ * flags as use. Its state is the caller's to know. */
+gpu_texture gpu_d3d12_texture_on(gpu_device* d, void* resource, gpu_texture_desc* out);
+
+#ifdef __cplusplus
+}
+#endif
+
+/* ---- step VC2 ---- */
+/* A lost device and a present that failed, with one meaning on every
+ * backend (each maps its API's results to these):
+ *   - lost: 0 while the device works. Once it is lost (a driver reset, the
+ *     GPU gone), never 0 again: the API's own code for why, which the caller
+ *     names (rsxcore's rc_be_lost_text): D3D12's GetDeviceRemovedReason
+ *     HRESULT, Vulkan's VkResult (VK_ERROR_DEVICE_LOST) as a uint32_t. A
+ *     lost device's fences read UINT64_MAX, so fence_wait returns 0 at once.
+ *   - fence_wait: 0 once the GPU has passed the fence or the device is lost,
+ *     1 after the timeout or any other failure of the wait (never "passed"
+ *     unless it is).
+ *   - swap_present: GPU_PRESENTED when the image went to the display queue,
+ *     a swap chain the window no longer fits included (Vulkan's out of date
+ *     and suboptimal: the backend makes it again at the next acquire);
+ *     GPU_PRESENT_LOST when the device is lost (lost says why);
+ *     GPU_PRESENT_SURFACE_LOST when the window's surface is gone and could
+ *     not be made again (the device still works; nothing reaches this
+ *     window again: Vulkan's VK_ERROR_SURFACE_LOST_KHR); GPU_PRESENT_FAILED
+ *     for anything else (no image acquired, out of memory). */
+enum {
+    GPU_PRESENTED            = 0,
+    GPU_PRESENT_LOST         = 1,
+    GPU_PRESENT_SURFACE_LOST = 2,
+    GPU_PRESENT_FAILED       = 3
+};
 #endif /* PS3RECOMP_GPU_H */

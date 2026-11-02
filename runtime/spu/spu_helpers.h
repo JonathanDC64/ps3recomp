@@ -14,6 +14,7 @@
 #define SPU_HELPERS_H
 
 #include "spu_context.h"
+#include "ps3emu/ps3_sse.h"   /* PS3_SSE2NEON: the SSE4.1 paths below on arm64 */
 #include <string.h>
 #include <math.h>
 
@@ -183,8 +184,10 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
+#endif
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
  * as the byte loop). It works in the host layout, where SPU byte P is host
  * byte P^3 (SPU_W). Result host byte j is SPU byte j^3, whose control is host
@@ -260,7 +263,7 @@ static inline u128 spu_rothi(u128 a, int sh) { u128 r; sh&=15; for(int i=0;i<8;i
 static inline u128 spu_rotmi(u128 a, int i7)  { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]>>sh); return r; }
 static inline u128 spu_rotmai(u128 a, int i7) { u128 r; int sh=(0-i7)&0x3F; for(int i=0;i<4;i++) r._s32[i]=(sh>31)?(a._s32[i]>>31):(a._s32[i]>>sh); return r; }
 static inline u128 spu_rotmhi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 /* Whole-quadword byte shifts and rotates as one pshufb. Host byte j holds SPU
  * byte j^3 (SPU_W), so result host byte j takes source host byte
  * (((j^3) + sh) ^ 3) for a left shift/rotate and (((j^3) - sh) ^ 3) for a
@@ -295,7 +298,7 @@ static inline u128 spu_qb_shr(u128 a, int sh)
     return spu_qb_shuf(a, _mm_xor_si128(t, _mm_set1_epi8(3)));
 }
 #endif
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_qb_shl(a, sh & 0x1F); }
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_qb_rot(a, sh & 0x0F); }
 #else
@@ -413,7 +416,7 @@ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) retur
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 static inline u128 spu_shlqby(u128 a, u128 b)  { return spu_qb_shl(a, b._u32[0] & 0x1F); }
 static inline u128 spu_rotqby(u128 a, u128 b)  { return spu_qb_rot(a, b._u32[0] & 0x0F); }
 static inline u128 spu_shlqbybi(u128 a, u128 b){ return spu_qb_shl(a, (b._u32[0] >> 3) & 0x1F); }
@@ -617,7 +620,7 @@ static inline u128 spu_fsmbi(int32_t imm) {
  * a word, 0..7 for a doubleword. Every store is mapped through SPU_W to land at
  * the right host index. Verified to compose correctly with the fixed shufb for
  * both cbd-generated and immediate/LS-constant controls. */
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 /* The same controls without the narrow store into a just-built vector (which
  * stalls store forwarding on the read back). In host layout the inserted part
  * is one whole lane: cwd's word is _u32[p/4] = 0x00010203, cdd's dword is
@@ -691,7 +694,7 @@ static inline u128 spu_rotqmbi(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; 
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 static inline u128 spu_rotqmby(u128 a, u128 b)   { return spu_qb_shr(a, (0-(int)b._u32[0])&0x1F); }
 static inline u128 spu_rotqmbybi(u128 a, u128 b) { return spu_qb_shr(a, (0-((int)b._u32[0]>>3))&0x1F); }
 #else
@@ -702,7 +705,7 @@ static inline u128 spu_rotqmbii(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) retu
     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
-#if defined(__SSE4_1__)
+#if defined(__SSE4_1__) || defined(PS3_SSE2NEON)
 static inline u128 spu_rotqmbyi(u128 a, int i7)  { return spu_qb_shr(a, (0-i7)&0x1F); }
 #else
 static inline u128 spu_rotqmbyi(u128 a, int i7)  { int sh=(0-i7)&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }

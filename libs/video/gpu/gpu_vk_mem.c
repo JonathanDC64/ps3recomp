@@ -189,6 +189,7 @@ void gpu_vk_tex_free_now(gpu_vk_device* dd, uint32_t id)
     if (t->memory) dd->vk.vkFreeMemory(dd->device, t->memory, NULL);
     memset(t, 0, sizeof *t);
     dd->tex_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+    dd->tex_att[i] = 0;
     gpu_vk_slot_free(&dd->tex_slots, id);
 }
 
@@ -446,11 +447,52 @@ void gpu_vk_buffer_unmap(gpu_device* d, gpu_buffer b, uint64_t written_offset, u
  * Textures
  * -------------------------------------------------------------------------*/
 
+/* The formats a TYPELESS colour format's views may take (its D3D12 family),
+ * so the driver need not give up the image's compression for any format. */
+typedef struct view_family {
+    uint16_t        dxgi;   /* the TYPELESS one */
+    uint8_t         n;
+    VkFormat        f[5];
+} view_family;
+
+static const view_family k_view_families[] = {
+    {1,  3, {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_SINT}},
+    {9,  5, {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UINT,
+             VK_FORMAT_R16G16B16A16_SNORM, VK_FORMAT_R16G16B16A16_SINT}},
+    {23, 2, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2B10G10R10_UINT_PACK32}},
+    {27, 5, {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UINT, VK_FORMAT_R8G8B8A8_SNORM,
+             VK_FORMAT_R8G8B8A8_SINT}},
+    {33, 4, {VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_UINT, VK_FORMAT_R16G16_SNORM}},
+    {39, 3, {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT}},
+    {48, 3, {VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SNORM}},
+    {53, 5, {VK_FORMAT_R16_SFLOAT, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UINT, VK_FORMAT_R16_SNORM, VK_FORMAT_R16_SINT}},
+    {60, 4, {VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_SINT}},
+    {70, 2, {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK}},
+    {73, 2, {VK_FORMAT_BC2_UNORM_BLOCK, VK_FORMAT_BC2_SRGB_BLOCK}},
+    {76, 2, {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}},
+    {90, 2, {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB}},
+};
+
+/* Filled in for the family of `format`, NULL for a format with none. */
+static const void* view_list(gpu_format format, VkImageFormatListCreateInfo* fl)
+{
+    for (size_t i = 0; i < sizeof k_view_families / sizeof k_view_families[0]; i++)
+        if (k_view_families[i].dxgi == (uint16_t)format) {
+            memset(fl, 0, sizeof *fl);
+            fl->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+            fl->viewFormatCount = k_view_families[i].n;
+            fl->pViewFormats = k_view_families[i].f;
+            return fl;
+        }
+    return NULL;
+}
+
 /* The image a description makes: every usage its format has (sampled and
  * both copies), plus the targets it asks for. A TYPELESS colour format's
- * views may reinterpret it; six square layers may be a cube. 0 when the
- * format cannot do what is asked. */
-static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu_vk_format* f, VkImageCreateInfo* ci)
+ * views may reinterpret it (as its family, in *fl, which ci points to); six
+ * square layers may be a cube. 0 when the format cannot do what is asked. */
+static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu_vk_format* f, VkImageCreateInfo* ci,
+                      VkImageFormatListCreateInfo* fl)
 {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(dd->phys, f->vk, &fp);
@@ -471,7 +513,10 @@ static int image_info(gpu_vk_device* dd, const gpu_texture_desc* desc, const gpu
     if (!u) return 0;
     memset(ci, 0, sizeof *ci);
     ci->sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    if (f->typeless && (f->aspect & GPU_VK_ASPECT_COLOR)) ci->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    if (f->typeless && (f->aspect & GPU_VK_ASPECT_COLOR)) {
+        ci->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        ci->pNext = view_list(desc->format, fl);
+    }
     if (desc->layers >= 6 && desc->layers % 6 == 0 && desc->width == desc->height && desc->samples <= 1)
         ci->flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     ci->imageType = VK_IMAGE_TYPE_2D;
@@ -529,6 +574,7 @@ gpu_texture gpu_vk_tex_add(gpu_vk_device* dd, VkImage image, VkDeviceMemory memo
         t->depth = (f->aspect & GPU_VK_ASPECT_DEPTH) != 0;
         t->init_layout = gpu_vk_state_layout(desc->state, t);
         dd->tex_layout[i] = init_now ? (uint32_t)t->init_layout : (uint32_t)VK_IMAGE_LAYOUT_UNDEFINED;
+        dd->tex_att[i] = 0;
         if (init_now) {
             dd->init[dd->ninit].tex = r.id;
             dd->init[dd->ninit].layout = t->init_layout;
@@ -571,31 +617,56 @@ VkCommandBuffer gpu_vk_init_record(gpu_vk_device* dd, uint64_t value)
     memset(&di, 0, sizeof di);
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     di.pImageMemoryBarriers = ib;
-    uint32_t n = 0;
-    for (uint32_t j = 0; j <= dd->ninit; j++) {
-        if (n == 32 || (j == dd->ninit && n)) {
-            di.imageMemoryBarrierCount = n;
-            dd->vk.vkCmdPipelineBarrier2(cb, &di);
-            n = 0;
+    /* Step VC1: three passes. A texture to zero (GPU_VK_TEX_ZERO) goes to
+     * TRANSFER_DST first, is cleared, then goes to its layout; the others go
+     * to their layouts in the first pass, as before. */
+    for (uint32_t pass = 0; pass < 3; pass++) {
+        uint32_t n = 0;
+        for (uint32_t j = 0; j <= dd->ninit; j++) {
+            if (n == 32 || (j == dd->ninit && n)) {
+                di.imageMemoryBarrierCount = n;
+                dd->vk.vkCmdPipelineBarrier2(cb, &di);
+                n = 0;
+            }
+            if (j == dd->ninit) break;
+            const gpu_vk_init e = dd->init[j];
+            if (!gpu_vk_slot_valid(&dd->tex_slots, e.tex)) continue;
+            const gpu_vk_tex* const t = &dd->tex[GPU_HANDLE_INDEX(e.tex)];
+            const int zero = (t->flags & GPU_VK_TEX_ZERO) != 0;
+            if (pass && !zero) continue;
+            VkImageSubresourceRange all;
+            memset(&all, 0, sizeof all);
+            all.aspectMask = t->aspect;
+            all.levelCount = VK_REMAINING_MIP_LEVELS;
+            all.layerCount = VK_REMAINING_ARRAY_LAYERS;
+            if (pass == 1) {   /* every bit 0: 0.0, depth 0.0, stencil 0, as D3D12's zeroed memory */
+                if (t->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+                    VkClearColorValue cv;
+                    memset(&cv, 0, sizeof cv);
+                    dd->vk.vkCmdClearColorImage(cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &all);
+                } else {
+                    VkClearDepthStencilValue dv;
+                    memset(&dv, 0, sizeof dv);
+                    dd->vk.vkCmdClearDepthStencilImage(cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1,
+                                                       &all);
+                }
+                continue;
+            }
+            VkImageMemoryBarrier2* const b = &ib[n++];
+            memset(b, 0, sizeof *b);
+            b->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            b->srcStageMask = pass ? VK_PIPELINE_STAGE_2_CLEAR_BIT : VK_PIPELINE_STAGE_2_NONE;
+            b->srcAccessMask = pass ? VK_ACCESS_2_TRANSFER_WRITE_BIT : 0u;
+            b->dstStageMask = zero && !pass ? VK_PIPELINE_STAGE_2_CLEAR_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b->dstAccessMask = zero && !pass ? VK_ACCESS_2_TRANSFER_WRITE_BIT
+                                             : VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b->oldLayout = pass ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            b->newLayout = zero && !pass ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : e.layout;
+            b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b->image = t->image;
+            b->subresourceRange = all;
         }
-        if (j == dd->ninit) break;
-        const gpu_vk_init e = dd->init[j];
-        if (!gpu_vk_slot_valid(&dd->tex_slots, e.tex)) continue;
-        const gpu_vk_tex* const t = &dd->tex[GPU_HANDLE_INDEX(e.tex)];
-        VkImageMemoryBarrier2* const b = &ib[n++];
-        memset(b, 0, sizeof *b);
-        b->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        b->srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-        b->dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b->dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-        b->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b->newLayout = e.layout;
-        b->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b->image = t->image;
-        b->subresourceRange.aspectMask = t->aspect;
-        b->subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
-        b->subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     }
     dd->ninit = 0;
     gpu_vk_unlock(&dd->lock);
@@ -612,13 +683,14 @@ gpu_heap gpu_vk_heap_create(gpu_device* d, const gpu_heap_desc* desc)
     gpu_heap r = {0};
     gpu_texture_desc td;
     VkImageCreateInfo ci;
+    VkImageFormatListCreateInfo fl;
     memset(&td, 0, sizeof td);
     td.width = td.height = 64;
     td.layers = td.mips = 1;
     td.samples = 1;
     td.format = GPU_FORMAT_R8G8B8A8_UNORM;
     td.use = GPU_USE_SAMPLED;
-    if (!desc->size || !image_info(dd, &td, gpu_vk_format_of(td.format, 0), &ci)) return r;
+    if (!desc->size || !image_info(dd, &td, gpu_vk_format_of(td.format, 0), &ci, &fl)) return r;
     VkDeviceImageMemoryRequirements ir;
     VkMemoryRequirements2 mr;
     memset(&ir, 0, sizeof ir);
@@ -655,9 +727,10 @@ void gpu_vk_texture_size(gpu_device* d, const gpu_texture_desc* desc, uint64_t* 
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     const gpu_vk_format* const f = tex_format(dd, desc->format, desc->use);
     VkImageCreateInfo ci;
+    VkImageFormatListCreateInfo fl;
     *size = 0;
     *align = 0;
-    if (!f || !image_info(dd, desc, f, &ci)) return;
+    if (!f || !image_info(dd, desc, f, &ci, &fl)) return;
     VkDeviceImageMemoryRequirements ir;
     VkMemoryRequirements2 mr;
     memset(&ir, 0, sizeof ir);
@@ -729,7 +802,8 @@ gpu_texture gpu_vk_texture_create(gpu_device* d, const gpu_texture_desc* desc)
     gpu_texture none = {0};
     const gpu_vk_format* const f = tex_format(dd, desc->format, desc->use);
     VkImageCreateInfo ci;
-    if (!f || !image_info(dd, desc, f, &ci)) return none;
+    VkImageFormatListCreateInfo fl;
+    if (!f || !image_info(dd, desc, f, &ci, &fl)) return none;
     VkImage image = VK_NULL_HANDLE;
     if (dd->vk.vkCreateImage(dd->device, &ci, NULL, &image) != VK_SUCCESS) return none;
     VkMemoryRequirements req;
@@ -762,7 +836,12 @@ gpu_texture gpu_vk_texture_create(gpu_device* d, const gpu_texture_desc* desc)
                  dd->vk.vkBindImageMemory(dd->device, image, m, 0) == VK_SUCCESS;
         }
     }
-    gpu_texture r = ok ? gpu_vk_tex_add(dd, image, m, desc, 0, !placed) : none;
+    /* Step VC1: a texture with memory of its own starts zeroed, as D3D12's
+     * committed resources do (the core writes targets back to guest memory,
+     * parts it never drew too); one that cannot be cleared (BC) keeps what
+     * the memory held. A placed one is what its heap held, on both. */
+    const uint32_t zero = !placed && f->bw == 1 && (ci.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? GPU_VK_TEX_ZERO : 0u;
+    gpu_texture r = ok ? gpu_vk_tex_add(dd, image, m, desc, zero, !placed) : none;
     if (!r.id) {
         dd->vk.vkDestroyImage(dd->device, image, NULL);
         if (m) dd->vk.vkFreeMemory(dd->device, m, NULL);

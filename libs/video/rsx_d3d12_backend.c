@@ -221,6 +221,8 @@ typedef struct {
         u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
                          * filt bits 20-22 (unused by the register) hold
                          * TEXTURE_CONTROL0's max anisotropy */
+        u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
+                         * address mode reads outside the texture */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -553,7 +555,7 @@ typedef struct {
     int                   vp_fp_n, vp_fp_cap;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt, border; int cube; int set; } cur_texs[RSX_FP_UNITS];
     ID3D12DescriptorHeap* samp_heap;            /* shader-visible guest samplers */
     u32                   samp_inc;
     u32                   samp_n;               /* 4-sampler tables created so far */
@@ -637,6 +639,7 @@ static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 static u32 s_vp_icap = 0;
 static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
 static u32 s_vf_off = 0;    /* bytes used in this frame's half */
+static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
 /* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
@@ -1662,21 +1665,21 @@ static float hdr_sdr_white(const WCHAR* gdi)
 }
 
 /* What the display the window is on reports. A new factory each time: one
- * keeps describing the outputs as they were when it was made. */
+ * keeps describing the outputs as they were when it was made. 0 when no
+ * display answered for the window, as while it closes (it is on none then):
+ * what the last answer said stays. */
 static IDXGIFactory1* s_hdr_factory;
 static HMONITOR s_hdr_mon;
-static void hdr_display_query(void)
+static int hdr_display_query(void)
 {
-    s_hdr.disp_hdr = 0;
-    s_hdr.disp_peak = s_hdr.disp_white = 0.0f;
-    s_hdr.failed = 0;
     if (s_hdr_factory) s_hdr_factory->lpVtbl->Release(s_hdr_factory);
     s_hdr_factory = NULL;
     s_hdr_mon = MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST);
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) {
         s_hdr_factory = NULL;
-        return;
+        return 0;
     }
+    int found = 0;
     IDXGIAdapter1* a = NULL;
     for (UINT i = 0; s_hdr_factory->lpVtbl->EnumAdapters1(s_hdr_factory, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         IDXGIOutput* o = NULL;
@@ -1690,6 +1693,8 @@ static void hdr_display_query(void)
                     s_hdr.disp_hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
                     s_hdr.disp_peak = d1.MaxLuminance;
                     s_hdr.disp_white = hdr_sdr_white(d1.DeviceName);
+                    s_hdr.failed = 0;
+                    found = 1;
                 }
                 o6->lpVtbl->Release(o6);
             }
@@ -1697,6 +1702,7 @@ static void hdr_display_query(void)
         }
         a->lpVtbl->Release(a);
     }
+    return found;
 }
 
 /* Between frames, with RSX_HDR on: asks again when the window moved to
@@ -1709,7 +1715,10 @@ static void hdr_display_check(void)
         MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST) == s_hdr_mon &&
         s_hdr_factory->lpVtbl->IsCurrent(s_hdr_factory))
         return;
-    hdr_display_query();
+    /* No answer while the window closes: switching the swap chain to SDR then
+     * failed (ResizeBuffers on the window going away) and left it with no
+     * buffers for a frame drawn before the exit. */
+    if (!hdr_display_query()) return;
     printf("[D3D12] HDR: the window's display has HDR %s (peak %.0f nits, SDR white %.0f nits)\n",
            s_hdr.disp_hdr ? "on" : "off", s_hdr.disp_peak, s_hdr.disp_white);
 }
@@ -3193,8 +3202,9 @@ static int init_d3d12(u32 width, u32 height)
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
-         * once, default 64) per half; a draw that does not fit takes the CPU
-         * path. */
+         * once, default 64) per half to start with; a draw that does not fit
+         * takes the CPU path, and the ring grows at the frame's end
+         * (vf_grow). */
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
           s_vf_cap = (u32)mb << 20;
@@ -4924,14 +4934,25 @@ static u8 gl_blend_op_d3d(u32 e)
     }
 }
 /* Pack the guest's face-culling state for the PSO key.
- * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW.
+ * bit0 = cull enabled, bit1 = cull FRONT (else BACK), bit2 = front face is CCW,
+ * bit3 = depth is clamped, not clipped.
  * RSX/GL enums: CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408;
  * FRONT_FACE CW=0x0900 CCW=0x0901. rsx_commands seeds the reset state, BACK
- * and CCW. */
+ * and CCW.
+ *
+ * Depth: SET_ZMIN_MAX_CONTROL bit 0 clips, bit 4 clamps; clamping wins, and
+ * no clipping means clamping (as RPCS3 sets depth clamp). Its reset value
+ * clips. The guest pipelines used to clamp always, so a shadow map kept
+ * casters outside the light's depth range, squashed onto its near or far
+ * plane: the floor above, or things behind the light, threw shadows where
+ * nothing stands (issue #286). */
 static u32 rsx_cull_key(const rsx_state* st)
 {
-    if (!st || !st->cull_face_enable) return 0;
-    u32 k = 1u;
+    if (!st) return 0;
+    const u32 z = st->zminmax_control;
+    u32 k = ((z & 0xF0u) || !(z & 0xFu)) ? 8u : 0u;
+    if (!st->cull_face_enable) return k;
+    k |= 1u;
     if (st->cull_face == 0x0404u || st->cull_face == 0x0408u) k |= 2u;  /* FRONT */
     if (st->front_face == 0x0901u) k |= 4u;                             /* CCW */
     return k;
@@ -5881,6 +5902,7 @@ static void vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPUT_ELEME
     pd->InputLayout.pInputElementDescs = il; pd->InputLayout.NumElements = 16;
     if (fetch) pd->InputLayout.NumElements = 0;   /* SV_VertexID only */
     pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd->RasterizerState.DepthClipEnable = (cull & 8u) ? FALSE : TRUE;   /* rsx_cull_key */
     /* Guest face culling. CULL_OFF=1 forces double-sided, the old
      * unconditional behaviour -- geometry that vanishes under culling is a
      * winding/front-face problem, not a missing draw. */
@@ -8288,13 +8310,26 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* A unit addresses with a border (TEXTURE_ADDRESS wrap 4 on S, T or R), so
+ * its sampler needs the unit's border colour (TEXTURE_BORDER_COLOR); every
+ * border used to read transparent black. The game's shadow maps are
+ * border-addressed with a white border: past the map's edge is lit. */
+static int addr_has_border(u32 a)
+{
+    return (a & 0xF) == 4 || ((a >> 8) & 0xF) == 4 || ((a >> 16) & 0xF) == 4;
+}
+
+/* A sampler key is three words a unit: TEXTURE_ADDRESS, tex_filter_key, and
+ * the border colour (0 when no axis uses it, so those units still share). */
+#define SAMP_KEY_W 3
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
 static u32 samp_key_slot(const u32* k)
 {
     u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
-    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+    for (int i = 0; i < RSX_FP_UNITS * SAMP_KEY_W; i += 4) {
         a = (a ^ k[i])     * 0x01000193u;
         b = (b ^ k[i + 1]) * 0x01000193u;
         c = (c ^ k[i + 2]) * 0x01000193u;
@@ -8307,13 +8342,15 @@ static u32 samp_key_slot(const u32* k)
 
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
-    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
+    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
-    u32 k[RSX_FP_UNITS * 2];
+    u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * 2 + 1] = dr && dr->tex[u].set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
-                                            : (u ? 0x02060001u : 0x01010001u);
+        const int set = dr && dr->tex[u].set;
+        k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
+        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+                                    : (u ? 0x02060001u : 0x01010001u);
+        k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
     const u64 now = s_d3d.frame_count;
     /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
@@ -8367,7 +8404,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     D3D12_CPU_DESCRIPTOR_HANDLE h;
     s_d3d.samp_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.samp_heap, &h);
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        const u32 a = k[u * 2], f = k[u * 2 + 1];
+        const u32 a = k[u * SAMP_KEY_W], f = k[u * SAMP_KEY_W + 1], bc = k[u * SAMP_KEY_W + 2];
         const u32 minf = (f >> 16) & 7, magf = (f >> 24) & 7;
         /* min: 1 NEAREST, 2 LINEAR, 3 N_MIP_N, 4 L_MIP_N, 5 N_MIP_L, 6 L_MIP_L,
          * 7 convolution; mag: 1 NEAREST, 2 LINEAR, 4 convolution. */
@@ -8396,6 +8433,10 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         static const u8 zrev[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
         sd.ComparisonFunc = (f & 0x80000000u) ? (D3D12_COMPARISON_FUNC)(zrev[(a >> 28) & 7u] + 1u)
                                               : D3D12_COMPARISON_FUNC_NEVER;
+        sd.BorderColor[0] = (float)((bc >> 16) & 0xFF) / 255.0f;   /* ARGB8, as RPCS3 decodes it */
+        sd.BorderColor[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+        sd.BorderColor[2] = (float)(bc & 0xFF) / 255.0f;
+        sd.BorderColor[3] = (float)(bc >> 24) / 255.0f;
         sd.MinLOD = 0.0f;
         sd.MaxLOD = (minf == 1 || minf == 2) ? 0.0f : D3D12_FLOAT32_MAX;  /* no mipmapping */
         D3D12_CPU_DESCRIPTOR_HANDLE hs = h;
@@ -9838,6 +9879,44 @@ static void vp_ib_grow(u64 want)
             s_vp_icap, (unsigned long long)(bd.Width >> 20), 10);
 }
 
+/* Grow the GPU fetch ring (vf_buf) to hold a frame of `want` bytes, with
+ * headroom, as vp_vb grows. A strip that does not fit takes the CPU path,
+ * which writes 256 bytes a vertex: on Demon's Souls' dragon bridge in 1-2 a
+ * frame asks for up to ~120 MB of ring, and with the ring at its 64 MB the
+ * CPU path wrote ~2 million vertices a frame and held the frame rate at ~77
+ * (issue #288). The old ring may still be read by the frame in flight, so it
+ * is released with the deferred RT resources. At most 1024 MB a half, as
+ * VP_FETCH_RING_MB. */
+static void vf_grow(u64 want)
+{
+    static u64 limit = 1024ull << 20;
+    u64 cap = s_vf_cap;
+    while (cap < want + want / 8 && cap < limit) cap *= 2;
+    if (cap > limit) cap = limit;
+    if (cap <= s_vf_cap) return;
+    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Width = cap * 2;                /* two parity halves */
+    ID3D12Resource* nb = NULL; void* mp = NULL; D3D12_RANGE nr = {0, 0};
+    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
+            D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+            &IID_ID3D12Resource, (void**)&nb)) ||
+        FAILED(nb->lpVtbl->Map(nb, 0, &nr, &mp)) || !mp) {
+        if (nb) nb->lpVtbl->Release(nb);
+        fprintf(stderr, "[VF] growing the fetch ring to %llu MB a half failed; staying at %u MB%c",
+                (unsigned long long)(cap >> 20), s_vf_cap >> 20, 10);
+        limit = s_vf_cap;
+        return;
+    }
+    off_rt_defer_release(s_d3d.vf_buf);
+    s_d3d.vf_buf = nb; s_d3d.vf_mapped = mp; s_vf_cap = (u32)cap;
+    fprintf(stderr, "[VF] a frame asked for %llu MB of the fetch ring: grown to %u MB a half%c",
+            (unsigned long long)(want >> 20), s_vf_cap >> 20, 10);
+}
+
 /* -------------------------------------------------------------------------
  * Occlusion queries (NV4097 ZPASS pixel counts)
  *
@@ -9870,6 +9949,29 @@ static u32  s_zq_rec[ZQ_MAX];              /* cb_slot of each query issued */
 static float s_zq_area[ZQ_MAX];            /* its target's host/guest pixel ratio (RSX_SCALE) */
 static int  s_zq_n;                        /* queries issued this batch */
 static u64  s_zq_acc;                      /* samples since the last clear */
+static int  s_zq_pend;                     /* the last batch's counts, not stored yet */
+static int  s_zq_pend_nev;                 /* ... its events, s_zq_ev's first ones */
+static int  s_zq_pend_on;                  /* ... and counting at its end */
+
+/* RSX_ZPASS_DEFER (default 1): a batch with counted draws stores its reports
+ * when the stream reaches the next batch's first ZPASS GET_REPORT (or the next
+ * batch starts, if it has none), once the GPU has finished, instead of waiting
+ * for the GPU right after the batch's submit. That wait held up the FIFO drain
+ * on this thread for the GPU's frame time on every frame that probes the sun.
+ * The next batch's other events queue behind the pending ones meanwhile:
+ * Demon's Souls turns counting off at the start of each frame and probes near
+ * its end, so waiting at its first ZPASS method was hardly later than waiting
+ * after the submit. The game reads the count after a semaphore released right
+ * after the probe's GET_REPORT, and both stores land before that, so either
+ * way it reads the previous probe's count. 0 restores the wait after submit. */
+static int zq_defer_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_ZPASS_DEFER", 1));
+    return on;
+}
+
+static void zq_finish(int nev, int on_after);
 
 static void zq_hook(u32 method, u32 data)
 {
@@ -9877,6 +9979,13 @@ static void zq_hook(u32 method, u32 data)
     if (method == 0x17CC) { s_zq_on = data != 0; kind = s_zq_on ? ZQ_ON : ZQ_OFF; }
     else if (method == 0x17C8) { if (data != 1) return; kind = ZQ_CLEAR; }
     else { if ((data >> 24) != 1) return; kind = ZQ_REPORT; idx = (data & 0xFFFFFFu) / 16u; }
+    /* A report the title can read next: the last batch's are stored first, once
+     * its GPU work is done. */
+    if (kind == ZQ_REPORT && s_zq_pend) {
+        s_zq_pend = 0;
+        wait_for_gpu();
+        zq_finish(s_zq_pend_nev, s_zq_pend_on);
+    }
     if (s_zq_nev < ZQ_EV_MAX) {
         s_zq_ev[s_zq_nev].at = s_d3d.draw_count;
         s_zq_ev[s_zq_nev].kind = kind;
@@ -9919,10 +10028,13 @@ static int zq_ready(void)
 }
 
 /* After the batch's GPU work is complete: sum the counts in stream order and
- * store each report. ZPASS_LOG=<n> prints the first n stored values. */
-static void zq_finish(void)
+ * store each report. The batch's events are s_zq_ev's first nev; any after
+ * them are the next batch's (deferred, RSX_ZPASS_DEFER), which move up, and
+ * on_after is counting at the batch's end. ZPASS_LOG=<n> prints the first n
+ * stored values. */
+static void zq_finish(int nev, int on_after)
 {
-    if (!s_zq_nev && !s_zq_n) { s_zq_on_start = s_zq_on; return; }
+    if (!nev && !s_zq_n) { s_zq_on_start = on_after; return; }
     u64 cnt[ZQ_MAX];
     memset(cnt, 0, sizeof cnt);
     if (s_zq_n) {
@@ -9942,7 +10054,7 @@ static void zq_finish(void)
     static int logn = -1, logged = 0;
     PS3_KNOB(logn, ps3_env_int("ZPASS_LOG", 0));
     int qi = 0;
-    for (int e = 0; e < s_zq_nev; e++) {
+    for (int e = 0; e < nev; e++) {
         for (; qi < s_zq_n && s_zq_rec[qi] < s_zq_ev[e].at; qi++) s_zq_acc += cnt[qi];
         if (s_zq_ev[e].kind == ZQ_CLEAR) s_zq_acc = 0;
         else if (s_zq_ev[e].kind == ZQ_REPORT) {
@@ -9954,9 +10066,10 @@ static void zq_finish(void)
         }
     }
     for (; qi < s_zq_n; qi++) s_zq_acc += cnt[qi];
-    s_zq_nev = 0;
+    s_zq_nev -= nev;
+    if (s_zq_nev) memmove(s_zq_ev, s_zq_ev + nev, (size_t)s_zq_nev * sizeof s_zq_ev[0]);
     s_zq_n = 0;
-    s_zq_on_start = s_zq_on;
+    s_zq_on_start = on_after;
 }
 
 /* Per-draw fingerprints (live and replay): one line per record with the
@@ -11191,6 +11304,8 @@ static void render_frame(void)
       QueryPerformanceCounter(&_w1);
       /* Before the pre-pass below resets `used` and reassigns slots. */
       if (s_wb_pending) { s_wb_pending = 0; rt_writeback_store(); }
+      /* The last batch's counts, when no ZPASS method came since (zq_hook). */
+      if (s_zq_pend) { s_zq_pend = 0; zq_finish(s_zq_pend_nev, s_zq_pend_on); }
       QueryPerformanceCounter(&_w2); QueryPerformanceFrequency(&_f);
       s_fl_wait_ms  = (double)(_w1.QuadPart - _w0.QuadPart) * 1000.0 / (double)_f.QuadPart;
       s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
@@ -12504,7 +12619,9 @@ rtt_dump_done:;
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    const u64 vf_want = (u64)s_vf_off + s_vf_short;   /* what this frame's fetch draws asked for */
     s_vf_off = 0;
+    s_vf_short = 0;
     s_fx.valid = 0;
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
       PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
@@ -12525,6 +12642,7 @@ rtt_dump_done:;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
     if (!s_d3d.vp_ib || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
+    if (s_d3d.vf_buf && vf_want > s_vf_cap) vf_grow(vf_want);
 
     /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
      * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program
@@ -12792,8 +12910,11 @@ skip_dump_consider: ;
         if (perf_on()) s_perf_gpu += perf_now() - _g;
         rt_writeback_store();
     }
-    if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
-    zq_finish();
+    if (s_zq_n && (!write_color_on() || write_color_defer())) {
+        if (zq_defer_on()) {   /* stored by zq_hook or the next render_frame */
+            s_zq_pend = 1; s_zq_pend_nev = s_zq_nev; s_zq_pend_on = s_zq_on;
+        } else { wait_for_gpu(); zq_finish(s_zq_nev, s_zq_on); }
+    } else zq_finish(s_zq_nev, s_zq_on);
 
     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
      * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
@@ -14992,7 +15113,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             }
             u64 total = 512;
             for (u32 j = 0; j < nsp; j++) total += g1[j] - g0[j];
-            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; return -1; }
+            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; s_vf_short += total; return -1; }
             u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
@@ -15116,6 +15237,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15250,6 +15372,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15467,6 +15590,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -15652,6 +15776,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].addr  = tex->address;
         s_d3d.cur_texs[unit].filt  = (tex->filter & ~0x00700000u) | (((tex->control0 >> 4) & 7u) << 20);
+        s_d3d.cur_texs[unit].border = tex->border_color;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;

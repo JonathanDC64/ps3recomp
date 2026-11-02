@@ -2289,6 +2289,14 @@ void flow_lookup_alloc(unsigned int p) {
  * A split build's is the game module's (ps3emu/game_split.h). */
 #ifndef PS3_GAME_SPLIT
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
+/* The newest live guest setjmp of this thread (the lift's SJLJ_SUPPORT, in the
+ * files of a lift that call setjmp or define longjmp). */
+extern "C" PPU_THREAD_LOCAL struct ps3_sjlj_slot* g_ps3_sjlj_top = nullptr;
+/* sys_ppu_thread.c, at a guest thread's entry. sys_ppu_thread_exit longjmps
+ * out of the lifted frames, which drops their setjmp slots without their
+ * scopes running, and an interrupt handler then runs its entry again on the
+ * same host thread. (game_host.c has the split build's.) */
+extern "C" void ps3_sjlj_thread_reset(void) { g_ps3_sjlj_top = nullptr; }
 #endif
 
 /* Per-thread active guest context, for the crash handler to report the guest PC

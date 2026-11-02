@@ -20,6 +20,8 @@
 
 #if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
 
+#include <stddef.h>   /* offsetof */
+
 #define GPU_D3D12_CPU(c, v) { (SIZE_T)(c)->view[GPU_HANDLE_INDEX((v).id)] }
 
 static inline void gpu_cmd_pass_begin(gpu_cmd* c, const gpu_pass* pass)
@@ -306,23 +308,34 @@ static inline void gpu_cmd_marker(gpu_cmd* c, const char* text, uint32_t len)
 /* ---- The per-draw device calls (GPU_FAST_FUNCS) ---- */
 
 /* The memo (today's SrvMemo): an entry already holding this description is
- * left as it is. srv NULL is today's per-draw empty slot. */
+ * left as it is (gpu_view_memo_same, gpu_cmd_ops.h: srv's fields packed into
+ * the entry's words, no copy on the stack). srv NULL is today's per-draw
+ * empty slot. The copy is made only for a write. */
+static inline void gpu_d3d12_memo_write_tex(gpu_device* d, gpu_d3d12_tpool* p, uint32_t index,
+                                            const gpu_view_desc* srv)
+{
+    static const gpu_view_desc none = { {0}, GPU_VIEW_SRV, GPU_DIM_2D, 0, 1, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0, 0 };
+    const gpu_view_desc* const s = srv ? srv : &none;
+    const uint32_t swizzle = s->swizzle ? s->swizzle : GPU_SWIZZLE_IDENTITY;
+    gpu_view_desc v;
+    if (gpu_view_memo_same(&((const gpu_view_desc*)p->memo)[index], s, swizzle)) return;
+    v = *s;
+    v.swizzle = swizzle;
+    gpu_d3d12_write_srv(GPU_D3D12_DEV(d), p, index, &v);
+}
+
 static inline void gpu_fast_table_write_tex(gpu_device* d, gpu_table_pool pool, uint32_t index,
                                             const gpu_view_desc* srv)
 {
-    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
-    gpu_d3d12_tpool* const p = &dd->tpool[GPU_HANDLE_INDEX(pool.id)];
-    gpu_view_desc v;
-    if (srv) {
-        v = *srv;
-    } else {
-        memset(&v, 0, sizeof v);
-        v.mips = 1;
-        v.format = GPU_FORMAT_R8G8B8A8_UNORM;
-    }
-    if (!v.swizzle) v.swizzle = GPU_SWIZZLE_IDENTITY;
-    if (!memcmp(&((const gpu_view_desc*)p->memo)[index], &v, sizeof v)) return;
-    gpu_d3d12_write_srv(dd, p, index, &v);
+    gpu_d3d12_memo_write_tex(d, &GPU_D3D12_DEV(d)->tpool[GPU_HANDLE_INDEX(pool.id)], index, srv);
+}
+
+/* The same through a writer: w.v is the pool's record (its tpool entry),
+ * found once, so a write looks nothing up before the memo. */
+static inline void gpu_fast_table_writer_tex(gpu_device* d, gpu_table_writer w, uint32_t index,
+                                             const gpu_view_desc* srv)
+{
+    gpu_d3d12_memo_write_tex(d, (gpu_d3d12_tpool*)(uintptr_t)w.v, index, srv);
 }
 
 static inline void gpu_fast_table_write_sampler(gpu_device* d, gpu_table_pool pool, uint32_t index, gpu_sampler s)

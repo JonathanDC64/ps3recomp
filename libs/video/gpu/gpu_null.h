@@ -113,9 +113,12 @@ uint32_t    gpu_null_errors(gpu_device* d, int kind);
 void        gpu_null_errors_reset(gpu_device* d);
 const char* gpu_null_error_name(int kind);
 
-/* What the stream holds so far. */
+/* What the stream holds so far; and, outside it, the pipelines the device
+ * keeps (one per contents) and the GPU_PIPELINE_STORE_ONLY creates, which
+ * keep none. */
 typedef struct gpu_null_counts {
     uint64_t submits, commands, draws, table_writes, presents;
+    uint64_t pipelines, stored_only;
 } gpu_null_counts;
 void gpu_null_counts_get(gpu_device* d, gpu_null_counts* out);
 

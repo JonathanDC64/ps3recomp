@@ -10,6 +10,7 @@
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../../libs/spurs/spurs_taskset.h"   /* taskset bitset layout + atomic set/clear */
 #include "../ps3_log.h"      /* ps3_log_verbose */
+#include "spu_async_pool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
+#include "../platform/plat.h"         /* plat_thread_stack_range */
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
@@ -1228,123 +1230,21 @@ static void spu_async_run(spu_async_job* j)
     free(j);
 }
 
-#ifdef _WIN32
-/* Async job workers.
- *
- * Every async dispatch used to create a host thread and let it exit with the
- * job. Demon's Souls runs ~650 such jobs a second (Havok image 7, image 10,
- * images 3-6), so that was ~650 CreateThread calls a second on the
- * dispatching PPU threads, a fresh stack to fault in for each job's 260 KB
- * stack-local spu_context, and every job starting on cold caches.
- *
- * A finished worker now parks on its own event and the next dispatch hands it
- * a job. There is no queue and no cap: a dispatch with no idle worker creates
- * one, exactly as before, so a job never waits for another to finish (tasks
- * block in WAIT_SIGNAL on each other). Idle workers exit after 5 s, or at
- * once beyond 64 idle. SPU_ASYNC_POOL=0 creates a thread per job again.
- * Image 22 (the cri task) always gets its own: its EXIT handling counts calls
- * in a thread-local. */
-typedef struct spu_async_worker {
-    HANDLE ev;                        /* auto-reset: a job was handed over */
-    spu_async_job* job;
-    struct spu_async_worker* next;    /* idle list */
-} spu_async_worker;
-static SRWLOCK s_aw_lock = SRWLOCK_INIT;
-static spu_async_worker* s_aw_idle;
-static int s_aw_idle_n;
-#define SPU_AW_MAX_IDLE 64
-#define SPU_AW_IDLE_MS  5000
-
-static void spu_async_run_one(spu_async_job* j)
+/* Async jobs run on spu_async_pool.c's workers, which wait for the next job
+ * when one returns instead of exiting. */
+static void spu_async_run_one(void* p)
 {
-    spu_async_run(j);
+    spu_async_run((spu_async_job*)p);
     /* Nothing on this stack may stay in the lock-line reserver set or hold an
      * MFC slot: the job's stack-local contexts are gone once it returns. */
-    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
-      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      extern void spu_mfc_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
-      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
-}
-
-/* Take an idle worker off the list, or NULL. */
-static spu_async_worker* spu_aw_take(void)
-{
-    AcquireSRWLockExclusive(&s_aw_lock);
-    spu_async_worker* w = s_aw_idle;
-    if (w) { s_aw_idle = w->next; s_aw_idle_n--; }
-    ReleaseSRWLockExclusive(&s_aw_lock);
-    return w;
-}
-
-/* Park a worker that finished its job. Returns 0 if it should exit instead. */
-static int spu_aw_park(spu_async_worker* w)
-{
-    AcquireSRWLockExclusive(&s_aw_lock);
-    if (s_aw_idle_n >= SPU_AW_MAX_IDLE) { ReleaseSRWLockExclusive(&s_aw_lock); return 0; }
-    w->next = s_aw_idle; s_aw_idle = w; s_aw_idle_n++;
-    ReleaseSRWLockExclusive(&s_aw_lock);
-    if (WaitForSingleObject(w->ev, SPU_AW_IDLE_MS) == WAIT_OBJECT_0) return 1;
-    /* Timed out: leave the list, unless a dispatcher took us off it in the
-     * meantime -- then its job is on the way and the event will fire. */
-    int removed = 0;
-    AcquireSRWLockExclusive(&s_aw_lock);
-    for (spu_async_worker** pp = &s_aw_idle; *pp; pp = &(*pp)->next)
-        if (*pp == w) { *pp = w->next; s_aw_idle_n--; removed = 1; break; }
-    ReleaseSRWLockExclusive(&s_aw_lock);
-    if (removed) return 0;
-    WaitForSingleObject(w->ev, INFINITE);
-    return 1;
-}
-
-static DWORD WINAPI spu_async_thread(LPVOID p) {
-    /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
-     * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
-     * instead of killing the process silently with 0x80000001. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    spu_async_worker* w = (spu_async_worker*)p;
-    for (;;) {
-        spu_async_job* j = w->job;
-        w->job = NULL;
-        const int pooled = j->image_id != 22;
-        spu_async_run_one(j);
-        if (!pooled || !spu_aw_park(w)) break;
+    uintptr_t lo, hi;
+    if (plat_thread_stack_range(&lo, &hi)) {
+        extern void spu_coh_forget_range(uintptr_t, uintptr_t);
+        extern void spu_mfc_forget_range(uintptr_t, uintptr_t);
+        spu_coh_forget_range(lo, hi);
+        spu_mfc_forget_range(lo, hi);
     }
-    CloseHandle(w->ev);
-    free(w);
-    return 0;
 }
-
-static int spu_async_pool_on(void)
-{
-    static int s_on = -1;
-    PS3_KNOB(s_on, ps3_env_int("SPU_ASYNC_POOL", 1));
-    return s_on;
-}
-
-/* Run j on an idle worker, or on a new thread. 0 if no thread could be made. */
-static int spu_async_start(spu_async_job* j)
-{
-    spu_async_worker* w = (j->image_id != 22 && spu_async_pool_on()) ? spu_aw_take() : NULL;
-    if (w) { w->job = j; SetEvent(w->ev); return 1; }
-    w = (spu_async_worker*)calloc(1, sizeof *w);
-    if (!w) return 0;
-    w->ev = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!w->ev) { free(w); return 0; }
-    w->job = j;
-    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
-     * chains are deep host call chains with fat lifted frames -- a 1MB stack
-     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
-     * process death) the moment the real decode path first executed. */
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, w,
-                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { CloseHandle(w->ev); free(w); return 0; }
-    CloseHandle(th);   /* detached */
-    return 1;
-}
-#else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
-#endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
@@ -1993,27 +1893,8 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
-#ifdef _WIN32
-    if (!spu_async_start(j)) { free(j); return 0; }
-#else
-    /* Same 256 MB reservation, for the same reason: pthread stacks are
-     * mmap'd and committed on touch, so this reserves address space rather
-     * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
-     * the guard page above. */
-    pthread_t th;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
-        prc = pthread_create(&th, &attr, spu_async_thread, j);
-    pthread_attr_destroy(&attr);
-    /* A host that will not reserve that much still gets the thread, on the
-     * default stack: a shallow SPU job runs there, and a deep one dying
-     * beats never dispatching at all. */
-    if (prc != 0)
-        prc = pthread_create(&th, NULL, spu_async_thread, j);
-    if (prc != 0) { free(j); return 0; }
-    pthread_detach(th);
-#endif
+    /* Image 22 (the cri task) always gets a thread of its own: its EXIT
+     * handling counts calls in a thread-local. */
+    if (!spu_async_pool_start(spu_async_run_one, j, j->image_id == 22)) { free(j); return 0; }
     return 1;
 }

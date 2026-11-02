@@ -20,8 +20,12 @@ extern void (*g_rsx_report_hook)(u32 method, u32 data);
 #define ZQ_MAX     256    /* counted draws per batch */
 #define ZQ_EV_MAX  256    /* report events per batch */
 enum { ZQ_OFF = 0, ZQ_ON = 1, ZQ_CLEAR = 2, ZQ_REPORT = 3 };
-static ID3D12QueryHeap* s_zq_heap;
-static ID3D12Resource*  s_zq_rb;
+/* The query pool and its readback buffer are the GPU layer's (step C5b), kept
+ * for the device's life, and bound by their handles (step C7). s_zq_made:
+ * both are made (step C8a: in place of the native pointers' test). */
+static gpu_query_pool   s_zq_pool;
+static gpu_buffer       s_zq_rb_buf;
+static int              s_zq_made;
 static int  s_zq_on;                       /* counting enabled, as of the stream */
 static int  s_zq_on_start;                 /* ... when the current batch began */
 static struct { u32 at, kind, idx; } s_zq_ev[ZQ_EV_MAX];
@@ -30,6 +34,29 @@ static u32  s_zq_rec[ZQ_MAX];              /* cb_slot of each query issued */
 static float s_zq_area[ZQ_MAX];            /* its target's host/guest pixel ratio (RSX_SCALE) */
 static int  s_zq_n;                        /* queries issued this batch */
 static u64  s_zq_acc;                      /* samples since the last clear */
+static int  s_zq_pend;                     /* the last batch's counts, not stored yet */
+static int  s_zq_pend_nev;                 /* ... its events, s_zq_ev's first ones */
+static int  s_zq_pend_on;                  /* ... and counting at its end */
+
+/* RSX_ZPASS_DEFER (default 1): a batch with counted draws stores its reports
+ * when the stream reaches the next batch's first ZPASS GET_REPORT (or the next
+ * batch starts, if it has none), once the GPU has finished, instead of waiting
+ * for the GPU right after the batch's submit. That wait held up the FIFO drain
+ * on this thread for the GPU's frame time on every frame that probes the sun.
+ * The next batch's other events queue behind the pending ones meanwhile:
+ * Demon's Souls turns counting off at the start of each frame and probes near
+ * its end, so waiting at its first ZPASS method was hardly later than waiting
+ * after the submit. The game reads the count after a semaphore released right
+ * after the probe's GET_REPORT, and both stores land before that, so either
+ * way it reads the previous probe's count. 0 restores the wait after submit. */
+static int zq_defer_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_ZPASS_DEFER", 1));
+    return on;
+}
+
+static void zq_finish(int nev, int on_after);
 
 static void zq_hook(u32 method, u32 data)
 {
@@ -37,6 +64,13 @@ static void zq_hook(u32 method, u32 data)
     if (method == 0x17CC) { s_zq_on = data != 0; kind = s_zq_on ? ZQ_ON : ZQ_OFF; }
     else if (method == 0x17C8) { if (data != 1) return; kind = ZQ_CLEAR; }
     else { if ((data >> 24) != 1) return; kind = ZQ_REPORT; idx = (data & 0xFFFFFFu) / 16u; }
+    /* A report the title can read next: the last batch's are stored first, once
+     * its GPU work is done. */
+    if (kind == ZQ_REPORT && s_zq_pend) {
+        s_zq_pend = 0;
+        wait_for_gpu();
+        zq_finish(s_zq_pend_nev, s_zq_pend_on);
+    }
     if (s_zq_nev < ZQ_EV_MAX) {
         s_zq_ev[s_zq_nev].at = s_d3d.draw_count;
         s_zq_ev[s_zq_nev].kind = kind;
@@ -56,42 +90,43 @@ static int zq_counted(u32 slot)
 
 static int zq_ready(void)
 {
-    if (s_zq_heap) return 1;
-    D3D12_QUERY_HEAP_DESC qd = {0};
-    qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-    qd.Count = ZQ_MAX;
-    if (FAILED(s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd,
-            &IID_ID3D12QueryHeap, (void**)&s_zq_heap))) { s_zq_heap = NULL; return 0; }
-    D3D12_HEAP_PROPERTIES hp = {0};
-    hp.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC rd = {0};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = ZQ_MAX * sizeof(u64);
-    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(d3d_create_committed(s_d3d.device, &hp,
-            D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, NULL,
-            &IID_ID3D12Resource, (void**)&s_zq_rb))) {
-        s_zq_heap->lpVtbl->Release(s_zq_heap); s_zq_heap = NULL; s_zq_rb = NULL; return 0;
+    if (s_zq_made) return 1;
+    /* Today's: an OCCLUSION heap of ZQ_MAX, and a READBACK buffer of ZQ_MAX
+     * counts in COPY_DEST. Either failing is tried again next time (the pool
+     * made is kept: pools live as long as the device). */
+    if (!GPU_VALID(s_zq_pool)) s_zq_pool = gpu_query_pool_create(s_rc_dev, GPU_QUERY_OCCLUSION, ZQ_MAX);
+    if (!GPU_VALID(s_zq_pool)) return 0;
+    if (!GPU_VALID(s_zq_rb_buf)) {
+        gpu_buffer_desc bd;
+        memset(&bd, 0, sizeof bd);
+        bd.size = ZQ_MAX * sizeof(u64);
+        bd.use = GPU_USE_QUERY | GPU_USE_COPY_DST;
+        bd.memory = GPU_MEM_READBACK;
+        bd.state = GPU_STATE_COPY_DEST;
+        s_zq_rb_buf = gpu_buffer_create(s_rc_dev, &bd);
+        if (!GPU_VALID(s_zq_rb_buf)) return 0;
     }
+    s_zq_made = 1;
     return 1;
 }
 
 /* After the batch's GPU work is complete: sum the counts in stream order and
- * store each report. ZPASS_LOG=<n> prints the first n stored values. */
-static void zq_finish(void)
+ * store each report. The batch's events are s_zq_ev's first nev; any after
+ * them are the next batch's (deferred, RSX_ZPASS_DEFER), which move up, and
+ * on_after is counting at the batch's end. ZPASS_LOG=<n> prints the first n
+ * stored values. */
+static void zq_finish(int nev, int on_after)
 {
-    if (!s_zq_nev && !s_zq_n) { s_zq_on_start = s_zq_on; return; }
+    if (!nev && !s_zq_n) { s_zq_on_start = on_after; return; }
     u64 cnt[ZQ_MAX];
     memset(cnt, 0, sizeof cnt);
     if (s_zq_n) {
-        void* mp = NULL;
-        D3D12_RANGE rr = {0, (SIZE_T)s_zq_n * sizeof(u64)};
-        if (SUCCEEDED(s_zq_rb->lpVtbl->Map(s_zq_rb, 0, &rr, &mp)) && mp) {
+        /* The GPU layer's map and unmap (step C5b): today's Map(0, {0, n})
+         * and Unmap(0, {0, 0}). */
+        const void* mp = gpu_buffer_map(s_rc_dev, s_zq_rb_buf, 0, (u64)s_zq_n * sizeof(u64));
+        if (mp) {
             memcpy(cnt, mp, (size_t)s_zq_n * sizeof(u64));
-            D3D12_RANGE wr = {0, 0};
-            s_zq_rb->lpVtbl->Unmap(s_zq_rb, 0, &wr);
+            gpu_buffer_unmap(s_rc_dev, s_zq_rb_buf, 0, 0);
         }
         /* A scaled target covers more samples; report what the guest's size would,
          * rounded up so a sliver that showed is never reported as hidden. */
@@ -102,7 +137,7 @@ static void zq_finish(void)
     static int logn = -1, logged = 0;
     PS3_KNOB(logn, ps3_env_int("ZPASS_LOG", 0));
     int qi = 0;
-    for (int e = 0; e < s_zq_nev; e++) {
+    for (int e = 0; e < nev; e++) {
         for (; qi < s_zq_n && s_zq_rec[qi] < s_zq_ev[e].at; qi++) s_zq_acc += cnt[qi];
         if (s_zq_ev[e].kind == ZQ_CLEAR) s_zq_acc = 0;
         else if (s_zq_ev[e].kind == ZQ_REPORT) {
@@ -114,8 +149,9 @@ static void zq_finish(void)
         }
     }
     for (; qi < s_zq_n; qi++) s_zq_acc += cnt[qi];
-    s_zq_nev = 0;
+    s_zq_nev -= nev;
+    if (s_zq_nev) memmove(s_zq_ev, s_zq_ev + nev, (size_t)s_zq_nev * sizeof s_zq_ev[0]);
     s_zq_n = 0;
-    s_zq_on_start = s_zq_on;
+    s_zq_on_start = on_after;
 }
 

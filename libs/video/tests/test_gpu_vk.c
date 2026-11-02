@@ -21,8 +21,11 @@
  *     shader, a read-only depth target, occlusion counts; a post pass with a
  *     static sampler;
  *   - the table memo, sampler and view caching, fences and a wait's timeout;
+ *     t20 switched between buffers from draw to draw (the set-0 memo); the
+ *     vertex fetch's loads through the spv target over all of t20;
  *   - the pipeline cache across two devices, a swap chain on a hidden window
- *     (Windows), breadcrumbs and the fault report.
+ *     and one made on a minimized window, then minimized, hidden, shown and
+ *     resized between frames (Windows), breadcrumbs and the fault report.
  */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE   /* clock_gettime, setenv, MAP_ANONYMOUS under -std=c99 */
@@ -32,6 +35,7 @@
 #include "gpu_vk_internal.h"
 #include "gpu_vk_cmd.h"
 #include "test_gpu_vk_spv.h"
+#include "gpu_shader.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -715,13 +719,18 @@ static void test_layouts(void)
         CHECK(l->push_size == 24 && l->slot[2].push_off == 16 && l->first == 1);
     }
 
-    /* A table not from register 0 is refused (its bindings could not match
-     * a pool's sets). */
+    /* A table from another register than 0 (step VM: the menu's t1): its
+     * entry 0 is that register, so it binds a pool's sets as one from 0. */
     memset(&ld, 0, sizeof ld);
-    ld.nslots = 1;
-    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
-    printf("  (a layout refused on purpose:)\n");
-    CHECK(!GPU_VALID(gpu_layout_create(g_d, &ld)));
+    ld.nslots = 2;
+    ld.slot[0] = slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = slot(GPU_SLOT_TABLE_TEX, 4, 2, GPU_VIS_PIXEL);
+    const gpu_layout t4 = gpu_layout_create(g_d, &ld);
+    CHECK(GPU_VALID(t4));
+    if (GPU_VALID(t4)) {
+        const gpu_vk_layout* l = &g_vk->layout[GPU_HANDLE_INDEX(t4.id)];
+        CHECK(l->slot[0].set != l->slot[1].set && l->slot[1].set < l->nsets);
+    }
 }
 
 /* ---- A draw on the guest layout ---- */
@@ -781,23 +790,24 @@ static int scene_make(scene* s)
     if (!GPU_VALID(s->layout) || !GPU_VALID(s->vs) || !GPU_VALID(s->ps)) return 0;
     draw_desc(&s->desc, s->layout, s->vs, s->ps);
     uint32_t cached = 7;
-    s->pso = gpu_pipeline_create(g_d, &s->desc, &cached);
-    CHECK(s->pso.v != 0 && cached == 0);
+    s->pso = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
+    /* the device's cache, empty before it; with the cache masked (RSX_VK_MASK), compiled only */
+    CHECK(s->pso.v != 0 && cached == (has(GPU_CAP_PIPELINE_CACHE) ? GPU_PIPELINE_STORED : GPU_PIPELINE_COMPILED));
     gpu_pipeline_desc pd = s->desc;
     pd.depth_clip = 1;
-    s->pso_clip = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_clip = gpu_pipeline_create(g_d, &pd, 0, NULL);
     if (GPU_VALID(s->gs)) {
         pd = s->desc;
         pd.vs = s->vs_gs;
         pd.gs = s->gs;
-        s->pso_gs = gpu_pipeline_create(g_d, &pd, NULL);
+        s->pso_gs = gpu_pipeline_create(g_d, &pd, 0, NULL);
         CHECK(s->pso_gs.v != 0);
     }
     pd = s->desc;
     pd.depth_test = 1;
     pd.depth_write = 1;
     pd.ds_format = GPU_FORMAT_D32_FLOAT;
-    s->pso_depth = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_depth = gpu_pipeline_create(g_d, &pd, 0, NULL);
     /* Today's zeta pipelines: D24S8 with stencil, which the D32S8 fallback must take too. */
     pd.ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
     pd.depth_func = GPU_CMP_LESS_EQUAL;
@@ -807,7 +817,7 @@ static int scene_make(scene* s)
     pd.stencil_front.pass = GPU_STENCIL_REPLACE;
     pd.stencil_front.func = GPU_CMP_ALWAYS;
     pd.stencil_back = pd.stencil_front;
-    s->pso_zeta = gpu_pipeline_create(g_d, &pd, NULL);
+    s->pso_zeta = gpu_pipeline_create(g_d, &pd, 0, NULL);
     CHECK(s->pso_clip.v != 0 && s->pso_depth.v != 0 && s->pso_zeta.v != 0);
 
     gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
@@ -1139,7 +1149,7 @@ static void test_draw(scene* s)
     gpu_buffer_destroy(g_d, qrb, 0);
 
     uint32_t cached = 7;
-    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, &cached);
+    const gpu_pipeline again = gpu_pipeline_create(g_d, &s->desc, 0, &cached);
     CHECK(again.v != 0);
 }
 
@@ -1154,7 +1164,7 @@ static void test_post(const scene* s)
     gpu_pipeline_desc pd;
     draw_desc(&pd, blit, vs, ps);
     memset(&pd.vertex, 0, sizeof pd.vertex);
-    const gpu_pipeline pso = gpu_pipeline_create(g_d, &pd, NULL);
+    const gpu_pipeline pso = gpu_pipeline_create(g_d, &pd, 0, NULL);
     CHECK(pso.v != 0);
 
     const gpu_texture_desc td = tex_desc(2, 2, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_SAMPLED | GPU_USE_COPY_DST,
@@ -1254,6 +1264,15 @@ static void test_memo(const scene* s)
     gpu_fast_table_write_tex(g_d, pool, 6, NULL); CHECK(g_vk->n_srv_writes == n0 + 4);
     e.format = GPU_FORMAT_R8G8B8A8_UNORM;
     gpu_fast_table_write_tex(g_d, pool, 6, &e);   CHECK(g_vk->n_srv_writes == n0 + 4);   /* NULL's own */
+    /* Through a writer (the pool found once): the same memo. */
+    const gpu_table_writer w = gpu_table_writer_get(g_d, pool);
+    CHECK(w.v != 0);
+    gpu_fast_table_writer_tex(g_d, w, 5, &a);     CHECK(g_vk->n_srv_writes == n0 + 4);   /* entry 5 holds a */
+    gpu_table_writer_tex(g_d, w, 5, &a);          CHECK(g_vk->n_srv_writes == n0 + 4);   /* through the table too */
+    gpu_fast_table_writer_tex(g_d, w, 6, NULL);   CHECK(g_vk->n_srv_writes == n0 + 4);
+    a.swizzle = 0;
+    gpu_fast_table_writer_tex(g_d, w, 5, &a);     CHECK(g_vk->n_srv_writes == n0 + 5);   /* changed: written */
+    gpu_fast_table_write_tex(g_d, pool, 5, &a);   CHECK(g_vk->n_srv_writes == n0 + 5);   /* the pool's memo has it */
 
     gpu_table_pool_desc sd;
     memset(&sd, 0, sizeof sd);
@@ -1283,6 +1302,204 @@ static void test_memo(const scene* s)
     CHECK(t0.v && t4.v && t8.v && t0.v != t4.v && t4.v != t8.v && t0.v != t8.v);
     CHECK(gpu_table_ref(g_d, pool, 3).v == 0 && gpu_fast_table_ref(g_d, pool, 9).v == 0);
     CHECK(gpu_fast_table_ref(g_d, pool, 8).v == t8.v);
+}
+
+/* Step V5v: t20 switched between two buffers and offsets from draw to draw,
+ * as the core's vertex-shader clamp does (its table's ring, then vf_buf):
+ * every draw reads its own, and the recorder's set-0 memo finds a set it had
+ * without the cache. The vertex shader scales the colour by raw[off + 4]. */
+static void test_raw_switch(scene* s)
+{
+    /* From 0: 0 (black); from 256 (the largest minStorageBufferOffsetAlignment): 1. */
+    float other[66];
+    memset(other, 0, sizeof other);
+    other[0] = other[65] = 1.0f;
+    const gpu_buffer b = buf_new(g_d, 512, GPU_MEM_UPLOAD, GPU_STATE_GENERIC_READ);
+    CHECK(GPU_VALID(b));
+    if (!GPU_VALID(b)) return;
+    memcpy(buf_ptr(b), other, sizeof other);
+    const gpu_addr k_at[3] = {gpu_fast_buffer_addr(g_d, s->raw), gpu_fast_buffer_addr(g_d, b),
+                              gpu_fast_buffer_addr(g_d, b) + 256};
+    const int k_lit[3] = {1, 0, 1};
+    /* Each recorder draws with s->raw first, then with seq[i]: the memo holds
+     * that pair, so a buffer comes from the cache (miss) when it is new or
+     * fell out of the memo (1 after 2), and not when it is still in it. */
+    static const int seq[] = {0, 1, 1, 0, 2, 2, 1, 1};
+    static const int miss[] = {0, 1, 0, 0, 1, 0, 1, 0};
+    const gpu_table t16 = gpu_fast_table_ref(g_d, s->tex_pool, 16);
+    const float zero[4] = {0, 0, 0, 0};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = s->rtv;
+    int ok = 1;
+    for (uint32_t i = 0; i < sizeof seq / sizeof seq[0]; i++) {
+        readback rb;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_pass_begin(c, &pass);
+        gpu_cmd_clear_color(c, s->rtv, zero, NULL);
+        scene_binds(c, s, s->pso, t16, 0, 0);
+        gpu_cmd_draw(c, 3, 1, 0, 0);   /* s->raw's set: in the memo from the draw before */
+        gpu_cmd_bind_raw(c, 4, k_at[seq[i]]);
+        const uint32_t n0 = g_vk->n_set0_gets;
+        gpu_cmd_draw(c, 3, 1, 0, 0);
+        const uint32_t looked = g_vk->n_set0_gets - n0;
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        const int ran = run(g_d, c);
+        const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0);
+        char what[32];
+        snprintf(what, sizeof what, "raw switch %u", i);
+        const int lit = k_lit[seq[i]];
+        ok &= ran && tex_read(s->rt, &td, &rb) &&
+              px_is(&rb, 8, 8, lit ? 128 : 0, lit ? 128 : 0, lit ? 64 : 0, lit ? 255 : 0, what);
+        rb_done(&rb);
+        c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_COPY_SOURCE, GPU_STATE_RENDER_TARGET);
+        run(g_d, c);
+        if (i && looked != (uint32_t)miss[i]) {
+            printf("  raw switch %u: %u set-0 lookups, not %d\n", i, looked, miss[i]);
+            ok = 0;
+        }
+    }
+    CHECK(ok);
+    gpu_buffer_destroy(g_d, b, 0);
+    printf("  t20 switched between buffers and offsets: %u draws, each read its own; the memo held two\n",
+           (unsigned)(sizeof seq / sizeof seq[0]));
+}
+
+/* The vertex fetch's loads (the core's fetch form, rsx_vp_decompile_fetch)
+ * through the spv target, kept inside t20 by its edit E3 (clamp = 1, a
+ * device without robustBufferAccess2) or by robustBufferAccess2 alone: every
+ * byte of t20 reads back, from the buffer's start and from an offset (the
+ * core's two parity halves of vf_buf), and past its end reads 0. E3's first
+ * version took glslang's GetDimensions (uints) for bytes, so a read past a
+ * quarter of the range gave 0: the far half of a Demon's Souls frame's fetch
+ * ring. */
+static void fetch_bounds(scene* s, int clamp)
+{
+    static const char k_vs[] =
+        "ByteAddressBuffer vf_raw : register(t20);\n"
+        "cbuffer VFDraw : register(b2) { uint vf_desc; };\n"
+        "struct VO { float4 pos : SV_Position; float4 c : COLOR0; };\n"
+        "VO main(uint vid : SV_VertexID) {\n"
+        "    VO o; float2 t = float2((vid << 1) & 2, vid & 2);\n"
+        "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+        "    o.c = asfloat(vf_raw.Load4(vf_desc)) * asfloat(vf_raw.Load(vf_desc + 16u));\n"
+        "    return o; }\n";
+    if (!gpu_sc_available(GPU_SC_SPV)) {
+        printf("  fetch bounds: skipped (no spv target in this build)\n");
+        return;
+    }
+    /* The float controls only where the device keeps them, as the core's
+     * rc_vk_spv_options sets them. */
+    VkPhysicalDeviceVulkan12Properties p12;
+    VkPhysicalDeviceProperties2 p2;
+    memset(&p12, 0, sizeof p12);
+    memset(&p2, 0, sizeof p2);
+    p12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    p2.pNext = &p12;
+    vkGetPhysicalDeviceProperties2(g_vk->phys, &p2);
+    const unsigned was = gpu_sc_spv_options();
+    unsigned opts = GPU_SC_SPV_DEFAULT & ~(GPU_SC_SPV_FLOAT_PRESERVE | GPU_SC_SPV_DENORM_PRESERVE);
+    if (p12.shaderSignedZeroInfNanPreserveFloat32) opts |= GPU_SC_SPV_FLOAT_PRESERVE;
+    if (p12.shaderDenormPreserveFloat32) opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    if (clamp) opts |= GPU_SC_SPV_FETCH_CLAMP;
+    gpu_sc_spv_set_options(opts);
+    gpu_sc_blob blob;
+    char err[512];
+    const int rc = gpu_sc_compile_layout(GPU_SC_SPV, GPU_SC_VS, k_vs, sizeof k_vs - 1, "fetch_bounds", NULL, NULL,
+                                         GPU_SC_NO_CACHE, &blob, err, sizeof err);
+    gpu_sc_spv_set_options(was);
+    if (rc != GPU_SC_OK) printf("  fetch bounds: the vertex shader did not compile: %s\n", err);
+    CHECK(rc == GPU_SC_OK);
+    if (rc != GPU_SC_OK) return;
+    gpu_shader_desc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.stage = GPU_STAGE_VS;
+    sd.code = GPU_CODE_SPIRV;
+    sd.bytes = blob.data;
+    sd.size = blob.size;
+    const gpu_shader vs = gpu_shader_create(g_d, &sd);
+    gpu_sc_blob_release(&blob);
+    gpu_pipeline_desc pd = s->desc;
+    pd.vs = vs;
+    pd.vertex.count = 0;   /* SV_VertexID only, as the core's fetch pipelines */
+    const gpu_pipeline pso = GPU_VALID(vs) ? gpu_pipeline_create(g_d, &pd, 0, NULL) : (gpu_pipeline){0};
+    CHECK(GPU_VALID(vs) && pso.v != 0);
+
+    /* 1 MB of t20, the core's vf_buf use: at each place a float4 of ones,
+     * then a 1.0 (the draw's colour is their product). */
+    const uint32_t size = 1u << 20, half = size / 2;
+    gpu_buffer_desc bd;
+    memset(&bd, 0, sizeof bd);
+    bd.size = size;
+    bd.use = GPU_USE_RAW;
+    bd.memory = GPU_MEM_UPLOAD;
+    bd.state = GPU_STATE_GENERIC_READ;
+    const gpu_buffer b = gpu_buffer_create(g_d, &bd);
+    CHECK(GPU_VALID(b));
+    if (!GPU_VALID(b) || !pso.v) {
+        if (GPU_VALID(b)) gpu_buffer_destroy(g_d, b, 0);
+        return;
+    }
+    uint8_t* p = buf_ptr(b);
+    memset(p, 0, size);
+    static const struct { uint32_t base, at; int lit; const char* what; } k[] = {
+        {0, 16, 1, "start"},
+        {0, size / 4 + 16, 1, "past a quarter"},
+        {0, size * 3 / 4, 1, "three quarters"},
+        {0, size - 32, 1, "the last whole read"},
+        {0, size - 16, 0, "partly past the end"},
+        {0, size, 0, "past the end"},
+        {half, half / 4 + 64, 1, "the second half, past a quarter of it"},
+        {half, half - 32, 1, "the second half's last whole read"},
+        {half, half, 0, "past the second half's end"},
+    };
+    const float one4[5] = {1, 1, 1, 1, 1};
+    for (uint32_t i = 0; i < sizeof k / sizeof k[0]; i++)
+        if (k[i].lit) memcpy(p + k[i].base + k[i].at, one4, sizeof one4);
+    const gpu_table t16 = gpu_fast_table_ref(g_d, s->tex_pool, 16);
+    const float zero[4] = {0, 0, 0, 0};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = s->rtv;
+    int ok = 1;
+    for (uint32_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        readback rb;
+        gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_pass_begin(c, &pass);
+        gpu_cmd_clear_color(c, s->rtv, zero, NULL);
+        scene_binds(c, s, pso, t16, 0, 0);
+        gpu_cmd_bind_raw(c, 4, gpu_fast_buffer_addr(g_d, b) + k[i].base);
+        gpu_cmd_push_const1(c, 5, k[i].at, 0);
+        gpu_cmd_draw(c, 3, 1, 0, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+        const int ran = run(g_d, c);
+        const gpu_texture_desc td = tex_desc(16, 16, GPU_FORMAT_R8G8B8A8_UNORM, 0, 0);
+        char what[96];
+        snprintf(what, sizeof what, "fetch bounds (%s), %s", clamp ? "E3" : "robustness2", k[i].what);
+        /* The ones times the texel (128, 255, 255, 255); 0 reads nothing. */
+        const int lit = k[i].lit;
+        ok &= ran && tex_read(s->rt, &td, &rb) &&
+              px_is(&rb, 8, 8, lit ? 128 : 0, lit ? 255 : 0, lit ? 255 : 0, lit ? 255 : 0, what);
+        rb_done(&rb);
+        c = gpu_cmd_begin(g_d, 0);
+        gpu_cmd_barrier(c, s->rt, GPU_STATE_COPY_SOURCE, GPU_STATE_RENDER_TARGET);
+        run(g_d, c);
+    }
+    CHECK(ok);
+    gpu_buffer_destroy(g_d, b, 0);
+    printf("  vertex fetch loads through the spv target (%s): all of t20 read, from 0 and from %u KB; 0 past its end\n",
+           clamp ? "E3" : "robustness2", half >> 10);
+}
+
+static void test_fetch_bounds(scene* s)
+{
+    fetch_bounds(s, 1);
+    if (g_d->caps.bits & GPU_CAP_ROBUST2) fetch_bounds(s, 0);
+    else printf("  fetch bounds without E3: skipped (no robustBufferAccess2)\n");
 }
 
 static void test_caches(void)
@@ -1347,6 +1564,96 @@ static void test_fences(void)
 
 /* ---- The pipeline cache, across two devices ---- */
 
+/* Step VC2: the file's checks. A bad file (path holds one) is ignored and the
+ * next save replaces it; then every way of spoiling that good file is
+ * refused before the driver sees it: one byte short or long, our header's
+ * version, its length, the driver, a byte of the data (its sum), and
+ * Vulkan's own header's vendor (with the sum made right again). The layout
+ * (gpu_vk_pipe.c's pcache_head): magic 0, version 8, header length 12,
+ * vendor 16, device 20, driver 24, UUID 28, data length 48, sum 56, data
+ * from 64. */
+static int pcache_load_on_new(const gpu_device_desc* dd, const char* path)
+{
+    gpu_device* d = gpu_vk_create(dd);
+    if (!d) return -2;
+    const int r = gpu_pipeline_cache_load(d, path);
+    CHECK(GPU_VK_DEV(d)->n_validation == 0);
+    gpu_destroy(d);
+    return r;
+}
+
+static void pcache_write(const char* path, const uint8_t* p, size_t n)
+{
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fwrite(p, 1, n, f);
+        fclose(f);
+    }
+}
+
+static void test_pipeline_cache_file(const gpu_device_desc* dd, const char* path)
+{
+    gpu_device* d = gpu_vk_create(dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);   /* (the bad file: ignored) */
+    const gpu_layout l = guest_layout(d);
+    const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
+    const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
+    gpu_pipeline_desc pd;
+    draw_desc(&pd, l, vs, ps);
+    uint32_t how = 7;
+    CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0);
+    CHECK(gpu_pipeline_cache_save(d, path) == 1);   /* replaces it */
+    gpu_destroy(d);
+    CHECK(pcache_load_on_new(dd, path) == GPU_PIPELINE_CACHE_LOADED);
+
+    FILE* f = fopen(path, "rb");
+    uint8_t* good = NULL;
+    long n = 0;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        good = n > 64 ? (uint8_t*)malloc((size_t)n + 1) : NULL;
+        if (good && fread(good, 1, (size_t)n, f) != (size_t)n) n = 0;
+        fclose(f);
+    }
+    uint64_t size = 0;
+    if (good) memcpy(&size, good + 48, 8);
+    CHECK(good && n > 64 && size == (uint64_t)n - 64 && !memcmp(good, "PS3VKPC", 7));
+    if (!good || size != (uint64_t)n - 64) {
+        free(good);
+        return;
+    }
+    uint8_t* bad = (uint8_t*)malloc((size_t)n + 1);
+    static const struct { const char* what; int at; } k[] = {
+        {"one byte short", -1}, {"one byte long", -2}, {"the version", 8}, {"the header's length", 12},
+        {"the driver", 24}, {"a byte of the data", -3}, {"Vulkan's header's vendor", 64 + 8},
+    };
+    int refused = 0;
+    for (size_t i = 0; bad && i < sizeof k / sizeof k[0]; i++) {
+        memcpy(bad, good, (size_t)n);
+        size_t len = (size_t)n;
+        if (k[i].at == -1) len--;
+        else if (k[i].at == -2) bad[len++] = 0;
+        else if (k[i].at == -3) bad[len - 1] ^= 0x5A;
+        else bad[k[i].at] ^= 0x01;
+        if (k[i].at >= 64) {   /* the sum made right again: only Vulkan's header can refuse it */
+            const uint64_t fnv = gpu_vk_fnv(GPU_VK_FNV_BASIS, bad + 64, (size_t)size);
+            memcpy(bad + 56, &fnv, 8);
+        }
+        pcache_write(path, bad, len);
+        const int r = pcache_load_on_new(dd, path);
+        if (r != GPU_PIPELINE_CACHE_NEW) printf("  pipeline cache file: %s was not refused (%d)\n", k[i].what, r);
+        else refused++;
+    }
+    CHECK(refused == (int)(sizeof k / sizeof k[0]));
+    printf("  pipeline cache file: %ld bytes; a bad one replaced; %d spoilt ones refused\n", n, refused);
+    free(bad);
+    free(good);
+}
+
 static void test_pipeline_cache(void)
 {
     char path[512];
@@ -1356,30 +1663,54 @@ static void test_pipeline_cache(void)
     memset(&dd, 0, sizeof dd);
     dd.flags = g_flags;
     dd.cmd_slots = 1;
-    int hits = 1;
+    int hits = 1, cache = 1;
     for (int run_no = 0; run_no < 2; run_no++) {
         gpu_device* d = gpu_vk_create(&dd);
         CHECK(d != NULL);
         if (!d) break;
+        /* With the cache masked (RSX_VK_MASK, as CI's run with every cap
+         * off), only the no-cache case below applies. */
+        if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE)) {
+            printf("  pipeline cache: masked; the two-device round trip is skipped\n");
+            gpu_destroy(d);
+            cache = 0;
+            break;
+        }
         const int loaded = gpu_pipeline_cache_load(d, path);
-        CHECK(loaded == run_no);   /* none the first time, the first device's the second */
+        /* none the first time, the first device's the second */
+        CHECK(loaded == (run_no ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW));
         /* The layout and shaders made again on each device: the name is their
          * content's, not their handles'. */
         const gpu_layout l = guest_layout(d);
         const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
         const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
-        gpu_pipeline_desc pd;
+        gpu_pipeline_desc pd, pd2;
         draw_desc(&pd, l, vs, ps);
+        pd2 = pd;
+        pd2.depth_clip = 1;
+        const gpu_vk_device* const g = GPU_VK_DEV(d);
+        const uint32_t kept = g->npso;
+        /* Made only for the cache (today's startup builds): made with it,
+         * destroyed at once; no handle, no slot. Then a draw's, kept. */
+        uint32_t c0 = 7, c3 = 7;
+        CHECK(gpu_pipeline_create(d, &pd2, GPU_PIPELINE_STORE_ONLY, &c0).v == 0 && g->npso == kept);
+        const gpu_pipeline p0 = gpu_pipeline_create(d, &pd2, 0, &c3);
+        CHECK(p0.v != 0 && g->npso == kept + 1);
+        CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, p0.v) != NULL);
         uint32_t c1 = 7, c2 = 7;
-        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, &c1);
-        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, &c2);
+        const gpu_pipeline p1 = gpu_pipeline_create(d, &pd, 0, &c1);
+        const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, 0, &c2);
         CHECK(p1.v != 0 && p2.v != 0);
         if (run_no == 0) {
-            CHECK(c1 == 0);
-            hits = c2 == 1;   /* the cache's hit, if the driver says (creation feedback) */
+            /* The first in an empty cache; the second description differs by
+             * depth_clip alone, so a driver that caches per stage may find
+             * it there (NVIDIA does). */
+            CHECK(c0 == GPU_PIPELINE_STORED && (c1 == GPU_PIPELINE_STORED || c1 == GPU_PIPELINE_LOADED));
+            hits = c3 == GPU_PIPELINE_LOADED;   /* the store-only one's, if the driver says (creation feedback) */
             if (!hits) printf("  pipeline cache: the driver does not say when it hits\n");
+            else CHECK(c2 == GPU_PIPELINE_LOADED);
         } else if (hits) {
-            CHECK(c1 == 1);   /* from the file */
+            CHECK(c0 == GPU_PIPELINE_LOADED && c1 == GPU_PIPELINE_LOADED);   /* from the file */
         }
         gpu_shader_destroy(d, vs);   /* pipelines outlive their shaders */
         gpu_shader_destroy(d, ps);
@@ -1388,7 +1719,7 @@ static void test_pipeline_cache(void)
         gpu_destroy(d);
     }
     /* A file from something else is not loaded. */
-    {
+    if (cache) {
         FILE* f = fopen(path, "r+b");
         if (f) {
             fputc('X', f);
@@ -1396,9 +1727,34 @@ static void test_pipeline_cache(void)
         }
         gpu_device* d = gpu_vk_create(&dd);
         if (d) {
-            CHECK(gpu_pipeline_cache_load(d, path) == 0);
+            CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);
             gpu_destroy(d);
         }
+    }
+    if (cache) test_pipeline_cache_file(&dd, path);
+    /* No cache (the cap masked, as RSX_VK_MASK would): pipelines are made
+     * without it and never stored; a store-only one is made and destroyed. */
+    {
+        dd.cap_mask = GPU_CAP_PIPELINE_CACHE;
+        gpu_device* d = gpu_vk_create(&dd);
+        CHECK(d != NULL);
+        if (d) {
+            CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NONE);
+            const gpu_layout l = guest_layout(d);
+            const gpu_shader vs = SH(d, GPU_STAGE_VS, k_spv_guest_vs);
+            const gpu_shader ps = SH(d, GPU_STAGE_PS, k_spv_guest_ps);
+            gpu_pipeline_desc pd;
+            draw_desc(&pd, l, vs, ps);
+            uint32_t how = 7;
+            CHECK(gpu_pipeline_create(d, &pd, GPU_PIPELINE_STORE_ONLY, &how).v == 0);
+            CHECK(how == GPU_PIPELINE_COMPILED && GPU_VK_DEV(d)->npso == 0);
+            how = 7;
+            CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_COMPILED);
+            CHECK(gpu_pipeline_cache_save(d, path) == 0);
+            CHECK(GPU_VK_DEV(d)->n_validation == 0);
+            gpu_destroy(d);
+        }
+        dd.cap_mask = 0;
     }
     remove(path);
 }
@@ -1508,7 +1864,441 @@ static void test_swapchain(void)
     DestroyWindow(w);
     UnregisterClassA(wc.lpszClassName, wc.hInstance);
 }
+
+/* ---- A swap chain on a minimized window, and a window minimized, hidden,
+ * shown and resized between frames ---- */
+
+static void win_pump(void)
+{
+    MSG m;
+    while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&m);
+        DispatchMessageA(&m);
+    }
+}
+
+/* swap_frame, or 1 when the acquire gives no image (the present then fails,
+ * as gpu.h says). */
+static int win_frame(gpu_swapchain sc, gpu_texture* got)
+{
+    static const float grey[4] = {0.5f, 0.5f, 0.5f, 1};
+    gpu_texture img;
+    gpu_swap_acquire(g_d, sc, &img);
+    if (got) *got = img;
+    if (!GPU_VALID(img)) return gpu_swap_present(g_d, sc, 1, 0) == GPU_PRESENT_FAILED ? 1 : -3;
+    return swap_frame(sc, grey, 1, 0);
+}
+
+/* The image acquired is the one swap_image gives at its index, of the
+ * window's client size. */
+static int win_image_ok(gpu_swapchain sc, HWND w, gpu_texture img)
+{
+    RECT cr;
+    GetClientRect(w, &cr);
+    const uint32_t n = gpu_swap_image_count(g_d, sc);
+    uint32_t i = 0;
+    while (i < n && gpu_swap_image(g_d, sc, i).id != img.id) i++;
+    const gpu_vk_tex* const t = &g_vk->tex[GPU_HANDLE_INDEX(img.id)];
+    return GPU_VALID(img) && n >= 2 && i < n && t->width == (uint32_t)(cr.right - cr.left) &&
+           t->height == (uint32_t)(cr.bottom - cr.top);
+}
+
+static gpu_swapchain vc2_swap(gpu_device* d, HWND w);   /* (below) */
+
+static void test_window_states(void)
+{
+    const uint32_t v0 = g_vk->n_validation;
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "ps3r_test_gpu_vk_win";
+    RegisterClassA(&wc);
+    HWND w = CreateWindowExA(WS_EX_NOACTIVATE, wc.lpszClassName, "test_gpu_vk", WS_OVERLAPPEDWINDOW, 0, 0, 160, 120,
+                             NULL, NULL, wc.hInstance, NULL);
+    CHECK(w != NULL);
+    if (!w) return;
+    /* Made on a minimized window (as a program started minimized has it):
+     * no images until it is shown, and the present fails. */
+    ShowWindow(w, SW_SHOWMINNOACTIVE);
+    win_pump();
+    CHECK(IsIconic(w));
+    const gpu_swapchain sc = vc2_swap(g_d, w);
+    CHECK(GPU_VALID(sc));
+    int none_min = 0, again = 0, hid = 0, sized = 0;
+    if (GPU_VALID(sc)) {
+        gpu_texture img = {0}, before = {0};
+        CHECK(gpu_swap_image_count(g_d, sc) == 0);
+        CHECK(win_frame(sc, &img) == 1);
+        /* Shown: images of its size from the next acquire. */
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        win_pump();
+        CHECK(!IsIconic(w));
+        CHECK(win_frame(sc, &img) == 0 && win_image_ok(sc, w, img));
+        CHECK(win_frame(sc, &before) == 0);
+        /* Minimized while it presents: within a few frames no image, and no
+         * images at all; restored, new images (the swap chain made again). */
+        ShowWindow(w, SW_SHOWMINNOACTIVE);
+        win_pump();
+        for (int k = 0; k < 4; k++) {
+            const int r = win_frame(sc, &img);
+            CHECK(r == 0 || r == 1);
+            if (r == 1 && gpu_swap_image_count(g_d, sc) == 0) none_min = 1;
+        }
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        win_pump();
+        for (int k = 0; k < 3; k++) CHECK(win_frame(sc, &img) == 0);
+        CHECK(win_image_ok(sc, w, img));
+        again = img.id != before.id;
+        /* Hidden: it keeps its size, and frames present. */
+        ShowWindow(w, SW_HIDE);
+        win_pump();
+        for (int k = 0; k < 3; k++) hid += win_frame(sc, &img) == 0;
+        CHECK(hid >= 2 && win_image_ok(sc, w, img));
+        /* Shown and resized: images of the new size. */
+        ShowWindow(w, SW_SHOWNOACTIVATE);
+        SetWindowPos(w, NULL, 0, 0, 220, 170, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        win_pump();
+        for (int k = 0; k < 3; k++) CHECK(win_frame(sc, &img) == 0);
+        sized = win_image_ok(sc, w, img);
+        CHECK(sized);
+        gpu_wait_idle(g_d);
+        gpu_swap_destroy(g_d, sc);
+    }
+    printf("  window states: made minimized %s, none while minimized %s, made again at the restore %s, "
+           "hidden %d of 3 presented, resized %s\n", GPU_VALID(sc) ? "yes" : "NO", none_min ? "yes" : "no",
+           again ? "yes" : "no", hid, sized ? "yes" : "no");
+    DestroyWindow(w);
+    UnregisterClassA(wc.lpszClassName, wc.hInstance);
+    CHECK(g_vk->n_validation == v0);
+}
 #endif
+
+/* ---- step VC2: presenting as the core does, and a lost device ---- */
+
+#ifdef _WIN32
+/* A borderless window of w x h client pixels, never shown. */
+static HWND vc2_window(int w, int h)
+{
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "ps3r_test_gpu_vk_vc2";
+    RegisterClassA(&wc);   /* (once: a second time fails, harmlessly) */
+    return CreateWindowExA(0, wc.lpszClassName, "test_gpu_vk", WS_POPUP, 0, 0, w, h, NULL, NULL, wc.hInstance, NULL);
+}
+
+static gpu_swapchain vc2_swap(gpu_device* d, HWND w)
+{
+    gpu_swapchain_desc sd;
+    memset(&sd, 0, sizeof sd);
+    sd.window = w;
+    sd.width = 64;
+    sd.height = 64;
+    sd.format = GPU_FORMAT_R8G8B8A8_UNORM;
+    sd.buffers = 2;
+    sd.colour_space = GPU_COLOR_SRGB;
+    sd.flags = (d->caps.bits & GPU_CAP_TEARING) ? GPU_SWAP_TEARING : 0;
+    return gpu_swap_create(d, &sd);
+}
+
+static void vc2_submit(gpu_device* d, gpu_cmd* c, gpu_swapchain sc, uint32_t more)
+{
+    gpu_submit_desc how;
+    memset(&how, 0, sizeof how);
+    how.swapchain = sc;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL | more;   /* (on every submit, as the core) */
+    gpu_cmd_end(d, c);
+    (void)gpu_submit(d, &c, 1, &how);
+}
+
+static gpu_fence vc2_submit_signal(gpu_device* d, gpu_cmd* c, gpu_swapchain sc)
+{
+    gpu_submit_desc how;
+    memset(&how, 0, sizeof how);
+    how.swapchain = sc;
+    how.flags = GPU_SUBMIT_ACQUIRE_WAIT | GPU_SUBMIT_PRESENT_SIGNAL | GPU_SUBMIT_SIGNAL;
+    gpu_cmd_end(d, c);
+    return gpu_submit(d, &c, 1, &how);
+}
+
+/* The window's image cleared to rgba, in PRESENT before and after: the blit. */
+static void vc2_blit(gpu_device* d, gpu_cmd* c, gpu_texture img, const float rgba[4], const gpu_rect* rect)
+{
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = img;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(d, &vd);
+    gpu_cmd_barrier(c, img, GPU_STATE_PRESENT, GPU_STATE_RENDER_TARGET);
+    gpu_cmd_clear_color(c, rtv, rgba, rect);
+    gpu_cmd_barrier(c, img, GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
+}
+
+/* Frames as the core presents them, on a device of their own with two frames
+ * in flight and three recorders each: every submit says ACQUIRE_WAIT and
+ * PRESENT_SIGNAL (the present semaphore: VC1's gap 4, on a real present).
+ * The first submit has the frame's own work and, on even frames, the blit
+ * into the window's image; the second, on odd frames, the blit (after a
+ * submit that waited for the acquire), and a copy of the image (a capture's
+ * readback); the third the overlay, a corner of the image. The present
+ * modes go FIFO (interval 1), IMMEDIATE (interval 0 with tearing:
+ * RSX_VSYNC=0), FIFO, then interval 2 (RSX_VSYNC=2, present_gate). Every
+ * present is FIFO or IMMEDIATE, never MAILBOX. Validation, with
+ * synchronization validation, says nothing. */
+static void test_present_frames(void)
+{
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags;
+    dd.cmd_slots = 6;
+    gpu_device* d = gpu_vk_create(&dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    gpu_vk_device* const v = GPU_VK_DEV(d);
+    HWND w = vc2_window(64, 64);
+    CHECK(w != NULL);
+    const gpu_swapchain sc = w ? vc2_swap(d, w) : (gpu_swapchain){0};
+    CHECK(GPU_VALID(sc));
+    if (!GPU_VALID(sc)) {
+        if (w) DestroyWindow(w);
+        gpu_destroy(d);
+        return;
+    }
+    gpu_vk_swap* const s = &v->swap[GPU_HANDLE_INDEX(sc.id)];
+    const int tear = (d->caps.bits & GPU_CAP_TEARING) != 0;
+
+    /* The frame's own target, and the capture's buffer for the image. */
+    gpu_texture_desc otd = tex_desc(64, 64, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT, GPU_STATE_RENDER_TARGET);
+    const gpu_texture off = gpu_texture_create(d, &otd);
+    gpu_view_desc ovd;
+    memset(&ovd, 0, sizeof ovd);
+    ovd.texture = off;
+    ovd.kind = GPU_VIEW_RTV;
+    const gpu_view off_rtv = gpu_view_get(d, &ovd);
+    gpu_texture_desc itd = tex_desc(s->width, s->height, GPU_FORMAT_R8G8B8A8_UNORM, 0, GPU_STATE_PRESENT);
+    gpu_footprint fp;
+    uint32_t rows = 0;
+    uint64_t row_bytes = 0;
+    const uint64_t total = gpu_texture_footprints(d, &itd, 0, 1, 0, &fp, &rows, &row_bytes);
+    const gpu_buffer rb = buf_new(d, total, GPU_MEM_READBACK, GPU_STATE_COPY_DEST);
+    CHECK(GPU_VALID(off) && GPU_VALID(rb));
+
+    enum { N = 32 };
+    const int64_t f0 = ms_now();
+    gpu_fence fence[2] = {0, 0};
+    uint32_t done = 0, gate0 = 0, gate_ok = 1;
+    int64_t gate_t0 = 0, last_shown = 0, min_gap = INT64_MAX;
+    uint8_t want[4] = {0, 0, 0, 0};
+    for (uint32_t f = 0; f < N && GPU_VALID(off) && GPU_VALID(rb); f++) {
+        const uint32_t half = f % 2, phase = f / 8;
+        uint32_t interval = phase == 1 ? 0u : phase == 3 ? 2u : 1u;
+        if (interval == 0 && !tear) interval = 1;   /* (the core's: no tearing, vsync) */
+        const uint32_t flags = interval == 0 ? GPU_PRESENT_TEARING : 0;
+        if (fence[half]) CHECK(gpu_fence_wait(d, fence[half], 5000) == 0);
+        gpu_texture img;
+        gpu_swap_acquire(d, sc, &img);
+        CHECK(GPU_VALID(img));
+        if (!GPU_VALID(img)) break;
+        const float c8 = (float)(f * 8 % 256) / 255.0f;
+        const float colour[4] = {c8, 1.0f - c8, 0.25f, 1.0f}, white[4] = {1, 1, 1, 1}, grey[4] = {0.5f, 0.5f, 0.5f, 1};
+        const gpu_rect corner = {0, 0, 8, 8};
+
+        gpu_cmd* c = gpu_cmd_begin(d, half * 3 + 0);
+        gpu_cmd_clear_color(c, off_rtv, grey, NULL);
+        if (!(f & 1)) vc2_blit(d, c, img, colour, NULL);
+        vc2_submit(d, c, sc, 0);
+
+        c = gpu_cmd_begin(d, half * 3 + 1);
+        if (f & 1) vc2_blit(d, c, img, colour, NULL);
+        gpu_cmd_barrier(c, img, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE);
+        gpu_cmd_copy_tex_to_buf(c, rb, &fp, img, 0, NULL);
+        gpu_cmd_barrier(c, img, GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT);
+        vc2_submit(d, c, sc, 0);
+
+        c = gpu_cmd_begin(d, half * 3 + 2);
+        vc2_blit(d, c, img, white, &corner);
+        fence[half] = vc2_submit_signal(d, c, sc);
+
+        if (phase == 3 && !gate_t0) {
+            gate0 = s->gate_n;
+            gate_t0 = (int64_t)s->gate_ticks;
+        }
+        const int pr = gpu_swap_present(d, sc, interval, flags);
+        CHECK(pr == GPU_PRESENTED);
+        if (pr == GPU_PRESENTED) done++;
+        /* The mode the present had: per present with swapchain_maintenance1,
+         * else from the next acquire (the swap chain made again). */
+        const VkPresentModeKHR m = interval == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        CHECK(s->mode == VK_PRESENT_MODE_FIFO_KHR || s->mode == VK_PRESENT_MODE_IMMEDIATE_KHR);
+        if (s->modes_switch) CHECK(s->mode == m);
+        else CHECK(s->mode == m || s->recreate);
+        if (phase == 3 && s->gate_n > gate0 && s->done_qpc && s->done_qpc != last_shown) {
+            if (last_shown && s->done_qpc - last_shown < min_gap) min_gap = s->done_qpc - last_shown;
+            last_shown = s->done_qpc;
+        }
+        want[0] = (uint8_t)(c8 * 255.0f + 0.5f);
+        want[1] = (uint8_t)((1.0f - c8) * 255.0f + 0.5f);
+        want[2] = 64;
+        want[3] = 255;
+    }
+    gpu_wait_idle(d);
+    /* The last frame's capture: its blit's colour, the overlay not yet in it. */
+    const uint8_t* p = (const uint8_t*)gpu_buffer_map(d, rb, 0, total);
+    if (p) {
+        const uint8_t* q = p + 32ull * fp.row_pitch + 32ull * 4;
+        CHECK(close_to(q[0], want[0]) && close_to(q[1], want[1]) && close_to(q[2], want[2]) && q[3] == 255);
+        q = p;   /* (the corner: the frame before's overlay is gone, the blit covered it) */
+        CHECK(close_to(q[0], want[0]) && close_to(q[1], want[1]));
+        gpu_buffer_unmap(d, rb, 0, 0);
+    }
+    CHECK(done == N);
+    LARGE_INTEGER qf;
+    QueryPerformanceFrequency(&qf);
+    const int64_t tps = (int64_t)qf.QuadPart;   /* (now_ticks' units on Windows) */
+    const uint32_t gates = s->gate_n - gate0;
+    if ((d->caps.bits & GPU_CAP_PRESENT_WAIT) && s->period) {
+        /* Interval 2: each present waited (present_wait and the hold),
+         * unless the window is not shown (the compositor never says). */
+        if (s->gate_miss) printf("  present gate: the hidden window's presents are never seen; no gate\n");
+        else {
+            CHECK(gates >= 6);
+            /* Each frame shown two refreshes after the one before, less the
+             * gate's quarter (a display that shows a frame at once) and some. */
+            if (min_gap != INT64_MAX) gate_ok = min_gap >= 2 * s->period - s->period / 2;
+            CHECK(gate_ok);
+        }
+        printf("  present gate: %u waits, %.2f ms a frame, refresh %.2f ms, shortest time between frames %.2f ms\n",
+               gates, gates ? 1000.0 * (double)(s->gate_ticks - gate_t0) / (double)tps / gates : 0.0,
+               1000.0 * (double)s->period / (double)tps,
+               min_gap != INT64_MAX ? 1000.0 * (double)min_gap / (double)tps : 0.0);
+    } else {
+        CHECK(gates == 0);
+        printf("  present gate: no present_wait (or no refresh rate): interval 2 is FIFO's 1\n");
+    }
+    printf("  presents as the core does: %u frames, 3 submits each, in %lld ms; modes %s, tearing %s\n", done,
+           (long long)(ms_now() - f0), s->modes_switch ? "switched per present" : "by a new swap chain",
+           tear ? "IMMEDIATE" : "none (FIFO)");
+    CHECK(v->n_validation == 0);
+    gpu_buffer_destroy(d, rb, 0);
+    gpu_swap_destroy(d, sc);
+    gpu_destroy(d);
+    DestroyWindow(w);
+}
+#endif
+
+/* gpu.h's codes (step VC2): every VkResult a present or an acquire gives, and
+ * what a lost device leaves, on a device of its own noted lost as a driver
+ * reset would leave it. (A real loss would need a GPU hang: a TDR resets the
+ * driver for every program on the machine, so the test does not make one.)
+ * On Windows also the window's surface lost: the window destroyed under its
+ * swap chain, which the backend cannot make a surface for again. */
+static void test_lost(void)
+{
+    static const struct { VkResult r; int code; } k[] = {
+        {VK_SUCCESS, GPU_PRESENTED},
+        {VK_SUBOPTIMAL_KHR, GPU_PRESENTED},
+        {VK_ERROR_OUT_OF_DATE_KHR, GPU_PRESENTED},
+        {VK_ERROR_DEVICE_LOST, GPU_PRESENT_LOST},
+        {VK_ERROR_SURFACE_LOST_KHR, GPU_PRESENT_SURFACE_LOST},
+        {VK_ERROR_OUT_OF_HOST_MEMORY, GPU_PRESENT_FAILED},
+        {VK_ERROR_OUT_OF_DEVICE_MEMORY, GPU_PRESENT_FAILED},
+        {VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT, GPU_PRESENT_FAILED},
+        {VK_ERROR_UNKNOWN, GPU_PRESENT_FAILED},
+        {VK_TIMEOUT, GPU_PRESENT_FAILED},
+        {VK_NOT_READY, GPU_PRESENT_FAILED},
+    };
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) CHECK(gpu_vk_present_code(k[i].r) == k[i].code);
+
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags | GPU_DEVICE_BREADCRUMBS;
+    dd.cmd_slots = 1;
+    gpu_device* d = gpu_vk_create(&dd);
+    CHECK(d != NULL);
+    if (!d) return;
+    gpu_vk_device* const v = GPU_VK_DEV(d);
+#ifdef _WIN32
+    gpu_swapchain sc = {0};
+    HWND w = vc2_window(64, 64);
+    if (w) sc = vc2_swap(d, w);
+    CHECK(GPU_VALID(sc));
+    if (GPU_VALID(sc)) {   /* an image acquired and drawn into, left for the present after the loss */
+        gpu_texture img;
+        gpu_swap_acquire(d, sc, &img);
+        const float red[4] = {1, 0, 0, 1};
+        gpu_cmd* c = gpu_cmd_begin(d, 0);
+        gpu_cmd_marker(c, "before the loss", 15);
+        vc2_blit(d, c, img, red, NULL);
+        vc2_submit(d, c, sc, 0);
+    }
+#endif
+    gpu_wait_idle(d);   /* (the GPU idle: a lost device's fences read as passed, and frees come at once) */
+    CHECK(gpu_lost(d) == 0);
+    gpu_vk_lost_note(v, VK_ERROR_OUT_OF_HOST_MEMORY);
+    gpu_vk_lost_note(v, VK_ERROR_SURFACE_LOST_KHR);   /* (a surface's: the device works) */
+    CHECK(gpu_lost(d) == 0);
+    gpu_vk_lose_by_hand(v);   /* (gpu_vk_lost_note's VK_ERROR_DEVICE_LOST, the driver not asked) */
+    CHECK(gpu_lost(d) == (uint32_t)VK_ERROR_DEVICE_LOST && v->lost_by_hand == 1);
+    gpu_vk_lost_note(v, VK_ERROR_OUT_OF_DATE_KHR);
+    gpu_vk_lost_note(v, VK_ERROR_DEVICE_LOST);
+    CHECK(gpu_lost(d) == (uint32_t)VK_ERROR_DEVICE_LOST);   /* the first reason stays */
+    CHECK(gpu_fence_completed(d) == UINT64_MAX);
+    const int64_t t0 = ms_now();
+    CHECK(gpu_fence_wait(d, gpu_signal(d) + 1000000, 2000) == 0);   /* never signalled, but lost: at once */
+    CHECK(ms_now() - t0 < 1000);
+#ifdef _WIN32
+    if (GPU_VALID(sc)) CHECK(gpu_swap_present(d, sc, 1, 0) == GPU_PRESENT_LOST);
+#endif
+    gpu_fault_report(d, "test_gpu_vk's noted loss");   /* (the line, the checkpoints; device_fault not asked) */
+    CHECK(v->fault_done == 1);
+#ifdef _WIN32
+    if (GPU_VALID(sc)) gpu_swap_destroy(d, sc);
+    if (w) DestroyWindow(w);
+#endif
+    CHECK(v->n_validation == 0);
+    gpu_destroy(d);
+
+#ifdef _WIN32
+    /* The surface: presents until the window's surface is given up on. */
+    w = vc2_window(64, 64);
+    sc = w ? vc2_swap(g_d, w) : (gpu_swapchain){0};
+    CHECK(GPU_VALID(sc));
+    if (!GPU_VALID(sc)) return;
+    gpu_vk_swap* const s = &g_vk->swap[GPU_HANDLE_INDEX(sc.id)];
+    int pr = GPU_PRESENTED, frames = 0;
+    for (; frames < 6 && pr != GPU_PRESENT_SURFACE_LOST; frames++) {
+        if (frames == 1) DestroyWindow(w);   /* after one frame shown */
+        gpu_texture img;
+        gpu_swap_acquire(g_d, sc, &img);
+        if (GPU_VALID(img)) {
+            const float blue[4] = {0, 0, 1, 1};
+            gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+            vc2_blit(g_d, c, img, blue, NULL);
+            const gpu_fence f = vc2_submit_signal(g_d, c, sc);
+            pr = gpu_swap_present(g_d, sc, 1, 0);
+            CHECK(f && gpu_fence_wait(g_d, f, 5000) == 0);
+        } else {
+            pr = gpu_swap_present(g_d, sc, 1, 0);   /* (no image: SURFACE_LOST once given up, else FAILED) */
+            CHECK(pr == GPU_PRESENT_SURFACE_LOST || pr == GPU_PRESENT_FAILED);
+        }
+        if (frames == 0) CHECK(pr == GPU_PRESENTED);
+    }
+    if (pr == GPU_PRESENT_SURFACE_LOST) {
+        CHECK(s->surface_dead && gpu_lost(g_d) == 0);   /* the device works on */
+        gpu_texture img;
+        gpu_swap_acquire(g_d, sc, &img);
+        CHECK(!GPU_VALID(img));   /* no more images */
+        printf("  surface lost: given up after %d frames (the window destroyed after the first)\n", frames);
+    } else {
+        printf("  surface lost: the driver went on presenting to a destroyed window (%d frames); not reached\n",
+               frames);
+    }
+    gpu_swap_destroy(g_d, sc);
+    CHECK(g_vk->n_validation == 0);
+#endif
+}
 
 /* ---- Breadcrumbs and the fault report ---- */
 
@@ -1578,14 +2368,19 @@ int main(void)
         test_draw(&s);
         test_post(&s);
         test_memo(&s);
+        test_raw_switch(&s);
+        test_fetch_bounds(&s);
     }
     test_caches();
     test_fences();
 #ifdef _WIN32
     test_swapchain();
+    test_window_states();
+    test_present_frames();
 #else
     printf("  swap chain: skipped (Windows only here)\n");
 #endif
+    test_lost();
     CHECK(gpu_lost(g_d) == 0);
     CHECK(g_vk->n_validation == 0);
     gpu_destroy(g_d);

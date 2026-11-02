@@ -100,6 +100,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_spu_helpers.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          # The SSE4.1 paths against their scalar forms (as arm64 runs them
+          # through sse2neon on macOS). Quoted: PowerShell splits a bare
+          # -msse4.1 at the dot, and the test then stops at its #error.
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS '-msse4.1' /I include /I runtime/spu /Fe:test_spu_simd_paths.exe runtime/spu/tests/test_spu_simd_paths.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_spu_simd_paths.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
@@ -231,6 +238,18 @@ jobs:
           cmake --build build-sync-stress
           if ($LASTEXITCODE -ne 0) { exit 1 }
           ctest --test-dir build-sync-stress --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # runtime/platform/plat.h's threads, events and mutex, and the SPU async
+      # job pool on them. On Windows plat.h is the Win32 calls the pool made
+      # before it moved, so this checks the same rules the other hosts do.
+      - name: Build and run plat_threads
+        run: |
+          cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build-plat-threads
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build-plat-threads --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Run self-contained RSX tests

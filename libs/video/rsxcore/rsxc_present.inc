@@ -10,10 +10,10 @@ static const char* s_dump_name = NULL;
 
 static void dump_backbuffer_bmp(void)
 {
-    if (!s_d3d.readback_buf) return;
-    void* mapped = NULL;
-    D3D12_RANGE rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.host_h};
-    if (FAILED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &rr, &mapped)) || !mapped)
+    if (!GPU_VALID(s_rc_readback_buf)) return;
+    /* The GPU layer's readback buffer (step C2): its rows read. */
+    void* mapped = gpu_buffer_map(s_rc_dev, s_rc_readback_buf, 0, (u64)s_d3d.readback_pitch * s_d3d.host_h);
+    if (!mapped)
         return;
 
     /* CELLMARK_DUMP_CHANGED=1: write a frame only when it differs from the
@@ -29,8 +29,7 @@ static void dump_backbuffer_bmp(void)
               for (u32 x = 0; x < s_d3d.host_w; x += 16) hsh = (hsh ^ row[x]) * 1099511628211ull;
           }
           if (hsh == last) {
-              D3D12_RANGE wr0 = {0, 0};
-              s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr0);
+              gpu_buffer_unmap(s_rc_dev, s_rc_readback_buf, 0, 0);
               return;
           }
           last = hsh;
@@ -86,7 +85,6 @@ static void dump_backbuffer_bmp(void)
         printf("[D3D12] dumped %s (%ux%u, %u draws)\n", path, s_d3d.host_w, s_d3d.host_h,
                s_dbg_last_draws);
     }
-    D3D12_RANGE wr = {0, 0};
-    s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &wr);
+    gpu_buffer_unmap(s_rc_dev, s_rc_readback_buf, 0, 0);
 }
 

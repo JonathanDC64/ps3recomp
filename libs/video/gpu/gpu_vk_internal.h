@@ -20,7 +20,7 @@
  *     each static sampler s<n> at binding 48 + n (an immutable sampler, s0-s15);
  *   - set 1, 2, ...: the TABLE_TEX and TABLE_SAMPLER slots in slot order, one
  *     set each; entry j of a texture table is binding 16 + j (t<j>), of a
- *     sampler table binding 48 + j (s<j>). Tables start at register 0;
+ *     sampler table binding 48 + j (s<j>), counted from the slot's first register (step VM: any);
  *   - CONST32 slots: push constants, one block, the slots in slot order, each
  *     at 4 bytes times the counts before it;
  *   - vertex attribute k of gpu_vertex_layout is location k.
@@ -74,6 +74,7 @@ extern "C" {
 #define GPU_VK_MAX_IMAGES     8u      /* a swap chain's */
 #define GPU_VK_MAX_SETS       (1u + GPU_MAX_SLOTS)
 #define GPU_VK_MAX_DYN        GPU_MAX_SLOTS
+#define GPU_VK_MAX_PENDING    64   /* barriers held for one vkCmdPipelineBarrier2 */
 #define GPU_VK_INIT_RING      8u      /* command buffers for new textures' first layouts */
 #define GPU_VK_MARKS          4096u   /* the checkpoint markers' ring (GPU_DEVICE_BREADCRUMBS) */
 #define GPU_VK_MARK_LEN       64u
@@ -82,6 +83,19 @@ extern "C" {
 #define GPU_VK_BIND_CB      0u
 #define GPU_VK_BIND_T       16u
 #define GPU_VK_BIND_S       48u
+
+/* ---- step VC1 ---- */
+/* The entries a table's set layout has: tables of up to 16 entries share
+ * one 16-entry layout, so a table slot binds a table at least as long as
+ * its count (D3D12 lets a slot read the start of a longer table: the blit's
+ * one-entry slot binds the HDR blit's two-entry tables); a longer table's
+ * layout is its own size. The entries past a table's own are never written
+ * and never read (partially bound). */
+#define GPU_VK_TABLE_MIN 16u
+static inline uint32_t gpu_vk_table_entries(uint32_t size)
+{
+    return size < GPU_VK_TABLE_MIN ? GPU_VK_TABLE_MIN : size;
+}
 
 /* gpu_addr: the buffer's handle in the high 32 bits, the byte offset in the
  * low 32 (buffers are below 4 GB), so an address decodes with no lookup. */
@@ -162,6 +176,8 @@ const gpu_vk_format* gpu_vk_format_dev(const struct gpu_vk_device* dd, gpu_forma
 /* ---- Objects ---- */
 
 enum { GPU_VK_TEX_SWAP = 1u };   /* a swap chain's image */
+/* ---- step VC1 ---- */
+enum { GPU_VK_TEX_ZERO = 2u };   /* its own memory, zeroed before its first use (gpu_vk_init_record) */
 typedef struct gpu_vk_tex {
     VkImage            image;
     VkDeviceMemory     memory;    /* its own; none when placed or a swap chain's */
@@ -298,6 +314,14 @@ typedef struct gpu_vk_shader {
     uint32_t       stage;
     uint64_t       hash;          /* FNV-1a 64 of the code */
     char           entry[64];
+    /* Step VC1: its interface, for pipelines that do not use all of it (D3D12
+     * ignores what the other side does not take; Vulkan's validation says
+     * so): the Locations its Input and Output variables take (builtins left
+     * out), and a pixel shader's code, kept to make a copy without the
+     * outputs a pipeline has no target for (gpu_vk_pipe.c). */
+    uint32_t       in_mask, out_mask;
+    uint32_t*      words;
+    uint32_t       nwords;
 } gpu_vk_shader;
 
 /* A layout slot's place: a set, and in set 0 the dynamic offset's index (in
@@ -388,6 +412,28 @@ typedef struct gpu_vk_swap {
     uint32_t         waited, signalled;
     uint64_t         present_id, done_id;
     int64_t          done_qpc;
+    /* Step VC2: the window's surface lost (made again at the next acquire),
+     * and given up on (it could not be: GPU_PRESENT_SURFACE_LOST). */
+    uint32_t         surface_lost, surface_dead;
+    /* Step VC2: intervals 2-4 held by present_wait (present_gate). The
+     * display's refresh period and a vblank it was seen at, in now_ticks
+     * units (0: not known); when the last present was queued; a wait that
+     * timed out (the window is not shown: no gate until a present is seen);
+     * the gate's waits and the ticks they took (test hooks). chain_id0: the
+     * last present id before this swap chain was made (ids up to it were
+     * another's, and no wait may name them). */
+    int64_t          period, vblank, queued_at;
+    uint64_t         chain_id0;
+    uint32_t         gate_miss, gate_n;
+    int64_t          gate_ticks;
+    /* Step L1: a window with no RGBA8 images (X11's and Wayland's on Mesa
+     * and NVIDIA): the swap chain is BGRA8, image[] are RGBA8 textures of
+     * the backend's that the core draws into, and the present's own submit
+     * blits each into its vkimage[] (a blit swaps the channels' order). */
+    uint32_t         shadow;
+    VkCommandPool    blit_pool;
+    VkCommandBuffer  blit_cb[GPU_VK_MAX_IMAGES];
+    VkFence          blit_fence[GPU_VK_MAX_IMAGES];   /* the image's last blit done */
 } gpu_vk_swap;
 
 enum { GPU_VK_DEFER_BUFFER = 0, GPU_VK_DEFER_TEXTURE = 1 };
@@ -416,6 +462,13 @@ typedef struct gpu_vk_set0_entry {
 } gpu_vk_set0_entry;
 
 /* A recorder: one command buffer, the device's arrays, and what is bound. */
+#define GPU_VK_MAX_VB         16u     /* vertex buffer slots whose binding is remembered */
+#define GPU_VK_PUSH_DW        32u     /* 128 bytes, Vulkan's least push-constant size */
+#define GPU_VK_ST_PIPE        1u      /* gpu_cmd.st_ok: the pipeline, viewport, scissor and index buffer known */
+#define GPU_VK_ST_VP          2u
+#define GPU_VK_ST_SC          4u
+#define GPU_VK_ST_IB          8u
+
 struct gpu_cmd {
     gpu_cmd_head                 head;
     VkCommandBuffer              cb;
@@ -423,6 +476,7 @@ struct gpu_cmd {
     struct gpu_vk_device*        dd;
     gpu_vk_tex*                  tex;
     uint32_t*                    tex_layout;   /* each texture's layout as recorded so far */
+    uint64_t*                    tex_att;      /* the last pass it was an attachment of (0: ordered since) */
     const VkBuffer*              buf;
     const gpu_vk_buf*            bufi;
     const gpu_vk_view*           view;
@@ -438,7 +492,12 @@ struct gpu_cmd {
     uint32_t                     dyn[GPU_VK_MAX_DYN];
     gpu_vk_set0_key              key;           /* set 0's buffers */
     uint32_t                     set0_stale;    /* key changed since sets[0] was found */
-    uint32_t                     dirty;         /* bind before the next draw */
+    /* Step V5v: the last two sets 0 found, newest first, so a slot that goes
+     * back and forth between two buffers (the vertex-shader clamp's t20, twice
+     * a draw) finds its set without the cache's lock and hash. */
+    gpu_vk_set0_key              memo_key[2];
+    VkDescriptorSet              memo_set[2];
+    uint32_t                     dirty;         /* the sets to bind before the next draw (~0: all) */
 
     /* The pass (targets) and its rendering. */
     gpu_pass                     pass;
@@ -449,6 +508,42 @@ struct gpu_cmd {
     uint32_t                     dw;            /* set_depth_write's */
     uint32_t                     pipe_dw;       /* the bound pipeline's depth writes are dynamic */
     uint32_t                     restart;
+    uint64_t                     att_order;     /* passes up to this one are ordered before the next */
+
+    /* What the last state calls set, so the same value is not sent again:
+     * D3D12's drivers drop repeats themselves, Vulkan's send each one. Known
+     * from cmd_begin; a pipeline bind keeps them (they are dynamic in every
+     * pipeline), but depth writes only in the pipelines that make them so. */
+    VkPipeline                   last_pipe;
+    VkViewport                   last_vp;
+    VkRect2D                     last_sc;
+    uint32_t                     last_topo;
+    uint32_t                     last_dw;       /* depth writes as set: 0, 1, or 2 when not known */
+    uint32_t                     st_ok;         /* GPU_VK_ST_* known */
+    VkBuffer                     vb_b[GPU_VK_MAX_VB];
+    VkDeviceSize                 vb_off[GPU_VK_MAX_VB], vb_sz[GPU_VK_MAX_VB];
+    uint32_t                     vb_ok;         /* the slots known */
+    VkBuffer                     ib_b;
+    VkDeviceSize                 ib_off;
+    uint32_t                     ib_type;
+    uint32_t                     pc[GPU_VK_PUSH_DW];   /* the push constants as pushed */
+    uint32_t                     pc_ok;         /* the dwords known */
+
+    /* Whole-target clears asked before the pass opened, done as its load
+     * ops (the driver's fast clear, as D3D12's Clear*View; a clear inside
+     * the rendering writes every pixel): bits 0-3 the colour slots, 4 depth,
+     * 5 stencil, with their values (4 holds depth and stencil). */
+    uint32_t                     pend_clr;
+    VkClearValue                 clr[5];
+
+    /* The barriers recorded since the last command that does work, sent as
+     * one vkCmdPipelineBarrier2 just before the next one (gpu_vk__sync).
+     * Nothing runs between them, so this is the same order, in one call
+     * instead of one per D3D12-style barrier. */
+    VkImageMemoryBarrier2        pend_img[GPU_VK_MAX_PENDING];
+    VkBufferMemoryBarrier2       pend_buf[GPU_VK_MAX_PENDING];
+    VkMemoryBarrier2             pend_mem;
+    uint32_t                     pend_ni, pend_nb, pend_nm;
 };
 
 typedef struct gpu_vk_device {
@@ -491,6 +586,8 @@ typedef struct gpu_vk_device {
                                layout_slots, qpool_slots, heap_slots, tpool_slots, swap_slots;
     gpu_vk_tex*                tex;
     uint32_t*                  tex_layout;
+    uint64_t*                  tex_att;
+    uint64_t                   att_seq;         /* passes opened, every recorder's */
     VkBuffer*                  buf_vk;
     gpu_vk_buf*                buf;
     gpu_vk_view*               view;
@@ -539,8 +636,17 @@ typedef struct gpu_vk_device {
     char*                      marks;
     volatile uint32_t          mark_next;
 
-    /* Test hooks: descriptors the table writes wrote, validation messages. */
-    volatile uint32_t          n_srv_writes, n_sampler_writes, n_validation;
+    /* Test hooks: descriptors the table writes wrote, validation messages,
+     * the set-0 cache's lookups (step V5v, under lock). */
+    volatile uint32_t          n_srv_writes, n_sampler_writes, n_validation, n_set0_gets;
+
+    /* Step VC2: lost by hand (gpu_vk_lose_by_hand), not by the driver. The
+     * pipelines made, those the pipeline cache had, and the driver's time
+     * for them (creation feedback, ns), under pso_lock: PS3_PSO_LOG=1 prints
+     * them when the device goes. */
+    volatile uint32_t          lost_by_hand;
+    uint32_t                   pso_made, pso_hits;
+    uint64_t                   pso_ns;
 } gpu_vk_device;
 
 #define GPU_VK_DEV(d) ((gpu_vk_device*)(void*)(d))
@@ -571,6 +677,16 @@ void        gpu_vk_rec_buf_tex(gpu_cmd* c, int to_tex, gpu_texture t, uint32_t s
 void        gpu_vk_rec_resolve(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, gpu_texture src, uint32_t src_sub);
 void        gpu_vk_rec_marker(gpu_cmd* c, const char* text, uint32_t len);
 void        gpu_vk_rec_barriers(gpu_cmd* c, uint32_t n, const gpu_barrier* list);
+/* Barriers held for the next command that does work: one that touches what a
+ * held one does (the same image or buffer, overlapping) sends those first. */
+void        gpu_vk_pend(gpu_cmd* c, const VkImageMemoryBarrier2* ib, uint32_t ni, const VkBufferMemoryBarrier2* bb,
+                        uint32_t nb, const VkMemoryBarrier2* mb, uint32_t nm);
+void        gpu_vk_sync_slow(gpu_cmd* c);
+/* Before a command that does work: the held barriers sent. */
+static inline void gpu_vk__sync(gpu_cmd* c)
+{
+    if (c->pend_ni | c->pend_nb | c->pend_nm) gpu_vk_sync_slow(c);
+}
 /* A placed texture's first use: UNDEFINED to its first state's layout. */
 void        gpu_vk_tex_touch(gpu_cmd* c, uint32_t index);
 /* A command buffer run at once and waited for (the empty entries' textures); NULL / 0 on failure. */
@@ -608,7 +724,7 @@ VkCommandBuffer gpu_vk_init_record(gpu_vk_device* dd, uint64_t value);
 gpu_view       gpu_vk_view_get(gpu_device* d, const gpu_view_desc* desc);
 uint32_t       gpu_vk_view_find(gpu_vk_device* dd, const gpu_view_desc* desc, uint32_t kind);  /* under lock: index + 1 */
 gpu_sampler    gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc);
-VkSampler      gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, VkBorderColor border);
+VkSampler      gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc);
 gpu_table_pool gpu_vk_table_pool_create(gpu_device* d, const gpu_table_pool_desc* desc);
 VkDescriptorSetLayout gpu_vk_table_layout(gpu_vk_device* dd, uint32_t kind, uint32_t size);   /* under lock */
 void           gpu_vk_write_tex(gpu_vk_device* dd, gpu_vk_tpool* p, uint32_t index, const gpu_view_desc* v);
@@ -622,7 +738,7 @@ void           gpu_vk_desc_release(gpu_vk_device* dd);
 gpu_shader   gpu_vk_shader_create(gpu_device* d, const gpu_shader_desc* desc);
 void         gpu_vk_shader_destroy(gpu_device* d, gpu_shader s);
 gpu_layout   gpu_vk_layout_create(gpu_device* d, const gpu_layout_desc* desc);
-gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache);
+gpu_pipeline gpu_vk_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how);
 int          gpu_vk_pipeline_cache_load(gpu_device* d, const char* path);
 int          gpu_vk_pipeline_cache_save(gpu_device* d, const char* path);
 void         gpu_vk_pipe_release(gpu_vk_device* dd);
@@ -642,6 +758,15 @@ void          gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* 
                                       uint32_t* nwait, VkSemaphoreSubmitInfo* sig, uint32_t* nsig);
 /* The instance extensions a surface needs here (NULL-terminated). */
 const char* const* gpu_vk_surface_extensions(void);
+
+/* ---- step VC2 ---- */
+/* A present's VkResult as gpu.h's GPU_PRESENT_* (out of date and suboptimal
+ * are GPU_PRESENTED: the swap chain is made again). */
+int           gpu_vk_present_code(VkResult r);
+/* The device noted lost as a driver reset leaves it, without the driver
+ * saying so (RSX_LOSE_DEVICE_AT_FRAME, the tests): the fault report then
+ * asks the driver nothing (device_fault is for a device the driver lost). */
+void          gpu_vk_lose_by_hand(gpu_vk_device* dd);
 
 #ifdef __cplusplus
 }
