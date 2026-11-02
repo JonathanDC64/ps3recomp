@@ -389,6 +389,11 @@ void (*g_rsx_report_hook)(u32 method, u32 data) = NULL;
  * report, a semaphore, `get`): a backend with work still queued from earlier
  * methods finishes it first (the D3D12 backend's vertex fetch threads). */
 void (*g_rsx_sync_hook)(void) = NULL;
+/* Called before the 2D engine writes guest [ea, ea+len) (cellGcmSys's inline
+ * transfers). A backend that sets it decides there whether the write needs
+ * g_rsx_sync_hook's work; with it set, the 2D methods that write no memory
+ * don't call g_rsx_sync_hook. */
+void (*g_rsx_sync_write_hook)(u32 ea, u32 len) = NULL;
 
 /* See rsx_commands.h. The per-word handlers these replace are the
  * NV4097_SET_TRANSFORM_PROGRAM, _CONSTANT_LOAD and _CONSTANT cases of

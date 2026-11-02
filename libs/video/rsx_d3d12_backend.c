@@ -666,6 +666,9 @@ static u32 s_vfo_ep = 1;
 #define VFO_PAGES 16u
 static struct { u32 ep[VFO_PWAYS]; u16 e[VFO_PWAYS]; u8 rr; } s_vfop[VFO_PSETS];
 static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
+/* Per 64 KB guest page, the stretch a span copy last read it in (vf_copy,
+ * vpj_sync_write_hook). */
+static u32* s_vpg;
 static void vfo_next(void)
 {
     if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); memset(s_vfop, 0, sizeof s_vfop); s_vfo_ep = 1; }
@@ -13836,6 +13839,7 @@ static _Alignas(64) VPJCounter s_vpj_ctr[4];
  * increment of a line the workers spin on, ~6% of the FIFO thread. */
 static LONG s_vpj_q;
 static u32 s_vpj_qv;
+static int s_vpj_conv;   /* a vertex job (not a span copy) queued since the last sync */
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -13906,8 +13910,27 @@ static void vpj_sync(void)
     InterlockedExchange(&s_vpj_done, 0);
     s_vpj_q = 0;
     s_vpj_vis_n = 0;
+    s_vpj_conv = 0;
 }
 static void vpj_sync_hook(void) { vpj_sync(); vfo_next(); }
+/* The 2D engine's inline writes (g_rsx_sync_write_hook): about 9,000 4-byte
+ * words a frame on Demon's Souls' 1-2 bridge, and each one ended the stretch
+ * and finished the queued copies on this thread. A 2D write is no fence for
+ * the RSX's vertex reads (on the PS3 the 3D pipe may still be reading when
+ * it lands), so a title can't rely on one to reuse vertex memory. It needs
+ * the queue done and the stretch ended only where it lands on a page a span
+ * copy of this stretch read, so a later copy can't see the new bytes and a
+ * later draw can't reuse the old ones; or while a vertex job is queued,
+ * whose reads aren't tracked. VF_SYNC_2D (live, default 1): 0 syncs at every
+ * write, as before. */
+static void vpj_sync_write_hook(u32 ea, u32 len)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VF_SYNC_2D", 1));
+    int hit = !on || s_vpj_conv || !len;
+    for (u32 p = ea >> 16; !hit && p <= (ea + len - 1) >> 16; p++) hit = s_vpg[p] == s_vfo_ep;
+    if (hit) vpj_sync_hook();
+}
 static int vpj_threads(void)
 {
     static int n = -1;
@@ -13917,6 +13940,9 @@ static int vpj_threads(void)
      * nothing queued, vpj_sync returns at once. */
     extern void (*g_rsx_sync_hook)(void);
     g_rsx_sync_hook = vpj_sync_hook;
+    extern void (*g_rsx_sync_write_hook)(u32, u32);
+    s_vpg = (u32*)calloc(1u << 16, sizeof *s_vpg);
+    if (s_vpg) g_rsx_sync_write_hook = vpj_sync_write_hook;
     n = ps3_env_int("VP_FETCH_THREADS", 1);
     if (n > 16) n = 16;
     if (n > 0) {
@@ -13966,6 +13992,7 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
     s_vpj_q++;
+    s_vpj_conv = 1;
     s_vpj_qv += n;
     if (s_vpj_qv >= vpj_batch()) vpj_publish();
 }
@@ -13980,6 +14007,9 @@ static void vf_copy(u8* dst, u32 src, u32 len)
     extern uint8_t* vm_base;
     static int on = -1;
     PS3_KNOB(on, ps3_env_int("VF_COPY_WORKER", 1));
+    vpj_threads();   /* makes s_vpg */
+    if (s_vpg && len)
+        for (u32 p = src >> 16; p <= (src + len - 1) >> 16; p++) s_vpg[p] = s_vfo_ep;
     if (!on || vpj_threads() <= 0) { memcpy(dst, vm_base + src, len); return; }
     /* Not published yet, so no worker has taken it. */
     VPJob* P = s_vpj_q > s_vpj_pub ? &s_vpj[s_vpj_q - 1] : NULL;

@@ -487,6 +487,9 @@ static u32 s_vfo_ep = 1;
 #define VFO_PAGES 16u
 static struct { u32 ep[VFO_PWAYS]; u16 e[VFO_PWAYS]; u8 rr; } s_vfop[VFO_PSETS];
 static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
+/* Per 64 KB guest page, the stretch a span copy last read it in (vf_copy,
+ * vpj_sync_write_hook). */
+static u32* s_vpg;
 static void vfo_next(void)
 {
     if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); memset(s_vfop, 0, sizeof s_vfop); s_vfo_ep = 1; }
