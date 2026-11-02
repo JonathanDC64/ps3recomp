@@ -382,8 +382,9 @@ static int init_d3d12(u32 width, u32 height)
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
-         * once, default 64) per half; a draw that does not fit takes the CPU
-         * path. */
+         * once, default 64) per half to start with; a draw that does not fit
+         * takes the CPU path, and the ring grows at the frame's end
+         * (vf_grow). */
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
           s_vf_cap = (u32)mb << 20;

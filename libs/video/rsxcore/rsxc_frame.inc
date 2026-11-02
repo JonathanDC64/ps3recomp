@@ -1151,7 +1151,9 @@ rtt_dump_done:;
     s_d3d.vp_vb_offset = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    const u64 vf_want = (u64)s_vf_off + s_vf_short;   /* what this frame's fetch draws asked for */
     s_vf_off = 0;
+    s_vf_short = 0;
     s_fx.valid = 0;
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
       PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
@@ -1172,6 +1174,7 @@ rtt_dump_done:;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
     if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
+    if (GPU_VALID(s_rc_vf_buf) && vf_want > s_vf_cap) vf_grow(vf_want);
 
     /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
      * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program

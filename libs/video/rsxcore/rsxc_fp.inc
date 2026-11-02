@@ -509,7 +509,8 @@ static gpu_shader uvc_vs4(int i)
  * vp_ib, which is write-combined and slow to read, but only for these draws,
  * a 2D pass's. A draw of converted vertices with no indices needs no table
  * (b2's top bit). Sets uvc_tab (b2) and uvc_n (vertices to draw); 0 when
- * the ring has no room (vp_vb grows for the next frame, s_vp_want). */
+ * the ring has no room (vp_vb or vf_buf grows for the next frame, s_vp_want
+ * or s_vf_short). */
 static int uvc_table(D3D12DrawRecord* dr)
 {
     const u32 base = dr->vb_byte_offset / 256u;   /* 256: VP_VERT_STRIDE (rsxc_vertex.inc) */
@@ -527,7 +528,8 @@ static int uvc_table(D3D12DrawRecord* dr)
     u8* dst;
     u32 at;
     if (dr->fetch) {
-        if (!s_d3d.vf_mapped || (u64)s_vf_off + head + most * 4 > s_vf_cap) return 0;
+        if (!s_d3d.vf_mapped) return 0;
+        if ((u64)s_vf_off + head + most * 4 > s_vf_cap) { s_vf_short += head + most * 4; return 0; }
         at = s_vf_off;
         dst = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + at;
     } else {
