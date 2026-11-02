@@ -81,6 +81,15 @@ holds `gpr[32]`, `fpr[32]`, `vr[32]` VMX, `cr/lr/ctr/xer/...`). Output is C++
 - Import stubs (with `--imports`) → `func_STUB(ctx) { ps3_hle_call(NID, ctx); }`.
 - Call targets not in this lift → `ppu_unlifted_stub` (a full-image lift has none).
 - `ppu_recomp_register()` populates the runtime address→function map.
+- The SDK's `setjmp` and `longjmp`, found by their first five instructions
+  (`find_guest_setjmp`): a call of `setjmp` → `PS3_GUEST_SETJMP(ctx, _sjN,
+  func_SETJMP(ctx));`, which also runs a host `setjmp` in the caller's frame.
+  `longjmp` ends in `ps3_guest_longjmp(ctx, buf)`, which host-`longjmp`s to
+  the newest live call for that buffer and stack pointer. Without it a guest
+  `longjmp` restored the registers but returned to its own C caller. Lua's
+  error throw is one (`luaD_throw` back to `luaD_rawrunprotected`). The code
+  is `SJLJ_SUPPORT` in `tools/ppu_lifter.py`, at the top of the chunks that
+  use it; `tools/test_ppu_setjmp.py` tests it.
 
 **ISA coverage**: ~99.8% on real Uncharted code (measured by counting
 `/* TODO */` no-ops). Remaining gaps are a few VMX ops the *disassembler*

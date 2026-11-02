@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import sys
 import time
 from collections import Counter
@@ -621,6 +622,7 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
+    sjlj_slots: int = 0  # calls of the guest setjmp in the body (PS3_GUEST_SETJMP)
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -656,6 +658,108 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 # Ends the line that calls an --insn-hooks host function; _hook_decl_lines finds
 # the calls by it.
 _HOOK_MARK = "/* INSN HOOK -> host */"
+
+# The PS3 SDK C library's setjmp and longjmp, which a title links in once. Both
+# start by aligning the buffer in r3 to 16 (addi r3,r3,15; rldicr r3,r3,0,59);
+# then setjmp stores r1, r2 and r13 at 0, 8 and 16 in it, and longjmp loads them.
+_SETJMP_WORDS = (0x3863000F, 0x786306E4, 0xF8230000, 0xF8430008, 0xF9A30010)
+_LONGJMP_WORDS = (0x3863000F, 0x786306E4, 0xE8230000, 0xE8430008, 0xE9A30010)
+
+
+def find_guest_setjmp(seg_blobs, starts, big_endian: bool = True) -> tuple[set[int], set[int]]:
+    """The function starts (of `starts`) that begin like the SDK's setjmp, and
+    those that begin like its longjmp. seg_blobs: [(vaddr, bytes)]."""
+    order = ">" if big_endian else "<"
+    found_set: set[int] = set()
+    found_long: set[int] = set()
+    for addr in starts:
+        for va, blob in seg_blobs:
+            off = addr - va
+            if 0 <= off and off + 20 <= len(blob):
+                words = struct.unpack(order + "5I", blob[off:off + 20])
+                if words == _SETJMP_WORDS:
+                    found_set.add(addr)
+                elif words == _LONGJMP_WORDS:
+                    found_long.add(addr)
+                break
+    return found_set, found_long
+
+
+# The guest setjmp and longjmp in a lift, emitted at the top of the chunks that
+# use them (_sjlj_decl_lines). The lifted longjmp restores the guest registers
+# from the buffer, but a C return then goes back to its own caller: the function
+# that called setjmp is a host frame further up the stack, and only a host
+# longjmp gets back into it. So each call of the guest setjmp also records a slot
+# in that function's frame (PS3_GUEST_SETJMP: a host setjmp beside the guest
+# one), and the guest longjmp, after its restore, jumps to the slot for the
+# buffer and the stack pointer it restored (ps3_guest_longjmp). The slots are a
+# list, newest first, from g_ps3_sjlj_top; a function's scope (ps3_sjlj_scope)
+# drops its own when it returns, and a jump drops those of the frames it skips.
+# One pointer per thread (the runtime defines it, as it does g_trampoline_fn), so
+# a split module's static TLS stays small. The host setjmp and longjmp are the C
+# library's, which unwind through the lift's frames by their unwind tables, as
+# the runtime's thread exit does.
+SJLJ_SUPPORT = """\
+/* Guest setjmp/longjmp (ppu_lifter.py, SJLJ_SUPPORT) */
+#include <setjmp.h>
+typedef struct ps3_sjlj_slot {
+    jmp_buf hb;                    /* the host setjmp beside the guest one */
+    struct ps3_sjlj_slot* prev;    /* the next older slot */
+    uint32_t gbuf, gsp;            /* the guest buffer (aligned) and r1 at the call */
+#ifdef DS_SHADOW_STACK
+    unsigned ds_sp;
+#endif
+} ps3_sjlj_slot;
+extern "C" PPU_THREAD_LOCAL ps3_sjlj_slot* g_ps3_sjlj_top;
+struct ps3_sjlj_scope {
+    ps3_sjlj_slot* const base;
+    ps3_sjlj_scope() : base(g_ps3_sjlj_top) {}
+    ~ps3_sjlj_scope() { g_ps3_sjlj_top = base; }
+};
+#define PS3_SJLJ_BUF(r3) ((uint32_t)(((r3) + 15) & ~(uint64_t)15))
+static inline void ps3_sjlj_arm(const ps3_sjlj_scope* sc, ps3_sjlj_slot* s, const ppu_context* ctx) {
+    /* (the same call again, in a loop: its slot leaves the list first) */
+    for (ps3_sjlj_slot** p = &g_ps3_sjlj_top; *p && *p != sc->base; p = &(*p)->prev)
+        if (*p == s) { *p = s->prev; break; }
+    s->gbuf = PS3_SJLJ_BUF(ctx->gpr[3]);
+    s->gsp = (uint32_t)ctx->gpr[1];
+#ifdef DS_SHADOW_STACK
+    s->ds_sp = g_ds_sp;
+#endif
+    s->prev = g_ps3_sjlj_top;
+    g_ps3_sjlj_top = s;
+}
+/* call: a call of the guest setjmp. On a longjmp to it, the guest registers are
+ * the buffer's already, and r3 is the value. */
+#define PS3_GUEST_SETJMP(ctx, slot, call) do { \\
+    ps3_sjlj_arm(&_sjs, &(slot), (ctx)); \\
+    if (setjmp((slot).hb) == 0) { call; DRAIN_TRAMPOLINE(ctx); } \\
+    else ps3_sjlj_landed(&(slot)); \\
+} while (0)
+static inline void ps3_sjlj_landed(ps3_sjlj_slot* s) {
+    g_ps3_sjlj_top = s;
+    g_trampoline_fn = 0;
+#ifdef DS_SHADOW_STACK
+    g_ds_sp = s->ds_sp;
+#endif
+}
+/* The end of the guest longjmp, after it restored the registers from gbuf. With
+ * no live slot for it (its setjmp's host frame has returned), it returns to its
+ * caller as a lift without this did, and says so once. */
+static inline void ps3_guest_longjmp(ppu_context* ctx, uint32_t gbuf) {
+    for (ps3_sjlj_slot* s = g_ps3_sjlj_top; s; s = s->prev)
+        if (s->gbuf == gbuf && s->gsp == (uint32_t)ctx->gpr[1]) {
+            g_ps3_sjlj_top = s;
+            longjmp(s->hb, 1);
+        }
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "[ppu] longjmp to 0x%08X with r1 0x%08X: no live setjmp for it; "
+                "returning to its caller\\n", gbuf, (unsigned)ctx->gpr[1]);
+    }
+}
+"""
 
 
 def _write_if_changed(path: str, text: str) -> bool:
@@ -771,6 +875,11 @@ class PPULifter:
         # The instruction must not be a branch: nothing after a taken branch
         # runs.
         self.insn_hooks: dict[int, str] = {}
+        # The title's setjmp and longjmp (find_guest_setjmp, SJLJ_SUPPORT): a
+        # call of the one is a PS3_GUEST_SETJMP, and the other ends in
+        # ps3_guest_longjmp instead of a plain return.
+        self.setjmp_addrs: set[int] = set()
+        self.longjmp_addrs: set[int] = set()
 
     def _range_insns(self, instructions: list["Instruction"],
                      start: int, end: int) -> list["Instruction"]:
@@ -1071,6 +1180,18 @@ class PPULifter:
             _decls += [f"    uint64_t _cs_{_n} = vm_read64(ctx->gpr[1] + {_off});"
                        for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
             func.body_lines = _decls + func.body_lines
+
+        # SJLJ_SUPPORT: the slots this function's setjmp calls record, and the
+        # scope that drops them when it returns; in longjmp itself, the buffer
+        # it was given (r3 is the value it returns by the end).
+        if func.sjlj_slots:
+            func.body_lines = (["    ps3_sjlj_scope _sjs;",
+                                "    ps3_sjlj_slot " +
+                                ", ".join(f"_sj{i}" for i in range(func.sjlj_slots)) + ";"] +
+                               func.body_lines)
+        if start in self.longjmp_addrs:
+            func.body_lines = (["    const uint32_t _sj_buf = PS3_SJLJ_BUF(ctx->gpr[3]);"] +
+                               func.body_lines)
 
         self.functions.append(func)
         return func
@@ -1625,6 +1746,8 @@ class PPULifter:
 
         # ------- Branches -------
         if mn == "blr":
+            if func.start_addr in self.longjmp_addrs:
+                return "ps3_guest_longjmp(ctx, _sj_buf); return;"
             return "return;"
 
         # blrl = branch to LR *with link* = an indirect CALL through LR, not a
@@ -1677,6 +1800,11 @@ class PPULifter:
                 # PPC `bl` sets LR = return address (next instr). Emit it so mflr
                 # reads the correct value AND stack-saved LRs are real return
                 # addresses -> reliable back-chain unwinding for diagnostics.
+                if tgt in self.setjmp_addrs:
+                    slot = func.sjlj_slots
+                    func.sjlj_slots += 1
+                    return (f"ctx->lr = 0x{insn.addr + 4:08X}; "
+                            f"PS3_GUEST_SETJMP(ctx, _sj{slot}, {self.prefix}func_{tgt:08X}(ctx));")
                 return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
@@ -3664,6 +3792,17 @@ class PPULifter:
                 [f'extern "C" void {sym}(ppu_context* ctx, uint32_t addr); /* insn hook host impl */'
                  for sym in sorted(syms)] + [""])
 
+    def _sjlj_decl_lines(self, funcs) -> list[str]:
+        """SJLJ_SUPPORT, for the top of the source file that defines `funcs`,
+        if one of them calls the guest setjmp or is the guest longjmp (no
+        lines otherwise, so the other files of a lift stay as they were)."""
+        if not (self.setjmp_addrs or self.longjmp_addrs):
+            return []
+        for func in funcs:
+            if func.start_addr in self.longjmp_addrs or not self.setjmp_addrs.isdisjoint(func.calls):
+                return SJLJ_SUPPORT.split("\n")
+        return []
+
     def _table_lines(self) -> list[str]:
         """The exported function table (typedef + extern declaration live in
         the header). Emitted once, into the final chunk file."""
@@ -3687,7 +3826,7 @@ class PPULifter:
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
-        lines = self._preamble_lines() + self._hook_decl_lines(emit_funcs)
+        lines = self._preamble_lines() + self._hook_decl_lines(emit_funcs) + self._sjlj_decl_lines(emit_funcs)
         for func in emit_funcs:
             lines += self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
         lines += self._table_lines()
@@ -3716,7 +3855,8 @@ class PPULifter:
             path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
             # The hook declarations do not count towards max_lines, so the cut
             # points stay where they are without them.
-            lines = preamble + self._hook_decl_lines(funcs) + body_lines + (trailer or [])
+            lines = (preamble + self._hook_decl_lines(funcs) + self._sjlj_decl_lines(funcs) +
+                     body_lines + (trailer or []))
             changed = _write_if_changed(path, "\n".join(lines))
             written.append(path)
             print(f"  {'wrote' if changed else 'unchanged'} {os.path.basename(path)} "
@@ -4245,7 +4385,8 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, override_funcs=None, insn_hooks=None):
+                 toc_base=0, override_funcs=None, insn_hooks=None,
+                 setjmp_addrs=None, longjmp_addrs=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4262,6 +4403,8 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["override_funcs"] = override_funcs or {}
     _WORKER_STATE["insn_hooks"] = insn_hooks or {}
+    _WORKER_STATE["setjmp_addrs"] = setjmp_addrs or set()
+    _WORKER_STATE["longjmp_addrs"] = longjmp_addrs or set()
 
 
 def _worker_lift(task):
@@ -4279,6 +4422,8 @@ def _worker_lift(task):
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.override_funcs = _WORKER_STATE.get("override_funcs", {})
     lifter.insn_hooks = _WORKER_STATE.get("insn_hooks", {})
+    lifter.setjmp_addrs = _WORKER_STATE.get("setjmp_addrs", set())
+    lifter.longjmp_addrs = _WORKER_STATE.get("longjmp_addrs", set())
     results = []
     for start, end in bounds:
         blob = b""
@@ -4314,7 +4459,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.override_funcs, lifter.insn_hooks))
+                             lifter.override_funcs, lifter.insn_hooks,
+                             lifter.setjmp_addrs, lifter.longjmp_addrs))
     try:
         for idx0, results, ct, bt, osyms in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4900,6 +5046,11 @@ def main() -> None:
     lifter.insn_hooks = insn_hooks
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    lifter.setjmp_addrs, lifter.longjmp_addrs = find_guest_setjmp(
+        seg_blobs, [s for s, _ in func_bounds], big_endian)
+    if lifter.setjmp_addrs or lifter.longjmp_addrs:
+        print("  guest setjmp at " + (", ".join(f"0x{a:08X}" for a in sorted(lifter.setjmp_addrs)) or "-") +
+              ", longjmp at " + (", ".join(f"0x{a:08X}" for a in sorted(lifter.longjmp_addrs)) or "-"))
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
