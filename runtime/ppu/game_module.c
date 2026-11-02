@@ -11,7 +11,8 @@
  *     gives them (the host copies its current values in at the load, then
  *     writes them through pointers);
  *   - the two trampoline thread-locals, and functions that return the calling
- *     thread's copy to the host;
+ *     thread's copy to the host; and the thread's newest guest setjmp, which
+ *     only the lifted code reads;
  *   - vm_base, set once from the host (the guest space is reserved before the
  *     load and never moves);
  *   - g_extra_symtab, which a lifted system PRX's glue fills; the host copies
@@ -24,11 +25,11 @@
  * On Linux (an ELF shared object) everything here is hidden, as the forced
  * include ps3emu/game_freestanding.h makes every name in the module, so the
  * module's globals are read relative to the instruction pointer and nothing
- * binds to the host's names. The two trampolines are initial-exec
- * thread-locals (the module is compiled with -ftls-model=initial-exec): one
- * %fs-relative access, as cheap as the DLL's. glibc keeps some static TLS
- * spare for a library opened later; these two pointers take 16 bytes of it,
- * and if none were left the dlopen would fail with glibc's message.
+ * binds to the host's names. The thread-locals are initial-exec (the module
+ * is compiled with -ftls-model=initial-exec): one %fs-relative access, as
+ * cheap as the DLL's. glibc keeps some static TLS spare for a library opened
+ * later; these three pointers take 24 bytes of it, and if none were left the
+ * dlopen would fail with glibc's message.
  */
 #ifndef PS3_GAME_MODULE
 #define PS3_GAME_MODULE 1
@@ -102,8 +103,12 @@ uint64_t          g_extra_symtab_count;
 /* (__thread and __attribute__ above: clang's spellings, which clang-cl takes as well) */
 __thread void (*g_trampoline_fn)(void*);
 __thread void (*g_spu_trampoline_fn)(void*);   /* (spu_context*) in the runtime */
+/* The newest live guest setjmp of the thread (the lift's SJLJ_SUPPORT): the
+ * lifted code reads it, and the host clears it at a guest thread's entry. */
+__thread struct ps3_sjlj_slot* g_ps3_sjlj_top;
 static void** ppu_tramp_slot(void) { return (void**)&g_trampoline_fn; }
 static void** spu_tramp_slot(void) { return (void**)&g_spu_trampoline_fn; }
+static void** sjlj_top_slot(void)  { return (void**)&g_ps3_sjlj_top; }
 
 /* --- The lift's function table (ppu_recomp.h declares it) ------------------ */
 extern const struct ps3_gm_func_entry { uint64_t addr; void* func; const char* name; } function_table[];
@@ -149,6 +154,7 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game)
     game->func_table_count     = &function_table_count;
     game->ppu_tramp_slot       = ppu_tramp_slot;
     game->spu_tramp_slot       = spu_tramp_slot;
+    game->sjlj_top_slot        = sjlj_top_slot;
     game->host_fn_thunks       = s_host_thunks;
     game->vm_inl_rd_lim       = &g_vm_inl_rd_lim;
     game->vm_inl_wr_lim        = &g_vm_inl_wr_lim;

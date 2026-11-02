@@ -24,6 +24,7 @@
  */
 #if defined(PS3_GAME_SPLIT)
 #include <math.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -183,6 +184,13 @@ void** ps3_split_spu_tramp_init(void)
 {
     if (!s_game.spu_tramp_slot) return &t_spu_tramp_host;
     return ps3_split_t_spu_tramp = s_game.spu_tramp_slot();
+}
+
+/* sys_ppu_thread.c, at a guest thread's entry: the module's list of the
+ * thread's live guest setjmps starts empty (ppu_loader.cpp has the reason). */
+void ps3_sjlj_thread_reset(void)
+{
+    if (s_game.sjlj_top_slot) *s_game.sjlj_top_slot() = 0;
 }
 
 extern const void* g_extra_symtab;   /* ppu_loader.cpp */

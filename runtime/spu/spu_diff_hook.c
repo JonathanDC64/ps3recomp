@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/ps3_knob.h"
+#include "ps3emu/ps3_sse.h"   /* PS3_SSE2NEON: diff_pass_sse on arm64 */
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_interp.h"
@@ -108,8 +109,10 @@ static inline void diff_pass_fast(spu_context* ctx, u128* A, u128* B, u128* m56,
     *m57 = n57;
 }
 
+#if defined(_M_X64) || defined(__x86_64__) || defined(PS3_SSE2NEON)
 #if defined(_M_X64) || defined(__x86_64__)
 #include <emmintrin.h>
+#endif
 /* The constant c with word 0 cleared when its quadwords were equal (eq):
  * diff_bit, without the branch. */
 static inline u128 diff_bit_eq(u128 c, unsigned eq)

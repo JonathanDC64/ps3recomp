@@ -38,6 +38,7 @@
  *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
  *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
  *         runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+ *         runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c \
  *         runtime/platform/win32_compat.c \
  *         -lpthread
  *

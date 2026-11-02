@@ -1,2 +1,2 @@
 # Extra sources for the workload-dispatch test: the dispatch layer itself.
-EXTRA="$RUNTIME_SPU/spu_workload.c"
+EXTRA="$RUNTIME_SPU/spu_workload.c $RUNTIME_SPU/spu_async_pool.c $REPO/runtime/platform/plat_posix.c"

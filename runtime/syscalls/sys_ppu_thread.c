@@ -161,6 +161,10 @@ static void* ppu_host_thread_proc(void* param)
 
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
+        /* (each pass of the entry starts with no live guest setjmp: an exit
+         * unwind below drops the lifted frames that held them) */
+        extern void ps3_sjlj_thread_reset(void);
+        ps3_sjlj_thread_reset();
         s_exit_armed = 1;
         if (setjmp(s_exit_jmp) == 0)
             g_ppu_thread_entry_trampoline(&info->ctx);
@@ -185,6 +189,7 @@ static void* ppu_host_thread_proc(void* param)
               fprintf(stderr, "[intr] thread %llu is an interrupt handler -- \n",
                       (unsigned long long)info->ctx.thread_id);
               while (ps3_intr_wait(info->ctx.thread_id)) {
+                  ps3_sjlj_thread_reset();
                   s_exit_armed = 1;
                   if (setjmp(s_exit_jmp) == 0)
                       g_ppu_thread_entry_trampoline(&info->ctx);

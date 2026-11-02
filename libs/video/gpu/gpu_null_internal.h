@@ -245,6 +245,7 @@ typedef struct gpu_null_device {
     gpu_null_layout* layout;
     gpu_null_pipe*  pipe;          /* fixed: GPU_NULL_MAX_PIPELINES */
     uint32_t        npipe;
+    uint32_t        stored_only;   /* GPU_PIPELINE_STORE_ONLY creates (under the lock): they keep no entry */
     uint32_t*       pipe_hash;     /* pipeline indexes + 1 by name, 2 * GPU_NULL_MAX_PIPELINES */
     gpu_null_heap*  heap;
     gpu_null_qpool  qpool[GPU_NULL_MAX_QPOOLS];

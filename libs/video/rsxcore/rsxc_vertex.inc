@@ -1584,7 +1584,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             }
             u64 total = 512;
             for (u32 j = 0; j < nsp; j++) total += g1[j] - g0[j];
-            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; return -1; }
+            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; s_vf_short += total; return -1; }
             u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;

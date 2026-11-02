@@ -179,12 +179,16 @@ static int lib_store(gpu_d3d12_device* dd, const WCHAR* name, const D3D12_GRAPHI
 
 /* Today's pso_create_cached: without a library, CreateGraphicsPipelineState;
  * with one, LoadGraphicsPipeline by name under the lock, else create and
- * store. */
-gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t* from_cache)
+ * store. GPU_PIPELINE_STORE_ONLY is today's startup and index builds
+ * (pso_prebuild_one, pxi_build_one): the pipeline loaded or stored is
+ * released at once, as theirs are, so it is not kept beside the one a draw
+ * later loads from the library. */
+gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
     gpu_pipeline r = {0};
-    if (from_cache) *from_cache = 0;
+    uint32_t made;
+    if (how) *how = GPU_PIPELINE_FAILED;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd;
     D3D12_INPUT_ELEMENT_DESC il[GPU_MAX_VERTEX_ATTRS];
     gpu_d3d12_pipe_d3d_desc(dd, desc, &pd, il);
@@ -198,13 +202,18 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
                           : E_FAIL;
     ReleaseSRWLockExclusive(&dd->lib_lock);
     if (SUCCEEDED(hr) && pso) {
-        if (from_cache) *from_cache = 1;
+        made = GPU_PIPELINE_LOADED;
     } else {
         pso = NULL;
         hr = dd->device->lpVtbl->CreateGraphicsPipelineState(dd->device, &pd, &IID_ID3D12PipelineState,
                                                              (void**)&pso);
         if (FAILED(hr) || !pso) return r;
-        if (have_lib) lib_store(dd, name, &pd, pso);
+        made = have_lib && lib_store(dd, name, &pd, pso) ? GPU_PIPELINE_STORED : GPU_PIPELINE_COMPILED;
+    }
+    if (how) *how = made;
+    if (flags & GPU_PIPELINE_STORE_ONLY) {   /* (nothing has recorded it) */
+        pso->lpVtbl->Release(pso);
+        return r;
     }
     gpu_d3d12_pipe_keep(dd, pso);
     r.v = (uint64_t)(uintptr_t)pso;
@@ -241,14 +250,17 @@ static void* read_file(const char* path, long* n)
 
 /* Today's pso_lib_open, its library half: the file's library, or, when the
  * file is another driver's or GPU's (or there is none), a new empty one.
- * Called before pipelines are made (it replaces the library). 1 when the
- * file's library is used. */
+ * Called before pipelines are made (it replaces the library).
+ * GPU_PIPELINE_CACHE_LOADED when the file's library is used, _NEW for an
+ * empty one, _NONE when there can be none (no ID3D12Device1, the cap masked,
+ * or the driver makes no library): today's s_pso_lib NULL. */
 int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
     ID3D12Device1* d1 = NULL;
-    if (FAILED(dd->device->lpVtbl->QueryInterface(dd->device, &IID_ID3D12Device1, (void**)&d1)))
-        return 0;
+    if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE) ||
+        FAILED(dd->device->lpVtbl->QueryInterface(dd->device, &IID_ID3D12Device1, (void**)&d1)))
+        return GPU_PIPELINE_CACHE_NONE;
     long n = 0;
     void* blob = path ? read_file(path, &n) : NULL;
     ID3D12PipelineLibrary* lib = NULL;
@@ -275,7 +287,8 @@ int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
     ReleaseSRWLockExclusive(&dd->lib_lock);
     if (old) old->lpVtbl->Release(old);
     free(old_blob);
-    return SUCCEEDED(hr) && lib ? 1 : 0;
+    if (!lib) return GPU_PIPELINE_CACHE_NONE;
+    return SUCCEEDED(hr) ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW;
 }
 
 /* Today's pso_lib_save: Serialize can fail when a pipeline is stored between
