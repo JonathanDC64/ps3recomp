@@ -657,10 +657,18 @@ typedef struct { u32 g0, g1, r0, ep; } VFOEntry;
 static VFOEntry s_vfo[VFO_SETS][VFO_WAYS];
 static u8 s_vfo_rr[VFO_SETS];   /* the way a set's next entry replaces when all are this stretch's */
 static u32 s_vfo_ep = 1;
+/* The same entries by the 64 KB pages they cover (VFO_PAGES at most each),
+ * for a span that starts inside a copy: an entry index and its stretch. A
+ * slot can name an entry that holds another copy since; the lookup checks
+ * the entry itself. */
+#define VFO_PSETS 512u
+#define VFO_PWAYS 8u
+#define VFO_PAGES 16u
+static struct { u32 ep[VFO_PWAYS]; u16 e[VFO_PWAYS]; u8 rr; } s_vfop[VFO_PSETS];
 static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
 static void vfo_next(void)
 {
-    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); s_vfo_ep = 1; }
+    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); memset(s_vfop, 0, sizeof s_vfop); s_vfo_ep = 1; }
 }
 static u64 s_vp_iwant = 0;
 /* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
@@ -14963,11 +14971,12 @@ static u32 vf_strip_native(const GuestIdx* gi, u32 first, u32 count, int restart
 }
 static int s_up_strip;   /* the last upload_strip_vp_fetch wrote a strip */
 
-/* VF_ONCE (live, default 1): a new descriptor's span that starts where a copy
- * made earlier in the same stretch starts, and ends inside it, points at that
- * copy, with no copy of its own. Within a stretch the title can't know the
- * RSX has read a range, so it can't have rewritten it either: the rule the
- * copy queue relies on. A mesh drawn in several passes is copied once a
+/* VF_ONCE (live, default 1): a new descriptor's span that lies inside a copy
+ * made earlier in the same stretch points into that copy, with no copy of its
+ * own: a copy that starts where the span starts, else one of the span's
+ * first page (s_vfop). Within a stretch the title can't know the RSX has read
+ * a range, so it can't have rewritten it either: the rule the copy queue
+ * relies on. A mesh drawn in several passes is copied once a
  * stretch, not once a pass: on Demon's Souls' 1-2 bridge about 80% of 114 MB
  * of copies a frame repeated bytes of the same stretch. A copy grows its
  * entry with what later draws of its descriptor append to it, and a
@@ -14984,29 +14993,55 @@ static int vfo_on(void)
     return on;
 }
 static u32 vfo_set(u32 g0) { return (g0 >> 4) * 2654435761u >> 24; }
-/* The entry (set * VFO_WAYS + way) of this stretch whose copy starts at g0
- * and holds guest [g0,g1), or ~0. */
+static u32 vfo_pset(u32 page) { return page * 2654435761u >> 23; }
+static VFOEntry* vfo_at(u32 e) { return &s_vfo[e / VFO_WAYS][e % VFO_WAYS]; }
+static int vfo_holds(const VFOEntry* E, u32 g0, u32 g1)
+{
+    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1;
+}
+/* The entry (set * VFO_WAYS + way) of this stretch whose copy holds guest
+ * [g0,g1): one that starts at g0, else one of g0's page. ~0 if none. */
 static u32 vfo_find(const u8* base, u32 g0, u32 g1)
 {
+    u32 e = ~0u;
     const u32 s = vfo_set(g0);
-    for (u32 w = 0; w < VFO_WAYS; w++) {
-        const VFOEntry* E = &s_vfo[s][w];
-        if (E->ep != s_vfo_ep || E->g0 != g0 || E->g1 < g1) continue;
-        static int chk = -1;
-        PS3_KNOB(chk, ps3_env_int("VF_ONCE_CHECK", 0));
-        if (chk) {
-            extern uint8_t* vm_base;
-            static u64 n, bad;
-            vpj_sync();
-            n++;
-            if (memcmp(base + E->r0, vm_base + g0, g1 - g0)) bad++;
-            if (n % 20000u == 0)
-                fprintf(stderr, "[VF] once: %llu reused ranges checked, %llu differ from guest memory%c",
-                        (unsigned long long)n, (unsigned long long)bad, 10);
-        }
-        return s * VFO_WAYS + w;
+    for (u32 w = 0; w < VFO_WAYS && e == ~0u; w++)
+        if (s_vfo[s][w].g0 == g0 && vfo_holds(&s_vfo[s][w], g0, g1)) e = s * VFO_WAYS + w;
+    if (e == ~0u) {
+        const u32 ps = vfo_pset(g0 >> 16);
+        for (u32 w = 0; w < VFO_PWAYS && e == ~0u; w++)
+            if (s_vfop[ps].ep[w] == s_vfo_ep && vfo_holds(vfo_at(s_vfop[ps].e[w]), g0, g1)) e = s_vfop[ps].e[w];
     }
-    return ~0u;
+    if (e == ~0u) return e;
+    static int chk = -1;
+    PS3_KNOB(chk, ps3_env_int("VF_ONCE_CHECK", 0));
+    if (chk) {
+        extern uint8_t* vm_base;
+        static u64 n, bad;
+        const VFOEntry* E = vfo_at(e);
+        vpj_sync();
+        n++;
+        if (memcmp(base + E->r0 + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
+        if (n % 20000u == 0)
+            fprintf(stderr, "[VF] once: %llu reused ranges checked, %llu differ from guest memory%c",
+                    (unsigned long long)n, (unsigned long long)bad, 10);
+    }
+    return e;
+}
+/* Entry e in the page sets of [g0,g1)'s pages (the first VFO_PAGES of its copy). */
+static void vfo_pages(u32 e, u32 g0, u32 g1)
+{
+    const u32 p0 = vfo_at(e)->g0 >> 16;
+    for (u32 p = g0 >> 16; p <= (g1 - 1) >> 16 && p - p0 < VFO_PAGES; p++) {
+        const u32 ps = vfo_pset(p);
+        u32 w = 0;
+        while (w < VFO_PWAYS && !(s_vfop[ps].ep[w] == s_vfo_ep && s_vfop[ps].e[w] == e)) w++;
+        if (w < VFO_PWAYS) continue;   /* there already */
+        w = 0;
+        while (w < VFO_PWAYS && s_vfop[ps].ep[w] == s_vfo_ep) w++;
+        if (w == VFO_PWAYS) { w = s_vfop[ps].rr; s_vfop[ps].rr = (u8)((w + 1) % VFO_PWAYS); }
+        s_vfop[ps].e[w] = (u16)e; s_vfop[ps].ep[w] = s_vfo_ep;
+    }
 }
 /* A way of this stretch's that isn't in use, else the set's oldest. */
 static u32 vfo_add(u32 g0, u32 g1, u32 r0)
@@ -15017,6 +15052,7 @@ static u32 vfo_add(u32 g0, u32 g1, u32 r0)
     if (w == VFO_WAYS) { w = s_vfo_rr[s]; s_vfo_rr[s] = (u8)((w + 1) % VFO_WAYS); }
     VFOEntry* E = &s_vfo[s][w];
     E->g0 = g0; E->g1 = g1; E->r0 = r0; E->ep = s_vfo_ep;
+    vfo_pages(s * VFO_WAYS + w, g0, g1);
     return s * VFO_WAYS + w;
 }
 /* Span j of the descriptor grew to guest g1 in place: so does its copy's
@@ -15025,8 +15061,10 @@ static void vfo_grow(u32 j, u32 g1)
 {
     const u32 e = s_fx.ve[j];
     if (e == ~0u) return;
-    VFOEntry* E = &s_vfo[e / VFO_WAYS][e % VFO_WAYS];
-    if (E->ep == s_vfo_ep && E->r0 == s_fx.r0[j] && E->g0 == s_fx.g0[j]) E->g1 = g1;
+    VFOEntry* E = vfo_at(e);
+    if (E->ep != s_vfo_ep || E->r0 != s_fx.r0[j] || E->g0 != s_fx.g0[j]) return;
+    if (E->g1 < g1) vfo_pages(e, E->g1, g1);
+    E->g1 = g1;
 }
 
 /* Returns the indices written (0 is a strip that made no triangle), or -1
@@ -15173,7 +15211,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 } else {
                     /* The whole copy, so a draw that continues this one
                      * finds its range there too. */
-                    const VFOEntry* E = &s_vfo[e / VFO_WAYS][e % VFO_WAYS];
+                    const VFOEntry* E = vfo_at(e);
                     s_fx.g0[j] = E->g0; s_fx.g1[j] = E->g1; s_fx.r0[j] = E->r0; s_fx.ve[j] = ~0u;
                     s_vfo_reused += g1[j] - g0[j];
                 }

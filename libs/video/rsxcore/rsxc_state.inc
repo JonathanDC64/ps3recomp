@@ -478,10 +478,18 @@ typedef struct { u32 g0, g1, r0, ep; } VFOEntry;
 static VFOEntry s_vfo[VFO_SETS][VFO_WAYS];
 static u8 s_vfo_rr[VFO_SETS];   /* the way a set's next entry replaces when all are this stretch's */
 static u32 s_vfo_ep = 1;
+/* The same entries by the 64 KB pages they cover (VFO_PAGES at most each),
+ * for a span that starts inside a copy: an entry index and its stretch. A
+ * slot can name an entry that holds another copy since; the lookup checks
+ * the entry itself. */
+#define VFO_PSETS 512u
+#define VFO_PWAYS 8u
+#define VFO_PAGES 16u
+static struct { u32 ep[VFO_PWAYS]; u16 e[VFO_PWAYS]; u8 rr; } s_vfop[VFO_PSETS];
 static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
 static void vfo_next(void)
 {
-    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); s_vfo_ep = 1; }
+    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); memset(s_vfop, 0, sizeof s_vfop); s_vfo_ep = 1; }
 }
 static u64 s_vp_iwant = 0;
 /* Step C2: the buffers are the GPU layer's. The fixed-function vertex buffer,
