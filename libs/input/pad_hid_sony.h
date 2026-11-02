@@ -22,6 +22,11 @@ typedef struct {
  * copies what the reader threads last parsed. PAD_NO_HID=1 returns 0. */
 int pad_hid_sony_poll(PadHidSonyState* out, int max);
 
+/* What the pad in a slot is, for a title's settings: "DualSense (USB)",
+ * "DualShock 4 (Bluetooth)" and so on, into out (n bytes). 0, and out empty,
+ * when the slot has no pad. Windows only, like pad_hid_sony_rumble. */
+int pad_hid_sony_describe(int slot, char* out, size_t n);
+
 /* Sets a pad's motors (0-255: strong the large, left one; weak the small,
  * right one; "small" is a macro in Windows' headers) with its output
  * report. Blocks while the report is written (a few ms over Bluetooth), so it

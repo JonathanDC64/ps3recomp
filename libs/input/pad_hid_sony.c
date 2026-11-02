@@ -79,6 +79,7 @@ typedef struct {
     HANDLE          h;
     int             kind;
     USHORT          in_len;    /* input report length: 64 USB, larger on BT */
+    USHORT          pid;       /* the product (sony_kind's list), for pad_hid_sony_describe */
     wchar_t         path[512];
     SRWLOCK         lock;
     PadHidSonyState st;
@@ -239,7 +240,7 @@ static void sony_scan(void)
         if (in_len < 10 || slot < 0) { if (slot >= 0) s_dev[slot].used = 0; CloseHandle(h); continue; }
 
         SonyDev* d = &s_dev[slot];
-        d->h = h; d->kind = kind; d->in_len = in_len; d->have = 0;
+        d->h = h; d->kind = kind; d->in_len = in_len; d->pid = at.ProductID; d->have = 0;
         wcscpy(d->path, path);
         /* The write handle, if the pad takes output reports this long. */
         uint8_t probe[1024];
@@ -300,6 +301,18 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
         ReleaseSRWLockShared(&s_dev[i].lock);
     }
     return n;
+}
+
+int pad_hid_sony_describe(int slot, char* out, size_t n)
+{
+    if (!out || !n) return 0;
+    out[0] = '\0';
+    if (slot < 0 || slot >= PAD_HID_SONY_MAX || !s_started) return 0;
+    const SonyDev* d = &s_dev[slot];
+    if (!d->used || !d->have) return 0;   /* (have: open, and its fields set) */
+    const char* what = d->kind == KIND_DS4 ? "DualShock 4" : d->pid == 0x0DF2 ? "DualSense Edge" : "DualSense";
+    const char* link = d->pid == 0x0BA0 ? "wireless adapter" : d->in_len > 64 ? "Bluetooth" : "USB";
+    return snprintf(out, n, "%s (%s)", what, link) > 0;
 }
 
 int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak)
