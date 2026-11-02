@@ -23,8 +23,10 @@ typedef struct rsxc_display_hdr {
 } rsxc_display_hdr;
 
 /* Asks the display the window is on now. No window, or nothing to ask, is
- * no HDR and nothing known. Render thread. */
-void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out);
+ * no HDR and nothing known. 0 when the window is on no display that
+ * answered, as while it closes: then *out says nothing, and the caller keeps
+ * what the last answer said. Render thread. */
+int rsxc_display_hdr_query(void* window, rsxc_display_hdr* out);
 
 /* 1 while the last query's answer still holds: one was made, the window is
  * on the same display, and the system's display setup has not changed since
