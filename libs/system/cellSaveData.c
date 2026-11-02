@@ -41,6 +41,7 @@
 #else
 #  include <unistd.h>
 #  include <dirent.h>
+#  include <fcntl.h>
 #  include <sys/types.h>
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
@@ -81,6 +82,35 @@ static void ensure_dirs(const char* path)
         }
     }
     HOST_MKDIR(tmp);
+}
+
+/* Put a written file's data on the disk. Closing it leaves the data in the
+ * system's cache, and a crash or power cut before the cache is written can
+ * keep the file's new size, or its rename over the old file, but not its
+ * data: the save then reads back as zeros. */
+static int file_sync(FILE* fp)
+{
+    if (fflush(fp) != 0) return -1;
+#ifdef _WIN32
+    return _commit(_fileno(fp));
+#else
+    return fsync(fileno(fp));
+#endif
+}
+
+/* Replace `dst` with `tmp`, a written and synced file, and put the rename on
+ * the disk before returning. Until then the old file is the one that stays. */
+static int file_replace(const char* tmp, const char* dst, const char* dir)
+{
+#ifdef _WIN32
+    (void)dir;
+    return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+#else
+    if (rename(tmp, dst) != 0) return -1;
+    const int fd = open(dir, O_RDONLY);   /* the folder's entry for it */
+    if (fd >= 0) { fsync(fd); close(fd); }
+    return 0;
+#endif
 }
 
 /* A save directory name the title gives: one name that fits, no separators,
@@ -573,7 +603,7 @@ static void pfd_add(const char* save_path, const char* name)
     char path[1024];
     pfd_path(save_path, path, sizeof(path));
     FILE* fp = fopen(path, "ab");
-    if (fp) { fprintf(fp, "%s\n", name); fclose(fp); }
+    if (fp) { fprintf(fp, "%s\n", name); file_sync(fp); fclose(fp); }
 }
 
 static u32 savedata_file_type(const char* save_path, const char* name)
@@ -720,10 +750,11 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
         ensure_dirs(save_path);
-        /* A whole-file write goes to ".<name>.tmp" and then replaces the file,
-         * so a crash or a full disk in the middle leaves the old file whole
-         * rather than a short one (an autosave's character data). The listing
-         * skips names starting with '.', so a leftover is never shown. */
+        /* A whole-file write goes to ".<name>.tmp", which is synced and then
+         * replaces the file, so a crash, a full disk or a power cut at any
+         * point leaves the old file whole or the new one, never a short or
+         * zeroed one (an autosave's character data). The listing skips names
+         * starting with '.', so a leftover is never shown. */
         const int whole = set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0;
         char tmp_path[1024 + 8];
         snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.tmp", save_path, name);
@@ -751,13 +782,10 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
         int failed = wrote != write_size;
+        if (!failed && file_sync(fp) != 0) failed = 1;
         if (fclose(fp) != 0) failed = 1;
         if (whole) {
-#ifdef _WIN32
-            if (!failed && !MoveFileExA(tmp_path, file_path, MOVEFILE_REPLACE_EXISTING)) failed = 1;
-#else
-            if (!failed && rename(tmp_path, file_path) != 0) failed = 1;
-#endif
+            if (!failed && file_replace(tmp_path, file_path, save_path) != 0) failed = 1;
             if (failed) {
                 printf("[cellSaveData] file write: '%s' failed, old file kept\n", file_path);
                 remove(tmp_path);
@@ -782,15 +810,20 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
 {
     if (!param) return;
 
-    char sfo_path[1024];
+    char sfo_path[1024], tmp_path[1024 + 8];
     snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
+    snprintf(tmp_path, sizeof(tmp_path), "%s/.PARAM.SFO.tmp", save_path);
 #ifdef _WIN32
     for (char* p = sfo_path; *p; p++) {
         if (*p == '/') *p = '\\';
     }
+    for (char* p = tmp_path; *p; p++) {
+        if (*p == '/') *p = '\\';
+    }
 #endif
 
-    FILE* fp = fopen(sfo_path, "wb");
+    /* Written beside it and swapped in, as the files are (process_file_op). */
+    FILE* fp = fopen(tmp_path, "wb");
     if (!fp) return;
 
     /* Write a simplified text-based PARAM.SFO for easy debugging.
@@ -800,7 +833,9 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     fprintf(fp, "DETAIL=%s\n", param->detail);
     fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
     fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
-    fclose(fp);
+    int failed = ferror(fp) || file_sync(fp) != 0;
+    if (fclose(fp) != 0) failed = 1;
+    if (failed || file_replace(tmp_path, sfo_path, save_path) != 0) remove(tmp_path);
 }
 
 /* Read simplified PARAM.SFO */
