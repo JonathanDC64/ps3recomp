@@ -28,6 +28,8 @@ static void render_frame(void)
       QueryPerformanceCounter(&_w1);
       /* Before the pre-pass below resets `used` and reassigns slots. */
       if (s_wb_pending) { s_wb_pending = 0; rt_writeback_store(); }
+      /* The last batch's counts, when no ZPASS method came since (zq_hook). */
+      if (s_zq_pend) { s_zq_pend = 0; zq_finish(s_zq_pend_nev, s_zq_pend_on); }
       QueryPerformanceCounter(&_w2); QueryPerformanceFrequency(&_f);
       s_fl_wait_ms  = (double)(_w1.QuadPart - _w0.QuadPart) * 1000.0 / (double)_f.QuadPart;
       s_fl_store_ms = (double)(_w2.QuadPart - _w1.QuadPart) * 1000.0 / (double)_f.QuadPart; }
@@ -1417,8 +1419,11 @@ skip_dump_consider: ;
         if (perf_on()) s_perf_gpu += perf_now() - _g;
         rt_writeback_store();
     }
-    if (s_zq_n && (!write_color_on() || write_color_defer())) wait_for_gpu();
-    zq_finish();
+    if (s_zq_n && (!write_color_on() || write_color_defer())) {
+        if (zq_defer_on()) {   /* stored by zq_hook or the next render_frame */
+            s_zq_pend = 1; s_zq_pend_nev = s_zq_nev; s_zq_pend_on = s_zq_on;
+        } else { wait_for_gpu(); zq_finish(s_zq_nev, s_zq_on); }
+    } else zq_finish(s_zq_nev, s_zq_on);
 
     /* (The drain of the debug layer's message queue is not copied:
      * this route never enables the debug layer, so the queue holds nothing;
