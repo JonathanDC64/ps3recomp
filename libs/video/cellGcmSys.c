@@ -121,6 +121,7 @@ void (*g_gcm_fifo_flip_hook)(void) = NULL;
  * the RSX move on. */
 extern void (*g_rsx_sync_hook)(void);
 #define GCM_RSX_SYNC() do { if (g_rsx_sync_hook) g_rsx_sync_hook(); } while (0)
+extern void (*g_rsx_sync_write_hook)(u32 ea, u32 len);
 
 int cellGcm_take_flip_pending(void)
 {
@@ -1189,6 +1190,17 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
+/* With a write hook (g_rsx_sync_write_hook), the 2D methods that still sync
+ * before they run: the scaled blit's trigger and whatever gcm_2d_method
+ * doesn't handle. The surface and inline-transfer setup write no memory, and
+ * an inline COLOR word asks the hook itself, with the address it writes. */
+static int gcm_2d_syncs(u32 subch, u32 method)
+{
+    if (subch >= 2 && subch <= 5) return 0;
+    if (subch == 6 || subch == 7) return method == 0x040C;
+    return 1;
+}
+
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
 {
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
@@ -1269,6 +1281,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
               u32 doff = s_gcm2d.dst_offset + py * dst_pitch + px * 4;
               if (wi && doff >= wlo && doff <= whi && wn < 400 && ++wn)
                   fprintf(stderr, "[GCM2D-WATCH] off=0x%X = 0x%08X%c", doff, data, 10); }
+            if (g_rsx_sync_write_hook) g_rsx_sync_write_hook(base + py * dst_pitch + px * 4, 4);
             vm_write32(base + py * dst_pitch + px * 4, data);
             return;
         }
@@ -2253,7 +2266,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         }
                     }
                 } else
-                    { GCM_RSX_SYNC(); gcm_2d_method(subch, m, vm_read32(dea)); }
+                    { if (!g_rsx_sync_write_hook || gcm_2d_syncs(subch, m)) GCM_RSX_SYNC();
+                      gcm_2d_method(subch, m, vm_read32(dea)); }
                 }
             }
             s_fifo_getoff += 4 + count * 4;

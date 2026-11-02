@@ -1157,6 +1157,7 @@ rtt_dump_done:;
     s_vf_off = 0;
     s_vf_short = 0;
     s_fx.valid = 0;
+    vfo_next();
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
       PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
       emit += s_vp_want;

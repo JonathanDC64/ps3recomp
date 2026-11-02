@@ -644,8 +644,35 @@ static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for 
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
     u32 g0[16], g1[16], r0[16];   /* guest [g0,g1) copied to ring offset r0 */
+    u32 ve[16];                   /* each span's VF_ONCE entry if copied here, or ~0 */
     u32 x[16];                    /* the records' x, slot by slot */
 } s_fx;
+/* The span copies made in this stretch of the stream (upload_strip_vp_fetch,
+ * VF_ONCE), by guest start. A stretch ends at each point where the title can
+ * see the RSX move on (g_rsx_sync_hook) and at each frame's ring reset; an
+ * entry of an older stretch is empty. */
+#define VFO_SETS 256u
+#define VFO_WAYS 4u
+typedef struct { u32 g0, g1, r0, ep; } VFOEntry;
+static VFOEntry s_vfo[VFO_SETS][VFO_WAYS];
+static u8 s_vfo_rr[VFO_SETS];   /* the way a set's next entry replaces when all are this stretch's */
+static u32 s_vfo_ep = 1;
+/* The same entries by the 64 KB pages they cover (VFO_PAGES at most each),
+ * for a span that starts inside a copy: an entry index and its stretch. A
+ * slot can name an entry that holds another copy since; the lookup checks
+ * the entry itself. */
+#define VFO_PSETS 512u
+#define VFO_PWAYS 8u
+#define VFO_PAGES 16u
+static struct { u32 ep[VFO_PWAYS]; u16 e[VFO_PWAYS]; u8 rr; } s_vfop[VFO_PSETS];
+static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
+/* Per 64 KB guest page, the stretch a span copy last read it in (vf_copy,
+ * vpj_sync_write_hook). */
+static u32* s_vpg;
+static void vfo_next(void)
+{
+    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); memset(s_vfop, 0, sizeof s_vfop); s_vfo_ep = 1; }
+}
 static u64 s_vp_iwant = 0;
 /* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
  * vertices fetched from guest memory, vertices written to the upload heap,
@@ -12617,6 +12644,7 @@ rtt_dump_done:;
     s_vf_off = 0;
     s_vf_short = 0;
     s_fx.valid = 0;
+    vfo_next();
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
       PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
       emit += s_vp_want;
@@ -13856,6 +13884,7 @@ static _Alignas(64) VPJCounter s_vpj_ctr[4];
  * increment of a line the workers spin on, ~6% of the FIFO thread. */
 static LONG s_vpj_q;
 static u32 s_vpj_qv;
+static int s_vpj_conv;   /* a vertex job (not a span copy) queued since the last sync */
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -13926,12 +13955,39 @@ static void vpj_sync(void)
     InterlockedExchange(&s_vpj_done, 0);
     s_vpj_q = 0;
     s_vpj_vis_n = 0;
+    s_vpj_conv = 0;
 }
-static void vpj_sync_hook(void) { vpj_sync(); }
+static void vpj_sync_hook(void) { vpj_sync(); vfo_next(); }
+/* The 2D engine's inline writes (g_rsx_sync_write_hook): about 9,000 4-byte
+ * words a frame on Demon's Souls' 1-2 bridge, and each one ended the stretch
+ * and finished the queued copies on this thread. A 2D write is no fence for
+ * the RSX's vertex reads (on the PS3 the 3D pipe may still be reading when
+ * it lands), so a title can't rely on one to reuse vertex memory. It needs
+ * the queue done and the stretch ended only where it lands on a page a span
+ * copy of this stretch read, so a later copy can't see the new bytes and a
+ * later draw can't reuse the old ones; or while a vertex job is queued,
+ * whose reads aren't tracked. VF_SYNC_2D (live, default 1): 0 syncs at every
+ * write, as before. */
+static void vpj_sync_write_hook(u32 ea, u32 len)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VF_SYNC_2D", 1));
+    int hit = !on || s_vpj_conv || !len;
+    for (u32 p = ea >> 16; !hit && p <= (ea + len - 1) >> 16; p++) hit = s_vpg[p] == s_vfo_ep;
+    if (hit) vpj_sync_hook();
+}
 static int vpj_threads(void)
 {
     static int n = -1;
     if (n >= 0) return n;
+    /* With no workers too: the hook also ends the copy table's stretches
+     * (VF_ONCE), and the same draws must give the same descriptors. With
+     * nothing queued, vpj_sync returns at once. */
+    extern void (*g_rsx_sync_hook)(void);
+    g_rsx_sync_hook = vpj_sync_hook;
+    extern void (*g_rsx_sync_write_hook)(u32, u32);
+    s_vpg = (u32*)calloc(1u << 16, sizeof *s_vpg);
+    if (s_vpg) g_rsx_sync_write_hook = vpj_sync_write_hook;
     n = ps3_env_int("VP_FETCH_THREADS", 1);
     if (n > 16) n = 16;
     if (n > 0) {
@@ -13942,8 +13998,6 @@ static int vpj_threads(void)
             HANDLE h = CreateThread(NULL, 0, vpj_worker, NULL, 0, NULL);
             if (h) CloseHandle(h);
         }
-        extern void (*g_rsx_sync_hook)(void);
-        g_rsx_sync_hook = vpj_sync_hook;
         fprintf(stderr, "[VPJ] %d vertex fetch threads%c", n, 10);
     }
     return n;
@@ -13983,6 +14037,7 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
     s_vpj_q++;
+    s_vpj_conv = 1;
     s_vpj_qv += n;
     if (s_vpj_qv >= vpj_batch()) vpj_publish();
 }
@@ -13997,6 +14052,9 @@ static void vf_copy(u8* dst, u32 src, u32 len)
     extern uint8_t* vm_base;
     static int on = -1;
     PS3_KNOB(on, ps3_env_int("VF_COPY_WORKER", 1));
+    vpj_threads();   /* makes s_vpg */
+    if (s_vpg && len)
+        for (u32 p = src >> 16; p <= (src + len - 1) >> 16; p++) s_vpg[p] = s_vfo_ep;
     if (!on || vpj_threads() <= 0) { memcpy(dst, vm_base + src, len); return; }
     /* Not published yet, so no worker has taken it. */
     VPJob* P = s_vpj_q > s_vpj_pub ? &s_vpj[s_vpj_q - 1] : NULL;
@@ -14988,6 +15046,102 @@ static u32 vf_strip_native(const GuestIdx* gi, u32 first, u32 count, int restart
 }
 static int s_up_strip;   /* the last upload_strip_vp_fetch wrote a strip */
 
+/* VF_ONCE (live, default 1): a new descriptor's span that lies inside a copy
+ * made earlier in the same stretch points into that copy, with no copy of its
+ * own: a copy that starts where the span starts, else one of the span's
+ * first page (s_vfop). Within a stretch the title can't know the RSX has read
+ * a range, so it can't have rewritten it either: the rule the copy queue
+ * relies on. A mesh drawn in several passes is copied once a
+ * stretch, not once a pass: on Demon's Souls' 1-2 bridge about 80% of 114 MB
+ * of copies a frame repeated bytes of the same stretch. A copy grows its
+ * entry with what later draws of its descriptor append to it, and a
+ * descriptor that points at a copy takes all of it, so the next pass's
+ * draws that continue the first find their ranges there. The vertex
+ * worker's sync hook ends the stretches, workers or not (vpj_threads).
+ * VF_ONCE_CHECK=1 (debug, slow) compares each reused range with guest
+ * memory and counts those that differ. */
+static int vfo_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VF_ONCE", 1));
+    vpj_threads();   /* sets the hook */
+    return on;
+}
+static u32 vfo_set(u32 g0) { return (g0 >> 4) * 2654435761u >> 24; }
+static u32 vfo_pset(u32 page) { return page * 2654435761u >> 23; }
+static VFOEntry* vfo_at(u32 e) { return &s_vfo[e / VFO_WAYS][e % VFO_WAYS]; }
+static int vfo_holds(const VFOEntry* E, u32 g0, u32 g1)
+{
+    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1;
+}
+/* The entry (set * VFO_WAYS + way) of this stretch whose copy holds guest
+ * [g0,g1): one that starts at g0, else one of g0's page. ~0 if none. */
+static u32 vfo_find(const u8* base, u32 g0, u32 g1)
+{
+    u32 e = ~0u;
+    const u32 s = vfo_set(g0);
+    for (u32 w = 0; w < VFO_WAYS && e == ~0u; w++)
+        if (s_vfo[s][w].g0 == g0 && vfo_holds(&s_vfo[s][w], g0, g1)) e = s * VFO_WAYS + w;
+    if (e == ~0u) {
+        const u32 ps = vfo_pset(g0 >> 16);
+        for (u32 w = 0; w < VFO_PWAYS && e == ~0u; w++)
+            if (s_vfop[ps].ep[w] == s_vfo_ep && vfo_holds(vfo_at(s_vfop[ps].e[w]), g0, g1)) e = s_vfop[ps].e[w];
+    }
+    if (e == ~0u) return e;
+    static int chk = -1;
+    PS3_KNOB(chk, ps3_env_int("VF_ONCE_CHECK", 0));
+    if (chk) {
+        extern uint8_t* vm_base;
+        static u64 n, bad;
+        const VFOEntry* E = vfo_at(e);
+        vpj_sync();
+        n++;
+        if (memcmp(base + E->r0 + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
+        if (n % 20000u == 0)
+            fprintf(stderr, "[VF] once: %llu reused ranges checked, %llu differ from guest memory%c",
+                    (unsigned long long)n, (unsigned long long)bad, 10);
+    }
+    return e;
+}
+/* Entry e in the page sets of [g0,g1)'s pages (the first VFO_PAGES of its copy). */
+static void vfo_pages(u32 e, u32 g0, u32 g1)
+{
+    const u32 p0 = vfo_at(e)->g0 >> 16;
+    for (u32 p = g0 >> 16; p <= (g1 - 1) >> 16 && p - p0 < VFO_PAGES; p++) {
+        const u32 ps = vfo_pset(p);
+        u32 w = 0;
+        while (w < VFO_PWAYS && !(s_vfop[ps].ep[w] == s_vfo_ep && s_vfop[ps].e[w] == e)) w++;
+        if (w < VFO_PWAYS) continue;   /* there already */
+        w = 0;
+        while (w < VFO_PWAYS && s_vfop[ps].ep[w] == s_vfo_ep) w++;
+        if (w == VFO_PWAYS) { w = s_vfop[ps].rr; s_vfop[ps].rr = (u8)((w + 1) % VFO_PWAYS); }
+        s_vfop[ps].e[w] = (u16)e; s_vfop[ps].ep[w] = s_vfo_ep;
+    }
+}
+/* A way of this stretch's that isn't in use, else the set's oldest. */
+static u32 vfo_add(u32 g0, u32 g1, u32 r0)
+{
+    const u32 s = vfo_set(g0);
+    u32 w = 0;
+    while (w < VFO_WAYS && s_vfo[s][w].ep == s_vfo_ep) w++;
+    if (w == VFO_WAYS) { w = s_vfo_rr[s]; s_vfo_rr[s] = (u8)((w + 1) % VFO_WAYS); }
+    VFOEntry* E = &s_vfo[s][w];
+    E->g0 = g0; E->g1 = g1; E->r0 = r0; E->ep = s_vfo_ep;
+    vfo_pages(s * VFO_WAYS + w, g0, g1);
+    return s * VFO_WAYS + w;
+}
+/* Span j of the descriptor grew to guest g1 in place: so does its copy's
+ * entry, while it is this stretch's. */
+static void vfo_grow(u32 j, u32 g1)
+{
+    const u32 e = s_fx.ve[j];
+    if (e == ~0u) return;
+    VFOEntry* E = vfo_at(e);
+    if (E->ep != s_vfo_ep || E->r0 != s_fx.r0[j] || E->g0 != s_fx.g0[j]) return;
+    if (E->g1 < g1) vfo_pages(e, E->g1, g1);
+    E->g1 = g1;
+}
+
 /* Returns the indices written (0 is a strip that made no triangle), or -1
  * when the draw has to take the CPU path. ext: the fetch draw this range
  * continues, or NULL. */
@@ -15072,7 +15226,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 for (u32 j = 0; j < s_fx.nsp; j++) {
                     const int last = (j + 1 == s_fx.nsp) && s_fx.end == s_vf_off;
                     if (sg0[k] >= s_fx.g0[j] && (sg1[k] <= s_fx.g1[j] || (last && sg0[k] <= s_fx.g1[j]))) {
-                        if (s_fx.r0[j] + (sg0[k] - s_fx.g0[j]) - sx[k] != s_fx.x[pl.on[k].idx]) break;
+                        if (s_fx.r0[j] + (sg0[k] - s_fx.g0[j]) - sx[k] != s_fx.x[pl.on[k].idx]) continue;
                         if (sg1[k] > s_fx.g1[j] && sg1[k] > ng1) ng1 = sg1[k];
                         in = 1; break;
                     }
@@ -15086,6 +15240,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                     vf_copy((u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + s_vf_off,
                             s_fx.g1[j], add);
                     s_vf_off += add; s_fx.end = s_vf_off; s_fx.g1[j] = g1;
+                    vfo_grow(j, g1);
                     s_vf_stat[2]++;
                 } else ok = 0;
             } else if (ok) s_vf_stat[1]++;
@@ -15111,10 +15266,30 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
+            const int once = vfo_on();
             for (u32 j = 0; j < nsp; j++) {
-                vf_copy(base + r, g0[j], g1[j] - g0[j]);
-                s_fx.g0[j] = g0[j]; s_fx.g1[j] = g1[j]; s_fx.r0[j] = r;
-                r += g1[j] - g0[j];
+                /* Inside a copy an earlier span of this descriptor points at. */
+                u32 i = 0;
+                while (once && i < j && !(s_fx.g0[i] <= g0[j] && g1[j] <= s_fx.g1[i])) i++;
+                if (once && i < j) {
+                    s_fx.g0[j] = s_fx.g0[i]; s_fx.g1[j] = s_fx.g1[i]; s_fx.r0[j] = s_fx.r0[i]; s_fx.ve[j] = ~0u;
+                    s_vfo_reused += g1[j] - g0[j];
+                    continue;
+                }
+                const u32 e = once ? vfo_find(base, g0[j], g1[j]) : ~0u;
+                if (e == ~0u) {
+                    vf_copy(base + r, g0[j], g1[j] - g0[j]);
+                    s_fx.g0[j] = g0[j]; s_fx.g1[j] = g1[j]; s_fx.r0[j] = r;
+                    s_fx.ve[j] = once ? vfo_add(g0[j], g1[j], r) : ~0u;
+                    r += g1[j] - g0[j];
+                    s_vfo_copied += g1[j] - g0[j];
+                } else {
+                    /* The whole copy, so a draw that continues this one
+                     * finds its range there too. */
+                    const VFOEntry* E = vfo_at(e);
+                    s_fx.g0[j] = E->g0; s_fx.g1[j] = E->g1; s_fx.r0[j] = E->r0; s_fx.ve[j] = ~0u;
+                    s_vfo_reused += g1[j] - g0[j];
+                }
             }
             struct { u32 x, y, z, w; float c[4]; } rec[16];
             for (u32 i = 0; i < 16; i++) {
@@ -15126,7 +15301,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 const rsx_fetch_slot* sl = &pl.on[k];
                 u32 j = 0;
                 while (j + 1 < nsp && !(sg0[k] >= g0[j] && sg0[k] < g1[j])) j++;
-                const u32 x = s_fx.r0[j] + (sg0[k] - g0[j]) - sx[k];
+                const u32 x = s_fx.r0[j] + (sg0[k] - s_fx.g0[j]) - sx[k];
                 rec[sl->idx].x = x; rec[sl->idx].y = sl->stride;
                 rec[sl->idx].z = sl->type | (sl->n << 4)
                                | ((sl->freq ? (sl->modulo ? 2u : 1u) : 0u) << 8);
@@ -15136,7 +15311,9 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             memcpy(base + fdesc, rec, sizeof rec);
             s_vf_off = r;
             s_fx.valid = 1; s_fx.epoch = state->begin_epoch; s_fx.fdesc = fdesc;
-            s_fx.end = r; s_fx.nsp = nsp;
+            /* Where the last span ends: the ring's end only if it was copied
+             * here, and only then can a draw that continues this one append. */
+            s_fx.end = s_fx.r0[nsp - 1] + (s_fx.g1[nsp - 1] - s_fx.g0[nsp - 1]); s_fx.nsp = nsp;
             s_vf_stat[0]++;
         }
         s_up_fdesc = s_fx.fdesc;
@@ -15150,11 +15327,13 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     { static int st = -1; static u32 calls;
       PS3_KNOB(st, ps3_env_int("VP_FETCH_STATS", 0));
       if (st && ++calls % 20000u == 0)
-          fprintf(stderr, "[VF] new %llu reuse %llu append %llu | cpu: sparse %llu type/addr %llu room %llu | ring %u KB%c",
+          fprintf(stderr, "[VF] new %llu reuse %llu append %llu | cpu: sparse %llu type/addr %llu room %llu | ring %u KB"
+                          " | spans: copied %llu MB, pointed at a copy %llu MB%c",
                   (unsigned long long)s_vf_stat[0], (unsigned long long)s_vf_stat[1],
                   (unsigned long long)s_vf_stat[2], (unsigned long long)s_vf_stat[3],
                   (unsigned long long)s_vf_stat[4], (unsigned long long)s_vf_stat[5],
-                  s_vf_off >> 10, 10); }
+                  s_vf_off >> 10, (unsigned long long)(s_vfo_copied >> 20),
+                  (unsigned long long)(s_vfo_reused >> 20), 10); }
     return (int)ni;
 }
 

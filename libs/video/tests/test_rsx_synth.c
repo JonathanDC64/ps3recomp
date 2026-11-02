@@ -133,14 +133,14 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0xe6eda6f3fa074e52ull, 0x07bbb9ef68f4987dull },
-    { "draws",     0xf785e8c197a89c9full, 0xccd1ed7af6d6186dull },
-    { "states",    0xbeec242ec0ddd572ull, 0xe0c29658ddf2d9d3ull },
-    { "textures",  0x90436c8bc63df033ull, 0x2dfecd766b1ecb56ull },
-    { "offscreen", 0xa9acdc876a531e2bull, 0x7000e8424fd96c05ull },
-    { "zpass",     0x872f1774ccf8722full, 0x5df22583bed540cbull },
-    { "frames",    0x4e7434cd674421bbull, 0xae2888f039e2ccdbull },
-    { "mainmem",   0x33ccdb82857df2bdull, 0xbbb654e4d21b9a5bull },
+    { "clears",    0xe6eda6f3fa074e52ull, 0x0b73e510142a4245ull },
+    { "draws",     0x7657c13ac5a00d27ull, 0x540d274be08c68bdull },
+    { "states",    0x22382604fc4a06aaull, 0x9b19ecb7564af0e3ull },
+    { "textures",  0x3ea6de5666e231dbull, 0xdf322923509a0d06ull },
+    { "offscreen", 0x443fccc8d5a98833ull, 0x55f9ca1497e68a75ull },
+    { "zpass",     0xf95c3364106ac5d7ull, 0xff387d88063d50fbull },
+    { "frames",    0x39b43599ecad2f03ull, 0x3b6a7a0180758a4bull },
+    { "mainmem",   0xc4025e9123d074b5ull, 0xdb3c6fdda38c244bull },
 };
 
 /* ---------------------------------------------------------------------------
