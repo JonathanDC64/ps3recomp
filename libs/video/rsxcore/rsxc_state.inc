@@ -465,8 +465,24 @@ static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for 
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
     u32 g0[16], g1[16], r0[16];   /* guest [g0,g1) copied to ring offset r0 */
+    u32 ve[16];                   /* each span's VF_ONCE entry if copied here, or ~0 */
     u32 x[16];                    /* the records' x, slot by slot */
 } s_fx;
+/* The span copies made in this stretch of the stream (upload_strip_vp_fetch,
+ * VF_ONCE), by guest start. A stretch ends at each point where the title can
+ * see the RSX move on (g_rsx_sync_hook) and at each frame's ring reset; an
+ * entry of an older stretch is empty. */
+#define VFO_SETS 256u
+#define VFO_WAYS 4u
+typedef struct { u32 g0, g1, r0, ep; } VFOEntry;
+static VFOEntry s_vfo[VFO_SETS][VFO_WAYS];
+static u8 s_vfo_rr[VFO_SETS];   /* the way a set's next entry replaces when all are this stretch's */
+static u32 s_vfo_ep = 1;
+static u64 s_vfo_copied, s_vfo_reused;   /* span bytes, for VP_FETCH_STATS */
+static void vfo_next(void)
+{
+    if (++s_vfo_ep == 0) { memset(s_vfo, 0, sizeof s_vfo); s_vfo_ep = 1; }
+}
 static u64 s_vp_iwant = 0;
 /* Step C2: the buffers are the GPU layer's. The fixed-function vertex buffer,
  * the per-draw rings (vp_vb, vp_ib, vp_cb, vp_fpcb, vf_buf) and the dump's
