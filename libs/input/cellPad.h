@@ -227,6 +227,12 @@ int cellPad_host_key_down(int vk);
  * reads the pads itself, so it ignores them when the title does. */
 int cellPad_host_pads_on(void);
 
+/* The controllers connected at the last poll, by their PAD_CONTROLLER names
+ * ("controller1", "playstation2", ...) in port order, separated by commas,
+ * into out (n bytes, always terminated). Returns how many. For a title's
+ * settings, to show which controller is which. */
+int cellPad_host_controllers(char* out, int n);
+
 /* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
  * and the other bindings of the same inputs do not. */
 void cellPad_host_set_menu(int open);
