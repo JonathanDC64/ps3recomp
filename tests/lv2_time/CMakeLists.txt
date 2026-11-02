@@ -27,6 +27,7 @@ endif()
 add_executable(test_system_time
     test_system_time.c
     "${PS3RECOMP_TREE_ROOT}/runtime/syscalls/sys_timer.c"
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/plat_posix.c"
 )
 if(NOT WIN32)
     # The Win32 handle and wait API sys_timer.c uses for its timer threads.

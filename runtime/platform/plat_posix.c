@@ -156,6 +156,17 @@ int plat_event_wait(plat_event* e, unsigned ms)
     return got;
 }
 
+/* ---- Time ----------------------------------------------------------------- */
+
+void plat_sleep_us(uint64_t us)
+{
+    struct timespec d;
+    d.tv_sec  = (time_t)(us / 1000000u);
+    d.tv_nsec = (long)(us % 1000000u) * 1000L;
+    /* A signal ends a sleep early; sleep the rest. */
+    while (nanosleep(&d, &d) != 0 && errno == EINTR) {}
+}
+
 #else
 typedef int plat_posix_off;   /* (a file with no declaration is not ISO C) */
 #endif /* !_WIN32 */

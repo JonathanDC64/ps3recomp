@@ -1,7 +1,8 @@
 # ps3recomp - tests/plat_threads
 #
 # runtime/platform/plat.h's threads, events and mutex, and the SPU async job
-# pool built on them (runtime/spu/spu_async_pool.c). Standalone project with
+# pool built on them (runtime/spu/spu_async_pool.c); and its time and sleep
+# (test_plat_time: the monotonic clock and the precise sleep). Standalone project with
 # its own build dir, and also added from the top-level CMakeLists under
 # PS3RECOMP_BUILD_TESTS.
 #
@@ -52,4 +53,24 @@ add_test(NAME plat_threads COMMAND test_plat_threads)
 set_tests_properties(plat_threads PROPERTIES
     LABELS "runtime;platform;threads"
     TIMEOUT 120
+)
+
+# Time and sleep: plat.h alone (and plat_posix.c off Windows).
+add_executable(test_plat_time
+    test_plat_time.c
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/plat_posix.c"
+)
+target_include_directories(test_plat_time PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_options(test_plat_time PRIVATE /W3)
+    target_compile_definitions(test_plat_time PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_plat_time PRIVATE -Wall -Wextra)
+    target_link_libraries(test_plat_time PRIVATE Threads::Threads)
+endif()
+
+add_test(NAME plat_time COMMAND test_plat_time)
+set_tests_properties(plat_time PROPERTIES
+    LABELS "runtime;platform;time"
+    TIMEOUT 60
 )
