@@ -11,11 +11,12 @@
 
 #include "rsxc_display.h"
 
-void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
+int rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
 {
     (void)window;
     out->hdr = 0;
     out->peak = out->white = 0.0f;
+    return 1;
 }
 
 int rsxc_display_hdr_current(void* window)

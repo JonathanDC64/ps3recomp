@@ -67,14 +67,15 @@ static float hdr_peak_nits(void)
 /* What the display the window is on reports (step C8b: the system's
  * display code, rsxc_display_win.c, which reads DXGI's outputs for every
  * backend on Windows; with no window, as on a headless backend, no HDR). */
-static void hdr_display_query(void)
+static int hdr_display_query(void)
 {
     rsxc_display_hdr dh;
-    rsxc_display_hdr_query(s_d3d.hwnd, &dh);
+    if (!rsxc_display_hdr_query(s_d3d.hwnd, &dh)) return 0;   /* (no answer: what the last one said stays) */
     s_hdr.disp_hdr = dh.hdr;
     s_hdr.disp_peak = dh.peak;
     s_hdr.disp_white = dh.white;
     s_hdr.failed = 0;
+    return 1;
 }
 
 /* Between frames, with RSX_HDR on: asks again when the window moved to
@@ -85,7 +86,10 @@ static void hdr_display_check(void)
 {
     if (!InterlockedExchange(&s_hdr_requery, 0) && rsxc_display_hdr_current(s_d3d.hwnd))
         return;
-    hdr_display_query();
+    /* No answer while the window closes: switching the swap chain to SDR then
+     * failed (ResizeBuffers on the window going away) and left it with no
+     * buffers for a frame drawn before the exit. */
+    if (!hdr_display_query()) return;
     printf("[D3D12] HDR: the window's display has HDR %s (peak %.0f nits, SDR white %.0f nits)\n",
            s_hdr.disp_hdr ? "on" : "off", s_hdr.disp_peak, s_hdr.disp_white);
 }

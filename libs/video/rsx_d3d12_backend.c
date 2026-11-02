@@ -1665,21 +1665,21 @@ static float hdr_sdr_white(const WCHAR* gdi)
 }
 
 /* What the display the window is on reports. A new factory each time: one
- * keeps describing the outputs as they were when it was made. */
+ * keeps describing the outputs as they were when it was made. 0 when no
+ * display answered for the window, as while it closes (it is on none then):
+ * what the last answer said stays. */
 static IDXGIFactory1* s_hdr_factory;
 static HMONITOR s_hdr_mon;
-static void hdr_display_query(void)
+static int hdr_display_query(void)
 {
-    s_hdr.disp_hdr = 0;
-    s_hdr.disp_peak = s_hdr.disp_white = 0.0f;
-    s_hdr.failed = 0;
     if (s_hdr_factory) s_hdr_factory->lpVtbl->Release(s_hdr_factory);
     s_hdr_factory = NULL;
     s_hdr_mon = MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST);
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) {
         s_hdr_factory = NULL;
-        return;
+        return 0;
     }
+    int found = 0;
     IDXGIAdapter1* a = NULL;
     for (UINT i = 0; s_hdr_factory->lpVtbl->EnumAdapters1(s_hdr_factory, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         IDXGIOutput* o = NULL;
@@ -1693,6 +1693,8 @@ static void hdr_display_query(void)
                     s_hdr.disp_hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
                     s_hdr.disp_peak = d1.MaxLuminance;
                     s_hdr.disp_white = hdr_sdr_white(d1.DeviceName);
+                    s_hdr.failed = 0;
+                    found = 1;
                 }
                 o6->lpVtbl->Release(o6);
             }
@@ -1700,6 +1702,7 @@ static void hdr_display_query(void)
         }
         a->lpVtbl->Release(a);
     }
+    return found;
 }
 
 /* Between frames, with RSX_HDR on: asks again when the window moved to
@@ -1712,7 +1715,10 @@ static void hdr_display_check(void)
         MonitorFromWindow(s_d3d.hwnd, MONITOR_DEFAULTTONEAREST) == s_hdr_mon &&
         s_hdr_factory->lpVtbl->IsCurrent(s_hdr_factory))
         return;
-    hdr_display_query();
+    /* No answer while the window closes: switching the swap chain to SDR then
+     * failed (ResizeBuffers on the window going away) and left it with no
+     * buffers for a frame drawn before the exit. */
+    if (!hdr_display_query()) return;
     printf("[D3D12] HDR: the window's display has HDR %s (peak %.0f nits, SDR white %.0f nits)\n",
            s_hdr.disp_hdr ? "on" : "off", s_hdr.disp_peak, s_hdr.disp_white);
 }
