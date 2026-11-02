@@ -4,3 +4,6 @@
 # For a merged pull request, the merge commit (core_sync lists first parents).
 3550beba6082601f44955eabf2486e47492fbcb2 ported #208: depth clip (rsx_cull_key bit 3, rsxc_pipeline depth_clip) and border colours (rsxc_targets, rsxc_record2, rsxc_state), in the same pull request
 c262d0f948e920940534d88956fe24bfa72534e0 ported #210: the fetch ring grows (vf_grow in rsxc_writeback, s_vf_short in rsxc_state, rsxc_vertex and uvc_table in rsxc_fp, the frame end in rsxc_frame, rc_ring_old[2]), in the same pull request
+0804616e0f7c60d231849e96047fb2fa06c9c40d ported #213: the deferred occlusion store (zq_finish's pending batch in rsxc_zpass, the batch start in rsxc_frame), in the same pull request
+5143c2742bd62150bdb0415048f357b7a39f5c15 ported #214: a closing window's display check keeps its HDR state (rsxc_hdr, rsxc_display_win, rsxc_display_none, rsxc_display.h), in the same pull request
+d5f78243d3e72ddf570a03dbc2f55dfb51192185 ported #215: copy-once (the table and page sets in rsxc_state, vfo_* and the 2D write hook in rsxc_vertex, vfo_next at the ring reset in rsxc_frame), in the same pull request
