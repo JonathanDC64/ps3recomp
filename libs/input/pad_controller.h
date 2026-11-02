@@ -42,6 +42,28 @@ static int pad_controller_find(const long* devs, int ports, long want)
     return -1;
 }
 
+/* What an XInput pad is, for a title's settings, into out (n bytes). vid and
+ * pid come from XInputGetCapabilitiesEx (0 when Windows doesn't give them),
+ * subtype (XINPUT_DEVSUBTYPE_*) and wireless from XInputGetCapabilities.
+ * XInput has no product names: Microsoft's pads are Xbox controllers, the
+ * rest go by their subtype. Inline: cellPad.c uses it only with XInput. */
+static inline int pad_controller_xinput_label(unsigned vid, unsigned pid, int subtype, int wireless, char* out, size_t n)
+{
+    const char* what;
+    if (vid == 0x045E)
+        what = pid == 0x028E || pid == 0x028F || pid == 0x0719 ? "Xbox 360 controller" : "Xbox controller";
+    else switch (subtype) {
+        case 0x02: what = "Wheel"; break;
+        case 0x03: case 0x13: what = "Arcade stick"; break;
+        case 0x04: what = "Flight stick"; break;
+        case 0x05: what = "Dance pad"; break;
+        case 0x06: case 0x07: case 0x0B: what = "Guitar"; break;
+        case 0x08: what = "Drum kit"; break;
+        default: what = "XInput controller"; break;
+    }
+    return snprintf(out, n, "%s%s", what, wireless ? " (wireless)" : "") > 0;
+}
+
 /* A device's PAD_CONTROLLER name, into out (n bytes). 0 for an empty port. */
 static int pad_controller_name(long dev, char* out, size_t n)
 {

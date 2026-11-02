@@ -53,5 +53,17 @@ int main(void) {
         assert(pad_controller_parse(name, 0, 4) == (RUMBLE_HID | i));
     }
     puts("PASS: names round-trip");
+
+    /* What an XInput pad is: Microsoft's by product, others by subtype. */
+    char wide[64];
+    assert(pad_controller_xinput_label(0x045E, 0x0B13, 1, 1, wide, sizeof wide) &&
+           !strcmp(wide, "Xbox controller (wireless)"));
+    assert(pad_controller_xinput_label(0x045E, 0x028E, 1, 0, wide, sizeof wide) && !strcmp(wide, "Xbox 360 controller"));
+    assert(pad_controller_xinput_label(0x046D, 0xC29B, 2, 0, wide, sizeof wide) && !strcmp(wide, "Wheel"));
+    assert(pad_controller_xinput_label(0x0F0D, 0x00C1, 0x13, 0, wide, sizeof wide) && !strcmp(wide, "Arcade stick"));
+    assert(pad_controller_xinput_label(0x2DC8, 0x3106, 1, 0, wide, sizeof wide) && !strcmp(wide, "XInput controller"));
+    assert(pad_controller_xinput_label(0, 0, 1, 1, wide, sizeof wide) && !strcmp(wide, "XInput controller (wireless)"));
+    assert(pad_controller_xinput_label(0x045E, 0x0B13, 1, 1, name, 8) && !strcmp(name, "Xbox co"));   /* cut, ended */
+    puts("PASS: XInput pads are named");
     return 0;
 }

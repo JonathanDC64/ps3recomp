@@ -1075,6 +1075,62 @@ int cellPad_host_controllers(char* out, int n)
     return count;
 }
 
+#if PAD_BACKEND_XINPUT
+/* XInputGetCapabilitiesEx (xinput1_4.dll, ordinal 108, as SDL uses it): XInputGetCapabilities plus the vendor and
+ * product, which tell an Xbox pad from another XInput one. */
+typedef struct { XINPUT_CAPABILITIES caps; WORD vid, pid, version, unk1; DWORD unk2; } PadXInputCapsEx;
+typedef DWORD (WINAPI *PadXInputCapsExFn)(DWORD one, DWORD user, DWORD flags, PadXInputCapsEx* out);
+
+static void pad_xinput_label(int user, char* out, size_t n)
+{
+    HMODULE m = GetModuleHandleW(L"xinput1_4.dll");
+    PadXInputCapsExFn ex = m ? (PadXInputCapsExFn)(void*)GetProcAddress(m, (LPCSTR)108) : NULL;
+    PadXInputCapsEx cx;
+    memset(&cx, 0, sizeof cx);
+    if (!ex || ex(1, (DWORD)user, 0, &cx) != ERROR_SUCCESS) {
+        memset(&cx, 0, sizeof cx);
+        if (XInputGetCapabilities((DWORD)user, 0, &cx.caps) != ERROR_SUCCESS) return;
+    }
+    pad_controller_xinput_label(cx.vid, cx.pid, cx.caps.SubType, (cx.caps.Flags & XINPUT_CAPS_WIRELESS) != 0, out, n);
+}
+#endif
+
+/* What a device is ("Xbox controller (wireless)", "DualSense (USB)", SDL's name), into out; empty when unknown. */
+static void pad_device_label(long dev, char* out, size_t n)
+{
+    out[0] = '\0';
+#if PAD_BACKEND_XINPUT
+    if (dev & RUMBLE_HID)                    pad_hid_sony_describe((int)(dev & 0xF), out, n);
+    else if ((dev & 0xFF) == RUMBLE_XINPUT)  pad_xinput_label(pad_dev_index(dev), out, n);
+#elif PAD_BACKEND_SDL2
+    if ((dev & 0xFF) == RUMBLE_SDL) {
+        const int k = pad_dev_index(dev);
+        SDL_LockJoysticks();   /* (the poll closes a controller under it) */
+        const char* name = k < PAD_MAX_HOST_PORTS && s_sdl_controllers[k] ? SDL_GameControllerName(s_sdl_controllers[k]) : NULL;
+        if (name) snprintf(out, n, "%s", name);
+        SDL_UnlockJoysticks();
+    }
+#else
+    (void)dev; (void)n;
+#endif
+}
+
+/* cellPad.h */
+int cellPad_host_controller(int i, char* id, int idn, char* name, int namen)
+{
+    if (id && idn > 0) id[0] = '\0';
+    if (name && namen > 0) name[0] = '\0';
+    for (int p = 0, k = 0; p < PAD_MAX_HOST_PORTS; p++) {
+        const long dev = s_rumble_dev[p];   /* (the last published sweep) */
+        char nm[16];
+        if (!pad_controller_name(dev, nm, sizeof nm) || k++ != i) continue;
+        if (id && idn > 0) snprintf(id, (size_t)idn, "%s", nm);
+        if (name && namen > 0) pad_device_label(dev, name, (size_t)namen);
+        return 1;
+    }
+    return 0;
+}
+
 /* PS3_NO_USER_INPUT=1 (ps3_knob.h): no pad or key of the user's is read. Port
  * 0 stays a pad at rest, so scripted input (PAD_FILE, PAD_STICK, PAD_SCRIPT,
  * g_pad_title_hook) still has a pad to press; the other ports are empty. */

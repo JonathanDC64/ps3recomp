@@ -233,6 +233,12 @@ int cellPad_host_pads_on(void);
  * settings, to show which controller is which. */
 int cellPad_host_controllers(char* out, int n);
 
+/* The i-th of those controllers (0 first): its PAD_CONTROLLER name into id
+ * (idn bytes), and what it is ("Xbox controller (wireless)", "DualSense
+ * (USB)", SDL's name for it) into name (namen bytes; empty when unknown).
+ * Both are always terminated. 0 when there is no i-th. */
+int cellPad_host_controller(int i, char* id, int idn, char* name, int namen);
+
 /* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
  * and the other bindings of the same inputs do not. */
 void cellPad_host_set_menu(int open);
