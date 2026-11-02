@@ -65,6 +65,7 @@ extern int      ppu_thread_named(const char* name);   /* runtime/syscalls/sys_pp
   #define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
   #endif
   #include <process.h>
+  #include <wchar.h>   /* wcscmp: device ids */
 
   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
   #ifdef __cplusplus
@@ -85,6 +86,10 @@ extern int      ppu_thread_named(const char* name);   /* runtime/syscalls/sys_pp
   DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
+  DEFINE_AUDIO_GUID(ps3r_IID_IUnknown,             0x00000000,0x0000,0x0000,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
+  DEFINE_AUDIO_GUID(ps3r_IID_IMMNotificationClient, 0x7991EEC9,0x7E89,0x4D85,0x83,0x90,0x6C,0x70,0x3C,0xEC,0x60,0xC0);
+  static const PROPERTYKEY ps3r_PKEY_AudioEndpoint_FormFactor =
+      { { 0x1DA5D803,0xD492,0x4EDD,{0x8C,0x23,0xE0,0xC0,0xFF,0xEE,0x7F,0x0E} }, 0 };
 
   /* Map to the names used in the code */
   #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
@@ -264,6 +269,10 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
+/* SDL's device opened with no name is the system's default, and SDL or the
+ * sound server moves it to a new default. */
+static void audio_backend_follow(void) {}
+
 #endif /* AUDIO_BACKEND_SDL2 */
 
 #if AUDIO_BACKEND_WASAPI
@@ -273,39 +282,149 @@ static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
 
-static int audio_backend_init(void)
+/* Following Windows' default output device. The stream opens on the device
+ * that is the default at the time and stays there: when another device
+ * becomes the default (headphones or a headset plugged in or connected, a
+ * choice in Windows' sound settings), the game kept playing to the old one
+ * and the player heard nothing until a restart (Demon's Souls, issue #296).
+ * Windows now tells s_wasapi_notify, on a thread of its own, and the mixing
+ * thread reopens the stream on the new default (audio_backend_follow). A
+ * device that goes away (unplugged, disabled, its driver restarted) fails the
+ * stream's calls instead; the mixer then tries the default device about once
+ * a second and paces on its clock meanwhile. Once the mixing thread runs,
+ * only it touches the stream. */
+static IMMDeviceEnumerator* s_wasapi_enum = NULL;
+static WCHAR                s_wasapi_id[128];     /* the open device's id */
+static volatile LONG        s_wasapi_changed = 0; /* set by s_wasapi_notify */
+static int                  s_wasapi_retry = 0;   /* blocks until the next try to open; 0: playing */
+static int                  s_wasapi_said = 0;    /* this outage is in the log */
+#define WASAPI_RETRY_BLOCKS 188                   /* about a second: 187.5 blocks */
+
+static HRESULT STDMETHODCALLTYPE wasapi_notify_query(IMMNotificationClient* self, REFIID riid, void** out)
 {
-    HRESULT hr;
-
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
-        return -1;
+    if (IsEqualIID(riid, &ps3r_IID_IUnknown) || IsEqualIID(riid, &ps3r_IID_IMMNotificationClient)) {
+        *out = self;
+        return S_OK;
     }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
 
-    IMMDeviceEnumerator* enumerator = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                          &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
-        return -1;
+/* One static object: nothing to count. */
+static ULONG STDMETHODCALLTYPE wasapi_notify_ref(IMMNotificationClient* self) { (void)self; return 1; }
+
+static HRESULT STDMETHODCALLTYPE wasapi_notify_state(IMMNotificationClient* self, LPCWSTR id, DWORD state)
+{
+    (void)self; (void)id; (void)state;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE wasapi_notify_device(IMMNotificationClient* self, LPCWSTR id)
+{
+    (void)self; (void)id;
+    return S_OK;
+}
+
+/* Windows' rule: no waiting and no COM calls here, so only a flag. */
+static HRESULT STDMETHODCALLTYPE wasapi_notify_default(IMMNotificationClient* self, EDataFlow flow, ERole role,
+                                                       LPCWSTR id)
+{
+    (void)self; (void)id;
+    if (flow == eRender && role == eConsole) InterlockedExchange(&s_wasapi_changed, 1);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE wasapi_notify_property(IMMNotificationClient* self, LPCWSTR id, const PROPERTYKEY key)
+{
+    (void)self; (void)id; (void)key;
+    return S_OK;
+}
+
+static IMMNotificationClientVtbl s_wasapi_notify_vtbl = {
+    .QueryInterface         = wasapi_notify_query,
+    .AddRef                 = wasapi_notify_ref,
+    .Release                = wasapi_notify_ref,
+    .OnDeviceStateChanged   = wasapi_notify_state,
+    .OnDeviceAdded          = wasapi_notify_device,
+    .OnDeviceRemoved        = wasapi_notify_device,
+    .OnDefaultDeviceChanged = wasapi_notify_default,
+    .OnPropertyValueChanged = wasapi_notify_property,
+};
+static IMMNotificationClient s_wasapi_notify = { &s_wasapi_notify_vtbl };
+
+/* The device's id into out[128] ("" if Windows won't say). */
+static void wasapi_device_id(IMMDevice* device, WCHAR* out)
+{
+    LPWSTR id = NULL;
+    size_t i = 0;
+    if (SUCCEEDED(device->lpVtbl->GetId(device, &id)) && id) {
+        for (; id[i] && i < 127; i++) out[i] = id[i];
+        CoTaskMemFree(id);
     }
+    out[i] = 0;
+}
 
+/* What kind of device it is, for the log. Not its name, which can carry the
+ * player's ("<name>'s headphones"). */
+static const char* wasapi_device_kind(IMMDevice* device)
+{
+    static const char* const kinds[] = {
+        "network device", "speakers", "line out", "headphones", "microphone", "headset", "handset",
+        "digital passthrough", "S/PDIF", "display audio (HDMI or DisplayPort)", "unknown kind"};
+    const char* kind = "unknown kind";
+    IPropertyStore* props = NULL;
+    if (SUCCEEDED(device->lpVtbl->OpenPropertyStore(device, STGM_READ, &props))) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(props->lpVtbl->GetValue(props, &ps3r_PKEY_AudioEndpoint_FormFactor, &v)) &&
+            v.vt == VT_UI4 && v.ulVal < sizeof(kinds) / sizeof(kinds[0]))
+            kind = kinds[v.ulVal];
+        PropVariantClear(&v);
+        props->lpVtbl->Release(props);
+    }
+    return kind;
+}
+
+static void wasapi_close(void)
+{
+    if (s_wasapi_client) {
+        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
+    }
+    if (s_wasapi_render) {
+        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
+        s_wasapi_render = NULL;
+    }
+    if (s_wasapi_client) {
+        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
+        s_wasapi_client = NULL;
+    }
+    if (s_wasapi_event) {
+        CloseHandle(s_wasapi_event);
+        s_wasapi_event = NULL;
+    }
+}
+
+/* Opens the stream on the default output device. On failure, *step names
+ * the call that failed. */
+static HRESULT wasapi_open(const char** step)
+{
     IMMDevice* device = NULL;
-    hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender,
-                                                      eConsole, &device);
-    enumerator->lpVtbl->Release(enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
-        return -1;
+    HRESULT hr = s_wasapi_enum->lpVtbl->GetDefaultAudioEndpoint(s_wasapi_enum, eRender,
+                                                                 eConsole, &device);
+    if (FAILED(hr)) {   /* E_NOTFOUND: no output device at all */
+        *step = "getting the default device";
+        return hr;
     }
+    wasapi_device_id(device, s_wasapi_id);
+    const char* kind = wasapi_device_kind(device);
 
     hr = device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_ALL,
                                    NULL, (void**)&s_wasapi_client);
     device->lpVtbl->Release(device);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to activate audio client: 0x%08lX\n", hr);
-        return -1;
+        s_wasapi_client = NULL;
+        *step = "activating the audio client";
+        return hr;
     }
 
     WAVEFORMATEX wfx;
@@ -344,12 +463,9 @@ static int audio_backend_init(void)
             AUDCLNT_SHAREMODE_SHARED,
             convert, buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
-            printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-            s_wasapi_client = NULL;
-            CloseHandle(s_wasapi_event);
-            s_wasapi_event = NULL;
-            return -1;
+            wasapi_close();
+            *step = "WASAPI Initialize";
+            return hr;
         }
         CloseHandle(s_wasapi_event);
         s_wasapi_event = NULL;
@@ -362,33 +478,99 @@ static int audio_backend_init(void)
     hr = s_wasapi_client->lpVtbl->GetService(
         s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
     if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
-        return -1;
+        s_wasapi_render = NULL;
+        wasapi_close();
+        *step = "getting the render client";
+        return hr;
     }
 
     s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    printf("[cellAudio] output: the default device, %s\n", kind);
+    return S_OK;
+}
+
+/* A call on the stream failed: its device went away
+ * (AUDCLNT_E_DEVICE_INVALIDATED) or Windows' audio service restarted. The
+ * mixer tries the default device on its next block. */
+static void wasapi_lost(HRESULT hr)
+{
+    printf("[cellAudio] the output device stopped (0x%08lX); trying the default device\n", (unsigned long)hr);
+    wasapi_close();
+    s_wasapi_retry = 1;
+}
+
+static int audio_backend_init(void)
+{
+    HRESULT hr;
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
+        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
+        return -1;
+    }
+
+    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &IID_IMMDeviceEnumerator, (void**)&s_wasapi_enum);
+    if (FAILED(hr)) {
+        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
+        s_wasapi_enum = NULL;
+        return -1;
+    }
+    hr = s_wasapi_enum->lpVtbl->RegisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_notify);
+    if (FAILED(hr))
+        printf("[cellAudio] Windows won't say when the default output device changes: 0x%08lX\n", hr);
+
+    const char* step = "";
+    hr = wasapi_open(&step);
+    if (FAILED(hr)) {
+        printf("[cellAudio] No output device (%s failed: 0x%08lX); trying again every second\n", step, hr);
+        s_wasapi_said = 1;
+        s_wasapi_retry = WASAPI_RETRY_BLOCKS;
+        return -1;
+    }
     return 0;
 }
 
 static void audio_backend_shutdown(void)
 {
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
+    wasapi_close();
+    if (s_wasapi_enum) {
+        s_wasapi_enum->lpVtbl->UnregisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_notify);
+        s_wasapi_enum->lpVtbl->Release(s_wasapi_enum);
+        s_wasapi_enum = NULL;
     }
-    if (s_wasapi_render) {
-        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
-        s_wasapi_render = NULL;
+}
+
+/* On the mixing thread, before each block: move to a new default device, and
+ * try the default device again while there is no stream. */
+static void audio_backend_follow(void)
+{
+    if (!s_wasapi_enum) return;
+    if (InterlockedExchange(&s_wasapi_changed, 0)) {
+        WCHAR now[128] = {0};
+        IMMDevice* device = NULL;
+        if (SUCCEEDED(s_wasapi_enum->lpVtbl->GetDefaultAudioEndpoint(s_wasapi_enum, eRender, eConsole, &device))) {
+            wasapi_device_id(device, now);
+            device->lpVtbl->Release(device);
+        }
+        /* (Windows also says so when the default stays the same.) */
+        if (!s_wasapi_client || wcscmp(now, s_wasapi_id) != 0) {
+            printf("[cellAudio] the default output device changed; moving there\n");
+            wasapi_close();
+            s_wasapi_retry = 1;
+        }
     }
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
+    if (!s_wasapi_retry || --s_wasapi_retry) return;
+    const char* step = "";
+    const HRESULT hr = wasapi_open(&step);
+    if (SUCCEEDED(hr)) {
+        s_wasapi_said = 0;
+        return;
     }
-    if (s_wasapi_event) {
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
-    }
+    if (!s_wasapi_said)
+        printf("[cellAudio] No output device (%s failed: 0x%08lX); trying again every second\n", step, (unsigned long)hr);
+    s_wasapi_said = 1;
+    s_wasapi_retry = WASAPI_RETRY_BLOCKS;
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
@@ -396,7 +578,11 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (!s_wasapi_render) return;
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr)) {
+        wasapi_lost(hr);
+        return;
+    }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available) {
@@ -406,7 +592,7 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     if (num_samples == 0) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         /* AUDIO_MUTE=1 (live): submit silence. The device is fed at the same
          * rate, so the audio clock and the game's pacing are unchanged
@@ -416,20 +602,19 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
         if (mute) memset(buf, 0, num_samples * 2 * sizeof(float));
         else      memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
         s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+    } else if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+        wasapi_lost(hr);
     }
 }
 
-/* Frames the device can take right now; -1 with no device open. */
+/* Frames the device can take right now; -1 with no stream open. */
 static int audio_backend_room(void)
 {
     if (!s_wasapi_client) return -1;
     UINT32 padding = 0;
     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
     if (FAILED(hr)) {
-        /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
-         * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (_n < 4 && ++_n)
-            fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
+        wasapi_lost(hr);   /* the mixer paces on its clock until a stream opens */
         return -1;
     }
     return (int)(s_wasapi_buf_frames - padding);
@@ -736,6 +921,7 @@ static void audio_mix_loop(void)
         /* More than 50 ms behind (a debugger stop, the device going away):
          * drop the backlog instead of mixing it in a burst. */
         if (now - due > 50000000LL) t0 = now - (long long)blocks * period;
+        audio_backend_follow();
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; continue; }   /* DAC slower: slip */
         if (blocks > 8 && audio_backend_starving()) t0 -= period;                     /* DAC faster: gain */
@@ -799,6 +985,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       else SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
       printf("[cellAudio] Mixing thread started (%s)\n", mm ? "MMCSS Pro Audio" : "TIME_CRITICAL"); }
     s_mix_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#if AUDIO_BACKEND_WASAPI
+    /* The mixer reopens the stream itself (audio_backend_follow): COM calls,
+     * in the process's multithreaded apartment like the first open. */
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
     audio_mix_loop();
     if (s_mix_timer) { CloseHandle(s_mix_timer); s_mix_timer = NULL; }
     printf("[cellAudio] Mixing thread stopped\n");
