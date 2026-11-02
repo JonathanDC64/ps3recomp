@@ -108,7 +108,8 @@ extern "C" const char* gpu_spv_tag(const gpu_layout_desc* layout, char* buf, siz
 {
     if (!buf || !cap) return "";
     snprintf(buf, cap, "spv;%s;%s;edits=%d.%d.%d.%d.%d;layout=%016llx", gpu_spv_compiler(), k_flags,
-             GPU_SPV_E1_VERSION, GPU_SPV_E2_VERSION, GPU_SPV_E3_VERSION, GPU_SPV_E4_VERSION, GPU_SPV_E5_VERSION,
+             GPU_SPV_E1_VERSION, GPU_SPV_E2_VERSION, (gpu_spv_edits() & GPU_SPV_E3) ? GPU_SPV_E3_VERSION : 0,
+             GPU_SPV_E4_VERSION, GPU_SPV_E5_VERSION,
              (unsigned long long)layout_hash(layout ? layout : gpu_spv_guest_layout()));
     return buf;
 }

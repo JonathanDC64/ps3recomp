@@ -3545,7 +3545,7 @@ static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
             handles_req(nd, r, NL_ARG1);
             rb_drop(b);
         }
-        return -1;
+        return GPU_PRESENT_FAILED;
     }
     if (!s->acquired) {
         nl_err(nd, GPU_NULL_ERR_SWAP, r, "no image is acquired (swap_acquire before drawing into it)");
@@ -3573,7 +3573,8 @@ static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
         flush_events(nd);
         fflush((FILE*)nd->dump);
     }
-    return 0;
+    /* (gpu.h's codes, step VC2: a lost device's present says so) */
+    return at_load32(&nd->lost) ? GPU_PRESENT_LOST : GPU_PRESENTED;
 }
 
 /* No display: no statistics. */

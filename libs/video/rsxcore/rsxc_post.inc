@@ -96,26 +96,26 @@ static int aa_ready(void)
     if (s_aa.pso.v) return 1;
     if (s_aa.failed || !s_rc_dev || !GPU_VALID(s_rc_srv_pool)) return 0;
     s_aa.failed = 1;   /* until it is made */
-    gpu_shader vb = sc_shader(GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
-                              GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+    /* The GPU layer's layout and pipelines (step C3b): the t0 table, b0 = 4
+     * constants, a linear clamp at s0. The shaders are compiled for it (step
+     * VC1). */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 2;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
+    ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_PIXEL);
+    ld.nstatic = 1;
+    ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+    gpu_shader vb = sc_shader_for(&ld, GPU_SC_VS, rsx_fxaa_vs, sizeof rsx_fxaa_vs - 1, "rsx_fxaa_vs", NULL,
+                                  GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     gpu_shader pb = {0};
     if (GPU_VALID(vb))
-        pb = sc_shader(GPU_SC_PS, rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL,
-                       GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        pb = sc_shader_for(&ld, GPU_SC_PS, rsx_fxaa_ps, sizeof rsx_fxaa_ps - 1, "rsx_fxaa_ps", NULL,
+                           GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
     if (!GPU_VALID(pb))
         printf("[AA] shader compile failed: %s\n", sc_msg("?"));
-    else {
-        /* The GPU layer's layout and pipelines (step C3b): the t0 table, b0 =
-         * 4 constants, a linear clamp at s0. */
-        gpu_layout_desc ld;
-        memset(&ld, 0, sizeof ld);
-        ld.nslots = 2;
-        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
-        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_PIXEL);
-        ld.nstatic = 1;
-        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 1, 0), 0);
+    else
         s_aa.layout = lay_make(&ld);
-    }
     if (GPU_VALID(s_aa.layout)) {
         gpu_pipeline_desc pd;
         pass_desc(&pd, s_aa.layout, vb, pb, GPU_FORMAT_R8G8B8A8_UNORM,
@@ -232,9 +232,20 @@ static int smaa_ready(void)
         memcpy(text + nh, rsx_smaa_src, ns);
         memcpy(text + nh + ns, rsx_smaa_tail, nt);
     }
+    /* The GPU layer's layout and pipelines (step C3b): a t0-t2 table, b0 = 4
+     * constants (the vertex shaders use them too), a linear clamp at s0 and a
+     * point clamp at s1. The shaders are compiled for it (step VC1). */
+    gpu_layout_desc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.nslots = 2;
+    ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 3, GPU_VIS_PIXEL);
+    ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_ALL);
+    ld.nstatic = 2;
+    ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 0, 0), 0);
+    ld.statics[1] = pass_sampler(GPU_FILTER(0, 0, 0, 0), 1);
     for (int i = 0; i < 6 && SUCCEEDED(hr); i++) {
-        code[i] = sc_shader((i & 1) ? GPU_SC_PS : GPU_SC_VS, text, nh + ns + nt, "rsx_smaa", entry[i],
-                            GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
+        code[i] = sc_shader_for(&ld, (i & 1) ? GPU_SC_PS : GPU_SC_VS, text, nh + ns + nt, "rsx_smaa", entry[i],
+                                GPU_SC_NO_CACHE | GPU_SC_OPTIMIZE);
         if (!GPU_VALID(code[i])) {
             hr = E_FAIL;
             printf("[AA] SMAA shader %s failed to compile: %s\n", entry[i], sc_msg("?"));
@@ -242,17 +253,6 @@ static int smaa_ready(void)
     }
     free(text);
     if (SUCCEEDED(hr)) {
-        /* The GPU layer's layout and pipelines (step C3b): a t0-t2 table, b0
-         * = 4 constants (the vertex shaders use them too), a linear clamp at
-         * s0 and a point clamp at s1. */
-        gpu_layout_desc ld;
-        memset(&ld, 0, sizeof ld);
-        ld.nslots = 2;
-        ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 3, GPU_VIS_PIXEL);
-        ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 4, GPU_VIS_ALL);
-        ld.nstatic = 2;
-        ld.statics[0] = pass_sampler(GPU_FILTER(1, 1, 0, 0), 0);
-        ld.statics[1] = pass_sampler(GPU_FILTER(0, 0, 0, 0), 1);
         s_smaa.layout = lay_make(&ld);
         if (!GPU_VALID(s_smaa.layout)) hr = E_FAIL;
     }

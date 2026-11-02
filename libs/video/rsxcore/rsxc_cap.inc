@@ -327,7 +327,7 @@ static void compile_vp(void)
     /* Strip draws (vf_strip_native) cut at 0xFFFFFFFF; list draws never hold it. */
     pd.strip_cut = GPU_STRIP_CUT_FFFFFFFF;
     pd.nrt = 1; pd.rt_format[0] = GPU_FORMAT_R8G8B8A8_UNORM;
-    pd.ds_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    pd.ds_format = rc_ds_format();   /* (step V5) */
     /* Depth test ON (LESS_EQUAL, matching the guest's rsxtiny_DepthTestFunc 515 /
      * CELL_GCM_LEQUAL). Without it the cube's faces drew in submission order and
      * back faces overwrote the front -> you saw through the near face to the

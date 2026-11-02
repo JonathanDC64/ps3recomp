@@ -48,6 +48,7 @@
 
 #if PAD_BACKEND_SDL2
   #include <SDL2/SDL.h>
+  #include "pad_sdl_slots.h"
   #include "pad_hid_sony.h"   /* (pad_hid_sony_poll off Windows: the SDL pads, below) */
 #endif
 
@@ -860,24 +861,12 @@ static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
 
+    pad_sdl_sync_slots(s_sdl_controllers, PAD_MAX_HOST_PORTS);
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (!s_sdl_controllers[i]) {
-            /* Try to open newly connected controllers */
-            if (SDL_IsGameController(i)) {
-                s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-            }
-        }
-
         SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) {
+        if (!gc) {
             s_host_state[i].connected = 0;
             s_poll_dev[i] = RUMBLE_NONE;
-            if (gc) {
-                SDL_LockJoysticks();   /* (pad_hid_sony_poll reads the list from another thread) */
-                SDL_GameControllerClose(gc);
-                s_sdl_controllers[i] = NULL;
-                SDL_UnlockJoysticks();
-            }
             continue;
         }
 
@@ -923,13 +912,7 @@ static void pad_init_backend(void)
     }
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
 
-    /* Open any controllers already connected */
-    int num = SDL_NumJoysticks();
-    for (int i = 0; i < num && i < PAD_MAX_HOST_PORTS; i++) {
-        if (SDL_IsGameController(i)) {
-            s_sdl_controllers[i] = SDL_GameControllerOpen(i);
-        }
-    }
+    pad_sdl_sync_slots(s_sdl_controllers, PAD_MAX_HOST_PORTS);
 }
 
 static void pad_shutdown_backend(void)

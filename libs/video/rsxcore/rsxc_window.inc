@@ -396,6 +396,14 @@ static volatile LONG s_refresh_hz;        /* the window's display, 0 until known
  * fullscreen, the window covering its display. Window-thread state. */
 static int s_borderless;
 
+/* Step L2: the window thread runs (set once it has made the window, cleared
+ * once the window is gone), and a failed start's close (win_close_wait):
+ * the thread then gives back the video subsystem it took, so that today's
+ * renderer, started in its place, opens its own on a thread of its own as
+ * at any start. */
+static volatile LONG s_win_live;
+static volatile LONG s_win_give_back;
+
 static void win_post(int what, int arg)
 {
     if (!s_sdl_mail) return;
@@ -687,7 +695,8 @@ static DWORD WINAPI window_thread(LPVOID p)
 {
     window_thread_args* a = (window_thread_args*)p;
     SDL_Window* w = NULL;
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+    const int video = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+    if (!video) {
         printf("[D3D12] SDL video init failed: %s\n", SDL_GetError());
     } else {
         s_sdl_mail = SDL_RegisterEvents(1);
@@ -698,11 +707,15 @@ static DWORD WINAPI window_thread(LPVOID p)
     s_sdl_window = w;
     s_d3d.hwnd = w;
     if (w) {
+        InterlockedExchange(&s_win_live, 1);
         win_size_note();
         win_refresh_note();
     }
     SetEvent(a->ready);   /* `a` is the creator's: not touched after this */
-    if (!w) return 0;
+    if (!w) {
+        if (video) SDL_QuitSubSystem(SDL_INIT_VIDEO);   /* (no window: the start fails) */
+        return 0;
+    }
     /* Closing (the window's close button, or Escape) only flags it: the swap
      * chain still presents to this window until the backend shuts down and
      * posts WIN_MAIL_CLOSE, so the window is hidden until then. The overlay
@@ -745,6 +758,8 @@ static DWORD WINAPI window_thread(LPVOID p)
     *(volatile int*)&s_d3d.window_closed = 1;
     s_sdl_window = NULL;
     SDL_DestroyWindow(w);
+    if (s_win_give_back) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    InterlockedExchange(&s_win_live, 0);
     return 0;
 }
 
@@ -760,6 +775,19 @@ static HWND open_window(u32 width, u32 height, const char* title)
     CloseHandle(a.ready);
     CloseHandle(t);
     return s_d3d.hwnd;
+}
+
+/* Step L2: a failed start's window (rc_abort_init), gone before this
+ * returns, as the Win32 one is: once today's renderer starts, its window
+ * thread must be the only one waiting on SDL's events. 1 when it went, 0
+ * when it was still there after 2 s. */
+static int win_close_wait(void)
+{
+    InterlockedExchange(&s_win_give_back, 1);
+    win_post(WIN_MAIL_CLOSE, 0);
+    for (int i = 0; i < 2000 && s_win_live; i++) Sleep(1);
+    InterlockedExchange(&s_win_give_back, 0);
+    return !s_win_live;
 }
 
 #endif /* _WIN32 */

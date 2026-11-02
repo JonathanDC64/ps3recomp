@@ -34,6 +34,29 @@ static u32  s_zq_rec[ZQ_MAX];              /* cb_slot of each query issued */
 static float s_zq_area[ZQ_MAX];            /* its target's host/guest pixel ratio (RSX_SCALE) */
 static int  s_zq_n;                        /* queries issued this batch */
 static u64  s_zq_acc;                      /* samples since the last clear */
+static int  s_zq_pend;                     /* the last batch's counts, not stored yet */
+static int  s_zq_pend_nev;                 /* ... its events, s_zq_ev's first ones */
+static int  s_zq_pend_on;                  /* ... and counting at its end */
+
+/* RSX_ZPASS_DEFER (default 1): a batch with counted draws stores its reports
+ * when the stream reaches the next batch's first ZPASS GET_REPORT (or the next
+ * batch starts, if it has none), once the GPU has finished, instead of waiting
+ * for the GPU right after the batch's submit. That wait held up the FIFO drain
+ * on this thread for the GPU's frame time on every frame that probes the sun.
+ * The next batch's other events queue behind the pending ones meanwhile:
+ * Demon's Souls turns counting off at the start of each frame and probes near
+ * its end, so waiting at its first ZPASS method was hardly later than waiting
+ * after the submit. The game reads the count after a semaphore released right
+ * after the probe's GET_REPORT, and both stores land before that, so either
+ * way it reads the previous probe's count. 0 restores the wait after submit. */
+static int zq_defer_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_ZPASS_DEFER", 1));
+    return on;
+}
+
+static void zq_finish(int nev, int on_after);
 
 static void zq_hook(u32 method, u32 data)
 {
@@ -41,6 +64,13 @@ static void zq_hook(u32 method, u32 data)
     if (method == 0x17CC) { s_zq_on = data != 0; kind = s_zq_on ? ZQ_ON : ZQ_OFF; }
     else if (method == 0x17C8) { if (data != 1) return; kind = ZQ_CLEAR; }
     else { if ((data >> 24) != 1) return; kind = ZQ_REPORT; idx = (data & 0xFFFFFFu) / 16u; }
+    /* A report the title can read next: the last batch's are stored first, once
+     * its GPU work is done. */
+    if (kind == ZQ_REPORT && s_zq_pend) {
+        s_zq_pend = 0;
+        wait_for_gpu();
+        zq_finish(s_zq_pend_nev, s_zq_pend_on);
+    }
     if (s_zq_nev < ZQ_EV_MAX) {
         s_zq_ev[s_zq_nev].at = s_d3d.draw_count;
         s_zq_ev[s_zq_nev].kind = kind;
@@ -81,10 +111,13 @@ static int zq_ready(void)
 }
 
 /* After the batch's GPU work is complete: sum the counts in stream order and
- * store each report. ZPASS_LOG=<n> prints the first n stored values. */
-static void zq_finish(void)
+ * store each report. The batch's events are s_zq_ev's first nev; any after
+ * them are the next batch's (deferred, RSX_ZPASS_DEFER), which move up, and
+ * on_after is counting at the batch's end. ZPASS_LOG=<n> prints the first n
+ * stored values. */
+static void zq_finish(int nev, int on_after)
 {
-    if (!s_zq_nev && !s_zq_n) { s_zq_on_start = s_zq_on; return; }
+    if (!nev && !s_zq_n) { s_zq_on_start = on_after; return; }
     u64 cnt[ZQ_MAX];
     memset(cnt, 0, sizeof cnt);
     if (s_zq_n) {
@@ -104,7 +137,7 @@ static void zq_finish(void)
     static int logn = -1, logged = 0;
     PS3_KNOB(logn, ps3_env_int("ZPASS_LOG", 0));
     int qi = 0;
-    for (int e = 0; e < s_zq_nev; e++) {
+    for (int e = 0; e < nev; e++) {
         for (; qi < s_zq_n && s_zq_rec[qi] < s_zq_ev[e].at; qi++) s_zq_acc += cnt[qi];
         if (s_zq_ev[e].kind == ZQ_CLEAR) s_zq_acc = 0;
         else if (s_zq_ev[e].kind == ZQ_REPORT) {
@@ -116,8 +149,9 @@ static void zq_finish(void)
         }
     }
     for (; qi < s_zq_n; qi++) s_zq_acc += cnt[qi];
-    s_zq_nev = 0;
+    s_zq_nev -= nev;
+    if (s_zq_nev) memmove(s_zq_ev, s_zq_ev + nev, (size_t)s_zq_nev * sizeof s_zq_ev[0]);
     s_zq_n = 0;
-    s_zq_on_start = s_zq_on;
+    s_zq_on_start = on_after;
 }
 

@@ -324,7 +324,8 @@ void gpu_sc_stats_take(gpu_sc_stats* out, int reset)
  * dxbc profile), behind a 24-byte header the loader checks: "GSPV", version
  * 1, T (low word, high word), the module's size in bytes and 0, each a
  * little-endian u32. The post-passes run on every module handed out, by the
- * options of the moment, so one file serves every device. Debug builds (and
+ * options of the moment, so one file serves every device; only
+ * GPU_SC_SPV_FETCH_CLAMP, an edit, has files of its own. Debug builds (and
  * RSX_SPV_VALIDATE=1) validate each one. gpu_sc_load, gpu_sc_put and
  * gpu_sc_cache_path are the guest layout's. */
 #ifndef _WIN32
@@ -348,6 +349,11 @@ unsigned gpu_sc_spv_options(void)
     static int nocontract = -1;
     PS3_KNOB(nocontract, ps3_env_int("RSX_SPV_NOCONTRACT", 1));
     return nocontract ? s_spv_opts : (s_spv_opts & ~GPU_SC_SPV_NO_CONTRACT);
+}
+
+unsigned gpu_spv_edits(void)
+{
+    return (s_spv_opts & GPU_SC_SPV_FETCH_CLAMP) ? GPU_SPV_EDITS_ALL : (GPU_SPV_EDITS_ALL & ~GPU_SPV_E3);
 }
 
 static void spv_stats_take(gpu_sc_stats* out, int reset)
@@ -499,7 +505,7 @@ static int spv_compile(gpu_sc_stage stage, const char* src, size_t n, const char
 {
     size_t tl = 0;
     if (!layout) layout = gpu_spv_guest_layout();
-    char* text = gpu_spv_edit(stage, src, n, GPU_SPV_EDITS_ALL, layout, &tl, err, err_cap);
+    char* text = gpu_spv_edit(stage, src, n, gpu_spv_edits(), layout, &tl, err, err_cap);
     if (!text) {
         if (err && err_cap && !err[0]) snprintf(err, err_cap, "spv: out of memory");
         return GPU_SC_FAILED;

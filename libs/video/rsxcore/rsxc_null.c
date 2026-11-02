@@ -26,12 +26,16 @@
  *     writes the stream as text (flushed at each present);
  *   - the menu gets no native objects (its renderer is D3D12's until V4).
  *
- * Windows only for now, as the D3D12 instance: the core still calls Win32
- * (threads, locks, the window, DWM); the platform module (Phase 5) takes
- * those.
+ * Windows and Linux, as rsxc_vk.c: the core still calls Win32 (threads,
+ * locks, files, timing), which win32_compat.h gives it on Linux; the
+ * platform module (Phase 5) takes those.
  */
-#if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__))
 
+#ifndef _WIN32
+#include "../../../runtime/platform/win32_compat.h"
+#include "rsxc_posix.h"   /* (the few Windows names win32_compat.h leaves out) */
+#endif
 #include "rsxc_head.inc"
 /* The GPU layer, with the null backend's static inline commands, and its own
  * calls (gpu_null.h). */
@@ -47,6 +51,10 @@ static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_null_cre
 /* No window: the swap chain's images are presented to nothing. */
 static const int rc_be_headless = 1;
 
+/* Step V6: a frame buffer that cannot be made does not fail the start (as
+ * on D3D12; init_d3d12). */
+static const int rc_be_start_strict = 0;
+
 /* No breadcrumbs (the null backend keeps none). */
 static int rc_be_breadcrumbs(void) { return 0; }
 static const char rc_be_lost_hint[] = "";
@@ -61,6 +69,8 @@ static void rc_be_lose_device(gpu_device* d, int frames)
     fprintf(stderr, "[null] RSX_LOSE_DEVICE_AT_FRAME: losing the device at frame %d%c", frames, 10);
     gpu_null_test_lose(d, 0x887A0005u);   /* (the number a removed D3D12 device gives) */
 }
+/* No surface to lose (step VC2). */
+static const u32 rc_be_surface_lost = 0;
 
 /* The menu's renderer has nothing to draw with here. */
 static void* rc_be_device(gpu_device* d) { (void)d; return NULL; }
@@ -70,6 +80,7 @@ static void* rc_be_image(gpu_device* d, gpu_texture t) { (void)d; (void)t; retur
 /* No shader cache: none of its files (rsxc_shadercache.inc). */
 static const int rc_be_cache_files = 0;
 static const char rc_be_lib_dir[] = "null";   /* (never used: no pipeline library) */
+static const char* rc_be_lib_file(gpu_device* d) { (void)d; return "pipelines.lib"; }   /* (nor this) */
 static int rc_be_cache_put(gpu_sc_stage stage, const char* hlsl) { (void)stage; (void)hlsl; return 0; }
 
 /* A shader's "code": K as 8 bytes, little-endian, then the entry point's
@@ -89,9 +100,9 @@ static int rc_be_key_blob(u64 key, const char* entry, gpu_sc_blob* out)
     return 1;
 }
 static int rc_be_sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
-                            unsigned flags, gpu_sc_blob* out, char* msg, size_t cap)
+                            unsigned flags, const gpu_layout_desc* layout, gpu_sc_blob* out, char* msg, size_t cap)
 {
-    (void)name; (void)flags;
+    (void)name; (void)flags; (void)layout;   /* (the key names the text; the layout is the pipeline's) */
     if (msg && cap) msg[0] = 0;
     if ((unsigned)stage >= GPU_SC_STAGE_COUNT || !src) return 0;
     return rc_be_key_blob(gpu_sc_key(src, n, k_rc_null_profile[stage]), entry, out);
@@ -133,6 +144,9 @@ static void rc_be_presented(gpu_device* d)
            (unsigned long long)gpu_null_stream_hash(d), gpu_null_errors(d, GPU_NULL_ERR_ALL));
 }
 
+/* The frame slot after an acquire: the image's index, as on D3D12. */
+static u32 rc_be_frame_slot(u32 prev, u32 image) { (void)prev; return image; }
+
 #include "rsxc_core.inc"
 
 #include "rsx_out.h"
@@ -147,4 +161,8 @@ const rsx_route rsxc_route_null = {
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
 
-#endif /* PS3RECOMP_RSX_HAL && _WIN32 */
+/* ---- step VM ---- */
+/* The overlay v2's calls (rsx_out.h; rsxc_api.inc). */
+const rsx_route_gpu rsxc_route_gpu_null = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
+
+#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || __linux__) */

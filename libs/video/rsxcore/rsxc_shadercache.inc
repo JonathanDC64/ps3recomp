@@ -27,13 +27,16 @@ static void shader_cache_warm(void) { if (rc_be_cache_files) gpu_sc_warm(); }
 /* A compile for the backend (rc_be_sc_compile; on D3D12 the service's dxbc
  * target): 1 with the code in *out (the caller's to release,
  * gpu_sc_blob_release), else 0 with the compiler's message for sc_msg.
- * entry NULL is "main". */
+ * entry NULL is "main". layout is the one the shader is bound with, NULL for
+ * the guest programs' (vp_layout's): the spv target places its resources by
+ * it (step VC1); dxbc's registers are the root signature's, so D3D12 does
+ * not use it. */
 static __declspec(thread) char t_sc_msg[8192];
 static int sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name,
-                      const char* entry, unsigned flags, gpu_sc_blob* out)
+                      const char* entry, unsigned flags, const gpu_layout_desc* layout, gpu_sc_blob* out)
 {
     gpu_sc_perf(perf_on());
-    return rc_be_sc_compile(stage, src, n, name, entry, flags, out, t_sc_msg, sizeof t_sc_msg);
+    return rc_be_sc_compile(stage, src, n, name, entry, flags, layout, out, t_sc_msg, sizeof t_sc_msg);
 }
 /* The message of this thread's last compile that failed, or `none` when the
  * compiler gave none. */
@@ -55,12 +58,19 @@ static gpu_shader sc_shader_from(gpu_sc_stage stage, gpu_sc_blob* b)
     gpu_sc_blob_release(b);
     return s;
 }
+/* A built-in pass's shader, for the layout it is bound with (step VC1). */
+static gpu_shader sc_shader_for(const gpu_layout_desc* layout, gpu_sc_stage stage, const char* src, size_t n,
+                                const char* name, const char* entry, unsigned flags)
+{
+    gpu_sc_blob b;
+    if (!sc_compile(stage, src, n, name, entry, flags, layout, &b)) { const gpu_shader none = {0}; return none; }
+    return sc_shader_from(stage, &b);
+}
+/* A shader for the guest programs' layout. */
 static gpu_shader sc_shader(gpu_sc_stage stage, const char* src, size_t n, const char* name,
                             const char* entry, unsigned flags)
 {
-    gpu_sc_blob b;
-    if (!sc_compile(stage, src, n, name, entry, flags, &b)) { const gpu_shader none = {0}; return none; }
-    return sc_shader_from(stage, &b);
+    return sc_shader_for(NULL, stage, src, n, name, entry, flags);
 }
 static void sc_shader_drop(gpu_shader* s)
 {

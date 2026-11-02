@@ -110,7 +110,8 @@ def check_vcmp_record_sets_cr6(cc, mn, kind, a, b, cr6):
         c = Path(td) / "t.c"
         exe = Path(td) / ("t.exe" if os.name == "nt" else "t")
         c.write_text(src)
-        r = subprocess.run([cc, "-std=c11", "-O1", "-o", str(exe), str(c)],
+        # include/: the helpers take ps3emu/ps3_sse.h (sse2neon) on arm64
+        r = subprocess.run([cc, "-std=c11", "-O1", "-I", str(ROOT / "include"), "-o", str(exe), str(c)],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr + "\n" + src
         out = subprocess.run([str(exe)], capture_output=True, text=True)

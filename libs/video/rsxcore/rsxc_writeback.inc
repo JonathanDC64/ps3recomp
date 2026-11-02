@@ -104,26 +104,27 @@ static int down_init(void)
         "float4 main(float4 p : SV_Position) : SV_Target {\n"
         "    return src.Load(int3(int2(p.xy * ratio), 0)).argb;\n"
         "}\n";
-    /* The shaders are the GPU layer's (step C3b), kept for down_pso's later
-     * formats: never freed. */
-    s_down_vs = sc_shader(GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE);
-    if (GPU_VALID(s_down_vs))
-        s_down_ps = sc_shader(GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE);
-    if (GPU_VALID(s_down_ps))
-        s_down_ps_argb = sc_shader(GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL, GPU_SC_NO_CACHE);
-    if (!GPU_VALID(s_down_ps_argb)) {
-        if (t_sc_msg[0]) fprintf(stderr, "[D3D12] write-back downscale: %s%c", t_sc_msg, 10);
-        return 0;
-    }
     /* The GPU layer's layout: the t0 table, b0 = 2 constants. (Call map G12:
      * today's range has offset 0, the GPU layer's OFFSET_APPEND; the first
      * range of its table, it lands at 0 either way, so only the serialized
-     * bytes differ.) */
+     * bytes differ.) The shaders are compiled for it (step VC1). */
     gpu_layout_desc ld;
     memset(&ld, 0, sizeof ld);
     ld.nslots = 2;
     ld.slot[0] = lay_slot(GPU_SLOT_TABLE_TEX, 0, 1, GPU_VIS_PIXEL);
     ld.slot[1] = lay_slot(GPU_SLOT_CONST32, 0, 2, GPU_VIS_PIXEL);
+    /* The shaders are the GPU layer's (step C3b), kept for down_pso's later
+     * formats: never freed. */
+    s_down_vs = sc_shader_for(&ld, GPU_SC_VS, vs, sizeof vs - 1, "down_vs", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_vs))
+        s_down_ps = sc_shader_for(&ld, GPU_SC_PS, ps, sizeof ps - 1, "down_ps", NULL, GPU_SC_NO_CACHE);
+    if (GPU_VALID(s_down_ps))
+        s_down_ps_argb = sc_shader_for(&ld, GPU_SC_PS, ps_argb, sizeof ps_argb - 1, "down_ps_argb", NULL,
+                                       GPU_SC_NO_CACHE);
+    if (!GPU_VALID(s_down_ps_argb)) {
+        if (t_sc_msg[0]) fprintf(stderr, "[D3D12] write-back downscale: %s%c", t_sc_msg, 10);
+        return 0;
+    }
     s_down_layout = lay_make(&ld);
     if (!GPU_VALID(s_down_layout)) return 0;
     {   /* the GPU layer's table pool, a 1-entry table each (step C4): shader
@@ -897,7 +898,7 @@ static void vp_vb_grow(u64 want)
     }
     const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
     gpu_buffer nb; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_VERTEX, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
+    if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
         if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
         fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
                 (unsigned long long)cap, s_vp_cap, 10);
@@ -936,5 +937,36 @@ static void vp_ib_grow(u64 want)
     s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
     fprintf(stderr, "[VPIB] index buffer: %u indices (%llu MB)%c",
             s_vp_icap, (unsigned long long)(bytes >> 20), 10);
+}
+
+/* Grow the GPU fetch ring (vf_buf) to hold a frame of `want` bytes, with
+ * headroom, as vp_vb grows. A strip that does not fit takes the CPU path,
+ * which writes 256 bytes a vertex: on Demon's Souls' dragon bridge in 1-2 a
+ * frame asks for up to ~120 MB of ring, and with the ring at its 64 MB the
+ * CPU path wrote ~2 million vertices a frame and held the frame rate at ~77
+ * (issue #288). The old ring may still be read by the frame in flight, so it
+ * is destroyed with that frame's fence (rc_ring_retire). At most 1024 MB a
+ * half, as VP_FETCH_RING_MB. */
+static void vf_grow(u64 want)
+{
+    static u64 limit = 1024ull << 20;
+    u64 cap = s_vf_cap;
+    while (cap < want + want / 8 && cap < limit) cap *= 2;
+    if (cap > limit) cap = limit;
+    if (cap <= s_vf_cap) return;
+    const u64 bytes = cap * 2;   /* two parity halves */
+    gpu_buffer nb; void* mp = NULL;
+    if (!rc_buf_make(bytes, GPU_USE_RAW, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
+        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
+        fprintf(stderr, "[VF] growing the fetch ring to %llu MB a half failed; staying at %u MB%c",
+                (unsigned long long)(cap >> 20), s_vf_cap >> 20, 10);
+        limit = s_vf_cap;
+        return;
+    }
+    rc_ring_retire(2, s_rc_vf_buf);
+    s_rc_vf_buf = nb;
+    s_d3d.vf_mapped = mp; s_vf_cap = (u32)cap;
+    fprintf(stderr, "[VF] a frame asked for %llu MB of the fetch ring: grown to %u MB a half%c",
+            (unsigned long long)(want >> 20), s_vf_cap >> 20, 10);
 }
 

@@ -619,6 +619,7 @@ static void legacy_vp_fp_desc(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, D3D12_INPU
     pd->RasterizerState.CullMode = (cull & 1u) ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
                                                : D3D12_CULL_MODE_NONE;
     pd->RasterizerState.FrontCounterClockwise = (cull & 4u) ? TRUE : FALSE;
+    pd->RasterizerState.DepthClipEnable = (cull & 8u) ? FALSE : TRUE;
     pd->BlendState.RenderTarget[0].BlendEnable    = (blend & 1) ? TRUE : FALSE;
     pd->BlendState.RenderTarget[0].SrcBlend       = (blend & 1) ? (D3D12_BLEND)((blend >> 1)  & 0x1F) : D3D12_BLEND_ONE;
     pd->BlendState.RenderTarget[0].DestBlend      = (blend & 1) ? (D3D12_BLEND)((blend >> 6)  & 0x1F) : D3D12_BLEND_ZERO;
@@ -667,6 +668,7 @@ static void hal_vp_fp_desc(gpu_pipeline_desc* d, gpu_layout layout, gpu_shader v
     d->topology_type = GPU_TOPOLOGY_TYPE_TRIANGLE;
     d->cull = (cull & 1u) ? ((cull & 2u) ? GPU_CULL_FRONT : GPU_CULL_BACK) : GPU_CULL_NONE;
     d->front_ccw = (cull & 4u) ? 1 : 0;
+    d->depth_clip = (cull & 8u) ? 0 : 1;
     d->depth_test = (uint8_t)(depth & 1u);
     d->depth_write = (uint8_t)((depth >> 1) & 1u);
     d->depth_func = (uint8_t)(((depth >> 2) & 7u) + 1u);
@@ -732,6 +734,7 @@ static void test_pipeline_descs(gpu_layout layout, gpu_shader vs, gpu_shader ps)
         {0, 2, GPU_FORMAT_R16G16B16A16_FLOAT, 0x7, 1u | 4u, 0, 1},
         {0, 4, GPU_FORMAT_R8G8B8A8_UNORM, 0x0, 3u, 1u | (6u << 2), 0},
         {0, 0, GPU_FORMAT_UNKNOWN, 0xF, 1u, 1u | 2u, 0},   /* depth only */
+        {0, 1, GPU_FORMAT_R8G8B8A8_UNORM, 0xF, 1u | 4u | 8u, 1u | 2u, 0},   /* depth clamped */
     };
     for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
         const uint32_t blend = i == 1 ? alpha : i == 2 ? add : k[i].blend;
@@ -1208,6 +1211,48 @@ static void test_pipeline_cache(void)
         gpu_shader_destroy(d, ps);
         if (run_no == 0) CHECK(gpu_pipeline_cache_save(d, path) == 1);
         gpu_destroy(d);
+    }
+    /* A file the driver refuses (step P3S: another driver's or GPU's, or no
+     * library at all; here the saved one cut to half, then a text): a new,
+     * empty library, which pipelines are stored in. */
+    {
+        FILE* f = fopen(path, "rb");   /* (none when the device has no library: skipped above) */
+        const int saved = f != NULL;
+        uint8_t* good = NULL;
+        long n = 0;
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            n = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            good = n > 0 ? (uint8_t*)malloc((size_t)n) : NULL;
+            if (good && fread(good, 1, (size_t)n, f) != (size_t)n) n = 0;
+            fclose(f);
+        }
+        if (good && n > 0) {
+            static const char k_text[] = "not a pipeline library";
+            for (int k = 0; k < 2; k++) {
+                f = fopen(path, "wb");
+                if (f) {
+                    if (k == 0) fwrite(good, 1, (size_t)n / 2, f);
+                    else fwrite(k_text, 1, sizeof k_text - 1, f);
+                    fclose(f);
+                }
+                gpu_device* d = gpu_d3d12_create(&dd);
+                CHECK(d != NULL);
+                if (!d) break;
+                CHECK(gpu_pipeline_cache_load(d, path) == GPU_PIPELINE_CACHE_NEW);
+                const gpu_layout l = guest_layout(d);
+                const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+                const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+                gpu_pipeline_desc pd;
+                draw_desc(&pd, l, vs, ps);
+                uint32_t how = 7;
+                CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0 && how == GPU_PIPELINE_STORED);
+                gpu_destroy(d);
+            }
+        } else if (saved)
+            CHECK(!"the saved library could not be read back");
+        free(good);
     }
     /* No library (the cap masked, as a fallback would): pipelines are
      * compiled and never stored; a store-only one is compiled and released. */

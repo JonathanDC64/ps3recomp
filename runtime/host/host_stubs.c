@@ -29,6 +29,10 @@ void ppu_resv_register(void* ctx) { (void)ctx; }
  * loader's thread entry claims one. */
 void ppu_tls_thread_done(void) {}
 
+/* ppu_loader.cpp - a guest thread's list of live guest setjmps starts empty.
+ * With no lifted code there is no list. */
+void ps3_sjlj_thread_reset(void) {}
+
 /* ppu_loader.cpp - the size of the guest address space the loader mapped.
  * This host calloc's its own VM and passes bounds explicitly, so the bounds
  * checks keyed off this stay out of the way (see VM_READY in vm.h, which

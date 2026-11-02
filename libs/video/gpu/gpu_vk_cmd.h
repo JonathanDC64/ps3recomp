@@ -40,19 +40,36 @@ static inline void gpu_vk__end(gpu_cmd* c)
     c->rendering = 0;
 }
 
-/* Before a draw: the pass open, every set bound with its dynamic offsets. */
+/* Ends the pass; one that still holds clears is opened first, so they are
+ * done in their place. */
+static inline void gpu_vk__close(gpu_cmd* c)
+{
+    if (c->pend_clr && !c->rendering) gpu_vk_pass_open(c);
+    if (c->rendering) gpu_vk__end(c);
+}
+
+/* Before a draw: the pass open, and the sets that changed since the last
+ * draw bound (set 0 with its dynamic offsets), in runs; the others stay
+ * bound, as one layout's sets do. A new layout, or set 0 to find again,
+ * binds them all. */
 static inline void gpu_vk__ready(gpu_cmd* c)
 {
     if (!c->rendering) gpu_vk_pass_open(c);
     if (c->dirty) {
         const gpu_vk_layout* const l = c->lay;
-        if (c->set0_stale || c->have != l->sets_mask) {
+        if (c->set0_stale || c->have != l->sets_mask || c->dirty == ~0u) {
             gpu_vk_binds_slow(c);
         } else {
-            c->vk->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, l->pl, l->first,
-                                           l->nsets - l->first, &c->sets[l->first], l->first ? 0u : l->ndyn,
-                                           c->dyn);
+            uint32_t m = c->dirty & l->sets_mask;
             c->dirty = 0;
+            for (uint32_t s = 0; m; ) {
+                while (!(m & (1u << s))) s++;
+                uint32_t e = s;
+                while (m & (1u << e)) m &= ~(1u << e++);
+                c->vk->vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, l->pl, s, e - s, &c->sets[s],
+                                               s == 0 ? l->ndyn : 0u, c->dyn);
+                s = e;
+            }
         }
     }
 }
@@ -87,14 +104,14 @@ static inline void gpu_vk__clear(gpu_cmd* c, uint32_t att, VkImageAspectFlags as
 
 static inline void gpu_cmd_pass_begin(gpu_cmd* c, const gpu_pass* pass)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     c->pass = *pass;
     if (c->pass.nrt > 4) c->pass.nrt = 4;
 }
 
 static inline void gpu_cmd_pass_end(gpu_cmd* c)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
 }
 
 static inline void gpu_cmd_clear_color(gpu_cmd* c, gpu_view rtv, const float rgba[4], const gpu_rect* rect)
@@ -103,6 +120,11 @@ static inline void gpu_cmd_clear_color(gpu_cmd* c, gpu_view rtv, const float rgb
     memcpy(v.color.float32, rgba, sizeof v.color.float32);
     for (uint32_t i = 0; i < c->pass.nrt; i++)
         if (c->pass.rt[i].id == rtv.id) {
+            if (!rect && !c->rendering) {
+                c->pend_clr |= 1u << i;
+                c->clr[i] = v;
+                return;
+            }
             if (!c->rendering) gpu_vk_pass_open(c);
             gpu_vk__clear(c, i, VK_IMAGE_ASPECT_COLOR_BIT, &v, rect);
             return;
@@ -122,6 +144,12 @@ static inline void gpu_cmd_clear_depth(gpu_cmd* c, gpu_view dsv, uint32_t flags,
     a &= c->view[GPU_HANDLE_INDEX(dsv.id)].aspect;
     if (!a) return;
     if (GPU_VALID(c->pass.ds) && c->pass.ds.id == dsv.id) {
+        if (!rect && !c->rendering) {
+            if (a & VK_IMAGE_ASPECT_DEPTH_BIT) c->clr[4].depthStencil.depth = depth;
+            if (a & VK_IMAGE_ASPECT_STENCIL_BIT) c->clr[4].depthStencil.stencil = stencil;
+            c->pend_clr |= ((a & VK_IMAGE_ASPECT_DEPTH_BIT) ? 16u : 0u) | ((a & VK_IMAGE_ASPECT_STENCIL_BIT) ? 32u : 0u);
+            return;
+        }
         if (!c->rendering) gpu_vk_pass_open(c);
         gpu_vk__clear(c, 0, a, &v, rect);
         return;
@@ -139,7 +167,17 @@ static inline void gpu_cmd_set_layout(gpu_cmd* c, gpu_layout layout)
     c->sets[0] = l->set0_fixed;
     c->have = l->set0_fixed ? 1u : 0u;
     c->set0_stale = l->ndyn != 0;
-    c->dirty = 1;
+    c->dirty = ~0u;
+    c->pc_ok = 0;
+}
+
+/* Depth writes as they should be now, sent only when they change. */
+static inline void gpu_vk__dw(gpu_cmd* c)
+{
+    const uint32_t v = (c->dw && !c->ro_depth) ? 1u : 0u;
+    if (v == c->last_dw) return;
+    c->last_dw = v;
+    c->vk->vkCmdSetDepthWriteEnable(c->cb, v ? VK_TRUE : VK_FALSE);
 }
 
 /* Depth writes are dynamic in the pipelines that write depth (else off in
@@ -149,9 +187,14 @@ static inline void gpu_cmd_set_layout(gpu_cmd* c, gpu_layout layout)
 static inline void gpu_cmd_set_pipeline(gpu_cmd* c, gpu_pipeline pipeline)
 {
     const gpu_vk_pso* const p = &c->pso[pipeline.v - 1u];
-    c->vk->vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p);
+    if (p->p != c->last_pipe || !(c->st_ok & GPU_VK_ST_PIPE)) {
+        c->vk->vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p);
+        c->last_pipe = p->p;
+        c->st_ok |= GPU_VK_ST_PIPE;
+        if (!p->dyn_dw) c->last_dw = 2;   /* the pipeline's own value replaced the dynamic one */
+    }
     c->pipe_dw = p->dyn_dw;
-    if (p->dyn_dw) c->vk->vkCmdSetDepthWriteEnable(c->cb, (c->dw && !c->ro_depth) ? VK_TRUE : VK_FALSE);
+    if (p->dyn_dw) gpu_vk__dw(c);
 }
 
 /* GPU_TOPO_* is D3D_PRIMITIVE_TOPOLOGY, one more than VkPrimitiveTopology's
@@ -160,7 +203,10 @@ static inline void gpu_cmd_set_pipeline(gpu_cmd* c, gpu_pipeline pipeline)
 static inline void gpu_cmd_set_topology(gpu_cmd* c, uint32_t topology)
 {
     const uint32_t strip = topology == GPU_TOPO_LINESTRIP || topology == GPU_TOPO_TRIANGLESTRIP;
-    c->vk->vkCmdSetPrimitiveTopology(c->cb, (VkPrimitiveTopology)(topology - 1u));
+    if (topology != c->last_topo) {
+        c->last_topo = topology;
+        c->vk->vkCmdSetPrimitiveTopology(c->cb, (VkPrimitiveTopology)(topology - 1u));
+    }
     if (strip != c->restart) {
         c->restart = strip;
         c->vk->vkCmdSetPrimitiveRestartEnable(c->cb, strip ? VK_TRUE : VK_FALSE);
@@ -170,14 +216,17 @@ static inline void gpu_cmd_set_topology(gpu_cmd* c, uint32_t topology)
 static inline void gpu_cmd_set_depth_write(gpu_cmd* c, uint32_t on)
 {
     c->dw = on ? 1u : 0u;
-    if (c->pipe_dw) c->vk->vkCmdSetDepthWriteEnable(c->cb, (c->dw && !c->ro_depth) ? VK_TRUE : VK_FALSE);
+    if (c->pipe_dw) gpu_vk__dw(c);
 }
 
 /* gpu_viewport is VkViewport, field for field. The SPIR-V target flips Y in
  * the vertex shader, so D3D12's viewport is Vulkan's as it is. */
 static inline void gpu_cmd_set_viewport(gpu_cmd* c, const gpu_viewport* vp)
 {
-    c->vk->vkCmdSetViewport(c->cb, 0, 1, (const VkViewport*)(const void*)vp);
+    if ((c->st_ok & GPU_VK_ST_VP) && !memcmp(&c->last_vp, vp, sizeof c->last_vp)) return;
+    memcpy(&c->last_vp, vp, sizeof c->last_vp);
+    c->st_ok |= GPU_VK_ST_VP;
+    c->vk->vkCmdSetViewport(c->cb, 0, 1, &c->last_vp);
 }
 
 static inline void gpu_cmd_set_scissor(gpu_cmd* c, const gpu_rect* rect)
@@ -187,6 +236,9 @@ static inline void gpu_cmd_set_scissor(gpu_cmd* c, const gpu_rect* rect)
     r.offset.y = rect->top > 0 ? rect->top : 0;
     r.extent.width = rect->right > r.offset.x ? (uint32_t)(rect->right - r.offset.x) : 0u;
     r.extent.height = rect->bottom > r.offset.y ? (uint32_t)(rect->bottom - r.offset.y) : 0u;
+    if ((c->st_ok & GPU_VK_ST_SC) && !memcmp(&c->last_sc, &r, sizeof r)) return;
+    c->last_sc = r;
+    c->st_ok |= GPU_VK_ST_SC;
     c->vk->vkCmdSetScissor(c->cb, 0, 1, &r);
 }
 
@@ -207,7 +259,7 @@ static inline void gpu_cmd_bind_cb(gpu_cmd* c, uint32_t slot, gpu_addr addr)
         c->key.id[k] = id;
         c->set0_stale = 1;
     }
-    c->dirty = 1;
+    c->dirty |= 1u;
 }
 
 /* A raw buffer runs from the address to the buffer's end: its offset is the
@@ -222,27 +274,36 @@ static inline void gpu_cmd_bind_raw(gpu_cmd* c, uint32_t slot, gpu_addr addr)
         c->key.raw_off[k] = off;
         c->set0_stale = 1;
     }
-    c->dirty = 1;
+    c->dirty |= 1u;
 }
 
 static inline void gpu_cmd_bind_table(gpu_cmd* c, uint32_t slot, gpu_table table)
 {
     const uint32_t s = c->lay->slot[slot].set;
-    c->sets[s] = (VkDescriptorSet)(uintptr_t)table.v;
+    const VkDescriptorSet set = (VkDescriptorSet)(uintptr_t)table.v;
+    if (c->sets[s] == set && (c->have & (1u << s))) return;   /* bound already */
+    c->sets[s] = set;
     c->have |= 1u << s;
-    c->dirty = 1;
+    c->dirty |= 1u << s;
 }
 
+/* Pushed only when a value differs from what the layout's range holds. */
 static inline void gpu_cmd_push_const(gpu_cmd* c, uint32_t slot, uint32_t count, const void* values, uint32_t first)
 {
     const gpu_vk_layout* const l = c->lay;
-    c->vk->vkCmdPushConstants(c->cb, l->pl, l->push_stages, l->slot[slot].push_off + first * 4u, count * 4u, values);
+    const uint32_t off = l->slot[slot].push_off + first * 4u, d0 = off / 4u;
+    if (d0 + count <= GPU_VK_PUSH_DW && count) {
+        const uint32_t m = (count >= 32u ? ~0u : ((1u << count) - 1u)) << d0;
+        if ((c->pc_ok & m) == m && !memcmp(&c->pc[d0], values, count * 4u)) return;
+        memcpy(&c->pc[d0], values, count * 4u);
+        c->pc_ok |= m;
+    }
+    c->vk->vkCmdPushConstants(c->cb, l->pl, l->push_stages, off, count * 4u, values);
 }
 
 static inline void gpu_cmd_push_const1(gpu_cmd* c, uint32_t slot, uint32_t value, uint32_t first)
 {
-    const gpu_vk_layout* const l = c->lay;
-    c->vk->vkCmdPushConstants(c->cb, l->pl, l->push_stages, l->slot[slot].push_off + first * 4u, 4u, &value);
+    gpu_cmd_push_const(c, slot, 1u, &value, first);
 }
 
 /* The stride is the pipeline's (gpu_vertex_layout.stride); the size bounds
@@ -252,14 +313,28 @@ static inline void gpu_cmd_set_vb(gpu_cmd* c, uint32_t slot, gpu_addr addr, uint
     const VkBuffer b = c->buf[GPU_HANDLE_INDEX(GPU_VK_ADDR_ID(addr))];
     const VkDeviceSize off = GPU_VK_ADDR_OFF(addr), sz = size;
     (void)stride;
+    if (slot < GPU_VK_MAX_VB) {
+        if ((c->vb_ok & (1u << slot)) && c->vb_b[slot] == b && c->vb_off[slot] == off && c->vb_sz[slot] == sz) return;
+        c->vb_b[slot] = b;
+        c->vb_off[slot] = off;
+        c->vb_sz[slot] = sz;
+        c->vb_ok |= 1u << slot;
+    }
     c->vk->vkCmdBindVertexBuffers2(c->cb, slot, 1, &b, &off, &sz, NULL);
 }
 
 static inline void gpu_cmd_set_ib(gpu_cmd* c, gpu_addr addr, uint32_t size, gpu_format format)
 {
+    const VkBuffer b = c->buf[GPU_HANDLE_INDEX(GPU_VK_ADDR_ID(addr))];
+    const VkDeviceSize off = GPU_VK_ADDR_OFF(addr);
+    const uint32_t type = format == GPU_FORMAT_R16_UINT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     (void)size;
-    c->vk->vkCmdBindIndexBuffer(c->cb, c->buf[GPU_HANDLE_INDEX(GPU_VK_ADDR_ID(addr))], GPU_VK_ADDR_OFF(addr),
-                                format == GPU_FORMAT_R16_UINT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    if ((c->st_ok & GPU_VK_ST_IB) && c->ib_b == b && c->ib_off == off && c->ib_type == type) return;
+    c->ib_b = b;
+    c->ib_off = off;
+    c->ib_type = type;
+    c->st_ok |= GPU_VK_ST_IB;
+    c->vk->vkCmdBindIndexBuffer(c->cb, b, off, (VkIndexType)type);
 }
 
 static inline void gpu_cmd_draw(gpu_cmd* c, uint32_t vertices, uint32_t instances, uint32_t first_vertex,
@@ -282,8 +357,7 @@ static inline void gpu_cmd_barrier(gpu_cmd* c, gpu_texture texture, gpu_state be
     const uint32_t i = GPU_HANDLE_INDEX(texture.id);
     const gpu_vk_tex* const t = &c->tex[i];
     VkImageMemoryBarrier2 b;
-    VkDependencyInfo di;
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     memset(&b, 0, sizeof b);
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     gpu_vk_state_sync(before, 1, &b.srcStageMask, &b.srcAccessMask);
@@ -297,43 +371,40 @@ static inline void gpu_cmd_barrier(gpu_cmd* c, gpu_texture texture, gpu_state be
     b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
     b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     c->tex_layout[i] = (uint32_t)b.newLayout;
-    memset(&di, 0, sizeof di);
-    di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    di.imageMemoryBarrierCount = 1;
-    di.pImageMemoryBarriers = &b;
-    c->vk->vkCmdPipelineBarrier2(c->cb, &di);
+    c->tex_att[i] = 0;   /* its source scope holds its attachment use */
+    gpu_vk_pend(c, &b, 1, NULL, 0, NULL, 0);
 }
 
 static inline void gpu_cmd_barrier_n(gpu_cmd* c, uint32_t n, const gpu_barrier* list)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_barriers(c, n, list);
 }
 
 static inline void gpu_cmd_copy_texture(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, uint32_t x, uint32_t y,
                                         uint32_t z, gpu_texture src, uint32_t src_sub, const gpu_box* box)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_copy_texture(c, dst, dst_sub, x, y, z, src, src_sub, box);
 }
 
 static inline void gpu_cmd_copy_texture_whole(gpu_cmd* c, gpu_texture dst, gpu_texture src)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_copy_whole(c, dst, src);
 }
 
 static inline void gpu_cmd_copy_buf_to_tex(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub, uint32_t x, uint32_t y,
                                            uint32_t z, gpu_buffer src, const gpu_footprint* from)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_buf_tex(c, 1, dst, dst_sub, x, y, z, src, from, NULL);
 }
 
 static inline void gpu_cmd_copy_tex_to_buf(gpu_cmd* c, gpu_buffer dst, const gpu_footprint* to, gpu_texture src,
                                            uint32_t src_sub, const gpu_box* box)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_buf_tex(c, 0, src, src_sub, 0, 0, 0, dst, to, box);
 }
 
@@ -341,10 +412,11 @@ static inline void gpu_cmd_copy_buffer(gpu_cmd* c, gpu_buffer dst, uint64_t dst_
                                        uint64_t src_offset, uint64_t size)
 {
     VkBufferCopy r;
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     r.srcOffset = src_offset;
     r.dstOffset = dst_offset;
     r.size = size;
+    gpu_vk__sync(c);
     c->vk->vkCmdCopyBuffer(c->cb, c->buf[GPU_HANDLE_INDEX(src.id)], c->buf[GPU_HANDLE_INDEX(dst.id)], 1, &r);
 }
 
@@ -353,13 +425,14 @@ static inline void gpu_cmd_resolve(gpu_cmd* c, gpu_texture dst, uint32_t dst_sub
                                    gpu_format format)
 {
     (void)format;
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
     gpu_vk_rec_resolve(c, dst, dst_sub, src, src_sub);
 }
 
 static inline void gpu_cmd_query_reset(gpu_cmd* c, gpu_query_pool pool, uint32_t first, uint32_t count)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
+    gpu_vk__sync(c);
     c->vk->vkCmdResetQueryPool(c->cb, c->qpool[GPU_HANDLE_INDEX(pool.id)].pool, first, count);
 }
 
@@ -380,7 +453,8 @@ static inline void gpu_cmd_query_end(gpu_cmd* c, gpu_query_pool pool, uint32_t i
 static inline void gpu_cmd_query_resolve(gpu_cmd* c, gpu_query_pool pool, uint32_t first, uint32_t count,
                                          gpu_buffer dst, uint64_t offset)
 {
-    if (c->rendering) gpu_vk__end(c);
+    gpu_vk__close(c);
+    gpu_vk__sync(c);
     c->vk->vkCmdCopyQueryPoolResults(c->cb, c->qpool[GPU_HANDLE_INDEX(pool.id)].pool, first, count,
                                      c->buf[GPU_HANDLE_INDEX(dst.id)], offset, sizeof(uint64_t),
                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);

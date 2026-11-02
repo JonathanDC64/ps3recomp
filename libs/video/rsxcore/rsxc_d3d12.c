@@ -44,6 +44,10 @@ static gpu_device* rc_be_create(const gpu_device_desc* dd) { return gpu_d3d12_cr
 /* A window to present into (rc_backend_init): 0, today's window. */
 static const int rc_be_headless = 0;
 
+/* Step V6: a frame buffer that cannot be made does not fail the start (as
+ * today's; init_d3d12). */
+static const int rc_be_start_strict = 0;
+
 /* D3D12_DRED=1: Device Removed Extended Data, the device's breadcrumbs
  * (auto-breadcrumbs, page faults and the draws' markers, which
  * gpu_fault_report prints once the device is lost). rc_be_lost_hint ends
@@ -64,6 +68,10 @@ static const char* rc_be_lost_text(u32 reason)
     default: return "an unknown reason";
     }
 }
+
+/* A window's surface lost for good (gpu.h's GPU_PRESENT_SURFACE_LOST, step
+ * VC2): never on D3D12, whose swap chains have no surface of their own. */
+static const u32 rc_be_surface_lost = 0;
 
 /* RSX_LOSE_DEVICE_AT_FRAME (lose_device_test): the device removed on purpose
  * at frame `frames`, as a driver reset would lose it. */
@@ -94,16 +102,20 @@ static const int rc_be_cache_files = 1;
 /* The pipeline library's folder in the shader cache: <cache>/gpu/d3d12/
  * (pipelines.lib, pipelines.n, index.built: rsxc_psolib.inc). */
 static const char rc_be_lib_dir[] = "d3d12";
+/* The library's file there (step VC2: Vulkan's is named by its driver). */
+static const char* rc_be_lib_file(gpu_device* d) { (void)d; return "pipelines.lib"; }
 
 /* The shaders: the compile service's dxbc target (gpu_shader.c), today's
  * FXC call and .dxbc cache. A compile (sc_compile) is 1 with the code in
  * *out, else 0 with FXC's message in msg; a load (sc_load) the program the
  * cache holds under key K (the pipeline index's rows); a put
- * (rc_shader_cache_put) compiles a text into the cache. */
+ * (rc_shader_cache_put) compiles a text into the cache. The layout a shader
+ * is bound with is the root signature's business here: dxbc does not use it. */
 static const uint32_t rc_be_shader_code = GPU_CODE_DXBC;
 static int rc_be_sc_compile(gpu_sc_stage stage, const char* src, size_t n, const char* name, const char* entry,
-                            unsigned flags, gpu_sc_blob* out, char* msg, size_t cap)
+                            unsigned flags, const gpu_layout_desc* layout, gpu_sc_blob* out, char* msg, size_t cap)
 {
+    (void)layout;
     return gpu_sc_compile_entry(GPU_SC_DXBC, stage, src, n, name, entry, flags, out, msg, cap) == GPU_SC_OK;
 }
 static int rc_be_sc_load(gpu_sc_stage stage, u64 key, gpu_sc_blob* out)
@@ -114,6 +126,11 @@ static int rc_be_cache_put(gpu_sc_stage stage, const char* hlsl) { return gpu_sc
 
 /* After each present (swap_present): nothing more on D3D12. */
 static void rc_be_presented(gpu_device* d) { (void)d; }
+
+/* The frame slot after an acquire that gave image `image` (rc_acquire): the
+ * image's index itself, as today's (the swap chain has FRAME_COUNT buffers,
+ * one per slot, and its index stays when nothing is presented). */
+static u32 rc_be_frame_slot(u32 prev, u32 image) { (void)prev; return image; }
 
 /* A layout's serialized bytes' hash, part of every pipeline's name in
  * pso_manifest.bin (s_vp_root_hash). */
@@ -255,5 +272,9 @@ const rsx_route rsxc_route_d3d12 = {
 };
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
+
+/* ---- step VM ---- */
+/* The overlay v2's calls (rsx_out.h; rsxc_api.inc). */
+const rsx_route_gpu rsxc_route_gpu_d3d12 = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
 
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */

@@ -133,13 +133,20 @@ int gpu_sc_put(gpu_sc_target target, gpu_sc_stage stage, const char* src);
  * or read from the cache, which holds glslang's output), so a backend can
  * leave out what its device lacks: set them before compiling. The default
  * is all but BASE_VERTEX (every draw today starts at vertex 0, where the two
- * agree); RSX_SPV_NOCONTRACT=0 leaves NoContraction out (an A/B knob). */
+ * agree) and FETCH_CLAMP; RSX_SPV_NOCONTRACT=0 leaves NoContraction out
+ * (an A/B knob). */
 #define GPU_SC_SPV_FLOAT_PRESERVE  1u   /* SignedZeroInfNanPreserve 32 (shaderSignedZeroInfNanPreserveFloat32) */
 #define GPU_SC_SPV_DENORM_PRESERVE 2u   /* DenormPreserve 32 (shaderDenormPreserveFloat32) */
 #define GPU_SC_SPV_NO_CONTRACT     4u   /* NoContraction on float arithmetic: no fused multiply-add */
 #define GPU_SC_SPV_INVARIANT       8u   /* Invariant on the position output */
 #define GPU_SC_SPV_BASE_VERTEX     16u  /* SV_VertexID as D3D12's: VertexIndex - BaseVertex (shaderDrawParameters) */
-#define GPU_SC_SPV_ALL             31u
+/* Not a post-pass: edit E3, the vertex fetch's loads kept inside t20 by the
+ * shader, for a device whose out-of-range reads don't give D3D12's zero (no
+ * robustBufferAccess2). It changes the text, so its modules are other cache
+ * files (the key's E3 version is 0 without it). Off by default: setup's
+ * pass makes the form robustness2 needs. */
+#define GPU_SC_SPV_FETCH_CLAMP     32u
+#define GPU_SC_SPV_ALL             63u
 #define GPU_SC_SPV_DEFAULT         15u
 void gpu_sc_spv_set_options(unsigned opts);
 unsigned gpu_sc_spv_options(void);

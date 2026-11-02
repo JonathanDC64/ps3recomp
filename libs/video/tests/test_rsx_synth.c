@@ -4,6 +4,10 @@
  * backend's stream hash, against a golden list.
  *
  *   test_rsx_synth [--update-golden] [--keep] [--out <dir>] [--env NAME=VALUE]...
+ *   test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...
+ *   test_rsx_synth --route vulkan --fallback <step>|mark [...]   the start falls back to today's renderer
+ *   test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...
+ *                                   the new path's pipeline stores (stores_test says how)
  *   test_rsx_synth --caps <dir>     only write the scenes' captures (for rsx_replay)
  *   test_rsx_synth --run <dir>      the child the test starts: plays them
  *
@@ -54,18 +58,48 @@
  *   RSX_BACKEND=null rsx_replay <the captures> <the captures again> 1
  * prints the second pass's last hash as its last present line.
  *
- * Windows only, as the null route (rsxc_null.c).
+ * --route vulkan plays the same chain on the Vulkan route (rsxc_vk.c), in
+ * one child, with the validation layer on (RSX_VK_VALIDATION=1, with
+ * synchronization validation). There is no stream hash there; it passes
+ * when every frame played, the child got to the end, the layer was there
+ * (--no-validation runs without it) and it said nothing: any validation
+ * message fails. --env RSX_VK_MASK=<bits> runs the backend's fallbacks.
+ *
+ * --route vulkan --fallback <step> asks for Vulkan with the start made to
+ * fail at that step (RSX_FAIL_START_AT, rsxc_init.inc's steps), and
+ * --fallback mark with a start mark left (RSX_STATE_DIR/renderer_starting,
+ * a start that did not finish): the route switch must say why and start
+ * today's renderer in Vulkan's place (rsx_out.c, step V6), which plays the
+ * same chain; the mark must be gone at the end. Every Vulkan run has
+ * RSX_STATE_DIR, so the plain one checks the mark goes at the first present.
+ *
+ * Windows and Linux, as the null route (rsxc_null.c). The child plays
+ * through the route switch (rsx_out.c, RSX_BACKEND) on Windows and in
+ * Linux's vkd3d builds (PS3RECOMP_RSX_D3D12_VKD3D: the switch with today's
+ * renderer on vkd3d); a Linux build without vkd3d has no switch, and the
+ * child calls the route's table (rsxc_route_null, rsxc_route_vk) itself
+ * (no --fallback there). The hashes are the same on both: one golden list.
  */
-#if defined(PS3RECOMP_RSX_HAL) && defined(_WIN32)
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__))
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "rsx_commands.h"           /* rsx_state, NV4097 methods */
 #include "cellGcmSys.h"             /* CellGcmConfig, CellGcmDisplayInfo: capture sections */
@@ -73,6 +107,9 @@
 #include "rsx_fp_decompiler.h"      /* rsx_fp_program_size, rsx_fp_texture_units */
 #include "rsxcore/rsxc_shader.h"    /* rsxc_shader_hlsl: does a program decompile */
 #include "rsx_prog_gen.h"           /* the seeded program generator */
+#ifndef MAX_PATH
+#define MAX_PATH 4096
+#endif
 
 /* What the runtime library expects from a game's loader. No guest code runs. */
 uint8_t* vm_base = NULL;
@@ -96,22 +133,24 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0x36051ca52a5fffaaull, 0xc31ac4564fbe079full },
-    { "draws",     0xa7ba76be99884fe3ull, 0xec5cfd8d2ff830fdull },
-    { "states",    0xbb47e5374abb2605ull, 0x80048e8a62527110ull },
-    { "textures",  0xe9662a21292240a7ull, 0xd3b9c4e6502a78a3ull },
-    { "offscreen", 0x0a2dc318b59ff233ull, 0x8833caea42ea5fc0ull },
-    { "zpass",     0xaaa70f5fdadde81aull, 0x9fb362330df35148ull },
-    { "frames",    0x7513073b1e2ba8beull, 0xe36b6ddac7a20266ull },
-    { "mainmem",   0xcf70025a99857609ull, 0x0798f184c9ed0965ull },
+    { "clears",    0xe6eda6f3fa074e52ull, 0x07bbb9ef68f4987dull },
+    { "draws",     0xf785e8c197a89c9full, 0xccd1ed7af6d6186dull },
+    { "states",    0xbeec242ec0ddd572ull, 0xe0c29658ddf2d9d3ull },
+    { "textures",  0x90436c8bc63df033ull, 0x2dfecd766b1ecb56ull },
+    { "offscreen", 0xa9acdc876a531e2bull, 0x7000e8424fd96c05ull },
+    { "zpass",     0x872f1774ccf8722full, 0x5df22583bed540cbull },
+    { "frames",    0x4e7434cd674421bbull, 0xae2888f039e2ccdbull },
+    { "mainmem",   0x33ccdb82857df2bdull, 0xbbb654e4d21b9a5bull },
 };
 
 /* ---------------------------------------------------------------------------
  * Guest memory, as rsx_replay sets it up: the 4 GB guest space reserved,
- * pages committed on first touch (reads of untouched memory see zero).
+ * pages committed on first touch (reads of untouched memory see zero). On
+ * Linux an anonymous mapping without reserve does the same by itself.
  * -------------------------------------------------------------------------*/
 #define VM_SPAN 0x100010000ull
 
+#ifdef _WIN32
 static LONG WINAPI commit_on_touch(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
@@ -121,6 +160,85 @@ static LONG WINAPI commit_on_touch(EXCEPTION_POINTERS* ep)
     return VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE) ? EXCEPTION_CONTINUE_EXECUTION
                                                                    : EXCEPTION_CONTINUE_SEARCH;
 }
+
+static int vm_reserve(void)
+{
+    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SPAN, MEM_RESERVE, PAGE_READWRITE);
+    if (!vm_base) return 0;
+    AddVectoredExceptionHandler(1, commit_on_touch);
+    return 1;
+}
+#else
+static int vm_reserve(void)
+{
+    void* const p = mmap(NULL, VM_SPAN, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return 0;
+    vm_base = (uint8_t*)p;
+    return 1;
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * The few system calls the test makes, on both systems.
+ * -------------------------------------------------------------------------*/
+#ifdef _WIN32
+static void dir_make(const char* d) { CreateDirectoryA(d, NULL); }
+static void file_del(const char* f) { DeleteFileA(f); }
+static void dir_del(const char* d)  { RemoveDirectoryA(d); }
+static void env_set(const char* name, const char* v) { _putenv_s(name, v); }
+static int  self_exe(char* out, size_t cap) { return GetModuleFileNameA(NULL, out, (DWORD)cap) != 0; }
+#else
+static void dir_make(const char* d) { mkdir(d, 0777); }
+static void file_del(const char* f) { unlink(f); }
+static void dir_del(const char* d)  { rmdir(d); }
+static void env_set(const char* name, const char* v) { setenv(name, v, 1); }
+static int  self_exe(char* out, size_t cap)
+{
+    const ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+    if (n <= 0) return 0;
+    out[n] = 0;
+    return 1;
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * The route the child plays on, as RSX_BACKEND names it: through the route
+ * switch where the build has one, else the core's table itself (the file's
+ * comment says why). ROUTE(f) is the route's function f.
+ * -------------------------------------------------------------------------*/
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+extern volatile uint32_t gpu_vk_n_validation_all;   /* gpu_vk.c: the layer's messages, every device's */
+#endif
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+#define SYNTH_SWITCH 1
+#define ROUTE(f) rsx_out_##f
+static int route_open(const char* name) { (void)name; return 1; }
+static const char* route_name(void) { return rsx_out_renderer(); }
+static const char* route_why(void)
+{
+    const char* why = NULL;
+    rsx_out_renderer_info(&why);
+    return why;
+}
+#else
+#define SYNTH_SWITCH 0
+extern const rsx_route rsxc_route_null;
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+extern const rsx_route rsxc_route_vk;
+#endif
+static const rsx_route* g_route;
+#define ROUTE(f) g_route->f
+static int route_open(const char* name)
+{
+    if (!strcmp(name, "null")) g_route = &rsxc_route_null;
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+    else if (!strcmp(name, "vulkan")) g_route = &rsxc_route_vk;
+#endif
+    return g_route != NULL;
+}
+static const char* route_name(void) { return g_route->name; }
+static const char* route_why(void) { return NULL; }
+#endif
 
 /* ---------------------------------------------------------------------------
  * The guest's memory map. RSX offsets are local memory (guest 0xC0000000 +
@@ -919,7 +1037,7 @@ static void cap_path(char* out, size_t cap, const char* dir, int s, int k)
 static int caps_write(const char* dir)
 {
     rsx_state_init(&g_st0);
-    CreateDirectoryA(dir, NULL);
+    dir_make(dir);
     if (!programs_make()) return 0;
     for (int s = 0; s < NSCENES; s++)
         for (int k = 0; k < k_scene[s].frames; k++) {
@@ -933,7 +1051,8 @@ static int caps_write(const char* dir)
 }
 
 /* ---------------------------------------------------------------------------
- * The child: every capture, twice over, through the null route.
+ * The child: every capture, twice over, through the null route (or the
+ * Vulkan route, RSX_BACKEND=vulkan).
  * -------------------------------------------------------------------------*/
 static int play(const char* path)
 {
@@ -943,28 +1062,60 @@ static int play(const char* path)
     cellGcm_replay_reset();
     for (int i = 0; i < n; i++) cellGcm_replay_method(m[2 * i], m[2 * i + 1]);
     free(m);
-    rsx_out_backend_present();
-    rsx_out_backend_pump_messages();
+    ROUTE(backend_present)();
+    ROUTE(backend_pump_messages)();
     return 1;
 }
 
 static int child_main(const char* dir)
 {
     setvbuf(stdout, NULL, _IONBF, 0);   /* in order with the backend's stderr */
-    _putenv_s("RSX_BACKEND", "null");
-    if (!getenv("RSX_PRESENT")) _putenv_s("RSX_PRESENT", "1");
+    const char* be = getenv("RSX_BACKEND");
+    const char* const want = be && !strcmp(be, "vulkan") ? "vulkan" : be && !strcmp(be, "hal-d3d12") ? "hal-d3d12"
+                                                                                                     : "null";
+    env_set("RSX_BACKEND", want);
+    if (!getenv("RSX_PRESENT")) env_set("RSX_PRESENT", "1");
+    if (!route_open(want)) { fprintf(stderr, "test_rsx_synth: no %s route in this build\n", want); return 3; }
     char caps[MAX_PATH];
-    CreateDirectoryA(dir, NULL);
+    dir_make(dir);
     snprintf(caps, sizeof caps, "%s/caps", dir);
     if (!caps_write(caps)) return 3;
-    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SPAN, MEM_RESERVE, PAGE_READWRITE);
-    if (!vm_base) { fprintf(stderr, "test_rsx_synth: cannot reserve the guest space\n"); return 3; }
-    AddVectoredExceptionHandler(1, commit_on_touch);
-    if (rsx_out_backend_init(DISP_W, DISP_H, "test_rsx_synth") != 0 || strcmp(rsx_out_renderer(), "null")) {
-        fprintf(stderr, "test_rsx_synth: the null route did not start\n");
+    if (!vm_reserve()) { fprintf(stderr, "test_rsx_synth: cannot reserve the guest space\n"); return 3; }
+    /* SYNTH_ROUTE: the route the start must end on, when not the one asked
+     * for (--fallback: d3d12). */
+    const char* const end = getenv("SYNTH_ROUTE") ? getenv("SYNTH_ROUTE") : want;
+    if (ROUTE(backend_init)(DISP_W, DISP_H, "test_rsx_synth") != 0 || strcmp(route_name(), end)) {
+        fprintf(stderr, "test_rsx_synth: the %s route did not start\n", end);
         return 3;
     }
-    for (int p = 1; p <= NPASSES; p++)
+    const char* const why = route_why();
+    printf("[synth] route %s%s%s\n", route_name(), why ? ": " : "", why ? why : "");
+    /* --stores: pipeline index rows to hand over (RSX_SYNTH_ROWS, a rows
+     * file as rsx_replay's RSX_REPLAY_INDEX takes), and RSX_SYNTH_PLAY=0: no
+     * frames, only the start's builds (with PS3_PSO_WAIT=1). */
+    if (getenv("RSX_SYNTH_ROWS")) {
+        FILE* f = fopen(getenv("RSX_SYNTH_ROWS"), "rb");
+        if (!f) { fprintf(stderr, "test_rsx_synth: cannot read %s\n", getenv("RSX_SYNTH_ROWS")); return 3; }
+        char line[256];
+        unsigned rows = 0;
+        unsigned long long hash = 0;
+        while (fgets(line, sizeof line, f)) {
+            int fetch, clamp, nrt;
+            unsigned long long vk, pk;
+            unsigned blend, rtfmt, cmask, cull, depth;
+            if (sscanf(line, "add %d %llx %d %llx %x %d %x %x %x %x", &fetch, &vk, &clamp, &pk, &blend, &nrt, &rtfmt,
+                       &cmask, &cull, &depth) == 10) {
+                ROUTE(pso_index_add)(fetch, vk, clamp, pk, blend, nrt, rtfmt, cmask, cull, depth);
+                rows++;
+            } else
+                (void)sscanf(line, "ready %llx", &hash);
+        }
+        fclose(f);
+        ROUTE(pso_index_ready)(hash);
+        printf("[synth] rows %u\n", rows);
+    }
+    const int nplay = getenv("RSX_SYNTH_PLAY") && !atoi(getenv("RSX_SYNTH_PLAY")) ? 0 : NPASSES;
+    for (int p = 1; p <= nplay; p++)
         for (int s = 0; s < NSCENES; s++)
             for (int k = 0; k < k_scene[s].frames; k++) {
                 char path[MAX_PATH];
@@ -973,26 +1124,37 @@ static int child_main(const char* dir)
                 if (!play(path)) return 3;
             }
     printf("[synth] shutdown\n");
-    rsx_out_backend_shutdown();
+    ROUTE(backend_shutdown)();
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+    if (!strcmp(want, "vulkan")) printf("[synth] validation messages %u\n", (unsigned)gpu_vk_n_validation_all);
+#endif
     printf("[synth] done\n");
     fflush(stdout);
     fflush(stderr);
     /* The backend's threads go with the process, as rsx_replay's do. */
+#ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), 0);
+#else
+    _exit(0);
+#endif
     return 0;
 }
 
 /* ---------------------------------------------------------------------------
  * The test: two children, their logs and the first one's dump.
  * -------------------------------------------------------------------------*/
+#ifdef _WIN32
 static int env_cmp(const void* a, const void* b) { return _stricmp(*(const char* const*)a, *(const char* const*)b); }
 
-/* The child's environment: the system's variables from ours, then extra
- * (NAME=VALUE each). */
+/* The child's environment: the system's variables from ours (with what finds
+ * the Vulkan driver and layers, such as the SDK's VK_ADD_LAYER_PATH), then
+ * extra (NAME=VALUE each). */
 static char* env_block(const char* const* extra, int nextra)
 {
     static const char* const keep[] = { "SystemRoot", "SystemDrive", "windir", "PATH", "PATHEXT", "TEMP", "TMP",
-                                        "ComSpec", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE" };
+                                        "ComSpec", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+                                        "VK_ICD_FILENAMES", "VK_DRIVER_FILES", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH",
+                                        "VK_LOADER_LAYERS_DISABLE" };
     enum { NKEEP = sizeof keep / sizeof keep[0] };
     char* items[NKEEP + 64];
     int n = 0;
@@ -1026,7 +1188,7 @@ static char* env_block(const char* const* extra, int nextra)
 static int run_child(const char* exe, const char* dir, const char* const* extra, int nextra)
 {
     char log[MAX_PATH], cmd[3 * MAX_PATH];
-    CreateDirectoryA(dir, NULL);
+    dir_make(dir);
     snprintf(log, sizeof log, "%s/log.txt", dir);
     SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
     HANDLE h = CreateFileA(log, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1058,6 +1220,70 @@ static int run_child(const char* exe, const char* dir, const char* const* extra,
     CloseHandle(h);
     return code;
 }
+#else
+/* The child's environment: the system's variables from ours (with what finds
+ * the display and the Vulkan driver), then extra (NAME=VALUE each). */
+static char** env_list(const char* const* extra, int nextra)
+{
+    static const char* const keep[] = { "PATH", "HOME", "TMPDIR", "LANG", "LD_LIBRARY_PATH", "DISPLAY",
+                                        "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XAUTHORITY", "VK_ICD_FILENAMES",
+                                        "VK_DRIVER_FILES", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH" };
+    enum { NKEEP = sizeof keep / sizeof keep[0] };
+    char** items = (char**)calloc(NKEEP + 64 + 1, sizeof *items);
+    if (!items) exit(2);
+    int n = 0;
+    for (int i = 0; i < NKEEP; i++) {
+        const char* v = getenv(keep[i]);
+        if (!v) continue;
+        const size_t sz = strlen(keep[i]) + 1 + strlen(v) + 1;
+        items[n] = (char*)malloc(sz);
+        if (!items[n]) exit(2);
+        snprintf(items[n++], sz, "%s=%s", keep[i], v);
+    }
+    for (int i = 0; i < nextra && n < NKEEP + 64; i++) items[n++] = strdup(extra[i]);
+    return items;
+}
+
+/* Runs the child into dir (its log at dir/log.txt); its exit code, or -1. */
+static int run_child(const char* exe, const char* dir, const char* const* extra, int nextra)
+{
+    char log[MAX_PATH];
+    dir_make(dir);
+    snprintf(log, sizeof log, "%s/log.txt", dir);
+    const int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { printf("[synth] cannot write %s\n", log); return -1; }
+    char** env = env_list(extra, nextra);
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const int in = open("/dev/null", O_RDONLY);
+        if (in >= 0) dup2(in, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        alarm(600);   /* ten minutes is far more than the scenes take; then the child is stuck */
+        char* const argv[] = { (char*)exe, (char*)"--run", (char*)dir, NULL };
+        execve(exe, argv, env);
+        _exit(127);
+    }
+    close(fd);
+    int code = -1;
+    if (pid > 0) {
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+        if (WIFEXITED(st))
+            code = WEXITSTATUS(st);
+        else if (WIFSIGNALED(st)) {
+            if (WTERMSIG(st) == SIGALRM) printf("[synth] the child in %s did not finish in 10 minutes: stopped\n", dir);
+            else printf("[synth] the child in %s died of signal %d\n", dir, WTERMSIG(st));
+            code = 128 + WTERMSIG(st);
+        }
+    } else
+        printf("[synth] cannot start %s (error %d)\n", exe, errno);
+    for (char** p = env; *p; p++) free(*p);
+    free(env);
+    return code;
+}
+#endif
 
 static char* read_file(const char* path, size_t* len)
 {
@@ -1085,6 +1311,10 @@ typedef struct {
     unsigned failed;     /* at the last present */
     int played;          /* frames begun */
     char first_check[256];
+    int vk_seen, no_layer;   /* the Vulkan route: its count line; "no validation layer" */
+    unsigned vk_msgs;        /* the validation layer's messages, by the count line */
+    char first_vk[512];      /* the first message, and its text's line */
+    char route[256];         /* the child's route line, after "[synth] route " */
 } Run;
 
 static int frame_index(int s, int k)
@@ -1120,6 +1350,19 @@ static int run_parse(const char* dir, Run* r)
         } else if (strstr(line, "[GPU null]") && strstr(line, "checks failed")) {
             r->shutdown_fail = 1;
             if (!r->first_check[0]) snprintf(r->first_check, sizeof r->first_check, "%s", line);
+        } else if (sscanf(line, "[synth] validation messages %u", &n) == 1) {
+            r->vk_seen = 1;
+            r->vk_msgs = n;
+        } else if (!strncmp(line, "[VK] error:", 11) || !strncmp(line, "[VK] warning:", 13)) {
+            if (!r->first_vk[0]) {   /* (its text is the next line, indented) */
+                const char* tx = next ? next + strspn(next, " ") : "";
+                const size_t tn = strcspn(tx, "\r\n");
+                snprintf(r->first_vk, sizeof r->first_vk, "%.200s %.*s", line, (int)(tn < 300 ? tn : 300), tx);
+            }
+        } else if (strstr(line, "RSX_VK_VALIDATION: no ")) {
+            r->no_layer = 1;
+        } else if (!strncmp(line, "[synth] route ", 14)) {
+            snprintf(r->route, sizeof r->route, "%.*s", (int)strcspn(line + 14, "\r"), line + 14);
         } else if (!strncmp(line, "[synth] done", 12))
             r->done = 1;
         line = next;
@@ -1200,25 +1443,465 @@ static void out_remove(const char* out)
     for (int i = 0; i < 2; i++) {
         char d[MAX_PATH], f[MAX_PATH];
         snprintf(d, sizeof d, "%s/%s", out, sub[i]);
-        snprintf(f, sizeof f, "%s/log.txt", d); DeleteFileA(f);
-        snprintf(f, sizeof f, "%s/dump.txt", d); DeleteFileA(f);
+        snprintf(f, sizeof f, "%s/log.txt", d); file_del(f);
+        snprintf(f, sizeof f, "%s/dump.txt", d); file_del(f);
         snprintf(f, sizeof f, "%s/caps", d);
         for (int s = 0; s < NSCENES; s++)
             for (int k = 0; k < k_scene[s].frames; k++) {
                 char c[MAX_PATH];
                 cap_path(c, sizeof c, f, s, k);
-                DeleteFileA(c);
+                file_del(c);
             }
-        RemoveDirectoryA(f);
-        RemoveDirectoryA(d);
+        dir_del(f);
+        dir_del(d);
     }
-    RemoveDirectoryA(out);
+    dir_del(out);
 }
+
+static int file_there(const char* f)
+{
+    FILE* x = fopen(f, "rb");
+    if (x) fclose(x);
+    return x != NULL;
+}
+
+/* --route vulkan: one child on the Vulkan route, with the validation layer
+ * unless validation is 0. The shader cache is off, so every program goes
+ * through the spv target in every run. fallback (--fallback): NULL, a start
+ * step to fail at, or "mark"; the child must then end on d3d12, saying why. */
+static int vk_test(const char* exe, const char* out, const char* const* user, int nuser, int validation, int keep,
+                   const char* fallback)
+{
+    const char* e[60];
+    int n = 0;
+    e[n++] = "RSX_BACKEND=vulkan";
+    e[n++] = "RSX_PRESENT=1";
+    e[n++] = "PS3_SHADER_CACHE=0";
+    if (validation) e[n++] = "RSX_VK_VALIDATION=1";
+    e[n++] = "PSO_THREADS=4";
+    e[n++] = "VP_FETCH_THREADS=2";
+    /* The start mark's folder (rsx_out.c): empty, or the mark alone with
+     * --fallback mark. */
+    char state[MAX_PATH], mark[MAX_PATH + 32], state_env[MAX_PATH + 16], fail_env[96];
+    snprintf(state, sizeof state, "%s/state", out);
+    snprintf(mark, sizeof mark, "%s/renderer_starting", state);
+    snprintf(state_env, sizeof state_env, "RSX_STATE_DIR=%s", state);
+    dir_make(state);
+    file_del(mark);
+    e[n++] = state_env;
+    if (fallback) {
+        e[n++] = "SYNTH_ROUTE=d3d12";
+        if (!strcmp(fallback, "mark")) {
+            FILE* f = fopen(mark, "wb");
+            if (f) fclose(f);
+        } else {
+            snprintf(fail_env, sizeof fail_env, "RSX_FAIL_START_AT=%s", fallback);
+            e[n++] = fail_env;
+        }
+    }
+    const char* mask = "none";
+    for (int i = 0; i < nuser; i++) {
+        e[n++] = user[i];
+        if (!strncmp(user[i], "RSX_VK_MASK=", 12)) mask = user[i] + 12;
+    }
+    char da[MAX_PATH];
+    snprintf(da, sizeof da, "%s/a", out);
+    Run r;
+    memset(&r, 0, sizeof r);
+    r.code = run_child(exe, da, e, n);
+
+    int ok = 1;
+    const int nf = frames_total();
+    if (!run_parse(da, &r)) {
+        printf("[synth] FAIL: no log in %s\n", da);
+        ok = 0;
+    } else {
+        if (r.code != 0 || !r.done) {
+            printf("[synth] FAIL: the child in %s ended with %d, %s (see %s/log.txt)\n", da, r.code,
+                   r.done ? "done" : "not done", da);
+            ok = 0;
+        }
+        if (r.played != NPASSES * nf) {
+            printf("[synth] FAIL: the child in %s played %d frames of %d\n", da, r.played, NPASSES * nf);
+            ok = 0;
+        }
+        if (validation && r.no_layer) {
+            printf("[synth] FAIL: no validation layer (VK_LAYER_KHRONOS_validation); --no-validation runs without it\n");
+            ok = 0;
+        }
+        if (r.done && !r.vk_seen) {
+            printf("[synth] FAIL: the child gave no count of validation messages\n");
+            ok = 0;
+        }
+        if (r.vk_msgs || r.first_vk[0]) {
+            printf("[synth] FAIL: %u validation messages; the first: %s\n", r.vk_msgs, r.first_vk);
+            ok = 0;
+        }
+        /* The route, and why when it is d3d12: the step's name in brackets
+         * (rsx_out.c's step_words), or the mark's reason. */
+        char want[96];
+        if (!fallback) snprintf(want, sizeof want, "vulkan");
+        else if (!strcmp(fallback, "mark")) snprintf(want, sizeof want, "d3d12: the last start on Vulkan did not finish");
+        else snprintf(want, sizeof want, "(%s)", fallback);
+        const int route_ok = !fallback ? !strcmp(r.route, "vulkan")
+                                       : !strncmp(r.route, "d3d12: ", 7) && strstr(r.route, want) != NULL;
+        if (!route_ok) {
+            printf("[synth] FAIL: the child's route is \"%s\", not %s\"%s\"\n", r.route[0] ? r.route : "(none)",
+                   fallback ? "d3d12 with " : "", want);
+            ok = 0;
+        }
+        if (file_there(mark)) {
+            printf("[synth] FAIL: the start mark %s is still there at the end\n", mark);
+            ok = 0;
+        }
+    }
+    file_del(mark);
+    dir_del(state);
+    if (ok && fallback) {
+        printf("[synth] PASS: RSX_BACKEND=vulkan with %s%s went to d3d12 (\"%s\"), which played %d scenes, %d frames a "
+               "pass, %d passes; the mark gone; %s\n", strcmp(fallback, "mark") ? "the start failing at " : "",
+               strcmp(fallback, "mark") ? fallback : "a start mark left", r.route + 7, NSCENES, nf, NPASSES,
+               validation ? "0 validation messages" : "validation off");
+        if (!keep) out_remove(out);
+        return 0;
+    }
+    if (ok) {
+        printf("[synth] PASS: the Vulkan route played %d scenes, %d frames a pass, %d passes; %s; RSX_VK_MASK %s%s\n",
+               NSCENES, nf, NPASSES, validation ? "0 validation messages" : "validation off", mask,
+               SYNTH_SWITCH ? "; through the route switch, the start mark gone" : "");
+        if (!keep) out_remove(out);
+        return 0;
+    }
+    /* The child's last lines, but for the play marks and the decompiler's notes. */
+    char log[MAX_PATH];
+    snprintf(log, sizeof log, "%s/log.txt", da);
+    char* t = read_file(log, NULL);
+    if (t) {
+        const char* keep[24];
+        int nk = 0;
+        for (char* line = t; line && *line; ) {
+            char* next = strchr(line, '\n');
+            if (next) *next++ = 0;
+            if (strncmp(line, "[synth] play", 12) && strncmp(line, "[FP]", 4)) {
+                if (nk == 24) { memmove(keep, keep + 1, sizeof keep - sizeof keep[0]); nk--; }
+                keep[nk++] = line;
+            }
+            line = next;
+        }
+        printf("[synth] the child's last lines:\n");
+        for (int i = 0; i < nk; i++) printf("    %s\n", keep[i]);
+        free(t);
+    }
+    printf("[synth] FAILED. The log and the captures are in %s\n", out);
+    return 1;
+}
+
+#ifdef _WIN32
+/* ---------------------------------------------------------------------------
+ * --stores <vulkan|hal-d3d12>: the new path's pipeline stores (step P3S) on a
+ * real device, over the same chain, in seven children with
+ * PS3_SHADER_CACHE set and PS3_PSO_WAIT=1 (the start's builds run to their
+ * end). The cache's library is gpu/d3d12/pipelines.lib, or Vulkan's
+ * gpu/vulkan/<driver>.vkpc; the neutral manifest gpu/manifest.bin
+ * (rsxc_psolib.inc's records: 56 bytes, "GNM1").
+ *   A  an empty cache: the chain makes pipelines; the manifest holds M
+ *      records, all whole, none twice.
+ *   B  A's cache, its manifest with a torn record at its end: the tail is
+ *      cut (M records again) and the chain compiles no pipeline.
+ *   C  a cache with A's shaders and manifest only, no frames: the start
+ *      builds the M records, none fails.
+ *   D  C's cache: the chain compiles no guest-FP pipeline (the records are
+ *      the draws' pipelines), and nothing is left to build.
+ *   E  A's shaders only, and A's records handed over as pipeline index rows,
+ *      no frames: all M rows map to a pipeline (none not built), and the
+ *      index is marked built (gpu/<dir>/index.built).
+ *   F  E's cache: no guest-FP pipeline compiled.
+ *   G  A's cache, its library made another driver's (a byte of the file
+ *      changed), no frames: the library starts empty, and the M records are
+ *      built again.
+ * -------------------------------------------------------------------------*/
+#define GM_SIZE  56u
+#define GM_MAGIC 0x314D4E47u
+
+typedef struct {
+    int code, done;
+    long loaded, compiled, fp_loaded, fp_compiled;    /* "pipelines this run" (-1: no line) */
+    long mb[4], ix[4];         /* the manifest's and the index's builds: built, there already, not built, of */
+    long gm_recs, gm_build;    /* "pipeline manifest gpu/manifest.bin: %u records, %u to build" */
+    long torn;                 /* "keeping the first %u whole records" */
+    int lib_new;
+} StoreRun;
+
+static void store_parse(const char* dir, StoreRun* r)
+{
+    char log[MAX_PATH];
+    snprintf(log, sizeof log, "%s/log.txt", dir);
+    r->loaded = r->compiled = r->fp_loaded = r->fp_compiled = -1;
+    r->gm_recs = r->gm_build = r->torn = -1;
+    for (int i = 0; i < 4; i++) r->mb[i] = r->ix[i] = -1;
+    char* t = read_file(log, NULL);
+    for (char* line = t; line && *line; ) {
+        char* next = strchr(line, '\n');
+        if (next) *next++ = 0;
+        unsigned a, b;
+        if (sscanf(line, "[D3D12] pipelines this run: %ld loaded from the library, %ld compiled; guest FP: %ld loaded, "
+                         "%ld compiled", &r->loaded, &r->compiled, &r->fp_loaded, &r->fp_compiled) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline manifest build: %ld built, %ld there already, %ld not built, of %ld",
+                          &r->mb[0], &r->mb[1], &r->mb[2], &r->mb[3]) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline index: %ld built, %ld there already, %ld not built, of %ld",
+                          &r->ix[0], &r->ix[1], &r->ix[2], &r->ix[3]) == 4) {
+        } else if (sscanf(line, "[D3D12] pipeline manifest gpu/manifest.bin: %u records, %u to build", &a, &b) == 2) {
+            r->gm_recs = a; r->gm_build = b;
+        } else if (sscanf(line, "[D3D12] pipeline manifest gpu/manifest.bin: keeping the first %u whole", &a) == 1) {
+            r->torn = a;
+        } else if (!strncmp(line, "[D3D12] pipeline library: new", 29)) {
+            r->lib_new = 1;
+        } else if (!strncmp(line, "[synth] done", 12))
+            r->done = 1;
+        line = next;
+    }
+    free(t);
+}
+
+/* The manifest's records (NULL with *n -1 when the file is not whole). */
+static uint8_t* gm_read(const char* cache, long* n)
+{
+    char p[MAX_PATH];
+    snprintf(p, sizeof p, "%s/gpu/manifest.bin", cache);
+    size_t len = 0;
+    char* b = read_file(p, &len);
+    *n = -1;
+    if (!b) return NULL;
+    if (len % GM_SIZE) { free(b); return NULL; }
+    for (size_t o = 0; o < len; o += GM_SIZE) {
+        uint32_t m, s;
+        memcpy(&m, b + o, 4);
+        memcpy(&s, b + o + 4, 4);
+        if (m != GM_MAGIC || s != GM_SIZE) { free(b); return NULL; }
+        for (size_t q = 0; q < o; q += GM_SIZE)
+            if (!memcmp(b + q, b + o, GM_SIZE)) { free(b); return NULL; }   /* (none twice) */
+    }
+    *n = (long)(len / GM_SIZE);
+    return (uint8_t*)b;
+}
+
+/* Copies dir src's files matching pat into dst (made). */
+static int copy_files(const char* src, const char* pat, const char* dst)
+{
+    char q[MAX_PATH];
+    snprintf(q, sizeof q, "%s/%s", src, pat);
+    dir_make(dst);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(q, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int n = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char a[MAX_PATH], b[MAX_PATH];
+        snprintf(a, sizeof a, "%s/%s", src, fd.cFileName);
+        snprintf(b, sizeof b, "%s/%s", dst, fd.cFileName);
+        if (CopyFileA(a, b, FALSE)) n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+/* A cache's shaders (the route's target's files) into a new cache. */
+static int copy_shaders(const char* route, const char* src, const char* dst)
+{
+    dir_make(dst);
+    if (strcmp(route, "vulkan")) return copy_files(src, "*.dxbc", dst);
+    char a[MAX_PATH], b[MAX_PATH];
+    snprintf(a, sizeof a, "%s/gpu/spv", src);
+    snprintf(b, sizeof b, "%s/gpu", dst);
+    dir_make(b);
+    snprintf(b, sizeof b, "%s/gpu/spv", dst);
+    return copy_files(a, "*.spv", b);
+}
+/* The library's file in a cache (the first of the route's), "" if none. */
+static void lib_file(const char* route, const char* cache, char* out, size_t cap)
+{
+    char d[MAX_PATH];
+    const int vk = !strcmp(route, "vulkan");
+    snprintf(d, sizeof d, "%s/gpu/%s", cache, vk ? "vulkan" : "d3d12");
+    char q[MAX_PATH];
+    snprintf(q, sizeof q, "%s/%s", d, vk ? "*.vkpc" : "pipelines.lib");
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(q, &fd);
+    out[0] = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    snprintf(out, cap, "%s/%s", d, fd.cFileName);
+    FindClose(h);
+}
+
+static int g_store_ok;
+static void store_check(int ok, const char* child, const char* what)
+{
+    printf("[synth] %s %s: %s\n", ok ? "ok  " : "FAIL", child, what);
+    if (!ok) g_store_ok = 0;
+}
+
+/* One child on the route into out/<name>, cache PS3_SHADER_CACHE, with
+ * more NAME=VALUE (may be NULL). */
+static void store_child(const char* exe, const char* out, const char* name, const char* route, const char* cache,
+                        const char* const* user, int nuser, const char* more1, const char* more2, StoreRun* r)
+{
+    char dir[MAX_PATH], be[64], sc[MAX_PATH + 32];
+    snprintf(dir, sizeof dir, "%s/%s", out, name);
+    snprintf(be, sizeof be, "RSX_BACKEND=%s", route);
+    snprintf(sc, sizeof sc, "PS3_SHADER_CACHE=%s", cache);
+    const char* e[64];
+    int n = 0;
+    e[n++] = be;
+    e[n++] = sc;
+    e[n++] = "RSX_PRESENT=1";
+    e[n++] = "PS3_PSO_WAIT=1";
+    e[n++] = "PSO_THREADS=4";
+    for (int i = 0; i < nuser && n < 60; i++) e[n++] = user[i];
+    if (more1) e[n++] = more1;
+    if (more2) e[n++] = more2;
+    memset(r, 0, sizeof *r);
+    r->code = run_child(exe, dir, e, n);
+    store_parse(dir, r);
+    char what[160];
+    snprintf(what, sizeof what, "the child ended with %d, %s", r->code, r->done ? "done" : "not done");
+    store_check(r->code == 0 && r->done, name, what);
+}
+
+static int stores_test(const char* exe, const char* out, const char* route, const char* const* user, int nuser)
+{
+    g_store_ok = 1;
+    const int vk = !strcmp(route, "vulkan");
+    char ca[MAX_PATH], cc[MAX_PATH], ce[MAX_PATH], cg[MAX_PATH], p[MAX_PATH], q[MAX_PATH], what[256];
+    snprintf(ca, sizeof ca, "%s/cache_a", out);
+    snprintf(cc, sizeof cc, "%s/cache_c", out);
+    snprintf(ce, sizeof ce, "%s/cache_e", out);
+    snprintf(cg, sizeof cg, "%s/cache_g", out);
+    snprintf(p, sizeof p, "%s/cache_a/gpu", out);
+    if (GetFileAttributesA(ca) != INVALID_FILE_ATTRIBUTES) {
+        printf("[synth] %s is there from an earlier run: give another --out, or remove it\n", out);
+        return 2;
+    }
+    dir_make(ca);
+    StoreRun r;
+
+    store_child(exe, out, "A", route, ca, user, nuser, NULL, NULL, &r);
+    long m = -1;
+    uint8_t* recs = gm_read(ca, &m);
+    snprintf(what, sizeof what, "pipelines compiled %ld (guest FP %ld); the manifest holds %ld whole records, none twice",
+             r.compiled, r.fp_compiled, m);
+    store_check(r.compiled > 0 && m > 0 && m <= r.fp_loaded + r.fp_compiled, "A", what);
+    char lib[MAX_PATH];
+    lib_file(route, ca, lib, sizeof lib);
+    store_check(lib[0] != 0, "A", vk ? "the library gpu/vulkan/<driver>.vkpc is there" : "the library gpu/d3d12/pipelines.lib is there");
+    if (m <= 0) { free(recs); printf("[synth] FAILED: no manifest to go on with. Everything is in %s\n", out); return 1; }
+
+    /* The rows file: A's records as pipeline index rows. */
+    char rows[MAX_PATH], rows_env[MAX_PATH + 32];
+    snprintf(rows, sizeof rows, "%s/rows.txt", out);
+    FILE* f = fopen(rows, "wb");
+    for (long i = 0; f && i < m; i++) {
+        const uint8_t* b = recs + i * GM_SIZE;
+        uint64_t vs, ps;
+        uint32_t s[8];
+        memcpy(&vs, b + 8, 8);
+        memcpy(&ps, b + 16, 8);
+        memcpy(s, b + 24, 32);   /* fetch clamp blend nrt rtfmt cmask cull depth */
+        fprintf(f, "add %u %016llx %u %016llx %x %u %x %x %x %x\n", s[0], (unsigned long long)vs, s[1],
+                (unsigned long long)ps, s[2], s[3], s[4], s[5], s[6], s[7]);
+    }
+    if (f) { fprintf(f, "ready 00000000005d1e5e\n"); fclose(f); }
+    snprintf(rows_env, sizeof rows_env, "RSX_SYNTH_ROWS=%s", rows);
+
+    /* The caches C, E and G, from A's before B adds to it. */
+    copy_shaders(route, ca, cc);
+    snprintf(p, sizeof p, "%s/gpu/manifest.bin", ca);
+    snprintf(q, sizeof q, "%s/gpu", cc);
+    dir_make(q);
+    snprintf(q, sizeof q, "%s/gpu/manifest.bin", cc);
+    CopyFileA(p, q, FALSE);
+    copy_shaders(route, ca, ce);
+    copy_shaders(route, ca, cg);
+    snprintf(q, sizeof q, "%s/gpu", cg);
+    dir_make(q);
+    snprintf(q, sizeof q, "%s/gpu/manifest.bin", cg);
+    CopyFileA(p, q, FALSE);
+    snprintf(q, sizeof q, "%s/gpu/%s", cg, vk ? "vulkan" : "d3d12");
+    dir_make(q);
+    {   /* G's library: A's with one byte changed (Vulkan: our header's driver; D3D12: its first byte) */
+        char lg[MAX_PATH];
+        const char* leaf = strrchr(lib, '/');
+        snprintf(lg, sizeof lg, "%s%s", q, leaf ? leaf : "/pipelines.lib");
+        CopyFileA(lib, lg, FALSE);
+        FILE* g = fopen(lg, "r+b");
+        if (g) {
+            const long at = vk ? 24 : 0;
+            fseek(g, at, SEEK_SET);
+            const int c = fgetc(g);
+            fseek(g, at, SEEK_SET);
+            fputc(c ^ 0x5A, g);
+            fclose(g);
+        }
+    }
+
+    /* B: a torn record at the manifest's end first. */
+    f = fopen(p, "ab");
+    if (f) { fwrite("GNM1torn-tail", 1, 13, f); fclose(f); }
+    store_child(exe, out, "B", route, ca, user, nuser, NULL, NULL, &r);
+    long mb = -1;
+    free(gm_read(ca, &mb));
+    snprintf(what, sizeof what, "the torn tail cut (kept %ld, the file holds %ld of %ld)", r.torn, mb, m);
+    store_check(r.torn == m && mb == m, "B", what);
+    snprintf(what, sizeof what, "the second run compiles %ld pipelines (%ld loaded), %ld records to build", r.compiled,
+             r.loaded, r.gm_build);
+    store_check(r.compiled == 0 && r.loaded > 0 && r.gm_build == 0, "B", what);
+
+    store_child(exe, out, "C", route, cc, user, nuser, "RSX_SYNTH_PLAY=0", NULL, &r);
+    snprintf(what, sizeof what, "the manifest's build: %ld built, %ld there already, %ld not built, of %ld (of %ld records)",
+             r.mb[0], r.mb[1], r.mb[2], r.mb[3], m);
+    store_check(r.gm_recs == m && r.mb[3] == m && r.mb[2] == 0 && r.mb[0] + r.mb[1] == m, "C", what);
+
+    store_child(exe, out, "D", route, cc, user, nuser, NULL, NULL, &r);
+    snprintf(what, sizeof what, "guest-FP pipelines compiled %ld (loaded %ld); %ld records to build", r.fp_compiled,
+             r.fp_loaded, r.gm_build);
+    store_check(r.fp_compiled == 0 && r.fp_loaded > 0 && r.gm_build == 0, "D", what);
+
+    store_child(exe, out, "E", route, ce, user, nuser, "RSX_SYNTH_PLAY=0", rows_env, &r);
+    snprintf(what, sizeof what, "index rows mapped: %ld built, %ld there already, %ld not built, of %ld (of %ld rows)",
+             r.ix[0], r.ix[1], r.ix[2], r.ix[3], m);
+    store_check(r.ix[3] == m && r.ix[2] == 0 && r.ix[0] + r.ix[1] == m, "E", what);
+    snprintf(q, sizeof q, "%s/gpu/%s/index.built", ce, vk ? "vulkan" : "d3d12");
+    {
+        char* t = read_file(q, NULL);
+        store_check(t && !strncmp(t, "00000000005d1e5e", 16), "E", "the index is marked built (gpu/<dir>/index.built)");
+        free(t);
+    }
+
+    store_child(exe, out, "F", route, ce, user, nuser, NULL, NULL, &r);
+    snprintf(what, sizeof what, "guest-FP pipelines compiled %ld (loaded %ld)", r.fp_compiled, r.fp_loaded);
+    store_check(r.fp_compiled == 0 && r.fp_loaded > 0, "F", what);
+
+    store_child(exe, out, "G", route, cg, user, nuser, "RSX_SYNTH_PLAY=0", NULL, &r);
+    snprintf(what, sizeof what, "another driver's library: %s; the manifest's build: %ld built, %ld there already, "
+             "%ld not built, of %ld", r.lib_new ? "a new one" : "not refused", r.mb[0], r.mb[1], r.mb[2], r.mb[3]);
+    store_check(r.lib_new && r.gm_build == m && r.mb[2] == 0 && r.mb[0] + r.mb[1] == m, "G", what);
+
+    free(recs);
+    if (g_store_ok) {
+        printf("[synth] PASS: the pipeline stores on %s: %ld records, every one built from the manifest and as an "
+               "index row; the second run compiled none. Everything is in %s\n", route, m, out);
+        return 0;
+    }
+    printf("[synth] FAILED. Everything is in %s\n", out);
+    return 1;
+}
+#endif
 
 static int test_main(int argc, char** argv)
 {
     const char* out = "test_rsx_synth.out";
-    int update = 0, keep = 0, verbose = 0;
+    int update = 0, keep = 0, verbose = 0, vulkan = 0, validation = 1;
+    const char* fallback = NULL;
+    const char* stores = NULL;
     const char* extra[48];
     int nextra = 0;
     extra[nextra++] = "RSX_BACKEND=null";
@@ -1229,15 +1912,39 @@ static int test_main(int argc, char** argv)
         else if (!strcmp(argv[i], "--verbose")) verbose = 1;
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--env") && i + 1 < argc && nextra < 40) extra[nextra++] = argv[++i];
+        else if (!strcmp(argv[i], "--route") && i + 1 < argc && (!strcmp(argv[i + 1], "null") ||
+                                                                 !strcmp(argv[i + 1], "vulkan")))
+            vulkan = !strcmp(argv[++i], "vulkan");
+        else if (!strcmp(argv[i], "--no-validation")) validation = 0;
+        else if (!strcmp(argv[i], "--fallback") && i + 1 < argc) fallback = argv[++i];
+        else if (!strcmp(argv[i], "--stores") && i + 1 < argc && (!strcmp(argv[i + 1], "vulkan") ||
+                                                                  !strcmp(argv[i + 1], "hal-d3d12")))
+            stores = argv[++i];
         else {
             fprintf(stderr, "usage: test_rsx_synth [--update-golden] [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --route vulkan [--no-validation] [--fallback <step>|mark] [--keep] [--out <dir>]\n"
+                            "                      [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --caps <dir> | --run <dir>\n");
             return 2;
         }
     }
+    if (fallback && (!vulkan || !SYNTH_SWITCH)) {
+        fprintf(stderr, "test_rsx_synth: --fallback is --route vulkan's, in a build with the route switch\n");
+        return 2;
+    }
     char exe[MAX_PATH];
-    if (!GetModuleFileNameA(NULL, exe, sizeof exe)) return 2;
-    CreateDirectoryA(out, NULL);
+    if (!self_exe(exe, sizeof exe)) return 2;
+    dir_make(out);
+    if (stores) {
+#ifdef _WIN32
+        return stores_test(exe, out, stores, extra + 2, nextra - 2);
+#else
+        printf("[synth] --stores runs on Windows only for now\n");
+        return 0;
+#endif
+    }
+    if (vulkan) return vk_test(exe, out, extra + 2, nextra - 2, validation, keep, fallback);
     char da[MAX_PATH], db[MAX_PATH], dump[MAX_PATH], envdump[MAX_PATH + 16];
     snprintf(da, sizeof da, "%s/a", out);
     snprintf(db, sizeof db, "%s/b", out);
@@ -1374,7 +2081,7 @@ int main(int argc, char** argv)
 #include <stdio.h>
 int main(void)
 {
-    printf("test_rsx_synth: built without PS3RECOMP_RSX_HAL, or not on Windows\n");
+    printf("test_rsx_synth: built without PS3RECOMP_RSX_HAL, or not on Windows or Linux\n");
     return 0;
 }
 #endif

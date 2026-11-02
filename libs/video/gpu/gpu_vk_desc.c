@@ -148,9 +148,20 @@ static VkSamplerAddressMode addr_mode(const gpu_vk_device* dd, uint32_t a)
     }
 }
 
+/* The border colour Vulkan has nearest to the description's, by RPCS3's rule
+ * when custom border colours are missing: white when the colour channels add
+ * up to more than 1.35, else opaque black when alpha is over half, else
+ * transparent black. Exact for those three, which is what the guest uses
+ * (the shadow maps' white border, the post passes' defaults). */
+static VkBorderColor border_color(const float b[4])
+{
+    if (b[0] + b[1] + b[2] > 1.35f) return VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    return b[3] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+}
+
 /* D3D12_SAMPLER_DESC as a VkSampler. Anisotropy without GPU_CAP_ANISO16 is
  * capped at the device's (none without samplerAnisotropy). */
-VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, VkBorderColor border)
+VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc)
 {
     const uint32_t f = desc->filter;
     VkSamplerCreateInfo si;
@@ -175,7 +186,7 @@ VkSampler gpu_vk_sampler_make(gpu_vk_device* dd, const gpu_sampler_desc* desc, V
     si.minLod = desc->min_lod;
     si.maxLod = desc->max_lod >= GPU_LOD_MAX ? VK_LOD_CLAMP_NONE : desc->max_lod;
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
-    si.borderColor = border;
+    si.borderColor = border_color(desc->border);
     VkSampler s = VK_NULL_HANDLE;
     if (dd->vk.vkCreateSampler(dd->device, &si, NULL, &s) != VK_SUCCESS) return VK_NULL_HANDLE;
     return s;
@@ -216,8 +227,7 @@ gpu_sampler gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc)
             dd->samp_hash_cap = cap;
         }
     }
-    const VkSampler s = dd->samp_hash ? gpu_vk_sampler_make(dd, desc, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK)
-                                      : VK_NULL_HANDLE;
+    const VkSampler s = dd->samp_hash ? gpu_vk_sampler_make(dd, desc) : VK_NULL_HANDLE;
     if (s) {
         r.id = gpu_vk_slot_alloc(&dd->samp_slots);
         if (r.id) {
@@ -241,9 +251,12 @@ gpu_sampler gpu_vk_sampler_get(gpu_device* d, const gpu_sampler_desc* desc)
 
 /* Under lock: the set layout of a table of `size` entries, made once. Every
  * entry may be left unwritten and written while the set is in flight, as
- * long as the GPU does not read that entry (D3D12's tables). */
+ * long as the GPU does not read that entry (D3D12's tables). Step VC1: a
+ * short table's layout has 16 entries (gpu_vk_table_entries). */
 VkDescriptorSetLayout gpu_vk_table_layout(gpu_vk_device* dd, uint32_t kind, uint32_t size)
 {
+    if (!size) return VK_NULL_HANDLE;
+    size = gpu_vk_table_entries(size);
     for (uint32_t i = 0; i < dd->ntlayout; i++)
         if (dd->tlayout[i].kind == kind && dd->tlayout[i].size == size) return dd->tlayout[i].l;
     if (dd->ntlayout == 64 || !size || size > 64) return VK_NULL_HANDLE;
@@ -319,7 +332,7 @@ gpu_table_pool gpu_vk_table_pool_create(gpu_device* d, const gpu_table_pool_desc
         if (!g->tables || !g->size || g->size > 64 || (uint64_t)g->first + (uint64_t)g->tables * g->size > desc->count)
             return r;
         nsets += g->tables;
-        ndesc += g->tables * g->size;
+        ndesc += g->tables * gpu_vk_table_entries(g->size);   /* (step VC1: what each set's layout takes) */
     }
     VkDescriptorSetLayout lay[GPU_MAX_TABLE_REGIONS];
     gpu_vk_lock(&dd->lock);
@@ -558,6 +571,7 @@ VkDescriptorSet gpu_vk_set0_get(gpu_vk_device* dd, const gpu_vk_layout* l, const
     const uint32_t h = (uint32_t)gpu_vk_fnv(GPU_VK_FNV_BASIS, key, sizeof *key);
     VkDescriptorSet s = VK_NULL_HANDLE;
     gpu_vk_lock(&dd->lock);
+    dd->n_set0_gets++;
     if (dd->set0_map)
         for (uint32_t k = h & (dd->set0_cap - 1);; k = (k + 1) & (dd->set0_cap - 1)) {
             const gpu_vk_set0_entry* const e = &dd->set0_map[k];
@@ -603,7 +617,15 @@ VkDescriptorSet gpu_vk_set0_get(gpu_vk_device* dd, const gpu_vk_layout* l, const
                 break;
             }
             uint64_t range = b->size - key->raw_off[k];
-            if (range > dd->props.limits.maxStorageBufferRange) range = dd->props.limits.maxStorageBufferRange;
+            if (range > dd->props.limits.maxStorageBufferRange) {
+                /* Step V5v: the fetch's loads (E3) read 0 past the cut, so a
+                 * vertex-shader clamp table past it loses its corners: say so. */
+                static int said;
+                if (!said++)
+                    printf("[VK] a raw buffer's range is cut at the device's %u MB (maxStorageBufferRange): "
+                           "reads past it give 0\n", (unsigned)(dd->props.limits.maxStorageBufferRange >> 20));
+                range = dd->props.limits.maxStorageBufferRange;
+            }
             bi[k].offset = key->raw_off[k];
             bi[k].range = range;
         } else {

@@ -3,6 +3,7 @@
  * -----------------------------------------------------------------------*/
 
 #define FRAME_COUNT         2   /* double buffering */
+#define RC_SWAP_MAX         8   /* the swap chain's images: Vulkan may make more than FRAME_COUNT (step VC1) */
 #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
                                  * ~7.5k verts/frame; leave generous headroom) */
 /* Fragment texture units a draw records and binds: all sixteen the RSX has.
@@ -68,6 +69,8 @@ typedef struct {
         u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
                          * filt bits 20-22 (unused by the register) hold
                          * TEXTURE_CONTROL0's max anisotropy */
+        u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
+                         * address mode reads outside the texture */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -126,6 +129,9 @@ typedef struct {
      * offset of the draw's attribute records in vf_buf's half. fetch is 1
      * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
     u32   fetch, fdesc;
+    /* Step V5: 1 when the pre-pass drew it in the clamp's vertex-shader form
+     * (kind 4): uvc_n vertices from the table at uvc_tab (uvc_table). */
+    u32   uvc, uvc_tab, uvc_n;
     /* The pre-pass's vp_get_fp_pso result, and the render_frame it was made
      * in (s_rf_serial). The VP pass binds it instead of looking the pipeline
      * up a second time (RSX_PSO_IN_REC); a draw the pre-pass skipped keeps an
@@ -227,10 +233,14 @@ typedef struct {
 typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
     gpu_shader vs;          /* the compiled program (step C3b: the GPU layer's; never freed) */
+    gpu_shader vs4;         /* step V5: its clamp form (kind 4), made at its first clamp draw */
+    u8* vs4_code;           /* step V5: a copy of the program's bytes for that (s_uvc_vs); freed once made */
+    u32 vs4_len;
     int uses_c03;
     int fetch;              /* reads vf_buf (rsx_vp_decompile_fetch): no input layout */
     u64 code64;             /* the pipeline index's fingerprint: FNV-1a 64 of the words up to END */
     u32 start;              /* the transform program start it was decompiled at */
+    u64 vs_key, vs4_key;    /* step P3S: K of vs's and vs4's texts, for the neutral manifest (0: none) */
 } VPVSEntry;
 /* The per-draw VS cache grows and never evicts. Draws record a slot index
  * (vs_idx) and PSO keys carry it, so a slot must keep meaning the same
@@ -264,6 +274,7 @@ typedef struct {
                              * pipelines and must not share a cache entry. */
     u32 d2c_mask;           /* units reading depth as colour (PSO key) */
     u32 uvclamp;            /* 1 with the sprite-edge clamp (dr_uvclamp), else 0 (PSO key) */
+    u32 vs4;                /* step V5: built in the clamp's vertex-shader form (kind 4) */
     u32 hdrv;               /* HDR: a scene program's clamp limit (dr_hdrv), float bits, or 0 (PSO key) */
     gpu_pipeline pso;       /* none: this key failed to build; not retried */
     int pending;            /* psj: in this frame's batch, pso not built yet */
@@ -351,7 +362,7 @@ typedef struct {
     VPFPEntry*            vp_fp;                /* guest-FP PSO cache            */
     int                   vp_fp_n, vp_fp_cap;
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt; int cube; int set; } cur_texs[RSX_FP_UNITS];
+    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt, border; int cube; int set; } cur_texs[RSX_FP_UNITS];
     u32                   samp_n;               /* 4-sampler tables created so far */
 
     /* Render-to-texture: offscreen RT pool (their RTVs are views). */
@@ -397,7 +408,7 @@ static D3D12State s_d3d;
  * any of them; the menu's exports borrow them in rsxc_api.inc.) */
 static gpu_device*   s_rc_dev;
 static gpu_swapchain s_rc_swap;
-static gpu_texture   s_rc_swap_image[FRAME_COUNT];
+static gpu_texture   s_rc_swap_image[RC_SWAP_MAX];   /* by image index, s_rc_swap_n of them (step VC1) */
 static gpu_cmd*      s_rc_cmd;
 static gpu_fence     s_rc_frame_fence[FRAME_COUNT];
 static gpu_texture   s_rc_rt_tex[FRAME_COUNT];   /* the display targets (step C5a) */
@@ -449,6 +460,7 @@ static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 static u32 s_vp_icap = 0;
 static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
 static u32 s_vf_off = 0;    /* bytes used in this frame's half */
+static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
 /* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
@@ -469,12 +481,12 @@ static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
 static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
 static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
 static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
-/* The rings vp_vb_grow and vp_ib_grow replaced ([0] vp_vb, [1] vp_ib), with
- * the frame slot that last drew from each: destroyed with that frame's fence
- * at the next render_frame's start (rc_ring_release), where today's deferred
- * release let them go. */
-static gpu_buffer s_rc_ring_old[2];
-static u32        s_rc_ring_old_slot[2];
+/* The rings vp_vb_grow, vp_ib_grow and vf_grow replaced ([0] vp_vb, [1] vp_ib,
+ * [2] vf_buf), with the frame slot that last drew from each: destroyed with
+ * that frame's fence at the next render_frame's start (rc_ring_release), where
+ * today's deferred release let them go. */
+static gpu_buffer s_rc_ring_old[3];
+static u32        s_rc_ring_old_slot[3];
 
 /* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
  * GPU_MEM_READBACK (COPY_DEST) memory, as *b and, with map, its pointer for
@@ -505,7 +517,7 @@ static void rc_ring_retire(int i, gpu_buffer old)
  * each with the fence of the frame that drew from it (passed by now). */
 static void rc_ring_release(void)
 {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (!GPU_VALID(s_rc_ring_old[i])) continue;
         gpu_buffer_destroy(s_rc_dev, s_rc_ring_old[i], s_rc_frame_fence[s_rc_ring_old_slot[i]]);
         s_rc_ring_old[i].id = 0;
@@ -682,7 +694,7 @@ static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
 static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
-static gpu_view       s_rc_swap_rtv[FRAME_COUNT];     /* the swap chain images' RTVs */
+static gpu_view       s_rc_swap_rtv[RC_SWAP_MAX];     /* the swap chain images' RTVs */
 
 /* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and
  * kept with t. Format 0 and flags 0 are today's NULL RTV description; DSVs
@@ -712,4 +724,54 @@ static const gpu_pipeline k_rc_no_pipe = {0};      /* none */
 /* The overlay's frame callback with the window's buffer fi (the menu's,
  * rsxc_api.inc). */
 static void rc_overlay_frame(u32 fi);
+
+/* Step VC1: a frame slot is not a swap chain image. The slot
+ * (s_d3d.frame_index: the recorders, s_rc_frame_fence, the display targets,
+ * the blit's tables) is the instance file's pick (rc_be_frame_slot); the
+ * image (s_rc_image, below s_rc_swap_n) picks only the window's image and
+ * its view. On D3D12 the two are the same number, as today: the swap chain
+ * has FRAME_COUNT buffers and its index moves only at a present. On Vulkan
+ * the driver may make more images and hands them out in any order. */
+static u32 s_rc_image;    /* the image the last acquire gave */
+static u32 s_rc_swap_n;   /* the swap chain's images (swap_buffers_get) */
+/* Step VC2: the acquire gave an image. Always on D3D12; Vulkan gives none
+ * while the window is minimized or its surface is lost, and blit_to_window
+ * draws into nothing then (an image not acquired is not the core's). */
+static int s_rc_have_image;
+static void swap_follow(gpu_texture img);   /* (step VW, rsxc_hdr.inc) */
+static void rc_acquire(void)
+{
+    gpu_texture img;
+    s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, &img);
+    s_rc_have_image = GPU_VALID(img);
+    if (s_rc_have_image) swap_follow(img);
+    s_d3d.frame_index = rc_be_frame_slot(s_d3d.frame_index, s_rc_image);
+}
+
+/* Step V5: two forms for GPUs that lack a feature, picked once a device is
+ * made (rc_forms_pick, rsxc_init.inc).
+ * The sprite-edge clamp (dr_uvclamp): s_uvc_vs 0 is today's geometry shader
+ * (uvclamp_gs), 1 its vertex-shader form (kind 4, rsxc_vs_inject_uvclamp),
+ * where the draw becomes a list of triangles from a table (uvc_table).
+ * RSX_CLAMP_FORM=gs|vs, by default gs where the device has GPU_CAP_GS.
+ * The depth surfaces: s_rc_d32 0 is today's D24S8, 1 D32S8 (32-bit float
+ * depth). RSX_DEPTH_FORMAT=d24s8|d32s8, by default d24s8 where the device has
+ * GPU_CAP_D24S8. Nothing writes depth back to guest memory; a program that
+ * reads depth as colour gets its 24 bits from rsx_d2c, which rounds the
+ * float it samples to 24 bits either way. */
+static int s_uvc_vs;
+static int s_fp_vs4;      /* vp_get_fp_pso: the pipeline it returned is kind 4's */
+static int s_rc_d32;
+static gpu_format rc_ds_format(void)      /* the depth target and its views */
+{
+    return s_rc_d32 ? GPU_FORMAT_D32_FLOAT_S8X24_UINT : GPU_FORMAT_D24_UNORM_S8_UINT;
+}
+static gpu_format rc_ds_typeless(void)    /* a depth surface that is also sampled */
+{
+    return s_rc_d32 ? GPU_FORMAT_R32G8X24_TYPELESS : GPU_FORMAT_R24G8_TYPELESS;
+}
+static gpu_format rc_ds_depth_srv(void)   /* its depth, sampled */
+{
+    return s_rc_d32 ? GPU_FORMAT_R32_FLOAT_X8X24_TYPELESS : GPU_FORMAT_R24_UNORM_X8_TYPELESS;
+}
 

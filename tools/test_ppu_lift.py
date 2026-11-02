@@ -1395,6 +1395,7 @@ def main():
             with open(log, "w") as f:
                 cp = subprocess.run([cxx, "-std=c++17", "-O1", "-w",
                                      "-I", os.path.join("runtime", "ppu"),
+                                     "-I", "include",   # ps3emu/ps3_sse.h on arm64
                                      "-o", epath, cpath],
                                     cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
             if cp.returncode != 0:

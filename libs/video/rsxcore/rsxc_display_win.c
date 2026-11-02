@@ -68,7 +68,7 @@ static IDXGIFactory1* s_hdr_factory;
 static HMONITOR s_hdr_mon;
 static int s_hdr_no_window;   /* the last query had no window to ask about */
 
-void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
+int rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
 {
     out->hdr = 0;
     out->peak = out->white = 0.0f;
@@ -77,13 +77,14 @@ void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
     s_hdr_no_window = !window;
     if (!window) {   /* (a headless backend's: no display) */
         s_hdr_mon = NULL;
-        return;
+        return 1;
     }
     s_hdr_mon = MonitorFromWindow((HWND)window, MONITOR_DEFAULTTONEAREST);
     if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&s_hdr_factory))) {
         s_hdr_factory = NULL;
-        return;
+        return 0;
     }
+    int found = 0;
     IDXGIAdapter1* a = NULL;
     for (UINT i = 0; s_hdr_factory->lpVtbl->EnumAdapters1(s_hdr_factory, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         IDXGIOutput* o = NULL;
@@ -97,6 +98,7 @@ void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
                     out->hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
                     out->peak = d1.MaxLuminance;
                     out->white = hdr_sdr_white(d1.DeviceName);
+                    found = 1;
                 }
                 o6->lpVtbl->Release(o6);
             }
@@ -104,6 +106,7 @@ void rsxc_display_hdr_query(void* window, rsxc_display_hdr* out)
         }
         a->lpVtbl->Release(a);
     }
+    return found;
 }
 
 int rsxc_display_hdr_current(void* window)

@@ -621,6 +621,15 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    # Controller slots must survive SDL device-index changes and non-gamepad devices.
+    add_executable(test_pad_sdl_slots libs/input/tests/test_pad_sdl_slots.c)
+    target_include_directories(test_pad_sdl_slots PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_sdl_slots PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_sdl_slots PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_sdl_slots COMMAND test_pad_sdl_slots)
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so
@@ -749,16 +758,22 @@ endif()
 # The portable renderer's core on the null backend, over synthetic scenes: libs/video/tests/test_rsx_synth.c.
 # Seeded programs (rsx_prog_gen.h), vertex data, textures and surfaces written as captures and played as
 # rsx_replay plays a chain, in two processes; each scene's stream hash against its golden, no failed null
-# check. Windows only, as the null route. Built on demand:
+# check. Windows and Linux, as the null route, with one golden list. test_rsx_synth --route vulkan plays the
+# chain on the Vulkan route under the validation layer instead (builds with PS3RECOMP_RSX_HAL_VULKAN; it needs
+# a Vulkan device and a display, so it is no ctest: gpu-hal.yml runs it on lavapipe). test_rsx_synth --stores
+# vulkan|hal-d3d12 checks the new path's pipeline stores on a GPU (Windows; no ctest either). Built on demand:
 #   cmake --build build --target test_rsx_synth
 #   ctest --test-dir build -R rsx_synth
-if(PS3RECOMP_RSX_HAL AND WIN32)
+if(PS3RECOMP_RSX_HAL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_executable(test_rsx_synth EXCLUDE_FROM_ALL
         libs/video/tests/test_rsx_synth.c
         runtime/host/host_stubs.c
     )
     target_compile_definitions(test_rsx_synth PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(test_rsx_synth PRIVATE ps3recomp_runtime dxguid)
+    target_link_libraries(test_rsx_synth PRIVATE ps3recomp_runtime)
+    if(WIN32)
+        target_link_libraries(test_rsx_synth PRIVATE dxguid)
+    endif()
     target_include_directories(test_rsx_synth PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -766,6 +781,53 @@ if(PS3RECOMP_RSX_HAL AND WIN32)
     )
     set_target_properties(test_rsx_synth PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME rsx_synth COMMAND test_rsx_synth)
+
+    # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the Vulkan start's fallback to today's renderer
+    # and its start mark), built here against stand-ins for both renderers: libs/video/tests/test_rsx_out.c. No GPU,
+    # no window, and the Vulkan route's code whether or not this build has it. On Linux the switch is built as a
+    # host with today's renderer on vkd3d builds it (PS3RECOMP_RSX_D3D12_VKD3D; nothing of vkd3d is used). Built
+    # on demand:
+    #   cmake --build build --target test_rsx_out
+    #   ctest --test-dir build -R rsx_out
+    add_executable(test_rsx_out EXCLUDE_FROM_ALL
+        libs/video/tests/test_rsx_out.c
+        libs/video/rsx_out.c
+    )
+    target_compile_definitions(test_rsx_out PRIVATE
+        PS3RECOMP_RSX_HAL=1 PS3RECOMP_RSX_HAL_VULKAN=1 _CRT_SECURE_NO_WARNINGS)
+    if(NOT WIN32)
+        target_compile_definitions(test_rsx_out PRIVATE PS3RECOMP_RSX_D3D12_VKD3D=1)
+    endif()
+    target_include_directories(test_rsx_out PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME rsx_out COMMAND test_rsx_out)
+endif()
+
+# Setup's shader pass (libs/video/rsx_shader_precompile.c) over a game's
+# programs as the port feeds them, one target a run, and checks of what it
+# wrote (the same files as another run, the spv target's modules):
+# libs/video/tests/precompile_compare.c. Where the pass runs: Windows, and
+# with the spv target. A game's files go in and out, so it is no ctest.
+# Built on demand:
+#   cmake --build build --target precompile_compare
+if(WIN32 OR PS3RECOMP_RSX_HAL_SPV)
+    add_executable(precompile_compare EXCLUDE_FROM_ALL
+        libs/video/tests/precompile_compare.c
+        libs/video/tests/precompile_compare_today.c
+        runtime/host/host_stubs.c
+    )
+    target_compile_definitions(precompile_compare PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(precompile_compare PRIVATE ps3recomp_runtime)
+    if(WIN32)
+        target_link_libraries(precompile_compare PRIVATE dxguid)
+    endif()
+    target_include_directories(precompile_compare PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    set_target_properties(precompile_compare PROPERTIES LINKER_LANGUAGE CXX)
 endif()
 
 # ---------------------------------------------------------------------------

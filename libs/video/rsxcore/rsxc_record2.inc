@@ -69,6 +69,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -201,6 +202,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -416,6 +418,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
                     dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
                     dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -596,6 +599,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
         s_d3d.cur_texs[unit].addr  = tex->address;
         s_d3d.cur_texs[unit].filt  = (tex->filter & ~0x00700000u) | (((tex->control0 >> 4) & 7u) << 20);
+        s_d3d.cur_texs[unit].border = tex->border_color;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         s_d3d.cur_texs[unit].set = 1;

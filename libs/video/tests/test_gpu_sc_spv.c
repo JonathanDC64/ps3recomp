@@ -502,7 +502,7 @@ static void check_idioms(const char* t, const gpu_layout_desc* L, JobResult* r)
         if (q && (!nl || q < nl)) { jr_fail(r, "E2 left a DIVSQ guard: %.60s", p); return; }
     }
     for (const char* p = strstr(t, "vf_raw.Load"); p; p = strstr(p + 11, "vf_raw.Load"))
-        if (strncmp(p + 11, "(min(a, max(n, 4u)", 18) && strncmp(p + 11, "4(min(a, max(n, 16u)", 20)) {
+        if (strncmp(p + 11, "(min(w, max(n, 1u)", 18) && strncmp(p + 11, "4(min(w, max(n, 4u)", 19)) {
             jr_fail(r, "E3 left a load: %.40s", p);
             return;
         }
@@ -742,6 +742,7 @@ static const Golden k_golden[] = {
     { GPU_SPV_E1, 1, 0x8c7dacc32c2289f1ull },
     { GPU_SPV_E2, 1, 0x65d091bd563b2df9ull },
     { GPU_SPV_E3, 1, 0x18b28b3bc5b2cfe8ull },
+    { GPU_SPV_E3, 2, 0x6c9898290b3d4902ull },   /* bounds in words: GetDimensions is glslang's uint count */
     { GPU_SPV_E4, 1, 0x20c7ec2a01ed1b62ull },
     { GPU_SPV_E5, 1, 0xd3c093dd4050a371ull },
 };
@@ -1287,6 +1288,19 @@ static void test_cache(void)
         gpu_spv_tag(NULL, tag, sizeof tag);
         if (g_verbose) printf("  tag: %s\n", tag);
         CHECK(strstr(tag, gpu_spv_compiler()) && strstr(tag, ";edits=") && strstr(tag, ";layout="), "tag %s", tag);
+        /* Without the fetch clamp E3 is left out, and its files are other ones. */
+        const unsigned was = gpu_sc_spv_options();
+        gpu_sc_spv_set_options(was | GPU_SC_SPV_FETCH_CLAMP);
+        const uint64_t with = gpu_spv_key(K, NULL);
+        CHECK(gpu_spv_edits() == GPU_SPV_EDITS_ALL, "the edits with the fetch clamp");
+        gpu_sc_spv_set_options(was & ~GPU_SC_SPV_FETCH_CLAMP);
+        char tag0[320], ed0[64];
+        gpu_spv_tag(NULL, tag0, sizeof tag0);
+        snprintf(ed0, sizeof ed0, ";edits=%d.%d.0.%d.%d;", GPU_SPV_E1_VERSION, GPU_SPV_E2_VERSION, GPU_SPV_E4_VERSION,
+                 GPU_SPV_E5_VERSION);
+        CHECK(gpu_spv_edits() == (GPU_SPV_EDITS_ALL & ~GPU_SPV_E3) && strstr(tag0, ed0) && strcmp(tag0, tag) &&
+              gpu_spv_key(K, NULL) != with, "the tag without the fetch clamp: %s", tag0);
+        gpu_sc_spv_set_options(was);
     }
     gpu_sc_perf(0);
 }

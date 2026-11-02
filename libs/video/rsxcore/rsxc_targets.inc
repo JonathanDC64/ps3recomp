@@ -604,13 +604,26 @@ static u32 tex_filter_key(u32 filt, int shadow)
     return (magf << 24) | (minf << 16) | level | (shadow ? 0x80000000u : 0u);
 }
 
+/* A unit addresses with a border (TEXTURE_ADDRESS wrap 4 on S, T or R), so
+ * its sampler needs the unit's border colour (TEXTURE_BORDER_COLOR); every
+ * border used to read transparent black. The game's shadow maps are
+ * border-addressed with a white border: past the map's edge is lit. */
+static int addr_has_border(u32 a)
+{
+    return (a & 0xF) == 4 || ((a >> 8) & 0xF) == 4 || ((a >> 16) & 0xF) == 4;
+}
+
+/* A sampler key is three words a unit: TEXTURE_ADDRESS, tex_filter_key, and
+ * the border colour (0 when no axis uses it, so those units still share). */
+#define SAMP_KEY_W 3
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
 static u32 samp_key_slot(const u32* k)
 {
     u32 a = 0x9E3779B9u, b = 0x85EBCA6Bu, c = 0xC2B2AE35u, d = 0x27D4EB2Fu;
-    for (int i = 0; i < RSX_FP_UNITS * 2; i += 4) {
+    for (int i = 0; i < RSX_FP_UNITS * SAMP_KEY_W; i += 4) {
         a = (a ^ k[i])     * 0x01000193u;
         b = (b ^ k[i + 1]) * 0x01000193u;
         c = (c ^ k[i + 2]) * 0x01000193u;
@@ -623,13 +636,15 @@ static u32 samp_key_slot(const u32* k)
 
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
-    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * 2];
+    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
-    u32 k[RSX_FP_UNITS * 2];
+    u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        k[u * 2]     = dr && dr->tex[u].set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * 2 + 1] = dr && dr->tex[u].set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
-                                            : (u ? 0x02060001u : 0x01010001u);
+        const int set = dr && dr->tex[u].set;
+        k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
+        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+                                    : (u ? 0x02060001u : 0x01010001u);
+        k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
     const u64 now = s_d3d.frame_count;
     /* RSX_SAMP_TABLES=<n> (2..128): use only n tables, to exercise the reuse
@@ -684,7 +699,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
      * (gpu_sampler_get), written into table t of the sampler pool; an entry
      * that already holds it is left as it is (step C4). */
     for (int u = 0; u < RSX_FP_UNITS; u++) {
-        const u32 a = k[u * 2], f = k[u * 2 + 1];
+        const u32 a = k[u * SAMP_KEY_W], f = k[u * SAMP_KEY_W + 1], bc = k[u * SAMP_KEY_W + 2];
         const u32 minf = (f >> 16) & 7, magf = (f >> 24) & 7;
         /* min: 1 NEAREST, 2 LINEAR, 3 N_MIP_N, 4 L_MIP_N, 5 N_MIP_L, 6 L_MIP_L,
          * 7 convolution; mag: 1 NEAREST, 2 LINEAR, 4 convolution. */
@@ -715,6 +730,10 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
          * same way in its GL sampler). */
         static const u8 zrev[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
         sd.compare = (f & 0x80000000u) ? (u32)(zrev[(a >> 28) & 7u] + 1u) : (u32)GPU_CMP_NEVER;
+        sd.border[0] = (float)((bc >> 16) & 0xFF) / 255.0f;   /* ARGB8, as RPCS3 decodes it */
+        sd.border[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+        sd.border[2] = (float)(bc & 0xFF) / 255.0f;
+        sd.border[3] = (float)(bc >> 24) / 255.0f;
         sd.min_lod = 0.0f;
         sd.max_lod = (minf == 1 || minf == 2) ? 0.0f : GPU_LOD_MAX;  /* no mipmapping */
         gpu_fast_table_write_sampler(s_rc_dev, s_rc_samp_pool, t * RSX_FP_UNITS + (u32)u,
@@ -824,7 +843,8 @@ static int off_rt_find(u32 off)
  * and only the guest's own CLEAR_SURFACE Z/S bits reset it. A single shared
  * buffer cleared on every switch lost the scene's depth halfway through
  * Demon's Souls's frame, so later scene draws covered the player.
- * Created typeless (R24G8) so a later pass can sample one as a texture. */
+ * Created typeless (R24G8, or R32G8X24 with RSX_DEPTH_FORMAT=d32s8) so a
+ * later pass can sample one as a texture. */
 typedef struct {
     gpu_texture tex;    /* the GPU layer's texture (step C5a) */
     gpu_view dsv, dsv_ro;   /* its writable and read-only DSVs (step C5a) */
@@ -894,24 +914,25 @@ static int zeta_get(u32 off, u32 w, u32 h)
     ZetaRT* z = &s_zeta[slot];
     /* The GPU layer's texture (step C5a): typeless R24G8,
      * cleared to depth 1.0 fastest, sampled as depth (the SRV writes). Its
-     * DSVs are D24S8 views, writable and read-only. */
+     * DSVs are D24S8 views, writable and read-only (step V5: R32G8X24 and
+     * D32S8 with RSX_DEPTH_FORMAT=d32s8, rc_ds_typeless). */
     gpu_texture_desc td;
     memset(&td, 0, sizeof td);
     td.width = rt_host_dim(w, h, w); td.height = rt_host_dim(w, h, h);
     td.layers = 1; td.mips = 1;
-    td.format = GPU_FORMAT_R24G8_TYPELESS; td.samples = 1;
+    td.format = rc_ds_typeless(); td.samples = 1;
     td.use = GPU_USE_DS | GPU_USE_SAMPLED;
     td.state = GPU_STATE_DEPTH_WRITE;
-    td.clear_format = GPU_FORMAT_D24_UNORM_S8_UINT;
+    td.clear_format = rc_ds_format();
     td.clear_depth = 1.0f;
     z->tex = gpu_texture_create(s_rc_dev, &td);
     if (!GPU_VALID(z->tex)) return -1;
     z->off = off; z->w = w; z->h = h; z->used = 1;
     z->hw = td.width; z->hh = td.height;
     z->st = GPU_STATE_DEPTH_WRITE;
-    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, GPU_FORMAT_D24_UNORM_S8_UINT);
+    z->dsv = rc_target_view(z->tex, GPU_VIEW_DSV, 0, rc_ds_format());
     z->dsv_ro = rc_target_view(z->tex, GPU_VIEW_DSV, GPU_VIEW_READ_ONLY_DEPTH | GPU_VIEW_READ_ONLY_STENCIL,
-                               GPU_FORMAT_D24_UNORM_S8_UINT);
+                               rc_ds_format());
     gpu_cmd_clear_depth(s_rc_cmd, z->dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0, NULL);
     printf("[ZETA] depth surface 0x%08X %ux%u (host %ux%u, slot %d)\n", off, w, h, z->hw, z->hh, slot);
     return slot;

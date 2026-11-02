@@ -111,6 +111,10 @@ void rsx_state_init(rsx_state* state)
     state->cull_face = 0x0405; /* BACK */
     state->front_face = 0x0901; /* CCW */
 
+    /* Depth outside the clip range is clipped, not clamped (RSX reset, as
+     * RPCS3 has it). Demon's Souls never writes the register. */
+    state->zminmax_control = 1;
+
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
 
@@ -700,6 +704,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
     if (method == NV4097_SET_FRONT_FACE) {
         state->front_face = data;
+        return 0;
+    }
+    if (method == NV4097_SET_ZMIN_MAX_CONTROL) {
+        state->zminmax_control = data;
         return 0;
     }
 

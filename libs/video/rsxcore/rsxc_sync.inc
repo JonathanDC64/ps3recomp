@@ -89,7 +89,7 @@ static void move_to_next_frame(void)
     const u32 prev = s_d3d.frame_index;
     const gpu_fence mine = gpu_signal(s_rc_dev);
 
-    s_d3d.frame_index = gpu_swap_acquire(s_rc_dev, s_rc_swap, NULL);
+    rc_acquire();   /* (step VC1: the image, and the slot it falls in) */
 
     lose_device_test();
     frame_slot_wait(s_d3d.frame_index);

@@ -43,7 +43,7 @@
 extern "C" {
 #endif
 
-#define PS3_GAME_ABI 3
+#define PS3_GAME_ABI 4
 
 /* The runtime functions the lifted code calls by name, in slot order. A new
  * one goes at the end, with PS3_GAME_ABI raised. */
@@ -70,7 +70,10 @@ enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
  * inline instruction's result is a NaN: the errno path). The UCRT's fprintf
  * is inline in its header, so the host passes a function of its own
  * (game_host.c). fputc, fputs and fwrite are what the compiler rewrites some
- * fprintf calls into. A new one goes at the end, with PS3_GAME_ABI raised.
+ * fprintf calls into. _setjmp and longjmp are the guest setjmp's and
+ * longjmp's (the lift's SJLJ_SUPPORT): a thunk is a bare jump, so the C
+ * library's _setjmp sees the lifted function that called it as its caller.
+ * A new one goes at the end, with PS3_GAME_ABI raised.
  *
  * The module's stdin, stdout and stderr are __acrt_iob_func(0, 1, 2), as in
  * the UCRT (ps3emu/game_libc/stdio.h). glibc's are variables, which a module
@@ -85,7 +88,8 @@ enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
     X(fma, fma) X(sqrt, sqrt) X(sqrtf, sqrtf) X(ldexp, ldexp) X(exp2, exp2)      \
     X(getenv, getenv) X(atoi, atoi) X(strtoul, strtoul)                          \
     X(__acrt_iob_func, PS3_GAME_HOST_IOB) X(fprintf, ps3_gh_fprintf)             \
-    X(fputc, fputc) X(fputs, fputs) X(fwrite, fwrite) X(fflush, fflush)
+    X(fputc, fputc) X(fputs, fputs) X(fwrite, fwrite) X(fflush, fflush)      \
+    X(_setjmp, _setjmp) X(longjmp, longjmp)
 
 #define PS3_GAME_HOST_CRT_INDEX_(n, h) PS3_GC_##n,
 enum { PS3_GAME_HOST_CRT_FUNCS(PS3_GAME_HOST_CRT_INDEX_) PS3_GC_COUNT };
@@ -117,6 +121,9 @@ typedef struct ps3_game_api {
     /* The calling thread's g_trampoline_fn and g_spu_trampoline_fn. */
     void**   (*ppu_tramp_slot)(void);
     void**   (*spu_tramp_slot)(void);
+    /* The calling thread's newest guest setjmp (the lift's SJLJ_SUPPORT), which
+     * the host clears when a guest thread runs its entry. */
+    void**   (*sjlj_top_slot)(void);
     /* The module's address for each runtime function, in PS3_GAME_HOST_FUNCS
      * order: its jump thunk, which is what the lifted code stores when it
      * takes one's address (SPU_RET stores spu_indirect_branch). Where the
