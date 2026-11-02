@@ -3,3 +3,4 @@
 # in the port leaves them out). One line each: <full commit> ported|n/a <note>.
 # For a merged pull request, the merge commit (core_sync lists first parents).
 3550beba6082601f44955eabf2486e47492fbcb2 ported #208: depth clip (rsx_cull_key bit 3, rsxc_pipeline depth_clip) and border colours (rsxc_targets, rsxc_record2, rsxc_state), in the same pull request
+c262d0f948e920940534d88956fe24bfa72534e0 ported #210: the fetch ring grows (vf_grow in rsxc_writeback, s_vf_short in rsxc_state, rsxc_vertex and uvc_table in rsxc_fp, the frame end in rsxc_frame, rc_ring_old[2]), in the same pull request
