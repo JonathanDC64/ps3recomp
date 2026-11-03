@@ -467,6 +467,20 @@ jobs:
             -o /tmp/test_spu_simd_paths runtime/spu/tests/test_spu_simd_paths.c -lm
           /tmp/test_spu_simd_paths
 
+      # libs/system/tests: the dialog callbacks and the savedata suites. They leave runtime symbols they never call
+      # undefined, so each function and object gets its own section and the linker drops the ones nothing reaches
+      # (as macOS ld's -dead_strip does in macos.yml).
+      - name: Run self-contained sysutil tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          cc="${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -ffunction-sections -fdata-sections -Wl,--gc-sections"
+          $cc -o /tmp/test_dialog_callbacks libs/system/tests/test_dialog_callbacks.c libs/system/cellSysutil.c -pthread
+          /tmp/test_dialog_callbacks
+          $cc -o /tmp/test_savedata_fixed libs/system/tests/test_savedata_fixed.c
+          /tmp/test_savedata_fixed
+          $cc -o /tmp/test_savedata_io libs/system/tests/test_savedata_io.c
+          /tmp/test_savedata_io
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
