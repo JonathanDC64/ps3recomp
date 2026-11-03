@@ -1,5 +1,5 @@
 # Builds the runtime library on Windows, the only platform that can currently
-# run a recompiled game.
+# run a recompiled game, and runs every Windows test set in one job.
 #
 # The macOS job guards the POSIX paths; this one guards the platform everything
 # actually ships on. Without it, a change made to satisfy Clang could break the
@@ -9,36 +9,102 @@
 #
 # clang-cl rather than plain cl: the loader uses __builtin_bswap* and weak
 # symbols that MSVC does not provide (see docs/BUILDING.md).
+#
+# Two builds, one after the other:
+#   build      the runtime as CMake's defaults make it (the portable renderer off): the library, the lifter
+#              suites, the self-contained tests and the shader text identity test;
+#   build-hal  the portable renderer on (PS3RECOMP_RSX_HAL, libs/video/gpu), as the port's released des_host
+#              has it: the contract test (libs/video/tests/test_gpu_contract.*) against the SDK's headers, the
+#              D3D12 backend's test (libs/video/tests/test_gpu_d3d12.c) on WARP, the software adapter, so no GPU
+#              is needed; the null backend's (libs/video/tests/test_gpu_null.c), its operation stream's hash
+#              against a golden; the spv target's (libs/video/tests/test_gpu_sc_spv.c); the new path's core on the
+#              null route over synthetic scenes (libs/video/tests/test_rsx_synth.c), against the same goldens as
+#              Linux; the route switch's test (libs/video/tests/test_rsx_out.c); and the new path's external
+#              symbols (.github/scripts/check_hal_symbols.py). The Vulkan backend's test is only built: Windows
+#              runners have no Vulkan device (linux.yml runs it on lavapipe). Release only.
+#
+# A pull request runs Release, with the shader text identity test on a quarter of its programs; a push to
+# master and a manual run add Debug and run it on all of them.
 name: Windows
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master ]
+    paths-ignore: [ 'docs/**', '**.md' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new commit on a pull request (or a new push to master) cancels the run it replaces.
+concurrency:
+  group: windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: Windows x64 (${{ matrix.build_type }})
     runs-on: windows-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, Release]
+        build_type: ${{ github.event_name == 'pull_request' && fromJSON('["Release"]') || fromJSON('["Debug", "Release"]') }}
+    env:
+      # The GPU layer's pinned sources (cmake/gpu_deps.cmake), cached on that file (linux.yml says why).
+      GPU_SRC: ${{ github.workspace }}/.ci-cache/gpu-src
+      # sccache, pinned and checked (the release's size and SHA-256 from GitHub's asset list).
+      SCCACHE_VERSION: v0.18.0
+      SCCACHE_ARCHIVE_SIZE: '9694400'
+      SCCACHE_ARCHIVE_SHA256: 8965c74d5e8a225244f741e18ad2f3f504f48228dc1bac948fc22761a348363d
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
       # the MSVC headers even though it is doing the compiling, and the
       # conformance suite shells out to cl to build its generated driver.
       - name: Set up MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
       - name: Install Ninja
+        id: ninja
         run: choco install ninja -y --no-progress
+
+      # sccache for the configuration a pull request runs (Release), as in linux.yml: every CMake configure takes it
+      # from CMAKE_<LANG>_COMPILER_LAUNCHER; its cache comes from the newest master entry and is saved from master
+      # pushes only. Release builds carry no debug information (no /Zi), which sccache could not cache.
+      - name: sccache
+        id: sccache
+        if: matrix.build_type == 'Release'
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 --retry-all-errors -o sccache.zip \
+            "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/sccache-$SCCACHE_VERSION-x86_64-pc-windows-msvc.zip"
+          [ "$(stat -c %s sccache.zip)" = "$SCCACHE_ARCHIVE_SIZE" ] || { echo "::error::sccache.zip has the wrong size"; exit 1; }
+          echo "$SCCACHE_ARCHIVE_SHA256  sccache.zip" | sha256sum -c -
+          unzip -q sccache.zip
+          d="$RUNNER_TEMP/sccache-$SCCACHE_VERSION-x86_64-pc-windows-msvc"
+          [ -f "$d/sccache.exe" ] || { echo "::error::no sccache.exe in the archive"; exit 1; }
+          echo "$d" >> "$GITHUB_PATH"
+          {
+            echo "SCCACHE_DIR=$GITHUB_WORKSPACE/.ci-cache/sccache"
+            echo "SCCACHE_CACHE_SIZE=1G"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore sccache's cache
+        if: steps.sccache.outcome == 'success'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-Release-${{ github.sha }}
+          restore-keys: sccache-${{ runner.os }}-Release-
 
       - name: Show toolchain
         run: |
@@ -47,6 +113,7 @@ jobs:
           cmake --version
 
       - name: Configure
+        id: cfg
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_C_COMPILER=clang-cl
@@ -54,23 +121,29 @@ jobs:
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build
+        id: build
         run: cmake --build build
 
       - name: Verify the library exists
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: bash
         run: |
           ls -la build/ps3recomp_runtime.lib
           test -s build/ps3recomp_runtime.lib
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        id: py
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
-      # The same eight suites the macOS job runs. The conformance one compiles
+      # The same suites the macOS job runs. The conformance one compiles
       # and EXECUTES 1300+ lifted instruction cases; CI=1 makes it fail rather
       # than skip if no compiler is reachable, because a green tick meaning
       # "compiled nothing" is worse than a red one.
       - name: Run the lifter test suites
+        if: ${{ !cancelled() && steps.py.outcome == 'success' }}
         shell: bash
         env:
           CI: "1"
@@ -87,14 +160,15 @@ jobs:
       # this is a real gate here: the baseline is near zero and any new error
       # fails the job.
       - name: Check the PPU boot scaffold (ratchet)
+        if: ${{ !cancelled() && steps.py.outcome == 'success' }}
         run: python tools/check_ppu_scaffold.py
 
-      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
       # Linux and macOS have run these since they were written; Windows never
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
       # the platform most contributors build on.
       - name: Run self-contained SPU helper tests
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -111,6 +185,7 @@ jobs:
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_sys_net.exe libs/network/tests/test_sys_net.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -121,6 +196,8 @@ jobs:
       # network tests below: they include ps3_tls.c, the TLS to the online
       # server.
       - name: Build mbedTLS for the network tests
+        id: mbedtls
+        if: ${{ !cancelled() }}
         run: |
           New-Item -ItemType Directory -Force mbedtls_obj | Out-Null
           clang-cl /nologo /c /O2 /W0 /D_CRT_SECURE_NO_WARNINGS /I third_party/mbedtls/include /Fo:mbedtls_obj\ (Get-ChildItem third_party/mbedtls/library/*.c).FullName
@@ -132,6 +209,7 @@ jobs:
       # certificates: the built-in roots, the certificate and name checks,
       # a server that isn't TLS, timeouts, large transfers.
       - name: Run the TLS test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_net_tls.exe libs/network/tests/test_net_tls.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -141,6 +219,7 @@ jobs:
       # cellHttp end to end on loopback: guest pointers, the network gate, and
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_http_loopback.exe libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -151,6 +230,7 @@ jobs:
       # work, the session on cellHttp's requests to that server only. Then
       # what the player is told when psnr refuses co-op.
       - name: Run the sign-in tests
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_net_signin.exe libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -164,6 +244,7 @@ jobs:
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
       # big-endian units, the byte count returned.
       - name: Run the cellL10n test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_l10n.exe libs/font/tests/test_l10n.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -173,6 +254,7 @@ jobs:
       # Matching2 over psnr without a server: response relocation, attribute
       # packing, and the room structs a title reads.
       - name: Run the Matching2 test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -182,6 +264,7 @@ jobs:
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -191,6 +274,7 @@ jobs:
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -201,6 +285,7 @@ jobs:
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
       # source, on an SDAT the test makes with edat.c's own AES.
       - name: Run the EDAT path test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/filesystem /Fe:test_edat_paths.exe libs/filesystem/tests/test_edat_paths.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -211,6 +296,7 @@ jobs:
       # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control
       # characters or Windows device names.
       - name: Run the guest path test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_vfs_path.exe libs/filesystem/tests/test_vfs_path.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -220,18 +306,18 @@ jobs:
       # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
       # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
       - name: Run the stick conversion test
+        if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I libs/input /Fe:test_pad_stick.exe libs/input/tests/test_pad_stick.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_pad_stick.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      # arithmetic with no host API in it, so it runs everywhere, and it is the
-      # regression net for having lifted that maths out of the D3D12 uploader.
       # sync_stress has always been the Windows-native suite; now that its
       # source also builds on POSIX through the shim, this is what proves the
       # shared source still means the same thing here.
       - name: Build and run sync_stress
+        if: ${{ !cancelled() }}
         run: |
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -245,6 +331,7 @@ jobs:
       # before it moved, so this checks the same rules the other hosts do.
       # Its plat_time test checks plat.h's clock and precise sleep.
       - name: Build and run plat_threads
+        if: ${{ !cancelled() }}
         run: |
           cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -253,7 +340,11 @@ jobs:
           ctest --test-dir build-plat-threads --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+      # arithmetic with no host API in it, so it runs everywhere, and it is the
+      # regression net for having lifted that maths out of the D3D12 uploader.
       - name: Run self-contained RSX tests
+        if: ${{ !cancelled() }}
         # NOT shell: bash. Git Bash rewrites a leading-slash argument into a
         # Windows path, so /nologo arrived at the linker as an .obj under the
         # Git install directory. PowerShell leaves MSVC-style flags alone.
@@ -269,17 +360,131 @@ jobs:
 
       # The portable renderer's shader texts (libs/video/rsxcore) and compile
       # service (libs/video/gpu) against today's D3D12 renderer, byte for byte:
-      # a few thousand generated programs through both, and both filling a
-      # shader cache. It links the runtime library built above.
+      # generated programs through both, and both filling a shader cache. It
+      # links the runtime library built above. Its FXC compiles are most of
+      # this job's time, so a pull request checks 500 fragment and 500 vertex
+      # programs and 12 cache texts (the same seed); a push to master and a
+      # manual run check all 2000 + 2000 and 48.
       - name: Run the shader text identity test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           cmake --build build --target test_shader_text_identity
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\build\test_shader_text_identity.exe
+          $count = @()
+          if ('${{ github.event_name }}' -eq 'pull_request') { $count = @('--fp', '500', '--vp', '500', '--put', '12') }
+          .\build\test_shader_text_identity.exe @count
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Run condition semantics regressions
+        if: ${{ !cancelled() }}
         run: |
           cmake -S tests/sync_stress -B build-sync -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync --target test_cond_semantics
           ctest --test-dir build-sync -R "^cond_" --output-on-failure
+
+      # ---- build-hal: the portable renderer on (Release) -----------------------------------------------------
+
+      # FetchContent's clones of Vulkan-Headers, SPIRV-Headers, SPIRV-Tools and glslang, cached as on Linux: a
+      # hit hands them to the configure (FETCHCONTENT_SOURCE_DIR_*), a miss clones and the step after keeps them.
+      - name: Cache the GPU layer's sources
+        if: ${{ !cancelled() && matrix.build_type == 'Release' }}
+        id: gpu-src
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.GPU_SRC }}
+          key: gpu-src-${{ runner.os }}-${{ hashFiles('cmake/gpu_deps.cmake') }}-v1
+
+      # No FFmpeg download: nothing here plays a movie.
+      - name: Portable renderer, configure
+        id: hal_cfg
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.ninja.outcome == 'success' }}
+        run: |
+          $src = @()
+          if ('${{ steps.gpu-src.outputs.cache-hit }}' -eq 'true') {
+            foreach ($n in 'vulkan_headers', 'spirv_headers', 'spirv_tools', 'glslang') {
+              $d = "$env:GPU_SRC/$n" -replace '\\', '/'
+              if (-not (Test-Path "$d/CMakeLists.txt")) { Write-Output "::error::the cached $n has no CMakeLists.txt"; exit 1 }
+              $src += "-DFETCHCONTENT_SOURCE_DIR_$($n.ToUpper())=$d"
+            }
+          }
+          cmake -S . -B build-hal -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_FFMPEG_DOWNLOAD=OFF -DPS3RECOMP_RSX_HAL=ON @src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Never in the way: a copy that fails is removed, so no half copy is saved, and the job goes on.
+      - name: Keep the GPU layer's sources for the cache
+        if: ${{ !cancelled() && steps.gpu-src.outputs.cache-hit != 'true' && steps.hal_cfg.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          trap 'rm -rf .ci-cache/gpu-src' ERR
+          for n in vulkan_headers spirv_headers spirv_tools glslang; do
+            mkdir -p ".ci-cache/gpu-src/$n"
+            tar -C "build-hal/_deps/$n-src" --exclude=.git -cf - . | tar -C ".ci-cache/gpu-src/$n" -xf -
+          done
+          du -sh .ci-cache/gpu-src/*
+
+      - name: Portable renderer, build
+        id: hal_build
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_cfg.outcome == 'success' }}
+        run: >
+          cmake --build build-hal --target ps3recomp_runtime test_gpu_contract test_gpu_d3d12 test_gpu_vk
+          test_gpu_null test_gpu_sc_spv test_rsx_synth test_rsx_out
+
+      - name: Run the contract test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R gpu_contract --output-on-failure --no-tests=error
+
+      - name: Run the D3D12 backend's test (WARP)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R gpu_d3d12 --output-on-failure --no-tests=error
+
+      - name: Run the null backend's test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R gpu_null --output-on-failure --no-tests=error
+
+      - name: Run the spv target's test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R gpu_sc_spv --output-on-failure --no-tests=error
+
+      # The new path's core on the null route over synthetic scenes, in two processes: each scene's stream hash
+      # against its golden, with no failed check (libs/video/tests/test_rsx_synth.c).
+      - name: Run the core on the synthetic scenes (null route)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R rsx_synth --output-on-failure --no-tests=error
+
+      # On a failure: both children's logs, the first one's stream dump (dump.txt) and the scenes' captures.
+      - name: Keep the synthetic scenes' output
+        if: failure() && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rsx-synth-windows
+          path: build-hal/test_rsx_synth.out/
+          if-no-files-found: ignore
+
+      # The route switch's choice: RSX_BACKEND, the Vulkan start's fallback and its start mark.
+      - name: Run the route switch's test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' }}
+        run: ctest --test-dir build-hal -R rsx_out --output-on-failure --no-tests=error
+
+      # Every external symbol of the new path's objects starts with gpu_, rsxc_ or rsx_out_ (the script lists
+      # what else it allows, and why).
+      - name: Check the new path's symbols
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' && steps.py.outcome == 'success' }}
+        run: python .github/scripts/check_hal_symbols.py build-hal
+
+      # ---- sccache: its counts, and its cache from a push to master -------------------------------------------
+
+      - name: sccache's counts
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        shell: bash
+        run: |
+          sccache --show-stats
+          sccache --stop-server || true
+
+      - name: Save sccache's cache
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' && github.event_name == 'push' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-Release-${{ github.sha }}

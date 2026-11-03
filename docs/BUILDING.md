@@ -415,8 +415,9 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 ### Linux
 
-Builds and is covered by CI (`.github/workflows/linux.yml`, x86-64, GCC and
-Clang, Debug and Release on every push). That workflow builds the runtime
+Builds and is covered by CI (`.github/workflows/linux.yml`, x86-64: Clang
+Release on every pull request; GCC and Clang, Debug and Release on every push
+to master). That workflow builds the runtime
 library, runs all eight lifter suites plus the SPU helper tests, and drives
 `ps3recomp_host` end to end against the headless software backend.
 
@@ -439,7 +440,7 @@ library, runs all eight lifter suites plus the SPU helper tests, and drives
 ### macOS
 
 Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
-Release on every push). That workflow builds the runtime library, runs all
+Release once a night on master, and by hand). That workflow builds the runtime library, runs all
 eight lifter test suites — including the 1300+ instruction conformance checks,
 which compile and *execute* lifted code — and then runs `ps3recomp_host`
 headlessly, asserting the presented pixel matches the guest clear colour and

@@ -1,4 +1,48 @@
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
+
+/* The VP pass's binds for the whole batch: at its start, and again after
+ * each part RSX_SUBMIT_SPLIT submits (a part's submit drops every bind,
+ * gpu.h's cmd_split). Each draw binds the rest itself. */
+static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso)
+{
+    gpu_cmd_set_layout(rc, s_d3d.vp_layout);
+    gpu_cmd_set_pipeline(rc, vpso);
+    gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
+    gpu_cmd_bind_cb(rc, 0, s_rc_vpcb.va[0]);   /* (vp_cb's first chunk; each draw binds its bank) */
+    /* b2 (the fetch draws' descriptor) set once, before any draw: a draw
+     * without fetch reads none, and every slot is set before a draw
+     * (gpu.h's rule, Vulkan's; step C8b). Each fetch draw sets its own. */
+    gpu_cmd_push_const1(rc, 5, 0, 0);
+    /* The texture pool and, when there is one, the samplers', in today's
+     * order; then the samplers' table 0 and the first draw's window (a
+     * table on every backend, step C8b: today's bound the pool's first
+     * entry; each draw binds its own window before it draws). */
+    gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
+    vp_bind_sampler_table(NULL);
+    gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, DRAW_SRV_BASE));
+    /* vp_vb's and vf_buf's first chunks (rc_arena: no parity offset, the
+     * arena keeps the frames apart); render_frame's draws bind another
+     * chunk when theirs lies outside. */
+    gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, 0), (u32)s_vb.half, 256);   /* 16 float4 attrib slots */
+    if (GPU_VALID(s_rc_vp_ib))
+        gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
+                       s_vp_icap * 4, GPU_FORMAT_R32_UINT);
+    if (s_vf_cap) gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, 0));
+}
+
+/* RSX_SUBMIT_SPLIT=<records> (live, 0 = off): a batch goes to the GPU in
+ * parts, a part ending before the first draw once it has that many records
+ * (and that many are still to come), so the GPU starts on the batch while
+ * the rest is recorded, and the next batch's opening wait for it is
+ * shorter. The same commands in the same order: only where the submits fall
+ * moves, and that by the records, not by time. */
+static u32 submit_split_draws(void)
+{
+    static int n = -1;
+    PS3_KNOB(n, ps3_env_int("RSX_SUBMIT_SPLIT", 0));
+    return n > 0 ? (u32)n : 0u;
+}
+
 static void render_frame(void)
 {
     vpj_sync();   /* the batch's vertices, before anything reads vp_vb */
@@ -566,37 +610,21 @@ rtt_dump_done:;
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
         if (any && vpso.v && s_vb.n && s_rc_vpcb.n) {
-            gpu_cmd_set_layout(rc, s_d3d.vp_layout);
-            gpu_cmd_set_pipeline(rc, vpso);
-            gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
             s_vp_topo_strip = 0;
-            gpu_cmd_bind_cb(rc, 0, s_rc_vpcb.va[0]);   /* (vp_cb's first chunk; each draw binds its bank) */
-            /* b2 (the fetch draws' descriptor) set once, before any draw: a draw
-             * without fetch reads none, and every slot is set before a draw
-             * (gpu.h's rule, Vulkan's; step C8b). Each fetch draw sets its own. */
-            gpu_cmd_push_const1(rc, 5, 0, 0);
-            /* The texture pool and, when there is one, the samplers', in today's
-             * order; then the samplers' table 0 and the first draw's window (a
-             * table on every backend, step C8b: today's bound the pool's first
-             * entry; each draw binds its own window before it draws). */
-            gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
-            vp_bind_sampler_table(NULL);
-            gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, DRAW_SRV_BASE));
-            /* vp_vb's first chunk; a draw in another one binds that (rare:
-             * a frame past one chunk's vertices). */
-            u32 vb_chunk = 0;
-            u64 vb_lo = 0, vb_hi = s_vb.half;   /* the bound chunk's virtual offsets */
-            gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, 0), (u32)s_vb.half, 256);   /* 16 float4 attrib slots */
-            if (GPU_VALID(s_rc_vp_ib))
-                gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
-                               s_vp_icap * 4, GPU_FORMAT_R32_UINT);
-            /* t20: vf_buf's first chunk. The fetch draws' chunk bound is the
-             * virtual [vf_lo, vf_lo + vf_in) (rc_arena; vf_in 0 while t20
-             * holds another buffer): a draw whose fdesc lies outside binds
+            vp_pass_binds(rc, vpso);
+            const u32 split_n = submit_split_draws();
+            u32 split_from = 0;                    /* the record the part being recorded starts at */
+            u32 split_parts = 1;
+            /* The bound chunks, the first of each after vp_pass_binds. vp_vb's
+             * is the virtual [vb_lo, vb_hi); a draw in another one binds that
+             * (rare: a frame past one chunk's vertices). The fetch draws' is
+             * the virtual [vf_lo, vf_lo + vf_in) at t20 (rc_arena; vf_in 0 while
+             * t20 holds another buffer): a draw whose fdesc lies outside binds
              * its own, so a draw costs a compare, and a bind only where the
              * frame crossed a chunk's end. */
+            u32 vb_chunk = 0;
+            u64 vb_lo = 0, vb_hi = s_vb.half;
             u32 vf_lo = 0, vf_in = s_vf_cap;
-            if (s_vf_cap) gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, 0));
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
             /* its host size over guest size (RSX_SCALE). The batch starts on the display
@@ -838,6 +866,27 @@ rtt_dump_done:;
                             gpu_cmd_clear_color(rc, s_d3d.off_rt[cur_m[_m]].rtv, dr->cc, NULL);
                     continue;
                 }
+                /* RSX_SUBMIT_SPLIT: the part so far goes to the GPU before this
+                 * draw, and the rest goes on in the same targets, as the AA
+                 * pass's return binds them (no query is open: each draw's ends
+                 * with it). */
+                if (split_n && d - split_from >= split_n && s_d3d.draw_count - d >= split_n &&
+                    !gpu_cmd_split(rdev, rc, NULL)) {
+                    split_from = d;
+                    split_parts++;
+                    vp_pass_binds(rc, vpso);
+                    vb_chunk = 0; vb_lo = 0; vb_hi = s_vb.half;   /* the first chunks again */
+                    vf_lo = 0; vf_in = s_vf_cap;
+                    gpu_pass sp;
+                    sp.nrt = 0;
+                    if (!cur_nocol) {
+                        sp.rt[sp.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
+                        for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
+                            sp.rt[sp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
+                    }
+                    sp.ds = cur_z < 0 ? s_rc_depth_dsv : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
+                    gpu_cmd_pass_begin(rc, &sp);
+                }
                 /* Per-draw pipeline: prefer the guest's own compiled FP; fall
                  * back to the hardcoded atlas/colour PS pair. The pre-pass
                  * looked it up already and kept it in the record.
@@ -1059,6 +1108,12 @@ rtt_dump_done:;
             }
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             fpwatch_batch();
+            { static int said;   /* RSX_SUBMIT_SPLIT: the first batch that went in parts */
+              if (split_parts > 1 && !said) {
+                  said = 1;
+                  printf("[D3D12] RSX_SUBMIT_SPLIT=%u: batch %u went to the GPU in %u parts (%u records)\n",
+                         split_n, s_rf_serial, split_parts, s_d3d.draw_count);
+              } }
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
                 gpu_cmd_pass_begin(rc, &disp_pass);

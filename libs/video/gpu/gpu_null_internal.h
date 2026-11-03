@@ -75,7 +75,7 @@ typedef struct gpu_null_vec {
     X(table_write_sampler) X(layout_create) X(query_pool_create) X(swap_create) X(swap_destroy) \
     X(swap_resize) X(swap_acquire) X(swap_present) X(submit) X(cmd) X(signal) X(wait_idle) \
     X(buffer_map) X(buffer_unmap) X(fence_wait) X(cmd_begin) X(cmd_end) X(table_ref) \
-    X(shader_create) X(pipeline_create) X(view_get) X(buffer_addr) X(destroy)
+    X(shader_create) X(pipeline_create) X(view_get) X(buffer_addr) X(destroy) X(cmd_split)
 #define GPU__NULL_DEV_OP(name) GPU_NULL_OP_##name,
 enum { GPU_NULL_OP_DEV_FIRST = 128 - 1, GPU_NULL_DEV_CALLS(GPU__NULL_DEV_OP) GPU_NULL_OP_END };
 #undef GPU__NULL_DEV_OP

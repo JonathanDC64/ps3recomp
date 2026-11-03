@@ -879,6 +879,7 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
     for (uint32_t i = 0; i < dd->nslots; i++) {
         cmd_init(dd, &dd->slot[i]);
         if (!pool_make(dd, &dd->slot[i].pool, &dd->slot[i].cb, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT)) return 0;
+        dd->slot[i].part_cb[0] = dd->slot[i].cb;
     }
     for (uint32_t i = 0; i < GPU_VK_INIT_RING; i++)
         if (!pool_make(dd, &dd->init_ring[i].pool, &dd->init_ring[i].cb, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT))
@@ -1097,12 +1098,52 @@ static void gt_read(gpu_vk_device* dd, gpu_cmd* c)
     c->gt_n = c->gt_done = 0;
 }
 
-/* Today's allocator and list Reset. Each recording starts with a barrier
- * from everything before (D3D12 orders command lists one after another and
- * lets buffers and textures in COMMON go back to it between them), and with
- * D3D12's starting state: stencil reference 0, blend factor 1, a triangle
- * list, primitive restart off. With RSX_GPU_TIMES, the slot's last stamps
- * are read and a new start stamped. */
+/* A recording's start (cmd_begin's, and each part's after cmd_split):
+ * nothing bound, and D3D12's starting state: stencil reference 0, blend
+ * factor 1, a triangle list, primitive restart off. A recording (start)
+ * also opens with a barrier from everything before (D3D12 orders command
+ * lists one after another and lets buffers and textures in COMMON go back
+ * to it between them); a part does not: its commands follow the part
+ * before on the queue as they would in one buffer, and barriers order work
+ * across submits as within one. */
+static void rec_fresh(gpu_vk_device* dd, gpu_cmd* c, int start)
+{
+    c->lay = NULL;
+    memset(c->sets, 0, sizeof c->sets);
+    c->have = 0;
+    memset(c->dyn, 0, sizeof c->dyn);
+    memset(&c->key, 0, sizeof c->key);
+    c->set0_stale = 1;
+    c->dirty = 0;
+    memset(&c->pass, 0, sizeof c->pass);
+    c->rendering = 0;
+    c->ro_depth = 0;
+    c->dw = 1;
+    c->pipe_dw = 0;
+    c->restart = 0;
+    c->st_ok = c->vb_ok = c->pc_ok = 0;
+    c->pend_clr = 0;
+    c->last_dw = 2;
+    c->last_topo = GPU_TOPO_TRIANGLELIST;   /* as set below */
+    c->pend_ni = c->pend_nb = c->pend_nm = 0;
+    if (start) {
+        c->npasses = 0;
+        barrier_global(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        c->att_order = dd->att_seq;
+    }
+    {
+        const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        dd->vk.vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        dd->vk.vkCmdSetBlendConstants(c->cb, one);
+        dd->vk.vkCmdSetPrimitiveTopology(c->cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        dd->vk.vkCmdSetPrimitiveRestartEnable(c->cb, VK_FALSE);
+    }
+}
+
+/* Today's allocator and list Reset, then a recording's start (rec_fresh).
+ * With RSX_GPU_TIMES, the slot's last stamps are read and a new start
+ * stamped. */
 static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
@@ -1110,6 +1151,8 @@ static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
     gpu_vk_defer_collect(dd, 0);
     gpu_cmd* const c = &dd->slot[slot];
     dd->vk.vkResetCommandPool(dd->device, c->pool, 0);
+    c->part = 0;
+    c->cb = c->part_cb[0];
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof bi);
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1121,35 +1164,7 @@ static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
         dd->vk.vkCmdWriteTimestamp2(c->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->gt_pool, 0);
         c->gt_n = 1;
     }
-    c->lay = NULL;
-    memset(c->sets, 0, sizeof c->sets);
-    c->have = 0;
-    memset(c->dyn, 0, sizeof c->dyn);
-    memset(&c->key, 0, sizeof c->key);
-    c->set0_stale = 1;
-    c->dirty = 0;
-    memset(&c->pass, 0, sizeof c->pass);
-    c->rendering = 0;
-    c->npasses = 0;
-    c->ro_depth = 0;
-    c->dw = 1;
-    c->pipe_dw = 0;
-    c->restart = 0;
-    c->st_ok = c->vb_ok = c->pc_ok = 0;
-    c->pend_clr = 0;
-    c->last_dw = 2;
-    c->last_topo = GPU_TOPO_TRIANGLELIST;   /* as set below */
-    c->pend_ni = c->pend_nb = c->pend_nm = 0;
-    barrier_global(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
-                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
-    c->att_order = dd->att_seq;
-    {
-        const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-        dd->vk.vkCmdSetStencilReference(c->cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
-        dd->vk.vkCmdSetBlendConstants(c->cb, one);
-        dd->vk.vkCmdSetPrimitiveTopology(c->cb, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-        dd->vk.vkCmdSetPrimitiveRestartEnable(c->cb, VK_FALSE);
-    }
+    rec_fresh(dd, c, 1);
     return c;
 }
 
@@ -1785,6 +1800,46 @@ static gpu_fence vkb_submit(gpu_device* d, gpu_cmd* const* cmds, uint32_t n, con
     if (cbi != stack) free(cbi);
     if (r != VK_SUCCESS) gpu_vk_lost_note(dd, r);
     return how && (how->flags & GPU_SUBMIT_SIGNAL) ? value : 0;
+}
+
+/* The part so far ended and submitted as cmd_end and submit do, less
+ * cmd_end's barrier to the host (the last part's covers every part); the
+ * next part in another of the slot's buffers, with nothing bound
+ * (rec_fresh). RSX_GPU_TIMES's stamps go on in the slot's pool. */
+static int vkb_cmd_split(gpu_device* d, gpu_cmd* c, const gpu_submit_desc* how)
+{
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    if (c->part + 1 >= GPU_VK_CMD_PARTS) return 1;
+    VkCommandBuffer* const next = &c->part_cb[c->part + 1];
+    if (!*next) {
+        VkCommandBufferAllocateInfo ai;
+        memset(&ai, 0, sizeof ai);
+        ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ai.commandPool = c->pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        if (dd->vk.vkAllocateCommandBuffers(dd->device, &ai, next) != VK_SUCCESS) {
+            *next = VK_NULL_HANDLE;
+            return 1;
+        }
+    }
+    gpu_vk__close(c);
+    gpu_vk__sync(c);
+    const VkResult r = dd->vk.vkEndCommandBuffer(c->cb);
+    if (r != VK_SUCCESS) {   /* (a lost device: the rest is recorded into nothing) */
+        gpu_vk_lost_note(dd, r);
+        return 1;
+    }
+    vkb_submit(d, &c, 1, how);
+    c->cb = *next;
+    c->part++;
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    dd->vk.vkBeginCommandBuffer(c->cb, &bi);
+    rec_fresh(dd, c, 0);
+    return 0;
 }
 
 /* A point after everything submitted so far: an empty submit that signals

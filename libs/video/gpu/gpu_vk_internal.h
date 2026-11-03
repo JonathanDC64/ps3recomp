@@ -411,6 +411,7 @@ typedef struct gpu_vk_swap {
     uint32_t         next_sem;
     int32_t          current;          /* the acquired image, -1 when none */
     uint32_t         waited, signalled;
+    uint32_t         stats_misses;     /* swap_stats' waits for a present not yet shown (a test hook) */
     uint64_t         present_id, done_id;
     int64_t          done_qpc;
     /* Step VC2: the window's surface lost (made again at the next acquire),
@@ -469,6 +470,7 @@ typedef struct gpu_vk_set0_entry {
 #define GPU_VK_ST_VP          2u
 #define GPU_VK_ST_SC          4u
 #define GPU_VK_ST_IB          8u
+#define GPU_VK_CMD_PARTS      8u      /* a recording's parts at most (cmd_split) */
 
 struct gpu_cmd {
     gpu_cmd_head                 head;
@@ -490,6 +492,11 @@ struct gpu_cmd {
     const gpu_vk_qpool*          qpool;
     const gpu_vk_pso*            pso;
     VkCommandPool                pool;
+    /* cmd_split's parts: the slot's buffers from pool, [0] the one it was
+     * made with, the others made when a recording first needs them; cb is
+     * part_cb[part]. The pool's reset at cmd_begin resets them all. */
+    VkCommandBuffer              part_cb[GPU_VK_CMD_PARTS];
+    uint32_t                     part;
 
     /* Bound. */
     const gpu_vk_layout*         lay;

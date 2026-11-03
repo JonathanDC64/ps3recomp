@@ -6,7 +6,7 @@
  *   test_rsx_synth [--update-golden] [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan --fallback <step>|mark [...]   the start falls back to the default
- *   test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...
+ *   test_rsx_synth --stores vulkan|d3d12 [--out <dir>] [--env NAME=VALUE]...
  *                                   the new path's pipeline stores (stores_test says how)
  *   test_rsx_synth --caps <dir>     only write the scenes' captures (for rsx_replay)
  *   test_rsx_synth --run <dir>      the child the test starts: plays them
@@ -1072,8 +1072,9 @@ static int child_main(const char* dir)
 {
     setvbuf(stdout, NULL, _IONBF, 0);   /* in order with the backend's stderr */
     const char* be = getenv("RSX_BACKEND");
-    const char* const want = be && !strcmp(be, "vulkan") ? "vulkan" : be && !strcmp(be, "hal-d3d12") ? "hal-d3d12"
-                                                                                                     : "null";
+    /* (hal-d3d12: d3d12's name before the switch; the route says d3d12) */
+    const char* const want = be && !strcmp(be, "vulkan") ? "vulkan"
+                           : be && (!strcmp(be, "d3d12") || !strcmp(be, "hal-d3d12")) ? "d3d12" : "null";
     env_set("RSX_BACKEND", want);
     if (!getenv("RSX_PRESENT")) env_set("RSX_PRESENT", "1");
     if (!route_open(want)) { fprintf(stderr, "test_rsx_synth: no %s route in this build\n", want); return 3; }
@@ -1612,8 +1613,8 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
 
 #ifdef _WIN32
 /* ---------------------------------------------------------------------------
- * --stores <vulkan|hal-d3d12>: the new path's pipeline stores (step P3S) on a
- * real device, over the same chain, in seven children with
+ * --stores <vulkan|d3d12>: the new path's pipeline stores (step P3S) on a
+ * real device, over the same chain, in ten children with
  * PS3_SHADER_CACHE set and PS3_PSO_WAIT=1 (the start's builds run to their
  * end). The cache's library is gpu/d3d12/pipelines.lib, or Vulkan's
  * gpu/vulkan/<driver>.vkpc; the neutral manifest gpu/manifest.bin
@@ -1633,6 +1634,12 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
  *   G  A's cache, its library made another driver's (a byte of the file
  *      changed), no frames: the library starts empty, and the M records are
  *      built again.
+ *   H1 A's shaders and the first half of its records, no frames: they are
+ *      built into a new library.
+ *   H2 H1's cache: the library is loaded (on D3D12 from its file, mapped),
+ *      the chain compiles the other guest-FP pipelines, and the library is
+ *      saved over the file it was loaded from (it grows).
+ *   H3 H2's cache: the library is loaded and the chain compiles no pipeline.
  * -------------------------------------------------------------------------*/
 #define GM_SIZE  56u
 #define GM_MAGIC 0x314D4E47u
@@ -1643,7 +1650,7 @@ typedef struct {
     long mb[4], ix[4];         /* the manifest's and the index's builds: built, there already, not built, of */
     long gm_recs, gm_build;    /* "pipeline manifest gpu/manifest.bin: %u records, %u to build" */
     long torn;                 /* "keeping the first %u whole records" */
-    int lib_new;
+    int lib_new, lib_loaded, lib_saved;   /* "pipeline library: new" / ": loaded", "pipeline library saved" */
 } StoreRun;
 
 static void store_parse(const char* dir, StoreRun* r)
@@ -1670,6 +1677,10 @@ static void store_parse(const char* dir, StoreRun* r)
             r->torn = a;
         } else if (!strncmp(line, "[D3D12] pipeline library: new", 29)) {
             r->lib_new = 1;
+        } else if (!strncmp(line, "[D3D12] pipeline library: loaded", 32)) {
+            r->lib_loaded = 1;
+        } else if (!strncmp(line, "[D3D12] pipeline library saved:", 31)) {
+            r->lib_saved = 1;
         } else if (!strncmp(line, "[synth] done", 12))
             r->done = 1;
         line = next;
@@ -1730,6 +1741,13 @@ static int copy_shaders(const char* route, const char* src, const char* dst)
     dir_make(b);
     snprintf(b, sizeof b, "%s/gpu/spv", dst);
     return copy_files(a, "*.spv", b);
+}
+/* A file's size in bytes, -1 if there is none. */
+static long long file_bytes(const char* path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!path[0] || !GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) return -1;
+    return (long long)(((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
 }
 /* The library's file in a cache (the first of the route's), "" if none. */
 static void lib_file(const char* route, const char* cache, char* out, size_t cap)
@@ -1899,6 +1917,36 @@ static int stores_test(const char* exe, const char* out, const char* route, cons
              "%ld not built, of %ld", r.lib_new ? "a new one" : "not refused", r.mb[0], r.mb[1], r.mb[2], r.mb[3]);
     store_check(r.lib_new && r.gm_build == m && r.mb[2] == 0 && r.mb[0] + r.mb[1] == m, "G", what);
 
+    {   /* H1-H3: a library saved over the file it was loaded from */
+        const long half = m / 2;
+        char ch[MAX_PATH], lh[MAX_PATH];
+        snprintf(ch, sizeof ch, "%s/cache_h", out);
+        copy_shaders(route, ca, ch);
+        snprintf(q, sizeof q, "%s/gpu", ch);
+        dir_make(q);
+        snprintf(q, sizeof q, "%s/gpu/manifest.bin", ch);
+        f = fopen(q, "wb");
+        if (f) { fwrite(recs, GM_SIZE, (size_t)half, f); fclose(f); }
+        store_child(exe, out, "H1", route, ch, user, nuser, "RSX_SYNTH_PLAY=0", NULL, &r);
+        lib_file(route, ch, lh, sizeof lh);
+        const long long b1 = file_bytes(lh);
+        snprintf(what, sizeof what, "half the records into a new library (%lld bytes): %ld built, %ld there already, "
+                 "%ld not built, of %ld (of %ld)", b1, r.mb[0], r.mb[1], r.mb[2], r.mb[3], half);
+        store_check(half > 0 && r.lib_new && r.mb[3] == half && r.mb[2] == 0 && r.mb[0] + r.mb[1] == half && b1 > 0,
+                    "H1", what);
+        store_child(exe, out, "H2", route, ch, user, nuser, NULL, NULL, &r);
+        lib_file(route, ch, lh, sizeof lh);
+        const long long b2 = file_bytes(lh);
+        snprintf(what, sizeof what, "the library %s; guest-FP pipelines %ld loaded, %ld compiled; %s over its file "
+                 "(%lld bytes, from %lld)", r.lib_loaded ? "loaded" : "not loaded", r.fp_loaded, r.fp_compiled,
+                 r.lib_saved ? "saved" : "not saved", b2, b1);
+        store_check(r.lib_loaded && r.fp_loaded > 0 && r.fp_compiled > 0 && r.lib_saved && b2 > b1, "H2", what);
+        store_child(exe, out, "H3", route, ch, user, nuser, NULL, NULL, &r);
+        snprintf(what, sizeof what, "the library %s; the chain compiles %ld pipelines (%ld loaded)",
+                 r.lib_loaded ? "loaded" : "not loaded", r.compiled, r.loaded);
+        store_check(r.lib_loaded && r.compiled == 0 && r.loaded > 0, "H3", what);
+    }
+
     free(recs);
     if (g_store_ok) {
         printf("[synth] PASS: the pipeline stores on %s: %ld records, every one built from the manifest and as an "
@@ -1932,13 +1980,14 @@ static int test_main(int argc, char** argv)
         else if (!strcmp(argv[i], "--no-validation")) validation = 0;
         else if (!strcmp(argv[i], "--fallback") && i + 1 < argc) fallback = argv[++i];
         else if (!strcmp(argv[i], "--stores") && i + 1 < argc && (!strcmp(argv[i + 1], "vulkan") ||
+                                                                  !strcmp(argv[i + 1], "d3d12") ||
                                                                   !strcmp(argv[i + 1], "hal-d3d12")))
-            stores = argv[++i];
+            stores = strcmp(argv[++i], "vulkan") ? "d3d12" : "vulkan";   /* (hal-d3d12: its old name) */
         else {
             fprintf(stderr, "usage: test_rsx_synth [--update-golden] [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --route vulkan [--no-validation] [--fallback <step>|mark] [--keep] [--out <dir>]\n"
                             "                      [--env NAME=VALUE]...\n"
-                            "       test_rsx_synth --stores vulkan|hal-d3d12 [--out <dir>] [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --stores vulkan|d3d12 [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --caps <dir> | --run <dir>\n");
             return 2;
         }

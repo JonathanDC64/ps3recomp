@@ -8,16 +8,22 @@
 # macos-14 is deprecated (longer queues since July 2026, failing brownouts, and
 # retired on November 2, 2026: actions/runner-images#13518), and its jobs often
 # never got a machine ("not acquired by Runner"), with no step run. macos-15
-# picked jobs up in seconds when measured. The job also asks for as little as
-# it can: one build type on a pull request (both on master), a newer push or
-# PR update cancels the run it supersedes, and a job that hangs stops at the
-# timeout instead of holding a machine.
+# picked jobs up in seconds when measured, but on November 2 and 3, 2026 macos-15
+# jobs went unacquired too, each failing after 15 minutes and holding its pull
+# request red until a rerun. So the job no longer runs on pull requests or
+# pushes: it runs once a night on master, and by hand (gh workflow run macos.yml
+# --ref <branch>) for a change that needs it before it merges. It is not a
+# required check. A newer run cancels the one it supersedes, and a job that
+# hangs stops at the timeout instead of holding a machine.
+#
+# What only this job runs: the sse2neon check of the SPU SIMD paths, and the
+# Metal backend's scenes, smoke title and game template. The sysutil and
+# savedata tests run here and on Linux (linux.yml, with section GC).
 name: macOS
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
+  schedule:
+    - cron: '23 8 * * *'   # once a night (08:23 UTC), on master
   workflow_dispatch:
     inputs:
       runner:
@@ -28,7 +34,7 @@ on:
 
 concurrency:
   # the runner too, so manual runs on both images can run side by side
-  group: macos-${{ github.event.pull_request.number || github.ref }}-${{ inputs.runner }}
+  group: macos-${{ github.ref }}-${{ inputs.runner }}
   cancel-in-progress: true
 
 jobs:
@@ -40,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build_type: ${{ github.event_name == 'pull_request' && fromJSON('["Release"]') || fromJSON('["Debug", "Release"]') }}
+        build_type: [ Debug, Release ]
 
     steps:
       - uses: actions/checkout@v4
@@ -109,8 +115,8 @@ jobs:
       # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
       # both documenting a macOS clang line in their own header comment, neither
       # wired to any job. They need -Wl,-dead_strip (macOS ld) to drop the
-      # unreferenced runtime symbols they do not stub, which is why they belong
-      # here and not on the Linux or Windows jobs.
+      # unreferenced runtime symbols they do not stub. linux.yml runs them too,
+      # with -ffunction-sections -fdata-sections -Wl,--gc-sections.
       - name: Run self-contained sysutil tests
         run: |
           clang -std=gnu17 -I include                 libs/system/tests/test_dialog_callbacks.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks
