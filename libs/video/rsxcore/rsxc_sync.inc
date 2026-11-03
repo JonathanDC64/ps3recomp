@@ -84,10 +84,41 @@ static void lose_device_test(void)
  * fence value there is the opening wait's, already reached). The batch's
  * vertices go to the other parity half, and frame_cmd_begin waits for the
  * slot before its recorder is reset. */
+/* RSX_GPU_TIMES=1 or 2 (gpu/gpu_times.h): every 600 batches (render_frame
+ * calls), the GPU's own time from the backend's timestamps, a game frame
+ * (the title's flips that drew: s_pc_flip_render) or, with no flips (a
+ * replay), a batch. The stamps are read a few batches late, so a window is
+ * the one before, shifted:
+ *   [gpu-times] 300 frames: gpu 0.612 ms a frame (600 batches, 1200 recordings)
+ *   [gpu-times] 600 batches: gpu 0.306 ms a batch (600 recordings) */
+static void gpu_times_note(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_GPU_TIMES", 0));
+    if (on <= 0) return;
+    static u32 batches, flips0;
+    static u64 ns0, n0;
+    if (++batches < 600) return;
+    u64 n = 0;
+    const u64 ns = gpu_gpu_ns(s_rc_dev, &n);
+    const u32 flips = s_pc_flip_render - flips0;
+    if (n > n0 && flips)
+        printf("[gpu-times] %u frames: gpu %.3f ms a frame (%u batches, %llu recordings)\n", flips,
+               1e-6 * (double)(ns - ns0) / flips, batches, (unsigned long long)(n - n0));
+    else if (n > n0)
+        printf("[gpu-times] %u batches: gpu %.3f ms a batch (%llu recordings)\n", batches,
+               1e-6 * (double)(ns - ns0) / batches, (unsigned long long)(n - n0));
+    ns0 = ns;
+    n0 = n;
+    flips0 = s_pc_flip_render;
+    batches = 0;
+}
+
 static void move_to_next_frame(void)
 {
     const u32 prev = s_d3d.frame_index;
     const gpu_fence mine = gpu_signal(s_rc_dev);
+    gpu_times_note();
 
     rc_acquire();   /* (step VC1: the image, and the slot it falls in) */
 

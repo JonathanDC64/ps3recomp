@@ -105,6 +105,8 @@ static inline void gpu_vk__clear(gpu_cmd* c, uint32_t att, VkImageAspectFlags as
 static inline void gpu_cmd_pass_begin(gpu_cmd* c, const gpu_pass* pass)
 {
     gpu_vk__close(c);
+    if (c->gt_pass && c->gt_n < GPU_TIMES_MAX - 1)   /* RSX_GPU_TIMES=2 (one left for cmd_end) */
+        c->vk->vkCmdWriteTimestamp2(c->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->gt_pool, c->gt_n++);
     c->pass = *pass;
     if (c->pass.nrt > 4) c->pass.nrt = 4;
 }

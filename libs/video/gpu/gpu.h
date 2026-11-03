@@ -803,6 +803,11 @@ typedef struct gpu_device_desc {
     /* 0 once the GPU has passed f, 1 after timeout_ms without (never unbounded: a lost device \
      * never signals). */ \
     X(fence_wait,        R, int,            (gpu_device* d, gpu_fence f, uint32_t timeout_ms), (d, f, timeout_ms)) \
+    /* RSX_GPU_TIMES (gpu_times.h): the GPU's time in the recordings read back so far, in ns, \
+     * and how many (*n, may be NULL). A recording is read once its slot is begun again, and \
+     * at wait_idle. 0 with the knob off, or on a device without timestamps (the null one). \
+     * The render thread's. */ \
+    X(gpu_ns,            R, uint64_t,       (gpu_device* d, uint64_t* n), (d, n)) \
     /* Swap chains. On Vulkan one made on a minimized window has no images until it is shown. */ \
     X(swap_create,       R, gpu_swapchain,  (gpu_device* d, const gpu_swapchain_desc* desc), (d, desc)) \
     X(swap_destroy,      V, void,           (gpu_device* d, gpu_swapchain sc), (d, sc)) \
