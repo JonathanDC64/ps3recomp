@@ -205,10 +205,11 @@ static void drawprint_write(const char* path, const char* hdr)
             for (u32 k = 0; k < dr->vertex_count; k += 4)
                 vb = (vb ^ dp_hash(v0 + (u64)k * 256u, 256u)) * 16777619u;
         }
-        u32 cb = (s_d3d.vp_cb_mapped && dr->vcb_slot < MAX_DRAWS) ? dp_hash((const char*)s_d3d.vp_cb_mapped
-                     + ((u64)par * MAX_DRAWS + dr->vcb_slot) * VP_CB_STRIDE, VP_CB_STRIDE) : 0;
-        u32 fcb = (s_d3d.vp_fpcb_mapped && dr->cb_slot < MAX_DRAWS) ? dp_hash((const char*)s_d3d.vp_fpcb_mapped
-                     + ((u64)par * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE,
+        /* The bank and block the draw binds: the bytes are today's wherever
+         * the chunks put them, so the hashes are too. */
+        u32 cb = (vpcb_has(dr->vcb_slot) && dr->vcb_slot < MAX_DRAWS)
+                     ? dp_hash(vpcb_ptr(dr->vcb_slot, par), VP_CB_STRIDE) : 0;
+        u32 fcb = (fpcb_has(dr->cb_slot) && dr->cb_slot < MAX_DRAWS) ? dp_hash(fpcb_ptr(dr->cb_slot, par),
                      (size_t)(FPCB_K + s_fpk_n[dr->cb_slot]) * 16u) : 0;
         fprintf(f, "d%u fp=%X vs=%08X n=%u bk=%X dep=%X cull=%X cm=%X rt=%X z=%X d2c=%X vb=%08X cb=%08X fcb=%08X",
                 d, dr->fp_addr, vsh, dr->vertex_count, dr->blend_key, dr->depth, dr->cull,
@@ -234,9 +235,8 @@ static void drawprint_write(const char* path, const char* hdr)
         }
         /* RSX_DRAWPRINT_K=1: the inline FP constants and texture scales too. */
         { static int pk = -1; PS3_KNOB(pk, ps3_env_int("RSX_DRAWPRINT_K", 0));
-          if (pk && s_d3d.vp_fpcb_mapped && dr->cb_slot < MAX_DRAWS) {
-              const float* c = (const float*)((const char*)s_d3d.vp_fpcb_mapped
-                  + ((u64)par * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+          if (pk && fpcb_has(dr->cb_slot) && dr->cb_slot < MAX_DRAWS) {
+              const float* c = (const float*)fpcb_ptr(dr->cb_slot, par);
               fprintf(f, " at=(%g,%g,%g)", c[FPCB_ALPHA*4], c[FPCB_ALPHA*4+1], c[FPCB_ALPHA*4+2]);
               for (int u = 0; u < 16; u++)
                   if (c[u*4] != 1.0f || c[u*4+1] != 1.0f) fprintf(f, " ts%d=(%g,%g)", u, c[u*4], c[u*4+1]);

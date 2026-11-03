@@ -199,18 +199,19 @@ static void rsx_capture_frame(u32 fi, u32 ndraws, u32 capidx)
         }
         /* Per-draw VP constant banks for the first few offscreen-RT geometry
          * draws: c[0..3] is the projection row-major for most CG VPs; also scan
-         * for the largest non-zero slot so a mis-placed MVP is obvious. Records
-         * live at slot==draw-index; parity is post-^1 here (capture is after the
+         * for the largest non-zero slot so a mis-placed MVP is obvious. A draw's
+         * bank is its vcb_slot (banks are numbered as written, and VP_CB_REUSE
+         * shares them; it was the slot at the draw's index, which a draw that
+         * shared one never wrote); parity is post-^1 here (capture is after the
          * frame's vp_parity flip), so read the other half. */
-        if (s_d3d.vp_cb_mapped) {
+        if (s_rc_vpcb.n) {
             u32 par = (u32)(s_d3d.vp_parity ^ 1);
             fprintf(mf, "--- vp constants (first offscreen geometry draws) ---\n");
             int shown = 0;
             for (u32 d = 0; d < ndraws && d < MAX_DRAWS && shown < 4; d++) {
                 const D3D12DrawRecord* r = &s_d3d.draws[d];
                 if (r->is_clear || !r->rt_off) continue;
-                const float* c = (const float*)((const char*)s_d3d.vp_cb_mapped
-                    + ((u64)par * MAX_DRAWS + d) * VP_CB_STRIDE);
+                const float* c = (const float*)vpcb_ptr(vpcb_has(r->vcb_slot) ? r->vcb_slot : 0, par);
                 int last_nz = -1; float maxabs = 0.0f;
                 for (int i = 0; i < RSX_MAX_VERTEX_CONSTANTS * 4; i++) {
                     float a = c[i] < 0 ? -c[i] : c[i];

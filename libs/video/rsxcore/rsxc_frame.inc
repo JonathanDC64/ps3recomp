@@ -564,12 +564,12 @@ rtt_dump_done:;
                     (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
-        if (any && vpso.v && GPU_VALID(s_rc_vp_vb) && GPU_VALID(s_rc_vp_cb)) {
+        if (any && vpso.v && GPU_VALID(s_rc_vp_vb) && s_rc_vpcb.n) {
             gpu_cmd_set_layout(rc, s_d3d.vp_layout);
             gpu_cmd_set_pipeline(rc, vpso);
             gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
             s_vp_topo_strip = 0;
-            gpu_cmd_bind_cb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_cb));
+            gpu_cmd_bind_cb(rc, 0, s_rc_vpcb.va[0]);   /* (vp_cb's first chunk; each draw binds its bank) */
             /* b2 (the fetch draws' descriptor) set once, before any draw: a draw
              * without fetch reads none, and every slot is set before a draw
              * (gpu.h's rule, Vulkan's; step C8b). Each fetch draw sets its own. */
@@ -632,8 +632,14 @@ rtt_dump_done:;
              * the srv_inc it was given). */
             gpu_device* const rdev = s_rc_dev;
             const gpu_table_pool rsrv = s_rc_srv_pool;
-            const gpu_addr cb_va = gpu_fast_buffer_addr(rdev, s_rc_vp_cb);
-            const gpu_addr fpcb_va = GPU_VALID(s_rc_vp_fpcb) ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
+            /* The constants' chunks (made at record time, none while the
+             * frame renders), this frame's half's offset in each, and how
+             * many vp_fpcb has (0: none, slot 2 is not bound). */
+            const gpu_addr* const cb_va = s_rc_vpcb.va;
+            const gpu_addr* const fpcb_va = s_rc_fpcb.va;
+            const u64 cb_par = (u64)s_d3d.vp_parity * s_rc_vpcb.half;
+            const u64 fpcb_par = (u64)s_d3d.vp_parity * s_rc_fpcb.half;
+            const u32 fpcb_n = s_rc_fpcb.n;
             /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
              * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
             const gpu_addr uvc_vb_va = s_uvc_vs && GPU_VALID(s_rc_vp_vb)
@@ -927,12 +933,13 @@ rtt_dump_done:;
                 }
                 gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, DRAW_SRV_BASE + d * RSX_FP_UNITS));
                 vp_bind_sampler_table(dr);
-                /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
-                gpu_cmd_bind_cb(rc, 0, cb_va
-                    + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->vcb_slot) * VP_CB_STRIDE);
-                if (GPU_VALID(s_rc_vp_fpcb))
-                    gpu_cmd_bind_cb(rc, 2, fpcb_va
-                        + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_FPCB_STRIDE);
+                /* Per-draw constants: this draw's vp_cb bank + FP texscale
+                 * block, each in its chunk (a shift and a mask: no divide). */
+                gpu_cmd_bind_cb(rc, 0, cb_va[dr->vcb_slot >> VP_CB_CHUNK_SHIFT] + cb_par
+                    + (u64)(dr->vcb_slot & VP_CB_CHUNK_MASK) * VP_CB_STRIDE);
+                if ((dr->cb_slot >> VP_FPCB_CHUNK_SHIFT) < fpcb_n)
+                    gpu_cmd_bind_cb(rc, 2, fpcb_va[dr->cb_slot >> VP_FPCB_CHUNK_SHIFT] + fpcb_par
+                        + (u64)(dr->cb_slot & VP_FPCB_CHUNK_MASK) * VP_FPCB_STRIDE);
                 /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
                  * the target they are aimed at. A zero vertex count, or a start
                  * vertex past the buffer, rasterises nothing while every other
@@ -1175,6 +1182,9 @@ rtt_dump_done:;
     s_vp_want = 0;
     s_d3d.vp_ib_offset = 0;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
+    s_vcb_n = 0; s_fpcb_hi = 0;   /* numbered from 0 again, their chunks marked again */
+    rc_arena_frame_end(&s_rc_vpcb);
+    rc_arena_frame_end(&s_rc_fpcb);
     if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
     if (GPU_VALID(s_rc_vf_buf) && vf_want > s_vf_cap) vf_grow(vf_want);

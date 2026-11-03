@@ -13,8 +13,10 @@
  * build (E_INVALIDARG) and those surfaces never drew. */
 #define RSX_FP_UNITS      16
 #define MAX_DRAWS         16384 /* per-frame draw records. The per-draw
-                                 * constant buffer is VP_CB_STRIDE * MAX_DRAWS
-                                 * * 2 bytes (264 MB of upload heap). 2048,
+                                 * constants were VP_CB_STRIDE * MAX_DRAWS
+                                 * * 2 bytes (264 MB of upload heap) in one
+                                 * buffer; now chunks as frames need them
+                                 * (s_rc_vpcb, s_rc_fpcb). 2048,
                                  * sized from the spawn area's ~1841, was too
                                  * few for a dark room in the first level:
                                  * every draw past it was dropped, the display
@@ -28,6 +30,10 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
+/* vp_cb banks a chunk (s_rc_vpcb): 1 << 10, 8.25 MB a parity half. A power
+ * of two, so a draw finds its chunk with a shift, not a divide. */
+#define VP_CB_CHUNK_SHIFT 10
+#define VP_CB_CHUNK_MASK  ((1u << VP_CB_CHUNK_SHIFT) - 1u)
 /* b1 per-draw FP slot, in float4s: rsx_texscale[16], rsx_alphatest, then the
  * program's inline constants fp_constants[FPCB_KMAX]. (17 + 128) * 16 = 2320 B,
  * rounded up to D3D12's 256-byte CBV alignment. */
@@ -35,6 +41,9 @@
 #define FPCB_K            17
 #define FPCB_KMAX         128
 #define VP_FPCB_STRIDE    2560
+/* vp_fpcb draws a chunk (s_rc_fpcb): 1 << 11, 5 MB a parity half. */
+#define VP_FPCB_CHUNK_SHIFT 11
+#define VP_FPCB_CHUNK_MASK  ((1u << VP_FPCB_CHUNK_SHIFT) - 1u)
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -98,9 +107,10 @@ typedef struct {
      * reorders or compacts s_d3d.draws (DRAW_KEEP_TEX, DRAW_LAST_TEX,
      * DRAW_LIMIT) would otherwise make every surviving draw read some other
      * object's MVP -- silently transforming it somewhere else entirely. */
-    u32 cb_slot;
-    u32 vcb_slot;       /* vp_cb slot bound: cb_slot, or an earlier draw's this
-                         * frame whose vertex constants are the same (vp_record_cb) */
+    u32 cb_slot;        /* (also the draw's vp_fpcb block) */
+    u32 vcb_slot;       /* vp_cb bank bound: the frame's next bank, or an earlier
+                         * draw's this frame whose vertex constants are the same
+                         * (vp_record_cb numbers them as it writes them) */
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
@@ -349,8 +359,6 @@ typedef struct {
     u32                   vp_vb_offset;
     void*                 vp_ib_mapped;         /* u32 indices of the VP draws, per-frame: s_rc_vp_ib */
     u32                   vp_ib_offset;         /* in indices */
-    void*                 vp_cb_mapped;         /* per-draw VP constant slots: s_rc_vp_cb */
-    void*                 vp_fpcb_mapped;       /* per-draw FP texscale (b1): s_rc_vp_fpcb */
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
     gpu_shader            vp_vs_shader;         /* kept for guest-FP PSO builds (step C3b: a shader) */
@@ -504,8 +512,6 @@ static u64 s_vp_iwant = 0;
 static gpu_buffer s_rc_vertex_buf;     /* the fixed-function vertex buffer (vb_mapped) */
 static gpu_buffer s_rc_vp_vb;          /* the VP draws' vertices (vp_vb_mapped) */
 static gpu_buffer s_rc_vp_ib;          /* their indices (vp_ib_mapped) */
-static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
-static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
 static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
 static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
 /* The rings vp_vb_grow, vp_ib_grow and vf_grow replaced ([0] vp_vb, [1] vp_ib,
@@ -662,6 +668,26 @@ static void rc_arena_frame_end(rc_arena* a)
  * vertices fetched from guest memory, vertices written to the upload heap,
  * uploads by primitive, and the mean enabled-attribute count per fetch. */
 static u64 s_vs_fetch, s_vs_attr, s_vs_up[4];
+/* The per-draw constants in chunks (docs/124 steps 3 and 4). They were one
+ * upload heap each for MAX_DRAWS draws (vp_cb 264 MB, vp_fpcb 80 MB), and a
+ * frame uses a few hundred banks and a few thousand draws. vp_cb holds the
+ * vertex-constant banks by bank number (vp_record_cb numbers a frame's banks
+ * as it writes them, and VP_CB_REUSE has draws share one); vp_fpcb holds each
+ * draw's b1 block by draw number (cb_slot). The pointers below are given the
+ * parity half: a capture, made after the frame's flip, reads the other one. */
+static rc_arena s_rc_vpcb, s_rc_fpcb;
+static inline int vpcb_has(u32 bank) { return (bank >> VP_CB_CHUNK_SHIFT) < s_rc_vpcb.n; }
+static inline int fpcb_has(u32 slot) { return (slot >> VP_FPCB_CHUNK_SHIFT) < s_rc_fpcb.n; }
+static inline u8* vpcb_ptr(u32 bank, u32 par)
+{
+    return s_rc_vpcb.map[bank >> VP_CB_CHUNK_SHIFT] + (u64)par * s_rc_vpcb.half
+         + (u64)(bank & VP_CB_CHUNK_MASK) * VP_CB_STRIDE;
+}
+static inline u8* fpcb_ptr(u32 slot, u32 par)
+{
+    return s_rc_fpcb.map[slot >> VP_FPCB_CHUNK_SHIFT] + (u64)par * s_rc_fpcb.half
+         + (u64)(slot & VP_FPCB_CHUNK_MASK) * VP_FPCB_STRIDE;
+}
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like

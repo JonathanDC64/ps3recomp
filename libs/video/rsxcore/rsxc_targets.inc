@@ -217,22 +217,30 @@ static int fpk_extract_at(u32 off, float* out)
     }
     return n;
 }
-/* The last vp_cb slot written this frame, and what it was written from. */
-static u32 s_vcb_last = ~0u, s_vcb_gen;
+/* The last vp_cb bank written this frame, and what it was written from; the
+ * banks written this frame (the next one's number); the vp_fpcb chunks this
+ * frame has fitted (a draw below them has its block). Reset at the frame's end. */
+static u32 s_vcb_last = ~0u, s_vcb_gen, s_vcb_n;
+static u32 s_fpcb_hi;
 static const rsx_state* s_vcb_st;
 static float s_vcb_z[2];
 
-/* Returns the vp_cb slot the draw binds (its vcb_slot). */
+/* Returns the vp_cb bank the draw binds (its vcb_slot): always in a chunk
+ * that is there, so the draw loop binds it unchecked. `slot` is the draw. */
 static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
     late_note(slot, dr);
     const rsx_state* st = s_d3d.current_rsx_state;
-    if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return slot;
+    if (!s_rc_vpcb.n || !st || slot >= MAX_DRAWS) return 0;
     /* FP texcoord scale (b1): 1/size for UNnormalized textures (fmt bit
-     * 0x40 -- wave samples everything in texel space), 1.0 otherwise. */
-    if (s_d3d.vp_fpcb_mapped) {
-        float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
-            + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
+     * 0x40 -- wave samples everything in texel space), 1.0 otherwise.
+     * The first draw in a vp_fpcb chunk makes or marks it (rc_arena_fit). */
+    const u32 fk = slot >> VP_FPCB_CHUNK_SHIFT;
+    if (fk >= s_fpcb_hi && s_rc_fpcb.n &&
+        rc_arena_fit(&s_rc_fpcb, (u64)slot * VP_FPCB_STRIDE, VP_FPCB_STRIDE) != ~0ull)
+        s_fpcb_hi = fk + 1;
+    if (fk < s_fpcb_hi) {
+        float* ts = (float*)fpcb_ptr(slot, (u32)s_d3d.vp_parity);
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             float sx = 1.0f, sy = 1.0f;
             if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
@@ -339,10 +347,16 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
           s_vcb_gen == st->vertex_constants_gen &&
           s_vcb_z[0] == st->viewport_scale[2] && s_vcb_z[1] == st->viewport_offset[2])
           return s_vcb_last;
-      s_vcb_last = slot; s_vcb_st = st; s_vcb_gen = st->vertex_constants_gen;
+      /* A new bank takes the frame's next number; the first in a chunk makes
+       * or marks it (rc_arena_fit). One that cannot be made binds the last
+       * bank written (the number is tried again by the next draw). */
+      if (!(s_vcb_n & VP_CB_CHUNK_MASK) &&
+          rc_arena_fit(&s_rc_vpcb, (u64)s_vcb_n * VP_CB_STRIDE, VP_CB_STRIDE) == ~0ull)
+          return s_vcb_last < MAX_DRAWS ? s_vcb_last : 0;
+      s_vcb_last = s_vcb_n++; s_vcb_st = st; s_vcb_gen = st->vertex_constants_gen;
       s_vcb_z[0] = st->viewport_scale[2]; s_vcb_z[1] = st->viewport_offset[2]; }
-    char* dst = (char*)s_d3d.vp_cb_mapped
-        + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+    const u32 bank = s_vcb_last;
+    char* dst = (char*)vpcb_ptr(bank, (u32)s_d3d.vp_parity);
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
@@ -445,7 +459,7 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
         vpx[2] = 1.0f; vpx[6] = 0.0f;
     }
-    return slot;
+    return bank;
 }
 
 /* Which offscreen surface (if any) does the current RSX state render to?
