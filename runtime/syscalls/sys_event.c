@@ -10,6 +10,7 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#include <stddef.h>               /* offsetof */
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -52,6 +53,70 @@ static void evt_table_unlock(void)
 #else
     pthread_mutex_unlock(&s_evt_table_lock);
 #endif
+}
+
+/* A queue slot's lock and condition variable are made the first time the slot
+ * is used, then kept for the run: never deleted, never cleared. Host threads
+ * find a queue without the table lock (cellAudio's mixer by key, every audio
+ * period; the timers by id), so the lock must be valid whenever `active` can be
+ * read as set, and stay valid for a thread that read it and is on its way in.
+ * A queue goes live (`active`, a release store) only once it is set up, and
+ * event_queue_push checks `active` again under the lock. (#311: the mixer
+ * entered the lock of a queue sys_event_queue_create had marked active but not
+ * made the lock of yet -- an access violation writing near 0x24.) */
+static unsigned char s_q_lock_made[SYS_EVENT_QUEUE_MAX];
+
+static void q_lock_make(int slot)   /* (under the table lock) */
+{
+    if (s_q_lock_made[slot]) return;
+    sys_event_queue_info* q = &g_sys_event_queues[slot];
+#ifdef _WIN32
+    InitializeCriticalSection(&q->lock);
+    InitializeConditionVariable(&q->not_empty);
+#else
+    pthread_mutex_init(&q->lock, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+#endif
+    s_q_lock_made[slot] = 1;
+}
+
+static void q_lock(sys_event_queue_info* q)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&q->lock);
+#else
+    pthread_mutex_lock(&q->lock);
+#endif
+}
+
+static void q_unlock(sys_event_queue_info* q)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&q->lock);
+#else
+    pthread_mutex_unlock(&q->lock);
+#endif
+}
+
+/* Slot `slot` set up as a new queue, under the table lock and its own: every
+ * field before the lock cleared, then key, capacity and type. Returns with the
+ * queue's lock held; the caller sets the rest, then q_go_live. */
+static sys_event_queue_info* q_open(int slot, uint64_t key, int32_t size)
+{
+    sys_event_queue_info* q = &g_sys_event_queues[slot];
+    q_lock_make(slot);
+    q_lock(q);
+    memset(q, 0, offsetof(sys_event_queue_info, lock));   /* (not the lock: q_lock_make) */
+    q->key      = key;
+    q->capacity = size;
+    q->type     = SYS_PPU_QUEUE;
+    return q;
+}
+
+static void q_go_live(sys_event_queue_info* q)
+{
+    __atomic_store_n(&q->active, 1, __ATOMIC_RELEASE);
+    q_unlock(q);
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -111,25 +176,12 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     }
     if (slot < 0) { evt_table_unlock(); return 0; }
 
-    sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
-    q->active   = 1;
-    q->key      = key;
-    q->capacity = size;
-    q->type     = SYS_PPU_QUEUE;
-
-    /* The waiter primitives MUST be initialised here too. memset+fields is
-     * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
-     * first EnterCriticalSection on it faults writing near offset 0x24 of a
-     * null internal pointer -- which is exactly how YDKJ's FMOD audio thread
-     * died the moment it was finally given a real queue to block on. */
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
+    /* The waiter primitives MUST be valid here too: a zeroed CRITICAL_SECTION
+     * is not a valid one, and the first EnterCriticalSection on it faults
+     * writing near offset 0x24 of a null internal pointer -- which is exactly
+     * how YDKJ's FMOD audio thread died the moment it was finally given a
+     * real queue to block on. q_open makes them (once per slot). */
+    q_go_live(q_open(slot, key, size));
 
     evt_table_unlock();
 
@@ -159,17 +211,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
-    sys_event_queue_info* q = &g_sys_event_queues[slot];
-    memset(q, 0, sizeof(*q));
-    q->active   = 1;
-    q->key      = key;
-    q->capacity = size;
-    q->head     = 0;
-    q->tail     = 0;
-    q->count    = 0;
-    q->type     = SYS_PPU_QUEUE;
-    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
-            slot + 1, (unsigned long long)key, size);
+    sys_event_queue_info* q = q_open(slot, key, size);
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -191,14 +233,9 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
         memcpy(q->name, attr_raw + 8, 8);
     }
-
-#ifdef _WIN32
-    InitializeCriticalSection(&q->lock);
-    InitializeConditionVariable(&q->not_empty);
-#else
-    pthread_mutex_init(&q->lock, NULL);
-    pthread_cond_init(&q->not_empty, NULL);
-#endif
+    q_go_live(q);
+    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
+            slot + 1, (unsigned long long)key, size);
 
     uint32_t queue_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -224,14 +261,10 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
-#ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
-#else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
-#endif
-
-    q->active = 0;
+    /* The lock stays (q_lock_make): a host thread may be on its way in. */
+    q_lock(q);
+    __atomic_store_n(&q->active, 0, __ATOMIC_RELEASE);
+    q_unlock(q);
     evt_table_unlock();
     return CELL_OK;
 }
@@ -767,11 +800,11 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
                               (unsigned)g_sys_event_queues[k - 1].count);
               fprintf(stderr, "\n"); fflush(stderr);
           } } }
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
-    pthread_mutex_lock(&q->lock);
-#endif
+    q_lock(q);
+    if (!q->active) {   /* (destroyed since the caller looked: q_lock_make) */
+        q_unlock(q);
+        return -1;
+    }
 
     if (q->count >= q->capacity) {
 #ifdef _WIN32
@@ -951,7 +984,7 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
 {
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX) return -1;
     sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
-    if (!q->active) return -1;
+    if (!__atomic_load_n(&q->active, __ATOMIC_ACQUIRE)) return -1;
     sys_event_t evt;
     evt.source = source;
     evt.data1  = data1;
@@ -967,7 +1000,8 @@ uint32_t sys_event_find_queue_by_key(uint64_t key)
 {
     if (key == 0) return 0;
     for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
-        if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key)
+        if (__atomic_load_n(&g_sys_event_queues[i].active, __ATOMIC_ACQUIRE) &&
+            g_sys_event_queues[i].key == key)
             return (uint32_t)(i + 1);
     }
     return 0;
@@ -1543,6 +1577,7 @@ int64_t sys_event_flag_get(ppu_context* ctx)
 void sys_event_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_event_queues, 0, sizeof(g_sys_event_queues));
+    memset(s_q_lock_made, 0, sizeof(s_q_lock_made));   /* (before any thread: the locks are made again) */
     memset(g_sys_event_ports,  0, sizeof(g_sys_event_ports));
     memset(g_sys_event_flags,  0, sizeof(g_sys_event_flags));
 
