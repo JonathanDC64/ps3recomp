@@ -509,7 +509,7 @@ static gpu_shader uvc_vs4(int i)
  * vp_ib, which is write-combined and slow to read, but only for these draws,
  * a 2D pass's. A draw of converted vertices with no indices needs no table
  * (b2's top bit). Sets uvc_tab (b2) and uvc_n (vertices to draw); 0 when
- * the chunk of the draw has no room left (the frame moved on to another). */
+ * the chunk of the draw has no room left after the frame's data in it. */
 static int uvc_table(D3D12DrawRecord* dr)
 {
     /* (In the chunk of vp_vb that holds the draw's vertices: t20 is that
@@ -529,29 +529,42 @@ static int uvc_table(D3D12DrawRecord* dr)
     u8* dst;
     u32 at;
     u32 lo = 0;   /* the start of the fetch draw's chunk (virtual) */
+    u32 vf_k = RC_ARENA_MAX;   /* an earlier chunk of vf_buf the table goes in */
     if (dr->fetch) {
         /* In the chunk that holds the draw's records (t20 is that chunk's
-         * half), after the frame's data there: only while the frame still
-         * writes in that chunk (rc_arena; s_vf_wp is its half). */
+         * half), after the frame's data there: the chunk the frame writes
+         * in (s_vf_off; s_vf_wp is its half), or an earlier one's end. */
         lo = dr->fdesc >> s_vf_shift << s_vf_shift;
-        if (!s_vf_cap || lo != s_vf_lo || (u64)s_vf_off + head + most * 4 > s_vf_end) return 0;
-        at = s_vf_off - lo;
-        dst = s_vf_wp + at;
+        if (!s_vf_cap) return 0;
+        if (lo == s_vf_lo) {
+            if ((u64)s_vf_off + head + most * 4 > s_vf_end) return 0;
+            at = s_vf_off - lo;
+            dst = s_vf_wp + at;
+        } else {
+            vf_k = lo >> s_vf_shift;
+            if (vf_k >= s_vf.n || s_vf.used[vf_k] + head + most * 4 > s_vf_cap) return 0;
+            at = (u32)s_vf.used[vf_k];
+            dst = rc_arena_ptr(&s_vf, lo) + at;
+        }
     } else {
-        /* After the frame's vertices, in the chunk that holds the draw's
-         * (the table and the vertices it numbers share t20); none when the
-         * frame has moved on to another chunk and that one has no room. */
+        /* After the frame's vertices in the chunk that holds the draw's (the
+         * table and the vertices it numbers share t20): that chunk's end this
+         * frame (rc_arena used); none when it has no room left. */
         const u64 units = (most * 4 + 255u) / 256u;
         s_vp_want += units;
-        const u64 from = s_d3d.vp_vb_offset >= s_vb_big ? s_vb_cursor : s_d3d.vp_vb_offset;
         const u32 k = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
-        if (k >= RC_ARENA_MAX || rc_arena_chunk(&s_vb, from) != k ||
-            rc_arena_local(&s_vb, from) + units * 256u > s_vb.half ||
-            rc_arena_fit(&s_vb, from, units * 256u) != from)
-            return 0;
-        at = (u32)rc_arena_local(&s_vb, from);
+        if (k >= RC_ARENA_MAX || k >= s_vb.n || s_vb.used[k] + units * 256u > s_vb.half) return 0;
+        const u64 from = (u64)k * s_vb.half + s_vb.used[k];
+        if (rc_arena_fit(&s_vb, from, units * 256u) != from) return 0;
+        at = (u32)(from - (u64)k * s_vb.half);
         dst = rc_arena_ptr(&s_vb, from);
-        s_d3d.vp_vb_offset = (u32)from;
+        /* (the chunks' place, if in this one: past the table too) */
+        const u64 past = from + units * 256u;
+        if (s_d3d.vp_vb_offset < s_vb_big) {
+            if (rc_arena_chunk(&s_vb, s_d3d.vp_vb_offset) == k && s_d3d.vp_vb_offset < past)
+                s_d3d.vp_vb_offset = (u32)past;
+        } else if (rc_arena_chunk(&s_vb, s_vb_cursor) == k && s_vb_cursor < past)
+            s_vb_cursor = past;
     }
     u32* o = (u32*)(dst + head);
     u32 n = 0;
@@ -575,9 +588,9 @@ static int uvc_table(D3D12DrawRecord* dr)
     if (dr->fetch) {
         const u32 h[4] = { dr->fdesc - lo, 0, 0, 0 };   /* (in the chunk, as the draw's push) */
         memcpy(dst, h, sizeof h);
-        s_vf_off += head + n * 4;
-    } else
-        s_d3d.vp_vb_offset += (n * 4 + 255u) / 256u * 256u;
+        if (vf_k < RC_ARENA_MAX) s_vf.used[vf_k] = at + head + n * 4;
+        else s_vf_off += head + n * 4;
+    }
     dr->uvc_tab = at;
     dr->uvc_n = n;
     return 1;

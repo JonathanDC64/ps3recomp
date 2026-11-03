@@ -720,12 +720,20 @@ static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u
  * the chunks' place is kept for the draws after (s_vb_cursor). vp_vb_offset
  * and s_vb_at move to where they go, *out points there. The vertices there is
  * room for: want, or 0 when no buffer could be made (the draw is dropped, as
- * a full buffer's were). */
+ * a full buffer's were).
+ *
+ * With s_vb_carry set (a TRIANGLES range that continues the last draw,
+ * tri_carry) and the vertices going elsewhere than right after that draw's,
+ * the triangle it left open is copied there first: s_vb_at is its start,
+ * *out the range's first vertex, s_vb_carried how many went ahead. */
 static u32 vb_room(u32 want, VPSlot** out)
 {
-    u64 from = s_d3d.vp_vb_offset;
+    const u32 carry = s_vb_carry;
+    s_vb_carry = 0; s_vb_carried = 0;
+    const u64 prev = s_d3d.vp_vb_offset;   /* (right after the last draw's vertices) */
+    u64 from = prev;
     if (from >= s_vb_big) from = s_vb_cursor;   /* (the last draw went to the big buffer) */
-    const u64 at = rc_arena_fit(&s_vb, from, (u64)want * VP_VERT_STRIDE);
+    const u64 at = rc_arena_fit(&s_vb, from, (u64)(want + carry) * VP_VERT_STRIDE);
     if (at == ~0ull) {
         s_drop_draws++;
         { static int said = 0;
@@ -738,9 +746,14 @@ static u32 vb_room(u32 want, VPSlot** out)
         s_vb_most = want;
         if (want >= 16384u) fprintf(stderr, "[VPVB] the biggest draw so far: %u vertices%c", want, 10);
     }
-    s_d3d.vp_vb_offset = (u32)at;
     s_vb_at = (u32)at;
     *out = (VPSlot*)rc_arena_ptr(&s_vb, at);
+    if (carry && (at != prev || !rc_arena_local(&s_vb, at))) {   /* (not right after it, or a chunk's start) */
+        memcpy(*out, rc_arena_ptr(&s_vb, prev - (u64)carry * VP_VERT_STRIDE), (size_t)carry * VP_VERT_STRIDE);
+        *out += (size_t)carry * 16;
+        s_vb_carried = carry;
+    }
+    s_d3d.vp_vb_offset = (u32)(at + (u64)s_vb_carried * VP_VERT_STRIDE);
     return want;
 }
 
@@ -752,6 +765,24 @@ static int vb_fits(u64 want)
     const u64 at = s_d3d.vp_vb_offset;
     if (at >= s_vb_big || at % s_vb.half == 0) return 0;
     return at % s_vb.half + want * VP_VERT_STRIDE <= s_vb.half;
+}
+
+/* For a TRIANGLES range at `first` that continues the last draw (the merges
+ * in rsxc_record2.inc: the same BEGIN/END and program, no indices, its
+ * vertices ending at vp_vb_offset), the vertices of the triangle that draw
+ * left open. The RSX assembles the ranges as one stream (256 vertices each,
+ * not a multiple of 3); a range that starts a new chunk cannot extend the
+ * draw, so vb_room copies those vertices ahead of it to keep it in step. */
+static u32 tri_carry(u32 first)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st || !s_d3d.merge_prev_draw || !s_d3d.draw_count || s_d3d.merge_first_end != first) return 0;
+    const D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+    if (!pv->is_vp || pv->topology != RSX_TOPOLOGY_TRIANGLES || pv->index_count || pv->fetch ||
+        pv->fp_addr != st->shader_program || pv->begin_epoch != st->begin_epoch ||
+        pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE != s_d3d.vp_vb_offset)
+        return 0;
+    return pv->vertex_count % 3u;
 }
 
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
@@ -1771,6 +1802,7 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                  * has used the spare too), or none to be had. */
                 const u64 at = rc_arena_fit(&s_vf, s_vf_off, total);
                 if (at == ~0ull) { s_vf_stat[5]++; return -1; }
+                rc_arena_mark(&s_vf, s_vf_off);   /* (the chunk left: its end, for uvc_table) */
                 s_vf_off = (u32)at;
                 s_vf_lo = s_vf_off >> s_vf_shift << s_vf_shift;
                 s_vf_end = s_vf_lo + s_vf_cap;

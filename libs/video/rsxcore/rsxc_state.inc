@@ -587,6 +587,7 @@ typedef struct {
     u32 hi;                      /* chunks this frame reached (the highest written + 1) */
     u32 peak;                    /* the most any frame reached (said once per new peak) */
     u64 end;                     /* the end of what this frame placed (virtual, chunks only) */
+    u64 used[RC_ARENA_MAX];      /* each chunk's end of what this frame placed (in the chunk) */
     gpu_buffer buf[RC_ARENA_MAX];
     u8* map[RC_ARENA_MAX];
     gpu_addr va[RC_ARENA_MAX];
@@ -694,6 +695,7 @@ static u64 rc_arena_fit(rc_arena* a, u64 at, u64 bytes)
     }
     if ((u32)k + 1 > a->hi) a->hi = (u32)k + 1;
     if (at + bytes > a->end) a->end = at + bytes;
+    if (at - k * a->half + bytes > a->used[k]) a->used[k] = at - k * a->half + bytes;
     return at;
 }
 
@@ -739,6 +741,18 @@ static inline u64 rc_arena_local(const rc_arena* a, u64 off)
     const u32 k = rc_arena_chunk(a, off);
     return off - (u64)k * a->half;
 }
+/* The frame wrote up to virtual offset `end` (chunks only): for the users that
+ * place by their own counters and ask rc_arena_fit only for a chunk's first
+ * piece (vf_buf, the banks), so the chunk's end (used) and the chunk ahead
+ * at the frame's end see what they wrote. */
+static void rc_arena_mark(rc_arena* a, u64 end)
+{
+    if (!end) return;
+    const u64 k = rc_arena_k(a, end - 1);
+    if (k >= a->n) return;
+    if (end - k * a->half > a->used[k]) a->used[k] = end - k * a->half;
+    if (end > a->end) a->end = end;
+}
 
 /* At the frame's end: a new peak goes to the log; when the frame got past
  * half of the last chunk made, one more is made ahead for the frames to come;
@@ -755,6 +769,7 @@ static void rc_arena_frame_end(rc_arena* a)
     if (a->big_want > a->big_half)
         rc_arena_big_make(a, (a->big_want + a->big_want / 2 + 0xFFFFFull) & ~0xFFFFFull);
     a->hi = 0; a->end = 0; a->big_off = 0; a->big_want = 0;
+    memset(a->used, 0, sizeof a->used);
 }
 
 /* At render_frame's start, after its wait (as rc_ring_release): a big buffer
@@ -775,6 +790,8 @@ static u32 s_vb_chunk = 131072;
 static u64 s_vb_big = ~0ull;   /* the big buffer's first virtual offset (RC_ARENA_MAX chunks in) */
 static u32 s_vb_at;            /* where the last vb_room put its vertices */
 static u64 s_vb_cursor;        /* the chunks' place while vp_vb_offset is in the big buffer */
+static u32 s_vb_carry;         /* for the next vb_room: the open triangle's vertices it copies ahead (tri_carry) */
+static u32 s_vb_carried;       /* the vertices the last vb_room copied ahead of the draw's (at s_vb_at) */
 static u32 s_vb_most;          /* the biggest draw so far, in vertices */
 /* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
  * vertices fetched from guest memory, vertices written to the upload heap,

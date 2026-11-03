@@ -138,9 +138,12 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
         s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout) &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
+        s_vb_carried = 0;
+        s_vb_carry = primitive == RSX_PRIMITIVE_TRIANGLES ? tri_carry(first) : 0;
         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
             : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
+        s_vb_carry = 0;   /* (an upload that stopped before vb_room) */
         const u32 rec = s_vb_at;   /* (where vb_room put them) */
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
@@ -171,7 +174,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (emitted && draw_room()) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
             dr->vb_byte_offset = rec; dr->index_count = 0;
-            dr->vertex_count   = emitted;
+            dr->vertex_count   = emitted + s_vb_carried;   /* (the open triangle vb_room carried, first) */
             dr->topology       = RSX_TOPOLOGY_TRIANGLES;
             dr->is_vp          = 1;
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
@@ -294,6 +297,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
     s_up_icount = 0;
+    s_vb_carried = 0;
     /* A strip split over several DRAW_INDEX_ARRAY ranges of one BEGIN/END
      * (Demon's Souls' level meshes, 256 indices each) was a draw per range,
      * each paying the whole per-draw cost here and in render_frame. A range
@@ -345,7 +349,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     s_vs_up[primitive == RSX_PRIMITIVE_QUADS ? 0 : primitive == RSX_PRIMITIVE_TRIANGLES ? 1
             : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
     if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLES) {
+        s_vb_carry = tri_carry(first);   /* (as the non-indexed path) */
+        emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+        s_vb_carry = 0;
+    }
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
     else {
@@ -391,7 +399,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
         dr->vb_byte_offset = rec;
         dr->index_count = s_up_icount; dr->ib_first = s_up_ifirst;
-        dr->vertex_count   = emitted;
+        dr->vertex_count   = emitted + s_vb_carried;   /* (the open triangle vb_room carried, first) */
         dr->topology       = RSX_TOPOLOGY_TRIANGLES;
         dr->is_vp          = 1;
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;

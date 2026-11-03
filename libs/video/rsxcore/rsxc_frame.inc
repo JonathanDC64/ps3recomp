@@ -1176,6 +1176,11 @@ rtt_dump_done:;
     }
     s_dbg_last_draws = s_d3d.draw_count;
     vpj_sync();           /* nothing may still write the half being reset */
+    /* The ends the banks, the b1 blocks and the fetch ring reached (they ask
+     * rc_arena_fit only for a chunk's first piece), for the chunk ahead. */
+    rc_arena_mark(&s_rc_vpcb, (u64)s_vcb_n * VP_CB_STRIDE);
+    rc_arena_mark(&s_rc_fpcb, (u64)s_d3d.draw_count * VP_FPCB_STRIDE);
+    if (s_vf_cap) rc_arena_mark(&s_vf, s_vf_off);
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
     s_vb_cursor = 0;

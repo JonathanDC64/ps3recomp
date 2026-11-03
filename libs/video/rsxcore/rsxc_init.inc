@@ -352,15 +352,15 @@ static int init_d3d12(u32 width, u32 height)
          * by frame parity so a new frame's upload never overwrites vertices
          * the in-flight GPU frame is still reading (was: torn/missing
          * triangles mixing stale+new verts). VP_VB_CHUNK=<n> (read once):
-         * vertices a parity half per chunk, a power of two, default 131,072
-         * (64 MB a chunk); one is made to start with and more as frames need
+         * vertices a parity half per chunk, a power of two, 16,384 to 131,072
+         * (the default: 64 MB a chunk); one is made to start with and more as frames need
          * them, up to VP_VB_MAX_VERTS in all (default 2M), as that capped the
          * one buffer this was. It sat in RAM whole whatever a frame used, and
          * the port started it at 1.5M vertices (768 MB, VP_VB_VERTS, which
          * only today's renderer still reads). Steady frames use 5k-55k. */
         { int v = ps3_env_int("VP_VB_CHUNK", 131072);
           if (v < 16384) v = 16384;
-          if (v > (4 << 20)) v = 4 << 20;
+          if (v > 131072) v = 131072;   /* (the big buffer starts RC_ARENA_MAX chunks in: a draw's offset is 32 bits) */
           u32 c = 16384;
           while (c * 2 <= (u32)v) c *= 2;   /* (a power of two: a shift per draw, not a divide) */
           s_vb_chunk = c; }
