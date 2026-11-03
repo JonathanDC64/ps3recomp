@@ -374,6 +374,7 @@ jobs:
           CI: "1"          # makes a skipped conformance run fail instead of passing
         run: |
           set -e
+          unset CC CXX   # the suites take $CC/$CXX, else cc and c++: the system compiler, as before
           for t in tools/test_*.py; do
             echo "--- $t"
             python "$t"
