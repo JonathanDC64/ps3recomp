@@ -69,6 +69,10 @@ jobs:
       VKD3D_PREFIX: ${{ github.workspace }}/.ci-cache/vkd3d
       # The GPU layer's pinned sources (cmake/gpu_deps.cmake), cached on that file.
       GPU_SRC: ${{ github.workspace }}/.ci-cache/gpu-src
+      # sccache, pinned and checked (the release's size and SHA-256 from GitHub's asset list).
+      SCCACHE_VERSION: v0.18.0
+      SCCACHE_ARCHIVE_SIZE: '9730540'
+      SCCACHE_ARCHIVE_SHA256: 45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89
       CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
       CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
 
@@ -85,6 +89,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config clang libsdl2-dev libvulkan-dev libvulkan1 \
             mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb
+
+      # sccache for the configuration a pull request runs (clang, Release): every CMake configure below takes it
+      # from CMAKE_<LANG>_COMPILER_LAUNCHER. Most of the build is glslang and SPIRV-Tools, which never change
+      # between pins. Its cache comes from the newest master entry and is saved from master pushes only (at the
+      # end), one key per commit, so a day of merges stays small and the caches every run reads stay.
+      - name: sccache
+        id: sccache
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Release'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 --retry-all-errors -o sccache.tar.gz \
+            "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          [ "$(stat -c %s sccache.tar.gz)" = "$SCCACHE_ARCHIVE_SIZE" ] || { echo "::error::sccache.tar.gz has the wrong size"; exit 1; }
+          echo "$SCCACHE_ARCHIVE_SHA256  sccache.tar.gz" | sha256sum -c -
+          tar xzf sccache.tar.gz
+          d="$RUNNER_TEMP/sccache-$SCCACHE_VERSION-x86_64-unknown-linux-musl"
+          [ -x "$d/sccache" ] || { echo "::error::no sccache in the archive"; exit 1; }
+          echo "$d" >> "$GITHUB_PATH"
+          {
+            echo "SCCACHE_DIR=$GITHUB_WORKSPACE/.ci-cache/sccache"
+            echo "SCCACHE_CACHE_SIZE=1G"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore sccache's cache
+        if: steps.sccache.outcome == 'success'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-clang-Release-${{ github.sha }}
+          restore-keys: sccache-${{ runner.os }}-clang-Release-
 
       - name: Cache vkd3d
         if: matrix.build_type == 'Release'
@@ -922,3 +958,18 @@ jobs:
           cmake --build build-codec --target test_sail_movie test_vdec_stub test_vdec_ffmpeg test_cellPamf
           ctest --test-dir build-codec -N -R sail_movie_play | grep -q sail_movie_play
           ctest --test-dir build-codec -R "sail_movie|vdec|pamf" --output-on-failure
+
+      # ---- sccache: its counts, and its cache from a push to master -------------------------------------------
+
+      - name: sccache's counts
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        run: |
+          sccache --show-stats
+          sccache --stop-server || true
+
+      - name: Save sccache's cache
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' && github.event_name == 'push' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-clang-Release-${{ github.sha }}

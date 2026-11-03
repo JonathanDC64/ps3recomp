@@ -54,6 +54,10 @@ jobs:
     env:
       # The GPU layer's pinned sources (cmake/gpu_deps.cmake), cached on that file (linux.yml says why).
       GPU_SRC: ${{ github.workspace }}/.ci-cache/gpu-src
+      # sccache, pinned and checked (the release's size and SHA-256 from GitHub's asset list).
+      SCCACHE_VERSION: v0.18.0
+      SCCACHE_ARCHIVE_SIZE: '9694400'
+      SCCACHE_ARCHIVE_SHA256: 8965c74d5e8a225244f741e18ad2f3f504f48228dc1bac948fc22761a348363d
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -69,6 +73,38 @@ jobs:
       - name: Install Ninja
         id: ninja
         run: choco install ninja -y --no-progress
+
+      # sccache for the configuration a pull request runs (Release), as in linux.yml: every CMake configure takes it
+      # from CMAKE_<LANG>_COMPILER_LAUNCHER; its cache comes from the newest master entry and is saved from master
+      # pushes only. Release builds carry no debug information (no /Zi), which sccache could not cache.
+      - name: sccache
+        id: sccache
+        if: matrix.build_type == 'Release'
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 --retry-all-errors -o sccache.zip \
+            "https://github.com/mozilla/sccache/releases/download/$SCCACHE_VERSION/sccache-$SCCACHE_VERSION-x86_64-pc-windows-msvc.zip"
+          [ "$(stat -c %s sccache.zip)" = "$SCCACHE_ARCHIVE_SIZE" ] || { echo "::error::sccache.zip has the wrong size"; exit 1; }
+          echo "$SCCACHE_ARCHIVE_SHA256  sccache.zip" | sha256sum -c -
+          unzip -q sccache.zip
+          d="$RUNNER_TEMP/sccache-$SCCACHE_VERSION-x86_64-pc-windows-msvc"
+          [ -f "$d/sccache.exe" ] || { echo "::error::no sccache.exe in the archive"; exit 1; }
+          echo "$d" >> "$GITHUB_PATH"
+          {
+            echo "SCCACHE_DIR=$GITHUB_WORKSPACE/.ci-cache/sccache"
+            echo "SCCACHE_CACHE_SIZE=1G"
+            echo "CMAKE_C_COMPILER_LAUNCHER=sccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore sccache's cache
+        if: steps.sccache.outcome == 'success'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-Release-${{ github.sha }}
+          restore-keys: sccache-${{ runner.os }}-Release-
 
       - name: Show toolchain
         run: |
@@ -436,3 +472,19 @@ jobs:
       - name: Check the new path's symbols
         if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.hal_build.outcome == 'success' && steps.py.outcome == 'success' }}
         run: python .github/scripts/check_hal_symbols.py build-hal
+
+      # ---- sccache: its counts, and its cache from a push to master -------------------------------------------
+
+      - name: sccache's counts
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' }}
+        shell: bash
+        run: |
+          sccache --show-stats
+          sccache --stop-server || true
+
+      - name: Save sccache's cache
+        if: ${{ !cancelled() && steps.sccache.outcome == 'success' && github.event_name == 'push' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.ci-cache/sccache
+          key: sccache-${{ runner.os }}-Release-${{ github.sha }}
