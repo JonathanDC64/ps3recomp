@@ -1,4 +1,5 @@
-# Builds the runtime library on Linux.
+# Builds the runtime on Linux and runs every Linux test set: one job per compiler, each build made once and every
+# test that needs it run in the same job.
 #
 # Linux was the last platform with no CI and no evidence: the POSIX paths were
 # there, README listed the whole column as "untested", and nobody had ever run
@@ -9,62 +10,338 @@
 #
 # Both compilers, deliberately. GCC accepted the pthread_threadid_np call as an
 # implicit declaration and produced an archive that would only have failed when
-# something finally linked it; Clang rejected it outright. A single-compiler
-# matrix would have shipped that bug.
+# something finally linked it; Clang rejected it outright. A pull request runs
+# clang, Release (the stricter compiler); a push to master and a manual run add
+# gcc and both Debug builds.
 #
-# The graphics step runs against the null backend's headless software path,
-# which is what gives Linux an end-to-end check without a GPU, a display, or a
-# render backend of its own.
+# The builds, in the order the job makes them:
+#   build-routes  the portable renderer (PS3RECOMP_RSX_HAL) and today's D3D12 renderer on vkd3d
+#                 (PS3RECOMP_RSX_D3D12_VKD3D) in one runtime: the GPU layer's contract, null, spv and Vulkan
+#                 backend tests, the core on the synthetic scenes on the null and Vulkan routes (lavapipe, Xvfb,
+#                 the validation layer on: any message fails), once per GPU_CAP_* fallback, and the Vulkan
+#                 start's fallback to today's renderer on vkd3d. Release only.
+#   build-vkd3d   today's D3D12 renderer on vkd3d alone: the smoke title presents through it. Release only.
+#   build-hal     the portable renderer without vkd3d, as a Linux build without it has it: its tests that need
+#                 no display. Release, on a push to master or a manual run only.
+#   build         the runtime as a port links it today (both renderer options off): the archive's symbols, the
+#                 lifter suites, the smoke title and the game template on the null backend's headless software
+#                 path (no GPU, no display), the POSIX host's scenes, and the self-contained tests.
+#   build-vulkan  the opt-in Vulkan RSX backend (PS3RECOMP_RSX_VULKAN): every ps3recomp_host scene on lavapipe,
+#                 on the fixed-function path and on the draw engine under the validation layer. Release only.
+#   build-codec   cellSail's movies, cellVdec and cellPamf with FFmpeg loaded at run time.
+#
+# The portable renderer's builds come first, before the shader tools are installed: a system glslang found at
+# configure time turns the spv target off (cmake/gpu_deps.cmake), and the configure checks below say so if it did.
+# windows.yml builds both renderer options on Windows; macos.yml runs nightly.
 name: Linux
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master ]
+    paths-ignore: [ 'docs/**', '**.md' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new commit on a pull request (or a new push to master) cancels the run it replaces.
+concurrency:
+  group: linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     name: Linux x64 (${{ matrix.compiler }}, ${{ matrix.build_type }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        compiler: [gcc, clang]
-        build_type: [Debug, Release]
+        compiler: ${{ github.event_name == 'pull_request' && fromJSON('["clang"]') || fromJSON('["gcc", "clang"]') }}
+        build_type: ${{ github.event_name == 'pull_request' && fromJSON('["Release"]') || fromJSON('["Debug", "Release"]') }}
+    env:
+      # Built from its release tarball: Ubuntu packages 1.2, which has no HLSL compiler, and the backend compiles
+      # its shaders with vkd3d's D3DCompile. The build is cached on the version.
+      VKD3D_VERSION: "2.1"
+      VKD3D_SHA256: 7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a
+      VKD3D_PREFIX: ${{ github.workspace }}/../vkd3d
+      CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
+      CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # SDL2 is not optional off Windows: cellPad and cellAudio select their
-      # SDL2 backends unconditionally there, and CMakeLists.txt hard-fails
-      # without it.
-      # glslang and spirv-cross are what the Metal backend's guest-shader path
-      # translates with. There is no Metal here, but the translation itself
-      # has no GPU in it, so Linux is where the decompilers' HLSL meets
-      # glslang's front end on every push. glslang-tools is not used, but
-      # Ubuntu's glslang CMake config declares the standalone binary as an
-      # imported target and refuses to load while /usr/bin/glslang is absent.
+      # SDL2 is not optional off Windows: cellPad and cellAudio select their SDL2 backends unconditionally there,
+      # and CMakeLists.txt hard-fails without it. vkd3d's build needs flex, bison, Perl's JSON module and the SPIR-V
+      # headers; the Vulkan headers and loader build and run it; lavapipe is in mesa-vulkan-drivers, the validation
+      # layer is its own package; Xvfb is the display the windows open on.
       - name: Install dependencies
+        id: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+          sudo apt-get install -y ninja-build pkg-config clang libsdl2-dev libvulkan-dev libvulkan1 \
+            mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb
+
+      - name: Cache vkd3d
+        if: matrix.build_type == 'Release'
+        id: vkd3d-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.VKD3D_PREFIX }}
+          key: vkd3d-${{ env.VKD3D_VERSION }}-${{ runner.os }}-ubuntu-24.04-v1
+
+      - name: Build vkd3d
+        id: vkd3d
+        if: matrix.build_type == 'Release' && steps.vkd3d-cache.outputs.cache-hit != 'true'
+        run: |
+          unset CC CXX   # the system compiler, as for both matrix entries before: one cache serves both
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://dl.winehq.org/vkd3d/source/vkd3d-$VKD3D_VERSION.tar.xz"
+          echo "$VKD3D_SHA256  vkd3d-$VKD3D_VERSION.tar.xz" | sha256sum -c -
+          tar xf "vkd3d-$VKD3D_VERSION.tar.xz"
+          cd "vkd3d-$VKD3D_VERSION"
+          ./configure -q --prefix="$VKD3D_PREFIX" --disable-doxygen-doc
+          make -s -j"$(nproc)"
+          make -s install
+
+      # ---- build-routes: the portable renderer and today's D3D12 renderer on vkd3d, one runtime -------------
+
+      # Both renderers in one runtime: the configure must say so for each, and the spv target must be on.
+      - name: Both routes, configure
+        id: routes_cfg
+        if: matrix.build_type == 'Release'
+        run: |
+          export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
+          cmake -S . -B build-routes -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON \
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON | tee configure-routes.log
+          grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure-routes.log
+          grep -q "Renderer: *the GPU layer's Vulkan backend" configure-routes.log
+          grep -q "Renderer: *the compile service's spv target" configure-routes.log
+
+      - name: Both routes, build
+        id: routes_build
+        if: matrix.build_type == 'Release'
+        run: >
+          cmake --build build-routes --target ps3recomp_runtime test_gpu_contract test_gpu_null test_gpu_sc_spv
+          test_gpu_vk test_rsx_synth test_rsx_out
+
+      # The contract is plain C99 that C++ includes as well, built as both with -Wpedantic -Werror: nothing in the
+      # headers may be a Windows or compiler extension. The null backend's test: its operation stream's hash
+      # against a golden. The spv target's: the seeded generator's programs and the built-in passes compile,
+      # validate, bind where the Vulkan backend's layout says, and compile to the same bytes twice.
+      - name: Run the contract, null backend and spv target tests
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+        run: |
+          ctest --test-dir build-routes -R gpu_contract --output-on-failure --no-tests=error
+          ctest --test-dir build-routes -R gpu_null --output-on-failure --no-tests=error
+          ctest --test-dir build-routes -R gpu_sc_spv --output-on-failure --no-tests=error
+
+      # The switch's choice against its stand-ins, as Linux builds it (-V: each case's line).
+      - name: Run the route switch's test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+        run: ctest --test-dir build-routes -R rsx_out -V --no-tests=error
+
+      # The new path's core on the null route over synthetic scenes, through the switch, in two processes: each
+      # scene's stream hash against its golden (the same goldens as Windows: a hash that differs here is a
+      # portability bug in the core), with no failed check.
+      - name: Run the core on the synthetic scenes (null route, through the switch)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+        run: ctest --test-dir build-routes -R rsx_synth -V --no-tests=error
+
+      # The Vulkan backend's test on lavapipe, Mesa's CPU device: the test picks the CPU device and turns the
+      # validation layer on itself. Then again with every cap off (RSX_VK_MASK): every fallback at once.
+      - name: Run the Vulkan backend's test (lavapipe, validation on)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+        run: |
+          ctest --test-dir build-routes -R gpu_vk --output-on-failure --no-tests=error
+          RSX_VK_MASK=0xFFFFFF ctest --test-dir build-routes -R gpu_vk --output-on-failure --no-tests=error
+
+      # The Vulkan route through the switch, in the core's SDL window on Xvfb, the validation layer on with
+      # synchronization validation: every frame plays, no validation message, and the switch's own line names the
+      # route (a start that fell back to today's renderer would play the scenes too). lavapipe is the only device.
+      - name: Run the core on the synthetic scenes (Vulkan route, through the switch)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        working-directory: build-routes
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+          SDL_AUDIODRIVER: dummy
+        run: |
+          set -o pipefail
+          mkdir -p routes.out
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --keep --out routes.out/vulkan
+          grep -F "[rsx_out] route vulkan (the new path on its Vulkan backend)" routes.out/vulkan/a/log.txt
+
+      # The device's GPU_CAP_* bits (gpu.h), as the backend's test prints them; then the scenes once per bit it
+      # has, with that bit off (RSX_VK_MASK: its fallback), and once with every bit off. A bit the device lacks has
+      # no fallback to try here. Each run must have played on the Vulkan route, not fallen back to today's
+      # renderer. Every run is listed; the step fails if any did.
+      - name: Run the core on the synthetic scenes with each cap off
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        working-directory: build-routes
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+          SDL_AUDIODRIVER: dummy
+        run: |
+          caps=$(./test_gpu_vk | sed -n 's/.*, caps 0x\([0-9A-Fa-f]*\),.*/\1/p' | head -1)
+          [ -n "$caps" ] || { echo "no caps line from test_gpu_vk"; exit 1; }
+          echo "device caps 0x$caps"
+          masks=""
+          for b in $(seq 0 23); do
+            if [ $(( 0x$caps >> b & 1 )) = 1 ]; then masks="$masks $(printf '0x%X' $((1 << b)))"; fi
+          done
+          masks="$masks 0xFFFFFF"
+          # To come here, one more run each, once they land (ps3recomp #194, lane V5v):
+          #   --env RSX_CLAMP_FORM=vs        the vertex-shader clamp
+          #   --env RSX_DEPTH_FORMAT=d32s8   D32S8 depth
+          mkdir -p masks.out
+          fail=0; table=""
+          for m in $masks; do
+            out=masks.out/$m
+            if xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --keep --out "$out" \
+                 --env RSX_VK_MASK=$m > "$m.txt" 2>&1 \
+               && grep -qF "[rsx_out] route vulkan (the new path on its Vulkan backend)" "$out/a/log.txt" \
+               && ! grep -q "\[D3D12\] vkd3d: llvmpipe" "$out/a/log.txt"; then
+              table="$table\n  RSX_VK_MASK $m: pass"
+            else
+              table="$table\n  RSX_VK_MASK $m: FAIL"; fail=1
+              cat "$m.txt"
+            fi
+            tail -1 "$m.txt"
+          done
+          printf "the fallbacks:$table\n"
+          exit $fail
+
+      # A Vulkan start that fails at each step the core names (RSX_FAIL_START_AT), and one with a start mark left,
+      # must run today's renderer on vkd3d in the same process; it plays the same scenes. Every run is listed; the
+      # step fails if any did.
+      - name: Run the Vulkan start's fallback to today's renderer (each step, and a mark left)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        working-directory: build-routes
+        env:
+          LD_LIBRARY_PATH: ${{ env.VKD3D_PREFIX }}/lib
+          SDL_AUDIODRIVER: dummy
+        run: |
+          mkdir -p routes.out
+          fail=0; table=""
+          for s in loader instance adapter features device window "swap chain" targets shaders rings mark; do
+            out="routes.out/fallback-${s// /_}"
+            if xvfb-run -a -s "-screen 0 1920x1080x24" ./test_rsx_synth --route vulkan --fallback "$s" --keep \
+                 --out "$out" > "$out.txt" 2>&1 \
+               && grep -q "\[D3D12\] vkd3d: llvmpipe" "$out/a/log.txt" \
+               && ! grep -q "the failed start's window" "$out/a/log.txt"; then
+              table="$table\n  $s: pass"
+            else
+              table="$table\n  $s: FAIL"; fail=1
+              cat "$out.txt"
+            fi
+            tail -1 "$out.txt"
+            grep -F "[rsx_out] route" "$out/a/log.txt" || true
+          done
+          printf "the fallbacks:$table\n"
+          exit $fail
+
+      # On a failure: the children's logs, the first one's stream dump (dump.txt) and the scenes' captures.
+      - name: Keep the portable renderer's output
+        if: failure() && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rsx-routes-linux-${{ matrix.compiler }}
+          path: |
+            build-routes/routes.out/
+            build-routes/masks.out/
+            build-routes/test_rsx_synth.out/
+          if-no-files-found: ignore
+
+      # ---- build-vkd3d: today's D3D12 renderer on vkd3d alone ----------------------------------------------
+
+      # The backend a title takes on Linux today: rsx_d3d12_backend.c, the same file Windows builds, on vkd3d
+      # (Wine's D3D12 on Vulkan) in an SDL window, with the DXGI half from rsx_vkd3d_dxgi.c.
+      - name: D3D12 on vkd3d, configure and build
+        id: vkd3d_build
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.deps.outcome == 'success' && steps.vkd3d.outcome != 'failure' }}
+        run: |
+          export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
+          cmake -S . -B build-vkd3d -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON | tee configure-vkd3d.log
+          grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure-vkd3d.log
+          cmake --build build-vkd3d --target ps3recomp_runtime ps3recomp_boot_smoke
+
+      # The smoke title (below) again, this time presenting through the D3D12 backend: three frames cleared and
+      # flipped through the FIFO, on lavapipe, in an SDL window on Xvfb. Exit 0 is the title's own verdict; the
+      # greps make sure it was this backend on vkd3d that presented them, not a fallback.
+      - name: Run the PPU boot smoke title (D3D12 on vkd3d)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.vkd3d_build.outcome == 'success' }}
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+          SDL_AUDIODRIVER: dummy
+        run: |
+          set -o pipefail
+          export LD_LIBRARY_PATH="$VKD3D_PREFIX/lib"
+          test -x build-vkd3d/ps3recomp_boot_smoke
+          xvfb-run -a -s "-screen 0 1920x1080x24" \
+            ./build-vkd3d/ps3recomp_boot_smoke build-vkd3d/smoke/smoke.elf 2>&1 | tee smoke-vkd3d.log
+          grep -q "\[D3D12\] vkd3d: llvmpipe" smoke-vkd3d.log
+          grep -q "\[D3D12\] Backend ready" smoke-vkd3d.log
+          grep -q "frames presented: 3" smoke-vkd3d.log
+          grep -q "\[smoke\] PASS" smoke-vkd3d.log
+
+      # ---- build-hal: the portable renderer without vkd3d (push to master, manual run) ----------------------
+
+      # As a Linux build without vkd3d has it: the switch then has null and vulkan only (test_rsx_out.c's
+      # stand-ins). The Vulkan tests ran on build-routes above, against the same backend.
+      - name: Portable renderer without vkd3d, configure and build
+        id: hal_build
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && github.event_name != 'pull_request' && steps.deps.outcome == 'success' }}
+        run: |
+          cmake -S . -B build-hal -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON | tee configure-hal.log
+          grep -q "Renderer: *the GPU layer's Vulkan backend" configure-hal.log
+          grep -q "Renderer: *the compile service's spv target" configure-hal.log
+          cmake --build build-hal --target ps3recomp_runtime test_gpu_contract test_gpu_null test_gpu_sc_spv \
+            test_gpu_vk test_rsx_synth test_rsx_out
+
+      - name: Portable renderer without vkd3d, the tests with no display
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && github.event_name != 'pull_request' && steps.hal_build.outcome == 'success' }}
+        run: |
+          ctest --test-dir build-hal -R gpu_contract --output-on-failure --no-tests=error
+          ctest --test-dir build-hal -R gpu_null --output-on-failure --no-tests=error
+          ctest --test-dir build-hal -R gpu_sc_spv --output-on-failure --no-tests=error
+          ctest --test-dir build-hal -R rsx_out -V --no-tests=error
+          ctest --test-dir build-hal -R rsx_synth -V --no-tests=error
+
+      # ---- build: the runtime as a port links it today ------------------------------------------------------
+
+      # glslang and spirv-cross are what the Metal backend's guest-shader path translates with. There is no Metal
+      # here, but the translation itself has no GPU in it, so Linux is where the decompilers' HLSL meets glslang's
+      # front end on every push. glslang-tools is not used, but Ubuntu's glslang CMake config declares the
+      # standalone binary as an imported target and refuses to load while /usr/bin/glslang is absent. spirv-tools
+      # is what glslang's HLSL legalization runs on (the Vulkan backend below).
+      - name: Install the shader tools (glslang, spirv-cross)
+        id: tools
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          sudo apt-get install -y glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
 
       - name: Configure
-        run: |
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          else
-            CC=gcc CXX=g++ cmake -S . -B build -G Ninja \
-              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          fi
+        id: cfg
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build
+        id: build
+        if: ${{ !cancelled() && steps.cfg.outcome == 'success' }}
         run: cmake --build build
 
       - name: Verify the archive exists and is x86-64
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           test -f build/libps3recomp_runtime.a
           file build/libps3recomp_runtime.a
@@ -84,11 +361,14 @@ jobs:
       # the host compiler, so it is genuinely testing this platform's codegen
       # and not just re-checking the lifter's Python.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        id: py
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
 
       - name: Run the lifter test suites
+        if: ${{ !cancelled() && steps.py.outcome == 'success' }}
         env:
           CI: "1"          # makes a skipped conformance run fail instead of passing
         run: |
@@ -99,6 +379,7 @@ jobs:
           done
 
       - name: Run self-contained SPU helper tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
             -std=gnu17 -I include -I runtime/spu \
@@ -114,6 +395,7 @@ jobs:
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
           /tmp/test_sys_net
@@ -122,6 +404,8 @@ jobs:
       # network tests below: they include ps3_tls.c, the TLS to the online
       # server.
       - name: Build mbedTLS for the network tests
+        id: mbedtls
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           mkdir -p /tmp/mbedtls
           cd /tmp/mbedtls
@@ -132,6 +416,7 @@ jobs:
       # certificates: the built-in roots, the certificate and name checks,
       # a server that isn't TLS, timeouts, large transfers.
       - name: Run the TLS test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_net_tls libs/network/tests/test_net_tls.c /tmp/libmbedtls.a -lpthread
           /tmp/test_net_tls
@@ -139,6 +424,7 @@ jobs:
       # cellHttp end to end on loopback: guest pointers, the network gate, and
       # PS3_HTTP_HEADER's extra header.
       - name: Run the cellHttp loopback test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_http_loopback
@@ -147,6 +433,7 @@ jobs:
       # work, the session on cellHttp's requests to that server only. Then
       # what the player is told when psnr refuses co-op.
       - name: Run the sign-in tests
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_net_signin libs/network/tests/test_net_signin.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_net_signin
@@ -156,6 +443,7 @@ jobs:
       # cellL10n's UTF8toUTF16 at guest addresses: one character per call,
       # big-endian units, the byte count returned.
       - name: Run the cellL10n test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_l10n libs/font/tests/test_l10n.c
           /tmp/test_l10n
@@ -163,6 +451,7 @@ jobs:
       # Matching2 over psnr without a server: response relocation, attribute
       # packing, and the room structs a title reads.
       - name: Run the Matching2 test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
@@ -170,6 +459,7 @@ jobs:
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_identity
@@ -177,6 +467,7 @@ jobs:
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_nat
@@ -185,6 +476,7 @@ jobs:
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
       # source, on an SDAT the test makes with edat.c's own AES.
       - name: Run the EDAT path test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_paths libs/filesystem/tests/test_edat_paths.c
           /tmp/test_edat_paths
@@ -193,6 +485,7 @@ jobs:
       # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control
       # characters or Windows device names.
       - name: Run the guest path test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_vfs_path libs/filesystem/tests/test_vfs_path.c
           /tmp/test_vfs_path
@@ -200,16 +493,17 @@ jobs:
       # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
       # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
       - name: Run the stick conversion test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I libs/input -o /tmp/test_pad_stick libs/input/tests/test_pad_stick.c -lm
           /tmp/test_pad_stick
-
 
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
       # and attribute slots the Metal backend binds to. The binary missing
       # means the shader tools were not found, which must fail, not skip.
       - name: Run the guest shader translation test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           test -x build/test_shader_msl
           ./build/test_shader_msl
@@ -220,6 +514,7 @@ jobs:
       # count: it fails if the scaffold gets WORSE, which is what keeps the
       # port from sliding backwards while it is being done.
       - name: Check the PPU boot scaffold (ratchet)
+        if: ${{ !cancelled() && steps.py.outcome == 'success' }}
         env:
           CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
         run: python tools/check_ppu_scaffold.py
@@ -234,6 +529,7 @@ jobs:
       # exit status came back through sys_process_exit. The binary missing
       # means CMake skipped the target, which must fail rather than pass.
       - name: Run the PPU boot smoke title (null backend)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           test -x build/ps3recomp_boot_smoke
           ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
@@ -247,16 +543,12 @@ jobs:
       # nothing cannot pass. Linux is also where the template's null-backend
       # branch is the one that runs.
       - name: Build and run the game template (null backend)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           # pipefail, or tee below would swallow the runner's exit status --
           # which IS the smoke title's verdict.
           set -eo pipefail
           test -f build/smoke/lift/ppu_recomp.h
-          if [ "${{ matrix.compiler }}" = "clang" ]; then
-            export CC=clang CXX=clang++
-          else
-            export CC=gcc CXX=g++
-          fi
           cmake -S templates/project -B build-template -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DPS3RECOMP_DIR="$PWD" \
@@ -275,6 +567,7 @@ jobs:
       # display and no GPU are involved, so exit 0 means the whole graphics
       # bridge is intact on Linux, not merely that it compiled.
       - name: Run the POSIX host (headless end-to-end)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           # Clear + flip: asserts the guest clear colour reaches the framebuffer.
           ./build/ps3recomp_host
@@ -315,6 +608,7 @@ jobs:
       # arithmetic with no host API in it, so it runs everywhere, and it is the
       # regression net for having lifted that maths out of the D3D12 uploader.
       - name: Run self-contained RSX tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
           /tmp/test_texture_layout
@@ -346,6 +640,7 @@ jobs:
       # widths and return conventions, SRW/CS/condition variables, events,
       # semaphores, joinable threads, WaitOnAddress, timers, VirtualAlloc.
       - name: Run the Win32 compatibility layer tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
           /tmp/test_win32_compat
@@ -356,6 +651,7 @@ jobs:
       # that differently; this is the evidence, and it needs no game, so it is
       # the one thing about that trap CI can actually run.
       - name: Run the guest-pointer trap signal test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
@@ -365,7 +661,9 @@ jobs:
       # handles and multi-object waits; here it is the memory-model regression
       # net for the same primitives a game hammers.
       - name: Build and run sync_stress
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
+          unset CC CXX   # the system compiler, as before
           cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync-stress
           ctest --test-dir build-sync-stress --output-on-failure
@@ -376,8 +674,8 @@ jobs:
       # go and reserves the 256 MB stacks, on this host's own pthreads. Its
       # plat_time test checks plat.h's clock and precise sleep.
       - name: Build and run plat_threads
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
-          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang; else export CC=gcc; fi
           cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-plat-threads
           ctest --test-dir build-plat-threads --output-on-failure
@@ -387,8 +685,8 @@ jobs:
       # first reading, as on Windows, and a one-off usleep under a millisecond
       # never ends early. -V prints requested against measured sleeps.
       - name: Build and run lv2_time
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
-          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang; else export CC=gcc; fi
           cmake -S tests/lv2_time -B build-lv2-time -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-lv2-time
           ctest --test-dir build-lv2-time --output-on-failure -V
@@ -397,32 +695,18 @@ jobs:
       # not the one that bites, but running the suite on both hosts is what
       # tells a Darwin header problem from a logic error in the switch.
       - name: Build and run fiber_switch
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
+          unset CC CXX   # the system compiler, as before
           cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-fiber
           ./build-fiber/fiber_switch
-
-      # cellSail's movies off Windows: MPEG-2 through FFmpeg loaded at run
-      # time, on a PAMF file the test encodes and writes itself (B-frames,
-      # pictures split across PES packets, LPCM split mid-sample), with the
-      # cellVdec and cellPamf tests next to it. It needs the FFmpeg libraries,
-      # not the ffmpeg program (without that the cellVdec decode tests are not
-      # added). The movie test missing means CMake did not find the libraries,
-      # which must fail, not skip.
-      - name: Run the codec tests with FFmpeg (movies)
-        run: |
-          sudo apt-get install -y libavcodec-dev
-          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
-          cmake -S . -B build-codec -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DPS3RECOMP_BUILD_TESTS=ON -DPS3RECOMP_FFMPEG_RUNTIME=ON
-          cmake --build build-codec --target test_sail_movie test_vdec_stub test_vdec_ffmpeg test_cellPamf
-          ctest --test-dir build-codec -N -R sail_movie_play | grep -q sail_movie_play
-          ctest --test-dir build-codec -R "sail_movie|vdec|pamf" --output-on-failure
 
       # An SPU parked on a GETLLAR reservation has to be told when the PPU
       # writes that line. Nothing else in the tree fails when that notify is
       # missing -- the SPU just never wakes -- so it gets its own check.
       - name: Run the PPU/SPU lock-line coherence tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu \
                 -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
@@ -431,6 +715,7 @@ jobs:
       # The host inflate that replaces an SPU title's lifted zlib: its output
       # has to be zlib's byte for byte, and a bad stream has to fail cleanly.
       - name: Run the raw inflate tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -I include -I runtime/spu \
                 -o /tmp/test_spu_inflate runtime/spu/tests/test_spu_inflate.c
@@ -440,6 +725,7 @@ jobs:
       # so a commit that does not break its peers' reservations lets two of them
       # win the same compare-and-swap, and the queue is quietly wrong afterwards.
       - name: Run the SPU-to-SPU lock-line coherence tests
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_lockline_peer \
@@ -458,6 +744,7 @@ jobs:
       # that with PUTLLC on the taskset line, which never woke the parked
       # task's host thread: it saw the signal only when its 1 s wait timed out.
       - name: Run the SPURS task wake test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_taskset_wake \
@@ -482,6 +769,7 @@ jobs:
       # threads of their own, with the image in their local stores, the entry
       # point and image the registry says, and each thread's own arguments.
       - name: Run the lifted SPU thread-group start test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_lifted_start \
@@ -507,6 +795,7 @@ jobs:
       # over, and the check is that the same eight engines come back around,
       # each one clean and holding only its own owner's state.
       - name: Run the SPU MFC engine slot test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
             -o /tmp/test_spu_mfc_slots \
@@ -520,3 +809,77 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+      # ---- build-vulkan: the opt-in Vulkan RSX backend ------------------------------------------------------
+
+      # Every ps3recomp_host scene on lavapipe (a CPU Vulkan driver), in two passes, one per draw path:
+      #   - without guest programs, the rsx_state vtable's fixed-function path: the same scenes the null backend
+      #     ran above, now through Vulkan;
+      #   - with guest programs, the shared register-file draw engine (the path the Metal backend takes): all
+      #     twelve draw scenes, including the ones only a translating backend can pass (--shader, --mip, --rtt,
+      #     --depthtex, --mrt, --mrt-a, --cube), under the Khronos validation layer.
+      # The configure must find glslang, or the second pass would only ever skip.
+      - name: Vulkan backend, configure and build
+        id: vk_build
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.tools.outcome == 'success' }}
+        run: |
+          cmake -S . -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DPS3RECOMP_RSX_VULKAN=ON | tee configure-vulkan.log
+          grep -q "Vulkan: *guest programs available" configure-vulkan.log
+          cmake --build build-vulkan --target ps3recomp_host
+
+      - name: Vulkan backend, fixed-function path (no guest programs)
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.vk_build.outcome == 'success' }}
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: |
+          fail=0
+          for m in "" "--draw" "--draw --frames=60" "--depth" "--tex" "--tex-io" "--quads" "--threads"; do
+            rc=0; ./build-vulkan/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            echo "::group::ps3recomp_host ${m:-(default)} -> exit $rc"; cat run.log; echo "::endgroup::"
+            [ "$rc" -eq 0 ] || { echo "::error::${m:-default}: exit $rc"; fail=1; }
+          done
+          exit $fail
+
+      # Fails on any of: a scene's own check, a single validation message, a scene that did not take the engine
+      # path, or one that reported "nothing to check" -- a skipped scene is not a passed one.
+      - name: Vulkan backend, draw engine with guest programs, under the validation layer
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.vk_build.outcome == 'success' }}
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+          PS3RECOMP_VK_GUEST_PROGRAMS: "1"
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+        run: |
+          fail=0
+          # --threads is not here: it checks guest thread stacks and returns
+          # before any backend exists (the first pass still runs it).
+          for m in "" "--draw" "--depth" "--quads" "--shader" \
+                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube"; do
+            rc=0; ./build-vulkan/ps3recomp_host $m > run.log 2>&1 || rc=$?
+            name=${m:-default}
+            echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
+            [ "$rc" -eq 0 ] || { echo "::error::$name: exit $rc"; fail=1; }
+            if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
+            grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
+            if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+          done
+          exit $fail
+
+      # ---- build-codec: the movies with FFmpeg ---------------------------------------------------------------
+
+      # cellSail's movies off Windows: MPEG-2 through FFmpeg loaded at run
+      # time, on a PAMF file the test encodes and writes itself (B-frames,
+      # pictures split across PES packets, LPCM split mid-sample), with the
+      # cellVdec and cellPamf tests next to it. It needs the FFmpeg libraries,
+      # not the ffmpeg program (without that the cellVdec decode tests are not
+      # added). The movie test missing means CMake did not find the libraries,
+      # which must fail, not skip.
+      - name: Run the codec tests with FFmpeg (movies)
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: |
+          sudo apt-get install -y libavcodec-dev
+          cmake -S . -B build-codec -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DPS3RECOMP_BUILD_TESTS=ON -DPS3RECOMP_FFMPEG_RUNTIME=ON
+          cmake --build build-codec --target test_sail_movie test_vdec_stub test_vdec_ffmpeg test_cellPamf
+          ctest --test-dir build-codec -N -R sail_movie_play | grep -q sail_movie_play
+          ctest --test-dir build-codec -R "sail_movie|vdec|pamf" --output-on-failure
