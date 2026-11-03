@@ -870,48 +870,6 @@ static void guest_fb_present(u32 fi)
 }
 
 
-/* Grow the VP vertex buffer to hold a frame of `want` vertices (with
- * headroom). The frame that overflowed has already lost its tail; the next
- * ones fit. The old buffer may still be read by the frame in flight, so it is
- * destroyed with that frame's fence (rc_ring_retire). VP_VB_MAX_VERTS caps the
- * growth (default 2M vertices = 1 GB of upload heap at 256 bytes x 2
- * parities). */
-/* Growing creates and maps a new upload buffer of hundreds of MB on the render
- * thread: 100-400 ms for Demon's Souls's level, one frame, whose overflowing
- * draws are dropped as well. A title that needs more starts bigger
- * (VP_VB_VERTS). */
-static void vp_vb_grow(u64 want)
-{
-    static u64 limit = 0;
-    if (!limit) { const char* e = getenv("VP_VB_MAX_VERTS");
-                  limit = e ? strtoull(e, NULL, 0) : (2ull << 20);
-                  if (limit < s_vp_cap) limit = s_vp_cap; }
-    u64 cap = s_vp_cap;
-    while (cap < want + want / 8 && cap < limit) cap *= 2;
-    if (cap > limit) cap = limit;
-    if (cap <= s_vp_cap) {
-        static int warned = 0;
-        if (!warned++) fprintf(stderr, "[VPVB] a frame needs %llu vertices; the buffer stays at"
-                               " %u (VP_VB_MAX_VERTS); later draws are dropped%c",
-                               (unsigned long long)want, s_vp_cap, 10);
-        return;
-    }
-    const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
-    gpu_buffer nb; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
-        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
-        fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
-                (unsigned long long)cap, s_vp_cap, 10);
-        limit = s_vp_cap;
-        return;
-    }
-    rc_ring_retire(0, s_rc_vp_vb);
-    s_rc_vp_vb = nb;
-    s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
-    fprintf(stderr, "[VPVB] a frame asked for %llu vertices: buffer grown to %u (%llu MB)%c",
-            (unsigned long long)want, s_vp_cap, (unsigned long long)(bytes >> 20), 10);
-}
-
 /* The VP index buffer (indexed strip uploads, upload_strip_vp_indexed): u32
  * indices, two parity halves like vp_vb. Created at the first frame end and
  * grown there as vp_vb is; until it exists, or once a frame fills it, the

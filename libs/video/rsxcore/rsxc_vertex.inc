@@ -714,6 +714,46 @@ static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u
       } }
 }
 
+/* Room in vp_vb (its chunks, rc_arena: s_vb) for `want` vertices at
+ * vp_vb_offset: they go there, or at the next chunk's start when this chunk
+ * has less room left; a draw bigger than a chunk goes to the big buffer, and
+ * the chunks' place is kept for the draws after (s_vb_cursor). vp_vb_offset
+ * and s_vb_at move to where they go, *out points there. The vertices there is
+ * room for: want, or 0 when no buffer could be made (the draw is dropped, as
+ * a full buffer's were). */
+static u32 vb_room(u32 want, VPSlot** out)
+{
+    u64 from = s_d3d.vp_vb_offset;
+    if (from >= s_vb_big) from = s_vb_cursor;   /* (the last draw went to the big buffer) */
+    const u64 at = rc_arena_fit(&s_vb, from, (u64)want * VP_VERT_STRIDE);
+    if (at == ~0ull) {
+        s_drop_draws++;
+        { static int said = 0;
+          if (!said++) fprintf(stderr, "[VPVB] no room for a draw of %u vertices: dropped%c", want, 10); }
+        *out = (VPSlot*)rc_arena_ptr(&s_vb, 0);   /* (nothing is written) */
+        return 0;
+    }
+    if (at >= s_vb_big) s_vb_cursor = from;
+    if (want > s_vb_most) {
+        s_vb_most = want;
+        if (want >= 16384u) fprintf(stderr, "[VPVB] the biggest draw so far: %u vertices%c", want, 10);
+    }
+    s_d3d.vp_vb_offset = (u32)at;
+    s_vb_at = (u32)at;
+    *out = (VPSlot*)rc_arena_ptr(&s_vb, at);
+    return want;
+}
+
+/* Whether `want` more vertices fit right at vp_vb_offset, in the chunk that
+ * holds the vertices before it: a strip range that extends the last draw
+ * must sit next to that draw's vertices. */
+static int vb_fits(u64 want)
+{
+    const u64 at = s_d3d.vp_vb_offset;
+    if (at >= s_vb_big || at % s_vb.half == 0) return 0;
+    return at % s_vb.half + want * VP_VERT_STRIDE <= s_vb.half;
+}
+
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
@@ -722,11 +762,10 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 quads = count / 4;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
+    VPSlot* out;
+    u32 maxv = vb_room(quads * 6, &out);
     if (quads * 6 > maxv) quads = maxv / 6;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
@@ -758,14 +797,13 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    VPSlot* out;
+    u32 maxv = vb_room(count, &out);
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
                     state->shader_program, count, maxv, 10); }
         count = maxv - (maxv % 3); }
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       for (u32 k = 0; k < count; k++)
           read_vp_vertex(state, first + k, &out[k*16]);
@@ -808,11 +846,10 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     vp_plan_begin(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)tris * 3;
+    VPSlot* out;
+    u32 maxv = vb_room(tris * 3, &out);
     if (tris * 3 > maxv) tris = maxv / 3;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
@@ -885,11 +922,10 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 quads = count / 4;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
+    VPSlot* out;
+    u32 maxv = vb_room(quads * 6, &out);
     if (quads * 6 > maxv) quads = maxv / 6;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
@@ -929,14 +965,13 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    VPSlot* out;
+    u32 maxv = vb_room(count, &out);
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
                     state->shader_program, count, maxv, 10); }
         count = maxv - (maxv % 3); }
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       if (!state->restart_index_enable) {
           for (u32 k = 0; k < count; k++)
@@ -1191,9 +1226,12 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
           while ((t.QuadPart - t0.QuadPart) * 1000000000LL / fq < slow); } }
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    /* Room for the most the strip can write: three vertices a guest index
+     * (the list path; the indexed one writes each vertex once, while the
+     * vertex cache keeps it), never more than a chunk. */
+    VPSlot* out;
+    const u64 most = (u64)count * 3;
+    const u32 maxv = vb_room(most < s_vb_chunk ? (u32)most : s_vb_chunk, &out);
     /* Expand to a triangle list, one index at a time:
      *  - Strip triangles alternate winding; every odd one is emitted with its
      *    first two vertices swapped (as the non-indexed path does), or culling

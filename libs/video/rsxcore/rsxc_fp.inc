@@ -513,7 +513,9 @@ static gpu_shader uvc_vs4(int i)
  * or s_vf_short). */
 static int uvc_table(D3D12DrawRecord* dr)
 {
-    const u32 base = dr->vb_byte_offset / 256u;   /* 256: VP_VERT_STRIDE (rsxc_vertex.inc) */
+    /* (In the chunk of vp_vb that holds the draw's vertices: t20 is that
+     * chunk's half, rc_arena.) 256: VP_VERT_STRIDE (rsxc_vertex.inc). */
+    const u32 base = (u32)(rc_arena_local(&s_vb, dr->vb_byte_offset) / 256u);
     if (!dr->fetch && !dr->index_count) {
         if (base >= 0x80000000u) return 0;
         dr->uvc_tab = 0x80000000u | base;
@@ -533,13 +535,20 @@ static int uvc_table(D3D12DrawRecord* dr)
         at = s_vf_off;
         dst = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + at;
     } else {
+        /* After the frame's vertices, in the chunk that holds the draw's
+         * (the table and the vertices it numbers share t20); none when the
+         * frame has moved on to another chunk and that one has no room. */
         const u64 units = (most * 4 + 255u) / 256u;
         s_vp_want += units;
-        if ((u64)s_d3d.vp_vb_offset + units * 256u > (u64)s_vp_cap * 256u ||
-            s_d3d.vp_vb_offset >= 0x80000000u)
+        const u64 from = s_d3d.vp_vb_offset >= s_vb_big ? s_vb_cursor : s_d3d.vp_vb_offset;
+        const u32 k = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
+        if (k >= RC_ARENA_MAX || rc_arena_chunk(&s_vb, from) != k ||
+            rc_arena_local(&s_vb, from) + units * 256u > s_vb.half ||
+            rc_arena_fit(&s_vb, from, units * 256u) != from)
             return 0;
-        at = s_d3d.vp_vb_offset;
-        dst = (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * s_vp_cap * 256u + at;
+        at = (u32)rc_arena_local(&s_vb, from);
+        dst = rc_arena_ptr(&s_vb, from);
+        s_d3d.vp_vb_offset = (u32)from;
     }
     u32* o = (u32*)(dst + head);
     u32 n = 0;

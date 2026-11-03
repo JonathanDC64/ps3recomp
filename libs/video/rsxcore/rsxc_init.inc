@@ -347,26 +347,37 @@ static int init_d3d12(u32 width, u32 height)
             goto vp_buffers_done;
         }
 
-        /* VP_VB_VERTS=<n>: start the buffer at n vertices rather than
-         * MAX_VERTICES, for a title known to need more (it grows on demand,
-         * but the growth costs a frame; see vp_vb_grow). */
-        { u64 v = (u64)ps3_env_int("VP_VB_VERTS", 0);
-          if (v > MAX_VERTICES && v <= (64ull << 20)) s_vp_cap = (u32)v; }
-        bytes = (u64)s_vp_cap * 256 * 2;     /* generic VP vertex: 16 float4 slots,
-                                          * DOUBLE-buffered by frame parity so a
-                                          * new frame's upload never overwrites
-                                          * vertices the in-flight GPU frame is
-                                          * still reading (was: torn/missing
-                                          * triangles mixing stale+new verts) */
+        /* The VP vertex buffer in chunks (rc_arena, docs/124): generic VP
+         * vertices of 16 float4 slots (256 bytes), each chunk DOUBLE-buffered
+         * by frame parity so a new frame's upload never overwrites vertices
+         * the in-flight GPU frame is still reading (was: torn/missing
+         * triangles mixing stale+new verts). VP_VB_CHUNK=<n> (read once):
+         * vertices a parity half per chunk, a power of two, default 131,072
+         * (64 MB a chunk); one is made to start with and more as frames need
+         * them, up to VP_VB_MAX_VERTS in all (default 2M), as that capped the
+         * one buffer this was. It sat in RAM whole whatever a frame used, and
+         * the port started it at 1.5M vertices (768 MB, VP_VB_VERTS, which
+         * only today's renderer still reads). Steady frames use 5k-55k. */
+        { int v = ps3_env_int("VP_VB_CHUNK", 131072);
+          if (v < 16384) v = 16384;
+          if (v > (4 << 20)) v = 4 << 20;
+          u32 c = 16384;
+          while (c * 2 <= (u32)v) c *= 2;   /* (a power of two: a shift per draw, not a divide) */
+          s_vb_chunk = c; }
+        { u64 most = ((2ull << 20) + s_vb_chunk - 1) / s_vb_chunk;
+          const char* e = getenv("VP_VB_MAX_VERTS");
+          if (e) { most = (strtoull(e, NULL, 0) + s_vb_chunk - 1) / s_vb_chunk; if (!most) most = 1; }
+          /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
+          rc_arena_init(&s_vb, "vertex buffer", GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u),
+                        (u64)s_vb_chunk * 256, 1, (u32)(most < RC_ARENA_MAX ? most : RC_ARENA_MAX));
+          s_vb_big = (u64)RC_ARENA_MAX * s_vb.half;
+          s_vp_cap = (u32)((u64)s_vb.most * s_vb_chunk); }
         /* Failure here leaves vp_vb_mapped NULL and every VP draw silently
          * declines to upload -- the scene just does not render, with no error
-         * anywhere. Report the size too: this buffer is
-         * MAX_VERTICES * 256 * 2 bytes and grows fast. */
-        fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
-                (unsigned long long)(bytes >> 20), (unsigned)s_vp_cap, 10);
-        /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
-        if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD,
-                         &s_rc_vp_vb, &s_d3d.vp_vb_mapped))
+         * anywhere. (Set, it says the chunks are there; draws address them
+         * through s_vb.) */
+        s_d3d.vp_vb_mapped = s_vb.n ? s_vb.map[0] : NULL;
+        if (!s_d3d.vp_vb_mapped)
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
         bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */
@@ -393,7 +404,7 @@ static int init_d3d12(u32 width, u32 height)
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
-               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)s_rc_vp_vb.id,
+               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)(s_vb.n ? s_vb.buf[0].id : 0),
                (void*)(uintptr_t)s_rc_vp_cb.id);
     }
     /* Step V6: on a backend that starts strictly (rc_be_start_strict: Vulkan,

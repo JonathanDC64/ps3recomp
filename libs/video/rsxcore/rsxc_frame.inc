@@ -37,6 +37,7 @@ static void render_frame(void)
     hdr_batch_start();           /* the targets HDR promotes in this batch */
     rc_grave_release();          /* what the previous frame dropped (step C8a: the one grave) */
     rc_ring_release();           /* the rings it outgrew (step C2) */
+    rc_arena_release(&s_vb);     /* a big buffer the last frame outgrew */
     tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);
 
@@ -564,7 +565,7 @@ rtt_dump_done:;
                     (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
         /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
          * allocation failed. The pass is skipped rather than faulting.) */
-        if (any && vpso.v && GPU_VALID(s_rc_vp_vb) && GPU_VALID(s_rc_vp_cb)) {
+        if (any && vpso.v && s_vb.n && GPU_VALID(s_rc_vp_cb)) {
             gpu_cmd_set_layout(rc, s_d3d.vp_layout);
             gpu_cmd_set_pipeline(rc, vpso);
             gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
@@ -581,8 +582,11 @@ rtt_dump_done:;
             gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
             vp_bind_sampler_table(NULL);
             gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, DRAW_SRV_BASE));
-            gpu_cmd_set_vb(rc, 0, gpu_buffer_addr(s_rc_dev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256,
-                           s_vp_cap * 256, 256);   /* 16 float4 attrib slots */
+            /* vp_vb's first chunk; a draw in another one binds that (rare:
+             * a frame past one chunk's vertices). */
+            u32 vb_chunk = 0;
+            u64 vb_lo = 0, vb_hi = s_vb.half;   /* the bound chunk's virtual offsets */
+            gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, 0), (u32)s_vb.half, 256);   /* 16 float4 attrib slots */
             if (GPU_VALID(s_rc_vp_ib))
                 gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
                                s_vp_icap * 4, GPU_FORMAT_R32_UINT);
@@ -636,8 +640,6 @@ rtt_dump_done:;
             const gpu_addr fpcb_va = GPU_VALID(s_rc_vp_fpcb) ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
             /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
              * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
-            const gpu_addr uvc_vb_va = s_uvc_vs && GPU_VALID(s_rc_vp_vb)
-                ? gpu_fast_buffer_addr(rdev, s_rc_vp_vb) + (u64)s_d3d.vp_parity * s_vp_cap * 256 : 0;
             const gpu_addr uvc_vf_va = s_uvc_vs && GPU_VALID(s_rc_vf_buf)
                 ? gpu_fast_buffer_addr(rdev, s_rc_vf_buf) + (u64)s_d3d.vp_parity * s_vf_cap : 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
@@ -782,9 +784,7 @@ rtt_dump_done:;
                     { static int tt = -1;
                       PS3_KNOB(tt, ps3_env_int("VP_TESTTRI", 0));
                       if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
-                          float* vtx = (float*)((char*)s_d3d.vp_vb_mapped
-                              + (u64)s_d3d.vp_parity * s_vp_cap * 256u
-                              + (u64)1000 * 256u);
+                          float* vtx = (float*)rc_arena_ptr(&s_vb, vb_lo + (u64)1000 * 256u);
                           static const float tri[3][4] = {
                               {-2.0f, -2.0f, 0.0f, 1.0f},
                               { 2.0f, -2.0f, 0.0f, 1.0f},
@@ -982,7 +982,8 @@ rtt_dump_done:;
                      * triangles' corners (uvc_table); t20 as the table's ring,
                      * and back to vf_buf for the draws after. With no
                      * pipeline it is not drawn (the fallback reads vertices). */
-                    if (!dr->fetch) gpu_cmd_bind_raw(rc, 4, uvc_vb_va);
+                    if (!dr->fetch)   /* (the chunk that holds the draw's vertices and table) */
+                        gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vb, rc_arena_chunk(&s_vb, dr->vb_byte_offset)));
                     gpu_cmd_push_const1(rc, 5, dr->uvc_tab, 0);
                     if (s_vp_topo_strip) {
                         s_vp_topo_strip = 0;
@@ -1007,12 +1008,21 @@ rtt_dump_done:;
                         s_vp_topo_strip = dr->fetch == 2;
                         gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
                     }
+                    /* vp_vb's chunk with the draw's vertices, when it is
+                     * not the one bound (a compare per draw, no divide). */
+                    if (!dr->fetch && (dr->vb_byte_offset < vb_lo || dr->vb_byte_offset >= vb_hi)) {
+                        vb_chunk = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
+                        vb_lo = vb_chunk >= RC_ARENA_MAX ? s_vb_big : (u64)vb_chunk * s_vb.half;
+                        vb_hi = vb_lo + rc_arena_size(&s_vb, vb_chunk);
+                        gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, vb_chunk), (u32)rc_arena_size(&s_vb, vb_chunk), 256);
+                    }
+                    const u32 vb_first = dr->fetch ? 0 : (u32)((dr->vb_byte_offset - vb_lo) / 256);
                     dred_mark(d, dr);
                     if (dr->index_count)
                         gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count),
-                                             dr->ib_first, (int32_t)(dr->vb_byte_offset / 256), 0);
+                                             dr->ib_first, (int32_t)vb_first, 0);
                     else
-                        gpu_cmd_draw(rc, dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
+                        gpu_cmd_draw(rc, dr->vertex_count, 1, vb_first, 0);
                 }
                   if (zq >= 0)
                       gpu_cmd_query_end(rc, s_zq_pool, (u32)zq); }
@@ -1151,6 +1161,7 @@ rtt_dump_done:;
     vpj_sync();           /* nothing may still write the half being reset */
     s_d3d.vb_offset  = 0; /* reset for next frame */
     s_d3d.vp_vb_offset = 0;
+    s_vb_cursor = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
     const u64 vf_want = (u64)s_vf_off + s_vf_short;   /* what this frame's fetch draws asked for */
@@ -1171,7 +1182,7 @@ rtt_dump_done:;
                   (unsigned long long)(s_vs_up[2] / fr), (unsigned long long)(s_vs_up[3] / fr), 10);
           fr = 0; emit = 0; s_vs_fetch = s_vs_attr = 0; memset(s_vs_up, 0, sizeof s_vs_up);
       } }
-    if (s_vp_want > s_vp_cap) vp_vb_grow(s_vp_want);
+    rc_arena_frame_end(&s_vb);   /* (a chunk ahead when the frame got near the last) */
     s_vp_want = 0;
     s_d3d.vp_ib_offset = 0;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */

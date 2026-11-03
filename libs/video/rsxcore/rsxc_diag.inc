@@ -199,8 +199,7 @@ static void drawprint_write(const char* path, const char* hdr)
         /* Every 4th vertex: the upload heap is write-combined, slow to read. */
         u32 vb = 0;
         if (s_d3d.vp_vb_mapped) {
-            const u8* v0 = (const u8*)s_d3d.vp_vb_mapped
-                + (u64)par * s_vp_cap * 256u /* VP_VERT_STRIDE */ + dr->vb_byte_offset;
+            const u8* v0 = rc_arena_ptr_par(&s_vb, dr->vb_byte_offset, par);
             vb = 2166136261u;
             for (u32 k = 0; k < dr->vertex_count; k += 4)
                 vb = (vb ^ dp_hash(v0 + (u64)k * 256u, 256u)) * 16777619u;

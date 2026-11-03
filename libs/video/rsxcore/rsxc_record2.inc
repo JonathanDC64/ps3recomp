@@ -32,8 +32,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          * VP's MVP transform, so the cube was drawn in object space and clipped
          * off-screen. Untextured VP draws now render via the colour PSO. */
         if (s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout)) {
-            u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
+            const u32 rec = s_vb_at;   /* (where vb_room put them) */
             if (emitted && draw_room()) {
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
                 dr->vb_byte_offset = rec; dr->index_count = 0;
@@ -138,10 +138,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
         s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout) &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
-        u32 rec = s_d3d.vp_vb_offset;
         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
             : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
+        const u32 rec = s_vb_at;   /* (where vb_room put them) */
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
          * hardware concatenates them before assembling primitives. Recording a
@@ -161,7 +161,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
                 pv->index_count == 0 &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+            (rec & (s_vb.half - 1))) {   /* (not across a chunk's start: rc_arena) */
                 pv->vertex_count += emitted;
                 s_d3d.merge_first_end = first + count;
                 return;
@@ -310,7 +311,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             pv->begin_epoch == s_d3d.current_rsx_state->begin_epoch &&
             pv->fp_addr == s_d3d.current_rsx_state->shader_program &&
             pv->ib_first + pv->index_count == s_d3d.vp_ib_offset &&
-            (pv->fetch || pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset))
+            (pv->fetch || (pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset &&
+                           vb_fits((u64)count * 3))))   /* (its vertices stay in that draw's chunk) */
             mpv = pv;
     }
     /* VP_GPU_FETCH (live, default 1; 0 = the CPU path): strips and fans go
@@ -353,6 +355,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         return;
     }
     s_strip_base = 0;
+    if (emitted) rec = s_vb_at;   /* (where vb_room put them) */
     if (mpv) {
         s_d3d.merge_first_end = first + count;
         if (!emitted) return;   /* nothing drawn; the strip's carry still moved on */
@@ -376,7 +379,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
             pv->index_count == 0 &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+            (rec & (s_vb.half - 1))) {   /* (not across a chunk's start: rc_arena) */
             pv->vertex_count += emitted;
             s_d3d.merge_first_end = first + count;
             return;

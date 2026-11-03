@@ -147,9 +147,11 @@ static void rc_release_device(void)
      * pointers into them were borrowed. */
     s_d3d.vb_mapped = s_d3d.vp_vb_mapped = s_d3d.vp_ib_mapped = NULL;
     s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
-    s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
+    s_rc_vertex_buf.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
     s_rc_vf_buf.id = s_rc_readback_buf.id = 0;
     s_rc_ring_old[0].id = s_rc_ring_old[1].id = s_rc_ring_old[2].id = 0;
+    memset(&s_vb, 0, sizeof s_vb);   /* (its chunks went with the device too) */
+    s_vb_big = ~0ull;
     /* The passes' layouts and pipelines are the GPU layer's (step C3b) and go
      * with gpu_destroy. */
     s_d3d.blit_pso = k_rc_no_pipe;
