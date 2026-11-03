@@ -411,6 +411,7 @@ typedef struct gpu_vk_swap {
     uint32_t         next_sem;
     int32_t          current;          /* the acquired image, -1 when none */
     uint32_t         waited, signalled;
+    uint32_t         stats_misses;     /* swap_stats' waits for a present not yet shown (a test hook) */
     uint64_t         present_id, done_id;
     int64_t          done_qpc;
     /* Step VC2: the window's surface lost (made again at the next acquire),

@@ -1955,6 +1955,26 @@ static void test_window_states(void)
         win_pump();
         for (int k = 0; k < 3; k++) hid += win_frame(sc, &img) == 0;
         CHECK(hid >= 2 && win_image_ok(sc, w, img));
+        /* Hidden, its presents may never reach the display: the statistics
+         * wait for one present not yet shown at most a call (none after it
+         * is shown either), and never go back or past the presents made. */
+        if (has(GPU_CAP_PRESENT_WAIT)) {
+            const gpu_vk_swap* const s = &g_vk->swap[GPU_HANDLE_INDEX(sc.id)];
+            const uint32_t misses = s->stats_misses;
+            uint32_t shown = 0;
+            for (int k = 0; k < 3; k++) {
+                const uint32_t m0 = s->stats_misses;
+                gpu_present_stats st;
+                memset(&st, 0, sizeof st);
+                if (gpu_swap_stats(g_d, sc, &st) == 0) {
+                    CHECK(st.present_count >= shown && st.present_count <= st.last_present_count);
+                    shown = st.present_count;
+                }
+                CHECK(s->stats_misses - m0 <= 1);
+            }
+            printf("  hidden, statistics: %u waits for a present not shown over 3 calls, last shown %u\n",
+                   s->stats_misses - misses, shown);
+        }
         /* Shown and resized: images of the new size. */
         ShowWindow(w, SW_SHOWNOACTIVATE);
         SetWindowPos(w, NULL, 0, 0, 220, 170, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
