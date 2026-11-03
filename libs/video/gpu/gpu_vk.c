@@ -851,6 +851,17 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
             dd->luid_valid = 1;
         }
         snprintf(dd->driver, sizeof dd->driver, "%.31s %.31s", drv.driverName, drv.driverInfo);
+        /* As the D3D12 backend's adapter line: testers' logs name the GPU,
+         * even when the device is not made. */
+        {
+            unsigned long long vram = 0;
+            for (uint32_t i = 0; i < dd->mem.memoryHeapCount; i++)
+                if ((dd->mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && dd->mem.memoryHeaps[i].size > vram)
+                    vram = dd->mem.memoryHeaps[i].size;
+            printf("[VK] device: %s (VRAM %llu MB, driver %s, Vulkan %u.%u.%u)\n", dd->props.deviceName, vram >> 20,
+                   dd->driver, VK_API_VERSION_MAJOR(dd->props.apiVersion), VK_API_VERSION_MINOR(dd->props.apiVersion),
+                   VK_API_VERSION_PATCH(dd->props.apiVersion));
+        }
         if (!device_make(dd, desc, mask)) return 0;
         if (dd->has_host_import) {
             p2.pNext = &hp;
