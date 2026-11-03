@@ -9,7 +9,7 @@ name: Game files
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master ]
   pull_request:
   workflow_dispatch:
 
