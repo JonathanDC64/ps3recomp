@@ -7,8 +7,8 @@
  *   - On Windows the new path's D3D12 is the default; this renderer runs only
  *     with RSX_BACKEND=legacy, or when the new path's D3D12 fails to start
  *     (rsx_out.c).
- *   - Off Windows (vkd3d) it is still the default, until the new path's
- *     Vulkan takes that place.
+ *   - Off Windows (vkd3d) the default is the new path's Vulkan; this renderer
+ *     runs with RSX_BACKEND=d3d12, and when Vulkan fails to start.
  * Frozen: fixes and new work go to the new path, not here. The port's CI
  * (tools/des/core_sync.sh) lists every commit that changes the .c.
  */

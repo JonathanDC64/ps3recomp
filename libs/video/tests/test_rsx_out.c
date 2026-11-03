@@ -18,18 +18,19 @@
  * same process with what it was handed before; a D3D12 start of the new path
  * that fails (TEST_D3D12_INIT, likewise), which must start the legacy
  * renderer so, and both one after the other; a Vulkan start whose process
- * dies before its first present (the mark stays), the start after it (the
- * default, saying why; the mark goes) and the one after that (Vulkan again);
- * a mark left and the default asked for; no RSX_STATE_DIR (no mark). Each
- * child gets the system's environment and the case's variables only. Prints
- * a line a case and "test_rsx_out: N passed, M failed"; exit 1 on a failure.
+ * dies before its first present (the mark stays), the start after it (D3D12,
+ * saying why; the mark goes) and the one after that (Vulkan again); a mark
+ * left and the default asked for; no RSX_STATE_DIR (no mark). Each child
+ * gets the system's environment and the case's variables only. Prints a line
+ * a case and "test_rsx_out: N passed, M failed"; exit 1 on a failure.
  *
  * On Linux the switch is built as a Linux host builds it, with the legacy
  * renderer on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D; rsx_out.c is empty without
- * it), which is the default there: the new path has no D3D12 off Windows,
- * so d3d12 asks for the legacy renderer, hal-d3d12 is not in the build, and
- * a failed Vulkan start falls back to the legacy renderer. The null and
- * vulkan routes, the fallback and the start mark are the same.
+ * it) and Vulkan, which is the default there: the new path has no D3D12 off
+ * Windows, so d3d12 asks for the legacy renderer, hal-d3d12 is not in the
+ * build (the default runs), and a failed Vulkan start falls back to the
+ * legacy renderer. The null and vulkan routes, the fallback and the start
+ * mark are the same.
  */
 #if defined(_WIN32) || defined(__linux__)
 
@@ -291,23 +292,32 @@ typedef struct {
     int mark_after;        /* the mark once the case is done */
 } test_case;
 
-/* The default route, its start, and what a failed start hands it. */
+/* The default route (RSX_BACKEND unset), its start and its start mark (-1:
+ * no Vulkan start); D3D, what d3d12 asks for and what a failed Vulkan start
+ * runs instead, with what it is handed. On Windows both are the new path's
+ * D3D12; on Linux the default is Vulkan and d3d12 the legacy renderer. */
 #ifdef _WIN32
 #define DEF       "d3d12"
 #define DEF_START "hal:backend_init"
-#define DEF_HAND  "hal:set_overlay hal:set_overlay_gpu hal:pso_index_game"
+#define DEF_MARK  (-1)
+#define D3D       "d3d12"
+#define D3D_START "hal:backend_init"
+#define D3D_HAND  "hal:set_overlay hal:set_overlay_gpu hal:pso_index_game"
 #else
-#define DEF       "legacy"
-#define DEF_START "legacy:backend_init"
-#define DEF_HAND  "legacy:set_overlay legacy:pso_index_game"
+#define DEF       "vulkan"
+#define DEF_START "vk:backend_init"
+#define DEF_MARK  1
+#define D3D       "legacy"
+#define D3D_START "legacy:backend_init"
+#define D3D_HAND  "legacy:set_overlay legacy:pso_index_game"
 #endif
 #define LEG_START "legacy:backend_init"
 #define LEG_HAND  "legacy:set_overlay legacy:pso_index_game"
-#define VK_FAILS  "vk:backend_init " DEF_HAND " " DEF_START
+#define VK_FAILS  "vk:backend_init " D3D_HAND " " D3D_START
 
 static const test_case k_cases[] = {
-    {"unset",        NULL,        NULL, NULL, 1, 0, 0, DEF,      NULL, DEF_START, -1, 0},
-    {"d3d12",        "d3d12",     NULL, NULL, 1, 0, 0, DEF,      NULL, DEF_START, -1, 0},
+    {"unset",        NULL,        NULL, NULL, 1, 0, 0, DEF,      NULL, DEF_START, DEF_MARK, 0},
+    {"d3d12",        "d3d12",     NULL, NULL, 1, 0, 0, D3D,      NULL, D3D_START, -1, 0},
     {"legacy",       "legacy",    NULL, NULL, 1, 0, 0, "legacy", NULL, LEG_START, -1, 0},
     {"legacy-case",  "LeGaCy",    NULL, NULL, 1, 0, 0, "legacy", NULL, LEG_START, -1, 0},
     {"vulkan",       "vulkan",    NULL, NULL, 1, 0, 0, "vulkan", NULL, "vk:backend_init", 1, 0},
@@ -316,26 +326,26 @@ static const test_case k_cases[] = {
 #ifdef _WIN32
     {"hal-d3d12",    "hal-d3d12", NULL, NULL, 1, 0, 0, "d3d12",  NULL, "hal:backend_init", -1, 0},
 #else
-    {"hal-d3d12",    "hal-d3d12", NULL, NULL, 1, 0, 0, "legacy", "RSX_BACKEND=hal-d3d12 is not in this build",
-     LEG_START, -1, 0},
+    {"hal-d3d12",    "hal-d3d12", NULL, NULL, 1, 0, 0, DEF,      "RSX_BACKEND=hal-d3d12 is not in this build",
+     DEF_START, DEF_MARK, 0},
 #endif
     {"null",         "null",      NULL, NULL, 1, 0, 0, "null",   NULL, "null:backend_init", -1, 0},
     {"metal",        "metal",     NULL, NULL, 1, 0, 0, DEF,      "RSX_BACKEND=metal is not in this build",
-     DEF_START, -1, 0},
-    {"fail-loader",  "vulkan", "fail:loader", NULL, 1, 0, 0, DEF, "Vulkan failed to start: no Vulkan 1.3 driver (loader)",
+     DEF_START, DEF_MARK, 0},
+    {"fail-loader",  "vulkan", "fail:loader", NULL, 1, 0, 0, D3D, "Vulkan failed to start: no Vulkan 1.3 driver (loader)",
      VK_FAILS, 1, 0},
-    {"fail-instance", "vulkan", "fail:instance", NULL, 1, 0, 0, DEF, "(instance)", VK_FAILS, 1, 0},
-    {"fail-adapter", "vulkan", "fail:adapter", NULL, 1, 0, 0, DEF, "(adapter)", VK_FAILS, 1, 0},
-    {"fail-features", "vulkan", "fail:features", NULL, 1, 0, 0, DEF, "(features)", VK_FAILS, 1, 0},
-    {"fail-device",  "vulkan", "fail:device", NULL, 1, 0, 0, DEF, "the GPU device could not be made (device)",
+    {"fail-instance", "vulkan", "fail:instance", NULL, 1, 0, 0, D3D, "(instance)", VK_FAILS, 1, 0},
+    {"fail-adapter", "vulkan", "fail:adapter", NULL, 1, 0, 0, D3D, "(adapter)", VK_FAILS, 1, 0},
+    {"fail-features", "vulkan", "fail:features", NULL, 1, 0, 0, D3D, "(features)", VK_FAILS, 1, 0},
+    {"fail-device",  "vulkan", "fail:device", NULL, 1, 0, 0, D3D, "the GPU device could not be made (device)",
      VK_FAILS, 1, 0},
-    {"fail-window",  "vulkan", "fail:window", NULL, 1, 0, 0, DEF, "(window)", VK_FAILS, 1, 0},
-    {"fail-swap",    "vulkan", "fail:swap chain", NULL, 1, 0, 0, DEF, "swap chain could not be made (swap chain)",
+    {"fail-window",  "vulkan", "fail:window", NULL, 1, 0, 0, D3D, "(window)", VK_FAILS, 1, 0},
+    {"fail-swap",    "vulkan", "fail:swap chain", NULL, 1, 0, 0, D3D, "swap chain could not be made (swap chain)",
      VK_FAILS, 1, 0},
-    {"fail-targets", "vulkan", "fail:targets", NULL, 1, 0, 0, DEF, "(targets)", VK_FAILS, 1, 0},
-    {"fail-shaders", "vulkan", "fail:shaders", NULL, 1, 0, 0, DEF, "(shaders)", VK_FAILS, 1, 0},
-    {"fail-rings",   "vulkan", "fail:rings", NULL, 1, 0, 0, DEF, "(rings)", VK_FAILS, 1, 0},
-    {"fail-nodir",   "vulkan", "fail:window", NULL, 0, 0, 0, DEF, "(window)", VK_FAILS, 0, 0},
+    {"fail-targets", "vulkan", "fail:targets", NULL, 1, 0, 0, D3D, "(targets)", VK_FAILS, 1, 0},
+    {"fail-shaders", "vulkan", "fail:shaders", NULL, 1, 0, 0, D3D, "(shaders)", VK_FAILS, 1, 0},
+    {"fail-rings",   "vulkan", "fail:rings", NULL, 1, 0, 0, D3D, "(rings)", VK_FAILS, 1, 0},
+    {"fail-nodir",   "vulkan", "fail:window", NULL, 0, 0, 0, D3D, "(window)", VK_FAILS, 0, 0},
 #ifdef _WIN32
     /* The new path's D3D12 start fails: the legacy renderer, with what it was handed. */
     {"d3d12-fail-device", NULL, NULL, "fail:device", 1, 0, 0, "legacy",
@@ -354,10 +364,15 @@ static const test_case k_cases[] = {
 #endif
     /* A start that dies in the driver, then the two after it, in order. */
     {"crash",        "vulkan", NULL, NULL, 1, 1, 0, NULL, NULL, NULL, 1, 1},
-    {"after-crash",  "vulkan", NULL, NULL, 1, 0, -1, DEF, "the last start on Vulkan did not finish", DEF_START, -1, 0},
+    {"after-crash",  "vulkan", NULL, NULL, 1, 0, -1, D3D, "the last start on Vulkan did not finish", D3D_START, -1, 0},
     {"after-that",   "vulkan", NULL, NULL, 1, 0, -1, "vulkan", NULL, "vk:backend_init", 1, 0},
-    /* A mark left, and the default asked for: done with too. */
+    /* A mark left, and the default asked for: on Windows done with too; on
+     * Linux, where the default is Vulkan, the last Vulkan start's, as above. */
+#ifdef _WIN32
     {"left-default", NULL,     NULL, NULL, 1, 0, 1, DEF, NULL, DEF_START, -1, 0},
+#else
+    {"left-default", NULL,     NULL, NULL, 1, 0, 1, D3D, "the last start on Vulkan did not finish", D3D_START, -1, 0},
+#endif
 };
 
 static const test_case* case_named(const char* name)
