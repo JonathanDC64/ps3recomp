@@ -149,7 +149,11 @@ static void rc_release_device(void)
     s_d3d.vp_cb_mapped = s_d3d.vp_fpcb_mapped = s_d3d.vf_mapped = NULL;
     s_rc_vertex_buf.id = s_rc_vp_vb.id = s_rc_vp_ib.id = s_rc_vp_cb.id = s_rc_vp_fpcb.id = 0;
     s_rc_vf_buf.id = s_rc_readback_buf.id = 0;
-    s_rc_ring_old[0].id = s_rc_ring_old[1].id = s_rc_ring_old[2].id = 0;
+    s_rc_ring_old[0].id = s_rc_ring_old[1].id = 0;
+    /* vf_buf's chunks, the same; and the frame's place in them, so a start
+     * after this one writes through none of their pointers. */
+    memset(&s_vf, 0, sizeof s_vf);
+    s_vf_cap = s_vf_off = s_vf_lo = s_vf_end = 0; s_vf_wp = NULL; s_fx.valid = 0;
     /* The passes' layouts and pipelines are the GPU layer's (step C3b) and go
      * with gpu_destroy. */
     s_d3d.blit_pso = k_rc_no_pipe;

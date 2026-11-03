@@ -125,9 +125,11 @@ typedef struct {
     u32   ctgt;         /* SET_SURFACE_COLOR_TARGET at record time (0 = none) */
     u32   depth;        /* packed guest depth state (rsx_depth_key, PSO key) */
     /* GPU vertex fetch (VP_GPU_FETCH): the VS reads the guest's vertex arrays
-     * from vf_buf, and the indices are the guest's own. fdesc is the byte
-     * offset of the draw's attribute records in vf_buf's half. fetch is 1
-     * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
+     * from vf_buf, and the indices are the guest's own. fdesc is the virtual
+     * offset (rc_arena) of the draw's attribute records in vf_buf: the draw
+     * binds the chunk that holds it and passes its offset in that chunk.
+     * fetch is 1 for a triangle list, 2 for a strip with cuts
+     * (vf_strip_native). */
     u32   fetch, fdesc;
     /* Step V5: 1 when the pre-pass drew it in the clamp's vertex-shader form
      * (kind 4): uvc_n vertices from the table at uvc_tab (uvc_table). */
@@ -342,7 +344,7 @@ typedef struct {
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
     gpu_layout            vp_layout;            /* CBV(b0) + SRV table + sampler (step C3b) */
-    void*                 vf_mapped;            /* GPU vertex fetch ring (x2 parity): s_rc_vf_buf */
+    void*                 vf_mapped;            /* GPU vertex fetch ring's chunk 0 (x2 parity): s_rc_vf_buf */
     gpu_pipeline          pipeline_state_vp;    /* decompiled VS + atlas PS      */
     gpu_pipeline          pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
     void*                 vp_vb_mapped;         /* raw float4 attrib0, per-frame: s_rc_vp_vb */
@@ -458,15 +460,25 @@ static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 /* VP index buffer capacity, in indices per parity half, and what this frame's
  * indexed uploads asked for. 0 until the first frame end creates it. */
 static u32 s_vp_icap = 0;
-static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
-static u32 s_vf_off = 0;    /* bytes used in this frame's half */
-static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
-/* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
+static u32 s_vf_cap = 0;    /* bytes per parity half of a vf_buf chunk (s_vf), a power of two */
+static u32 s_vf_shift = 0;  /* its log2: chunk k starts at virtual offset k << s_vf_shift */
+static u32 s_vf_off = 0;    /* bytes used in this frame, as a virtual offset (rc_arena) */
+/* The chunk this frame writes in: virtual [s_vf_lo, s_vf_end), both 0 until
+ * the frame's first descriptor, and s_vf_wp its half for this frame (the
+ * CPU's pointer to s_vf_lo). Kept so a draw's upload neither divides nor
+ * looks the chunk up (upload_strip_vp_fetch). */
+static u32 s_vf_lo = 0, s_vf_end = 0;
+static u8* s_vf_wp = NULL;
+/* Bytes uvc_table (rsxc_fp.inc) found no room for. Nothing reads them since
+ * vf_buf went to chunks; there until uvc_table places its tables in them. */
+static u64 s_vf_short = 0;
+/* The last GPU-fetch descriptor (upload_strip_vp_fetch). Its offsets are
+ * virtual ones, in the chunk this frame writes in. */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
     u32 g0[16], g1[16], r0[16];   /* guest [g0,g1) copied to ring offset r0 */
     u32 ve[16];                   /* each span's VF_ONCE entry if copied here, or ~0 */
-    u32 x[16];                    /* the records' x, slot by slot */
+    u32 x[16];                    /* the records' x, slot by slot (a record holds it less s_vf_lo) */
 } s_fx;
 /* The span copies made in this stretch of the stream (upload_strip_vp_fetch,
  * VF_ONCE), by guest start. A stretch ends at each point where the title can
@@ -506,14 +518,14 @@ static gpu_buffer s_rc_vp_vb;          /* the VP draws' vertices (vp_vb_mapped) 
 static gpu_buffer s_rc_vp_ib;          /* their indices (vp_ib_mapped) */
 static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
 static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
-static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
+static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring's chunk 0 (s_vf.buf[0], vf_mapped) */
 static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
-/* The rings vp_vb_grow, vp_ib_grow and vf_grow replaced ([0] vp_vb, [1] vp_ib,
- * [2] vf_buf), with the frame slot that last drew from each: destroyed with
- * that frame's fence at the next render_frame's start (rc_ring_release), where
- * today's deferred release let them go. */
-static gpu_buffer s_rc_ring_old[3];
-static u32        s_rc_ring_old_slot[3];
+/* The rings vp_vb_grow and vp_ib_grow replaced ([0] vp_vb, [1] vp_ib), with
+ * the frame slot that last drew from each: destroyed with that frame's fence
+ * at the next render_frame's start (rc_ring_release), where today's deferred
+ * release let them go. */
+static gpu_buffer s_rc_ring_old[2];
+static u32        s_rc_ring_old_slot[2];
 
 /* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
  * GPU_MEM_READBACK (COPY_DEST) memory, as *b and, with map, its pointer for
@@ -544,7 +556,7 @@ static void rc_ring_retire(int i, gpu_buffer old)
  * each with the fence of the frame that drew from it (passed by now). */
 static void rc_ring_release(void)
 {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (!GPU_VALID(s_rc_ring_old[i])) continue;
         gpu_buffer_destroy(s_rc_dev, s_rc_ring_old[i], s_rc_frame_fence[s_rc_ring_old_slot[i]]);
         s_rc_ring_old[i].id = 0;
@@ -662,6 +674,10 @@ static void rc_arena_frame_end(rc_arena* a)
  * vertices fetched from guest memory, vertices written to the upload heap,
  * uploads by primitive, and the mean enabled-attribute count per fetch. */
 static u64 s_vs_fetch, s_vs_attr, s_vs_up[4];
+/* The vertex fetch ring (vf_buf) as chunks (rc_arena; made in rsxc_init.inc's
+ * "GPU vertex fetch ring"). Here rather than with the s_vf_* above, which
+ * come before rc_arena's type. */
+static rc_arena s_vf;
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like

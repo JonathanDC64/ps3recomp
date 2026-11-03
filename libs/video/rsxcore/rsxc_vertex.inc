@@ -1316,7 +1316,14 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
  * guest byte spans they point into. A record's x is where vertex 0's
  * element would sit, so one descriptor serves every range of a strip whose
  * bytes it holds; a range reaching past the last span appends to it when
- * nothing was written after it. */
+ * nothing was written after it.
+ *
+ * vf_buf is in chunks (rc_arena, s_vf). A descriptor and every span it
+ * points at lie in one chunk, the one render_frame binds at t20 for its
+ * draws, so the records' x and the offset the shader is given are from that
+ * chunk's start; fdesc and s_fx keep virtual offsets. A frame that fills a
+ * chunk goes on in the next; only a descriptor bigger than a chunk takes the
+ * CPU path. */
 static u32 s_up_fdesc;
 static u64 s_vf_stat[6];   /* new, reuse, append, sparse, type/addr, room */
 
@@ -1324,7 +1331,7 @@ static int vf_on(void)
 {
     static int en = -1;
     PS3_KNOB(en, ps3_env_int("VP_GPU_FETCH", 1));
-    return en && s_d3d.vf_mapped && s_vf_cap && s_vp_fast && !late_on();
+    return en && s_vf_cap && s_vp_fast && !late_on();   /* (s_vf_cap: vf_buf's chunks are there) */
 }
 
 /* The guest address of the main-memory bytes [a,b), or ~0 when they are not
@@ -1505,8 +1512,11 @@ static int s_up_strip;   /* the last upload_strip_vp_fetch wrote a strip */
  * of copies a frame repeated bytes of the same stretch. A copy grows its
  * entry with what later draws of its descriptor append to it, and a
  * descriptor that points at a copy takes all of it, so the next pass's
- * draws that continue the first find their ranges there. The vertex
- * worker's sync hook ends the stretches, workers or not (vpj_threads).
+ * draws that continue the first find their ranges there. Only a copy in the
+ * chunk the new descriptor is in counts (its draw sees that chunk alone at
+ * t20): a frame that moved on to the next chunk copies such a span again,
+ * once there. The vertex worker's sync hook ends the stretches, workers or
+ * not (vpj_threads).
  * VF_ONCE_CHECK=1 (debug, slow) compares each reused range with guest
  * memory and counts those that differ. */
 static int vfo_on(void)
@@ -1521,11 +1531,12 @@ static u32 vfo_pset(u32 page) { return page * 2654435761u >> 23; }
 static VFOEntry* vfo_at(u32 e) { return &s_vfo[e / VFO_WAYS][e % VFO_WAYS]; }
 static int vfo_holds(const VFOEntry* E, u32 g0, u32 g1)
 {
-    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1;
+    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1 && E->r0 - s_vf_lo < s_vf_cap;
 }
 /* The entry (set * VFO_WAYS + way) of this stretch whose copy holds guest
- * [g0,g1): one that starts at g0, else one of g0's page. ~0 if none. */
-static u32 vfo_find(const u8* base, u32 g0, u32 g1)
+ * [g0,g1) in the chunk this frame writes in: one that starts at g0, else one
+ * of g0's page. ~0 if none. */
+static u32 vfo_find(u32 g0, u32 g1)
 {
     u32 e = ~0u;
     const u32 s = vfo_set(g0);
@@ -1545,7 +1556,7 @@ static u32 vfo_find(const u8* base, u32 g0, u32 g1)
         const VFOEntry* E = vfo_at(e);
         vpj_sync();
         n++;
-        if (memcmp(base + E->r0 + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
+        if (memcmp(s_vf_wp + (E->r0 - s_vf_lo) + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
         if (n % 20000u == 0)
             fprintf(stderr, "[VF] once: %llu reused ranges checked, %llu differ from guest memory%c",
                     (unsigned long long)n, (unsigned long long)bad, 10);
@@ -1685,9 +1696,11 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             if (ok && ng1) {
                 const u32 j = s_fx.nsp - 1;
                 const u32 g1 = (ng1 + 3u) & ~3u, add = g1 - s_fx.g1[j];
-                if ((u64)s_vf_off + add <= s_vf_cap) {
-                    vf_copy((u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + s_vf_off,
-                            s_fx.g1[j], add);
+                /* Only inside the descriptor's chunk, the one this frame
+                 * writes in (it is the last descriptor); past its end the
+                 * range takes a new descriptor in the next. */
+                if ((u64)s_vf_off + add <= s_vf_end) {
+                    vf_copy(s_vf_wp + (s_vf_off - s_vf_lo), s_fx.g1[j], add);
                     s_vf_off += add; s_fx.end = s_vf_off; s_fx.g1[j] = g1;
                     vfo_grow(j, g1);
                     s_vf_stat[2]++;
@@ -1711,8 +1724,22 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             }
             u64 total = 512;
             for (u32 j = 0; j < nsp; j++) total += g1[j] - g0[j];
-            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; s_vf_short += total; return -1; }
-            u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
+            /* Bigger than a chunk: the CPU path (rc_arena_fit is never asked
+             * for more than a chunk). */
+            if (total > s_vf_cap) { s_vf_stat[5]++; return -1; }
+            if ((u64)s_vf_off + total > s_vf_end) {
+                /* Past the end of the chunk this frame writes in, or its
+                 * first descriptor: the next chunk (made now when the frame
+                 * has used the spare too), or none to be had. */
+                const u64 at = rc_arena_fit(&s_vf, s_vf_off, total);
+                if (at == ~0ull) { s_vf_stat[5]++; return -1; }
+                s_vf_off = (u32)at;
+                s_vf_lo = s_vf_off >> s_vf_shift << s_vf_shift;
+                s_vf_end = s_vf_lo + s_vf_cap;
+                s_vf_wp = rc_arena_ptr(&s_vf, s_vf_lo);
+            }
+            u8* const base = s_vf_wp;      /* this frame's half of that chunk, */
+            const u32 lo = s_vf_lo;        /* which starts at virtual offset lo */
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
             const int once = vfo_on();
@@ -1725,9 +1752,9 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                     s_vfo_reused += g1[j] - g0[j];
                     continue;
                 }
-                const u32 e = once ? vfo_find(base, g0[j], g1[j]) : ~0u;
+                const u32 e = once ? vfo_find(g0[j], g1[j]) : ~0u;
                 if (e == ~0u) {
-                    vf_copy(base + r, g0[j], g1[j] - g0[j]);
+                    vf_copy(base + (r - lo), g0[j], g1[j] - g0[j]);
                     s_fx.g0[j] = g0[j]; s_fx.g1[j] = g1[j]; s_fx.r0[j] = r;
                     s_fx.ve[j] = once ? vfo_add(g0[j], g1[j], r) : ~0u;
                     r += g1[j] - g0[j];
@@ -1751,13 +1778,13 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 u32 j = 0;
                 while (j + 1 < nsp && !(sg0[k] >= g0[j] && sg0[k] < g1[j])) j++;
                 const u32 x = s_fx.r0[j] + (sg0[k] - s_fx.g0[j]) - sx[k];
-                rec[sl->idx].x = x; rec[sl->idx].y = sl->stride;
+                rec[sl->idx].x = x - lo; rec[sl->idx].y = sl->stride;   /* from the chunk's start (t20) */
                 rec[sl->idx].z = sl->type | (sl->n << 4)
                                | ((sl->freq ? (sl->modulo ? 2u : 1u) : 0u) << 8);
                 rec[sl->idx].w = sl->freq ? sl->freq : 1;
                 s_fx.x[sl->idx] = x;
             }
-            memcpy(base + fdesc, rec, sizeof rec);
+            memcpy(base + (fdesc - lo), rec, sizeof rec);
             s_vf_off = r;
             s_fx.valid = 1; s_fx.epoch = state->begin_epoch; s_fx.fdesc = fdesc;
             /* Where the last span ends: the ring's end only if it was copied
