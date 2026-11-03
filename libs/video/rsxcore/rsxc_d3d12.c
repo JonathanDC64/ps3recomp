@@ -1,10 +1,11 @@
 /*
  * ps3recomp - the portable renderer's core, compiled for its D3D12 backend
  *
- * The route RSX_BACKEND=hal-d3d12 (libs/video/rsx_out.c). Step 1.0 of the
- * portable renderer: today's renderer, libs/video/rsx_d3d12_backend.c, copied
- * word for word into the .inc fragments of this folder and compiled here as
- * one translation unit, so it draws exactly the frames the d3d12 route draws.
+ * The route RSX_BACKEND=d3d12, Windows' default (libs/video/rsx_out.c; also
+ * hal-d3d12, its name before). Step 1.0 of the portable renderer: the legacy
+ * renderer, libs/video/rsx_d3d12_backend.c, copied word for word into the
+ * .inc fragments of this folder and compiled here as one translation unit,
+ * so it draws exactly the frames the legacy route draws.
  * The steps after it moved the fragments onto the GPU layer (gpu.h) one piece
  * at a time, checking the frames against captures after each. rsxc_null.c
  * (and rsxc_vk.c, later) include the same fragments after their backend's own
@@ -15,8 +16,9 @@
  * edits the copy makes, as a sed script: the original's exports are static
  * here and renamed rc_*, and the two globals it defines (g_rsx_title_base,
  * g_rsx_prof_toggle) are extern, since the original is always linked beside
- * the copy and owns them. Statics keep their names. So this file exports one
- * symbol, the route table at the end.
+ * the copy and owns them. Statics keep their names. So this file exports
+ * only what the route switch calls, at the end: the route tables and the
+ * step a failed start stopped at.
  *
  * The fragments name no backend (step C8b): what the core needs of D3D12
  * beyond gpu.h is in this file, as the rc_be_* hooks below, and only this
@@ -267,11 +269,15 @@ static int rc_be_pso_unrecord(const rc_be_pso_desc* rec, u32 nel, gpu_pipeline_d
 #define RSXC_ROUTE_V_(name, legacy, params, args)      .name = rc_##name,
 #define RSXC_ROUTE_R_(ret, name, legacy, params, args) .name = rc_##name,
 const rsx_route rsxc_route_d3d12 = {
-    .name = "hal-d3d12",
+    .name = "d3d12",
     RSX_OUT_FUNCS(RSXC_ROUTE_V_, RSXC_ROUTE_R_)
 };
 #undef RSXC_ROUTE_V_
 #undef RSXC_ROUTE_R_
+
+/* The step the last failed start stopped at (rsxc_init.inc's start_step),
+ * NULL after none: the route switch falls back to the legacy renderer. */
+const char* rsxc_d3d12_start_failed(void) { return s_rc_start_failed; }
 
 /* ---- step VM ---- */
 /* The overlay v2's calls (rsx_out.h; rsxc_api.inc). */

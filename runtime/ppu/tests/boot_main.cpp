@@ -358,8 +358,9 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
  * frame clock instead of no clock at all. */
 #if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
 #if defined(PS3RECOMP_RSX_HAL)
-/* Built with the portable renderer: the route switch picks today's renderer
- * or the new path at run time (RSX_BACKEND, libs/video/rsx_out.h). */
+/* Built with the portable renderer: the route switch picks the new path (its
+ * D3D12 the default on Windows) or the legacy renderer at run time
+ * (RSX_BACKEND, libs/video/rsx_out.h). */
 #include "../../../libs/video/rsx_out.h"
 #  define rsx_backend_init    rsx_out_backend_init
 #  define rsx_backend_present rsx_out_backend_present

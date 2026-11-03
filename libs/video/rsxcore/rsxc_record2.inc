@@ -1,3 +1,16 @@
+/* A draw without the vertex-program path (is_vp 0) is recorded but not
+ * drawn: the pass that drew them, with its font atlas, went in step C8a
+ * (copy_manifest.txt). Said once, for a game that draws them; the legacy
+ * renderer (RSX_BACKEND=legacy) still does. */
+static void nonvp_note(u32 primitive)
+{
+    static int said;
+    if (said) return;
+    said = 1;
+    printf("[D3D12] draw_arrays: prim=%u without the vertex-program path is not drawn "
+           "(RSX_BACKEND=legacy draws it)\n", primitive);
+}
+
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
@@ -109,6 +122,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         u32 record_offset = s_d3d.vb_offset;
         u32 emitted = upload_quads_from_rsx(first, count);
         if (emitted == 0) return;
+        nonvp_note(primitive);
         if (draw_room()) {
             s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
             s_d3d.draws[s_d3d.draw_count].index_count = 0;
@@ -257,6 +271,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     u32 record_offset = s_d3d.vb_offset;
     u32 actual_count  = upload_vertices_from_rsx(first, count);
     if (actual_count == 0) return;
+    nonvp_note(primitive);
 
     if (draw_room()) {
         s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;

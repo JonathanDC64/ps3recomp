@@ -779,8 +779,10 @@ static void device_free(gpu_vk_device* dd)
             }
         gpu_vk_pipe_release(dd);   /* pipelines and their layouts, before the set layouts */
         gpu_vk_desc_release(dd);
-        for (uint32_t i = 0; i < dd->nslots; i++)
+        for (uint32_t i = 0; i < dd->nslots; i++) {
             if (dd->slot[i].pool) dd->vk.vkDestroyCommandPool(dd->device, dd->slot[i].pool, NULL);
+            if (dd->slot[i].gt_pool) dd->vk.vkDestroyQueryPool(dd->device, dd->slot[i].gt_pool, NULL);
+        }
         for (uint32_t i = 0; i < GPU_VK_INIT_RING; i++)
             if (dd->init_ring[i].pool) dd->vk.vkDestroyCommandPool(dd->device, dd->init_ring[i].pool, NULL);
         if (dd->oneshot_pool) dd->vk.vkDestroyCommandPool(dd->device, dd->oneshot_pool, NULL);
@@ -1050,11 +1052,57 @@ static void barrier_global(gpu_cmd* c, VkPipelineStageFlags2 ss, VkAccessFlags2 
     gpu_vk_pend(c, NULL, 0, NULL, 0, &mb, 1);
 }
 
+/* RSX_GPU_TIMES (gpu_times.h): a timestamp pool of GPU_TIMES_MAX a slot,
+ * made once, when the queue keeps timestamps. 1 when there. */
+static int gt_make(gpu_vk_device* dd)
+{
+    if (dd->gt_tried) return dd->gt_ok;
+    dd->gt_tried = 1;
+    uint32_t nq = 0;
+    VkQueueFamilyProperties q[16];
+    vkGetPhysicalDeviceQueueFamilyProperties(dd->phys, &nq, NULL);
+    if (nq > 16) nq = 16;
+    vkGetPhysicalDeviceQueueFamilyProperties(dd->phys, &nq, q);
+    const uint32_t bits = dd->qfamily < nq ? q[dd->qfamily].timestampValidBits : 0;
+    if (!bits || dd->props.limits.timestampPeriod <= 0.0f) return 0;
+    VkQueryPoolCreateInfo qi;
+    memset(&qi, 0, sizeof qi);
+    qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = GPU_TIMES_MAX;
+    for (uint32_t i = 0; i < dd->nslots; i++)
+        if (dd->vk.vkCreateQueryPool(dd->device, &qi, NULL, &dd->slot[i].gt_pool) != VK_SUCCESS) {
+            for (uint32_t k = 0; k <= i; k++)
+                if (dd->slot[k].gt_pool) dd->vk.vkDestroyQueryPool(dd->device, dd->slot[k].gt_pool, NULL);
+            for (uint32_t k = 0; k <= i; k++) dd->slot[k].gt_pool = VK_NULL_HANDLE;
+            return 0;
+        }
+    for (uint32_t i = 0; i < dd->nslots; i++) dd->slot[i].gt_pass = gpu_times_mode() == 2;
+    dd->gt_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    dd->gt_ns_tick = (double)dd->props.limits.timestampPeriod;
+    dd->gt_ok = 1;
+    fprintf(stderr, "[VK] RSX_GPU_TIMES=%d: GPU timestamps, %.3f ns a tick, %u bits\n", gpu_times_mode(),
+            dd->gt_ns_tick, bits);
+    return 1;
+}
+
+/* A slot's stamps, once its recording is done (gpu_ns). */
+static void gt_read(gpu_vk_device* dd, gpu_cmd* c)
+{
+    if (!c->gt_done) return;
+    uint64_t ts[GPU_TIMES_MAX];
+    if (dd->vk.vkGetQueryPoolResults(dd->device, c->gt_pool, 0, c->gt_n, sizeof ts, ts, sizeof ts[0],
+                                     VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+        gpu_times_take(&dd->gt, ts, c->gt_n, dd->gt_ns_tick, dd->gt_mask);
+    c->gt_n = c->gt_done = 0;
+}
+
 /* Today's allocator and list Reset. Each recording starts with a barrier
  * from everything before (D3D12 orders command lists one after another and
  * lets buffers and textures in COMMON go back to it between them), and with
  * D3D12's starting state: stencil reference 0, blend factor 1, a triangle
- * list, primitive restart off. */
+ * list, primitive restart off. With RSX_GPU_TIMES, the slot's last stamps
+ * are read and a new start stamped. */
 static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
@@ -1067,6 +1115,12 @@ static gpu_cmd* vkb_cmd_begin(gpu_device* d, uint32_t slot)
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (dd->vk.vkBeginCommandBuffer(c->cb, &bi) != VK_SUCCESS) return NULL;
+    if (gpu_times_mode() && gt_make(dd)) {
+        gt_read(dd, c);
+        dd->vk.vkCmdResetQueryPool(c->cb, c->gt_pool, 0, GPU_TIMES_MAX);
+        dd->vk.vkCmdWriteTimestamp2(c->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->gt_pool, 0);
+        c->gt_n = 1;
+    }
     c->lay = NULL;
     memset(c->sets, 0, sizeof c->sets);
     c->have = 0;
@@ -1105,6 +1159,11 @@ static void vkb_cmd_end(gpu_device* d, gpu_cmd* c)
 {
     (void)d;
     gpu_vk__close(c);
+    if (c->gt_n && !c->gt_done) {   /* RSX_GPU_TIMES: the end's stamp, after the recording's work */
+        gpu_vk__sync(c);
+        c->vk->vkCmdWriteTimestamp2(c->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c->gt_pool, c->gt_n++);
+        c->gt_done = 1;
+    }
     barrier_global(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
                    VK_ACCESS_2_HOST_READ_BIT);
     gpu_vk__sync(c);
@@ -1791,6 +1850,15 @@ static void vkb_wait_idle(gpu_device* d)
     while (vkb_fence_wait(d, f, 2000))
         if (dd->lost) break;
     gpu_vk_defer_collect(dd, 0);
+    if (dd->gt_ok)
+        for (uint32_t i = 0; i < dd->nslots; i++) gt_read(dd, &dd->slot[i]);
+}
+
+static uint64_t vkb_gpu_ns(gpu_device* d, uint64_t* n)
+{
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    if (n) *n = dd->gt.n;
+    return dd->gt.ns;
 }
 
 VkCommandBuffer gpu_vk_oneshot_begin(gpu_vk_device* dd)

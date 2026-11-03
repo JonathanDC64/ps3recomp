@@ -31,10 +31,14 @@
  *   [replay] frame 7: 5.123 ms, cpu 4.688 ms
  *   [replay] times: 199 frames after the first: wall 5.140 ms, cpu 4.981 ms a frame
  * Windows counts a thread's time in clock ticks (about 15.6 ms), so one
- * frame's cpu figure is coarse; the mean over many frames is not.
+ * frame's cpu figure is coarse; the mean over many frames is not. With
+ * RSX_GPU_TIMES=1 too, on a new path's route, the line adds the GPU's own
+ * time from timestamps (gpu/gpu_times.h): the recordings' time, not the
+ * gaps between them, after a wait for the GPU before frame 1 and at the end:
+ *   [replay] times: 199 frames ...: wall 5.140 ms, cpu 4.981 ms a frame, gpu 0.612 ms a frame (398 recordings)
  *
  * The process ends without the renderer's shutdown. RSX_REPLAY_SHUTDOWN=1,
- * on the new path's routes only (RSX_BACKEND=hal-d3d12 or null), runs it
+ * on the new path's routes only (RSX_BACKEND=d3d12, null or vulkan), runs it
  * after the last frame first: the GPU idle, every object freed and the
  * device destroyed, which the null backend checks (its last line counts
  * the failed checks; GPU_NULL_DUMP's file ends with the stream's hash).
@@ -207,6 +211,34 @@ static LONG WINAPI commit_on_touch(EXCEPTION_POINTERS* ep)
                                                                    : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* A crash says where, as the game's does (boot_main.cpp): the code, the
+ * fault, and the stack as module RVAs, so a gate's "exit 139" can be looked
+ * up in the build's map. */
+static LONG WINAPI crash_report(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    fprintf(stderr, "\n[CRASH] code=0x%08lX thread %lu\n", (unsigned long)er->ExceptionCode,
+            (unsigned long)GetCurrentThreadId());
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        fprintf(stderr, "[CRASH] %s fault address 0x%llX\n", er->ExceptionInformation[0] ? "write" : "read",
+                (unsigned long long)er->ExceptionInformation[1]);
+    void* at[1 + 32];
+    at[0] = er->ExceptionAddress;
+    const USHORT n = (USHORT)(1 + RtlCaptureStackBackTrace(0, 32, at + 1, NULL));
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE m = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)at[i], &m);
+        char path[MAX_PATH] = "?";
+        if (m) GetModuleFileNameA(m, path, sizeof path);
+        const char* name = strrchr(path, '\\');
+        fprintf(stderr, "[CRASH] %s rva=0x%llX %s\n", i ? "  " : "at", (unsigned long long)((char*)at[i] - (char*)m),
+                name ? name + 1 : path);
+    }
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 /* The calling thread's CPU time so far (user + kernel), in ms. */
 static double thread_cpu_ms(void)
 {
@@ -232,6 +264,7 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SPAN, MEM_RESERVE, PAGE_READWRITE);
     if (!vm_base) { fprintf(stderr, "rsx_replay: cannot reserve the guest space\n"); return 1; }
     AddVectoredExceptionHandler(1, commit_on_touch);
+    SetUnhandledExceptionFilter(crash_report);
 
     if (rsx_d3d12_backend_init(1280, 720, "rsx_replay") != 0) {
         fprintf(stderr, "rsx_replay: backend init failed\n"); return 1;
@@ -266,7 +299,7 @@ int main(int argc, char** argv)
       } }
     char ovv[16] = "";
     const int overlay_gpu = GetEnvironmentVariableA("RSX_REPLAY_OVERLAY_GPU", ovv, sizeof ovv) < sizeof ovv &&
-                            atoi(ovv) > 0 && strcmp(rsx_out_renderer(), "d3d12") != 0;
+                            atoi(ovv) > 0 && strcmp(rsx_out_renderer(), "legacy") != 0;
     if (overlay_gpu) {
         static const rsx_d3d12_overlay v1 = {NULL, NULL, ov_overlay_v1, NULL};   /* (v2 set beside it, as des_ui) */
         static const rsx_out_overlay_gpu v2 = {NULL, ov_frame};
@@ -283,6 +316,11 @@ int main(int argc, char** argv)
     const DWORD wn = GetEnvironmentVariableA("RSX_REPLAY_WINDOW", wv, sizeof wv);
     s_win_steps = wn && wn < sizeof wv ? wv : NULL;
     int played = 0;   /* (frames across captures, for RSX_REPLAY_WINDOW) */
+#if defined(PS3RECOMP_RSX_HAL)
+    char gtv[8] = "";   /* RSX_GPU_TIMES on a new path's route: the times line says the GPU's time too */
+    gpu_device* const gt_dev = GetEnvironmentVariableA("RSX_GPU_TIMES", gtv, sizeof gtv) && atoi(gtv) > 0
+                                   ? rsx_out_gpu_device() : NULL;
+#endif
     for (int c = 0; c < ncaps; c++) {
         uint32_t* m = NULL;
         const int n = cellGcm_replay_load(argv[1 + c], &m);
@@ -290,7 +328,14 @@ int main(int argc, char** argv)
         printf("[replay] %s: %d methods\n", argv[1 + c], n);
         double wall_sum = 0.0, cpu_sum = 0.0;
         int timed = 0;
+        uint64_t gns0 = 0, grec0 = 0;   /* RSX_GPU_TIMES: the GPU's sums after the first frame */
         for (int k = 0; frames == 0 || k < frames; k++) {
+#if defined(PS3RECOMP_RSX_HAL)
+            if (times && k == 1 && gt_dev) {   /* (the wait is before the frame's clock starts) */
+                gpu_wait_idle(gt_dev);
+                gns0 = gpu_gpu_ns(gt_dev, &grec0);
+            }
+#endif
             const double cpu0 = times ? thread_cpu_ms() : 0.0;
             QueryPerformanceCounter(&t0);
             cellGcm_replay_reset();
@@ -307,9 +352,20 @@ int main(int argc, char** argv)
             window_steps(played++);
             if (rsx_d3d12_backend_pump_messages() != 0) { c = ncaps; break; }
         }
+        char gpu_txt[96] = "";
+#if defined(PS3RECOMP_RSX_HAL)
+        if (timed && gt_dev) {
+            gpu_wait_idle(gt_dev);
+            uint64_t grec = 0;
+            const uint64_t gns = gpu_gpu_ns(gt_dev, &grec) - gns0;
+            if (grec > grec0)
+                snprintf(gpu_txt, sizeof gpu_txt, ", gpu %.3f ms a frame (%llu recordings)", 1e-6 * (double)gns / timed,
+                         (unsigned long long)(grec - grec0));
+        }
+#endif
         if (timed)
-            printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame\n",
-                   timed, wall_sum / timed, cpu_sum / timed);
+            printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame%s\n",
+                   timed, wall_sum / timed, cpu_sum / timed, gpu_txt);
     }
 #if defined(PS3RECOMP_RSX_HAL)
     if (overlay_gpu)
@@ -322,7 +378,7 @@ int main(int argc, char** argv)
     /* RSX_REPLAY_SHUTDOWN=1 on the new path's routes: its shutdown first. */
     { char sv[16] = "";
       if (GetEnvironmentVariableA("RSX_REPLAY_SHUTDOWN", sv, sizeof sv) < sizeof sv && atoi(sv) > 0 &&
-          strcmp(rsx_out_renderer(), "d3d12") != 0) {
+          strcmp(rsx_out_renderer(), "legacy") != 0) {
           rsx_out_backend_shutdown();
           printf("[replay] shutdown: done\n");
           fflush(stdout);

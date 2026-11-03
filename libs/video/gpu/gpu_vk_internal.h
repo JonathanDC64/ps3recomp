@@ -53,6 +53,7 @@
 
 #include "gpu.h"
 #include "gpu_cmd_ops.h"
+#include "gpu_times.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -471,6 +472,11 @@ typedef struct gpu_vk_set0_entry {
 
 struct gpu_cmd {
     gpu_cmd_head                 head;
+    /* RSX_GPU_TIMES (gpu_times.h): this slot's timestamp pool while the knob
+     * is on (else none), the stamps written, whether pass_begin writes one,
+     * and whether cmd_end wrote the last. */
+    VkQueryPool                  gt_pool;
+    uint32_t                     gt_n, gt_pass, gt_done;
     VkCommandBuffer              cb;
     const struct VolkDeviceTable* vk;
     struct gpu_vk_device*        dd;
@@ -631,6 +637,14 @@ typedef struct gpu_vk_device {
     /* Recorders. */
     uint32_t                   nslots;
     gpu_cmd                    slot[GPU_VK_MAX_CMD_SLOTS];
+
+    /* RSX_GPU_TIMES: each slot's timestamp pool, made at the first cmd_begin
+     * with the knob on (gt_tried; gt_ok when there), the queue's bits a stamp
+     * keeps, and the sums. */
+    int                        gt_tried, gt_ok;
+    uint64_t                   gt_mask;
+    double                     gt_ns_tick;
+    gpu_times                  gt;
 
     /* Checkpoint markers (GPU_DEVICE_BREADCRUMBS on NVIDIA): their text lives here. */
     char*                      marks;

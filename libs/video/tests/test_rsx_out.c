@@ -1,6 +1,6 @@
 /*
- * test_rsx_out -- the route switch's choice (libs/video/rsx_out.c, step V6),
- * with no renderer: rsx_out.c is built here against stand-ins for today's
+ * test_rsx_out -- the route switch's choice (libs/video/rsx_out.c), with no
+ * renderer: rsx_out.c is built here against stand-ins for the legacy
  * renderer (rsx_d3d12_*) and for the new path's tables (rsxc_route_d3d12,
  * _null, _vk), which note each call and do nothing else.
  *
@@ -8,25 +8,29 @@
  *   test_rsx_out --case <name> the child (the route is picked once a process)
  *
  * Each child does what a host does at its start: hands the renderer its
- * overlay and the game's tag, starts it, presents once; then checks the
- * route, rsx_out_renderer_info's reason, which renderer got each call, and
- * the start mark in RSX_STATE_DIR. The cases: RSX_BACKEND unset, d3d12,
- * vulkan (in any case), hal-d3d12, null, metal; a Vulkan start that fails at
- * each step (TEST_VK_INIT=fail:<step>: the stand-in's start fails as the
- * core's does, and rsxc_vk_start_failed says where), which must start
- * today's renderer in the same process with what it was handed before; a
- * Vulkan start whose process dies before its first present (the mark
- * stays), the start after it (d3d12, saying why; the mark goes) and the one
- * after that (Vulkan again); a mark left and d3d12 asked for; no
- * RSX_STATE_DIR (no mark). Each child gets the system's environment and the
- * case's variables only. Prints a line a case and "test_rsx_out: N passed,
- * M failed"; exit 1 on a failure.
+ * overlay, the menus' overlay v2 and the game's tag, starts it, presents
+ * once; then checks the route, rsx_out_renderer_info's reason, which
+ * renderer got each call, and the start mark in RSX_STATE_DIR. The cases:
+ * RSX_BACKEND unset, d3d12, hal-d3d12, legacy (in any case), vulkan (in any
+ * case), null, metal; a Vulkan start that fails at each step
+ * (TEST_VK_INIT=fail:<step>: the stand-in's start fails as the core's does,
+ * and rsxc_vk_start_failed says where), which must start the default in the
+ * same process with what it was handed before; a D3D12 start of the new path
+ * that fails (TEST_D3D12_INIT, likewise), which must start the legacy
+ * renderer so, and both one after the other; a Vulkan start whose process
+ * dies before its first present (the mark stays), the start after it (D3D12,
+ * saying why; the mark goes) and the one after that (Vulkan again); a mark
+ * left and the default asked for; no RSX_STATE_DIR (no mark). Each child
+ * gets the system's environment and the case's variables only. Prints a line
+ * a case and "test_rsx_out: N passed, M failed"; exit 1 on a failure.
  *
- * On Linux the switch is built as a Linux host builds it, with today's
+ * On Linux the switch is built as a Linux host builds it, with the legacy
  * renderer on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D; rsx_out.c is empty without
- * it). It has the null and vulkan routes there too, with the same fallback
- * and start mark, and the same cases but one: hal-d3d12 is Windows' only, so
- * on Linux it runs today's renderer and says why.
+ * it) and Vulkan, which is the default there: the new path has no D3D12 off
+ * Windows, so d3d12 asks for the legacy renderer, hal-d3d12 is not in the
+ * build (the default runs), and a failed Vulkan start falls back to the
+ * legacy renderer. The null and vulkan routes, the fallback and the start
+ * mark are the same.
  */
 #if defined(_WIN32) || defined(__linux__)
 
@@ -71,21 +75,27 @@ static void logc(const char* who)
     snprintf(g_log + n, sizeof g_log - n, "%s ", who);
 }
 
-/* ---- today's renderer, standing in ---- */
+/* What each renderer was handed before its start: the overlay's user, the
+ * overlay v2's user and the game's tag. */
+typedef struct {
+    void* overlay_user;
+    void* overlay_gpu_user;
+    char game[64];
+} handed;
+static handed g_legacy, g_hal, g_vk;
+
+/* ---- the legacy renderer, standing in ---- */
 void rsx_d3d12_composite_from_offscreen(u32 raw_off);
 void rsx_prof_begin(const char* prefix);
 int  rsx_prof_end(char* digest, size_t cap);
 void rsx_prof_title(const char* title);
 
-static void* g_d3d12_overlay_user;   /* the overlay today's renderer was given */
-static char g_d3d12_game[64];
-
 /* (three are written out below: the table's stand-ins for them get other names) */
 #define rsx_d3d12_backend_init   unused_d3d12_backend_init
 #define rsx_d3d12_set_overlay    unused_d3d12_set_overlay
 #define rsx_d3d12_pso_index_game unused_d3d12_pso_index_game
-#define STUB_V_(name, legacy, params, args)      void legacy params { logc("d3d12:" #name); }
-#define STUB_R_(ret, name, legacy, params, args) ret legacy params { logc("d3d12:" #name); return (ret)0; }
+#define STUB_V_(name, legacy, params, args)      void legacy params { logc("legacy:" #name); }
+#define STUB_R_(ret, name, legacy, params, args) ret legacy params { logc("legacy:" #name); return (ret)0; }
 RSX_OUT_FUNCS(STUB_V_, STUB_R_)
 #undef rsx_d3d12_backend_init
 #undef rsx_d3d12_set_overlay
@@ -94,18 +104,18 @@ RSX_OUT_FUNCS(STUB_V_, STUB_R_)
 int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
 {
     (void)width; (void)height; (void)title;
-    logc("d3d12:backend_init");
+    logc("legacy:backend_init");
     return 0;
 }
 void rsx_d3d12_set_overlay(const rsx_d3d12_overlay* overlay)
 {
-    logc("d3d12:set_overlay");
-    g_d3d12_overlay_user = overlay ? overlay->user : NULL;
+    logc("legacy:set_overlay");
+    g_legacy.overlay_user = overlay ? overlay->user : NULL;
 }
 void rsx_d3d12_pso_index_game(const char* game)
 {
-    logc("d3d12:pso_index_game");
-    snprintf(g_d3d12_game, sizeof g_d3d12_game, "%s", game ? game : "");
+    logc("legacy:pso_index_game");
+    snprintf(g_legacy.game, sizeof g_legacy.game, "%s", game ? game : "");
 }
 
 /* The start mark: RSX_STATE_DIR/renderer_starting, "" without the knob. */
@@ -113,7 +123,7 @@ static char g_mark[MAX_PATH + 32];
 static int g_mark_at_init = -1;      /* the mark during the Vulkan start; -1: no Vulkan start */
 static int mark_there(void) { return g_mark[0] && file_there(g_mark); }
 
-/* ---- the new path's tables, standing in (hal-d3d12's on Windows only) ---- */
+/* ---- the new path's tables, standing in (d3d12's on Windows only) ---- */
 #define TAB_V_(tag, name, params)     static void tag##_##name params { logc(#tag ":" #name); }
 #define TAB_R_(tag, ret, name, params) static ret tag##_##name params { logc(#tag ":" #name); return (ret)0; }
 #define HAL_V_(name, legacy, params, args)      TAB_V_(hal, name, params)
@@ -122,32 +132,70 @@ static int mark_there(void) { return g_mark[0] && file_there(g_mark); }
 #define NUL_R_(ret, name, legacy, params, args) TAB_R_(null, ret, name, params)
 #define VK_V_(name, legacy, params, args)       TAB_V_(vk, name, params)
 #define VK_R_(ret, name, legacy, params, args)  TAB_R_(vk, ret, name, params)
+/* (the starts, the overlay and the tag are written out below for d3d12 and
+ * vulkan) */
+#define hal_backend_init    unused_hal_backend_init
+#define hal_set_overlay     unused_hal_set_overlay
+#define hal_pso_index_game  unused_hal_pso_index_game
+#define vk_backend_init     unused_vk_backend_init
+#define vk_backend_present  unused_vk_backend_present
+#define vk_set_overlay      unused_vk_set_overlay
+#define vk_pso_index_game   unused_vk_pso_index_game
 #ifdef _WIN32
 RSX_OUT_FUNCS(HAL_V_, HAL_R_)
 #endif
 RSX_OUT_FUNCS(NUL_V_, NUL_R_)
-#define vk_backend_init    unused_vk_backend_init
-#define vk_backend_present unused_vk_backend_present
 RSX_OUT_FUNCS(VK_V_, VK_R_)
+#undef hal_backend_init
+#undef hal_set_overlay
+#undef hal_pso_index_game
 #undef vk_backend_init
 #undef vk_backend_present
+#undef vk_set_overlay
+#undef vk_pso_index_game
 
-/* The Vulkan stand-in's start: TEST_VK_INIT=fail:<step> fails it at that
- * step, as the core's start_step does. It notes whether the start mark was
- * there while it ran. */
+/* A stand-in's start: <var>=fail:<step> fails it at that step, as the
+ * core's start_step does; its start_failed then says where. */
+static int start_as(const char* var, const char** failed)
+{
+    const char* f = getenv(var);
+    if (f && !strncmp(f, "fail:", 5)) {
+        *failed = f + 5;
+        return -1;
+    }
+    return 0;
+}
+
+#ifdef _WIN32
+static const char* g_hal_failed;
+static int test_hal_backend_init(uint32_t width, uint32_t height, const char* title)
+{
+    (void)width; (void)height; (void)title;
+    logc("hal:backend_init");
+    return start_as("TEST_D3D12_INIT", &g_hal_failed);
+}
+static void test_hal_set_overlay(const struct rsx_d3d12_overlay* overlay)
+{
+    logc("hal:set_overlay");
+    g_hal.overlay_user = overlay ? overlay->user : NULL;
+}
+static void test_hal_pso_index_game(const char* game)
+{
+    logc("hal:pso_index_game");
+    snprintf(g_hal.game, sizeof g_hal.game, "%s", game ? game : "");
+}
+const char* rsxc_d3d12_start_failed(void) { return g_hal_failed; }
+#endif
+
+/* The Vulkan stand-in's start notes whether the start mark was there while
+ * it ran. */
 static const char* g_vk_failed;
-
 static int test_vk_backend_init(uint32_t width, uint32_t height, const char* title)
 {
     (void)width; (void)height; (void)title;
     logc("vk:backend_init");
     g_mark_at_init = mark_there();
-    const char* f = getenv("TEST_VK_INIT");
-    if (f && !strncmp(f, "fail:", 5)) {
-        g_vk_failed = f + 5;
-        return -1;
-    }
-    return 0;
+    return start_as("TEST_VK_INIT", &g_vk_failed);
 }
 /* The core's first present tells the switch (rsxc_vk.c's rc_be_presented). */
 static void test_vk_backend_present(void)
@@ -156,13 +204,29 @@ static void test_vk_backend_present(void)
     logc("vk:backend_present");
     if (!n++) rsx_out_route_presented();
 }
+static void test_vk_set_overlay(const struct rsx_d3d12_overlay* overlay)
+{
+    logc("vk:set_overlay");
+    g_vk.overlay_user = overlay ? overlay->user : NULL;
+}
+static void test_vk_pso_index_game(const char* game)
+{
+    logc("vk:pso_index_game");
+    snprintf(g_vk.game, sizeof g_vk.game, "%s", game ? game : "");
+}
 const char* rsxc_vk_start_failed(void) { return g_vk_failed; }
 
 #define FIELD_V_(name, legacy, params, args)      .name = TAB_PREFIX(name),
 #define FIELD_R_(ret, name, legacy, params, args) .name = TAB_PREFIX(name),
 #ifdef _WIN32
 #define TAB_PREFIX(name) hal_##name
-const rsx_route rsxc_route_d3d12 = {.name = "hal-d3d12", RSX_OUT_FUNCS(FIELD_V_, FIELD_R_)};
+#define hal_backend_init   test_hal_backend_init
+#define hal_set_overlay    test_hal_set_overlay
+#define hal_pso_index_game test_hal_pso_index_game
+const rsx_route rsxc_route_d3d12 = {.name = "d3d12", RSX_OUT_FUNCS(FIELD_V_, FIELD_R_)};
+#undef hal_backend_init
+#undef hal_set_overlay
+#undef hal_pso_index_game
 #undef TAB_PREFIX
 #endif
 #define TAB_PREFIX(name) null_##name
@@ -171,20 +235,35 @@ const rsx_route rsxc_route_null = {.name = "null", RSX_OUT_FUNCS(FIELD_V_, FIELD
 #define TAB_PREFIX(name) vk_##name
 #define vk_backend_init    test_vk_backend_init
 #define vk_backend_present test_vk_backend_present
+#define vk_set_overlay     test_vk_set_overlay
+#define vk_pso_index_game  test_vk_pso_index_game
 const rsx_route rsxc_route_vk = {.name = "vulkan", RSX_OUT_FUNCS(FIELD_V_, FIELD_R_)};
 #undef vk_backend_init
 #undef vk_backend_present
+#undef vk_set_overlay
+#undef vk_pso_index_game
 #undef TAB_PREFIX
 
-/* The overlay v2's tables (rsx_out.h, step VM): nothing to draw here. */
-static void test_set_overlay_gpu(const rsx_out_overlay_gpu* overlay) { (void)overlay; }
+/* The overlay v2's tables (rsx_out.h, step VM): each notes the overlay it
+ * was given; nothing to draw here. */
 static struct gpu_device* test_gpu_device(void) { return NULL; }
 static struct gpu_cmd* test_overlay_gpu_flush(void) { return NULL; }
 #if defined(_WIN32)
-const rsx_route_gpu rsxc_route_gpu_d3d12 = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+static void hal_set_overlay_gpu(const rsx_out_overlay_gpu* overlay)
+{
+    logc("hal:set_overlay_gpu");
+    g_hal.overlay_gpu_user = overlay ? overlay->user : NULL;
+}
+const rsx_route_gpu rsxc_route_gpu_d3d12 = {hal_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
 #endif
-const rsx_route_gpu rsxc_route_gpu_null = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
-const rsx_route_gpu rsxc_route_gpu_vk = {test_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+static void null_set_overlay_gpu(const rsx_out_overlay_gpu* overlay) { (void)overlay; logc("null:set_overlay_gpu"); }
+static void vk_set_overlay_gpu(const rsx_out_overlay_gpu* overlay)
+{
+    logc("vk:set_overlay_gpu");
+    g_vk.overlay_gpu_user = overlay ? overlay->user : NULL;
+}
+const rsx_route_gpu rsxc_route_gpu_null = {null_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
+const rsx_route_gpu rsxc_route_gpu_vk = {vk_set_overlay_gpu, test_gpu_device, test_overlay_gpu_flush};
 
 /* ---- the child: one case ---- */
 static int g_fail;
@@ -202,60 +281,98 @@ typedef struct {
     const char* name;
     const char* backend;   /* RSX_BACKEND, NULL unset */
     const char* vk_init;   /* TEST_VK_INIT */
+    const char* d3d12_init;/* TEST_D3D12_INIT (Windows) */
     int state_dir;         /* RSX_STATE_DIR set (the parent's folder) */
     int die_after_init;    /* exit before the first present (a start that crashed) */
     int mark_before;       /* the parent leaves a mark before the child runs (-1: as the last case left it) */
     const char* route;     /* rsx_out_renderer after the start */
     const char* why;       /* a part of rsx_out_renderer_info's reason, NULL for none */
-    const char* starts;    /* the starts called, in order, as the log has them */
+    const char* starts;    /* the starts called, in order, with the hand-overs after a failed one */
     int vk_mark;           /* g_mark_at_init: the mark during the Vulkan start, -1 for no Vulkan start */
     int mark_after;        /* the mark once the case is done */
 } test_case;
 
-static const test_case k_cases[] = {
-    {"unset",        NULL,        NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
-    {"d3d12",        "d3d12",     NULL, 1, 0, 0, "d3d12",     NULL, "d3d12:backend_init", -1, 0},
-    {"vulkan",       "vulkan",    NULL, 1, 0, 0, "vulkan",    NULL, "vk:backend_init", 1, 0},
-    {"vulkan-case",  "VuLkAn",    NULL, 1, 0, 0, "vulkan",    NULL, "vk:backend_init", 1, 0},
-    {"vulkan-nodir", "vulkan",    NULL, 0, 0, 0, "vulkan",    NULL, "vk:backend_init", 0, 0},
+/* The default route (RSX_BACKEND unset), its start and its start mark (-1:
+ * no Vulkan start); D3D, what d3d12 asks for and what a failed Vulkan start
+ * runs instead, with what it is handed. On Windows both are the new path's
+ * D3D12; on Linux the default is Vulkan and d3d12 the legacy renderer. */
 #ifdef _WIN32
-    {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "hal-d3d12", NULL, "hal:backend_init", -1, 0},
+#define DEF       "d3d12"
+#define DEF_START "hal:backend_init"
+#define DEF_MARK  (-1)
+#define D3D       "d3d12"
+#define D3D_START "hal:backend_init"
+#define D3D_HAND  "hal:set_overlay hal:set_overlay_gpu hal:pso_index_game"
 #else
-    {"hal-d3d12",    "hal-d3d12", NULL, 1, 0, 0, "d3d12",     "RSX_BACKEND=hal-d3d12 is not in this build",
-     "d3d12:backend_init", -1, 0},
+#define DEF       "vulkan"
+#define DEF_START "vk:backend_init"
+#define DEF_MARK  1
+#define D3D       "legacy"
+#define D3D_START "legacy:backend_init"
+#define D3D_HAND  "legacy:set_overlay legacy:pso_index_game"
 #endif
-    {"null",         "null",      NULL, 1, 0, 0, "null",      NULL, "null:backend_init", -1, 0},
-    {"metal",        "metal",     NULL, 1, 0, 0, "d3d12",     "RSX_BACKEND=metal is not in this build",
-     "d3d12:backend_init", -1, 0},
-    {"fail-loader",  "vulkan", "fail:loader", 1, 0, 0, "d3d12", "Vulkan failed to start: no Vulkan 1.3 driver (loader)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-instance", "vulkan", "fail:instance", 1, 0, 0, "d3d12", "(instance)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-adapter", "vulkan", "fail:adapter", 1, 0, 0, "d3d12", "(adapter)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-features", "vulkan", "fail:features", 1, 0, 0, "d3d12", "(features)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-device",  "vulkan", "fail:device", 1, 0, 0, "d3d12", "(device)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-window",  "vulkan", "fail:window", 1, 0, 0, "d3d12", "(window)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-swap",    "vulkan", "fail:swap chain", 1, 0, 0, "d3d12", "swap chain could not be made (swap chain)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-targets", "vulkan", "fail:targets", 1, 0, 0, "d3d12", "(targets)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-shaders", "vulkan", "fail:shaders", 1, 0, 0, "d3d12", "(shaders)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-rings",   "vulkan", "fail:rings", 1, 0, 0, "d3d12", "(rings)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 1, 0},
-    {"fail-nodir",   "vulkan", "fail:window", 0, 0, 0, "d3d12", "(window)",
-     "vk:backend_init d3d12:set_overlay d3d12:pso_index_game d3d12:backend_init", 0, 0},
+#define LEG_START "legacy:backend_init"
+#define LEG_HAND  "legacy:set_overlay legacy:pso_index_game"
+#define VK_FAILS  "vk:backend_init " D3D_HAND " " D3D_START
+
+static const test_case k_cases[] = {
+    {"unset",        NULL,        NULL, NULL, 1, 0, 0, DEF,      NULL, DEF_START, DEF_MARK, 0},
+    {"d3d12",        "d3d12",     NULL, NULL, 1, 0, 0, D3D,      NULL, D3D_START, -1, 0},
+    {"legacy",       "legacy",    NULL, NULL, 1, 0, 0, "legacy", NULL, LEG_START, -1, 0},
+    {"legacy-case",  "LeGaCy",    NULL, NULL, 1, 0, 0, "legacy", NULL, LEG_START, -1, 0},
+    {"vulkan",       "vulkan",    NULL, NULL, 1, 0, 0, "vulkan", NULL, "vk:backend_init", 1, 0},
+    {"vulkan-case",  "VuLkAn",    NULL, NULL, 1, 0, 0, "vulkan", NULL, "vk:backend_init", 1, 0},
+    {"vulkan-nodir", "vulkan",    NULL, NULL, 0, 0, 0, "vulkan", NULL, "vk:backend_init", 0, 0},
+#ifdef _WIN32
+    {"hal-d3d12",    "hal-d3d12", NULL, NULL, 1, 0, 0, "d3d12",  NULL, "hal:backend_init", -1, 0},
+#else
+    {"hal-d3d12",    "hal-d3d12", NULL, NULL, 1, 0, 0, DEF,      "RSX_BACKEND=hal-d3d12 is not in this build",
+     DEF_START, DEF_MARK, 0},
+#endif
+    {"null",         "null",      NULL, NULL, 1, 0, 0, "null",   NULL, "null:backend_init", -1, 0},
+    {"metal",        "metal",     NULL, NULL, 1, 0, 0, DEF,      "RSX_BACKEND=metal is not in this build",
+     DEF_START, DEF_MARK, 0},
+    {"fail-loader",  "vulkan", "fail:loader", NULL, 1, 0, 0, D3D, "Vulkan failed to start: no Vulkan 1.3 driver (loader)",
+     VK_FAILS, 1, 0},
+    {"fail-instance", "vulkan", "fail:instance", NULL, 1, 0, 0, D3D, "(instance)", VK_FAILS, 1, 0},
+    {"fail-adapter", "vulkan", "fail:adapter", NULL, 1, 0, 0, D3D, "(adapter)", VK_FAILS, 1, 0},
+    {"fail-features", "vulkan", "fail:features", NULL, 1, 0, 0, D3D, "(features)", VK_FAILS, 1, 0},
+    {"fail-device",  "vulkan", "fail:device", NULL, 1, 0, 0, D3D, "the GPU device could not be made (device)",
+     VK_FAILS, 1, 0},
+    {"fail-window",  "vulkan", "fail:window", NULL, 1, 0, 0, D3D, "(window)", VK_FAILS, 1, 0},
+    {"fail-swap",    "vulkan", "fail:swap chain", NULL, 1, 0, 0, D3D, "swap chain could not be made (swap chain)",
+     VK_FAILS, 1, 0},
+    {"fail-targets", "vulkan", "fail:targets", NULL, 1, 0, 0, D3D, "(targets)", VK_FAILS, 1, 0},
+    {"fail-shaders", "vulkan", "fail:shaders", NULL, 1, 0, 0, D3D, "(shaders)", VK_FAILS, 1, 0},
+    {"fail-rings",   "vulkan", "fail:rings", NULL, 1, 0, 0, D3D, "(rings)", VK_FAILS, 1, 0},
+    {"fail-nodir",   "vulkan", "fail:window", NULL, 0, 0, 0, D3D, "(window)", VK_FAILS, 0, 0},
+#ifdef _WIN32
+    /* The new path's D3D12 start fails: the legacy renderer, with what it was handed. */
+    {"d3d12-fail-device", NULL, NULL, "fail:device", 1, 0, 0, "legacy",
+     "D3D12 failed to start: the GPU device could not be made (device)",
+     "hal:backend_init " LEG_HAND " " LEG_START, -1, 0},
+    {"d3d12-fail-swap", "d3d12", NULL, "fail:swap chain", 1, 0, 0, "legacy",
+     "D3D12 failed to start: the window's swap chain could not be made (swap chain)",
+     "hal:backend_init " LEG_HAND " " LEG_START, -1, 0},
+    {"d3d12-fail-unnamed", NULL, NULL, "fail:", 1, 0, 0, "legacy",
+     "D3D12 failed to start: an error the renderer did not name",
+     "hal:backend_init " LEG_HAND " " LEG_START, -1, 0},
+    /* Both fail, one after the other: the legacy renderer, saying why the last did. */
+    {"both-fail",    "vulkan", "fail:device", "fail:targets", 1, 0, 0, "legacy",
+     "D3D12 failed to start: the render targets could not be made (targets)",
+     VK_FAILS " " LEG_HAND " " LEG_START, 1, 0},
+#endif
     /* A start that dies in the driver, then the two after it, in order. */
-    {"crash",        "vulkan", NULL, 1, 1, 0, NULL, NULL, NULL, 1, 1},
-    {"after-crash",  "vulkan", NULL, 1, 0, -1, "d3d12", "the last start on Vulkan did not finish",
-     "d3d12:backend_init", -1, 0},
-    {"after-that",   "vulkan", NULL, 1, 0, -1, "vulkan", NULL, "vk:backend_init", 1, 0},
-    /* A mark left, and d3d12 asked for: done with too. */
-    {"left-d3d12",   NULL,     NULL, 1, 0, 1, "d3d12", NULL, "d3d12:backend_init", -1, 0},
+    {"crash",        "vulkan", NULL, NULL, 1, 1, 0, NULL, NULL, NULL, 1, 1},
+    {"after-crash",  "vulkan", NULL, NULL, 1, 0, -1, D3D, "the last start on Vulkan did not finish", D3D_START, -1, 0},
+    {"after-that",   "vulkan", NULL, NULL, 1, 0, -1, "vulkan", NULL, "vk:backend_init", 1, 0},
+    /* A mark left, and the default asked for: on Windows done with too; on
+     * Linux, where the default is Vulkan, the last Vulkan start's, as above. */
+#ifdef _WIN32
+    {"left-default", NULL,     NULL, NULL, 1, 0, 1, DEF, NULL, DEF_START, -1, 0},
+#else
+    {"left-default", NULL,     NULL, NULL, 1, 0, 1, D3D, "the last start on Vulkan did not finish", D3D_START, -1, 0},
+#endif
 };
 
 static const test_case* case_named(const char* name)
@@ -265,22 +382,31 @@ static const test_case* case_named(const char* name)
     return NULL;
 }
 
-/* The starts in the log (the calls named backend_init, and today's overlay
- * and tag calls after a fallback), as one string. */
+/* The starts in the log (the calls named backend_init, and the overlays and
+ * the tag handed over after the first), as one string. */
 static void starts_of(const char* log, char* out, size_t cap)
 {
     out[0] = 0;
     char copy[sizeof g_log];
     snprintf(copy, sizeof copy, "%s", log);
-    int after_vk = 0;
+    int after_start = 0;
     for (char* t = strtok(copy, " "); t; t = strtok(NULL, " ")) {
         const int start = strstr(t, ":backend_init") != NULL;
-        if (!strcmp(t, "vk:backend_init")) after_vk = 1;
-        if (start || (after_vk && (!strcmp(t, "d3d12:set_overlay") || !strcmp(t, "d3d12:pso_index_game")))) {
+        const int hand = has(t, ":set_overlay") || has(t, ":pso_index_game");
+        if (start || (after_start && hand)) {
             const size_t n = strlen(out);
             snprintf(out + n, cap - n, "%s%s", n ? " " : "", t);
         }
+        if (start) after_start = 1;
     }
+}
+
+/* What the renderer named by a route was handed. */
+static const handed* handed_to(const char* route)
+{
+    if (!strcmp(route, "legacy")) return &g_legacy;
+    if (!strcmp(route, "vulkan")) return &g_vk;
+    return &g_hal;
 }
 
 static int run_case(const char* name)
@@ -296,10 +422,12 @@ static int run_case(const char* name)
     const char* why = "x";
     check(rsx_out_renderer_info(&why) == NULL && why == NULL, "no route before the first call");
 
-    /* A host's start: the overlay and the tag first (des_ui_early_init,
+    /* A host's start: the overlays and the tag first (des_ui_early_init,
      * ps3_title_prework), then the window, then a frame. */
     static const rsx_d3d12_overlay ov = {(void*)(uintptr_t)0x1234, NULL, NULL, NULL};
+    static const rsx_out_overlay_gpu ovg = {(void*)(uintptr_t)0x5678, NULL};
     rsx_out_set_overlay(&ov);
+    rsx_out_set_overlay_gpu(&ovg);
     rsx_out_pso_index_game("TEST00000");
     const int r = rsx_out_backend_init(1280, 720, "test_rsx_out");
     if (c->die_after_init) {
@@ -330,18 +458,27 @@ static int run_case(const char* name)
     check(mark_there() == c->mark_after, "the mark after the first present");
 
     /* The calls after the start go to the renderer that runs. */
-    const char* const pres = !strcmp(c->route, "vulkan") ? "vk:backend_present" : !strcmp(c->route, "hal-d3d12")
+    const char* const pres = !strcmp(c->route, "vulkan") ? "vk:backend_present" : !strcmp(c->route, "d3d12")
                              ? "hal:backend_present" : !strcmp(c->route, "null") ? "null:backend_present"
-                             : "d3d12:backend_present";
+                             : "legacy:backend_present";
     snprintf(msg, sizeof msg, "the present went to %s (%s)", pres, g_log);
     check(has(g_log, pres), msg);
-    if (!strcmp(c->route, "d3d12") && c->vk_mark >= 0) {   /* a fallback: today's renderer has the overlay and tag */
-        check(g_d3d12_overlay_user == (void*)(uintptr_t)0x1234, "today's renderer got the overlay");
-        check(!strcmp(g_d3d12_game, "TEST00000"), "today's renderer got the game's tag");
-        check(!has(g_log, "vk:backend_present"), "nothing more went to Vulkan");
+    /* The renderer that runs has the overlay and the tag, whether it was
+     * handed them at the start or after a failed one; the overlay v2 too,
+     * but on legacy, which has none. */
+    if (strcmp(c->route, "null")) {
+        const handed* const h = handed_to(c->route);
+        check(h->overlay_user == (void*)(uintptr_t)0x1234, "the renderer that runs got the overlay");
+        check(!strcmp(h->game, "TEST00000"), "the renderer that runs got the game's tag");
+        if (strcmp(c->route, "legacy"))
+            check(h->overlay_gpu_user == (void*)(uintptr_t)0x5678, "the renderer that runs got the overlay v2");
     }
-    if (!strcmp(c->route, "d3d12") && c->vk_mark < 0)
+    if (c->vk_mark >= 0 && strcmp(c->route, "vulkan"))
+        check(!has(g_log, "vk:backend_present"), "nothing more went to Vulkan");
+    if (c->vk_mark < 0)
         check(!has(g_log, "vk:"), "nothing went to Vulkan");
+    if (!strcmp(c->route, "legacy") && has(c->starts, "hal:"))
+        check(!has(g_log, "hal:backend_present"), "nothing more went to the new path's D3D12");
     if (g_fail) printf("    log: %s\n", g_log);
     return g_fail ? 1 : 0;
 }
@@ -351,6 +488,7 @@ static int run_child(const char* exe, const test_case* c, const char* dir)
 {
     env_put("RSX_BACKEND", c->backend);
     env_put("TEST_VK_INIT", c->vk_init);
+    env_put("TEST_D3D12_INIT", c->d3d12_init);
     env_put("RSX_STATE_DIR", c->state_dir ? dir : NULL);
     env_put("RSX_FAIL_START_AT", NULL);
 #ifndef _WIN32

@@ -136,13 +136,21 @@ static int depth_buffer_make(void)
  * apart), window, swap chain, targets, shaders (the backend's own) and rings
  * (the recorders and the frame's buffers). ok 0 is a step that failed; the
  * first one is kept, for the route switch's line and the host's report
- * (rsx_out.c falls back to today's renderer when the Vulkan start fails).
+ * (rsx_out.c falls back to the default when the Vulkan start fails, and to
+ * today's renderer when the new path's D3D12 start fails).
  * RSX_FAIL_START_AT=<step> fails the start there on purpose, for tests, as
- * RSX_LOSE_DEVICE_AT_FRAME loses the device. */
+ * RSX_LOSE_DEVICE_AT_FRAME loses the device; <backend>:<step> (rc_be_lib_dir:
+ * d3d12, vulkan) only that backend's start, so the one it falls back to
+ * starts. */
 static const char* s_rc_start_failed;   /* the step a failed start stopped at, NULL */
 static int start_step(const char* step, int ok)
 {
     const char* f = getenv("RSX_FAIL_START_AT");
+    const char* const colon = f ? strchr(f, ':') : NULL;
+    if (colon) {
+        const size_t n = (size_t)(colon - f);
+        f = n == strlen(rc_be_lib_dir) && !strncmp(f, rc_be_lib_dir, n) ? colon + 1 : NULL;
+    }
     if (ok && f && !strcmp(f, step)) {
         fprintf(stderr, "[rsx] RSX_FAIL_START_AT=%s: the start fails here (test)%c", step, 10);
         ok = 0;
