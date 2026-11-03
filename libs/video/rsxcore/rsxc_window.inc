@@ -379,6 +379,12 @@ static HWND open_window(u32 width, u32 height, const char* title)
     return s_d3d.hwnd;
 }
 
+/* The window is hidden (SW_HIDE, as the test tools' runs are; minimized is
+ * not hidden). Vulkan's present to a hidden window waits up to 380 ms for
+ * an image that is never shown, so frames are rendered but not presented
+ * while it is, as behind the lock screen. Read at the flip. */
+static int window_hidden(void) { return s_d3d.hwnd && !IsWindowVisible(s_d3d.hwnd); }
+
 #else /* SDL */
 
 /* The window is SDL's, made by a thread of its own that then waits on its
@@ -391,6 +397,7 @@ enum { WIN_MAIL_TITLE, WIN_MAIL_BORDERLESS, WIN_MAIL_CLOSE };
 static SRWLOCK     s_win_title_lock;
 static char        s_win_title[320];
 static volatile LONG s_refresh_hz;        /* the window's display, 0 until known */
+static volatile LONG s_win_hidden;        /* SDL_WINDOWEVENT_HIDDEN until _SHOWN (window_hidden) */
 
 /* Borderless fullscreen (Alt+Enter, rc_set_borderless): SDL's desktop
  * fullscreen, the window covering its display. Window-thread state. */
@@ -746,6 +753,8 @@ static DWORD WINAPI window_thread(LPVOID p)
                 const Uint8 ev = e.window.event;
                 if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
                 else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
+                else if (ev == SDL_WINDOWEVENT_HIDDEN || ev == SDL_WINDOWEVENT_SHOWN)
+                    InterlockedExchange(&s_win_hidden, ev == SDL_WINDOWEVENT_HIDDEN);
             }
             const int alt_enter = e.type == SDL_KEYDOWN && win_alt_enter(&e.key);
             const int took = !alt_enter && win_overlay_event(&e);
@@ -776,6 +785,10 @@ static HWND open_window(u32 width, u32 height, const char* title)
     CloseHandle(t);
     return s_d3d.hwnd;
 }
+
+/* The window is hidden: frames are rendered but not presented, as on
+ * Windows. */
+static int window_hidden(void) { return s_win_hidden != 0; }
 
 /* Step L2: a failed start's window (rc_abort_init), gone before this
  * returns, as the Win32 one is: once today's renderer starts, its window
