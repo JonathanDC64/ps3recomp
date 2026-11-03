@@ -10,10 +10,11 @@
  *              same frames. hal-d3d12 is another name for it (its name
  *              while the legacy renderer was the default).
  *   legacy     the renderer before the new path (rsx_d3d12_backend.c),
- *              kept as it was to fall back on: each rsx_out_X calls
- *              rsx_d3d12_X directly. Off Windows the switch is built with
- *              it on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D, Linux), where it is
- *              the default, and d3d12 asks for it.
+ *              retired on Windows and frozen everywhere: kept as it was to
+ *              fall back on, its fixes go to the new path. Each rsx_out_X
+ *              calls rsx_d3d12_X directly. Off Windows the switch is built
+ *              with it on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D, Linux), where it
+ *              is still the default, and d3d12 asks for it.
  *   null       the new path on the null backend (gpu_null.c, Windows and
  *              Linux): no window and no GPU; every command is checked
  *              against gpu.h and hashed. For developers and CI only, never
@@ -26,7 +27,8 @@
  * in this build and runs the default. The pick prints one line, on every
  * route:
  *   [rsx_out] route d3d12 (the new path on its D3D12 backend)
- *   [rsx_out] route legacy (the renderer before the new path, rsx_d3d12_backend.c)
+ *   [rsx_out] route legacy (retired: the renderer before the new path, rsx_d3d12_backend.c, kept to fall back on)
+ *   [rsx_out] route legacy (the default off Windows: the renderer before the new path, on vkd3d; frozen)
  *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
  *   [rsx_out] route vulkan (the new path on its Vulkan backend)
  *   [rsx_out] route d3d12 (RSX_BACKEND=metal is not in this build)

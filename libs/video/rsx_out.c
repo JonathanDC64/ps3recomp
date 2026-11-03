@@ -8,7 +8,8 @@
  * D3D12 backend, rsxc_route_d3d12; null and vulkan call rsxc_route_null and
  * rsxc_route_vk (vulkan in builds with PS3RECOMP_RSX_HAL_VULKAN); on legacy
  * each rsx_out_X calls rsx_d3d12_X, the renderer before the new path
- * (rsx_d3d12_backend.c), kept as it was to fall back on. The new path's
+ * (rsx_d3d12_backend.c), retired on Windows and frozen everywhere: kept as
+ * it was to fall back on, with its fixes going to the new path. The new path's
  * D3D12 is Windows' only; off Windows the build is vkd3d's, which
  * CMakeLists.txt allows on Linux only, where the default is the legacy
  * renderer on vkd3d and the core builds null and vulkan too.
@@ -138,7 +139,12 @@ static long route_pick(void)
         s_why = s_why_text;
         printf("[rsx_out] route %s (%s)\n", route_name(want), s_why);
     } else if (want == ROUTE_LEGACY)
-        printf("[rsx_out] route legacy (the renderer before the new path, rsx_d3d12_backend.c)\n");
+#if defined(_WIN32)
+        printf("[rsx_out] route legacy (retired: the renderer before the new path, rsx_d3d12_backend.c, kept to fall"
+               " back on)\n");
+#else
+        printf("[rsx_out] route legacy (the default off Windows: the renderer before the new path, on vkd3d; frozen)\n");
+#endif
     else
         printf("[rsx_out] route d3d12 (the new path on its D3D12 backend)\n");
     fflush(stdout);

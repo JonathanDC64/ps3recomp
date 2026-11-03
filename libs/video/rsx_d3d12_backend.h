@@ -1,4 +1,19 @@
 /*
+ * RETIRED (2026-11-03): the legacy renderer.
+ *
+ * This file and rsx_d3d12_backend.c are the D3D12 renderer from before the
+ * portable renderer's new path (libs/video/rsxcore/, libs/video/gpu/). Both
+ * are kept, unchanged, and are not to be deleted:
+ *   - On Windows the new path's D3D12 is the default; this renderer runs only
+ *     with RSX_BACKEND=legacy, or when the new path's D3D12 fails to start
+ *     (rsx_out.c).
+ *   - Off Windows (vkd3d) it is still the default, until the new path's
+ *     Vulkan takes that place.
+ * Frozen: fixes and new work go to the new path, not here. The port's CI
+ * (tools/des/core_sync.sh) lists every commit that changes the .c.
+ */
+
+/*
  * ps3recomp - D3D12 RSX Backend
  *
  * Translates RSX GPU commands to Direct3D 12 rendering.
