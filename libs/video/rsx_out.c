@@ -8,14 +8,17 @@
  * D3D12 backend, rsxc_route_d3d12; null and vulkan call rsxc_route_null and
  * rsxc_route_vk (vulkan in builds with PS3RECOMP_RSX_HAL_VULKAN); on legacy
  * each rsx_out_X calls rsx_d3d12_X, the renderer before the new path
- * (rsx_d3d12_backend.c), kept as it was to fall back on. The new path's
+ * (rsx_d3d12_backend.c), retired on Windows and frozen everywhere: kept as
+ * it was to fall back on, with its fixes going to the new path. The new path's
  * D3D12 is Windows' only; off Windows the build is vkd3d's, which
- * CMakeLists.txt allows on Linux only, where the default is the legacy
- * renderer on vkd3d and the core builds null and vulkan too.
+ * CMakeLists.txt allows on Linux only, where the core builds null and vulkan
+ * too: there the default is vulkan (the legacy renderer in a build without
+ * it), and d3d12 is the legacy renderer on vkd3d.
  *
  * A start that fails runs another renderer in the same process (the section
- * "Starts that fall back" below says when and how): Vulkan's the default,
- * the new path's D3D12 the legacy renderer.
+ * "Starts that fall back" below says when and how): Vulkan's D3D12 (the new
+ * path's on Windows, the legacy renderer off it), the new path's D3D12 the
+ * legacy renderer.
  */
 #if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D))
 
@@ -51,10 +54,20 @@ void rsx_prof_title(const char* note);
 #endif
 
 enum { ROUTE_NONE, ROUTE_LEGACY, ROUTE_D3D12, ROUTE_NULL, ROUTE_VULKAN };
+/* ROUTE_DEFAULT: RSX_BACKEND unset. ROUTE_D3D: RSX_BACKEND=d3d12, and what a
+ * Vulkan start that fails (or did not finish last time) runs instead. Off
+ * Windows the new path has no D3D12, so there d3d12 is the legacy renderer
+ * on vkd3d, and the default is the new path's Vulkan when the build has it. */
 #if defined(_WIN32)
 #define ROUTE_DEFAULT ROUTE_D3D12    /* the new path on D3D12 */
+#define ROUTE_D3D     ROUTE_D3D12
 #else
-#define ROUTE_DEFAULT ROUTE_LEGACY   /* (no D3D12 of the new path off Windows: the legacy renderer on vkd3d) */
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+#define ROUTE_DEFAULT ROUTE_VULKAN
+#else
+#define ROUTE_DEFAULT ROUTE_LEGACY
+#endif
+#define ROUTE_D3D     ROUTE_LEGACY
 #endif
 static volatile long s_route;   /* ROUTE_*: none until the first call */
 
@@ -98,8 +111,10 @@ static long route_pick(void)
     const char* e = getenv("RSX_BACKEND");
     long want = ROUTE_DEFAULT;
     int other = 0, left = 0;
-    if (!e || !*e || same_name(e, "d3d12")) {
+    if (!e || !*e) {
         want = ROUTE_DEFAULT;
+    } else if (same_name(e, "d3d12")) {
+        want = ROUTE_D3D;
     } else if (same_name(e, "hal-d3d12")) {
 #if defined(_WIN32)
         want = ROUTE_D3D12;   /* (its name while the legacy renderer was the default) */
@@ -113,32 +128,34 @@ static long route_pick(void)
     } else if (same_name(e, "vulkan")) {
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
         want = ROUTE_VULKAN;   /* (Settings > Display > Renderer in the port) */
-        if (mark_left()) {     /* (the last Vulkan start never finished) */
-            want = ROUTE_DEFAULT;
-            left = 1;
-        }
 #else
         other = 1;
 #endif
     } else {
         other = 1;
     }
+#if defined(PS3RECOMP_RSX_HAL_VULKAN)
+    if (want == ROUTE_VULKAN && mark_left()) {   /* (the last Vulkan start never finished; Vulkan asked for, or the default) */
+        want = ROUTE_D3D;
+        left = 1;
+    }
+#endif
     const long had = RSX_OUT_CAS(&s_route, (long)ROUTE_NONE, want);
     if (had != ROUTE_NONE) return had;
-    if (want == ROUTE_NULL)
-        printf("[rsx_out] route null (the new path on the null backend: checks every command, draws nothing)\n");
-    else if (want == ROUTE_VULKAN)
-        printf("[rsx_out] route vulkan (the new path on its Vulkan backend)\n");
-    else if (left) {
+    if (left) {
         s_why = "the last start on Vulkan did not finish, so this one uses D3D12";
-        printf("[rsx_out] route %s (RSX_BACKEND=vulkan, but %s; the next start tries Vulkan again)\n",
-               route_name(want), s_why);
+        printf("[rsx_out] route %s (Vulkan, but %s; the next start tries Vulkan again)\n", route_name(want), s_why);
     } else if (other) {
         snprintf(s_why_text, sizeof s_why_text, "RSX_BACKEND=%.32s is not in this build", e);
         s_why = s_why_text;
         printf("[rsx_out] route %s (%s)\n", route_name(want), s_why);
-    } else if (want == ROUTE_LEGACY)
-        printf("[rsx_out] route legacy (the renderer before the new path, rsx_d3d12_backend.c)\n");
+    } else if (want == ROUTE_NULL)
+        printf("[rsx_out] route null (the new path on the null backend: checks every command, draws nothing)\n");
+    else if (want == ROUTE_VULKAN)
+        printf("[rsx_out] route vulkan (the new path on its Vulkan backend)\n");
+    else if (want == ROUTE_LEGACY)
+        printf("[rsx_out] route legacy (retired: the renderer before the new path, rsx_d3d12_backend.c, kept to fall"
+               " back on)\n");
     else
         printf("[rsx_out] route d3d12 (the new path on its D3D12 backend)\n");
     fflush(stdout);
@@ -251,7 +268,7 @@ struct gpu_cmd* rsx_out_overlay_gpu_flush(void)
  * report):
  *   [rsx_out] route d3d12 (Vulkan failed to start: no Vulkan 1.3 driver (loader); this start uses D3D12)
  *   [rsx_out] route legacy (D3D12 failed to start: the GPU device could not be made (device); this start uses the legacy renderer)
- * Vulkan falls back to the default (the new path's D3D12 on Windows, the
+ * Vulkan falls back to D3D12 (ROUTE_D3D: the new path's on Windows, the
  * legacy renderer on Linux), the new path's D3D12 to the legacy renderer.
  *
  * Vulkan's start has one more: a start that never finished (the process
@@ -425,7 +442,7 @@ int rsx_out_backend_init(uint32_t width, uint32_t height, const char* title)
         InterlockedExchange(&s_marked, mark_put());
         if (rsxc_route_vk.backend_init(width, height, title) == 0) return 0;   /* (the mark goes at the first present) */
         if (InterlockedExchange(&s_marked, 0)) mark_take();   /* (a failure the core saw is no crash) */
-        fall_back("Vulkan", rsxc_vk_start_failed(), ROUTE_DEFAULT);
+        fall_back("Vulkan", rsxc_vk_start_failed(), ROUTE_D3D);
         t = route_table();
     } else {
         mark_take();   /* (one the last start left: this start is not Vulkan's, so it is done with) */

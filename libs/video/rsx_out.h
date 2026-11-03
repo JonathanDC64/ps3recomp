@@ -10,10 +10,12 @@
  *              same frames. hal-d3d12 is another name for it (its name
  *              while the legacy renderer was the default).
  *   legacy     the renderer before the new path (rsx_d3d12_backend.c),
- *              kept as it was to fall back on: each rsx_out_X calls
- *              rsx_d3d12_X directly. Off Windows the switch is built with
- *              it on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D, Linux), where it is
- *              the default, and d3d12 asks for it.
+ *              retired on Windows and frozen everywhere: kept as it was to
+ *              fall back on, its fixes go to the new path. Each rsx_out_X
+ *              calls rsx_d3d12_X directly. Off Windows the switch is built
+ *              with it on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D, Linux), where
+ *              d3d12 asks for it and Vulkan is the default (it is in a build
+ *              without Vulkan).
  *   null       the new path on the null backend (gpu_null.c, Windows and
  *              Linux): no window and no GPU; every command is checked
  *              against gpu.h and hashed. For developers and CI only, never
@@ -26,17 +28,18 @@
  * in this build and runs the default. The pick prints one line, on every
  * route:
  *   [rsx_out] route d3d12 (the new path on its D3D12 backend)
- *   [rsx_out] route legacy (the renderer before the new path, rsx_d3d12_backend.c)
+ *   [rsx_out] route legacy (retired: the renderer before the new path, rsx_d3d12_backend.c, kept to fall back on)
  *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
  *   [rsx_out] route vulkan (the new path on its Vulkan backend)
  *   [rsx_out] route d3d12 (RSX_BACKEND=metal is not in this build)
  * A start that fails runs another renderer in the same process and says why
- * in a line of its own (rsx_out.c, "Starts that fall back"): Vulkan's the
- * default, the new path's D3D12 the legacy renderer. A Vulkan start that
- * did not finish last time runs the default this time:
+ * in a line of its own (rsx_out.c, "Starts that fall back"): Vulkan's D3D12
+ * (the new path's on Windows, the legacy renderer on Linux), the new path's
+ * D3D12 the legacy renderer. A Vulkan start that did not finish last time
+ * runs D3D12 this time:
  *   [rsx_out] route d3d12 (Vulkan failed to start: no Vulkan 1.3 driver (loader); this start uses D3D12)
  *   [rsx_out] route legacy (D3D12 failed to start: the GPU device could not be made (device); this start uses the legacy renderer)
- *   [rsx_out] route d3d12 (RSX_BACKEND=vulkan, but the last start on Vulkan did not finish, ...)
+ *   [rsx_out] route d3d12 (Vulkan, but the last start on Vulkan did not finish, ...)
  * The last needs RSX_STATE_DIR: a folder of the host's for the start mark.
  *
  * The functions are rsx_d3d12_backend.h's, with the same parameters and
