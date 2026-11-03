@@ -197,11 +197,19 @@ static void drawprint_write(const char* path, const char* hdr)
         if (!dr->is_vp) { fprintf(f, "d%u legacy n=%u\n", d, dr->vertex_count); continue; }
         u32 vsh = (dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[dr->vs_idx].hash : 0;
         /* Every 4th vertex: the upload heap is write-combined, slow to read. */
+        /* Only what the draw's chunk (or the big buffer) holds from its
+         * offset: a fetch draw's vertices are in vf_buf, not here, and its
+         * count from the vp_vb cursor it recorded ran past the chunk's end
+         * (a crash when nothing was mapped there; legacy's one buffer held
+         * the read). Its hash is of the bytes there, as legacy's is. */
         u32 vb = 0;
-        if (s_d3d.vp_vb_mapped) {
+        const u32 vk = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
+        if (s_d3d.vp_vb_mapped && (vk < RC_ARENA_MAX ? vk < s_vb.n : s_vb.big_map != NULL)) {
             const u8* v0 = rc_arena_ptr_par(&s_vb, dr->vb_byte_offset, par);
+            const u64 room = (rc_arena_size(&s_vb, vk) - rc_arena_local(&s_vb, dr->vb_byte_offset)) / 256u;
+            const u32 nv = dr->vertex_count < room ? dr->vertex_count : (u32)room;
             vb = 2166136261u;
-            for (u32 k = 0; k < dr->vertex_count; k += 4)
+            for (u32 k = 0; k < nv; k += 4)
                 vb = (vb ^ dp_hash(v0 + (u64)k * 256u, 256u)) * 16777619u;
         }
         /* The bank and block the draw binds: the bytes are today's wherever
