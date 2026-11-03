@@ -16,9 +16,9 @@
 # required check. A newer run cancels the one it supersedes, and a job that
 # hangs stops at the timeout instead of holding a machine.
 #
-# What only this job runs: the sysutil and savedata tests (they need macOS ld's
-# -dead_strip), the sse2neon check of the SPU SIMD paths, and the Metal
-# backend's scenes, smoke title and game template.
+# What only this job runs: the sse2neon check of the SPU SIMD paths, and the
+# Metal backend's scenes, smoke title and game template. The sysutil and
+# savedata tests run here and on Linux (linux.yml, with section GC).
 name: macOS
 
 on:
@@ -115,8 +115,8 @@ jobs:
       # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
       # both documenting a macOS clang line in their own header comment, neither
       # wired to any job. They need -Wl,-dead_strip (macOS ld) to drop the
-      # unreferenced runtime symbols they do not stub, which is why they belong
-      # here and not on the Linux or Windows jobs.
+      # unreferenced runtime symbols they do not stub. linux.yml runs them too,
+      # with -ffunction-sections -fdata-sections -Wl,--gc-sections.
       - name: Run self-contained sysutil tests
         run: |
           clang -std=gnu17 -I include                 libs/system/tests/test_dialog_callbacks.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks
