@@ -380,16 +380,20 @@ static int init_d3d12(u32 width, u32 height)
         if (!s_d3d.vp_vb_mapped)
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
-        bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */
-        /* A failure here is silent and catastrophic: vp_record_cb returns early,
+        /* The per-draw constants, x2 parity, in chunks (rc_arena): vp_cb's
+         * banks 1024 a chunk, vp_fpcb's draws (b1) 2048 a chunk, two chunks
+         * of each to start and more as frames need them, up to MAX_DRAWS.
+         * A failure here is silent and catastrophic: vp_record_cb returns early,
          * every draw loses its constants, and the whole scene transforms by
          * zeros -- indistinguishable from a broken vertex program. Say so. */
-        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
-                (unsigned long long)(bytes >> 20), MAX_DRAWS, 10);
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_cb, &s_d3d.vp_cb_mapped);
-
-        bytes = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;     /* per-draw FP slots (b1), x2 parity */
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb_mapped);
+        bytes = (u64)VP_CB_STRIDE << VP_CB_CHUNK_SHIFT;   /* a parity half of a chunk */
+        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB to start, up to %llu MB (%d draws)%c",
+                (unsigned long long)(bytes * 2 * 2 >> 20),
+                (unsigned long long)((u64)VP_CB_STRIDE * MAX_DRAWS * 2 >> 20), MAX_DRAWS, 10);
+        if (!rc_arena_init(&s_rc_vpcb, "vp_cb", GPU_USE_CONSTANT, bytes, 2, MAX_DRAWS >> VP_CB_CHUNK_SHIFT))
+            fprintf(stderr, "[VPCB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
+        rc_arena_init(&s_rc_fpcb, "vp_fpcb", GPU_USE_CONSTANT, (u64)VP_FPCB_STRIDE << VP_FPCB_CHUNK_SHIFT,
+                      2, MAX_DRAWS >> VP_FPCB_CHUNK_SHIFT);
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
          * attribute records, x2 parity like vp_vb, in chunks (rc_arena, s_vf).
@@ -411,14 +415,14 @@ static int init_d3d12(u32 width, u32 height)
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
                (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)(s_vb.n ? s_vb.buf[0].id : 0),
-               (void*)(uintptr_t)s_rc_vp_cb.id);
+               (void*)(uintptr_t)s_rc_vpcb.buf[0].id);
     }
     /* Step V6: on a backend that starts strictly (rc_be_start_strict: Vulkan,
      * whose route then starts today's renderer instead), a frame buffer that
      * could not be made fails the start; elsewhere the start goes on without
      * it, as today's does. */
     if (!start_step("rings", !rc_be_start_strict || !ps3_env_int("RSX_VP_BUFFERS", 1) ||
-                                 (s_d3d.vb_mapped && s_d3d.vp_vb_mapped && s_d3d.vp_cb_mapped && s_d3d.vp_fpcb_mapped)))
+                                 (s_d3d.vb_mapped && s_d3d.vp_vb_mapped && s_rc_vpcb.n && s_rc_fpcb.n)))
         return -1;
 
     printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",
