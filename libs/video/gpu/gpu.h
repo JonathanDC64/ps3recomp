@@ -786,7 +786,9 @@ typedef struct gpu_device_desc {
     X(pipeline_create,   R, gpu_pipeline,   (gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how), (d, desc, flags, how)) \
     /* The pipeline cache's file. Load once, before pipelines are made: GPU_PIPELINE_CACHE_* \
      * (NONE on a device without GPU_CAP_PIPELINE_CACHE, or when the API cannot make one). Save \
-     * may run on a thread of its own while pipelines are made: 1 when written. */ \
+     * may run on a thread of its own while pipelines are made: 1 when written. It writes a new \
+     * file and moves it over path, never into the old one: the file loaded may still be in use \
+     * (D3D12 maps it for the library's life). */ \
     X(pipeline_cache_load, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(pipeline_cache_save, R, int,          (gpu_device* d, const char* path), (d, path)) \
     X(query_pool_create, R, gpu_query_pool, (gpu_device* d, uint32_t type, uint32_t count), (d, type, count)) \

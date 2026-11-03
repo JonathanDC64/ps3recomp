@@ -6,7 +6,8 @@
  * async job pool needs (detached threads with a large stack reservation, the
  * calling thread's stack range, an auto-reset event with a timed wait, a
  * small mutex), then time and sleep (one monotonic clock, a thread's sleep
- * timer, and the precise sleep written once on them).
+ * timer, and the precise sleep written once on them), then a file mapped
+ * read-only (the D3D12 pipeline library's).
  *
  * On Windows each call is the Win32 call it stands for, inline, so code moved
  * onto this header makes the same calls in the same order as before. Off
@@ -314,6 +315,59 @@ static inline int64_t plat_sleep_precise(plat_timer* t, int64_t start, uint64_t 
     } while (now < deadline);
     return now;
 }
+
+/* ---- A file mapped read-only ---------------------------------------------- */
+
+/* A whole file mapped read-only, for bytes read in place for a long time (a
+ * D3D12 pipeline library reads the file it was made from as long as it
+ * lives). The pages are the file's, not the process's private memory:
+ * nothing is read until it is touched, and under memory pressure the system
+ * drops them and reads them again instead of writing them to the page file.
+ * A page that cannot be read again (its drive gone) ends the process, as the
+ * executable's own pages would.
+ *
+ * Only the view holds the file: no handle stays open. So while it is mapped
+ * the file can still be replaced by a rename over it (a new copy written
+ * under a temporary name, then moved there), and the view goes on reading
+ * the old bytes. Windows refuses to delete or cut short a mapped file, but
+ * not a rename over it. Writing into the file in place would change what the
+ * view reads: a file mapped here is only ever replaced.
+ *
+ * plat_file_map_read: 1 with m->p and m->n set; 0, with m zeroed, for a
+ * missing, empty or unreadable file. plat_file_unmap: once per mapped file;
+ * a zeroed one is nothing to unmap. */
+typedef struct { const void* p; size_t n; } plat_file_map;
+#ifdef _WIN32
+static inline int plat_file_map_read(const char* path, plat_file_map* m)
+{
+    m->p = NULL;
+    m->n = 0;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    LARGE_INTEGER size;
+    HANDLE s = NULL;
+    if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && (uint64_t)size.QuadPart <= (uint64_t)SIZE_MAX)
+        s = CreateFileMappingW(f, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(f);
+    if (!s) return 0;
+    const void* v = MapViewOfFile(s, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(s);
+    if (!v) return 0;
+    m->p = v;
+    m->n = (size_t)size.QuadPart;
+    return 1;
+}
+static inline void plat_file_unmap(plat_file_map* m)
+{
+    if (m->p) UnmapViewOfFile(m->p);
+    m->p = NULL;
+    m->n = 0;
+}
+#else
+int  plat_file_map_read(const char* path, plat_file_map* m);
+void plat_file_unmap(plat_file_map* m);
+#endif
 
 #ifdef __cplusplus
 }
