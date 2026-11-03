@@ -369,7 +369,8 @@ static int init_d3d12(u32 width, u32 height)
           if (e) { most = (strtoull(e, NULL, 0) + s_vb_chunk - 1) / s_vb_chunk; if (!most) most = 1; }
           /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
           rc_arena_init(&s_vb, "vertex buffer", GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u),
-                        (u64)s_vb_chunk * 256, 1, (u32)(most < RC_ARENA_MAX ? most : RC_ARENA_MAX));
+                        (u64)s_vb_chunk * 256, 1, (u32)(most < RC_ARENA_MAX ? most : RC_ARENA_MAX - 1));
+          /* (RC_ARENA_MAX - 1 at most: a full last chunk ends below s_vb_big, the big buffer's start) */
           s_vb_big = (u64)RC_ARENA_MAX * s_vb.half;
           s_vp_cap = (u32)((u64)s_vb.most * s_vb_chunk); }
         /* Failure here leaves vp_vb_mapped NULL and every VP draw silently
@@ -410,7 +411,8 @@ static int init_d3d12(u32 width, u32 height)
           while (sh < 30 && (2u << sh) <= ((u32)mb << 20)) sh++;
           s_vf_shift = sh;
           s_vf_cap = rc_arena_init(&s_vf, "vf_buf", GPU_USE_RAW, 1ull << sh, 1, (1u << 30) >> sh)
-                   ? 1u << sh : 0; }
+                   ? 1u << sh : 0;
+          s_vf.ahead = 7;   /* (a chunk is big: one ahead only for a frame near the end of the last) */ }
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",

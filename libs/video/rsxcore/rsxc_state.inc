@@ -585,6 +585,7 @@ typedef struct {
     u32 shift;                   /* log2(half) when half is a power of two (no divide per draw), else 0 */
     u32 n, most;                 /* chunks made; at most */
     u32 hi;                      /* chunks this frame reached (the highest written + 1) */
+    u32 ahead;                   /* eighths of the last chunk a frame passes for one more to be made */
     u32 peak;                    /* the most any frame reached (said once per new peak) */
     u64 end;                     /* the end of what this frame placed (virtual, chunks only) */
     u64 used[RC_ARENA_MAX];      /* each chunk's end of what this frame placed (in the chunk) */
@@ -659,7 +660,7 @@ static int rc_arena_big_make(rc_arena* a, u64 half)
 static int rc_arena_init(rc_arena* a, const char* name, u32 use, u64 half, u32 start, u32 most)
 {
     memset(a, 0, sizeof *a);
-    a->name = name; a->use = use; a->half = half;
+    a->name = name; a->use = use; a->half = half; a->ahead = 4;
     if (half && !(half & (half - 1))) while ((1ull << a->shift) < half) a->shift++;
     a->most = most < RC_ARENA_MAX ? most : RC_ARENA_MAX;
     if (!start) start = 1;
@@ -755,8 +756,9 @@ static void rc_arena_mark(rc_arena* a, u64 end)
 }
 
 /* At the frame's end: a new peak goes to the log; when the frame got past
- * half of the last chunk made, one more is made ahead for the frames to come;
- * a big buffer the frame outgrew is made bigger. */
+ * `ahead` eighths of the last chunk made (half, unless the user of the arena
+ * says), one more is made ahead for the frames to come; a big buffer the
+ * frame outgrew is made bigger. */
 static void rc_arena_frame_end(rc_arena* a)
 {
     if (a->hi > a->peak) {
@@ -764,7 +766,7 @@ static void rc_arena_frame_end(rc_arena* a)
         fprintf(stderr, "[RAM] %s: a frame used %u chunk(s) (%llu MB)%c", a->name, a->peak,
                 (unsigned long long)(a->peak * a->half * 2 >> 20), 10);
     }
-    if (a->n && a->n < a->most && a->end > (u64)(a->n - 1) * a->half + a->half / 2)
+    if (a->n && a->n < a->most && a->end > (u64)(a->n - 1) * a->half + a->half / 8 * a->ahead)
         rc_arena_make(a, a->n);
     if (a->big_want > a->big_half)
         rc_arena_big_make(a, (a->big_want + a->big_want / 2 + 0xFFFFFull) & ~0xFFFFFull);
