@@ -846,22 +846,29 @@ int gpu_vk_present_code(VkResult r)
 }
 
 /* present_wait: the newest present that reached the display, and when this
- * call saw it (sync_qpc); refresh counts are V3's (present timing). */
+ * call saw it (sync_qpc); refresh counts are V3's (present timing). The last
+ * four presents are asked oldest first. One that has not reached the display
+ * waits out even a zero timeout (about 0.3 ms on NVIDIA), and none after it
+ * has (the swap chain's present id only goes up), so a call waits out one at
+ * most, not one for each present still queued (four with a hidden window). */
 int gpu_vk_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out)
 {
     gpu_vk_device* const dd = GPU_VK_DEV(d);
     gpu_vk_swap* const s = swap_of(dd, sc);
     if (!s || !s->sc || !(dd->base.caps.bits & GPU_CAP_PRESENT_WAIT) || !s->present_id) return 1;
     gpu_vk_lock(&dd->qlock);
-    for (uint64_t id = s->present_id; id > s->done_id && id > s->chain_id0 && id + 4 > s->present_id; id--) {
-        const VkResult r = dd->vk.vkWaitForPresentKHR(dd->device, s->sc, id, 0);
-        if (r == VK_SUCCESS) {
-            s->done_id = id;
-            s->done_qpc = now_ticks();
+    const uint64_t was = s->done_id;
+    uint64_t id = s->present_id > 3 ? s->present_id - 3 : 1;
+    if (id <= s->done_id) id = s->done_id + 1;
+    if (id <= s->chain_id0) id = s->chain_id0 + 1;
+    for (; id <= s->present_id; id++) {
+        if (dd->vk.vkWaitForPresentKHR(dd->device, s->sc, id, 0) != VK_SUCCESS) {
+            s->stats_misses++;
             break;
         }
-        if (r != VK_TIMEOUT) break;
+        s->done_id = id;
     }
+    if (s->done_id != was) s->done_qpc = now_ticks();
     gpu_vk_unlock(&dd->qlock);
     if (!s->done_id) return 1;
     memset(out, 0, sizeof *out);

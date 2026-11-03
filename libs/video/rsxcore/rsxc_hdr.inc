@@ -559,12 +559,15 @@ static void hold_frame(u32 fi)
  * the time of one of its vblanks, in performance counter ticks. The swap
  * chain's statistics give both for the display the frames reach. After a
  * present, at most every 100 ms: the vblank the last frame shown went up at,
- * and, over a second or more of those, the period. */
+ * and, over a second or more of those, the period. Vulkan's statistics have
+ * no refresh counts (gpu.h), so it is not asked there: rc_display_timing
+ * takes DWM's timing or the mode's rate instead. */
 static volatile long long s_disp_period, s_disp_vblank, s_disp_at;
 static void display_note(long long now)
 {
     static long long freq, last, base_q;
     static UINT base_c;
+    if (s_rc_dev->caps.api == GPU_API_VULKAN) return;
     if (!freq) {
         LARGE_INTEGER f;
         QueryPerformanceFrequency(&f);
