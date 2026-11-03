@@ -1104,6 +1104,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                     fp.row_pitch = pitch;
                     gpu_cmd_copy_buf_to_tex(s_rc_cmd, r->tex, 0, 0, 0, 0, r->up_buf, &fp);
                 }
+                /* Written once: into the grave now, so it is freed when this
+                 * frame is done instead of living as long as the target
+                 * (docs/124: 32 MB for a 1280x720 target at scale 300). The
+                 * copy is in this frame's list: targets are made only while
+                 * render_frame records, after its rc_grave_release. */
+                const gpu_texture none = {0};
+                rc_grave_put(none, r->up_buf);
+                r->up_buf.id = 0;
             }
         }
         free(wide);

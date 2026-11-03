@@ -204,13 +204,16 @@ rtt_dump_done:;
       static int kblend = -2;
       if (kblend == -2) { const char* e = getenv("DRAW_KEEP_BLEND");
                           kblend = e ? atoi(e) : -1; }
-      if (want) {
+      /* (Made on first use: as a static array it was 17.75 MB of commit in
+       * each backend's copy of this file, set or not. docs/124.) */
+      static D3D12DrawRecord* kept;
+      if (want && !kept) kept = (D3D12DrawRecord*)malloc((size_t)MAX_DRAWS * sizeof *kept);
+      if (want && kept) {
         /* Emit the CLEARS FIRST, then the kept draws. Preserving the original
          * order means a clear that ran after them still runs after them and
          * wipes the isolated geometry; dropping the clears entirely (noclr)
          * leaves stale DEPTH that rejects most of its fragments. Neither shows
          * the object properly -- clear, then draw, does. */
-        static D3D12DrawRecord kept[MAX_DRAWS];
         u32 nk = 0;
         if (!noclr)
             for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++)
@@ -232,8 +235,9 @@ rtt_dump_done:;
     { static const char* lt = (const char*)1; static u32 want = 0;
       if (lt == (const char*)1) lt = getenv("DRAW_LAST_TEX");
       want = draw_filter_tex(lt);
-      if (want && s_d3d.draw_count > 1) {
-        static D3D12DrawRecord moved[MAX_DRAWS];
+      static D3D12DrawRecord* moved;   /* (made on first use, as kept above) */
+      if (want && !moved) moved = (D3D12DrawRecord*)malloc((size_t)MAX_DRAWS * sizeof *moved);
+      if (want && moved && s_d3d.draw_count > 1) {
         u32 nm = 0, keep = 0;
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
             if (!s_d3d.draws[_d].is_clear && s_d3d.draws[_d].tex[0].raw == want) {

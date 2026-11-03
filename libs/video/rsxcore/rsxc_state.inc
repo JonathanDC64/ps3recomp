@@ -158,7 +158,8 @@ typedef struct {
 typedef struct {
     gpu_texture           tex;         /* the GPU layer's texture (step C5a) */
     gpu_view              rtv;         /* its RTV (step C5a) */
-    gpu_buffer            up_buf;      /* init-upload staging (kept alive): the GPU layer's (step C5a) */
+    gpu_buffer            up_buf;      /* init-upload staging: the GPU layer's (step C5a); into the grave
+                                        * once its copy is recorded, so none after off_rt_get */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
     u32                   dxgi;        /* gpu_format of the resource */
