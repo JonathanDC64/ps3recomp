@@ -67,6 +67,8 @@ jobs:
       VKD3D_SHA256: 7510146aff2adfb4ae07ab890701a607e5ff7c66e57100cfc9f630ec92eeda6a
       # The prefix is inside the workspace: actions/cache refuses a path with '..' in it, and saved nothing while these were beside it.
       VKD3D_PREFIX: ${{ github.workspace }}/.ci-cache/vkd3d
+      # The GPU layer's pinned sources (cmake/gpu_deps.cmake), cached on that file.
+      GPU_SRC: ${{ github.workspace }}/.ci-cache/gpu-src
       CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
       CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
 
@@ -108,6 +110,28 @@ jobs:
 
       # ---- build-routes: the portable renderer and today's D3D12 renderer on vkd3d, one runtime -------------
 
+      # FetchContent clones Vulkan-Headers, SPIRV-Headers, SPIRV-Tools and glslang by commit, so not shallow:
+      # about 3.5 of the configure's 3.7 minutes. A hit hands the cached copies to each configure below
+      # through FetchContent's FETCHCONTENT_SOURCE_DIR_* (GPU_SRC_ARGS); a miss clones as before, and the step
+      # after the configure keeps the sources (no .git: their builds take their versions from their own files).
+      - name: Cache the GPU layer's sources
+        if: matrix.build_type == 'Release'
+        id: gpu-src
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.GPU_SRC }}
+          key: gpu-src-${{ runner.os }}-${{ hashFiles('cmake/gpu_deps.cmake') }}-v1
+
+      - name: The GPU layer's sources from the cache
+        if: steps.gpu-src.outputs.cache-hit == 'true'
+        run: |
+          args=
+          for n in vulkan_headers spirv_headers spirv_tools glslang; do
+            [ -f "$GPU_SRC/$n/CMakeLists.txt" ] || { echo "::error::the cached $n has no CMakeLists.txt"; exit 1; }
+            args="$args -DFETCHCONTENT_SOURCE_DIR_${n^^}=$GPU_SRC/$n"
+          done
+          echo "GPU_SRC_ARGS=$args" >> "$GITHUB_ENV"
+
       # Both renderers in one runtime: the configure must say so for each, and the spv target must be on.
       - name: Both routes, configure
         id: routes_cfg
@@ -115,10 +139,22 @@ jobs:
         run: |
           export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
           cmake -S . -B build-routes -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON \
-            -DPS3RECOMP_RSX_D3D12_VKD3D=ON | tee configure-routes.log
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON $GPU_SRC_ARGS | tee configure-routes.log
           grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure-routes.log
           grep -q "Renderer: *the GPU layer's Vulkan backend" configure-routes.log
           grep -q "Renderer: *the compile service's spv target" configure-routes.log
+
+      # Never in the way: a copy that fails is removed, so no half copy is saved, and the job goes on.
+      - name: Keep the GPU layer's sources for the cache
+        if: steps.gpu-src.outputs.cache-hit != 'true' && steps.routes_cfg.outcome == 'success'
+        continue-on-error: true
+        run: |
+          trap 'rm -rf "$GPU_SRC"' ERR
+          for n in vulkan_headers spirv_headers spirv_tools glslang; do
+            mkdir -p "$GPU_SRC/$n"
+            tar -C "build-routes/_deps/$n-src" --exclude=.git -cf - . | tar -C "$GPU_SRC/$n" -xf -
+          done
+          du -sh "$GPU_SRC"/*
 
       - name: Both routes, build
         id: routes_build
@@ -303,7 +339,8 @@ jobs:
         id: hal_build
         if: ${{ !cancelled() && matrix.build_type == 'Release' && github.event_name != 'pull_request' && steps.deps.outcome == 'success' }}
         run: |
-          cmake -S . -B build-hal -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON | tee configure-hal.log
+          cmake -S . -B build-hal -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON $GPU_SRC_ARGS \
+            | tee configure-hal.log
           grep -q "Renderer: *the GPU layer's Vulkan backend" configure-hal.log
           grep -q "Renderer: *the compile service's spv target" configure-hal.log
           cmake --build build-hal --target ps3recomp_runtime test_gpu_contract test_gpu_null test_gpu_sc_spv \

@@ -51,6 +51,9 @@ jobs:
       fail-fast: false
       matrix:
         build_type: ${{ github.event_name == 'pull_request' && fromJSON('["Release"]') || fromJSON('["Debug", "Release"]') }}
+    env:
+      # The GPU layer's pinned sources (cmake/gpu_deps.cmake), cached on that file (linux.yml says why).
+      GPU_SRC: ${{ github.workspace }}/.ci-cache/gpu-src
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -345,17 +348,45 @@ jobs:
 
       # ---- build-hal: the portable renderer on (Release) -----------------------------------------------------
 
+      # FetchContent's clones of Vulkan-Headers, SPIRV-Headers, SPIRV-Tools and glslang, cached as on Linux: a
+      # hit hands them to the configure (FETCHCONTENT_SOURCE_DIR_*), a miss clones and the step after keeps them.
+      - name: Cache the GPU layer's sources
+        if: ${{ !cancelled() && matrix.build_type == 'Release' }}
+        id: gpu-src
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.GPU_SRC }}
+          key: gpu-src-${{ runner.os }}-${{ hashFiles('cmake/gpu_deps.cmake') }}-v1
+
       # No FFmpeg download: nothing here plays a movie.
       - name: Portable renderer, configure
         id: hal_cfg
         if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.ninja.outcome == 'success' }}
-        run: >
-          cmake -S . -B build-hal -G Ninja
-          -DCMAKE_C_COMPILER=clang-cl
-          -DCMAKE_CXX_COMPILER=clang-cl
-          -DCMAKE_BUILD_TYPE=Release
-          -DPS3RECOMP_FFMPEG_DOWNLOAD=OFF
-          -DPS3RECOMP_RSX_HAL=ON
+        run: |
+          $src = @()
+          if ('${{ steps.gpu-src.outputs.cache-hit }}' -eq 'true') {
+            foreach ($n in 'vulkan_headers', 'spirv_headers', 'spirv_tools', 'glslang') {
+              $d = "$env:GPU_SRC/$n" -replace '\\', '/'
+              if (-not (Test-Path "$d/CMakeLists.txt")) { Write-Output "::error::the cached $n has no CMakeLists.txt"; exit 1 }
+              $src += "-DFETCHCONTENT_SOURCE_DIR_$($n.ToUpper())=$d"
+            }
+          }
+          cmake -S . -B build-hal -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_FFMPEG_DOWNLOAD=OFF -DPS3RECOMP_RSX_HAL=ON @src
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Never in the way: a copy that fails is removed, so no half copy is saved, and the job goes on.
+      - name: Keep the GPU layer's sources for the cache
+        if: ${{ !cancelled() && steps.gpu-src.outputs.cache-hit != 'true' && steps.hal_cfg.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          trap 'rm -rf .ci-cache/gpu-src' ERR
+          for n in vulkan_headers spirv_headers spirv_tools glslang; do
+            mkdir -p ".ci-cache/gpu-src/$n"
+            tar -C "build-hal/_deps/$n-src" --exclude=.git -cf - . | tar -C ".ci-cache/gpu-src/$n" -xf -
+          done
+          du -sh .ci-cache/gpu-src/*
 
       - name: Portable renderer, build
         id: hal_build
