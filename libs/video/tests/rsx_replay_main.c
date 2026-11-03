@@ -211,6 +211,34 @@ static LONG WINAPI commit_on_touch(EXCEPTION_POINTERS* ep)
                                                                    : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* A crash says where, as the game's does (boot_main.cpp): the code, the
+ * fault, and the stack as module RVAs, so a gate's "exit 139" can be looked
+ * up in the build's map. */
+static LONG WINAPI crash_report(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    fprintf(stderr, "\n[CRASH] code=0x%08lX thread %lu\n", (unsigned long)er->ExceptionCode,
+            (unsigned long)GetCurrentThreadId());
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+        fprintf(stderr, "[CRASH] %s fault address 0x%llX\n", er->ExceptionInformation[0] ? "write" : "read",
+                (unsigned long long)er->ExceptionInformation[1]);
+    void* at[1 + 32];
+    at[0] = er->ExceptionAddress;
+    const USHORT n = (USHORT)(1 + RtlCaptureStackBackTrace(0, 32, at + 1, NULL));
+    for (USHORT i = 0; i < n; i++) {
+        HMODULE m = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)at[i], &m);
+        char path[MAX_PATH] = "?";
+        if (m) GetModuleFileNameA(m, path, sizeof path);
+        const char* name = strrchr(path, '\\');
+        fprintf(stderr, "[CRASH] %s rva=0x%llX %s\n", i ? "  " : "at", (unsigned long long)((char*)at[i] - (char*)m),
+                name ? name + 1 : path);
+    }
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 /* The calling thread's CPU time so far (user + kernel), in ms. */
 static double thread_cpu_ms(void)
 {
@@ -236,6 +264,7 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SPAN, MEM_RESERVE, PAGE_READWRITE);
     if (!vm_base) { fprintf(stderr, "rsx_replay: cannot reserve the guest space\n"); return 1; }
     AddVectoredExceptionHandler(1, commit_on_touch);
+    SetUnhandledExceptionFilter(crash_report);
 
     if (rsx_d3d12_backend_init(1280, 720, "rsx_replay") != 0) {
         fprintf(stderr, "rsx_replay: backend init failed\n"); return 1;
