@@ -37,6 +37,7 @@
 #include "gpu.h"
 #include "gpu_cmd_ops.h"
 #include "gpu_times.h"
+#include "../../../runtime/platform/plat.h"   /* plat_file_map: the pipeline library's file */
 
 /* Table sizes. Each slot costs a few bytes until it is used. */
 #define GPU_D3D12_MAX_TEXTURES   (1u << 17)
@@ -214,7 +215,7 @@ typedef struct gpu_d3d12_device {
      * ID3D12PipelineLibrary, under its own lock. */
     SRWLOCK                lib_lock;
     ID3D12PipelineLibrary* lib;
-    void*                  lib_blob;         /* the library reads from it while it lives */
+    plat_file_map          lib_blob;         /* its file, mapped: the library reads from it while it lives */
     SRWLOCK                pso_lock;
     ID3D12PipelineState**  pso;
     uint32_t               npso, pso_cap;
