@@ -873,11 +873,18 @@ static void guest_fb_present(u32 fi)
 /* The VP index buffer (indexed strip uploads, upload_strip_vp_indexed): u32
  * indices, two parity halves like vp_vb. Created at the first frame end and
  * grown there as vp_vb is; until it exists, or once a frame fills it, the
- * uploads expand to unindexed lists instead. */
+ * uploads expand to unindexed lists instead.
+ *
+ * It starts at 4M indices (32 MB for both halves; VP_IB_INDICES sets it). A
+ * load into the 1-2 bridge wants up to 3.7M in one frame, and the fetch path
+ * needs room here too: at 1M (legacy's size) that frame's draws went down the
+ * CPU path, unindexed, and vp_vb kept the 9 chunks they took (576 MB). */
 static void vp_ib_grow(u64 want)
 {
     const u64 limit = 64ull << 20;          /* 512 MB of upload heap */
-    u64 cap = s_vp_icap ? s_vp_icap : (1u << 20);
+    static int start = -1;
+    PS3_KNOB(start, ps3_env_int("VP_IB_INDICES", 4 << 20));
+    u64 cap = s_vp_icap ? s_vp_icap : (u64)(start > 0 ? start : 4 << 20);
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
     if (GPU_VALID(s_rc_vp_ib) && cap <= s_vp_icap) return;

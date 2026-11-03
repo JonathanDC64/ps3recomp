@@ -1022,3 +1022,7 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   b0/b1, again only when a draw leaves the bound chunk (no divides per
 #   draw). test_rsx_synth's goldens moved with the new buffers (the stream is
 #   otherwise the same, see the goldens' commit).
+#  vp_ib (rsxc_writeback.inc vp_ib_grow) starts at 4M indices, where legacy
+#   starts at 1M (VP_IB_INDICES sets it): the fetch path needs room there too,
+#   and a load frame that filled 1M sent its draws down the CPU path, whose
+#   vp_vb chunks then stayed (the 1-2 bridge: 9 chunks, 576 MB).
