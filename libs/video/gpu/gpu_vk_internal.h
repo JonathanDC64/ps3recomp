@@ -469,6 +469,7 @@ typedef struct gpu_vk_set0_entry {
 #define GPU_VK_ST_VP          2u
 #define GPU_VK_ST_SC          4u
 #define GPU_VK_ST_IB          8u
+#define GPU_VK_CMD_PARTS      8u      /* a recording's parts at most (cmd_split) */
 
 struct gpu_cmd {
     gpu_cmd_head                 head;
@@ -490,6 +491,11 @@ struct gpu_cmd {
     const gpu_vk_qpool*          qpool;
     const gpu_vk_pso*            pso;
     VkCommandPool                pool;
+    /* cmd_split's parts: the slot's buffers from pool, [0] the one it was
+     * made with, the others made when a recording first needs them; cb is
+     * part_cb[part]. The pool's reset at cmd_begin resets them all. */
+    VkCommandBuffer              part_cb[GPU_VK_CMD_PARTS];
+    uint32_t                     part;
 
     /* Bound. */
     const gpu_vk_layout*         lay;

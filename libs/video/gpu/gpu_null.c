@@ -3322,6 +3322,35 @@ static gpu_fence nl_submit(gpu_device* d, gpu_cmd* const* cmds, uint32_t n, cons
     return (flags & GPU_SUBMIT_SIGNAL) ? do_signal(nd) : 0;
 }
 
+/* cmd_end and submit, then the slot records on as after cmd_begin (nothing
+ * bound), without its fence check: the part just submitted is its own. The
+ * queries' states stay: a reset in an earlier part counts on Vulkan, which
+ * orders the parts on the queue (a query left open is cmd_end's failure,
+ * once: its end in the next part balances it). */
+static int nl_cmd_split(gpu_device* d, gpu_cmd* c, const gpu_submit_desc* how)
+{
+    gpu_null_device* const nd = GPU_NULL_DEV(d);
+    if (!c) return 1;
+    {
+        NL_CALL(cmd_split);
+        put_u(b, c->slot);
+        gpu_null_arg* const r = rb_end(b);
+        if (c->state != GPU_NULL_REC_OPEN) {
+            nl_err(nd, GPU_NULL_ERR_RECORDER, r, "slot %u is %s: nothing to split", c->slot,
+                   rec_state_name(c->state));
+            return 1;
+        }
+    }
+    nl_cmd_end(d, c);
+    nl_submit(d, &c, 1, how);
+    c->ntuse = 0;
+    c->rec.n = 0;
+    memset(&c->b, 0, sizeof c->b);
+    c->b.depth_write = 2;
+    c->state = GPU_NULL_REC_OPEN;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------------
  * The timeline: instant, so waits never block
  * -------------------------------------------------------------------------*/

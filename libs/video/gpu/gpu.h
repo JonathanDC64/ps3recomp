@@ -796,6 +796,12 @@ typedef struct gpu_device_desc {
     X(cmd_end,           V, void,           (gpu_device* d, gpu_cmd* c), (d, c)) \
     /* Runs n ended recorders in order; a fence for them with GPU_SUBMIT_SIGNAL, else 0. */ \
     X(submit,            R, gpu_fence,      (gpu_device* d, gpu_cmd* const* cmds, uint32_t n, const gpu_submit_desc* how), (d, cmds, n, how)) \
+    /* Submits what c has recorded so far (as submit, with how) and goes on recording in c, so the \
+     * GPU starts on that part while the rest is recorded. The slot keeps its memory until its next \
+     * cmd_begin. After it nothing is bound and no pass is open, as after cmd_begin; no query may be \
+     * open. 0 when split; nonzero when it cannot be (a wrapped list, the slot's parts used up, a \
+     * lost device): then nothing was submitted and c goes on recording as one. */ \
+    X(cmd_split,         R, int,            (gpu_device* d, gpu_cmd* c, const gpu_submit_desc* how), (d, c, how)) \
     /* A new point on the timeline, after everything submitted and presented so far. */ \
     X(signal,            R, gpu_fence,      (gpu_device* d), (d)) \
     /* The last point the GPU has passed. Any thread. */ \
