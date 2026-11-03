@@ -1555,6 +1555,19 @@ static gpu_fence d12_submit(gpu_device* d, gpu_cmd* const* cmds, uint32_t n, con
     return how && (how->flags & GPU_SUBMIT_SIGNAL) ? d12_signal(d) : 0;
 }
 
+/* Close, ExecuteCommandLists, and the list's Reset on the same allocator
+ * (allowed while the part runs: only the allocator's Reset must wait for
+ * it, at the slot's next cmd_begin). RSX_GPU_TIMES's stamps go on in the
+ * slot's range; cmd_end resolves them all. */
+static int d12_cmd_split(gpu_device* d, gpu_cmd* c, const gpu_submit_desc* how)
+{
+    if (!c->alloc) return 1;   /* (a wrapped list: its allocator is the caller's) */
+    if (FAILED(c->cl->lpVtbl->Close(c->cl))) return 1;
+    d12_submit(d, &c, 1, how);
+    c->cl->lpVtbl->Reset(c->cl, c->alloc, NULL);
+    return 0;
+}
+
 /* One fence for the device. Values are signalled in order under a lock, so
  * two threads' signals never step it back. */
 static gpu_fence d12_signal(gpu_device* d)

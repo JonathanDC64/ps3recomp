@@ -1562,6 +1562,57 @@ static void test_fences(void)
     CHECK(gpu_native(g_d, GPU_NATIVE_BUFFER, c.id) != NULL);
 }
 
+/* cmd_split (RSX_SUBMIT_SPLIT): the first part runs on its own (a signal
+ * after it passes while the slot still records), the slot records on with
+ * the pass bound again, and every part's work lands in order. Splits past
+ * the slot's buffers are refused and the recording goes on as one. */
+static void test_split(void)
+{
+    gpu_texture_desc td = tex_desc(32, 32, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
+                                   GPU_STATE_RENDER_TARGET);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = t;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(g_d, &vd);
+    CHECK(GPU_VALID(t) && GPU_VALID(rtv));
+    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+    const gpu_rect left = {0, 0, 16, 32}, corner = {0, 0, 4, 4};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = rtv;
+    gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+    gpu_cmd_pass_begin(c, &pass);
+    gpu_cmd_clear_color(c, rtv, blue, NULL);
+    CHECK(gpu_cmd_split(g_d, c, NULL) == 0);
+    const gpu_fence f = gpu_signal(g_d);
+    CHECK(gpu_fence_wait(g_d, f, 5000) == 0);   /* the first part, done before the rest is recorded */
+    gpu_cmd_pass_begin(c, &pass);
+    gpu_cmd_clear_color(c, rtv, red, &left);
+    uint32_t parts = 2;
+    while (parts < 64 && gpu_cmd_split(g_d, c, NULL) == 0) {   /* until the slot's buffers are used up */
+        parts++;
+        gpu_cmd_pass_begin(c, &pass);
+    }
+    CHECK(parts > 2 && parts < 64);
+    gpu_cmd_clear_color(c, rtv, green, &corner);   /* in the last part */
+    gpu_cmd_pass_end(c);
+    gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+    CHECK(run(g_d, c));
+    readback rb;
+    CHECK(tex_read(t, &td, &rb));
+    CHECK(px_is(&rb, 0, 0, 0, 255, 0, 255, "split") && px_is(&rb, 8, 8, 255, 0, 0, 255, "split"));
+    CHECK(px_is(&rb, 31, 31, 0, 0, 255, 255, "split"));
+    rb_done(&rb);
+    gpu_texture_destroy(g_d, t, 0);
+    /* The slot's next recording starts from its first buffer again. */
+    c = gpu_cmd_begin(g_d, 0);
+    CHECK(c && gpu_cmd_split(g_d, c, NULL) == 0);
+    CHECK(run(g_d, c));
+}
+
 /* ---- The pipeline cache, across two devices ---- */
 
 /* Step VC2: the file's checks. A bad file (path holds one) is ignored and the
@@ -2393,6 +2444,7 @@ int main(void)
     }
     test_caches();
     test_fences();
+    test_split();
 #ifdef _WIN32
     test_swapchain();
     test_window_states();

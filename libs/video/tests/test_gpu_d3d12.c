@@ -1150,6 +1150,49 @@ static void test_fences(void)
     CHECK(gpu_native(g_d, GPU_NATIVE_BUFFER, c.id) != NULL);
 }
 
+/* cmd_split (RSX_SUBMIT_SPLIT): the first part runs on its own (a signal
+ * after it passes while the slot still records), the slot records on with
+ * the pass bound again, and both parts' work lands in order. */
+static void test_split(void)
+{
+    gpu_texture_desc td = tex_desc(32, 32, GPU_FORMAT_R8G8B8A8_UNORM, GPU_USE_RT | GPU_USE_COPY_SRC,
+                                   GPU_STATE_RENDER_TARGET);
+    const gpu_texture t = gpu_texture_create(g_d, &td);
+    gpu_view_desc vd;
+    memset(&vd, 0, sizeof vd);
+    vd.texture = t;
+    vd.kind = GPU_VIEW_RTV;
+    const gpu_view rtv = gpu_view_get(g_d, &vd);
+    CHECK(GPU_VALID(t) && GPU_VALID(rtv));
+    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1};
+    const gpu_rect left = {0, 0, 16, 32};
+    gpu_pass pass;
+    memset(&pass, 0, sizeof pass);
+    pass.nrt = 1;
+    pass.rt[0] = rtv;
+    gpu_cmd* c = gpu_cmd_begin(g_d, 0);
+    gpu_cmd_pass_begin(c, &pass);
+    gpu_cmd_clear_color(c, rtv, blue, NULL);
+    CHECK(gpu_cmd_split(g_d, c, NULL) == 0);
+    const gpu_fence f = gpu_signal(g_d);
+    CHECK(gpu_fence_wait(g_d, f, 5000) == 0);   /* the first part, done before the rest is recorded */
+    gpu_cmd_pass_begin(c, &pass);
+    gpu_cmd_clear_color(c, rtv, red, &left);
+    gpu_cmd_pass_end(c);
+    gpu_cmd_barrier(c, t, GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+    CHECK(run(g_d, c));
+    readback rb;
+    CHECK(tex_read(t, &td, &rb));
+    if (rb.p) {
+        const uint8_t* a = px(&rb, 0, 0);
+        const uint8_t* b = px(&rb, 31, 31);
+        CHECK(a[0] == 255 && a[1] == 0 && a[2] == 0 && a[3] == 255);
+        CHECK(b[0] == 0 && b[1] == 0 && b[2] == 255 && b[3] == 255);
+    }
+    rb_done(&rb);
+    gpu_texture_destroy(g_d, t, 0);
+}
+
 /* ---- The pipeline cache, across three devices ---- */
 
 static void test_pipeline_cache(void)
@@ -1768,6 +1811,7 @@ int main(void)
     test_bridges_c5a();
     test_caches();
     test_fences();
+    test_split();
     test_swapchain();
     CHECK(gpu_lost(g_d) == 0);
     gpu_destroy(g_d);

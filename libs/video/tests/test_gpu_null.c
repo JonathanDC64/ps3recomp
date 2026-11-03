@@ -1182,7 +1182,37 @@ static void neg_recorder(void)
     gpu_cmd_end(d, c2);                                            /* 3: ended twice */
     gpu_submit(d, (gpu_cmd* const*)&c, 1, NULL);
     gpu_submit(d, (gpu_cmd* const*)&c, 1, NULL);                   /* 4: submitted twice */
-    expect(d, GPU_NULL_ERR_RECORDER, 4);
+    CHECK(gpu_cmd_split(d, c, NULL) != 0);                         /* 5: split after its end */
+    expect(d, GPU_NULL_ERR_RECORDER, 5);
+    gpu_destroy(d);
+}
+
+/* cmd_split: two parts that each bind what they draw with run with no
+ * failure, and a query reset in the first part counts in the second
+ * (Vulkan orders the parts on the queue); a draw after a split with nothing
+ * bound again fails, as one after cmd_begin does. */
+static void test_split(void)
+{
+    mini m;
+    gpu_device* const d = mini_make(&m);
+    if (!d) return;
+    const gpu_query_pool q = gpu_query_pool_create(d, GPU_QUERY_OCCLUSION, 2);
+    gpu_cmd* const c = gpu_cmd_begin(d, 0);
+    gpu_cmd_query_reset(c, q, 0, 2);
+    mini_draw(&m, c, 0);
+    CHECK(gpu_cmd_split(d, c, NULL) == 0);
+    mini_draw(&m, c, 0);
+    gpu_cmd_query_begin(c, q, 0);
+    gpu_cmd_draw(c, 4, 1, 0, 0);
+    gpu_cmd_query_end(c, q, 0);
+    CHECK(run(d, c));
+    CHECK(gpu_null_errors(d, GPU_NULL_ERR_ALL) == 0);
+    gpu_cmd* const c2 = gpu_cmd_begin(d, 1);
+    mini_draw(&m, c2, 0);
+    CHECK(gpu_cmd_split(d, c2, NULL) == 0);
+    gpu_cmd_draw(c2, 4, 1, 0, 0);                                  /* 1: nothing bound since the split */
+    CHECK(run(d, c2));
+    expect(d, GPU_NULL_ERR_DRAW, 1);
     gpu_destroy(d);
 }
 
@@ -1225,6 +1255,7 @@ int main(void)
     test_footprints();
     test_device();
     test_store_only();
+    test_split();
     printf("  one case per check (each prints its first failure, as it should):\n");
     fflush(stdout);
     neg_handle();
