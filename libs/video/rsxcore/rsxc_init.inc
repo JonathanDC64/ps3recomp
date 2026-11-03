@@ -364,9 +364,17 @@ static int init_d3d12(u32 width, u32 height)
           u32 c = 16384;
           while (c * 2 <= (u32)v) c *= 2;   /* (a power of two: a shift per draw, not a divide) */
           s_vb_chunk = c; }
-        { u64 most = ((2ull << 20) + s_vb_chunk - 1) / s_vb_chunk;
+        { u64 want = 2ull << 20;
           const char* e = getenv("VP_VB_MAX_VERTS");
-          if (e) { most = (strtoull(e, NULL, 0) + s_vb_chunk - 1) / s_vb_chunk; if (!most) most = 1; }
+          if (e) { want = strtoull(e, NULL, 0); if (!want) want = 1; }
+          /* A chunk too small for RC_ARENA_MAX - 1 of them to reach the most
+           * grows (else VP_VB_CHUNK would lower the cap: 16,384 gave 1M). */
+          const u32 asked = s_vb_chunk;
+          while (s_vb_chunk < 131072 && (want + s_vb_chunk - 1) / s_vb_chunk > RC_ARENA_MAX - 1) s_vb_chunk *= 2;
+          if (s_vb_chunk != asked)
+              fprintf(stderr, "[RAM] vertex buffer: chunks of %u vertices, not %u, to reach %llu\n", s_vb_chunk,
+                      asked, (unsigned long long)want);
+          const u64 most = (want + s_vb_chunk - 1) / s_vb_chunk;
           /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
           rc_arena_init(&s_vb, "vertex buffer", GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u),
                         (u64)s_vb_chunk * 256, 1, (u32)(most < RC_ARENA_MAX ? most : RC_ARENA_MAX - 1));
