@@ -501,6 +501,8 @@ static void device_free(gpu_d3d12_device* dd)
         if (dd->layout_rs[i]) dd->layout_rs[i]->lpVtbl->Release(dd->layout_rs[i]);
     for (uint32_t i = 0; i < GPU_D3D12_MAX_QPOOLS; i++)
         if (dd->qpool[i].heap) dd->qpool[i].heap->lpVtbl->Release(dd->qpool[i].heap);
+    if (dd->gt_heap) dd->gt_heap->lpVtbl->Release(dd->gt_heap);
+    if (dd->gt_rb) dd->gt_rb->lpVtbl->Release(dd->gt_rb);
     for (uint32_t i = 0; i < dd->heap_slots.used; i++)
         if (dd->heap[i]) dd->heap[i]->lpVtbl->Release(dd->heap[i]);
     for (uint32_t i = 0; i < GPU_D3D12_MAX_TPOOLS; i++) {
@@ -1445,7 +1447,62 @@ static gpu_query_pool d12_query_pool_create(gpu_device* d, uint32_t type, uint32
  * Recording, submitting, the timeline
  * -------------------------------------------------------------------------*/
 
-/* Today's allocator Reset, then the list's Reset(allocator, NULL). */
+/* RSX_GPU_TIMES (gpu_times.h): the timestamp heap, GPU_TIMES_MAX stamps a
+ * slot, and the readback buffer they resolve into, made once. 1 when there. */
+static int gt_make(gpu_d3d12_device* dd)
+{
+    if (dd->gt_tried) return dd->gt_heap != NULL;
+    dd->gt_tried = 1;
+    UINT64 hz = 0;
+    if (FAILED(dd->queue->lpVtbl->GetTimestampFrequency(dd->queue, &hz)) || !hz) return 0;
+    const uint32_t n = dd->nslots * GPU_TIMES_MAX;
+    D3D12_QUERY_HEAP_DESC qd;
+    memset(&qd, 0, sizeof qd);
+    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    qd.Count = n;
+    ID3D12QueryHeap* heap = NULL;
+    if (FAILED(dd->device->lpVtbl->CreateQueryHeap(dd->device, &qd, &IID_ID3D12QueryHeap, (void**)&heap)) || !heap)
+        return 0;
+    D3D12_HEAP_PROPERTIES hp;
+    memset(&hp, 0, sizeof hp);
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd;
+    buf_rd(&bd, (uint64_t)n * 8u);
+    ID3D12Resource* rb = NULL;
+    if (FAILED(dd->device->lpVtbl->CreateCommittedResource(dd->device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                   D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&rb)) || !rb) {
+        heap->lpVtbl->Release(heap);
+        return 0;
+    }
+    dd->gt_heap = heap;
+    dd->gt_rb = rb;
+    dd->gt_ns_tick = 1e9 / (double)hz;
+    for (uint32_t i = 0; i < dd->nslots; i++) {
+        dd->slot[i].gt_heap = heap;
+        dd->slot[i].gt_base = i * GPU_TIMES_MAX;
+        dd->slot[i].gt_pass = gpu_times_mode() == 2;
+    }
+    fprintf(stderr, "[D3D12] RSX_GPU_TIMES=%d: GPU timestamps at %llu Hz\n", gpu_times_mode(),
+            (unsigned long long)hz);
+    return 1;
+}
+
+/* A slot's resolved stamps, once its recording is done (gpu_ns). */
+static void gt_read(gpu_d3d12_device* dd, gpu_cmd* c)
+{
+    if (!c->gt_done) return;
+    const D3D12_RANGE rr = {(SIZE_T)c->gt_base * 8u, (SIZE_T)(c->gt_base + c->gt_n) * 8u};
+    void* p = NULL;
+    if (SUCCEEDED(dd->gt_rb->lpVtbl->Map(dd->gt_rb, 0, &rr, &p)) && p) {
+        gpu_times_take(&dd->gt, (const uint64_t*)p + c->gt_base, c->gt_n, dd->gt_ns_tick, ~0ull);
+        const D3D12_RANGE wr = {0, 0};
+        dd->gt_rb->lpVtbl->Unmap(dd->gt_rb, 0, &wr);
+    }
+    c->gt_n = c->gt_done = 0;
+}
+
+/* Today's allocator Reset, then the list's Reset(allocator, NULL). With
+ * RSX_GPU_TIMES, the slot's last stamps are read and a new start stamped. */
 static gpu_cmd* d12_cmd_begin(gpu_device* d, uint32_t slot)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
@@ -1454,13 +1511,30 @@ static gpu_cmd* d12_cmd_begin(gpu_device* d, uint32_t slot)
     gpu_cmd* const c = &dd->slot[slot];
     c->alloc->lpVtbl->Reset(c->alloc);
     c->cl->lpVtbl->Reset(c->cl, c->alloc, NULL);
+    if (gpu_times_mode() && gt_make(dd)) {
+        gt_read(dd, c);
+        c->cl->lpVtbl->EndQuery(c->cl, c->gt_heap, D3D12_QUERY_TYPE_TIMESTAMP, c->gt_base);
+        c->gt_n = 1;
+    }
     return c;
 }
 
 static void d12_cmd_end(gpu_device* d, gpu_cmd* c)
 {
-    (void)d;
+    if (c->gt_n && !c->gt_done) {   /* RSX_GPU_TIMES: the end's stamp, and all of them into the readback buffer */
+        c->cl->lpVtbl->EndQuery(c->cl, c->gt_heap, D3D12_QUERY_TYPE_TIMESTAMP, c->gt_base + c->gt_n++);
+        c->cl->lpVtbl->ResolveQueryData(c->cl, c->gt_heap, D3D12_QUERY_TYPE_TIMESTAMP, c->gt_base, c->gt_n,
+                                        GPU_D3D12_DEV(d)->gt_rb, (UINT64)c->gt_base * 8u);
+        c->gt_done = 1;
+    }
     c->cl->lpVtbl->Close(c->cl);
+}
+
+static uint64_t d12_gpu_ns(gpu_device* d, uint64_t* n)
+{
+    gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
+    if (n) *n = dd->gt.n;
+    return dd->gt.ns;
 }
 
 static gpu_fence d12_signal(gpu_device* d);
@@ -1533,6 +1607,8 @@ static void d12_wait_idle(gpu_device* d)
     while (d12_fence_wait(d, f, 2000))
         if (d12_lost(d)) break;
     defer_collect(dd, 0);
+    if (dd->gt_heap)
+        for (uint32_t i = 0; i < dd->nslots; i++) gt_read(dd, &dd->slot[i]);
 }
 
 /* ---------------------------------------------------------------------------

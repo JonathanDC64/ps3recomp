@@ -31,7 +31,11 @@
  *   [replay] frame 7: 5.123 ms, cpu 4.688 ms
  *   [replay] times: 199 frames after the first: wall 5.140 ms, cpu 4.981 ms a frame
  * Windows counts a thread's time in clock ticks (about 15.6 ms), so one
- * frame's cpu figure is coarse; the mean over many frames is not.
+ * frame's cpu figure is coarse; the mean over many frames is not. With
+ * RSX_GPU_TIMES=1 too, on a new path's route, the line adds the GPU's own
+ * time from timestamps (gpu/gpu_times.h): the recordings' time, not the
+ * gaps between them, after a wait for the GPU before frame 1 and at the end:
+ *   [replay] times: 199 frames ...: wall 5.140 ms, cpu 4.981 ms a frame, gpu 0.612 ms a frame (398 recordings)
  *
  * The process ends without the renderer's shutdown. RSX_REPLAY_SHUTDOWN=1,
  * on the new path's routes only (RSX_BACKEND=d3d12, null or vulkan), runs it
@@ -283,6 +287,11 @@ int main(int argc, char** argv)
     const DWORD wn = GetEnvironmentVariableA("RSX_REPLAY_WINDOW", wv, sizeof wv);
     s_win_steps = wn && wn < sizeof wv ? wv : NULL;
     int played = 0;   /* (frames across captures, for RSX_REPLAY_WINDOW) */
+#if defined(PS3RECOMP_RSX_HAL)
+    char gtv[8] = "";   /* RSX_GPU_TIMES on a new path's route: the times line says the GPU's time too */
+    gpu_device* const gt_dev = GetEnvironmentVariableA("RSX_GPU_TIMES", gtv, sizeof gtv) && atoi(gtv) > 0
+                                   ? rsx_out_gpu_device() : NULL;
+#endif
     for (int c = 0; c < ncaps; c++) {
         uint32_t* m = NULL;
         const int n = cellGcm_replay_load(argv[1 + c], &m);
@@ -290,7 +299,14 @@ int main(int argc, char** argv)
         printf("[replay] %s: %d methods\n", argv[1 + c], n);
         double wall_sum = 0.0, cpu_sum = 0.0;
         int timed = 0;
+        uint64_t gns0 = 0, grec0 = 0;   /* RSX_GPU_TIMES: the GPU's sums after the first frame */
         for (int k = 0; frames == 0 || k < frames; k++) {
+#if defined(PS3RECOMP_RSX_HAL)
+            if (times && k == 1 && gt_dev) {   /* (the wait is before the frame's clock starts) */
+                gpu_wait_idle(gt_dev);
+                gns0 = gpu_gpu_ns(gt_dev, &grec0);
+            }
+#endif
             const double cpu0 = times ? thread_cpu_ms() : 0.0;
             QueryPerformanceCounter(&t0);
             cellGcm_replay_reset();
@@ -307,9 +323,20 @@ int main(int argc, char** argv)
             window_steps(played++);
             if (rsx_d3d12_backend_pump_messages() != 0) { c = ncaps; break; }
         }
+        char gpu_txt[96] = "";
+#if defined(PS3RECOMP_RSX_HAL)
+        if (timed && gt_dev) {
+            gpu_wait_idle(gt_dev);
+            uint64_t grec = 0;
+            const uint64_t gns = gpu_gpu_ns(gt_dev, &grec) - gns0;
+            if (grec > grec0)
+                snprintf(gpu_txt, sizeof gpu_txt, ", gpu %.3f ms a frame (%llu recordings)", 1e-6 * (double)gns / timed,
+                         (unsigned long long)(grec - grec0));
+        }
+#endif
         if (timed)
-            printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame\n",
-                   timed, wall_sum / timed, cpu_sum / timed);
+            printf("[replay] times: %d frames after the first: wall %.3f ms, cpu %.3f ms a frame%s\n",
+                   timed, wall_sum / timed, cpu_sum / timed, gpu_txt);
     }
 #if defined(PS3RECOMP_RSX_HAL)
     if (overlay_gpu)

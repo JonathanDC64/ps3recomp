@@ -3374,6 +3374,14 @@ static void nl_wait_idle(gpu_device* d)
     at_max64(&nd->seen, f);
 }
 
+/* No GPU, no timestamps (RSX_GPU_TIMES). Not an event: it records nothing. */
+static uint64_t nl_gpu_ns(gpu_device* d, uint64_t* n)
+{
+    (void)d;
+    if (n) *n = 0;
+    return 0;
+}
+
 static uint32_t nl_lost(gpu_device* d)
 {
     return at_load32(&GPU_NULL_DEV(d)->lost);

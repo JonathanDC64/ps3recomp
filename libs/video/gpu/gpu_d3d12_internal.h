@@ -36,6 +36,7 @@
 
 #include "gpu.h"
 #include "gpu_cmd_ops.h"
+#include "gpu_times.h"
 
 /* Table sizes. Each slot costs a few bytes until it is used. */
 #define GPU_D3D12_MAX_TEXTURES   (1u << 17)
@@ -160,6 +161,11 @@ struct gpu_cmd {
     const struct gpu_d3d12_tpool* tpool;
     const struct gpu_d3d12_qpool* qpool;
     ID3D12CommandAllocator*       alloc;    /* its slot's; NULL for a wrapped list (bridge) */
+    /* RSX_GPU_TIMES (gpu_times.h): the device's timestamp heap while the knob
+     * is on (else NULL), this slot's first stamp in it, the stamps written,
+     * whether pass_begin writes one, and whether cmd_end resolved them. */
+    ID3D12QueryHeap*              gt_heap;
+    uint32_t                      gt_base, gt_n, gt_pass, gt_done;
 };
 
 typedef struct gpu_d3d12_device {
@@ -216,6 +222,16 @@ typedef struct gpu_d3d12_device {
     /* Recorders: an allocator and a list per slot. */
     uint32_t             nslots;
     gpu_cmd              slot[GPU_D3D12_MAX_CMD_SLOTS];
+
+    /* RSX_GPU_TIMES: GPU_TIMES_MAX stamps a slot, resolved into a readback
+     * buffer kept mapped; made at the first cmd_begin with the knob on
+     * (gt_tried), none if that failed. */
+    ID3D12QueryHeap*     gt_heap;
+    ID3D12Resource*      gt_rb;
+    const uint64_t*      gt_map;
+    double               gt_ns_tick;
+    int                  gt_tried;
+    gpu_times            gt;
 
     /* Test hooks: descriptors written by the table writes (the memo skips
      * the rest). */

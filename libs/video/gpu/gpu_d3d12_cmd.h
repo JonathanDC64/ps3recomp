@@ -32,6 +32,8 @@ static inline void gpu_cmd_pass_begin(gpu_cmd* c, const gpu_pass* pass)
     for (UINT i = 0; i < n; i++) rt[i].ptr = (SIZE_T)c->view[GPU_HANDLE_INDEX(pass->rt[i].id)];
     if (GPU_VALID(pass->ds)) ds.ptr = (SIZE_T)c->view[GPU_HANDLE_INDEX(pass->ds.id)];
     c->cl->lpVtbl->OMSetRenderTargets(c->cl, n, n ? rt : NULL, FALSE, GPU_VALID(pass->ds) ? &ds : NULL);
+    if (c->gt_pass && c->gt_n < GPU_TIMES_MAX - 1)   /* RSX_GPU_TIMES=2 (one left for cmd_end) */
+        c->cl->lpVtbl->EndQuery(c->cl, c->gt_heap, D3D12_QUERY_TYPE_TIMESTAMP, c->gt_base + c->gt_n++);
 }
 
 static inline void gpu_cmd_pass_end(gpu_cmd* c)
