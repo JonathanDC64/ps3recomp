@@ -4,9 +4,9 @@
  * gpu_pipeline_desc to D3D12_GRAPHICS_PIPELINE_STATE_DESC, and today's
  * ID3D12PipelineLibrary around it (rsx_d3d12_backend.c, pso_create_cached and
  * pso_lib_*): a pipeline is loaded from the library by its name, or made and
- * stored under it; the library is read from and written to the file the
- * caller names. Thread-safe: the start's pipeline workers make pipelines
- * beside the render thread, as today's do.
+ * stored under it; the library is made from the file the caller names,
+ * mapped, and written to it. Thread-safe: the start's pipeline workers make
+ * pipelines beside the render thread, as today's do.
  *
  * Every field a description sets is passed through, so each of today's
  * pipelines comes out as the same D3D12 description, byte for byte except
@@ -150,8 +150,7 @@ void gpu_d3d12_pipe_release(gpu_d3d12_device* dd)
     dd->npso = dd->pso_cap = 0;
     if (dd->lib) dd->lib->lpVtbl->Release(dd->lib);
     dd->lib = NULL;
-    free(dd->lib_blob);
-    dd->lib_blob = NULL;
+    plat_file_unmap(&dd->lib_blob);
 }
 
 /* Store a pipeline under its name, unless the library has that name. Storing
@@ -221,7 +220,10 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
 }
 
 /* Through a temporary name and a rename, so a crash or a second process never
- * leaves a half-written file under the real name. Today's pso_write_file. */
+ * leaves a half-written file under the real name. Today's pso_write_file.
+ * The rename also replaces the file the library is mapped from (plat.h: a
+ * rename over a mapped file is allowed), and the library goes on reading
+ * the old one's bytes. */
 static int write_file(const char* path, const void* p, size_t n)
 {
     char tmp[MAX_PATH + 64];
@@ -235,25 +237,15 @@ static int write_file(const char* path, const void* p, size_t n)
     return 1;
 }
 
-static void* read_file(const char* path, long* n)
-{
-    *n = 0;
-    FILE* f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-    void* p = sz > 0 ? malloc((size_t)sz) : NULL;
-    if (p && fread(p, 1, (size_t)sz, f) != (size_t)sz) { free(p); p = NULL; }
-    fclose(f);
-    if (p) *n = sz;
-    return p;
-}
-
 /* Today's pso_lib_open, its library half: the file's library, or, when the
  * file is another driver's or GPU's (or there is none), a new empty one.
  * Called before pipelines are made (it replaces the library).
  * GPU_PIPELINE_CACHE_LOADED when the file's library is used, _NEW for an
  * empty one, _NONE when there can be none (no ID3D12Device1, the cap masked,
- * or the driver makes no library): today's s_pso_lib NULL. */
+ * or the driver makes no library): today's s_pso_lib NULL.
+ * D3D12 keeps reading the bytes a library is made from, for as long as it
+ * lives, so the file is mapped instead of read into memory: its pages stay
+ * the file's (plat_file_map), not tens of MB of private memory. */
 int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
@@ -261,17 +253,17 @@ int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
     if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE) ||
         FAILED(dd->device->lpVtbl->QueryInterface(dd->device, &IID_ID3D12Device1, (void**)&d1)))
         return GPU_PIPELINE_CACHE_NONE;
-    long n = 0;
-    void* blob = path ? read_file(path, &n) : NULL;
+    plat_file_map blob = { NULL, 0 };
+    if (path) plat_file_map_read(path, &blob);
     ID3D12PipelineLibrary* lib = NULL;
     HRESULT hr = E_FAIL;
-    if (blob) {
-        hr = d1->lpVtbl->CreatePipelineLibrary(d1, blob, (SIZE_T)n,
+    if (blob.p) {
+        hr = d1->lpVtbl->CreatePipelineLibrary(d1, blob.p, (SIZE_T)blob.n,
                  &IID_ID3D12PipelineLibrary, (void**)&lib);
         if (FAILED(hr)) {
             printf("[D3D12] pipeline library: '%s' is from another driver or GPU (0x%08lX); rebuilding it\n",
                    path, (unsigned long)hr);
-            free(blob); blob = NULL;
+            plat_file_unmap(&blob);
             lib = NULL;
         }
     }
@@ -281,12 +273,12 @@ int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
     d1->lpVtbl->Release(d1);
     AcquireSRWLockExclusive(&dd->lib_lock);
     ID3D12PipelineLibrary* const old = dd->lib;
-    void* const old_blob = dd->lib_blob;
+    plat_file_map old_blob = dd->lib_blob;
     dd->lib = lib;
     dd->lib_blob = blob;
     ReleaseSRWLockExclusive(&dd->lib_lock);
     if (old) old->lpVtbl->Release(old);
-    free(old_blob);
+    plat_file_unmap(&old_blob);
     if (!lib) return GPU_PIPELINE_CACHE_NONE;
     return SUCCEEDED(hr) ? GPU_PIPELINE_CACHE_LOADED : GPU_PIPELINE_CACHE_NEW;
 }
