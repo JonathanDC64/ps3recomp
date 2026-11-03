@@ -114,8 +114,8 @@ void rsx_shader_precompile_wait(void);
 /* ---- Targets (built with the portable renderer) ----
  * A pass makes its texts and fills its cache through a sink: the calls it
  * makes, as a table. One target a pass, each with its own files:
- *   d3d12  today's renderer's calls (rsx_d3d12_*), the default: the pass as
- *          it was, today's .dxbc files; its pipeline index rows go through
+ *   d3d12  the legacy renderer's calls (rsx_d3d12_*), the default target:
+ *          the pass as it was, its .dxbc files; its pipeline index rows go through
  *          the route switch (rsx_out.h) to the renderer that runs. Windows.
  *   dxbc   the new path's texts (rsxcore/rsxc_shader.c, copies of today's)
  *          into the compile service's dxbc target (gpu/gpu_shader.h): FXC
@@ -123,7 +123,7 @@ void rsx_shader_precompile_wait(void);
  *   spv    the same texts into its spv target, glslang, under
  *          <cache>/gpu/spv/. Where PS3RECOMP_RSX_HAL_SPV is built.
  * A target's pipeline index rows go to the renderer that draws with its
- * files (route: d3d12's to today's renderer, dxbc's to hal-d3d12, spv's to
+ * files (route: d3d12's to legacy, dxbc's to d3d12, the new path's, spv's to
  * vulkan), through the route switch, when that is the route the process
  * runs; each renderer marks the index built in a file of its own
  * (index_mark: today's pso_index.built, gpu/d3d12/index.built,
