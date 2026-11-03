@@ -590,9 +590,13 @@ rtt_dump_done:;
             if (GPU_VALID(s_rc_vp_ib))
                 gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
                                s_vp_icap * 4, GPU_FORMAT_R32_UINT);
-            if (GPU_VALID(s_rc_vf_buf))
-                gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
-                                        + (u64)s_d3d.vp_parity * s_vf_cap);
+            /* t20: vf_buf's first chunk. The fetch draws' chunk bound is the
+             * virtual [vf_lo, vf_lo + vf_in) (rc_arena; vf_in 0 while t20
+             * holds another buffer): a draw whose fdesc lies outside binds
+             * its own, so a draw costs a compare, and a bind only where the
+             * frame crossed a chunk's end. */
+            u32 vf_lo = 0, vf_in = s_vf_cap;
+            if (s_vf_cap) gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, 0));
             int cur_rt = -1;                       /* target A: -1 = backbuffer */
             float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
             /* its host size over guest size (RSX_SCALE). The batch starts on the display
@@ -640,8 +644,6 @@ rtt_dump_done:;
             const gpu_addr fpcb_va = GPU_VALID(s_rc_vp_fpcb) ? gpu_fast_buffer_addr(rdev, s_rc_vp_fpcb) : 0;
             /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
              * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
-            const gpu_addr uvc_vf_va = s_uvc_vs && GPU_VALID(s_rc_vf_buf)
-                ? gpu_fast_buffer_addr(rdev, s_rc_vf_buf) + (u64)s_d3d.vp_parity * s_vf_cap : 0;
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
                 const D3D12DrawRecord* dr = &s_d3d.draws[d];
                 if (!dr->is_vp) continue;
@@ -652,9 +654,10 @@ rtt_dump_done:;
                 if (aa_t >= 0 && d >= aa_before) {
                     if (aa_run_rt(aa_t)) {
                         gpu_cmd_set_layout(rc, s_d3d.vp_layout);
-                        if (GPU_VALID(s_rc_vf_buf))
-                            gpu_cmd_bind_raw(rc, 4, gpu_buffer_addr(s_rc_dev, s_rc_vf_buf)
-                                                    + (u64)s_d3d.vp_parity * s_vf_cap);
+                        if (s_vf_cap) {   /* the chunk bound before */
+                            gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, vf_lo >> s_vf_shift));
+                            vf_in = s_vf_cap;
+                        }
                         gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
                         s_vp_topo_strip = 0;
                         gpu_pass ap;
@@ -966,6 +969,14 @@ rtt_dump_done:;
                       bp.ds = s_rc_depth_dsv;
                       gpu_cmd_pass_begin(rc, &bp);
                   } }
+                /* A fetch draw reads its descriptor's chunk at t20 (vf_lo); a
+                 * clamp draw of converted vertices leaves its vp_vb chunk there,
+                 * so the next fetch draw binds its own again. */
+                if (dr->fetch && dr->fdesc - vf_lo >= vf_in) {
+                    vf_lo = dr->fdesc >> s_vf_shift << s_vf_shift;
+                    vf_in = s_vf_cap;
+                    gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, dr->fdesc >> s_vf_shift));
+                } else if (dr->uvc && !dr->fetch) vf_in = 0;
                 { int zq = -1;
                   if (g_rsx_report_hook && (s_zq_nev || s_zq_on_start) &&
                       s_zq_n < ZQ_MAX && zq_counted(dr->cb_slot) && zq_ready()) {
@@ -991,7 +1002,6 @@ rtt_dump_done:;
                     }
                     dred_mark(d, dr);
                     if (dpso.v && dr->uvc_n) gpu_cmd_draw(rc, dr->uvc_n, 1, 0, 0);
-                    if (!dr->fetch && uvc_vf_va) gpu_cmd_bind_raw(rc, 4, uvc_vf_va);
                     { static u32 said;   /* the first of each kind */
                       const u32 kind = 1u << (dr->fetch ? 1 + dr->fetch : dr->index_count ? 1 : 0);
                       if (!(said & kind)) {
@@ -1001,8 +1011,8 @@ rtt_dump_done:;
                                  : dr->index_count ? "indexed" : "not indexed", dr->uvc_n);
                       } }
                 } else {
-                    if (dr->fetch)
-                        gpu_cmd_push_const1(rc, 5, dr->fdesc, 0);
+                    if (dr->fetch)   /* the records' offset in the chunk bound */
+                        gpu_cmd_push_const1(rc, 5, dr->fdesc - vf_lo, 0);
                     /* A strip draw's indices are a strip (vf_strip_native). */
                     if ((dr->fetch == 2) != s_vp_topo_strip) {
                         s_vp_topo_strip = dr->fetch == 2;
@@ -1164,9 +1174,8 @@ rtt_dump_done:;
     s_vb_cursor = 0;
     s_d3d.draw_count = 0;
     s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
-    const u64 vf_want = (u64)s_vf_off + s_vf_short;   /* what this frame's fetch draws asked for */
     s_vf_off = 0;
-    s_vf_short = 0;
+    s_vf_lo = s_vf_end = 0;   /* the next frame's first descriptor finds its chunk (rc_arena_fit) */
     s_fx.valid = 0;
     vfo_next();
     { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
@@ -1188,7 +1197,7 @@ rtt_dump_done:;
     s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
     if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
     s_vp_iwant = 0;
-    if (GPU_VALID(s_rc_vf_buf) && vf_want > s_vf_cap) vf_grow(vf_want);
+    if (s_vf_cap) rc_arena_frame_end(&s_vf);   /* a chunk ahead when this frame reached the last */
 
     /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
      * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program

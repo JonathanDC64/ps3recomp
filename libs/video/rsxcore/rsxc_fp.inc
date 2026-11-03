@@ -509,8 +509,7 @@ static gpu_shader uvc_vs4(int i)
  * vp_ib, which is write-combined and slow to read, but only for these draws,
  * a 2D pass's. A draw of converted vertices with no indices needs no table
  * (b2's top bit). Sets uvc_tab (b2) and uvc_n (vertices to draw); 0 when
- * the ring has no room (vp_vb or vf_buf grows for the next frame, s_vp_want
- * or s_vf_short). */
+ * the chunk of the draw has no room left (the frame moved on to another). */
 static int uvc_table(D3D12DrawRecord* dr)
 {
     /* (In the chunk of vp_vb that holds the draw's vertices: t20 is that
@@ -529,11 +528,15 @@ static int uvc_table(D3D12DrawRecord* dr)
     const u64 most = dr->fetch == 2 ? (ni > 2 ? 3ull * (ni - 2) : 0) : ni - ni % 3u;   /* corners */
     u8* dst;
     u32 at;
+    u32 lo = 0;   /* the start of the fetch draw's chunk (virtual) */
     if (dr->fetch) {
-        if (!s_d3d.vf_mapped) return 0;
-        if ((u64)s_vf_off + head + most * 4 > s_vf_cap) { s_vf_short += head + most * 4; return 0; }
-        at = s_vf_off;
-        dst = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + at;
+        /* In the chunk that holds the draw's records (t20 is that chunk's
+         * half), after the frame's data there: only while the frame still
+         * writes in that chunk (rc_arena; s_vf_wp is its half). */
+        lo = dr->fdesc >> s_vf_shift << s_vf_shift;
+        if (!s_vf_cap || lo != s_vf_lo || (u64)s_vf_off + head + most * 4 > s_vf_end) return 0;
+        at = s_vf_off - lo;
+        dst = s_vf_wp + at;
     } else {
         /* After the frame's vertices, in the chunk that holds the draw's
          * (the table and the vertices it numbers share t20); none when the
@@ -570,7 +573,7 @@ static int uvc_table(D3D12DrawRecord* dr)
         for (u32 k = 0; k < n; k++) o[k] = ib[k] + add;
     }
     if (dr->fetch) {
-        const u32 h[4] = { dr->fdesc, 0, 0, 0 };
+        const u32 h[4] = { dr->fdesc - lo, 0, 0, 0 };   /* (in the chunk, as the draw's push) */
         memcpy(dst, h, sizeof h);
         s_vf_off += head + n * 4;
     } else

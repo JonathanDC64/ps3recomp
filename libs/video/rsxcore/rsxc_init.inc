@@ -392,15 +392,21 @@ static int init_d3d12(u32 width, u32 height)
         rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb_mapped);
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
-         * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
-         * once, default 64) per half to start with; a draw that does not fit
-         * takes the CPU path, and the ring grows at the frame's end
-         * (vf_grow). */
+         * attribute records, x2 parity like vp_vb, in chunks (rc_arena, s_vf).
+         * VP_FETCH_RING_MB (read once, default 64, rounded down to a power of
+         * two) is a chunk's half; one to start with (the ring's old start, so a
+         * frame that fitted it is laid out as before), more as frames need
+         * them, up to 1024 MB a half in all. A frame that fills a chunk goes on in
+         * the next, so a heavy area's first frame no longer sends its draws to
+         * the CPU path (256 bytes a vertex in vp_vb); only a draw bigger than
+         * a chunk still goes there. */
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
-          s_vf_cap = (u32)mb << 20;
-          if (!rc_buf_make((u64)s_vf_cap * 2, GPU_USE_RAW, GPU_MEM_UPLOAD, &s_rc_vf_buf, &s_d3d.vf_mapped))
-              s_vf_cap = 0; }
+          u32 sh = 22;   /* 4 MB, up to the power of two at or below mb */
+          while (sh < 30 && (2u << sh) <= ((u32)mb << 20)) sh++;
+          s_vf_shift = sh;
+          s_vf_cap = rc_arena_init(&s_vf, "vf_buf", GPU_USE_RAW, 1ull << sh, 1, (1u << 30) >> sh)
+                   ? 1u << sh : 0; }
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
