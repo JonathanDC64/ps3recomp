@@ -1624,7 +1624,7 @@ skip_dump_consider: ;
           if (s_overlay_wake) InterlockedExchange(&s_overlay_wake, 0);   /* (this call is the wake) */
           rc_overlay_frame(s_d3d.frame_index);   /* (the menu's: rsxc_api.inc) */
       }
-      if (s_present_this_frame && knob_present() && !s_session_locked)   /* skipped for an offscreen-only batch */
+      if (s_present_this_frame && knob_present() && !s_session_locked && !window_hidden())   /* skipped for an offscreen-only batch */
           swap_present(1);
       QueryPerformanceCounter(&_pq1);
       if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);

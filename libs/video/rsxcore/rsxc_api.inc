@@ -388,7 +388,7 @@ static void rc_overlay_tick(void)
      * from the last frame shown, once the game has stopped presenting. */
     const int wake = s_overlay_wake && !s_overlay_repaint;
     if ((!s_overlay_repaint && !wake) || !s_overlay_on || !s_overlay.frame || !s_d3d.initialized ||
-        !repaint_knob() || !knob_present() || s_session_locked)
+        !repaint_knob() || !knob_present() || s_session_locked || window_hidden())
         return;
     const int held = s_hold_valid && s_hold_w == s_d3d.host_w && s_hold_h == s_d3d.host_h;
     if (!held && !wake) return;   /* (held before RSX_SCALE moved) */
