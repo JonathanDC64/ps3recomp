@@ -1150,7 +1150,7 @@ static void test_fences(void)
     CHECK(gpu_native(g_d, GPU_NATIVE_BUFFER, c.id) != NULL);
 }
 
-/* ---- The pipeline cache, across two devices ---- */
+/* ---- The pipeline cache, across three devices ---- */
 
 static void test_pipeline_cache(void)
 {
@@ -1163,7 +1163,7 @@ static void test_pipeline_cache(void)
     memset(&dd, 0, sizeof dd);
     dd.flags = g_flags;
     dd.cmd_slots = 1;
-    for (int run_no = 0; run_no < 2; run_no++) {
+    for (int run_no = 0; run_no < 3; run_no++) {
         gpu_device* d = gpu_d3d12_create(&dd);
         CHECK(d != NULL);
         if (!d) break;
@@ -1207,6 +1207,22 @@ static void test_pipeline_cache(void)
         const gpu_pipeline p2 = gpu_pipeline_create(d, &pd, 0, &cached);
         CHECK(p2.v != 0 && cached == GPU_PIPELINE_LOADED);   /* stored by the first */
         CHECK(g->npso == kept + 3);
+        /* The second device stores one more and saves over the file its
+         * library is mapped from: the rename replaces it (plat.h), and the
+         * library goes on reading the old file's bytes. The third device
+         * loads the new file, which holds that one too. */
+        gpu_pipeline_desc pd3 = pd;
+        pd3.front_ccw = 1;
+        if (run_no == 1) {
+            how = 7;
+            CHECK(gpu_pipeline_create(d, &pd3, 0, &how).v != 0 && how == GPU_PIPELINE_STORED);
+            CHECK(gpu_pipeline_cache_save(d, path) == 1);
+            how = 7;
+            CHECK(gpu_pipeline_create(d, &pd2, 0, &how).v != 0 && how == GPU_PIPELINE_LOADED);
+        } else if (run_no == 2) {
+            how = 7;
+            CHECK(gpu_pipeline_create(d, &pd3, 0, &how).v != 0 && how == GPU_PIPELINE_LOADED);
+        }
         gpu_shader_destroy(d, vs);          /* pipelines outlive their shaders */
         gpu_shader_destroy(d, ps);
         if (run_no == 0) CHECK(gpu_pipeline_cache_save(d, path) == 1);

@@ -14,7 +14,10 @@
 #include "plat.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -165,6 +168,35 @@ void plat_sleep_us(uint64_t us)
     d.tv_nsec = (long)(us % 1000000u) * 1000L;
     /* A signal ends a sleep early; sleep the rest. */
     while (nanosleep(&d, &d) != 0 && errno == EINTR) {}
+}
+
+/* ---- A file mapped read-only ---------------------------------------------- */
+
+/* The descriptor is closed once the file is mapped: the mapping keeps the
+ * file, and a rename over its name leaves the mapped one as it was. */
+int plat_file_map_read(const char* path, plat_file_map* m)
+{
+    m->p = NULL;
+    m->n = 0;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    struct stat st;
+    void* v = MAP_FAILED;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+        (uint64_t)st.st_size <= (uint64_t)SIZE_MAX)
+        v = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (v == MAP_FAILED) return 0;
+    m->p = v;
+    m->n = (size_t)st.st_size;
+    return 1;
+}
+
+void plat_file_unmap(plat_file_map* m)
+{
+    if (m->p) munmap((void*)m->p, m->n);
+    m->p = NULL;
+    m->n = 0;
 }
 
 #else
