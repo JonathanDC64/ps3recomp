@@ -2,9 +2,10 @@
  * monotonic clock, the thread's sleep timer and the precise sleep written
  * once on them (what sys_timer_usleep runs on every platform).
  *
- * The clock is checked for going back, within a thread and across threads,
- * and against another clock for its rate. Each sleep is timed on the same
- * clock and the figures printed: requested against measured, p50 and p99.
+ * The clock is checked for going back, within a thread and across threads
+ * (by more than one tick), and against another clock for its rate. Each
+ * sleep is timed on the same clock and the figures printed: requested
+ * against measured, p50 and p99.
  * Only what holds on a busy CI machine is checked: the precise sleep never
  * ends before its deadline, and its median is near it.
  *
@@ -60,12 +61,15 @@ static double quantile(const double* v, int n, double q)
 
 typedef struct {
     volatile int64_t latest;     /* the highest reading any thread published */
-    volatile long back_self, back_cross, done;
+    volatile int64_t worst;      /* the largest step back across threads, in ticks */
+    volatile long back_self, back_cross, back_tick, done;
     plat_event fin;
 } mono_arg;
 
 /* Each reading must be at least this thread's last one, and at least the
- * latest one any thread had published before this thread read the clock. */
+ * latest one any thread had published before this thread read the clock,
+ * but for one tick: readings on two threads a tick apart have no order
+ * (Microsoft's notes on QueryPerformanceCounter). */
 static plat_thread_ret PLAT_THREAD_CALL mono_main(void* p)
 {
     mono_arg* a = (mono_arg*)p;
@@ -74,7 +78,16 @@ static plat_thread_ret PLAT_THREAD_CALL mono_main(void* p)
         const int64_t seen = atom_get(&a->latest);
         const int64_t now = plat_clock_now();
         if (now < last) atom_inc(&a->back_self);
-        if (now < seen) atom_inc(&a->back_cross);
+        if (now < seen) {
+            const int64_t back = seen - now;
+            atom_inc(back == 1 ? &a->back_tick : &a->back_cross);
+            int64_t w = atom_get(&a->worst);
+            while (w < back) {
+                const int64_t prev = plat_atomic_cas64(&a->worst, back, w);
+                if (prev == w) break;
+                w = prev;
+            }
+        }
         last = now;
         int64_t cur = seen;
         while (cur < now) {
@@ -107,7 +120,7 @@ static void test_clock(void)
     CHECK(plat_ticks_scale(month * 10000000ull + 9999999u, 10000000u, 79800000u)
           == month * 79800000ull + 79799992u);  /* 9999999 * 79.8e6 / 1e7, rounded down */
 
-    /* Never back, in a thread or across threads. */
+    /* Never back in a thread, and never by more than a tick across threads. */
     static mono_arg m;
     memset(&m, 0, sizeof m);
     CHECK(plat_event_init(&m.fin));
@@ -115,8 +128,10 @@ static void test_clock(void)
     CHECK(plat_event_wait(&m.fin, 60000));
     CHECK(m.back_self == 0);
     CHECK(m.back_cross == 0);
-    printf("clock: %d threads x %d readings: %ld went back in a thread, %ld across threads\n",
-           MONO_THREADS, MONO_READS, m.back_self, m.back_cross);
+    printf("clock: %d threads x %d readings: %ld went back in a thread, %ld across threads"
+           " by more than a tick, %ld by one tick (allowed); the most: %lld ticks\n",
+           MONO_THREADS, MONO_READS, m.back_self, m.back_cross, m.back_tick,
+           (long long)m.worst);
     plat_event_destroy(&m.fin);
 
     /* The rate, against another clock over about 300 ms. */
