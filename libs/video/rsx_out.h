@@ -4,11 +4,16 @@
  * With the portable renderer built (PS3RECOMP_RSX_HAL), the host calls the
  * renderer through these rsx_out_* functions instead of rsx_d3d12_*. Each
  * one goes to the route picked once, from RSX_BACKEND, on the first call:
- *   d3d12      today's renderer (rsx_d3d12_backend.c); the default. Each
- *              rsx_out_X calls rsx_d3d12_X directly.
- *   hal-d3d12  the new path on its own D3D12 backend (libs/video/rsxcore/,
- *              Windows only), for developers' A/Bs. Step 1.0 is today's
- *              renderer copied as it is, so it draws the same frames.
+ *   d3d12      the new path on its own D3D12 backend (libs/video/rsxcore/,
+ *              Windows only): the default on Windows. It began as the
+ *              legacy renderer copied as it is (step 1.0), and draws the
+ *              same frames. hal-d3d12 is another name for it (its name
+ *              while the legacy renderer was the default).
+ *   legacy     the renderer before the new path (rsx_d3d12_backend.c),
+ *              kept as it was to fall back on: each rsx_out_X calls
+ *              rsx_d3d12_X directly. Off Windows the switch is built with
+ *              it on vkd3d (PS3RECOMP_RSX_D3D12_VKD3D, Linux), where it is
+ *              the default, and d3d12 asks for it.
  *   null       the new path on the null backend (gpu_null.c, Windows and
  *              Linux): no window and no GPU; every command is checked
  *              against gpu.h and hashed. For developers and CI only, never
@@ -17,26 +22,27 @@
  *              Linux, in builds with PS3RECOMP_RSX_HAL_VULKAN): the port's
  *              Settings > Display > Renderer (rsxc_vk.c). On Linux its
  *              window is the core's SDL one, its surface SDL's.
- * Off Windows the switch is built with today's renderer on vkd3d
- * (PS3RECOMP_RSX_D3D12_VKD3D, Linux), which is the d3d12 route there.
  * Anything else (metal, auto, a typo, vulkan in a build without it) is not
- * in this build and runs d3d12. The pick prints one line, on every route:
- *   [rsx_out] route d3d12
- *   [rsx_out] route hal-d3d12 (the new path on its own D3D12 backend)
+ * in this build and runs the default. The pick prints one line, on every
+ * route:
+ *   [rsx_out] route d3d12 (the new path on its D3D12 backend)
+ *   [rsx_out] route legacy (the renderer before the new path, rsx_d3d12_backend.c)
  *   [rsx_out] route null (the new path on the null backend: checks every command, draws nothing)
  *   [rsx_out] route vulkan (the new path on its Vulkan backend)
  *   [rsx_out] route d3d12 (RSX_BACKEND=metal is not in this build)
- * Step V6: a Vulkan start that fails, or that did not finish last time,
- * runs d3d12 instead and says why in a line of its own (rsx_out.c,
- * "Vulkan's start"):
+ * A start that fails runs another renderer in the same process and says why
+ * in a line of its own (rsx_out.c, "Starts that fall back"): Vulkan's the
+ * default, the new path's D3D12 the legacy renderer. A Vulkan start that
+ * did not finish last time runs the default this time:
  *   [rsx_out] route d3d12 (Vulkan failed to start: no Vulkan 1.3 driver (loader); this start uses D3D12)
+ *   [rsx_out] route legacy (D3D12 failed to start: the GPU device could not be made (device); this start uses the legacy renderer)
  *   [rsx_out] route d3d12 (RSX_BACKEND=vulkan, but the last start on Vulkan did not finish, ...)
- * The second needs RSX_STATE_DIR: a folder of the host's for the start mark.
+ * The last needs RSX_STATE_DIR: a folder of the host's for the start mark.
  *
  * The functions are rsx_d3d12_backend.h's, with the same parameters and
  * meaning (see there), plus the profile sessions (rsx_prof_*, boot_main's
- * F11) and rsx_d3d12_composite_from_offscreen, which the original also
- * exports. Plain C with <stdint.h> types only, so C and C++ hosts can include
+ * F11) and rsx_d3d12_composite_from_offscreen, which the legacy renderer
+ * also exports. Plain C with <stdint.h> types only, so C and C++ hosts can include
  * it without the runtime's headers. Built without PS3RECOMP_RSX_HAL, nothing
  * uses this file and rsx_out.c is empty.
  */
@@ -54,7 +60,7 @@ struct rsx_d3d12_overlay;   /* rsx_d3d12_backend.h (the port's des_ui.cpp has it
 
 /* One line per function, as V(name, legacy, params, args) for one that
  * returns nothing and R(ret, name, legacy, params, args) for one that
- * returns ret. legacy is today's renderer's name for it; the copy in
+ * returns ret. legacy is the legacy renderer's name for it; the copy in
  * rsxcore names it rc_<name>. */
 #define RSX_OUT_FUNCS(V, R) \
     R(int,         backend_init,          rsx_d3d12_backend_init,          (uint32_t width, uint32_t height, const char* title), (width, height, title)) \
@@ -106,22 +112,22 @@ RSX_OUT_FUNCS(RSX_OUT_DECL_V_, RSX_OUT_DECL_R_)
 #undef RSX_OUT_DECL_V_
 #undef RSX_OUT_DECL_R_
 
-/* The route that runs: "d3d12", "hal-d3d12", "null" or "vulkan". Picks it if
+/* The route that runs: "d3d12", "legacy", "null" or "vulkan". Picks it if
  * no call has. */
 const char* rsx_out_renderer(void);
 
 /* Step V6: the same, without picking one: NULL while no call has (a process
  * that never used the renderer, such as a host's crash dialog). *why, when
- * why is not NULL: NULL, or why the route is d3d12 although RSX_BACKEND
- * asked for another, in plain words for a report ("Vulkan failed to start:
- * the window's swap chain could not be made (swap chain)"). */
+ * why is not NULL: NULL, or why the route is not the one RSX_BACKEND asked
+ * for, in plain words for a report ("Vulkan failed to start: the window's
+ * swap chain could not be made (swap chain)"). */
 const char* rsx_out_renderer_info(const char** why);
 
-/* A renderer other than today's, as a table of the functions above. The
- * new path's core defines one per backend it is compiled for:
- * rsxc_route_d3d12 (libs/video/rsxcore/rsxc_d3d12.c, Windows),
- * rsxc_route_null (rsxc_null.c, Windows and Linux) and rsxc_route_vk
- * (rsxc_vk.c, Windows and Linux, in builds with PS3RECOMP_RSX_HAL_VULKAN). */
+/* A renderer of the new path, as a table of the functions above. The core
+ * defines one per backend it is compiled for: rsxc_route_d3d12
+ * (libs/video/rsxcore/rsxc_d3d12.c, Windows), rsxc_route_null (rsxc_null.c,
+ * Windows and Linux) and rsxc_route_vk (rsxc_vk.c, Windows and Linux, in
+ * builds with PS3RECOMP_RSX_HAL_VULKAN). */
 #define RSX_OUT_FIELD_V_(name, legacy, params, args)      void (*name) params;
 #define RSX_OUT_FIELD_R_(ret, name, legacy, params, args) ret (*name) params;
 typedef struct rsx_route {
@@ -133,6 +139,8 @@ typedef struct rsx_route {
 
 #if defined(_WIN32)
 extern const rsx_route rsxc_route_d3d12;
+/* The step a failed start stopped at (rsxc_d3d12.c), NULL after none. */
+const char* rsxc_d3d12_start_failed(void);
 #endif
 #if defined(_WIN32) || defined(__linux__)
 extern const rsx_route rsxc_route_null;
@@ -158,9 +166,10 @@ extern "C" {
 /* The overlay on the new path's own GPU device (overlay v2), so the menu
  * draws on every route of it, Vulkan's included: with the core's gpu_device
  * (gpu.h), on a recorder the core hands it, into the window's image as one
- * of that device's textures. On d3d12 (today's renderer) set_overlay_gpu
- * does nothing and gpu_device is NULL: rsx_d3d12_set_overlay's overlay runs
- * as before.
+ * of that device's textures. On legacy set_overlay_gpu does nothing and
+ * gpu_device is NULL: rsx_d3d12_set_overlay's overlay runs as before. A
+ * start that falls back hands the overlay to the renderer it falls back to
+ * (rsx_out.c).
  *
  * Set beside rsx_d3d12_set_overlay's overlay, which still gives wndproc and
  * release, and whose frame must still be set: where the core would call
@@ -188,7 +197,7 @@ typedef struct rsx_out_overlay_gpu {
 /* Any thread; NULL takes it away (the old overlay's frame runs again). */
 void rsx_out_set_overlay_gpu(const rsx_out_overlay_gpu* overlay);
 /* The core's device, for the overlay's own objects: NULL before init and
- * on d3d12. Its calls that gpu.h does not call thread-safe belong to the
+ * on legacy. Its calls that gpu.h does not call thread-safe belong to the
  * render thread (frame_gpu, the overlay's release). */
 struct gpu_device* rsx_out_gpu_device(void);
 /* Inside frame_gpu only (NULL elsewhere): submits what the recorder holds,

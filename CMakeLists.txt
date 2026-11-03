@@ -791,11 +791,11 @@ if(PS3RECOMP_RSX_HAL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_target_properties(test_rsx_synth PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME rsx_synth COMMAND test_rsx_synth)
 
-    # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the Vulkan start's fallback to today's renderer
-    # and its start mark), built here against stand-ins for both renderers: libs/video/tests/test_rsx_out.c. No GPU,
-    # no window, and the Vulkan route's code whether or not this build has it. On Linux the switch is built as a
-    # host with today's renderer on vkd3d builds it (PS3RECOMP_RSX_D3D12_VKD3D; nothing of vkd3d is used). Built
-    # on demand:
+    # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the starts that fall back, Vulkan's to the
+    # default and the new path's D3D12 to the legacy renderer, and Vulkan's start mark), built here against
+    # stand-ins for the renderers: libs/video/tests/test_rsx_out.c. No GPU, no window, and the Vulkan route's code
+    # whether or not this build has it. On Linux the switch is built as a host with the legacy renderer on vkd3d
+    # builds it (PS3RECOMP_RSX_D3D12_VKD3D; nothing of vkd3d is used). Built on demand:
     #   cmake --build build --target test_rsx_out
     #   ctest --test-dir build -R rsx_out
     add_executable(test_rsx_out EXCLUDE_FROM_ALL

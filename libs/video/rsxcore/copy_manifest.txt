@@ -990,3 +990,13 @@ libs/video/tests/test_gpu_d3d12.c 3395-3409 lose_device_test
 #   (the spv target's pass hands them over, rsx_shader_precompile.c); its
 #   pipeline cache's file is written under a per-process temporary name
 #   (gpu_vk_pipe.c).
+
+# The default (2026-11): the new path on D3D12 is Windows' default route,
+# RSX_BACKEND=d3d12 (rsx_out.c; hal-d3d12 another name for it), and the
+# legacy renderer is RSX_BACKEND=legacy, kept as it was to fall back on. New
+# code, not copies:
+#  rsxc_d3d12.c: the route's name is "d3d12" (was "hal-d3d12"), and
+#   rsxc_d3d12_start_failed gives start_step's record, for the fallback to
+#   the legacy renderer.
+#  rsxc_record2.inc: nonvp_note says once that a draw without the
+#   vertex-program path is not drawn (step C8a took that pass out).

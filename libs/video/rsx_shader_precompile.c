@@ -66,8 +66,8 @@ void rsx_d3d12_pso_index_ready(uint64_t hash);
 #endif
 
 /* Step P3S: a target's rows go to the renderer that draws with its files
- * (the sink's route: d3d12's to today's renderer, dxbc's to the new path on
- * D3D12, spv's to Vulkan), through the route switch, only when that is the
+ * (the sink's route: d3d12's to the legacy renderer, dxbc's to the new path
+ * on D3D12, spv's to Vulkan), through the route switch, only when that is the
  * route this process runs (asked at _index, s_rows_taken). A build without
  * the route switch has no renderer to take them. */
 #if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
@@ -93,7 +93,7 @@ static const rsx_shader_precompile_sink s_sink_d3d12 = {
     "d3d12", "FXC", NULL,
     rsx_d3d12_shader_hlsl, rsx_d3d12_shader_hdr, rsx_d3d12_shader_key, rsx_d3d12_shader_cache_put,
     rsx_d3d12_shader_cache_path, rsx_d3d12_shader_fp_variants, rsx_d3d12_program_hash64,
-    ROWS_ADD, ROWS_READY, "d3d12", NULL
+    ROWS_ADD, ROWS_READY, "legacy", NULL
 };
 
 static int dxbc_put(int fragment, const char* hlsl)
@@ -109,7 +109,7 @@ static const rsx_shader_precompile_sink s_sink_dxbc = {
     "dxbc", "FXC", dxbc_tag,
     rsxc_shader_hlsl, rsxc_shader_hdr, rsxc_shader_key, dxbc_put,
     gpu_sc_cache_dir, rsxc_shader_fp_variants, rsxc_program_hash64,
-    ROWS_ADD, ROWS_READY, "hal-d3d12", "gpu/d3d12/index.built"
+    ROWS_ADD, ROWS_READY, "d3d12", "gpu/d3d12/index.built"
 };
 #endif
 

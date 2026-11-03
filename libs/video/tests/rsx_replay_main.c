@@ -34,7 +34,7 @@
  * frame's cpu figure is coarse; the mean over many frames is not.
  *
  * The process ends without the renderer's shutdown. RSX_REPLAY_SHUTDOWN=1,
- * on the new path's routes only (RSX_BACKEND=hal-d3d12 or null), runs it
+ * on the new path's routes only (RSX_BACKEND=d3d12, null or vulkan), runs it
  * after the last frame first: the GPU idle, every object freed and the
  * device destroyed, which the null backend checks (its last line counts
  * the failed checks; GPU_NULL_DUMP's file ends with the stream's hash).
@@ -266,7 +266,7 @@ int main(int argc, char** argv)
       } }
     char ovv[16] = "";
     const int overlay_gpu = GetEnvironmentVariableA("RSX_REPLAY_OVERLAY_GPU", ovv, sizeof ovv) < sizeof ovv &&
-                            atoi(ovv) > 0 && strcmp(rsx_out_renderer(), "d3d12") != 0;
+                            atoi(ovv) > 0 && strcmp(rsx_out_renderer(), "legacy") != 0;
     if (overlay_gpu) {
         static const rsx_d3d12_overlay v1 = {NULL, NULL, ov_overlay_v1, NULL};   /* (v2 set beside it, as des_ui) */
         static const rsx_out_overlay_gpu v2 = {NULL, ov_frame};
@@ -322,7 +322,7 @@ int main(int argc, char** argv)
     /* RSX_REPLAY_SHUTDOWN=1 on the new path's routes: its shutdown first. */
     { char sv[16] = "";
       if (GetEnvironmentVariableA("RSX_REPLAY_SHUTDOWN", sv, sizeof sv) < sizeof sv && atoi(sv) > 0 &&
-          strcmp(rsx_out_renderer(), "d3d12") != 0) {
+          strcmp(rsx_out_renderer(), "legacy") != 0) {
           rsx_out_backend_shutdown();
           printf("[replay] shutdown: done\n");
           fflush(stdout);
