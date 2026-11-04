@@ -395,7 +395,11 @@ typedef struct {
     /* Per-frame draw recording */
     int                   frame_recording; /* 1 if cmd list is open for recording */
     u32                   draw_count;      /* draws this frame */
-    D3D12DrawRecord       draws[MAX_DRAWS];
+    /* MAX_DRAWS records (17.75 MB), made by rc_backend_init and kept for a
+     * start after it. (As an array here they were in the exe's static data
+     * once for each backend's copy of this file, d3d12, vulkan and null,
+     * though only the running one's is used. docs/124.) */
+    D3D12DrawRecord*      draws;
 
     /* Pointer to current RSX state (set before draw calls) */
     const rsx_state*      current_rsx_state;

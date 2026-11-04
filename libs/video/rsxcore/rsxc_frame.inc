@@ -259,8 +259,12 @@ rtt_dump_done:;
     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
     for (int _i = 0; _i < MAX_ZETA; _i++) s_zeta[_i].used = 0;
     off_rt_drop_rewritten();
+    /* The draw records (made at the start, the same through the frame), read
+     * once for the per-draw loops below: a loop whose body calls out would
+     * read s_d3d.draws again for every draw. */
+    D3D12DrawRecord* const draws = s_d3d.draws;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
-        D3D12DrawRecord* dr = &s_d3d.draws[_d];
+        D3D12DrawRecord* dr = &draws[_d];
         if (dr->is_vp && dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u)))
             zeta_get(dr->zeta, dr->rt_w, dr->rt_h);
         u32 _offs[4] = { dr->rt_off, dr->rt_mrt[0], dr->rt_mrt[1], dr->rt_mrt[2] };
@@ -287,7 +291,7 @@ rtt_dump_done:;
     s_psj_defer = psj_threads() > 0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
-        D3D12DrawRecord* dr = &s_d3d.draws[_d];
+        D3D12DrawRecord* dr = &draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
         /* Debug: RTT_VIEWRT=<hex raw offset> makes display draws sample that
          * offscreen RT at t0 (the composite blit then shows it fullscreen). */
@@ -684,7 +688,7 @@ rtt_dump_done:;
             /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
              * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
             for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
-                const D3D12DrawRecord* dr = &s_d3d.draws[d];
+                const D3D12DrawRecord* dr = &draws[d];
                 if (!dr->is_vp) continue;
                 /* The pass binds its own pipeline. Then the VP pass's state
                  * goes back: its root signature, which drops every root
