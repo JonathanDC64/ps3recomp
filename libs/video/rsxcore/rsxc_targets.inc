@@ -1138,3 +1138,43 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     return slot;
 }
 
+/* The shared depth buffer (depth_buffer_make) covers every colour target it
+ * can be bound with: the display buffers and every offscreen target, which
+ * the pre-pass has just made for this frame's draws. render_frame calls this
+ * after that pre-pass, before the frame's first bind of the buffer (the
+ * display pass): a target larger in either direction remakes it at the larger
+ * of each, so no pass is cropped. The old one goes into the grave (the last
+ * frame's list may still use it), so a growth costs one depth texture's
+ * creation and nothing else: no copy (every bind of the buffer to other
+ * targets clears it, and nothing samples it) and no wait. It never shrinks,
+ * so it grows at most a few times a run (the largest target a guest declares
+ * is 2048x2048, current_rt_off) and again after an RSX_SCALE change (which
+ * starts it at the display buffers' size). Demon's Souls's largest offscreen
+ * target is its 1280x720 scene, the display's size: it never grows there. */
+static void depth_buffer_fit(void)
+{
+    u32 w = s_d3d.host_w, h = s_d3d.host_h;
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        const OffRT* r = &s_d3d.off_rt[i];
+        if (!GPU_VALID(r->tex)) continue;
+        if (r->hw > w) w = r->hw;
+        if (r->hh > h) h = r->hh;
+    }
+    if (w <= s_rc_depth_w && h <= s_rc_depth_h) return;
+    if (w < s_rc_depth_w) w = s_rc_depth_w;
+    if (h < s_rc_depth_h) h = s_rc_depth_h;
+    const u32 ow = s_rc_depth_w, oh = s_rc_depth_h;
+    gpu_texture old = s_rc_depth_tex;
+    if (depth_buffer_make(w, h) != 0) {   /* the old one stays: the larger target is cropped */
+        static int said_fail = 0;
+        if (said_fail < 8 && ++said_fail)
+            fprintf(stderr, "[D3D12] the shared depth buffer could not grow to %ux%u (stays %ux%u)%c",
+                    w, h, ow, oh, 10);
+        return;
+    }
+    rc_grave_tex(&old);   /* with its view */
+    static int said = 0;
+    if (said < 8 && ++said)
+        printf("[D3D12] shared depth buffer %ux%u -> %ux%u (host)\n", ow, oh, w, h);
+}
+

@@ -100,17 +100,24 @@ static void rc_forms_pick(void)
                (caps & GPU_CAP_D24S8) ? "RSX_DEPTH_FORMAT=d32s8" : "no D24S8");
 }
 
-static int depth_buffer_make(void)
+/* The shared depth buffer, w x h (host): what every colour target without a
+ * guest depth surface binds (the display buffers, offscreen targets drawn
+ * without a zeta), and depth-only passes without one. It must cover the
+ * LARGEST target bound with it, not just the window: D3D12 clips
+ * rasterization to the smallest bound attachment, and Vulkan's render area
+ * is the smallest attachment's (gpu_vk_pass_open) -- with a window-sized
+ * depth buffer, draws into larger offscreen RTs (wave's 1920x1080 input
+ * image) were silently cropped to the window rect. It was made once for the
+ * largest target a guest can declare (2048x2048, scaled: at RSX_SCALE=300
+ * 6144x6144, 180 MB of video memory and as much commit, docs/124); it now
+ * starts at the display buffers' size and depth_buffer_fit grows it when a
+ * larger target shows up. On failure the old one (if any) is kept. */
+static int depth_buffer_make(u32 w, u32 h)
 {
     gpu_texture_desc td;
     memset(&td, 0, sizeof td);
-    /* Sized to cover the LARGEST render target, not just the window:
-     * D3D12 clips rasterization to the smallest bound attachment, and
-     * this DSV is shared by every pass -- with a window-sized depth
-     * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
-     * image) were silently cropped to the window rect. */
-    td.width         = rt_host_dim(2048, 2048, 2048);
-    td.height        = rt_host_dim(2048, 2048, 2048);
+    td.width         = w;
+    td.height        = h;
     td.layers        = 1;
     td.mips          = 1;
     td.format        = rc_ds_format();   /* (step V5: D24S8, or D32S8) */
@@ -120,11 +127,14 @@ static int depth_buffer_make(void)
     td.clear_format  = rc_ds_format();
     td.clear_depth   = 1.0f;
     td.clear_stencil = 0;
-    s_rc_depth_tex = gpu_texture_create(s_rc_dev, &td);
-    if (!GPU_VALID(s_rc_depth_tex)) {
-        printf("[D3D12] Depth buffer creation failed\n");
+    const gpu_texture t = gpu_texture_create(s_rc_dev, &td);
+    if (!GPU_VALID(t)) {
+        printf("[D3D12] Depth buffer creation failed (%ux%u)\n", w, h);
         return -1;
     }
+    s_rc_depth_tex = t;
+    s_rc_depth_w = w;
+    s_rc_depth_h = h;
 
     /* The DSV: D24S8 (or D32S8), 2D, mip 0, no flags. */
     s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, rc_ds_format());
@@ -232,7 +242,7 @@ static int init_d3d12(u32 width, u32 height)
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
     {
-        if (!start_step("targets", depth_buffer_make() == 0)) return -1;
+        if (!start_step("targets", depth_buffer_make(s_d3d.host_w, s_d3d.host_h) == 0)) return -1;
 
         printf("[D3D12] Depth buffer created (%ux%u %s)\n", width, height, s_rc_d32 ? "D32S8" : "D24S8");
     }

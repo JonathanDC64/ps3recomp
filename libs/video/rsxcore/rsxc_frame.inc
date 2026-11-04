@@ -272,6 +272,7 @@ rtt_dump_done:;
                            s_d3d.off_rt[_s].gdma = dr->rt_dma[_m]; }
         }
     }
+    depth_buffer_fit();   /* the shared depth buffer covers them (before its first bind) */
 
     /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
      * texture it had bound at submit time into a slot (SRV heap

@@ -991,6 +991,7 @@ static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
 static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
+static u32            s_rc_depth_w, s_rc_depth_h;     /* its size (host; depth_buffer_fit) */
 static gpu_view       s_rc_swap_rtv[RC_SWAP_MAX];     /* the swap chain images' RTVs */
 
 /* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and

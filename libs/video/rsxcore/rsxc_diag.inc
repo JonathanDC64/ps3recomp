@@ -561,7 +561,10 @@ static void rsx_scale_apply(void)
     rc_grave_tex(&s_rc_depth_tex);
     s_d3d.host_w = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.width);
     s_d3d.host_h = rt_host_dim(s_d3d.width, s_d3d.height, s_d3d.height);
-    if (display_targets_make() != 0 || depth_buffer_make() != 0) {
+    /* (The shared depth buffer starts again at the display buffers' size: the
+     * offscreen targets come back at the next pre-pass, which fits it to
+     * them, depth_buffer_fit.) */
+    if (display_targets_make() != 0 || depth_buffer_make(s_d3d.host_w, s_d3d.host_h) != 0) {
         fprintf(stderr, "[D3D12] RSX_SCALE: the targets at %u%% could not be made%c", want, 10);
         abort();
     }
