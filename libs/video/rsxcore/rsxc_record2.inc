@@ -45,34 +45,36 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          * VP's MVP transform, so the cube was drawn in object space and clipped
          * off-screen. Untextured VP draws now render via the colour PSO. */
         if (s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout)) {
-            u32 rec = s_d3d.vp_vb_offset;
             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
+            const u32 rec = s_vb_at;   /* (where vb_room put them) */
             if (emitted && draw_room()) {
                 D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+                /* (Read once: to the compiler, a store through dr could be to it.) */
+                const rsx_state* const st = s_d3d.current_rsx_state;
                 dr->vb_byte_offset = rec; dr->index_count = 0;
                 dr->vertex_count   = emitted;
                 dr->topology       = RSX_TOPOLOGY_TRIANGLES;
                 dr->is_vp          = 1;
-                dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-                dr->fp_exp32 = s_d3d.current_rsx_state ?
-                    ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-                dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
-                dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
-        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
-            dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+                dr->fp_addr = st ? st->shader_program : 0;
+                dr->fp_exp32 = st ?
+                    ((st->shader_control & 0x40) != 0) : 1;
+                dr->cull = rsx_cull_key(st);
+                dr->depth = rsx_depth_key(st);
+        dr->begin_epoch = st ? st->begin_epoch : 0;
+            dr->begin_epoch = st ? st->begin_epoch : 0;
                 dr->cmask = 0xF;
-                if (s_d3d.current_rsx_state) {
-                    u32 _cm = s_d3d.current_rsx_state->color_mask;
+                if (st) {
+                    u32 _cm = st->color_mask;
                     dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
                               | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
                               | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                               | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
                 }
                 dr->alpha_ctl = 0;
-                if (s_d3d.current_rsx_state)
-                    dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
-                                  | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
-                                  | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+                if (st)
+                    dr->alpha_ctl = ((st->alpha_test_enable ? 1u : 0u) << 16)
+                                  | ((st->alpha_func & 0xFFu) << 8)
+                                  | (st->alpha_ref & 0xFFu);
                 for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
                     dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                     dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -89,15 +91,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex_rt[_u]  = -1;
                 }
                 dr->tex_slot = -1;
-                dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
+                dr->vs_idx = vp_get_vs(st);
                 dr->fetch = 0; dr->fdesc = 0;
                 dr->is_clear = 0;
                 /* Records are reused frame to frame without a reset: a slot that
                  * held a depth clear kept its Z/S flags, and a soft-particle draw in
                  * it lost its read-only depth view (FP_WATCH: "reads 0"). */
                 dr->clr_flags = 0;
-                dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
-                dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
+                dr->blend = st ? st->blend_enable : 1;
+                dr->blend_key = rsx_blend_key(st, dr->blend);
                 if (getenv("BLENDDBG")) { static u32 seen[32]; static int ns=0;
                     u32 k = (dr->blend ? 0x80000000u : 0u) | dr->blend_key;
                     int f=0; for (int i=0;i<ns;i++) if (seen[i]==k) f=1;
@@ -105,13 +107,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                         fprintf(stderr, "[BLEND] enable=%d key=0x%X%c",
                                 dr->blend, dr->blend_key, 10); } }
                 dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
-                dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+                dr->rt_fmt = st ? st->surface_format : 0;
                 rt_pitch_record(dr);
-                if (s_d3d.current_rsx_state) {
-                    dr->vp_x = s_d3d.current_rsx_state->viewport_x;
-                    dr->vp_y = s_d3d.current_rsx_state->viewport_y;
-                    dr->vp_w = s_d3d.current_rsx_state->viewport_w;
-                    dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+                if (st) {
+                    dr->vp_x = st->viewport_x;
+                    dr->vp_y = st->viewport_y;
+                    dr->vp_w = st->viewport_w;
+                    dr->vp_h = st->viewport_h;
                 } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
                 dr->cb_slot = s_d3d.draw_count;
                 dr->vcb_slot = vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
@@ -124,14 +126,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (emitted == 0) return;
         nonvp_note(primitive);
         if (draw_room()) {
-            s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
-            s_d3d.draws[s_d3d.draw_count].index_count = 0;
-            s_d3d.draws[s_d3d.draw_count].vertex_count   = emitted;
-            s_d3d.draws[s_d3d.draw_count].topology       = RSX_TOPOLOGY_TRIANGLES;
-            s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
-            s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
-            s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
-            s_d3d.draws[s_d3d.draw_count].rt_off         = 0;
+            D3D12DrawRecord* const dr = &s_d3d.draws[s_d3d.draw_count];
+            dr->vb_byte_offset = record_offset;
+            dr->index_count = 0;
+            dr->vertex_count   = emitted;
+            dr->topology       = RSX_TOPOLOGY_TRIANGLES;
+            dr->is_vp          = 0;
+            dr->is_clear       = 0;
+            dr->clr_flags      = 0;
+            dr->rt_off         = 0;
             s_d3d.draw_count++;
         }
         return;
@@ -152,10 +155,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
         s_d3d.vp_vb_mapped && GPU_VALID(s_d3d.vp_layout) &&
         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
-        u32 rec = s_d3d.vp_vb_offset;
+        s_vb_carried = 0;
+        s_vb_carry = primitive == RSX_PRIMITIVE_TRIANGLES ? tri_carry(first) : 0;
         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
             ? upload_tris_vp(s_d3d.current_rsx_state, first, count)
             : upload_strip_vp(s_d3d.current_rsx_state, first, count, primitive == RSX_PRIMITIVE_TRIANGLE_FAN);
+        s_vb_carry = 0;   /* (an upload that stopped before vb_room) */
+        const u32 rec = s_vb_at;   /* (where vb_room put them) */
         /* RSX splits one primitive stream across several DRAW_ARRAYS entries
          * inside a single BEGIN/END (each carries at most 256 vertices), and the
          * hardware concatenates them before assembling primitives. Recording a
@@ -175,7 +181,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
                 pv->index_count == 0 &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+            (rec & (s_vb.half - 1))) {   /* (not across a chunk's start: rc_arena) */
                 pv->vertex_count += emitted;
                 s_d3d.merge_first_end = first + count;
                 return;
@@ -183,30 +190,31 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         }
         if (emitted && draw_room()) {
             D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+            const rsx_state* const st = s_d3d.current_rsx_state;
             dr->vb_byte_offset = rec; dr->index_count = 0;
-            dr->vertex_count   = emitted;
+            dr->vertex_count   = emitted + s_vb_carried;   /* (the open triangle vb_room carried, first) */
             dr->topology       = RSX_TOPOLOGY_TRIANGLES;
             dr->is_vp          = 1;
-            dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-            dr->fp_exp32 = s_d3d.current_rsx_state ?
-                ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-            dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
-            dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
-        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
-            dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->fp_addr = st ? st->shader_program : 0;
+            dr->fp_exp32 = st ?
+                ((st->shader_control & 0x40) != 0) : 1;
+            dr->cull = rsx_cull_key(st);
+            dr->depth = rsx_depth_key(st);
+        dr->begin_epoch = st ? st->begin_epoch : 0;
+            dr->begin_epoch = st ? st->begin_epoch : 0;
             dr->cmask = 0xF;
-            if (s_d3d.current_rsx_state) {
-                u32 _cm = s_d3d.current_rsx_state->color_mask;
+            if (st) {
+                u32 _cm = st->color_mask;
                 dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
                           | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
                           | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                           | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
             }
             dr->alpha_ctl = 0;
-            if (s_d3d.current_rsx_state)
-                dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
-                              | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
-                              | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+            if (st)
+                dr->alpha_ctl = ((st->alpha_test_enable ? 1u : 0u) << 16)
+                              | ((st->alpha_func & 0xFFu) << 8)
+                              | (st->alpha_ref & 0xFFu);
             for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
                 dr->tex[_u].off = s_d3d.cur_texs[_u].off;
                 dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -223,20 +231,20 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex_rt[_u]  = -1;
             }
             dr->tex_slot = -1;
-            dr->vs_idx = vp_get_vs(s_d3d.current_rsx_state);
+            dr->vs_idx = vp_get_vs(st);
             dr->fetch = 0; dr->fdesc = 0;
             dr->is_clear = 0;
             dr->clr_flags = 0;
-            dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
-            dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
+            dr->blend = st ? st->blend_enable : 1;
+            dr->blend_key = rsx_blend_key(st, dr->blend);
             dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
-            dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+            dr->rt_fmt = st ? st->surface_format : 0;
             rt_pitch_record(dr);
-            if (s_d3d.current_rsx_state) {
-                dr->vp_x = s_d3d.current_rsx_state->viewport_x;
-                dr->vp_y = s_d3d.current_rsx_state->viewport_y;
-                dr->vp_w = s_d3d.current_rsx_state->viewport_w;
-                dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+            if (st) {
+                dr->vp_x = st->viewport_x;
+                dr->vp_y = st->viewport_y;
+                dr->vp_w = st->viewport_w;
+                dr->vp_h = st->viewport_h;
             } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
             dr->cb_slot = s_d3d.draw_count;
                 dr->vcb_slot = vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
@@ -270,14 +278,15 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     nonvp_note(primitive);
 
     if (draw_room()) {
-        s_d3d.draws[s_d3d.draw_count].vb_byte_offset = record_offset;
-            s_d3d.draws[s_d3d.draw_count].index_count = 0;
-        s_d3d.draws[s_d3d.draw_count].vertex_count   = actual_count;
-        s_d3d.draws[s_d3d.draw_count].topology       = topo;
-        s_d3d.draws[s_d3d.draw_count].is_vp          = 0;
-        s_d3d.draws[s_d3d.draw_count].is_clear       = 0;
-        s_d3d.draws[s_d3d.draw_count].clr_flags      = 0;
-        s_d3d.draws[s_d3d.draw_count].rt_off         = 0;
+        D3D12DrawRecord* const dr = &s_d3d.draws[s_d3d.draw_count];
+        dr->vb_byte_offset = record_offset;
+            dr->index_count = 0;
+        dr->vertex_count   = actual_count;
+        dr->topology       = topo;
+        dr->is_vp          = 0;
+        dr->is_clear       = 0;
+        dr->clr_flags      = 0;
+        dr->rt_off         = 0;
         s_d3d.draw_count++;
     }
 }
@@ -308,6 +317,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     u32 emitted = 0;
     u32 rec = s_d3d.vp_vb_offset;
     s_up_icount = 0;
+    s_vb_carried = 0;
     /* A strip split over several DRAW_INDEX_ARRAY ranges of one BEGIN/END
      * (Demon's Souls' level meshes, 256 indices each) was a draw per range,
      * each paying the whole per-draw cost here and in render_frame. A range
@@ -325,7 +335,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             pv->begin_epoch == s_d3d.current_rsx_state->begin_epoch &&
             pv->fp_addr == s_d3d.current_rsx_state->shader_program &&
             pv->ib_first + pv->index_count == s_d3d.vp_ib_offset &&
-            (pv->fetch || pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset))
+            (pv->fetch || (pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == s_d3d.vp_vb_offset &&
+                           vb_fits((u64)count * 3))))   /* (its vertices stay in that draw's chunk) */
             mpv = pv;
     }
     /* VP_GPU_FETCH (live, default 1; 0 = the CPU path): strips and fans go
@@ -358,7 +369,11 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     s_vs_up[primitive == RSX_PRIMITIVE_QUADS ? 0 : primitive == RSX_PRIMITIVE_TRIANGLES ? 1
             : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
     if (primitive == RSX_PRIMITIVE_QUADS)             emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
-    else if (primitive == RSX_PRIMITIVE_TRIANGLES)    emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+    else if (primitive == RSX_PRIMITIVE_TRIANGLES) {
+        s_vb_carry = tri_carry(first);   /* (as the non-indexed path) */
+        emitted = upload_tris_vp_indexed(s_d3d.current_rsx_state, first, count);
+        s_vb_carry = 0;
+    }
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP) emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 0);
     else if (primitive == RSX_PRIMITIVE_TRIANGLE_FAN)   emitted = upload_strip_vp_indexed(s_d3d.current_rsx_state, first, count, 1);
     else {
@@ -368,6 +383,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         return;
     }
     s_strip_base = 0;
+    if (emitted) rec = s_vb_at;   /* (where vb_room put them) */
     if (mpv) {
         s_d3d.merge_first_end = first + count;
         if (!emitted) return;   /* nothing drawn; the strip's carry still moved on */
@@ -391,7 +407,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
             pv->index_count == 0 &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+            (rec & (s_vb.half - 1))) {   /* (not across a chunk's start: rc_arena) */
             pv->vertex_count += emitted;
             s_d3d.merge_first_end = first + count;
             return;
@@ -400,30 +417,31 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     }
     if (emitted && draw_room()) {
         D3D12DrawRecord* dr = &s_d3d.draws[s_d3d.draw_count];
+        const rsx_state* const st = s_d3d.current_rsx_state;
         dr->vb_byte_offset = rec;
         dr->index_count = s_up_icount; dr->ib_first = s_up_ifirst;
-        dr->vertex_count   = emitted;
+        dr->vertex_count   = emitted + s_vb_carried;   /* (the open triangle vb_room carried, first) */
         dr->topology       = RSX_TOPOLOGY_TRIANGLES;
         dr->is_vp          = 1;
-        dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
-        dr->fp_exp32 = s_d3d.current_rsx_state ?
-            ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
-        dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
-        dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
-        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+        dr->fp_addr = st ? st->shader_program : 0;
+        dr->fp_exp32 = st ?
+            ((st->shader_control & 0x40) != 0) : 1;
+        dr->cull = rsx_cull_key(st);
+        dr->depth = rsx_depth_key(st);
+        dr->begin_epoch = st ? st->begin_epoch : 0;
         dr->cmask = 0xF;
-        if (s_d3d.current_rsx_state) {
-            u32 _cm = s_d3d.current_rsx_state->color_mask;
+        if (st) {
+            u32 _cm = st->color_mask;
             dr->cmask = ((_cm & 0x00010000) ? 1u : 0u)   /* R */
                       | ((_cm & 0x00000100) ? 2u : 0u)   /* G */
                       | ((_cm & 0x00000001) ? 4u : 0u)   /* B */
                       | ((_cm & 0x01000000) ? 8u : 0u);  /* A */
         }
         dr->alpha_ctl = 0;
-        if (s_d3d.current_rsx_state)
-            dr->alpha_ctl = ((s_d3d.current_rsx_state->alpha_test_enable ? 1u : 0u) << 16)
-                          | ((s_d3d.current_rsx_state->alpha_func & 0xFFu) << 8)
-                          | (s_d3d.current_rsx_state->alpha_ref & 0xFFu);
+        if (st)
+            dr->alpha_ctl = ((st->alpha_test_enable ? 1u : 0u) << 16)
+                          | ((st->alpha_func & 0xFFu) << 8)
+                          | (st->alpha_ref & 0xFFu);
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             dr->tex[_u].off = s_d3d.cur_texs[_u].off;
             dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
@@ -440,21 +458,21 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex_rt[_u]  = -1;
         }
         dr->tex_slot = -1;
-        dr->vs_idx = fetch ? vp_get_vs_fetch(s_d3d.current_rsx_state)
-                           : vp_get_vs(s_d3d.current_rsx_state);
+        dr->vs_idx = fetch ? vp_get_vs_fetch(st)
+                           : vp_get_vs(st);
         dr->fetch = (u32)fetch; dr->fdesc = fetch ? s_up_fdesc : 0;
         dr->is_clear = 0;
         dr->clr_flags = 0;
-        dr->blend = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->blend_enable : 1;
-        dr->blend_key = rsx_blend_key(s_d3d.current_rsx_state, dr->blend);
+        dr->blend = st ? st->blend_enable : 1;
+        dr->blend_key = rsx_blend_key(st, dr->blend);
         dr->rt_off = current_rt_off(&dr->rt_w, &dr->rt_h, dr->rt_mrt);
-        dr->rt_fmt = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->surface_format : 0;
+        dr->rt_fmt = st ? st->surface_format : 0;
         rt_pitch_record(dr);
-        if (s_d3d.current_rsx_state) {
-            dr->vp_x = s_d3d.current_rsx_state->viewport_x;
-            dr->vp_y = s_d3d.current_rsx_state->viewport_y;
-            dr->vp_w = s_d3d.current_rsx_state->viewport_w;
-            dr->vp_h = s_d3d.current_rsx_state->viewport_h;
+        if (st) {
+            dr->vp_x = st->viewport_x;
+            dr->vp_y = st->viewport_y;
+            dr->vp_w = st->viewport_w;
+            dr->vp_h = st->viewport_h;
         } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
         dr->cb_slot = s_d3d.draw_count;
                 dr->vcb_slot = vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);

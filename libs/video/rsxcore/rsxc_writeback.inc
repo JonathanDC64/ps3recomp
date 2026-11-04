@@ -38,7 +38,7 @@ static int write_color_defer(void)
 static int s_wb_pending;   /* copies recorded, store not yet done */
 static double s_fl_wait_ms, s_fl_store_ms;   /* FRAME_LOG: frame-start wait, store */
 
-static void rt_pitch_record(D3D12DrawRecord* dr)
+static inline __attribute__((always_inline)) void rt_pitch_record(D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!st) return;
@@ -870,56 +870,21 @@ static void guest_fb_present(u32 fi)
 }
 
 
-/* Grow the VP vertex buffer to hold a frame of `want` vertices (with
- * headroom). The frame that overflowed has already lost its tail; the next
- * ones fit. The old buffer may still be read by the frame in flight, so it is
- * destroyed with that frame's fence (rc_ring_retire). VP_VB_MAX_VERTS caps the
- * growth (default 2M vertices = 1 GB of upload heap at 256 bytes x 2
- * parities). */
-/* Growing creates and maps a new upload buffer of hundreds of MB on the render
- * thread: 100-400 ms for Demon's Souls's level, one frame, whose overflowing
- * draws are dropped as well. A title that needs more starts bigger
- * (VP_VB_VERTS). */
-static void vp_vb_grow(u64 want)
-{
-    static u64 limit = 0;
-    if (!limit) { const char* e = getenv("VP_VB_MAX_VERTS");
-                  limit = e ? strtoull(e, NULL, 0) : (2ull << 20);
-                  if (limit < s_vp_cap) limit = s_vp_cap; }
-    u64 cap = s_vp_cap;
-    while (cap < want + want / 8 && cap < limit) cap *= 2;
-    if (cap > limit) cap = limit;
-    if (cap <= s_vp_cap) {
-        static int warned = 0;
-        if (!warned++) fprintf(stderr, "[VPVB] a frame needs %llu vertices; the buffer stays at"
-                               " %u (VP_VB_MAX_VERTS); later draws are dropped%c",
-                               (unsigned long long)want, s_vp_cap, 10);
-        return;
-    }
-    const u64 bytes = cap * 256 * 2;   /* VP_VERT_STRIDE, two parity halves */
-    gpu_buffer nb; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
-        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
-        fprintf(stderr, "[VPVB] growing to %llu vertices failed; staying at %u%c",
-                (unsigned long long)cap, s_vp_cap, 10);
-        limit = s_vp_cap;
-        return;
-    }
-    rc_ring_retire(0, s_rc_vp_vb);
-    s_rc_vp_vb = nb;
-    s_d3d.vp_vb_mapped = mp; s_vp_cap = (u32)cap;
-    fprintf(stderr, "[VPVB] a frame asked for %llu vertices: buffer grown to %u (%llu MB)%c",
-            (unsigned long long)want, s_vp_cap, (unsigned long long)(bytes >> 20), 10);
-}
-
 /* The VP index buffer (indexed strip uploads, upload_strip_vp_indexed): u32
  * indices, two parity halves like vp_vb. Created at the first frame end and
  * grown there as vp_vb is; until it exists, or once a frame fills it, the
- * uploads expand to unindexed lists instead. */
+ * uploads expand to unindexed lists instead.
+ *
+ * It starts at 4M indices (32 MB for both halves; VP_IB_INDICES sets it). A
+ * load into the 1-2 bridge wants up to 3.7M in one frame, and the fetch path
+ * needs room here too: at 1M (legacy's size) that frame's draws went down the
+ * CPU path, unindexed, and vp_vb kept the 9 chunks they took (576 MB). */
 static void vp_ib_grow(u64 want)
 {
     const u64 limit = 64ull << 20;          /* 512 MB of upload heap */
-    u64 cap = s_vp_icap ? s_vp_icap : (1u << 20);
+    static int start = -1;
+    PS3_KNOB(start, ps3_env_int("VP_IB_INDICES", 4 << 20));
+    u64 cap = s_vp_icap ? s_vp_icap : (u64)(start > 0 ? start : 4 << 20);
     while (cap < want + want / 8 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
     if (GPU_VALID(s_rc_vp_ib) && cap <= s_vp_icap) return;
@@ -937,36 +902,5 @@ static void vp_ib_grow(u64 want)
     s_d3d.vp_ib_mapped = mp; s_vp_icap = (u32)cap;
     fprintf(stderr, "[VPIB] index buffer: %u indices (%llu MB)%c",
             s_vp_icap, (unsigned long long)(bytes >> 20), 10);
-}
-
-/* Grow the GPU fetch ring (vf_buf) to hold a frame of `want` bytes, with
- * headroom, as vp_vb grows. A strip that does not fit takes the CPU path,
- * which writes 256 bytes a vertex: on Demon's Souls' dragon bridge in 1-2 a
- * frame asks for up to ~120 MB of ring, and with the ring at its 64 MB the
- * CPU path wrote ~2 million vertices a frame and held the frame rate at ~77
- * (issue #288). The old ring may still be read by the frame in flight, so it
- * is destroyed with that frame's fence (rc_ring_retire). At most 1024 MB a
- * half, as VP_FETCH_RING_MB. */
-static void vf_grow(u64 want)
-{
-    static u64 limit = 1024ull << 20;
-    u64 cap = s_vf_cap;
-    while (cap < want + want / 8 && cap < limit) cap *= 2;
-    if (cap > limit) cap = limit;
-    if (cap <= s_vf_cap) return;
-    const u64 bytes = cap * 2;   /* two parity halves */
-    gpu_buffer nb; void* mp = NULL;
-    if (!rc_buf_make(bytes, GPU_USE_RAW, GPU_MEM_UPLOAD, &nb, &mp) || !mp) {
-        if (GPU_VALID(nb)) gpu_buffer_destroy(s_rc_dev, nb, 0);   /* made, not mapped: never used */
-        fprintf(stderr, "[VF] growing the fetch ring to %llu MB a half failed; staying at %u MB%c",
-                (unsigned long long)(cap >> 20), s_vf_cap >> 20, 10);
-        limit = s_vf_cap;
-        return;
-    }
-    rc_ring_retire(2, s_rc_vf_buf);
-    s_rc_vf_buf = nb;
-    s_d3d.vf_mapped = mp; s_vf_cap = (u32)cap;
-    fprintf(stderr, "[VF] a frame asked for %llu MB of the fetch ring: grown to %u MB a half%c",
-            (unsigned long long)(want >> 20), s_vf_cap >> 20, 10);
 }
 

@@ -217,22 +217,30 @@ static int fpk_extract_at(u32 off, float* out)
     }
     return n;
 }
-/* The last vp_cb slot written this frame, and what it was written from. */
-static u32 s_vcb_last = ~0u, s_vcb_gen;
+/* The last vp_cb bank written this frame, and what it was written from; the
+ * banks written this frame (the next one's number); the vp_fpcb chunks this
+ * frame has fitted (a draw below them has its block). Reset at the frame's end. */
+static u32 s_vcb_last = ~0u, s_vcb_gen, s_vcb_n;
+static u32 s_fpcb_hi;
 static const rsx_state* s_vcb_st;
 static float s_vcb_z[2];
 
-/* Returns the vp_cb slot the draw binds (its vcb_slot). */
+/* Returns the vp_cb bank the draw binds (its vcb_slot): always in a chunk
+ * that is there, so the draw loop binds it unchecked. `slot` is the draw. */
 static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
 {
     late_note(slot, dr);
     const rsx_state* st = s_d3d.current_rsx_state;
-    if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return slot;
+    if (!s_rc_vpcb.n || !st || slot >= MAX_DRAWS) return 0;
     /* FP texcoord scale (b1): 1/size for UNnormalized textures (fmt bit
-     * 0x40 -- wave samples everything in texel space), 1.0 otherwise. */
-    if (s_d3d.vp_fpcb_mapped) {
-        float* ts = (float*)((char*)s_d3d.vp_fpcb_mapped
-            + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
+     * 0x40 -- wave samples everything in texel space), 1.0 otherwise.
+     * The first draw in a vp_fpcb chunk makes or marks it (rc_arena_fit). */
+    const u32 fk = slot >> VP_FPCB_CHUNK_SHIFT;
+    if (fk >= s_fpcb_hi && s_rc_fpcb.n &&
+        rc_arena_fit(&s_rc_fpcb, (u64)slot * VP_FPCB_STRIDE, VP_FPCB_STRIDE) != ~0ull)
+        s_fpcb_hi = fk + 1;
+    if (fk < s_fpcb_hi) {
+        float* ts = (float*)fpcb_ptr(slot, (u32)s_d3d.vp_parity);
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             float sx = 1.0f, sy = 1.0f;
             if (dr && dr->tex[_u].set && (dr->tex[_u].fmt & 0x40) &&
@@ -339,10 +347,16 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
           s_vcb_gen == st->vertex_constants_gen &&
           s_vcb_z[0] == st->viewport_scale[2] && s_vcb_z[1] == st->viewport_offset[2])
           return s_vcb_last;
-      s_vcb_last = slot; s_vcb_st = st; s_vcb_gen = st->vertex_constants_gen;
+      /* A new bank takes the frame's next number; the first in a chunk makes
+       * or marks it (rc_arena_fit). One that cannot be made binds the last
+       * bank written (the number is tried again by the next draw). */
+      if (!(s_vcb_n & VP_CB_CHUNK_MASK) &&
+          rc_arena_fit(&s_rc_vpcb, (u64)s_vcb_n * VP_CB_STRIDE, VP_CB_STRIDE) == ~0ull)
+          return s_vcb_last < MAX_DRAWS ? s_vcb_last : 0;
+      s_vcb_last = s_vcb_n++; s_vcb_st = st; s_vcb_gen = st->vertex_constants_gen;
       s_vcb_z[0] = st->viewport_scale[2]; s_vcb_z[1] = st->viewport_offset[2]; }
-    char* dst = (char*)s_d3d.vp_cb_mapped
-        + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+    const u32 bank = s_vcb_last;
+    char* dst = (char*)vpcb_ptr(bank, (u32)s_d3d.vp_parity);
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
@@ -445,7 +459,7 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
         c[10]=1.0f/99.0f; c[14]=-1.0f/99.0f;
         vpx[2] = 1.0f; vpx[6] = 0.0f;
     }
-    return slot;
+    return bank;
 }
 
 /* Which offscreen surface (if any) does the current RSX state render to?
@@ -1090,6 +1104,14 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                     fp.row_pitch = pitch;
                     gpu_cmd_copy_buf_to_tex(s_rc_cmd, r->tex, 0, 0, 0, 0, r->up_buf, &fp);
                 }
+                /* Written once: into the grave now, so it is freed when this
+                 * frame is done instead of living as long as the target
+                 * (docs/124: 32 MB for a 1280x720 target at scale 300). The
+                 * copy is in this frame's list: targets are made only while
+                 * render_frame records, after its rc_grave_release. */
+                const gpu_texture none = {0};
+                rc_grave_put(none, r->up_buf);
+                r->up_buf.id = 0;
             }
         }
         free(wide);
@@ -1114,5 +1136,45 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         printf("[D3D12] offscreen RT %d: off=0x%X %ux%u host %ux%u (render-to-texture)\n",
                slot, off, w, h, hw, hh);
     return slot;
+}
+
+/* The shared depth buffer (depth_buffer_make) covers every colour target it
+ * can be bound with: the display buffers and every offscreen target, which
+ * the pre-pass has just made for this frame's draws. render_frame calls this
+ * after that pre-pass, before the frame's first bind of the buffer (the
+ * display pass): a target larger in either direction remakes it at the larger
+ * of each, so no pass is cropped. The old one goes into the grave (the last
+ * frame's list may still use it), so a growth costs one depth texture's
+ * creation and nothing else: no copy (every bind of the buffer to other
+ * targets clears it, and nothing samples it) and no wait. It never shrinks,
+ * so it grows at most a few times a run (the largest target a guest declares
+ * is 2048x2048, current_rt_off) and again after an RSX_SCALE change (which
+ * starts it at the display buffers' size). Demon's Souls's largest offscreen
+ * target is its 1280x720 scene, the display's size: it never grows there. */
+static void depth_buffer_fit(void)
+{
+    u32 w = s_d3d.host_w, h = s_d3d.host_h;
+    for (int i = 0; i < MAX_OFF_RTS; i++) {
+        const OffRT* r = &s_d3d.off_rt[i];
+        if (!GPU_VALID(r->tex)) continue;
+        if (r->hw > w) w = r->hw;
+        if (r->hh > h) h = r->hh;
+    }
+    if (w <= s_rc_depth_w && h <= s_rc_depth_h) return;
+    if (w < s_rc_depth_w) w = s_rc_depth_w;
+    if (h < s_rc_depth_h) h = s_rc_depth_h;
+    const u32 ow = s_rc_depth_w, oh = s_rc_depth_h;
+    gpu_texture old = s_rc_depth_tex;
+    if (depth_buffer_make(w, h) != 0) {   /* the old one stays: the larger target is cropped */
+        static int said_fail = 0;
+        if (said_fail < 8 && ++said_fail)
+            fprintf(stderr, "[D3D12] the shared depth buffer could not grow to %ux%u (stays %ux%u)%c",
+                    w, h, ow, oh, 10);
+        return;
+    }
+    rc_grave_tex(&old);   /* with its view */
+    static int said = 0;
+    if (said < 8 && ++said)
+        printf("[D3D12] shared depth buffer %ux%u -> %ux%u (host)\n", ow, oh, w, h);
 }
 

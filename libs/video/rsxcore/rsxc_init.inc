@@ -100,17 +100,24 @@ static void rc_forms_pick(void)
                (caps & GPU_CAP_D24S8) ? "RSX_DEPTH_FORMAT=d32s8" : "no D24S8");
 }
 
-static int depth_buffer_make(void)
+/* The shared depth buffer, w x h (host): what every colour target without a
+ * guest depth surface binds (the display buffers, offscreen targets drawn
+ * without a zeta), and depth-only passes without one. It must cover the
+ * LARGEST target bound with it, not just the window: D3D12 clips
+ * rasterization to the smallest bound attachment, and Vulkan's render area
+ * is the smallest attachment's (gpu_vk_pass_open) -- with a window-sized
+ * depth buffer, draws into larger offscreen RTs (wave's 1920x1080 input
+ * image) were silently cropped to the window rect. It was made once for the
+ * largest target a guest can declare (2048x2048, scaled: at RSX_SCALE=300
+ * 6144x6144, 180 MB of video memory and as much commit, docs/124); it now
+ * starts at the display buffers' size and depth_buffer_fit grows it when a
+ * larger target shows up. On failure the old one (if any) is kept. */
+static int depth_buffer_make(u32 w, u32 h)
 {
     gpu_texture_desc td;
     memset(&td, 0, sizeof td);
-    /* Sized to cover the LARGEST render target, not just the window:
-     * D3D12 clips rasterization to the smallest bound attachment, and
-     * this DSV is shared by every pass -- with a window-sized depth
-     * buffer, draws into larger offscreen RTs (wave's 1920x1080 input
-     * image) were silently cropped to the window rect. */
-    td.width         = rt_host_dim(2048, 2048, 2048);
-    td.height        = rt_host_dim(2048, 2048, 2048);
+    td.width         = w;
+    td.height        = h;
     td.layers        = 1;
     td.mips          = 1;
     td.format        = rc_ds_format();   /* (step V5: D24S8, or D32S8) */
@@ -120,11 +127,14 @@ static int depth_buffer_make(void)
     td.clear_format  = rc_ds_format();
     td.clear_depth   = 1.0f;
     td.clear_stencil = 0;
-    s_rc_depth_tex = gpu_texture_create(s_rc_dev, &td);
-    if (!GPU_VALID(s_rc_depth_tex)) {
-        printf("[D3D12] Depth buffer creation failed\n");
+    const gpu_texture t = gpu_texture_create(s_rc_dev, &td);
+    if (!GPU_VALID(t)) {
+        printf("[D3D12] Depth buffer creation failed (%ux%u)\n", w, h);
         return -1;
     }
+    s_rc_depth_tex = t;
+    s_rc_depth_w = w;
+    s_rc_depth_h = h;
 
     /* The DSV: D24S8 (or D32S8), 2D, mip 0, no flags. */
     s_rc_depth_dsv = rc_target_view(s_rc_depth_tex, GPU_VIEW_DSV, 0, rc_ds_format());
@@ -232,7 +242,7 @@ static int init_d3d12(u32 width, u32 height)
      * typically use a single zeta surface. Its DSV is a view of it.
      * ---------------------------------------------------------------*/
     {
-        if (!start_step("targets", depth_buffer_make() == 0)) return -1;
+        if (!start_step("targets", depth_buffer_make(s_d3d.host_w, s_d3d.host_h) == 0)) return -1;
 
         printf("[D3D12] Depth buffer created (%ux%u %s)\n", width, height, s_rc_d32 ? "D32S8" : "D24S8");
     }
@@ -355,61 +365,92 @@ static int init_d3d12(u32 width, u32 height)
             goto vp_buffers_done;
         }
 
-        /* VP_VB_VERTS=<n>: start the buffer at n vertices rather than
-         * MAX_VERTICES, for a title known to need more (it grows on demand,
-         * but the growth costs a frame; see vp_vb_grow). */
-        { u64 v = (u64)ps3_env_int("VP_VB_VERTS", 0);
-          if (v > MAX_VERTICES && v <= (64ull << 20)) s_vp_cap = (u32)v; }
-        bytes = (u64)s_vp_cap * 256 * 2;     /* generic VP vertex: 16 float4 slots,
-                                          * DOUBLE-buffered by frame parity so a
-                                          * new frame's upload never overwrites
-                                          * vertices the in-flight GPU frame is
-                                          * still reading (was: torn/missing
-                                          * triangles mixing stale+new verts) */
+        /* The VP vertex buffer in chunks (rc_arena, docs/124): generic VP
+         * vertices of 16 float4 slots (256 bytes), each chunk DOUBLE-buffered
+         * by frame parity so a new frame's upload never overwrites vertices
+         * the in-flight GPU frame is still reading (was: torn/missing
+         * triangles mixing stale+new verts). VP_VB_CHUNK=<n> (read once):
+         * vertices a parity half per chunk, a power of two, 16,384 to 131,072
+         * (the default: 64 MB a chunk); one is made to start with and more as frames need
+         * them, up to VP_VB_MAX_VERTS in all (default 2M), as that capped the
+         * one buffer this was. It sat in RAM whole whatever a frame used, and
+         * the port started it at 1.5M vertices (768 MB, VP_VB_VERTS, which
+         * only today's renderer still reads). Steady frames use 5k-55k. */
+        { int v = ps3_env_int("VP_VB_CHUNK", 131072);
+          if (v < 16384) v = 16384;
+          if (v > 131072) v = 131072;   /* (the big buffer starts RC_ARENA_MAX chunks in: a draw's offset is 32 bits) */
+          u32 c = 16384;
+          while (c * 2 <= (u32)v) c *= 2;   /* (a power of two: a shift per draw, not a divide) */
+          s_vb_chunk = c; }
+        { u64 want = 2ull << 20;
+          const char* e = getenv("VP_VB_MAX_VERTS");
+          if (e) { want = strtoull(e, NULL, 0); if (!want) want = 1; }
+          /* A chunk too small for RC_ARENA_MAX - 1 of them to reach the most
+           * grows (else VP_VB_CHUNK would lower the cap: 16,384 gave 1M). */
+          const u32 asked = s_vb_chunk;
+          while (s_vb_chunk < 131072 && (want + s_vb_chunk - 1) / s_vb_chunk > RC_ARENA_MAX - 1) s_vb_chunk *= 2;
+          if (s_vb_chunk != asked)
+              fprintf(stderr, "[RAM] vertex buffer: chunks of %u vertices, not %u, to reach %llu\n", s_vb_chunk,
+                      asked, (unsigned long long)want);
+          const u64 most = (want + s_vb_chunk - 1) / s_vb_chunk;
+          /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
+          rc_arena_init(&s_vb, "vertex buffer", GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u),
+                        (u64)s_vb_chunk * 256, 1, (u32)(most < RC_ARENA_MAX ? most : RC_ARENA_MAX - 1));
+          /* (RC_ARENA_MAX - 1 at most: a full last chunk ends below s_vb_big, the big buffer's start) */
+          s_vb_big = (u64)RC_ARENA_MAX * s_vb.half;
+          s_vp_cap = (u32)((u64)s_vb.most * s_vb_chunk); }
         /* Failure here leaves vp_vb_mapped NULL and every VP draw silently
          * declines to upload -- the scene just does not render, with no error
-         * anywhere. Report the size too: this buffer is
-         * MAX_VERTICES * 256 * 2 bytes and grows fast. */
-        fprintf(stderr, "[VPVB] per-frame vertex buffer: %llu MB (%u verts, x2 parity)%c",
-                (unsigned long long)(bytes >> 20), (unsigned)s_vp_cap, 10);
-        /* (Step V5: the clamp's vertex-shader form reads it at t20 too.) */
-        if (!rc_buf_make(bytes, GPU_USE_VERTEX | (s_uvc_vs ? GPU_USE_RAW : 0u), GPU_MEM_UPLOAD,
-                         &s_rc_vp_vb, &s_d3d.vp_vb_mapped))
+         * anywhere. (Set, it says the chunks are there; draws address them
+         * through s_vb.) */
+        s_d3d.vp_vb_mapped = s_vb.n ? s_vb.map[0] : NULL;
+        if (!s_d3d.vp_vb_mapped)
             fprintf(stderr, "[VPVB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
 
-        bytes = (u64)VP_CB_STRIDE * MAX_DRAWS * 2;      /* per-draw constant slots, x2 parity */
-        /* A failure here is silent and catastrophic: vp_record_cb returns early,
+        /* The per-draw constants, x2 parity, in chunks (rc_arena): vp_cb's
+         * banks 1024 a chunk, vp_fpcb's draws (b1) 2048 a chunk, two chunks
+         * of each to start and more as frames need them, up to MAX_DRAWS.
+         * A failure here is silent and catastrophic: vp_record_cb returns early,
          * every draw loses its constants, and the whole scene transforms by
          * zeros -- indistinguishable from a broken vertex program. Say so. */
-        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB (%d draws)%c",
-                (unsigned long long)(bytes >> 20), MAX_DRAWS, 10);
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_cb, &s_d3d.vp_cb_mapped);
-
-        bytes = (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2;     /* per-draw FP slots (b1), x2 parity */
-        rc_buf_make(bytes, GPU_USE_CONSTANT, GPU_MEM_UPLOAD, &s_rc_vp_fpcb, &s_d3d.vp_fpcb_mapped);
+        bytes = (u64)VP_CB_STRIDE << VP_CB_CHUNK_SHIFT;   /* a parity half of a chunk */
+        fprintf(stderr, "[VPCB] per-draw constant buffer: %llu MB to start, up to %llu MB (%d draws)%c",
+                (unsigned long long)(bytes * 2 * 2 >> 20),
+                (unsigned long long)((u64)VP_CB_STRIDE * MAX_DRAWS * 2 >> 20), MAX_DRAWS, 10);
+        if (!rc_arena_init(&s_rc_vpcb, "vp_cb", GPU_USE_CONSTANT, bytes, 2, MAX_DRAWS >> VP_CB_CHUNK_SHIFT))
+            fprintf(stderr, "[VPCB] ALLOCATION FAILED -- no VP geometry will render%c", 10);
+        rc_arena_init(&s_rc_fpcb, "vp_fpcb", GPU_USE_CONSTANT, (u64)VP_FPCB_STRIDE << VP_FPCB_CHUNK_SHIFT,
+                      2, MAX_DRAWS >> VP_FPCB_CHUNK_SHIFT);
 
         /* GPU vertex fetch ring: each fetch draw's guest vertex bytes and
-         * attribute records, x2 parity like vp_vb. VP_FETCH_RING_MB (read
-         * once, default 64) per half to start with; a draw that does not fit
-         * takes the CPU path, and the ring grows at the frame's end
-         * (vf_grow). */
+         * attribute records, x2 parity like vp_vb, in chunks (rc_arena, s_vf).
+         * VP_FETCH_RING_MB (read once, default 64, rounded down to a power of
+         * two) is a chunk's half; one to start with (the ring's old start, so a
+         * frame that fitted it is laid out as before), more as frames need
+         * them, up to 1024 MB a half in all. A frame that fills a chunk goes on in
+         * the next, so a heavy area's first frame no longer sends its draws to
+         * the CPU path (256 bytes a vertex in vp_vb); only a draw bigger than
+         * a chunk still goes there. */
         { int mb = ps3_env_int("VP_FETCH_RING_MB", 64);
           if (mb < 4) mb = 4; if (mb > 1024) mb = 1024;
-          s_vf_cap = (u32)mb << 20;
-          if (!rc_buf_make((u64)s_vf_cap * 2, GPU_USE_RAW, GPU_MEM_UPLOAD, &s_rc_vf_buf, &s_d3d.vf_mapped))
-              s_vf_cap = 0; }
+          u32 sh = 22;   /* 4 MB, up to the power of two at or below mb */
+          while (sh < 30 && (2u << sh) <= ((u32)mb << 20)) sh++;
+          s_vf_shift = sh;
+          s_vf_cap = rc_arena_init(&s_vf, "vf_buf", GPU_USE_RAW, 1ull << sh, 1, (1u << 30) >> sh)
+                   ? 1u << sh : 0;
+          s_vf.ahead = 7;   /* (a chunk is big: one ahead only for a frame near the end of the last) */ }
 
     vp_buffers_done:
         printf("[D3D12] VP path resources: rootsig=%p vb=%p cb=%p\n",
-               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)s_rc_vp_vb.id,
-               (void*)(uintptr_t)s_rc_vp_cb.id);
+               (void*)(uintptr_t)s_d3d.vp_layout.id, (void*)(uintptr_t)(s_vb.n ? s_vb.buf[0].id : 0),
+               (void*)(uintptr_t)s_rc_vpcb.buf[0].id);
     }
     /* Step V6: on a backend that starts strictly (rc_be_start_strict: Vulkan,
      * whose route then starts today's renderer instead), a frame buffer that
      * could not be made fails the start; elsewhere the start goes on without
      * it, as today's does. */
     if (!start_step("rings", !rc_be_start_strict || !ps3_env_int("RSX_VP_BUFFERS", 1) ||
-                                 (s_d3d.vb_mapped && s_d3d.vp_vb_mapped && s_d3d.vp_cb_mapped && s_d3d.vp_fpcb_mapped)))
+                                 (s_d3d.vb_mapped && s_d3d.vp_vb_mapped && s_rc_vpcb.n && s_rc_fpcb.n)))
         return -1;
 
     printf("[D3D12] Initialization complete (%ux%u, %u buffers, pipeline=%s)\n",

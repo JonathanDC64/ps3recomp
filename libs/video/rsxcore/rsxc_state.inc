@@ -13,8 +13,10 @@
  * build (E_INVALIDARG) and those surfaces never drew. */
 #define RSX_FP_UNITS      16
 #define MAX_DRAWS         16384 /* per-frame draw records. The per-draw
-                                 * constant buffer is VP_CB_STRIDE * MAX_DRAWS
-                                 * * 2 bytes (264 MB of upload heap). 2048,
+                                 * constants were VP_CB_STRIDE * MAX_DRAWS
+                                 * * 2 bytes (264 MB of upload heap) in one
+                                 * buffer; now chunks as frames need them
+                                 * (s_rc_vpcb, s_rc_fpcb). 2048,
                                  * sized from the spawn area's ~1841, was too
                                  * few for a dark room in the first level:
                                  * every draw past it was dropped, the display
@@ -28,6 +30,10 @@
  * own texScale/offset uniforms, so one per-frame snapshot ran every pass
  * with the LAST pass's constants. */
 #define VP_CB_STRIDE      8448
+/* vp_cb banks a chunk (s_rc_vpcb): 1 << 10, 8.25 MB a parity half. A power
+ * of two, so a draw finds its chunk with a shift, not a divide. */
+#define VP_CB_CHUNK_SHIFT 10
+#define VP_CB_CHUNK_MASK  ((1u << VP_CB_CHUNK_SHIFT) - 1u)
 /* b1 per-draw FP slot, in float4s: rsx_texscale[16], rsx_alphatest, then the
  * program's inline constants fp_constants[FPCB_KMAX]. (17 + 128) * 16 = 2320 B,
  * rounded up to D3D12's 256-byte CBV alignment. */
@@ -35,6 +41,9 @@
 #define FPCB_K            17
 #define FPCB_KMAX         128
 #define VP_FPCB_STRIDE    2560
+/* vp_fpcb draws a chunk (s_rc_fpcb): 1 << 11, 5 MB a parity half. */
+#define VP_FPCB_CHUNK_SHIFT 11
+#define VP_FPCB_CHUNK_MASK  ((1u << VP_FPCB_CHUNK_SHIFT) - 1u)
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
 typedef struct {
@@ -98,9 +107,10 @@ typedef struct {
      * reorders or compacts s_d3d.draws (DRAW_KEEP_TEX, DRAW_LAST_TEX,
      * DRAW_LIMIT) would otherwise make every surviving draw read some other
      * object's MVP -- silently transforming it somewhere else entirely. */
-    u32 cb_slot;
-    u32 vcb_slot;       /* vp_cb slot bound: cb_slot, or an earlier draw's this
-                         * frame whose vertex constants are the same (vp_record_cb) */
+    u32 cb_slot;        /* (also the draw's vp_fpcb block) */
+    u32 vcb_slot;       /* vp_cb bank bound: the frame's next bank, or an earlier
+                         * draw's this frame whose vertex constants are the same
+                         * (vp_record_cb numbers them as it writes them) */
     u32 rt_mrt[3];      /* colour targets B,C,D (MRT1/2/3), 0 = none. Deferred
                          * shading G-buffers write 3-4 targets in one pass. */
     u32 rt_w, rt_h;     /* surface clip dims at record time (offscreen RT size) */
@@ -125,9 +135,11 @@ typedef struct {
     u32   ctgt;         /* SET_SURFACE_COLOR_TARGET at record time (0 = none) */
     u32   depth;        /* packed guest depth state (rsx_depth_key, PSO key) */
     /* GPU vertex fetch (VP_GPU_FETCH): the VS reads the guest's vertex arrays
-     * from vf_buf, and the indices are the guest's own. fdesc is the byte
-     * offset of the draw's attribute records in vf_buf's half. fetch is 1
-     * for a triangle list, 2 for a strip with cuts (vf_strip_native). */
+     * from vf_buf, and the indices are the guest's own. fdesc is the virtual
+     * offset (rc_arena) of the draw's attribute records in vf_buf: the draw
+     * binds the chunk that holds it and passes its offset in that chunk.
+     * fetch is 1 for a triangle list, 2 for a strip with cuts
+     * (vf_strip_native). */
     u32   fetch, fdesc;
     /* Step V5: 1 when the pre-pass drew it in the clamp's vertex-shader form
      * (kind 4): uvc_n vertices from the table at uvc_tab (uvc_table). */
@@ -146,7 +158,8 @@ typedef struct {
 typedef struct {
     gpu_texture           tex;         /* the GPU layer's texture (step C5a) */
     gpu_view              rtv;         /* its RTV (step C5a) */
-    gpu_buffer            up_buf;      /* init-upload staging (kept alive): the GPU layer's (step C5a) */
+    gpu_buffer            up_buf;      /* init-upload staging: the GPU layer's (step C5a); into the grave
+                                        * once its copy is recorded, so none after off_rt_get */
     u32                   off, w, h;   /* raw RSX offset + guest dims */
     u32                   hw, hh;      /* the resource's dims (RSX_SCALE) */
     u32                   dxgi;        /* gpu_format of the resource */
@@ -342,15 +355,12 @@ typedef struct {
      * constant bank. This produces exact position + texcoord (vs. the frac
      * approximation). Used for the 2D/dbgfont quad draws. */
     gpu_layout            vp_layout;            /* CBV(b0) + SRV table + sampler (step C3b) */
-    void*                 vf_mapped;            /* GPU vertex fetch ring (x2 parity): s_rc_vf_buf */
     gpu_pipeline          pipeline_state_vp;    /* decompiled VS + atlas PS      */
     gpu_pipeline          pipeline_state_vp_color; /* decompiled VS + colour PS (untextured 3D) */
-    void*                 vp_vb_mapped;         /* raw float4 attrib0, per-frame: s_rc_vp_vb */
+    void*                 vp_vb_mapped;         /* set while vp_vb's chunks are there (s_vb); not an address */
     u32                   vp_vb_offset;
     void*                 vp_ib_mapped;         /* u32 indices of the VP draws, per-frame: s_rc_vp_ib */
     u32                   vp_ib_offset;         /* in indices */
-    void*                 vp_cb_mapped;         /* per-draw VP constant slots: s_rc_vp_cb */
-    void*                 vp_fpcb_mapped;       /* per-draw FP texscale (b1): s_rc_vp_fpcb */
     int                   vp_ready;             /* VS+PSO compiled ok            */
     u32                   vp_compiled_bytes;    /* ucode size when last compiled */
     gpu_shader            vp_vs_shader;         /* kept for guest-FP PSO builds (step C3b: a shader) */
@@ -385,7 +395,11 @@ typedef struct {
     /* Per-frame draw recording */
     int                   frame_recording; /* 1 if cmd list is open for recording */
     u32                   draw_count;      /* draws this frame */
-    D3D12DrawRecord       draws[MAX_DRAWS];
+    /* MAX_DRAWS records (17.75 MB), made by rc_backend_init and kept for a
+     * start after it. (As an array here they were in the exe's static data
+     * once for each backend's copy of this file, d3d12, vulkan and null,
+     * though only the running one's is used. docs/124.) */
+    D3D12DrawRecord*      draws;
 
     /* Pointer to current RSX state (set before draw calls) */
     const rsx_state*      current_rsx_state;
@@ -448,25 +462,33 @@ static char s_hotshot_name[40];   /* F9's live presents: "cap_NNN", else "" */
 static u32 s_clear_presents;   /* defined with the clear path */
 static u32 s_pc_flip_render, s_pc_flip_nodisp, s_pc_clear_nodisp, s_pc_clear_sameflip, s_pc_clear_small;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
-/* VP vertex buffer capacity, in vertices per frame-parity half. Starts at
- * MAX_VERTICES and grows when a frame asks for more (vp_vb_grow): a Demon's
- * Souls level frame filled all 393,216 and every later draw was dropped --
- * the rest of the scene, the bloom/luminance/tone-map chain and the final
- * composite -- so the exposure never updated and the level stayed dark. */
+/* The vertices vp_vb's chunks can hold in all (s_vb, below), for the logs and
+ * flip_without_display's full test. The one buffer it was grew when a frame
+ * asked for more: a Demon's Souls level frame filled all 393,216 and every
+ * later draw was dropped -- the rest of the scene, the bloom/luminance/
+ * tone-map chain and the final composite -- so the exposure never updated
+ * and the level stayed dark. */
 static u32 s_vp_cap = MAX_VERTICES;
 static u64 s_vp_want = 0;   /* vertices this frame's VP draws asked for */
 /* VP index buffer capacity, in indices per parity half, and what this frame's
  * indexed uploads asked for. 0 until the first frame end creates it. */
 static u32 s_vp_icap = 0;
-static u32 s_vf_cap = 0;    /* bytes per parity half of vf_buf */
-static u32 s_vf_off = 0;    /* bytes used in this frame's half */
-static u64 s_vf_short = 0;  /* bytes this frame's fetch draws found no room for (vf_grow) */
-/* The last GPU-fetch descriptor (upload_strip_vp_fetch). */
+static u32 s_vf_cap = 0;    /* bytes per parity half of a vf_buf chunk (s_vf), a power of two */
+static u32 s_vf_shift = 0;  /* its log2: chunk k starts at virtual offset k << s_vf_shift */
+static u32 s_vf_off = 0;    /* bytes used in this frame, as a virtual offset (rc_arena) */
+/* The chunk this frame writes in: virtual [s_vf_lo, s_vf_end), both 0 until
+ * the frame's first descriptor, and s_vf_wp its half for this frame (the
+ * CPU's pointer to s_vf_lo). Kept so a draw's upload neither divides nor
+ * looks the chunk up (upload_strip_vp_fetch). */
+static u32 s_vf_lo = 0, s_vf_end = 0;
+static u8* s_vf_wp = NULL;
+/* The last GPU-fetch descriptor (upload_strip_vp_fetch). Its offsets are
+ * virtual ones, in the chunk this frame writes in. */
 static struct {
     int valid; u32 epoch, fdesc, end, nsp;
     u32 g0[16], g1[16], r0[16];   /* guest [g0,g1) copied to ring offset r0 */
     u32 ve[16];                   /* each span's VF_ONCE entry if copied here, or ~0 */
-    u32 x[16];                    /* the records' x, slot by slot */
+    u32 x[16];                    /* the records' x, slot by slot (a record holds it less s_vf_lo) */
 } s_fx;
 /* The span copies made in this stretch of the stream (upload_strip_vp_fetch,
  * VF_ONCE), by guest start. A stretch ends at each point where the title can
@@ -502,18 +524,14 @@ static u64 s_vp_iwant = 0;
  * Their GPU addresses are gpu_buffer_addr's (per draw
  * gpu_fast_buffer_addr's) plus today's offsets. */
 static gpu_buffer s_rc_vertex_buf;     /* the fixed-function vertex buffer (vb_mapped) */
-static gpu_buffer s_rc_vp_vb;          /* the VP draws' vertices (vp_vb_mapped) */
 static gpu_buffer s_rc_vp_ib;          /* their indices (vp_ib_mapped) */
-static gpu_buffer s_rc_vp_cb;          /* their constants (vp_cb_mapped) */
-static gpu_buffer s_rc_vp_fpcb;        /* their FP texscales (vp_fpcb_mapped) */
-static gpu_buffer s_rc_vf_buf;         /* the vertex fetch ring (vf_mapped) */
 static gpu_buffer s_rc_readback_buf;   /* the dump's readback buffer */
-/* The rings vp_vb_grow, vp_ib_grow and vf_grow replaced ([0] vp_vb, [1] vp_ib,
- * [2] vf_buf), with the frame slot that last drew from each: destroyed with
- * that frame's fence at the next render_frame's start (rc_ring_release), where
+/* The ring vp_ib_grow replaced ([1]; [0] was vp_vb's, before its chunks,
+ * rc_arena), with the frame slot that last drew from it: destroyed with that
+ * frame's fence at the next render_frame's start (rc_ring_release), where
  * today's deferred release let them go. */
-static gpu_buffer s_rc_ring_old[3];
-static u32        s_rc_ring_old_slot[3];
+static gpu_buffer s_rc_ring_old[2];
+static u32        s_rc_ring_old_slot[2];
 
 /* A committed buffer of `bytes` in GPU_MEM_UPLOAD (GENERIC_READ) or
  * GPU_MEM_READBACK (COPY_DEST) memory, as *b and, with map, its pointer for
@@ -544,16 +562,272 @@ static void rc_ring_retire(int i, gpu_buffer old)
  * each with the fence of the frame that drew from it (passed by now). */
 static void rc_ring_release(void)
 {
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (!GPU_VALID(s_rc_ring_old[i])) continue;
         gpu_buffer_destroy(s_rc_dev, s_rc_ring_old[i], s_rc_frame_fence[s_rc_ring_old_slot[i]]);
         s_rc_ring_old[i].id = 0;
     }
 }
+
+/* The per-draw upload buffers in chunks (docs/124). Each was one upload heap
+ * sized for the worst frame (vp_vb 768 MB at the port's VP_VB_VERTS, vp_cb
+ * 264 MB, vp_fpcb 80 MB), and an upload heap sits in RAM whole, used or not.
+ * Now each is a list of chunks of one size, each with its two parity halves.
+ * A frame's data sits at a virtual offset: chunk = offset / half, the rest
+ * the offset in that chunk's half, and nothing lies across a chunk's end
+ * (rc_arena_fit). The GPU sees the same bytes at the same offsets inside a
+ * chunk; a draw binds the chunk it reads. Chunks are made as frames need them
+ * and kept. When a frame gets past half of the last chunk, one more is made
+ * at its end (rc_arena_frame_end), so a frame that grows a little never waits
+ * for a new buffer; only a frame that jumps past that makes one in its middle.
+ * One piece bigger than a chunk (a single draw's vertices) goes to the
+ * arena's big buffer, at the virtual offsets from RC_ARENA_MAX chunks on. */
+#define RC_ARENA_MAX 64u
+typedef struct {
+    const char* name;            /* the log's */
+    u32 use;                     /* GPU_USE_* */
+    u64 half;                    /* bytes per parity half of a chunk */
+    u32 shift;                   /* log2(half) when half is a power of two (no divide per draw), else 0 */
+    u32 n, most;                 /* chunks made; at most */
+    u32 hi;                      /* chunks this frame reached (the highest written + 1) */
+    u32 ahead;                   /* eighths of the last chunk a frame passes for one more to be made */
+    u32 peak;                    /* the most any frame reached (said once per new peak) */
+    u64 end;                     /* the end of what this frame placed (virtual, chunks only) */
+    u64 used[RC_ARENA_MAX];      /* each chunk's end of what this frame placed (in the chunk) */
+    gpu_buffer buf[RC_ARENA_MAX];
+    u8* map[RC_ARENA_MAX];
+    gpu_addr va[RC_ARENA_MAX];
+    /* The big buffer: two halves of big_half bytes, made when a piece bigger
+     * than a chunk first comes, bumped from big_off each frame. A frame that
+     * outgrows it after placing something in it makes a bigger one at its end
+     * (the old one goes with the fence of the frame that last read it). */
+    gpu_buffer big, big_old;
+    u8* big_map;
+    gpu_addr big_va;
+    u64 big_half, big_off, big_want;
+    u32 big_old_slot;
+} rc_arena;
+
+/* The chunk of virtual offset `off` (RC_ARENA_MAX or more: the big buffer). */
+static inline u64 rc_arena_k(const rc_arena* a, u64 off)
+{
+    return a->shift ? off >> a->shift : off / a->half;
+}
+
+/* Make chunks up to index k. 1 when chunk k is there. */
+static int rc_arena_make(rc_arena* a, u32 k)
+{
+    while (a->n <= k) {
+        if (a->n >= a->most) return 0;
+        gpu_buffer b; void* mp = NULL;
+        if (!rc_buf_make(a->half * 2, a->use, GPU_MEM_UPLOAD, &b, &mp) || !mp) {
+            if (GPU_VALID(b)) gpu_buffer_destroy(s_rc_dev, b, 0);   /* made, not mapped: never used */
+            fprintf(stderr, "[RAM] %s: chunk %u (%llu MB) could not be made; staying at %u%c",
+                    a->name, a->n, (unsigned long long)(a->half * 2 >> 20), a->n, 10);
+            a->most = a->n;
+            return 0;
+        }
+        a->buf[a->n] = b;
+        a->map[a->n] = (u8*)mp;
+        a->va[a->n] = gpu_buffer_addr(s_rc_dev, b);
+        a->n++;
+    }
+    return 1;
+}
+
+/* The big buffer at `half` bytes a parity half (the old one, if any, goes
+ * with this frame's fence at the next render_frame). 1 when it is there. */
+static int rc_arena_big_make(rc_arena* a, u64 half)
+{
+    gpu_buffer b; void* mp = NULL;
+    if (!rc_buf_make(half * 2, a->use, GPU_MEM_UPLOAD, &b, &mp) || !mp) {
+        if (GPU_VALID(b)) gpu_buffer_destroy(s_rc_dev, b, 0);
+        fprintf(stderr, "[RAM] %s: a big buffer of %llu MB could not be made%c", a->name,
+                (unsigned long long)(half * 2 >> 20), 10);
+        return 0;
+    }
+    if (GPU_VALID(a->big)) {
+        if (GPU_VALID(a->big_old)) gpu_buffer_destroy(s_rc_dev, a->big_old, s_rc_frame_fence[a->big_old_slot]);
+        a->big_old = a->big;
+        a->big_old_slot = s_d3d.frame_index;
+    }
+    a->big = b;
+    a->big_map = (u8*)mp;
+    a->big_va = gpu_buffer_addr(s_rc_dev, b);
+    a->big_half = half;
+    fprintf(stderr, "[RAM] %s: big buffer for pieces over a chunk: %llu MB%c", a->name,
+            (unsigned long long)(half * 2 >> 20), 10);
+    return 1;
+}
+
+/* An arena of `start` chunks of `half` bytes a parity half (at most `most`,
+ * capped at RC_ARENA_MAX). 1 when the first chunk is there. */
+static int rc_arena_init(rc_arena* a, const char* name, u32 use, u64 half, u32 start, u32 most)
+{
+    memset(a, 0, sizeof *a);
+    a->name = name; a->use = use; a->half = half; a->ahead = 4;
+    if (half && !(half & (half - 1))) while ((1ull << a->shift) < half) a->shift++;
+    a->most = most < RC_ARENA_MAX ? most : RC_ARENA_MAX;
+    if (!start) start = 1;
+    rc_arena_make(a, start - 1);
+    fprintf(stderr, "[RAM] %s: %u chunk(s) of %llu MB (%llu MB a half), up to %u%c", name, a->n,
+            (unsigned long long)(half * 2 >> 20), (unsigned long long)(half >> 20), a->most, 10);
+    return a->n > 0;
+}
+
+/* Where `bytes` go at or after virtual offset `at` without crossing a chunk's
+ * end: `at` itself, or the next chunk's start (made now if it is not there:
+ * the frame jumped past the spare). More than a chunk goes to the big buffer
+ * (made now if this frame has nothing in it yet). ~0 when they cannot be
+ * placed: no buffer could be made, or the big buffer is in use this frame
+ * and too small (it grows at the frame's end). */
+static u64 rc_arena_fit(rc_arena* a, u64 at, u64 bytes)
+{
+    if (bytes > a->half) {
+        const u64 o = (a->big_off + 255u) & ~255ull;
+        if (o + bytes > a->big_want) a->big_want = o + bytes;
+        if (o + bytes > a->big_half &&
+            (a->big_off || !rc_arena_big_make(a, (bytes + bytes / 2 + 0xFFFFFull) & ~0xFFFFFull)))
+            return ~0ull;
+        a->big_off = o + bytes;
+        return (u64)RC_ARENA_MAX * a->half + o;
+    }
+    u64 k = rc_arena_k(a, at);
+    if (at - k * a->half + bytes > a->half) { k++; at = k * a->half; }
+    if (k >= a->n) {
+        if (k >= a->most || !rc_arena_make(a, (u32)k)) return ~0ull;
+        fprintf(stderr, "[RAM] %s: a frame needed chunk %u in its middle (%u made)%c",
+                a->name, (u32)k + 1, a->n, 10);
+    }
+    if ((u32)k + 1 > a->hi) a->hi = (u32)k + 1;
+    if (at + bytes > a->end) a->end = at + bytes;
+    if (at - k * a->half + bytes > a->used[k]) a->used[k] = at - k * a->half + bytes;
+    return at;
+}
+
+/* Parity half `par` of the chunk (or the big buffer) that holds virtual
+ * offset `off`: the CPU's pointer to the byte, and the GPU's address of it. */
+static inline u8* rc_arena_ptr_par(const rc_arena* a, u64 off, u32 par)
+{
+    const u64 k = rc_arena_k(a, off);
+    if (k >= RC_ARENA_MAX)
+        return a->big_map + (u64)par * a->big_half + (off - (u64)RC_ARENA_MAX * a->half);
+    return a->map[k] + (u64)par * a->half + (off - k * a->half);
+}
+static inline u8* rc_arena_ptr(const rc_arena* a, u64 off)
+{
+    return rc_arena_ptr_par(a, off, (u32)s_d3d.vp_parity);
+}
+static inline gpu_addr rc_arena_va(const rc_arena* a, u64 off)
+{
+    const u64 k = rc_arena_k(a, off);
+    if (k >= RC_ARENA_MAX)
+        return a->big_va + (u64)s_d3d.vp_parity * a->big_half + (off - (u64)RC_ARENA_MAX * a->half);
+    return a->va[k] + (u64)s_d3d.vp_parity * a->half + (off - k * a->half);
+}
+/* The GPU address of chunk k's half for this frame (a whole-chunk bind; k at
+ * RC_ARENA_MAX or more is the big buffer), its size, and the chunk of an
+ * offset with the offset inside it. */
+static inline gpu_addr rc_arena_base(const rc_arena* a, u32 k)
+{
+    if (k >= RC_ARENA_MAX) return a->big_va + (u64)s_d3d.vp_parity * a->big_half;
+    return a->va[k] + (u64)s_d3d.vp_parity * a->half;
+}
+static inline u64 rc_arena_size(const rc_arena* a, u32 k)
+{
+    return k >= RC_ARENA_MAX ? a->big_half : a->half;
+}
+static inline u32 rc_arena_chunk(const rc_arena* a, u64 off)
+{
+    const u64 k = rc_arena_k(a, off);
+    return k >= RC_ARENA_MAX ? RC_ARENA_MAX : (u32)k;
+}
+static inline u64 rc_arena_local(const rc_arena* a, u64 off)
+{
+    const u32 k = rc_arena_chunk(a, off);
+    return off - (u64)k * a->half;
+}
+/* The frame wrote up to virtual offset `end` (chunks only): for the users that
+ * place by their own counters and ask rc_arena_fit only for a chunk's first
+ * piece (vf_buf, the banks), so the chunk's end (used) and the chunk ahead
+ * at the frame's end see what they wrote. */
+static void rc_arena_mark(rc_arena* a, u64 end)
+{
+    if (!end) return;
+    const u64 k = rc_arena_k(a, end - 1);
+    if (k >= a->n) return;
+    if (end - k * a->half > a->used[k]) a->used[k] = end - k * a->half;
+    if (end > a->end) a->end = end;
+}
+
+/* At the frame's end: a new peak goes to the log; when the frame got past
+ * `ahead` eighths of the last chunk made (half, unless the user of the arena
+ * says), one more is made ahead for the frames to come; a big buffer the
+ * frame outgrew is made bigger. */
+static void rc_arena_frame_end(rc_arena* a)
+{
+    if (a->hi > a->peak) {
+        a->peak = a->hi;
+        fprintf(stderr, "[RAM] %s: a frame used %u chunk(s) (%llu MB)%c", a->name, a->peak,
+                (unsigned long long)(a->peak * a->half * 2 >> 20), 10);
+    }
+    if (a->n && a->n < a->most && a->end > (u64)(a->n - 1) * a->half + a->half / 8 * a->ahead)
+        rc_arena_make(a, a->n);
+    if (a->big_want > a->big_half)
+        rc_arena_big_make(a, (a->big_want + a->big_want / 2 + 0xFFFFFull) & ~0xFFFFFull);
+    a->hi = 0; a->end = 0; a->big_off = 0; a->big_want = 0;
+    memset(a->used, 0, sizeof a->used);
+}
+
+/* At render_frame's start, after its wait (as rc_ring_release): a big buffer
+ * replaced since, with the fence of the frame that last read it. */
+static void rc_arena_release(rc_arena* a)
+{
+    if (!GPU_VALID(a->big_old)) return;
+    gpu_buffer_destroy(s_rc_dev, a->big_old, s_rc_frame_fence[a->big_old_slot]);
+    a->big_old.id = 0;
+}
+
+/* The VP vertex buffer (vp_vb) in chunks of s_vb_chunk vertices a parity half
+ * (VP_VB_CHUNK). Draws place their vertices with vb_room (rsxc_vertex.inc); a
+ * draw's vb_byte_offset is its virtual offset, and render_frame binds the
+ * chunk that holds it. */
+static rc_arena s_vb;
+static u32 s_vb_chunk = 131072;
+static u64 s_vb_big = ~0ull;   /* the big buffer's first virtual offset (RC_ARENA_MAX chunks in) */
+static u32 s_vb_at;            /* where the last vb_room put its vertices */
+static u64 s_vb_cursor;        /* the chunks' place while vp_vb_offset is in the big buffer */
+static u32 s_vb_carry;         /* for the next vb_room: the open triangle's vertices it copies ahead (tri_carry) */
+static u32 s_vb_carried;       /* the vertices the last vb_room copied ahead of the draw's (at s_vb_at) */
+static u32 s_vb_most;          /* the biggest draw so far, in vertices */
 /* VP_VSTAT=<N> (live): every N frames, print the VP uploads' vertex traffic:
  * vertices fetched from guest memory, vertices written to the upload heap,
  * uploads by primitive, and the mean enabled-attribute count per fetch. */
 static u64 s_vs_fetch, s_vs_attr, s_vs_up[4];
+/* The vertex fetch ring (vf_buf) as chunks (rc_arena; made in rsxc_init.inc's
+ * "GPU vertex fetch ring"). Here rather than with the s_vf_* above, which
+ * come before rc_arena's type. */
+static rc_arena s_vf;
+/* The per-draw constants in chunks (docs/124 steps 3 and 4). They were one
+ * upload heap each for MAX_DRAWS draws (vp_cb 264 MB, vp_fpcb 80 MB), and a
+ * frame uses a few hundred banks and a few thousand draws. vp_cb holds the
+ * vertex-constant banks by bank number (vp_record_cb numbers a frame's banks
+ * as it writes them, and VP_CB_REUSE has draws share one); vp_fpcb holds each
+ * draw's b1 block by draw number (cb_slot). The pointers below are given the
+ * parity half: a capture, made after the frame's flip, reads the other one. */
+static rc_arena s_rc_vpcb, s_rc_fpcb;
+static inline int vpcb_has(u32 bank) { return (bank >> VP_CB_CHUNK_SHIFT) < s_rc_vpcb.n; }
+static inline int fpcb_has(u32 slot) { return (slot >> VP_FPCB_CHUNK_SHIFT) < s_rc_fpcb.n; }
+static inline u8* vpcb_ptr(u32 bank, u32 par)
+{
+    return s_rc_vpcb.map[bank >> VP_CB_CHUNK_SHIFT] + (u64)par * s_rc_vpcb.half
+         + (u64)(bank & VP_CB_CHUNK_MASK) * VP_CB_STRIDE;
+}
+static inline u8* fpcb_ptr(u32 slot, u32 par)
+{
+    return s_rc_fpcb.map[slot >> VP_FPCB_CHUNK_SHIFT] + (u64)par * s_rc_fpcb.half
+         + (u64)(slot & VP_FPCB_CHUNK_MASK) * VP_FPCB_STRIDE;
+}
 /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like
@@ -721,6 +995,7 @@ static const gpu_texture k_rc_no_tex = {0};       /* none: an empty entry */
 static gpu_view       s_rc_rt_rtv[FRAME_COUNT];       /* the display targets' RTVs */
 static gpu_texture    s_rc_depth_tex;                 /* the shared depth buffer */
 static gpu_view       s_rc_depth_dsv;
+static u32            s_rc_depth_w, s_rc_depth_h;     /* its size (host; depth_buffer_fit) */
 static gpu_view       s_rc_swap_rtv[RC_SWAP_MAX];     /* the swap chain images' RTVs */
 
 /* A colour (GPU_VIEW_RTV) or depth (GPU_VIEW_DSV) view of t, made once and

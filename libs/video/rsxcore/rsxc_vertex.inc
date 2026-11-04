@@ -714,6 +714,77 @@ static void dbg_vtx_dump(const rsx_state* state, const VPSlot* out, u32 first, u
       } }
 }
 
+/* Room in vp_vb (its chunks, rc_arena: s_vb) for `want` vertices at
+ * vp_vb_offset: they go there, or at the next chunk's start when this chunk
+ * has less room left; a draw bigger than a chunk goes to the big buffer, and
+ * the chunks' place is kept for the draws after (s_vb_cursor). vp_vb_offset
+ * and s_vb_at move to where they go, *out points there. The vertices there is
+ * room for: want, or 0 when no buffer could be made (the draw is dropped, as
+ * a full buffer's were).
+ *
+ * With s_vb_carry set (a TRIANGLES range that continues the last draw,
+ * tri_carry) and the vertices going elsewhere than right after that draw's,
+ * the triangle it left open is copied there first: s_vb_at is its start,
+ * *out the range's first vertex, s_vb_carried how many went ahead. */
+static u32 vb_room(u32 want, VPSlot** out)
+{
+    const u32 carry = s_vb_carry;
+    s_vb_carry = 0; s_vb_carried = 0;
+    const u64 prev = s_d3d.vp_vb_offset;   /* (right after the last draw's vertices) */
+    u64 from = prev;
+    if (from >= s_vb_big) from = s_vb_cursor;   /* (the last draw went to the big buffer) */
+    const u64 at = rc_arena_fit(&s_vb, from, (u64)(want + carry) * VP_VERT_STRIDE);
+    if (at == ~0ull) {
+        s_drop_draws++;
+        { static int said = 0;
+          if (!said++) fprintf(stderr, "[VPVB] no room for a draw of %u vertices: dropped%c", want, 10); }
+        *out = (VPSlot*)rc_arena_ptr(&s_vb, 0);   /* (nothing is written) */
+        return 0;
+    }
+    if (at >= s_vb_big) s_vb_cursor = from;
+    if (want > s_vb_most) {
+        s_vb_most = want;
+        if (want >= 16384u) fprintf(stderr, "[VPVB] the biggest draw so far: %u vertices%c", want, 10);
+    }
+    s_vb_at = (u32)at;
+    *out = (VPSlot*)rc_arena_ptr(&s_vb, at);
+    if (carry && (at != prev || !rc_arena_local(&s_vb, at))) {   /* (not right after it, or a chunk's start) */
+        memcpy(*out, rc_arena_ptr(&s_vb, prev - (u64)carry * VP_VERT_STRIDE), (size_t)carry * VP_VERT_STRIDE);
+        *out += (size_t)carry * 16;
+        s_vb_carried = carry;
+    }
+    s_d3d.vp_vb_offset = (u32)(at + (u64)s_vb_carried * VP_VERT_STRIDE);
+    return want;
+}
+
+/* Whether `want` more vertices fit right at vp_vb_offset, in the chunk that
+ * holds the vertices before it: a strip range that extends the last draw
+ * must sit next to that draw's vertices. */
+static int vb_fits(u64 want)
+{
+    const u64 at = s_d3d.vp_vb_offset;
+    if (at >= s_vb_big || at % s_vb.half == 0) return 0;
+    return at % s_vb.half + want * VP_VERT_STRIDE <= s_vb.half;
+}
+
+/* For a TRIANGLES range at `first` that continues the last draw (the merges
+ * in rsxc_record2.inc: the same BEGIN/END and program, no indices, its
+ * vertices ending at vp_vb_offset), the vertices of the triangle that draw
+ * left open. The RSX assembles the ranges as one stream (256 vertices each,
+ * not a multiple of 3); a range that starts a new chunk cannot extend the
+ * draw, so vb_room copies those vertices ahead of it to keep it in step. */
+static u32 tri_carry(u32 first)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st || !s_d3d.merge_prev_draw || !s_d3d.draw_count || s_d3d.merge_first_end != first) return 0;
+    const D3D12DrawRecord* pv = &s_d3d.draws[s_d3d.draw_count - 1];
+    if (!pv->is_vp || pv->topology != RSX_TOPOLOGY_TRIANGLES || pv->index_count || pv->fetch ||
+        pv->fp_addr != st->shader_program || pv->begin_epoch != st->begin_epoch ||
+        pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE != s_d3d.vp_vb_offset)
+        return 0;
+    return pv->vertex_count % 3u;
+}
+
 static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
@@ -722,11 +793,10 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 quads = count / 4;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
+    VPSlot* out;
+    u32 maxv = vb_room(quads * 6, &out);
     if (quads * 6 > maxv) quads = maxv / 6;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
@@ -758,14 +828,13 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    VPSlot* out;
+    u32 maxv = vb_room(count, &out);
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
                     state->shader_program, count, maxv, 10); }
         count = maxv - (maxv % 3); }
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       for (u32 k = 0; k < count; k++)
           read_vp_vertex(state, first + k, &out[k*16]);
@@ -808,11 +877,10 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     vp_plan_begin(state);
     if (count < 3) return 0;
     u32 tris = count - 2;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)tris * 3;
+    VPSlot* out;
+    u32 maxv = vb_room(tris * 3, &out);
     if (tris * 3 > maxv) tris = maxv / 3;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
@@ -885,11 +953,10 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     u32 quads = count / 4;
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     s_vp_want += (u64)quads * 6;
+    VPSlot* out;
+    u32 maxv = vb_room(quads * 6, &out);
     if (quads * 6 > maxv) quads = maxv / 6;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     u32 o = 0;
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
@@ -929,14 +996,13 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+    VPSlot* out;
+    u32 maxv = vb_room(count, &out);
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
                     state->shader_program, count, maxv, 10); }
         count = maxv - (maxv % 3); }
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       if (!state->restart_index_enable) {
           for (u32 k = 0; k < count; k++)
@@ -1191,9 +1257,12 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
           while ((t.QuadPart - t0.QuadPart) * 1000000000LL / fq < slow); } }
     vp_attrs_dbg(state);
     vp_plan_begin(state);
-    u32 maxv = (s_vp_cap * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
-        + (u64)s_d3d.vp_parity * s_vp_cap * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+    /* Room for the most the strip can write: three vertices a guest index
+     * (the list path; the indexed one writes each vertex once, while the
+     * vertex cache keeps it), never more than a chunk. */
+    VPSlot* out;
+    const u64 most = (u64)count * 3;
+    const u32 maxv = vb_room(most < s_vb_chunk ? (u32)most : s_vb_chunk, &out);
     /* Expand to a triangle list, one index at a time:
      *  - Strip triangles alternate winding; every odd one is emitted with its
      *    first two vertices swapped (as the non-indexed path does), or culling
@@ -1316,7 +1385,14 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
  * guest byte spans they point into. A record's x is where vertex 0's
  * element would sit, so one descriptor serves every range of a strip whose
  * bytes it holds; a range reaching past the last span appends to it when
- * nothing was written after it. */
+ * nothing was written after it.
+ *
+ * vf_buf is in chunks (rc_arena, s_vf). A descriptor and every span it
+ * points at lie in one chunk, the one render_frame binds at t20 for its
+ * draws, so the records' x and the offset the shader is given are from that
+ * chunk's start; fdesc and s_fx keep virtual offsets. A frame that fills a
+ * chunk goes on in the next; only a descriptor bigger than a chunk takes the
+ * CPU path. */
 static u32 s_up_fdesc;
 static u64 s_vf_stat[6];   /* new, reuse, append, sparse, type/addr, room */
 
@@ -1324,7 +1400,7 @@ static int vf_on(void)
 {
     static int en = -1;
     PS3_KNOB(en, ps3_env_int("VP_GPU_FETCH", 1));
-    return en && s_d3d.vf_mapped && s_vf_cap && s_vp_fast && !late_on();
+    return en && s_vf_cap && s_vp_fast && !late_on();   /* (s_vf_cap: vf_buf's chunks are there) */
 }
 
 /* The guest address of the main-memory bytes [a,b), or ~0 when they are not
@@ -1505,8 +1581,11 @@ static int s_up_strip;   /* the last upload_strip_vp_fetch wrote a strip */
  * of copies a frame repeated bytes of the same stretch. A copy grows its
  * entry with what later draws of its descriptor append to it, and a
  * descriptor that points at a copy takes all of it, so the next pass's
- * draws that continue the first find their ranges there. The vertex
- * worker's sync hook ends the stretches, workers or not (vpj_threads).
+ * draws that continue the first find their ranges there. Only a copy in the
+ * chunk the new descriptor is in counts (its draw sees that chunk alone at
+ * t20): a frame that moved on to the next chunk copies such a span again,
+ * once there. The vertex worker's sync hook ends the stretches, workers or
+ * not (vpj_threads).
  * VF_ONCE_CHECK=1 (debug, slow) compares each reused range with guest
  * memory and counts those that differ. */
 static int vfo_on(void)
@@ -1521,11 +1600,12 @@ static u32 vfo_pset(u32 page) { return page * 2654435761u >> 23; }
 static VFOEntry* vfo_at(u32 e) { return &s_vfo[e / VFO_WAYS][e % VFO_WAYS]; }
 static int vfo_holds(const VFOEntry* E, u32 g0, u32 g1)
 {
-    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1;
+    return E->ep == s_vfo_ep && E->g0 <= g0 && g1 <= E->g1 && E->r0 - s_vf_lo < s_vf_cap;
 }
 /* The entry (set * VFO_WAYS + way) of this stretch whose copy holds guest
- * [g0,g1): one that starts at g0, else one of g0's page. ~0 if none. */
-static u32 vfo_find(const u8* base, u32 g0, u32 g1)
+ * [g0,g1) in the chunk this frame writes in: one that starts at g0, else one
+ * of g0's page. ~0 if none. */
+static u32 vfo_find(u32 g0, u32 g1)
 {
     u32 e = ~0u;
     const u32 s = vfo_set(g0);
@@ -1545,7 +1625,7 @@ static u32 vfo_find(const u8* base, u32 g0, u32 g1)
         const VFOEntry* E = vfo_at(e);
         vpj_sync();
         n++;
-        if (memcmp(base + E->r0 + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
+        if (memcmp(s_vf_wp + (E->r0 - s_vf_lo) + (g0 - E->g0), vm_base + g0, g1 - g0)) bad++;
         if (n % 20000u == 0)
             fprintf(stderr, "[VF] once: %llu reused ranges checked, %llu differ from guest memory%c",
                     (unsigned long long)n, (unsigned long long)bad, 10);
@@ -1685,9 +1765,11 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             if (ok && ng1) {
                 const u32 j = s_fx.nsp - 1;
                 const u32 g1 = (ng1 + 3u) & ~3u, add = g1 - s_fx.g1[j];
-                if ((u64)s_vf_off + add <= s_vf_cap) {
-                    vf_copy((u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap + s_vf_off,
-                            s_fx.g1[j], add);
+                /* Only inside the descriptor's chunk, the one this frame
+                 * writes in (it is the last descriptor); past its end the
+                 * range takes a new descriptor in the next. */
+                if ((u64)s_vf_off + add <= s_vf_end) {
+                    vf_copy(s_vf_wp + (s_vf_off - s_vf_lo), s_fx.g1[j], add);
                     s_vf_off += add; s_fx.end = s_vf_off; s_fx.g1[j] = g1;
                     vfo_grow(j, g1);
                     s_vf_stat[2]++;
@@ -1711,8 +1793,23 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
             }
             u64 total = 512;
             for (u32 j = 0; j < nsp; j++) total += g1[j] - g0[j];
-            if ((u64)s_vf_off + total > s_vf_cap) { s_vf_stat[5]++; s_vf_short += total; return -1; }
-            u8* base = (u8*)s_d3d.vf_mapped + (u64)s_d3d.vp_parity * s_vf_cap;
+            /* Bigger than a chunk: the CPU path (rc_arena_fit is never asked
+             * for more than a chunk). */
+            if (total > s_vf_cap) { s_vf_stat[5]++; return -1; }
+            if ((u64)s_vf_off + total > s_vf_end) {
+                /* Past the end of the chunk this frame writes in, or its
+                 * first descriptor: the next chunk (made now when the frame
+                 * has used the spare too), or none to be had. */
+                const u64 at = rc_arena_fit(&s_vf, s_vf_off, total);
+                if (at == ~0ull) { s_vf_stat[5]++; return -1; }
+                rc_arena_mark(&s_vf, s_vf_off);   /* (the chunk left: its end, for uvc_table) */
+                s_vf_off = (u32)at;
+                s_vf_lo = s_vf_off >> s_vf_shift << s_vf_shift;
+                s_vf_end = s_vf_lo + s_vf_cap;
+                s_vf_wp = rc_arena_ptr(&s_vf, s_vf_lo);
+            }
+            u8* const base = s_vf_wp;      /* this frame's half of that chunk, */
+            const u32 lo = s_vf_lo;        /* which starts at virtual offset lo */
             const u32 fdesc = s_vf_off;
             u32 r = fdesc + 512;
             const int once = vfo_on();
@@ -1725,9 +1822,9 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                     s_vfo_reused += g1[j] - g0[j];
                     continue;
                 }
-                const u32 e = once ? vfo_find(base, g0[j], g1[j]) : ~0u;
+                const u32 e = once ? vfo_find(g0[j], g1[j]) : ~0u;
                 if (e == ~0u) {
-                    vf_copy(base + r, g0[j], g1[j] - g0[j]);
+                    vf_copy(base + (r - lo), g0[j], g1[j] - g0[j]);
                     s_fx.g0[j] = g0[j]; s_fx.g1[j] = g1[j]; s_fx.r0[j] = r;
                     s_fx.ve[j] = once ? vfo_add(g0[j], g1[j], r) : ~0u;
                     r += g1[j] - g0[j];
@@ -1751,13 +1848,13 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
                 u32 j = 0;
                 while (j + 1 < nsp && !(sg0[k] >= g0[j] && sg0[k] < g1[j])) j++;
                 const u32 x = s_fx.r0[j] + (sg0[k] - s_fx.g0[j]) - sx[k];
-                rec[sl->idx].x = x; rec[sl->idx].y = sl->stride;
+                rec[sl->idx].x = x - lo; rec[sl->idx].y = sl->stride;   /* from the chunk's start (t20) */
                 rec[sl->idx].z = sl->type | (sl->n << 4)
                                | ((sl->freq ? (sl->modulo ? 2u : 1u) : 0u) << 8);
                 rec[sl->idx].w = sl->freq ? sl->freq : 1;
                 s_fx.x[sl->idx] = x;
             }
-            memcpy(base + fdesc, rec, sizeof rec);
+            memcpy(base + (fdesc - lo), rec, sizeof rec);
             s_vf_off = r;
             s_fx.valid = 1; s_fx.epoch = state->begin_epoch; s_fx.fdesc = fdesc;
             /* Where the last span ends: the ring's end only if it was copied
