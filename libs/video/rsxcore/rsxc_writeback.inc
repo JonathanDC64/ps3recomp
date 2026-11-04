@@ -38,7 +38,7 @@ static int write_color_defer(void)
 static int s_wb_pending;   /* copies recorded, store not yet done */
 static double s_fl_wait_ms, s_fl_store_ms;   /* FRAME_LOG: frame-start wait, store */
 
-static void rt_pitch_record(D3D12DrawRecord* dr)
+static inline __attribute__((always_inline)) void rt_pitch_record(D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!st) return;

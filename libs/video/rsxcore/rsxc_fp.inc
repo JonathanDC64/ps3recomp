@@ -49,7 +49,7 @@ static u8 gl_blend_op_gpu(u32 e)
  * casters outside the light's depth range, squashed onto its near or far
  * plane: the floor above, or things behind the light, threw shadows where
  * nothing stands (issue #286). */
-static u32 rsx_cull_key(const rsx_state* st)
+static inline __attribute__((always_inline)) u32 rsx_cull_key(const rsx_state* st)
 {
     if (!st) return 0;
     const u32 z = st->zminmax_control;
