@@ -30,6 +30,7 @@
 #include "../ppu_tls.h"
 #include "../../platform/win32_compat.h"      /* Sleep, GetTickCount64, threads on POSIX */
 #include "../../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../../platform/plat.h"              /* plat_core_reserve (RSX_CORE) */
 /* ps3emu/ppu_lift.h already defines `struct ppu_context` (the same layout as
  * runtime/ppu/ppu_context.h by design -- "keep the two in sync"; the vector
  * registers' type differs, so the two cannot be one definition). A syscall
@@ -719,6 +720,24 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         rsx_ok = (rsx_backend_init(rsx_w, rsx_h, _title) == 0);
     }
     fprintf(stderr, "[rsx] backend init %s\n", rsx_ok ? "OK -- window open" : "FAILED");
+    /* RSX_CORE: this thread, which runs the FIFO and draws, alone on one CPU
+     * of a core, and the rest of the process off that core, its second
+     * hardware thread included (plat_core_reserve). 1: on; auto: only with
+     * SMT and at least 4 cores; 0 or unset: where the system puts it. Linux
+     * only for now. On a Steam Deck this thread holds the frame, and it ran
+     * 4-8% faster so. Threads started since are moved off the core every 64
+     * flips (plat_core_keep). */
+    int core_on = 0;
+    unsigned core_flip = 0;
+    if (const char* e = getenv("RSX_CORE")) {
+        const int mode = !strcmp(e, "auto") ? 2 : atoi(e) > 0 ? 1 : 0;
+        if (mode) {
+            const int cpu = plat_core_reserve(mode);
+            core_on = cpu >= 0;
+            if (core_on) fprintf(stderr, "[rsx] RSX_CORE=%s: this thread on CPU %d, the rest off its core%c", e, cpu, 10);
+            else fprintf(stderr, "[rsx] RSX_CORE=%s: not used here (Linux with SMT and 4 cores for auto)%c", e, 10);
+        }
+    }
     unsigned last_flip = 0;
     /* The game's frame pacing (vblank/flip handlers -> display frame counter) must
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
@@ -849,6 +868,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * the display's rate shows the last frame again (a menu over a
              * 30 fps game, or through a hitch). */
             if (!s_rsx_live) rsx_backend_idle();
+        }
+        if (core_on && cellGcm_flip_request_count() - core_flip >= 64) {
+            core_flip = cellGcm_flip_request_count();
+            plat_core_keep();
         }
     }
     return 0;

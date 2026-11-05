@@ -7,7 +7,8 @@
  * calling thread's stack range, an auto-reset event with a timed wait, a
  * small mutex), then time and sleep (one monotonic clock, a thread's sleep
  * timer, and the precise sleep written once on them), then a file mapped
- * read-only (the D3D12 pipeline library's).
+ * read-only (the D3D12 pipeline library's), then a core kept for one thread
+ * (the RSX thread's, RSX_CORE).
  *
  * On Windows each call is the Win32 call it stands for, inline, so code moved
  * onto this header makes the same calls in the same order as before. Off
@@ -367,6 +368,28 @@ static inline void plat_file_unmap(plat_file_map* m)
 #else
 int  plat_file_map_read(const char* path, plat_file_map* m);
 void plat_file_unmap(plat_file_map* m);
+#endif
+
+/* ---- A core for one thread ------------------------------------------------ */
+
+/* plat_core_reserve puts the calling thread alone on one CPU of a core and
+ * every other thread of the process on the other cores' CPUs, so nothing runs
+ * beside it on that core, its second hardware thread (SMT) included. The core
+ * is the fastest by the system's own figures, not the first one when others
+ * tie (CPU 0 takes most interrupts). mode 1: whenever another core is left
+ * for the rest; mode 2: only with SMT and at least 4 cores. Gives the CPU, or
+ * -1 when it changed nothing (mode 0, no topology to read, or not Linux).
+ *
+ * A new thread starts on its starter's CPUs, so one the reserved thread
+ * starts would share its CPU. plat_core_keep moves such threads to the other
+ * cores. Call it from the reserved thread now and then: it reads the thread
+ * list only when the number of threads changed, and every 16th call. */
+#if defined(__linux__)
+int  plat_core_reserve(int mode);
+void plat_core_keep(void);
+#else
+static inline int  plat_core_reserve(int mode) { (void)mode; return -1; }
+static inline void plat_core_keep(void) {}
 #endif
 
 #ifdef __cplusplus
