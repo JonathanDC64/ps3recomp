@@ -1134,6 +1134,25 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
             if (taskId) vm_write32((u32)(uintptr_t)taskId, i);
             (void)taskId_h;
 
+            /* elf/context are guest effective addresses; translate the image
+             * pointer to host memory for fingerprint+load, but keep context
+             * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
+            const uint8_t* host_elf = elf ? GUEST_PTR(elf, const uint8_t*) : NULL;
+            const size_t image_size = host_elf ? spu_elf_image_size(host_elf, 2u * 1024 * 1024) : 0;
+
+            /* Mark the task running BEFORE it becomes ready, not from when its
+             * thread starts and not after spurs_taskset_add_task: a task of this
+             * taskset exiting on another thread starts every ready task not marked
+             * running (spu_taskset_task_exited). Marked after, this task could
+             * start there and again below, two runs of one id. The first to exit
+             * frees the id, and the second then clears it under whichever task
+             * took it next. Demon's Souls' HighGraphics gave it to its second
+             * task, whose SPU child took the same id and was wiped before it
+             * started, so HighGraphics waited forever for that child's report
+             * (the picture froze, the music played on). */
+            extern void spu_taskset_mark_running(uint32_t, uint32_t, int);
+            if (image_size) spu_taskset_mark_running(taskset_ea, i, 1);
+
             /* Register the task in the REAL BE taskset: writes task_info[slot]
              * (args/elf/context/ls_pattern) + sets enabled+ready bits so the PM's
              * SELECT_TASK picks it. Slot index i = the SPURS taskId (bitset bit). */
@@ -1211,23 +1230,12 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
              * suits create+join task patterns; a workload/taskset whose SPU job
              * waits on concurrent PPU-side signals will want the async lv2
              * SPU-thread path instead — wired when a title exercises it. */
-            if (elf) {
-                /* elf/context are guest effective addresses; translate the image
-                 * pointer to host memory for fingerprint+load, but keep context
-                 * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
-                const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
-                size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz) {
-                    /* Running from now, not from when its thread starts (see
-                     * spu_taskset_mark_running). */
-                    extern void spu_taskset_mark_running(uint32_t, uint32_t, int);
-                    spu_taskset_mark_running(taskset_ea, i, 1);
-                    /* Async: SPURS tasks are persistent workers — running them
-                     * inline would block this PPU thread forever (deadlock). */
-                    if (!spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                     (uint32_t)(uintptr_t)context))
-                        spu_taskset_mark_running(taskset_ea, i, 0);
-                }
+            if (image_size) {
+                /* Async: SPURS tasks are persistent workers — running them
+                 * inline would block this PPU thread forever (deadlock). */
+                if (!spu_workload_dispatch_async(host_elf, (uint32_t)image_size,
+                                                 (uint32_t)(uintptr_t)context))
+                    spu_taskset_mark_running(taskset_ea, i, 0);
             }
             return CELL_OK;
         }
