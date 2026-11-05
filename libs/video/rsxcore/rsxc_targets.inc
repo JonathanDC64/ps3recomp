@@ -648,6 +648,14 @@ static u32 samp_key_slot(const u32* k)
     return h & (VP_SAMP_HINTS - 1);
 }
 
+/* RSX_SUBMIT_SPLIT: a part of this batch went to the GPU and may be running.
+ * Making a sampler then is legal, but lavapipe (seen on Mesa 25.2) moves every
+ * texture's function table when it meets a new sampler, with no lock against
+ * its running draws (llvmpipe_register_sampler), and a draw then reads one
+ * texture with another's function and size, and faults. So a table new to the
+ * session waits for the parts first: rare, and with no split nothing runs here. */
+static int s_split_running;
+
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
@@ -682,6 +690,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     }
     for (u32 i = 0; i < s_d3d.samp_n; i++)
         if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; hint[hs] = (u16)(i + 1); return i; }
+    if (s_split_running) { s_split_running = 0; wait_for_gpu(); }
     u32 t;
     if (s_d3d.samp_n < cap) {
         t = s_d3d.samp_n++;
