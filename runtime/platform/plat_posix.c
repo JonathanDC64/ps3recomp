@@ -16,10 +16,104 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+/* ---- A CPU-time sampler, for test runs ----------------------------------- */
+
+/* PS3_SAMPLE=<file>,<start s>,<seconds>: where the process's CPU time goes on
+ * a machine with no profiler to hand (a Steam Deck). <start s> after the call,
+ * for <seconds>, each tick that finds the process on a CPU notes the thread,
+ * its instruction and the word on top of its stack (a leaf's caller, usually).
+ * Then <file> gets the memory map ("M " lines) and the notes ("S tid pc top"),
+ * for tools/des/sample_read.py. Off unless set. */
+#if defined(__linux__) && defined(__x86_64__)
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <ucontext.h>
+
+typedef struct { uint64_t pc, top; uint32_t tid; } plat_sample;
+#define PLAT_SAMPLE_CAP (1u << 20)
+static plat_sample* s_samples;
+static atomic_uint s_sample_n;
+static char s_sample_file[1024];
+static unsigned s_sample_start, s_sample_secs;
+
+static void sample_on_tick(int sig, siginfo_t* si, void* uc_)
+{
+    (void)sig; (void)si;
+    const int saved = errno;
+    const ucontext_t* uc = (const ucontext_t*)uc_;
+    const unsigned i = atomic_fetch_add_explicit(&s_sample_n, 1, memory_order_relaxed);
+    if (i < PLAT_SAMPLE_CAP) {
+        s_samples[i].pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
+        s_samples[i].top = *(const uint64_t*)uc->uc_mcontext.gregs[REG_RSP];
+        s_samples[i].tid = (uint32_t)syscall(SYS_gettid);
+    }
+    errno = saved;
+}
+
+static void* sample_thread(void* arg)
+{
+    (void)arg;
+    sigset_t only;
+    sigemptyset(&only);
+    sigaddset(&only, SIGPROF);
+    pthread_sigmask(SIG_BLOCK, &only, NULL);
+    sleep(s_sample_start);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sample_on_tick;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPROF, &sa, NULL) != 0) return NULL;
+    struct itimerval every = {{0, 1000}, {0, 1000}}, off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_PROF, &every, NULL);
+    sleep(s_sample_secs);
+    setitimer(ITIMER_PROF, &off, NULL);
+    FILE* out = fopen(s_sample_file, "w");
+    if (!out) return NULL;
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (maps) {
+        char line[512];
+        while (fgets(line, sizeof line, maps)) fprintf(out, "M %s", line);
+        fclose(maps);
+    }
+    unsigned n = atomic_load(&s_sample_n);
+    if (n > PLAT_SAMPLE_CAP) n = PLAT_SAMPLE_CAP;
+    for (unsigned i = 0; i < n; i++)
+        fprintf(out, "S %u %llx %llx\n", s_samples[i].tid, (unsigned long long)s_samples[i].pc,
+                (unsigned long long)s_samples[i].top);
+    fclose(out);
+    fprintf(stderr, "[sample] %u samples in %s\n", n, s_sample_file);
+    return NULL;
+}
+
+void plat_sampler_start(void)
+{
+    const char* v = getenv("PS3_SAMPLE");
+    if (!v || !*v || s_samples) return;
+    const char* c1 = strchr(v, ',');
+    const char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+    if (!c2 || (size_t)(c1 - v) >= sizeof s_sample_file) return;
+    memcpy(s_sample_file, v, (size_t)(c1 - v));
+    s_sample_start = (unsigned)atoi(c1 + 1);
+    s_sample_secs = (unsigned)atoi(c2 + 1);
+    s_samples = (plat_sample*)malloc(PLAT_SAMPLE_CAP * sizeof *s_samples);
+    if (!s_samples) return;
+    pthread_t t;
+    if (pthread_create(&t, NULL, sample_thread, NULL) == 0) pthread_detach(t);
+}
+#else
+void plat_sampler_start(void) {}
+#endif
 
 /* ---- Threads ------------------------------------------------------------ */
 

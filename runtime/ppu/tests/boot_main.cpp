@@ -2340,8 +2340,14 @@ static uint8_t* vm_reserve(void)
  * the instances it started without touching any other copy running.
  * EXIT_AFTER_MS=<n>: a hard stop for test runs, from inside the process,
  * so a probe does not need an external timeout to end. */
+#ifndef _WIN32
+extern "C" void plat_sampler_start(void);   /* plat_posix.c: PS3_SAMPLE */
+#endif
 static void start_test_stops(void)
 {
+#ifndef _WIN32
+    plat_sampler_start();
+#endif
     if (const char* pf = getenv("PS3_PIDFILE")) {
         if (FILE* f = fopen(pf, "a")) { fprintf(f, "%lu\n", (unsigned long)GetCurrentProcessId()); fclose(f); }
     }
