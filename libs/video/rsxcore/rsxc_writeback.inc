@@ -323,14 +323,20 @@ static int wbg_place(u32 dst, u64 len, gpu_buffer* buf, u64* offset)
         }
     if (s_wbg_spans == WBG_SPANS) return 0;
     const u64 a = s_rc_dev->caps.host_import_align;
-    if (!a) return 0;
-    const u64 base = dst & ~(a - 1), end = (dst + len + a - 1) & ~(a - 1);
-    const gpu_buffer b = gpu_buffer_import_host(s_rc_dev, vm_base + base, end - base);
+    if (!a || a > 0x10000u) return 0;
+    /* The host address is what must be aligned: the guest space's mapping is
+     * only page-aligned, and the alignment can be larger (D3D12's 64 KB). The
+     * span stays inside the guest space, which runs well past RSX local
+     * memory on both sides. */
+    const uintptr_t at = (uintptr_t)(vm_base + dst);
+    const uintptr_t lo = at & ~(uintptr_t)(a - 1), hi = (at + len + a - 1) & ~(uintptr_t)(a - 1);
+    const gpu_buffer b = gpu_buffer_import_host(s_rc_dev, (void*)lo, hi - lo);
     if (!GPU_VALID(b)) {
         static int said;
         if (!said) { said = 1; fprintf(stderr, "[rsx] write-back: no buffer on guest memory at 0x%08X; stores on the CPU%c", dst, 10); }
         return 0;
     }
+    const u64 base = dst - (u64)(at - lo), end = base + (u64)(hi - lo);
     s_wbg_span[s_wbg_spans].base = (u32)base;
     s_wbg_span[s_wbg_spans].size = (u32)(end - base);
     s_wbg_span[s_wbg_spans].buf = b;

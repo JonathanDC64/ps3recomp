@@ -1077,6 +1077,12 @@ static int child_main(const char* dir)
                            : be && (!strcmp(be, "d3d12") || !strcmp(be, "hal-d3d12")) ? "d3d12" : "null";
     env_set("RSX_BACKEND", want);
     if (!getenv("RSX_PRESENT")) env_set("RSX_PRESENT", "1");
+    /* The null route's hashes are one list for Windows and Linux, so its
+     * targets store on the CPU on both. Windows' GPU write-back needs RSX
+     * local memory as an allocation of its own, which this guest space is
+     * not; Linux's needs nothing (rsxc_writeback.inc, wbg_place). The Vulkan
+     * route keeps it, under the validation layer. */
+    if (!strcmp(want, "null") && !getenv("RSX_WB_GPU")) env_set("RSX_WB_GPU", "0");
     if (!route_open(want)) { fprintf(stderr, "test_rsx_synth: no %s route in this build\n", want); return 3; }
     char caps[MAX_PATH];
     dir_make(dir);
