@@ -24,7 +24,13 @@ static SHORT test_key_state(int vk)
     return (SHORT)(held ? 0x8000 : 0);
 }
 static HWND test_foreground(void) { return GetDesktopWindow(); }
-static DWORD test_xinput_get(DWORD i, XINPUT_STATE* s) { (void)i; (void)s; return ERROR_DEVICE_NOT_CONNECTED; }
+static int s_pad_on;   /* the stubbed pad on port 0, nothing pressed */
+static DWORD test_xinput_get(DWORD i, XINPUT_STATE* s)
+{
+    if (i != 0 || !s_pad_on) return ERROR_DEVICE_NOT_CONNECTED;
+    memset(s, 0, sizeof *s);
+    return ERROR_SUCCESS;
+}
 static DWORD test_xinput_set(DWORD i, XINPUT_VIBRATION* v) { (void)i; (void)v; return ERROR_DEVICE_NOT_CONNECTED; }
 static DWORD test_window_pid(HWND w, LPDWORD pid) { (void)w; *pid = GetCurrentProcessId(); return 0; }
 #define GetAsyncKeyState         test_key_state
@@ -47,6 +53,7 @@ void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 int pad_hid_sony_poll(PadHidSonyState* out, int max) { (void)out; (void)max; return 0; }
 int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak) { (void)slot; (void)strong; (void)weak; return 0; }
+int pad_hid_sony_describe(int slot, char* out, size_t n) { (void)slot; (void)out; (void)n; return 0; }
 
 #define EA 0x1000u
 
@@ -266,6 +273,27 @@ int main(void)
     p = rd(); CHECK(p.buttons == CROSS);
     s_kb_busy = 0;
     p = rd(); CHECK(p.buttons == 0);
+
+    /* PAD_KEYBOARD_WITH_PAD: unset, keys merge into a pad. =0 (a Steam Deck's default), they stay out of a pad, and
+     * still count with no pad on the port. */
+    set_env("PAD_KEYS", NULL);
+    KEYS('Z');
+    s_pad_on = 1;
+    p = rd(); CHECK(p.buttons == CROSS);
+    CHECK(!cellPad_host_keys_out());
+    set_env("PAD_KEYBOARD_WITH_PAD", "0");
+    p = rd(); CHECK(p.buttons == 0);
+    CHECK(cellPad_host_keys_out());
+    cellPad_host_mouse_buttons(1);
+    set_env("PAD_KEYS", "r1=mouse1");
+    p = rd(); CHECK(p.buttons == 0);
+    cellPad_host_mouse_buttons(0);
+    set_env("PAD_KEYS", NULL);
+    s_pad_on = 0;
+    p = rd(); CHECK(p.buttons == CROSS);
+    CHECK(!cellPad_host_keys_out());
+    set_env("PAD_KEYBOARD_WITH_PAD", NULL);
+    KEYS();
 
     printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
     return failures ? 1 : 0;

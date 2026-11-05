@@ -215,6 +215,9 @@ void cellPad_set_host_hold(int hold);
  * queued with the buttons it presses as it turns (Shift held then counts
  * when its turn comes), at most 4 waiting. */
 void cellPad_host_mouse_buttons(unsigned mask);
+/* 1 while keys and the mouse stay out of port 0, which has a pad (PAD_KEYBOARD_WITH_PAD, on by default on a Steam Deck):
+ * the mouse's other uses for the game, such as looking around, should stay out too. */
+int cellPad_host_keys_out(void);
 void cellPad_host_mouse_wheel(int notches);
 
 /* A key or mouse button is held now, by its Windows virtual-key code (VK_LBUTTON to VK_XBUTTON2 for the mouse), read
