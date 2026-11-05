@@ -386,9 +386,15 @@ static void vpj_publish(void)
     /* A worker counts itself a sleeper before it checks for work, so either
      * it sees these jobs or this sees it. */
     if (s_vpj_sleepers) {
+        /* VPJ_WAKE_OUT=1 (test): wake after letting the lock go, so a woken
+         * worker doesn't block on it at once. The lock taken and let go is
+         * still what orders this after a worker's check. */
+        static int out = -1;
+        if (out < 0) out = ps3_env_int("VPJ_WAKE_OUT", 0);
         AcquireSRWLockExclusive(&s_vpj_lk);
-        WakeAllConditionVariable(&s_vpj_cv);
+        if (!out) WakeAllConditionVariable(&s_vpj_cv);
         ReleaseSRWLockExclusive(&s_vpj_lk);
+        if (out) WakeAllConditionVariable(&s_vpj_cv);
     }
 }
 /* Wait for every queued vertex, converting what no worker has taken yet. */

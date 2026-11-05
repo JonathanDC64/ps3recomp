@@ -321,6 +321,16 @@ int64_t sys_timer_usleep(ppu_context* ctx)
           if (t_last_end && start - t_last_end <= gap_ticks) t_streak++;
           else t_streak = 0;
           if (!s_spin) plat_timer_open(&t_timer);
+          /* USLEEP_SLEEP_MIN_US=<n> (test): a usleep of n us or more sleeps
+           * all of its time on the timer, with no spin at the end. */
+          { static int s_min = -1;
+            PS3_KNOB(s_min, getenv("USLEEP_SLEEP_MIN_US") ? atoi(getenv("USLEEP_SLEEP_MIN_US")) : 0);
+            if (!s_spin && s_min > 0 && usec >= (uint64_t)s_min && plat_timer_is_open(&t_timer)) {
+                plat_timer_sleep_us(&t_timer, usec);
+                t_last_end = plat_clock_now();
+                return CELL_OK;
+            }
+          }
           if (!s_spin && t_streak >= 64 && usec > usleep_yield_us()) {
               if (plat_timer_is_open(&t_timer)) {
                   plat_timer_sleep_us(&t_timer, usec);

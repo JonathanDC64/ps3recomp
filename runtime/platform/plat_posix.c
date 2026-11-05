@@ -28,9 +28,13 @@
  * a machine with no profiler to hand (a Steam Deck). <start s> after the call,
  * for <seconds>, each tick that finds the process on a CPU notes the thread,
  * its instruction and the word on top of its stack (a leaf's caller, usually).
- * Then <file> gets the memory map ("M " lines) and the notes ("S tid pc top"),
- * for tools/des/sample_read.py. Off unless set. */
+ * Then <file> gets the memory map ("M " lines), the notes ("S tid pc" and the
+ * top 8 words of the stack), the thread names ("T tid name") and the nearest
+ * exported name of each instruction seen ("P pc name"), for
+ * tools/des/sample_read.py. Off unless set. */
 #if defined(__linux__) && defined(__x86_64__)
+#include <dirent.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -39,8 +43,8 @@
 #include <sys/time.h>
 #include <ucontext.h>
 
-typedef struct { uint64_t pc, top; uint32_t tid; } plat_sample;
-#define PLAT_SAMPLE_CAP (1u << 20)
+typedef struct { uint64_t pc, w[8]; uint32_t tid; } plat_sample;
+#define PLAT_SAMPLE_CAP (1u << 18)
 static plat_sample* s_samples;
 static atomic_uint s_sample_n;
 static char s_sample_file[1024];
@@ -54,10 +58,47 @@ static void sample_on_tick(int sig, siginfo_t* si, void* uc_)
     const unsigned i = atomic_fetch_add_explicit(&s_sample_n, 1, memory_order_relaxed);
     if (i < PLAT_SAMPLE_CAP) {
         s_samples[i].pc = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
-        s_samples[i].top = *(const uint64_t*)uc->uc_mcontext.gregs[REG_RSP];
+        const uint64_t* sp = (const uint64_t*)uc->uc_mcontext.gregs[REG_RSP];
+        for (int k = 0; k < 8; k++) s_samples[i].w[k] = sp[k];
         s_samples[i].tid = (uint32_t)syscall(SYS_gettid);
     }
     errno = saved;
+}
+
+static int sample_pc_order(const void* a, const void* b)
+{
+    const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void sample_write_names(FILE* out, unsigned n)
+{
+    uint64_t* pcs = (uint64_t*)malloc((n ? n : 1) * sizeof *pcs);
+    if (pcs) {
+        for (unsigned i = 0; i < n; i++) pcs[i] = s_samples[i].pc;
+        qsort(pcs, n, sizeof *pcs, sample_pc_order);
+        for (unsigned i = 0; i < n; i++) {
+            if (i && pcs[i] == pcs[i - 1]) continue;
+            Dl_info di;
+            if (dladdr((void*)pcs[i], &di) && di.dli_sname)
+                fprintf(out, "P %llx %s\n", (unsigned long long)pcs[i], di.dli_sname);
+        }
+        free(pcs);
+    }
+    DIR* d = opendir("/proc/self/task");
+    if (d) {
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            char path[64], name[32] = "";
+            if (e->d_name[0] == '.' || strlen(e->d_name) > 16) continue;
+            snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+            FILE* f = fopen(path, "r");
+            if (!f) continue;
+            if (fgets(name, sizeof name, f)) fprintf(out, "T %s %s", e->d_name, name);
+            fclose(f);
+        }
+        closedir(d);
+    }
 }
 
 static void* sample_thread(void* arg)
@@ -88,9 +129,12 @@ static void* sample_thread(void* arg)
     }
     unsigned n = atomic_load(&s_sample_n);
     if (n > PLAT_SAMPLE_CAP) n = PLAT_SAMPLE_CAP;
-    for (unsigned i = 0; i < n; i++)
-        fprintf(out, "S %u %llx %llx\n", s_samples[i].tid, (unsigned long long)s_samples[i].pc,
-                (unsigned long long)s_samples[i].top);
+    for (unsigned i = 0; i < n; i++) {
+        fprintf(out, "S %u %llx", s_samples[i].tid, (unsigned long long)s_samples[i].pc);
+        for (int k = 0; k < 8; k++) fprintf(out, " %llx", (unsigned long long)s_samples[i].w[k]);
+        fputc('\n', out);
+    }
+    sample_write_names(out, n);
     fclose(out);
     fprintf(stderr, "[sample] %u samples in %s\n", n, s_sample_file);
     return NULL;
@@ -113,6 +157,18 @@ void plat_sampler_start(void)
 }
 #else
 void plat_sampler_start(void) {}
+#endif
+
+/* PS3_TIMER_SLACK_US=<n> (test, Linux): how late a sleep may wake. The kernel's
+ * default is 50 us. Threads inherit it, so it's set before any of them start. */
+#if defined(__linux__)
+#include <stdlib.h>
+#include <sys/prctl.h>
+__attribute__((constructor)) static void plat_timer_slack_knob(void)
+{
+    const char* v = getenv("PS3_TIMER_SLACK_US");
+    if (v && *v) prctl(PR_SET_TIMERSLACK, (unsigned long)atoi(v) * 1000ul, 0, 0, 0);
+}
 #endif
 
 /* ---- Threads ------------------------------------------------------------ */

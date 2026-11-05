@@ -522,7 +522,18 @@ typedef void*  CONDITION_VARIABLE;
 typedef CONDITION_VARIABLE* PCONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT NULL
 
-typedef struct { pthread_mutex_t m; pthread_cond_t c; unsigned gen; } ps3_condvar;
+typedef struct { pthread_mutex_t m; pthread_cond_t c; unsigned gen; unsigned waiters; } ps3_condvar;
+
+/* CV_FAST=1 (test): a wake with nobody waiting returns without the mutex. A
+ * waiter counts itself before it lets the caller's lock go, the point where
+ * Windows queues it, so a wake that finds no waiter is one Windows would drop
+ * too. */
+static inline int ps3__cv_fast(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("CV_FAST"); on = e && *e == '1'; }
+    return on;
+}
 
 static inline void ps3__cv_init(void* p)
 {
@@ -530,6 +541,7 @@ static inline void ps3__cv_init(void* p)
     pthread_mutex_init(&cv->m, NULL);
     pthread_cond_init(&cv->c, NULL);
     cv->gen = 0;
+    cv->waiters = 0;
 }
 static inline ps3_condvar* ps3_cv(CONDITION_VARIABLE* c)
 { return (ps3_condvar*)ps3_lazy_obj((void**)c, sizeof(ps3_condvar), ps3__cv_init); }
@@ -539,6 +551,7 @@ static inline void WakeConditionVariable(CONDITION_VARIABLE* c)
 {
     ps3_condvar* cv = ps3_cv(c);
     if (!cv) return;
+    if (ps3__cv_fast() && !__atomic_load_n(&cv->waiters, __ATOMIC_ACQUIRE)) return;
     pthread_mutex_lock(&cv->m);
     cv->gen++;
     pthread_cond_signal(&cv->c);
@@ -548,6 +561,7 @@ static inline void WakeAllConditionVariable(CONDITION_VARIABLE* c)
 {
     ps3_condvar* cv = ps3_cv(c);
     if (!cv) return;
+    if (ps3__cv_fast() && !__atomic_load_n(&cv->waiters, __ATOMIC_ACQUIRE)) return;
     pthread_mutex_lock(&cv->m);
     cv->gen++;
     pthread_cond_broadcast(&cv->c);
@@ -562,6 +576,7 @@ static inline BOOL ps3__cv_sleep(ps3_condvar* cv, DWORD ms,
     if (!cv) return FALSE;
     pthread_mutex_lock(&cv->m);
     unsigned g = cv->gen;
+    __atomic_add_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     unlock(lock);
     int rc = 0;
     if (ms == INFINITE) {
@@ -571,6 +586,7 @@ static inline BOOL ps3__cv_sleep(ps3_condvar* cv, DWORD ms,
         while (cv->gen == g && rc == 0) rc = pthread_cond_timedwait(&cv->c, &cv->m, &ts);
     }
     BOOL woke = (cv->gen != g);
+    __atomic_sub_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&cv->m);
     relock(lock);
     if (!woke) SetLastError(ERROR_TIMEOUT);
