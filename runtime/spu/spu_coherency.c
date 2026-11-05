@@ -37,13 +37,56 @@ extern "C" {
  * Moved here from spu_channels.c, where it was a file-static and so could
  * serialize SPU against SPU but not SPU against PPU -- which left the PPU free
  * to write a line in the middle of a PUTLLC's compare-and-commit. Same
- * spinlock, same semantics, now shared. _InterlockedExchange is a clang-cl/MSVC
- * intrinsic (no runtime library symbol needed); elsewhere use the C11
- * equivalent, which lowers to the same LL/SC or lock-xchg on every target.
+ * spinlock, same semantics, now shared.
  * ===========================================================================*/
+/* What differs by compiler. The lock below is the same everywhere. */
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
+#define SPU_LL_NOINLINE   __declspec(noinline)
+#define SPU_LL_INLINE     __forceinline
+#define SPU_LL_STATS      1
+#define spu_ll_take(l)    _interlockedbittestandset((l), 0)
+#define spu_ll_give(l)    _InterlockedIncrement(l)
+#define spu_ll_held(l)    (*(l) & 1)
+#define spu_ll_pause()    _mm_pause()
+#define spu_ll_yield()    SwitchToThread()
+#define spu_ll_ctz(i, s)  _BitScanForward64(&(i), (s))
+#else
+#include <sched.h>     /* sched_yield */
+#define SPU_LL_NOINLINE   __attribute__((noinline))
+#define SPU_LL_INLINE     inline __attribute__((always_inline))
+#define SPU_LL_STATS      0
+/* Full fences, as MSVC's interlocked calls are: spu_coh_notify_write and
+ * spu_lockline_read_ok rely on one between taking the stripe and reading a
+ * reservation. On x86-64 the locked instruction is that fence. */
+static SPU_LL_INLINE long spu_ll_take(volatile long* l)
+{
+    const long was = __atomic_fetch_or(l, 1L, __ATOMIC_SEQ_CST) & 1;
+#if !defined(__x86_64__)
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    return was;
+}
+static SPU_LL_INLINE void spu_ll_give(volatile long* l)
+{
+    (void)__atomic_fetch_add(l, 1L, __ATOMIC_SEQ_CST);
+}
+static SPU_LL_INLINE long spu_ll_held(volatile long* l)
+{
+    return __atomic_load_n(l, __ATOMIC_RELAXED) & 1;
+}
+#if defined(__x86_64__)
+#define spu_ll_pause()    _mm_pause()
+#elif defined(__aarch64__)
+#define spu_ll_pause()    __asm__ __volatile__("yield")
+#else
+#define spu_ll_pause()    ((void)0)
+#endif
+#define spu_ll_yield()    sched_yield()
+#define spu_ll_ctz(i, s)  ((i) = (unsigned long)__builtin_ctzll(s))
+#endif
+
 /* Striped by line: one spinlock per (line % 64), each on a cache line of its
  * own. What the lock serializes is per line -- a GETLLAR's snapshot, a
  * PUTLLC's compare and commit, a PPU or DMA store into a reserved line and its
@@ -63,9 +106,11 @@ extern "C" {
  * every line on one stripe: the old global lock, for an A/B. */
 #define SPU_LL_NSTRIPE 64
 static SPU_COH_LINE(volatile long) g_ll[SPU_LL_NSTRIPE];
+#if SPU_LL_STATS
 /* SPU_LOCKLINE_STATS: the host thread holding the lock (its own line, so the
  * stats do not add traffic to the lock's). One for all stripes: a hint. */
 static SPU_COH_LINE(volatile unsigned long) g_lockline_holder_line;
+#endif
 static unsigned spu_ll_mask(void)
 {
     /* Same value from every thread, so a race on the first read is benign. */
@@ -73,7 +118,8 @@ static unsigned spu_ll_mask(void)
     if (s_mask < 0) s_mask = getenv("SPU_LL_STRIPES") ? 0 : SPU_LL_NSTRIPE - 1;
     return (unsigned)s_mask;
 }
-/* SPU_LOCKLINE_STATS=1: per host thread, every 2^20 acquisitions, how long
+#if SPU_LL_STATS
+/* SPU_LOCKLINE_STATS=1 (Windows): per host thread, every 2^20 acquisitions, how long
  * they took to accumulate and how many found the lock held -- which threads
  * share this lock, and how hard. */
 static void spu_lockline_stats(int contended, unsigned long holder, unsigned long long wait)
@@ -115,6 +161,7 @@ static void spu_lockline_stats(int contended, unsigned long holder, unsigned lon
     t0 = now; c = 0; tw = 0;
     memset(h_tid, 0, sizeof h_tid); memset(h_n, 0, sizeof h_n); memset(h_w, 0, sizeof h_w);
 }
+#endif
 /* Each stripe is a sequence lock: odd while held, and every release moves it
  * on by two. A writer takes it as before (test-and-test-and-set below); a
  * GETLLAR on a line already reserved can instead read the line without
@@ -134,24 +181,31 @@ static void spu_lockline_stats(int contended, unsigned long holder, unsigned lon
  * those stores a second, the vectorized stripe walk's xmm saves, the stack
  * cookie and the pushes were most of the lock's time outside its two locked
  * instructions. */
-static __declspec(noinline) void spu_ll_acquire_wait(unsigned i, int s_st)
+static SPU_LL_NOINLINE void spu_ll_acquire_wait(unsigned i, int s_st)
 {
     volatile long* l = &g_ll[i].v;
     unsigned spins = 0;
     int contended = 0;
+#if SPU_LL_STATS
     unsigned long holder = 0;
     LARGE_INTEGER w0 = {0};
+#else
+    (void)s_st;
+#endif
     /* lock bts: one read-for-ownership of the line, as the exchange was. A
      * plain read then a compare-exchange costs two transfers of a line the
      * other side has just written (shared, then the upgrade). */
-    while (_interlockedbittestandset(l, 0)) {
+    while (spu_ll_take(l)) {
+#if SPU_LL_STATS
         if (!contended && s_st) { holder = g_lockline_holder_line.v; QueryPerformanceCounter(&w0); }
+#endif
         contended = 1;
         do {
-            _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
-        } while (*l & 1);
+            spu_ll_pause();
+            if (++spins >= 4096) { spins = 0; spu_ll_yield(); }
+        } while (spu_ll_held(l));
     }
+#if SPU_LL_STATS
     if (s_st) {
         unsigned long long wait = 0;
         if (contended) { LARGE_INTEGER w1; QueryPerformanceCounter(&w1);
@@ -159,22 +213,25 @@ static __declspec(noinline) void spu_ll_acquire_wait(unsigned i, int s_st)
         g_lockline_holder_line.v = GetCurrentThreadId();
         spu_lockline_stats(contended, holder, wait);
     }
+#else
+    (void)contended;
+#endif
 }
 /* SPU_LL_ONE_LINE (live): 1 (default) takes a free stripe, and the stripe of
  * a range in one line, in line; 0 sends every acquire and every range through
  * the out-of-line paths, as before, for A/B. Both take the same stripes, so a
  * change between a lock and its unlock is harmless. */
-static __forceinline int spu_ll_one_on(void)
+static SPU_LL_INLINE int spu_ll_one_on(void)
 {
     static int on = 1;
     PS3_KNOB(on, ps3_env_int("SPU_LL_ONE_LINE", 1));
     return on;
 }
-static __forceinline void spu_ll_acquire(unsigned i)
+static SPU_LL_INLINE void spu_ll_acquire(unsigned i)
 {
     static int s_st = -1;
     PS3_KNOB(s_st, getenv("SPU_LOCKLINE_STATS") ? 1 : 0);
-    if (!s_st && spu_ll_one_on() && !_interlockedbittestandset(&g_ll[i].v, 0)) return;
+    if (!s_st && spu_ll_one_on() && !spu_ll_take(&g_ll[i].v)) return;
     spu_ll_acquire_wait(i, s_st);
 }
 /* The stripes [ea, ea+len) touches, as a bit set. */
@@ -190,21 +247,21 @@ static unsigned long long spu_ll_set(uint32_t ea, uint32_t len)
 }
 /* The stripe of [ea, ea+len) when it lies in one line, as spu_ll_set has it;
  * -1 when it spans lines. */
-static __forceinline int spu_ll_one(uint32_t ea, uint32_t len)
+static SPU_LL_INLINE int spu_ll_one(uint32_t ea, uint32_t len)
 {
     if (!spu_ll_one_on()) return -1;
     return (unsigned long long)(ea & 127u) + (len ? len : 1u) <= 128u ? (int)((ea >> 7) & spu_ll_mask())
                                                                       : -1;
 }
-static __declspec(noinline) void spu_ll_lock_set(uint32_t ea, uint32_t len)
+static SPU_LL_NOINLINE void spu_ll_lock_set(uint32_t ea, uint32_t len)
 {
     unsigned long long s = spu_ll_set(ea, len);
-    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; spu_ll_acquire((unsigned)i); }
+    while (s) { unsigned long i; spu_ll_ctz(i, s); s &= s - 1; spu_ll_acquire((unsigned)i); }
 }
-static __declspec(noinline) void spu_ll_unlock_set(uint32_t ea, uint32_t len)
+static SPU_LL_NOINLINE void spu_ll_unlock_set(uint32_t ea, uint32_t len)
 {
     unsigned long long s = spu_ll_set(ea, len);
-    while (s) { unsigned long i; _BitScanForward64(&i, s); s &= s - 1; _InterlockedIncrement(&g_ll[i].v); }
+    while (s) { unsigned long i; spu_ll_ctz(i, s); s &= s - 1; spu_ll_give(&g_ll[i].v); }
 }
 void spu_lockline_lock_ea(uint32_t ea, uint32_t len)
 {
@@ -216,7 +273,7 @@ void spu_lockline_unlock_ea(uint32_t ea, uint32_t len)
 {
     const int i = spu_ll_one(ea, len);
     if (i < 0) { spu_ll_unlock_set(ea, len); return; }
-    _InterlockedIncrement(&g_ll[i].v);
+    spu_ll_give(&g_ll[i].v);
 }
 int spu_lockline_read_begin(uint32_t ea, long* seq)
 {
@@ -245,19 +302,8 @@ void spu_lockline_lock(void)
 void spu_lockline_unlock(void)
 {
     const unsigned m = spu_ll_mask();
-    for (unsigned i = 0; i <= m; i++) _InterlockedIncrement(&g_ll[i].v);
+    for (unsigned i = 0; i <= m; i++) spu_ll_give(&g_ll[i].v);
 }
-#else
-#include <stdatomic.h>
-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
-void spu_lockline_lock_ea(uint32_t ea, uint32_t len)   { (void)ea; (void)len; spu_lockline_lock(); }
-void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; spu_lockline_unlock(); }
-int spu_lockline_read_begin(uint32_t ea, long* seq) { (void)ea; *seq = 0; return 0; }   /* always lock */
-int spu_lockline_read_ok(uint32_t ea, long seq)     { (void)ea; (void)seq; return 0; }
-int spu_lockline_read_same(uint32_t ea, long seq)   { (void)ea; (void)seq; return 0; }
-#endif
 
 /* ===========================================================================
  * The reserved-line bitmap
