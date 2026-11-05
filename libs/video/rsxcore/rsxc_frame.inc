@@ -620,6 +620,7 @@ rtt_dump_done:;
          * allocation failed. The pass is skipped rather than faulting.) */
         if (any && vpso.v && s_vb.n && s_rc_vpcb.n) {
             s_vp_topo_strip = 0;
+            s_split_running = 0;   /* (the opening wait saw the last batch's parts through) */
             vp_pass_binds(rc, vpso);
             const u32 split_n = submit_split_draws();
             u32 split_from = 0;                    /* the record the part being recorded starts at */
@@ -883,6 +884,7 @@ rtt_dump_done:;
                     !gpu_cmd_split(rdev, rc, NULL)) {
                     split_from = d;
                     split_parts++;
+                    s_split_running = 1;
                     vp_pass_binds(rc, vpso);
                     vb_chunk = 0; vb_lo = 0; vb_hi = s_vb.half;   /* the first chunks again */
                     vf_lo = 0; vf_in = s_vf_cap;
