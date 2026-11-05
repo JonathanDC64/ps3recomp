@@ -156,6 +156,10 @@ static void rc_release_device(void)
     /* Release D3D12 resources */
     /* The write-back's buffer over guest memory (the GPU layer's, step C5b)
      * goes here, as today, while guest memory is there; the GPU is idle. */
+#ifndef _WIN32
+    for (int i = 0; i < s_wbg_spans; i++) gpu_buffer_destroy(s_rc_dev, s_wbg_span[i].buf, 0);
+    s_wbg_spans = 0;
+#endif
     if (GPU_VALID(s_wbg.buf)) gpu_buffer_destroy(s_rc_dev, s_wbg.buf, 0);
     s_wbg.buf.id = 0;
     s_wbg.state = -1;

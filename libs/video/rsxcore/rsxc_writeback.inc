@@ -233,7 +233,7 @@ static gpu_texture off_rt_downscale(int i, int argb)
     return r->down_tex;
 }
 
-/* RSX_WB_GPU (live, default 1; Windows): the write-back of a linear A8R8G8B8
+/* RSX_WB_GPU (live, default 1): the write-back of a linear A8R8G8B8
  * target in RSX local memory goes from the GPU straight into guest memory,
  * through a heap opened on the guest's own pages: a draw puts the target in
  * the guest's byte order and a copy puts it in place. The CPU store was 13 MB
@@ -244,13 +244,23 @@ static gpu_texture off_rt_downscale(int i, int argb)
  * copy cannot address (512-byte offsets, 256-byte pitches) store on the CPU
  * as before. 0: every target on the CPU. 2: as 1, and the CPU store is also
  * made, into a scratch copy, and compared with what the GPU stored (a line
- * per mismatching target, and a count every 1024 stores). */
+ * per mismatching target, and a count every 1024 stores).
+ * Off Windows there is no heap to open: the guest's space is one anonymous
+ * mapping (boot_main.cpp), and each target gets a buffer over its own pages
+ * (wbg_place). Not one over all 256 MB: amdgpu checks an imported buffer's
+ * pages one by one at every submit (amdgpu_cs_parser_bos), and they stay
+ * resident. */
 #define WBG_BASE 0xC0000000u   /* RSX local memory (cellGcm's localAddress) */
 #define WBG_SIZE 0x10000000u
 /* state: 0 untried, 1 ready, -1 off. buf: the GPU layer's buffer over RSX
  * local memory (step C5b: gpu_buffer_import_host, today's heap opened on the
  * guest's pages and the buffer placed on it). */
 static struct { int state; gpu_buffer buf; } s_wbg;
+#ifndef _WIN32
+#define WBG_SPANS 32   /* more than MAX_OFF_RTS: targets move between areas; past it, the CPU store */
+static struct { u32 base, size; gpu_buffer buf; } s_wbg_span[WBG_SPANS];
+static int s_wbg_spans;
+#endif
 static int wbg_mode(void)
 {
     static int on = -1;
@@ -287,7 +297,47 @@ static int wbg_ready(void)
     fprintf(stderr, "[D3D12] write-back: from the GPU into guest memory%c", 10);
     return 1;
 #else
-    return 0;   /* the heap needs RSX local memory as an allocation of its own (Windows placeholders) */
+    if (!(s_rc_dev->caps.bits & GPU_CAP_HOST_IMPORT)) return 0;
+    s_wbg.state = 1;
+    fprintf(stderr, "[rsx] write-back: from the GPU into guest memory%c", 10);
+    return 1;
+#endif
+}
+
+/* The buffer a copy to [dst, dst + len) of guest memory goes through, and the
+ * offset in it. 0: none, so that target stores on the CPU. */
+static int wbg_place(u32 dst, u64 len, gpu_buffer* buf, u64* offset)
+{
+#ifdef _WIN32
+    (void)len;
+    *buf = s_wbg.buf;
+    *offset = dst - WBG_BASE;
+    return 1;
+#else
+    extern uint8_t* vm_base;
+    for (int i = 0; i < s_wbg_spans; i++)
+        if (dst >= s_wbg_span[i].base && dst + len <= (u64)s_wbg_span[i].base + s_wbg_span[i].size) {
+            *buf = s_wbg_span[i].buf;
+            *offset = dst - s_wbg_span[i].base;
+            return 1;
+        }
+    if (s_wbg_spans == WBG_SPANS) return 0;
+    const u64 a = s_rc_dev->caps.host_import_align;
+    if (!a) return 0;
+    const u64 base = dst & ~(a - 1), end = (dst + len + a - 1) & ~(a - 1);
+    const gpu_buffer b = gpu_buffer_import_host(s_rc_dev, vm_base + base, end - base);
+    if (!GPU_VALID(b)) {
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "[rsx] write-back: no buffer on guest memory at 0x%08X; stores on the CPU%c", dst, 10); }
+        return 0;
+    }
+    s_wbg_span[s_wbg_spans].base = (u32)base;
+    s_wbg_span[s_wbg_spans].size = (u32)(end - base);
+    s_wbg_span[s_wbg_spans].buf = b;
+    s_wbg_spans++;
+    *buf = b;
+    *offset = dst - base;
+    return 1;
 #endif
 }
 
@@ -304,18 +354,21 @@ static int wbg_record(int i)
     if (dst < WBG_BASE || dst - WBG_BASE >= WBG_SIZE || ((dst - WBG_BASE) & 511u) || (gp & 255u) ||
         gp < r->w * 4u || gp > 0x10000 || !r->h ||
         (u64)(dst - WBG_BASE) + (u64)gp * (r->h - 1) + r->w * 4u > WBG_SIZE) return 0;
+    gpu_buffer into;
+    u64 into_at;
+    if (!wbg_place(dst, (u64)gp * (r->h - 1) + r->w * 4u, &into, &into_at)) return 0;
     gpu_state prior = r->st;
     const gpu_texture from = off_rt_downscale(i, 1);
     if (!GPU_VALID(from)) return 0;
     gpu_footprint to;   /* the target's place in the buffer over RSX local memory */
     memset(&to, 0, sizeof to);
-    to.offset    = dst - WBG_BASE;
+    to.offset    = into_at;
     to.format    = GPU_FORMAT_R8G8B8A8_UNORM;
     to.width     = r->w;
     to.height    = r->h;
     to.depth     = 1;
     to.row_pitch = gp;
-    gpu_cmd_copy_tex_to_buf(s_rc_cmd, s_wbg.buf, &to, from, 0, NULL);
+    gpu_cmd_copy_tex_to_buf(s_rc_cmd, into, &to, from, 0, NULL);
     off_rt_transition(i, prior);
     r->gpu_dst = dst;
     r->used = 3;   /* stored by the GPU: the store only takes its checksum */
