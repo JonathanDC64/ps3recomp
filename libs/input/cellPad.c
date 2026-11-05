@@ -547,10 +547,38 @@ static u8 pad_axis_byte(int dir, float r)
     return (u8)(dir < 0 ? lroundf(127.5f - 127.5f * r) : dir > 0 ? lroundf(127.5f + 127.5f * r) : 128);
 }
 
+/* 1 on a Steam Deck. Its firmware names the maker, whatever the system or the session. */
+static int pad_host_is_steam_deck(void)
+{
+    static int deck = -1;
+    if (deck < 0) {
+        deck = 0;
+#if defined(__linux__)
+        char vendor[8] = {0};
+        FILE* f = fopen("/sys/class/dmi/id/sys_vendor", "r");
+        if (f) {
+            if (fread(vendor, 1, 5, f) == 5 && memcmp(vendor, "Valve", 5) == 0) deck = 1;
+            fclose(f);
+        }
+#endif
+    }
+    return deck;
+}
+
+/* Keys and mouse leaving port 0 to its pad (below). */
+static volatile int s_keys_out;
+int cellPad_host_keys_out(void) { return s_keys_out; }
+
 /* One keyboard poll (pad_poll_keyboard runs one at a time). */
 static void pad_poll_keyboard_once(void)
 {
-    static int off = -1, keys = -1, walk = -1;
+    /* with_pad: do keys and the mouse merge into a real pad on port 0? Not on a Steam Deck. Steam's desktop layout
+     * presses keys and mouse buttons for the Deck's controls while the pad reports them too, so one press would count
+     * twice (issue #351: B is also Esc, so it would also press Start; R2 is also a left click, so it would also press
+     * R1). PAD_KEYBOARD_WITH_PAD=1 brings them back, for a keyboard on a docked Deck; =0 does this on any PC. With no
+     * pad on port 0 the keys count as always: they may be the only input there is. */
+    static int off = -1, keys = -1, walk = -1, with_pad = -1;
+    PS3_KNOB(with_pad, ps3_env_int("PAD_KEYBOARD_WITH_PAD", pad_host_is_steam_deck() ? 0 : 1));
     PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
     if (off) return;
     PS3_KNOB(keys, pad_parse_keys(getenv("PAD_KEYS")));
@@ -559,6 +587,16 @@ static void pad_poll_keyboard_once(void)
 
     PadHostState* hs = &s_host_state[0];
     const int pad = hs->connected;   /* a real pad on port 0: merge into it */
+    s_keys_out = pad && !with_pad;
+    if (s_keys_out) {
+        static int said = 0;
+        if (!said) {
+            said = 1;
+            printf("[cellPad] keys and mouse stay out of port 0, which has a pad (PAD_KEYBOARD_WITH_PAD=%d)\n", with_pad);
+            fflush(stdout);
+        }
+        return;
+    }
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */
@@ -682,6 +720,7 @@ static void pad_poll_keyboard(void)
 }
 #else
 int cellPad_host_key_down(int vk) { (void)vk; return 0; }   /* (no host input in this build) */
+int cellPad_host_keys_out(void) { return 0; }
 #endif /* PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2 */
 
 /* PAD_FOCUS_ONLY=1: the user's pads count only while a window of this process
