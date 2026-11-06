@@ -125,6 +125,8 @@ jobs:
           /tmp/test_savedata_fixed
           clang -std=gnu17 -I include                 libs/system/tests/test_savedata_io.c                    -Wl,-dead_strip -o /tmp/test_savedata_io
           /tmp/test_savedata_io
+          clang -std=gnu17 -I include                 libs/system/tests/test_sys_lang.c                       -Wl,-dead_strip -o /tmp/test_sys_lang
+          /tmp/test_sys_lang
 
       - name: Run self-contained SPU helper tests
         run: |

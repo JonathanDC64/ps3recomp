@@ -480,6 +480,8 @@ jobs:
           /tmp/test_savedata_fixed
           $cc -o /tmp/test_savedata_io libs/system/tests/test_savedata_io.c
           /tmp/test_savedata_io
+          $cc -o /tmp/test_sys_lang libs/system/tests/test_sys_lang.c
+          /tmp/test_sys_lang
 
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
