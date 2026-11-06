@@ -168,14 +168,15 @@ jobs:
           done
           echo "GPU_SRC_ARGS=$args" >> "$GITHUB_ENV"
 
-      # Both renderers in one runtime: the configure must say so for each, and the spv target must be on.
+      # Both renderers in one runtime: the configure must say so for each, and the spv target must be on. The unit
+      # tests' targets are declared too (PS3RECOMP_BUILD_TESTS), for the one run on this runtime below.
       - name: Both routes, configure
         id: routes_cfg
         if: matrix.build_type == 'Release'
         run: |
           export PKG_CONFIG_PATH="$VKD3D_PREFIX/lib/pkgconfig"
           cmake -S . -B build-routes -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_RSX_HAL=ON \
-            -DPS3RECOMP_RSX_D3D12_VKD3D=ON $GPU_SRC_ARGS | tee configure-routes.log
+            -DPS3RECOMP_RSX_D3D12_VKD3D=ON -DPS3RECOMP_BUILD_TESTS=ON $GPU_SRC_ARGS | tee configure-routes.log
           grep -q "D3D12: *RSX backend on vkd3d $VKD3D_VERSION" configure-routes.log
           grep -q "Renderer: *the GPU layer's Vulkan backend" configure-routes.log
           grep -q "Renderer: *the compile service's spv target" configure-routes.log
@@ -197,7 +198,7 @@ jobs:
         if: matrix.build_type == 'Release'
         run: >
           cmake --build build-routes --target ps3recomp_runtime test_gpu_contract test_gpu_null test_gpu_sc_spv
-          test_gpu_vk test_rsx_synth test_rsx_out
+          test_gpu_vk test_rsx_synth test_rsx_out test_spurs_queues
 
       # The contract is plain C99 that C++ includes as well, built as both with -Wpedantic -Werror: nothing in the
       # headers may be a Windows or compiler extension. The null backend's test: its operation stream's hash
@@ -211,6 +212,11 @@ jobs:
           ctest --test-dir build-routes -R gpu_contract --output-on-failure --no-tests=error
           ctest --test-dir build-routes -R gpu_null --output-on-failure --no-tests=error
           ctest --test-dir build-routes -R gpu_sc_spv --output-on-failure --no-tests=error
+
+      # LIBSRE_OWN's queue families against stand-ins for their SPU side, under load (libs/spurs/tests).
+      - name: Run the SPURS queue families' test
+        if: ${{ !cancelled() && matrix.build_type == 'Release' && steps.routes_build.outcome == 'success' }}
+        run: ctest --test-dir build-routes -R spurs_queues --output-on-failure --no-tests=error
 
       # The switch's choice against its stand-ins, as Linux builds it (-V: each case's line).
       - name: Run the route switch's test
