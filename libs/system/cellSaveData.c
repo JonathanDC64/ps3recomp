@@ -66,8 +66,11 @@ static void save_root_init(void)
     if (e && *e) snprintf(s_save_root, sizeof(s_save_root), "%s", e);
 }
 
-/* Ensure directory (and parents) exist */
-static void ensure_dirs(const char* path)
+static int dir_exists(const char* path);
+
+/* Ensure directory (and parents) exist. 0 once `path` is a directory, -1 if it
+ * could not be made, with errno (and Windows' own error) left from that try. */
+static int ensure_dirs(const char* path)
 {
     char tmp[1024];
     strncpy(tmp, path, sizeof(tmp) - 1);
@@ -81,7 +84,8 @@ static void ensure_dirs(const char* path)
             *p = saved;
         }
     }
-    HOST_MKDIR(tmp);
+    if (HOST_MKDIR(tmp) == 0) return 0;
+    return errno == EEXIST && dir_exists(tmp) ? 0 : -1;
 }
 
 /* Put a written file's data on the disk. Closing it leaves the data in the
@@ -111,6 +115,26 @@ static int file_replace(const char* tmp, const char* dst, const char* dir)
     if (fd >= 0) { fsync(fd); close(fd); }
     return 0;
 #endif
+}
+
+/* Why the file call just made failed, for the log line that says so: errno's
+ * text, and on Windows the system's error number as well, which tells apart
+ * reasons errno folds together (access denied, a file in use, a path too
+ * long). `win32` is for a failed Windows call, which leaves errno as it was.
+ * Called right after the failure, before another call can change either. */
+static const char* savedata_os_error(char* buf, size_t n, int win32)
+{
+#ifdef _WIN32
+    const unsigned long w = GetLastError();
+    const int e = errno;
+    if (win32) snprintf(buf, n, "Windows error %lu", w);
+    else snprintf(buf, n, "%s (errno %d, Windows error %lu)", strerror(e), e, w);
+#else
+    const int e = errno;
+    (void)win32;
+    snprintf(buf, n, "%s (errno %d)", strerror(e), e);
+#endif
+    return buf;
 }
 
 /* A save directory name the title gives: one name that fits, no separators,
@@ -729,7 +753,9 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     case CELL_SAVEDATA_FILEOP_READ: {
         FILE* fp = fopen(file_path, "rb");
         if (!fp) {
-            printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
+            char why[160];
+            printf("[cellSaveData] file read: cannot open '%s': %s\n", file_path,
+                   savedata_os_error(why, sizeof why, 0));
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -749,7 +775,17 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 
     case CELL_SAVEDATA_FILEOP_WRITE:
     case CELL_SAVEDATA_FILEOP_WRITE_NOTRUNC: {
-        ensure_dirs(save_path);
+        /* Each failure below names its step and the system's reason. A save
+         * folder the game cannot write (one that Windows Security's controlled
+         * folder access guards, say) fails every save the same way, and a title
+         * that retries -- Demon's Souls makes its save again and again behind
+         * "Creating SAVE DATA..." -- gives the player nothing else to go on. */
+        char why[160];
+        if (ensure_dirs(save_path) != 0) {
+            printf("[cellSaveData] file write: cannot make the save folder '%s': %s\n", save_path,
+                   savedata_os_error(why, sizeof why, 0));
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+        }
         /* A whole-file write goes to ".<name>.tmp", which is synced and then
          * replaces the file, so a crash, a full disk or a power cut at any
          * point leaves the old file whole or the new one, never a short or
@@ -768,7 +804,8 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             fp = fopen(file_path, "wb");
         }
         if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s'\n", whole ? tmp_path : file_path);
+            printf("[cellSaveData] file write: cannot open '%s': %s\n", whole ? tmp_path : file_path,
+                   savedata_os_error(why, sizeof why, 0));
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
@@ -781,15 +818,20 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
         size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
-        int failed = wrote != write_size;
-        if (!failed && file_sync(fp) != 0) failed = 1;
-        if (fclose(fp) != 0) failed = 1;
-        if (whole) {
-            if (!failed && file_replace(tmp_path, file_path, save_path) != 0) failed = 1;
-            if (failed) {
-                printf("[cellSaveData] file write: '%s' failed, old file kept\n", file_path);
-                remove(tmp_path);
-            }
+        const char* step = NULL;
+        if (wrote != write_size) step = "the write";
+        else if (file_sync(fp) != 0) step = "the flush to the disk";
+        if (step) savedata_os_error(why, sizeof why, 0);
+        if (fclose(fp) != 0 && !step) { step = "the close"; savedata_os_error(why, sizeof why, 0); }
+        if (whole && !step && file_replace(tmp_path, file_path, save_path) != 0) {
+            step = "the replace";
+            savedata_os_error(why, sizeof why, 1);
+        }
+        int failed = step != NULL;
+        if (failed) {
+            if (whole) remove(tmp_path);
+            printf("[cellSaveData] file write: %s of '%s' failed%s: %s\n", step, file_path,
+                   whole ? ", old file kept" : "", why);
         }
         if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
             pfd_add(save_path, name);
@@ -805,10 +847,11 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
     }
 }
 
-/* Write a simplified PARAM.SFO with the save's title/subtitle/detail */
-static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
+/* Write a simplified PARAM.SFO with the save's title/subtitle/detail.
+ * 0 if written, -1 (and a log line saying why) if not. */
+static int write_param_sfo(const char* save_path, const CellSaveDataSystemFileParam* param)
 {
-    if (!param) return;
+    if (!param) return 0;
 
     char sfo_path[1024], tmp_path[1024 + 8];
     snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
@@ -823,8 +866,13 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
 #endif
 
     /* Written beside it and swapped in, as the files are (process_file_op). */
+    char why[160];
     FILE* fp = fopen(tmp_path, "wb");
-    if (!fp) return;
+    if (!fp) {
+        printf("[cellSaveData] PARAM.SFO: cannot open '%s': %s\n", tmp_path,
+               savedata_os_error(why, sizeof why, 0));
+        return -1;
+    }
 
     /* Write a simplified text-based PARAM.SFO for easy debugging.
        Games don't read this directly - our stat callback fills it from here. */
@@ -833,9 +881,19 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
     fprintf(fp, "DETAIL=%s\n", param->detail);
     fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
     fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
-    int failed = ferror(fp) || file_sync(fp) != 0;
-    if (fclose(fp) != 0) failed = 1;
-    if (failed || file_replace(tmp_path, sfo_path, save_path) != 0) remove(tmp_path);
+    const char* step = NULL;
+    if (ferror(fp)) step = "the write";
+    else if (file_sync(fp) != 0) step = "the flush to the disk";
+    if (step) savedata_os_error(why, sizeof why, 0);
+    if (fclose(fp) != 0 && !step) { step = "the close"; savedata_os_error(why, sizeof why, 0); }
+    if (!step && file_replace(tmp_path, sfo_path, save_path) != 0) {
+        step = "the replace";
+        savedata_os_error(why, sizeof why, 1);
+    }
+    if (!step) return 0;
+    remove(tmp_path);
+    printf("[cellSaveData] PARAM.SFO: %s of '%s' failed: %s\n", step, sfo_path, why);
+    return -1;
 }
 
 /* Read simplified PARAM.SFO */
@@ -974,13 +1032,26 @@ static s32 savedata_execute(const char* dirName, int is_save,
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
 
-    /* Write PARAM.SFO if stat set provided params and we're saving */
+    /* Write PARAM.SFO if stat set provided params and we're saving.
+     * PARAM.SFO is what makes the folder a save (dir_has_save): a new save that
+     * cannot have one would read back as no save at all, the title would be
+     * told so and make it again, so that save fails here. An existing save
+     * keeps its old one if the new one cannot replace it, and goes on. */
     if (is_save && statSet.setParam) {
-        ensure_dirs(save_path);
+        char why[160];
+        if (ensure_dirs(save_path) != 0) {
+            printf("[cellSaveData] SAVE: cannot make the save folder '%s': %s\n", save_path,
+                   savedata_os_error(why, sizeof why, 0));
+            free(fileList);
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+        }
         CellSaveDataSystemFileParam params;
         memcpy(&params, statSet.setParam, sizeof(params));
         params.attribute = ps3_bswap32(params.attribute);
-        write_param_sfo(save_path, &params);
+        if (write_param_sfo(save_path, &params) != 0 && !dir_has_save(save_path)) {
+            free(fileList);
+            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
+        }
     }
 
     /* Each NEXT callback requests one operation. LAST ends the sequence;
