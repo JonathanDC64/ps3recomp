@@ -163,6 +163,10 @@ static u64            s_audio_start_us = 0;
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS totals */
+/* AUDIO_RATE: the mixer's own pacing events. A gain or a late wake mixes two
+ * blocks back to back, and the title, which writes one block per notify,
+ * cannot fill the second in no time. */
+static unsigned long long g_mix_gain, g_mix_slip, g_mix_b2b;
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -172,6 +176,24 @@ static thread_t      s_mix_thread;
 static int           s_mix_thread_live = 0;
 #endif
 static mutex_t       s_audio_mutex;
+
+/* AUDIO_WAKE=1 (diagnostic): how soon the title writes each block we publish.
+ * The mixer stamps each slot it publishes and the time; a watcher thread looks
+ * at the slots still pending every 0.25 ms and notes when each one's samples
+ * turn non-zero. A slot still clear 1.9 block-times on (just before the mixer
+ * reads it, at a lag of one block) was never written in time: silence, or a
+ * slot the title skipped because it woke after the next publish (AUDIO_GAPS
+ * tells which). Every 5 s, per port: slots written, the median, 99th percentile
+ * and worst time to write, how many took longer than a block-time (a gap with
+ * AUDIO_LAG_BLOCKS=0), and how many were never written. */
+#define WAKE_RING 8
+static int               s_wake_on = -1;
+static volatile u32      s_wake_seq[CELL_AUDIO_PORT_MAX];
+static volatile u32      s_wake_blk[CELL_AUDIO_PORT_MAX][WAKE_RING];
+static volatile long long s_wake_ns[CELL_AUDIO_PORT_MAX][WAKE_RING];
+static thread_t          s_wake_thread;
+static int               s_wake_live;
+static long long mix_clock_ns(void);
 
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
@@ -201,7 +223,20 @@ static int audio_backend_init(void)
     want.freq     = CELL_AUDIO_SAMPLE_RATE;
     want.format   = AUDIO_F32SYS;
     want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
+    /* The device's buffer. SDL hands it to PulseAudio as the stream's whole
+     * target latency (tlength), and to PipeWire as the node's latency, so one
+     * block (256 frames, 5.3 ms) left the server 5.3 ms to cover any late
+     * write: crackle on a busy desktop (a Demon's Souls player on CachyOS,
+     * PipeWire, at 240 fps).
+     * 1024 frames, 21.3 ms, is SDL's usual size for games; with the queue
+     * below the sound leaves about 50 ms after it is mixed (it was 15-20).
+     * Beside four busy threads on two CPUs (the standalone test below), the
+     * server went without data 12% of the time at 256 frames and 1-3% at
+     * 1024. AUDIO_SDL_FRAMES=<n> sets it (256 is the size before). */
+    { static int frames = -1;
+      PS3_KNOB(frames, ps3_env_int("AUDIO_SDL_FRAMES", 1024));
+      want.samples = (Uint16)(frames < CELL_AUDIO_BLOCK_SAMPLES ? CELL_AUDIO_BLOCK_SAMPLES
+                              : frames > 8192 ? 8192 : frames); }
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
@@ -211,7 +246,9 @@ static int audio_backend_init(void)
     }
 
     s_sdl_chunk = have.samples > CELL_AUDIO_BLOCK_SAMPLES ? have.samples : CELL_AUDIO_BLOCK_SAMPLES;
-    printf("[cellAudio] SDL audio: %s, %d Hz, %d channels, %u frames at a time\n",
+    /* (stderr, unbuffered: a report made mid-session must show the driver;
+     * stdout reaches des.log only when its buffer fills) */
+    fprintf(stderr, "[cellAudio] SDL audio: %s, %d Hz, %d channels, %u frames at a time\n",
            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", have.freq, have.channels,
            (unsigned)have.samples);
 
@@ -246,19 +283,38 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     SDL_QueueAudio(s_sdl_audio_dev, stereo_samples, num_samples * 2 * sizeof(float));
 }
 
-/* SDL queues without bound: keep up to three blocks beyond what the device
- * takes at a time (four blocks with SDL's usual 256 frames). */
+/* SDL queues without bound: keep up to two of the device's takes and two
+ * blocks more (2560 frames, 53 ms, with the 1024-frame buffer; 1024 frames
+ * with 256, as before). A server may take twice within a few ms: WSLg's
+ * PulseAudio did so every few seconds, and one take's worth plus three
+ * blocks then ran dry. */
 static int audio_backend_room(void)
 {
     if (!s_sdl_audio_dev) return -1;
     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           s_sdl_chunk + CELL_AUDIO_BLOCK_SAMPLES * 3 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+           2 * s_sdl_chunk + CELL_AUDIO_BLOCK_SAMPLES * 2 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
-/* The device is about to run dry: less queued than it takes at a time. */
+/* The device is about to run dry. SDL takes s_sdl_chunk frames at a time, so
+ * the queue climbs a block a mix and drops a chunk at each take: its level
+ * right after a take is the margin. The lowest level over two takes under
+ * half a take (at least a block) is starving, decided once per two takes.
+ * The level at one moment (under a chunk, as this read before) calls nearly
+ * every take starving once a chunk is larger than a block. With 1024 frames,
+ * in a standalone test against WSLg's PulseAudio on two CPUs, 30 s each: a
+ * one-block margin ran the queue dry 14 times idle; half a take, never, idle
+ * or beside four busy threads. */
 static int audio_backend_starving(void)
 {
-    return s_sdl_audio_dev && SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < s_sdl_chunk;
+    if (!s_sdl_audio_dev) return 0;
+    static u32 low = 0xFFFFFFFFu, seen;
+    const u32 q = SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
+    if (q < low) low = q;
+    if (++seen < 2 * s_sdl_chunk / CELL_AUDIO_BLOCK_SAMPLES) return 0;
+    const u32 margin = s_sdl_chunk / 2 > CELL_AUDIO_BLOCK_SAMPLES ? s_sdl_chunk / 2 : CELL_AUDIO_BLOCK_SAMPLES;
+    const int starving = low < margin;
+    low = 0xFFFFFFFFu; seen = 0;
+    return starving;
 }
 
 static u32 audio_backend_queued_samples(void)
@@ -814,6 +870,12 @@ static void audio_mix_one_block(void)
         port->read_index++;
         if (port->read_idx_addr)
             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+        if (s_wake_on > 0) {
+            const u32 i = s_wake_seq[p] % WAKE_RING;
+            s_wake_blk[p][i] = (u32)(port->read_index % nblock);
+            s_wake_ns[p][i] = mix_clock_ns();
+            s_wake_seq[p]++;
+        }
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -911,6 +973,7 @@ static void audio_mix_loop(void)
     const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * 1000000000LL / CELL_AUDIO_SAMPLE_RATE;
     long long t0 = mix_clock_ns();
     unsigned long long blocks = 0;
+    int gain_left = 0;   /* quarters of a block still to gain */
     while (s_mix_thread_running) {
         const long long now = mix_clock_ns();
         const long long due = t0 + (long long)blocks * period;
@@ -923,9 +986,17 @@ static void audio_mix_loop(void)
         if (now - due > 50000000LL) t0 = now - (long long)blocks * period;
         audio_backend_follow();
         const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; continue; }   /* DAC slower: slip */
-        if (blocks > 8 && audio_backend_starving()) t0 -= period;                     /* DAC faster: gain */
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; g_mix_slip++; continue; }   /* DAC slower: slip */
+        /* DAC faster: gain a block, a quarter at a time over the next four
+         * mixes. A whole block at once mixed two back to back, and the title,
+         * which writes one block per notify, had no time for the second: it
+         * played as silence. Now each of the four comes 4 ms after the last. */
+        if (!gain_left && blocks > 8 && audio_backend_starving()) { gain_left = 4; g_mix_gain++; }
+        if (gain_left) { t0 -= period / 4; gain_left--; }
         blocks++;
+        { static long long last_mix; const long long m = mix_clock_ns();
+          if (last_mix && m - last_mix < period / 2) g_mix_b2b++;
+          last_mix = m; }
         /* Mix and submit one block */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -956,6 +1027,11 @@ static void audio_mix_loop(void)
                             g_audio_gaps - g0, g_audio_gap_blocks - gb0,
                             n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0, 10);
                 g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
+                { static unsigned long long ga0, sl0, bb0;
+                  if (g_mix_gain != ga0 || g_mix_slip != sl0 || g_mix_b2b != bb0)
+                      fprintf(stderr, "[audio-rate] mixer: gained %llu, slipped %llu, mixed back to back %llu%c",
+                              g_mix_gain - ga0, g_mix_slip - sl0, g_mix_b2b - bb0, 10);
+                  ga0 = g_mix_gain; sl0 = g_mix_slip; bb0 = g_mix_b2b; }
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, %s %u%c",
                         n * 1000.0 / (ms - t0ms), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (ms - t0ms),
 #if AUDIO_BACKEND_WASAPI
@@ -999,9 +1075,122 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
+#if AUDIO_BACKEND_SDL2
+    /* Off Windows there is no MMCSS. At the default priority the mixer wakes
+     * late when every core is busy (a fight on a 4-core handheld), and each
+     * late block is mixed with no time left for the title to write the next
+     * one: a gap. On Linux SDL asks for nice -20 and, without the privilege
+     * for that, asks RealtimeKit over D-Bus (the service PipeWire and
+     * PulseAudio use) for the best nice level it grants, -15 by default; the
+     * thread stays in the ordinary class, not a real-time one. (macOS: SDL's
+     * round-robin class, as Apple asks of audio threads.) If neither works it
+     * runs as before. */
+    const int raised = SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL) == 0;
+    fprintf(stderr, "[cellAudio] Mixing thread started (%s%s)\n", raised ? "raised priority" : "normal priority: ",
+           raised ? "" : SDL_GetError());
+#else
     printf("[cellAudio] Mixing thread started\n");
+#endif
     audio_mix_loop();
     printf("[cellAudio] Mixing thread stopped\n");
+    return NULL;
+}
+#endif
+
+/* The AUDIO_WAKE watcher (see s_wake_on). */
+static void audio_wake_watch(void)
+{
+    enum { BINS = 120 };   /* 0.1 ms each */
+    const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * 1000000000LL / CELL_AUDIO_SAMPLE_RATE;
+    static u32 next[CELL_AUDIO_PORT_MAX];                       /* the next published slot to take on */
+    static u32 pblk[CELL_AUDIO_PORT_MAX][WAKE_RING];            /* pending slots */
+    static long long pns[CELL_AUDIO_PORT_MAX][WAKE_RING];
+    static u8 plive[CELL_AUDIO_PORT_MAX][WAKE_RING];
+    static u32 hist[CELL_AUDIO_PORT_MAX][BINS];
+    static u32 n[CELL_AUDIO_PORT_MAX], late[CELL_AUDIO_PORT_MAX], never[CELL_AUDIO_PORT_MAX], lost[CELL_AUDIO_PORT_MAX];
+    static long long worst[CELL_AUDIO_PORT_MAX];
+#ifdef _WIN32
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+#endif
+    long long t_report = mix_clock_ns();
+    while (s_mix_thread_running) {
+        for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+            const AudioPortSlot* port = &s_ports[p];
+            if (!port->in_use || !port->running || !port->buffer) continue;
+            const u32 seq = s_wake_seq[p];
+            if (seq - next[p] > WAKE_RING / 2) { lost[p] += seq - next[p] - WAKE_RING / 2; next[p] = seq - WAKE_RING / 2; }
+            for (; next[p] != seq; next[p]++) {   /* take on the newly published slots */
+                const u32 i = next[p] % WAKE_RING;
+                pblk[p][i] = s_wake_blk[p][i]; pns[p][i] = s_wake_ns[p][i]; plive[p][i] = 1;
+            }
+            const long long now = mix_clock_ns();
+            const u32 words = CELL_AUDIO_BLOCK_SAMPLES * (u32)port->param.nChannel;
+            for (u32 i = 0; i < WAKE_RING; i++) {
+                if (!plive[p][i]) continue;
+                const u32* w = (const u32*)(port->buffer + pblk[p][i] * words);
+                int nz = 0;
+                for (u32 s = 0; s < words; s += 8) if (w[s]) { nz = 1; break; }
+                const long long lat = now - pns[p][i];
+                if (nz) {
+                    long long b = lat / 100000; if (b >= BINS) b = BINS - 1;
+                    hist[p][b]++; n[p]++;
+                    if (lat > period) late[p]++;
+                    if (lat > worst[p]) worst[p] = lat;
+                    plive[p][i] = 0;
+                } else if (lat > period * 19 / 10) {
+                    never[p]++; plive[p][i] = 0;
+                }
+            }
+        }
+        const long long now = mix_clock_ns();
+        if (now - t_report >= 5000000000LL) {
+            for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
+                if (!n[p] && !never[p]) continue;
+                int p50 = -1, p99 = -1; u32 acc = 0;
+                for (int b = 0; b < BINS; b++) {
+                    acc += hist[p][b];
+                    if (p50 < 0 && acc * 2 >= n[p]) p50 = b;
+                    if (p99 < 0 && acc * 100 >= n[p] * 99) p99 = b;
+                }
+                fprintf(stderr, "[audio-wake] port %d: %u written, median %.1f ms, 99%% %.1f ms, worst %.1f ms;"
+                        " after a block-time %u, never %u%s%c",
+                        p, n[p], p50 < 0 ? 0.0 : (p50 + 1) * 0.1, p99 < 0 ? 0.0 : (p99 + 1) * 0.1,
+                        worst[p] / 1e6, late[p], never[p], lost[p] ? " (watcher fell behind)" : "", 10);
+                memset(hist[p], 0, sizeof(hist[p]));
+                n[p] = late[p] = never[p] = lost[p] = 0; worst[p] = 0;
+            }
+            t_report = now;
+        }
+#ifdef _WIN32
+        if (timer) {
+            LARGE_INTEGER rel; rel.QuadPart = -2500;   /* 0.25 ms */
+            SetWaitableTimer(timer, &rel, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(timer, 5);
+        } else {
+            Sleep(0);
+        }
+#else
+        { struct timespec ts = { 0, 250000 }; nanosleep(&ts, NULL); }
+#endif
+    }
+#ifdef _WIN32
+    if (timer) CloseHandle(timer);
+#endif
+}
+
+#ifdef _WIN32
+static unsigned __stdcall audio_wake_thread_func(void* arg)
+{
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);   /* so its own wake is not the delay */
+    audio_wake_watch();
+    return 0;
+}
+#else
+static void* audio_wake_thread_func(void* arg)
+{
+    (void)arg;
+    audio_wake_watch();
     return NULL;
 }
 #endif
@@ -1009,6 +1198,15 @@ static void* audio_mix_thread_func(void* arg)
 static int audio_start_mix_thread(void)
 {
     s_mix_thread_running = 1;
+    PS3_KNOB(s_wake_on, getenv("AUDIO_WAKE") ? 1 : 0);
+    if (s_wake_on > 0) {
+#ifdef _WIN32
+        s_wake_thread = (HANDLE)_beginthreadex(NULL, 0, audio_wake_thread_func, NULL, 0, NULL);
+        s_wake_live = s_wake_thread != NULL;
+#else
+        s_wake_live = pthread_create(&s_wake_thread, NULL, audio_wake_thread_func, NULL) == 0;
+#endif
+    }
 
 #ifdef _WIN32
     s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
@@ -1030,6 +1228,15 @@ static int audio_start_mix_thread(void)
 static void audio_stop_mix_thread(void)
 {
     s_mix_thread_running = 0;
+    if (s_wake_live) {
+#ifdef _WIN32
+        WaitForSingleObject(s_wake_thread, 2000);
+        CloseHandle(s_wake_thread);
+#else
+        pthread_join(s_wake_thread, NULL);
+#endif
+        s_wake_live = 0;
+    }
 #ifdef _WIN32
     if (s_mix_thread) {
         WaitForSingleObject(s_mix_thread, 2000);

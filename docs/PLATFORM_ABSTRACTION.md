@@ -67,24 +67,22 @@ Thread-local `ppu_context` pointers are stored using:
 
 ### Thread Priority
 
-PS3 priorities (0 = highest, 3071 = lowest) are mapped approximately to host priorities:
+PS3 priorities run from 0 (most urgent) to 3071. A title's main thread and most
+of its workers sit at the SDK's default, 1001. The threads it ranks ahead of
+that are the ones that must not wait, its audio and I/O pollers, so those get
+one step up on the host (`ppu_host_raised` in `runtime/syscalls/sys_ppu_thread.c`);
+every other guest thread keeps the host's normal priority.
 
-**Windows:**
-```c
-if (priority < 500)       SetThreadPriority(h, THREAD_PRIORITY_HIGHEST);
-else if (priority < 1000) SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
-else if (priority < 2000) SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
-else if (priority < 2500) SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
-else                      SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
-```
+| Guest priority | Windows | Linux | macOS |
+|---|---|---|---|
+| below 1000 | `THREAD_PRIORITY_ABOVE_NORMAL` | nice -5: `setpriority`, or RealtimeKit through SDL when the process may not lower its own nice | the shim's above-normal mapping (QoS user-interactive) |
+| 1000 and up | normal | nice 0 | default |
 
-**POSIX:**
-```c
-struct sched_param param;
-param.sched_priority = sched_get_priority_max(SCHED_OTHER)
-                     - (priority * range / 3071);
-pthread_setschedparam(thread, SCHED_OTHER, &param);
-```
+`PPU_RAISE_BELOW=<prio>` moves the line (256 was the line before; 0 turns it
+off). Raising the thread is best effort: a refusal leaves it at normal priority
+and is logged once. The cellAudio mixer itself runs higher still: MMCSS "Pro
+Audio" on Windows, `SDL_SetThreadPriority(TIME_CRITICAL)` elsewhere (on Linux a
+nice level from RealtimeKit, not a real-time class).
 
 ---
 
