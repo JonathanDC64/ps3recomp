@@ -2,8 +2,9 @@
 #
 # runtime/platform/plat.h's threads, events and mutex, and the SPU async job
 # pool built on them (runtime/spu/spu_async_pool.c); its time and sleep
-# (test_plat_time: the monotonic clock and the precise sleep); and its file
-# mapped read-only (test_plat_file). Standalone project with
+# (test_plat_time: the monotonic clock and the precise sleep); its file
+# mapped read-only (test_plat_file); and its core kept for one thread
+# (test_plat_core). Standalone project with
 # its own build dir, and also added from the top-level CMakeLists under
 # PS3RECOMP_BUILD_TESTS.
 #
@@ -94,5 +95,26 @@ endif()
 add_test(NAME plat_file COMMAND test_plat_file)
 set_tests_properties(plat_file PROPERTIES
     LABELS "runtime;platform;file"
+    TIMEOUT 60
+)
+
+# A core kept for one thread (RSX_CORE): plat.h alone (and plat_posix.c off
+# Windows). Skips its checks on a machine with no core to spare.
+add_executable(test_plat_core
+    test_plat_core.c
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/plat_posix.c"
+)
+target_include_directories(test_plat_core PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_options(test_plat_core PRIVATE /W3)
+    target_compile_definitions(test_plat_core PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_plat_core PRIVATE -Wall -Wextra)
+    target_link_libraries(test_plat_core PRIVATE Threads::Threads)
+endif()
+
+add_test(NAME plat_core COMMAND test_plat_core)
+set_tests_properties(plat_core PROPERTIES
+    LABELS "runtime;platform;threads"
     TIMEOUT 60
 )
