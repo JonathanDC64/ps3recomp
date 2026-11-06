@@ -163,6 +163,10 @@ static u64            s_audio_start_us = 0;
 /* Mixing thread */
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static unsigned long long g_audio_gaps, g_audio_gap_blocks;   /* AUDIO_GAPS totals */
+/* AUDIO_RATE: the mixer's own pacing events. A gain or a late wake mixes two
+ * blocks back to back, and the title, which writes one block per notify,
+ * cannot fill the second in no time. */
+static unsigned long long g_mix_gain, g_mix_slip, g_mix_b2b;
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
 #ifndef _WIN32
@@ -947,9 +951,12 @@ static void audio_mix_loop(void)
         if (now - due > 50000000LL) t0 = now - (long long)blocks * period;
         audio_backend_follow();
         const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; continue; }   /* DAC slower: slip */
-        if (blocks > 8 && audio_backend_starving()) t0 -= period;                     /* DAC faster: gain */
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; g_mix_slip++; continue; }   /* DAC slower: slip */
+        if (blocks > 8 && audio_backend_starving()) { t0 -= period; g_mix_gain++; }                 /* DAC faster: gain */
         blocks++;
+        { static long long last_mix; const long long m = mix_clock_ns();
+          if (last_mix && m - last_mix < period / 2) g_mix_b2b++;
+          last_mix = m; }
         /* Mix and submit one block */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -980,6 +987,11 @@ static void audio_mix_loop(void)
                             g_audio_gaps - g0, g_audio_gap_blocks - gb0,
                             n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0, 10);
                 g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
+                { static unsigned long long ga0, sl0, bb0;
+                  if (g_mix_gain != ga0 || g_mix_slip != sl0 || g_mix_b2b != bb0)
+                      fprintf(stderr, "[audio-rate] mixer: gained %llu, slipped %llu, mixed back to back %llu%c",
+                              g_mix_gain - ga0, g_mix_slip - sl0, g_mix_b2b - bb0, 10);
+                  ga0 = g_mix_gain; sl0 = g_mix_slip; bb0 = g_mix_b2b; }
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, %s %u%c",
                         n * 1000.0 / (ms - t0ms), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (ms - t0ms),
 #if AUDIO_BACKEND_WASAPI
