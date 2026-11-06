@@ -657,6 +657,23 @@ if(PS3RECOMP_BUILD_TESTS)
         endif()
         set_target_properties(test_event_queue_life PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME event_queue_life COMMAND test_event_queue_life)
+        # Our own SPURS queue families (LIBSRE_OWN) against stand-ins for their SPU side, under load.
+        add_executable(test_spurs_queues
+            libs/spurs/tests/test_spurs_queues.c
+            runtime/host/host_stubs.c
+        )
+        target_link_libraries(test_spurs_queues PRIVATE ps3recomp_runtime)
+        if(WIN32)
+            target_link_libraries(test_spurs_queues PRIVATE dxguid)
+        endif()
+        if(MSVC)
+            target_compile_options(test_spurs_queues PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(test_spurs_queues PRIVATE -UNDEBUG)
+        endif()
+        set_target_properties(test_spurs_queues PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME spurs_queues COMMAND test_spurs_queues)
+        set_tests_properties(spurs_queues PROPERTIES TIMEOUT 120)
     endif()
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).

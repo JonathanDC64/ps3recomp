@@ -186,6 +186,10 @@ extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
  * HLE stub. prx_resolve_export returns 0 when no PRX exports the NID, so this is
  * a no-op when no PRX is loaded. */
 extern "C" uint32_t prx_resolve_export(uint32_t nid);
+/* LIBSRE_OWN: our own SPURS queue families (libs/spurs/spurs_queues.h). */
+extern "C" int         spurs_own_nid(uint32_t nid);
+extern "C" const char* spurs_own_name(uint32_t nid);
+extern "C" uint32_t    spurs_own_call(uint32_t nid, const uint64_t* gpr);
 extern "C" void     ps3_indirect_call(ppu_context* ctx);
 extern "C" uint32_t vm_read32(uint64_t a);
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -565,6 +569,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * (e.g. the deserializer's this-pointer). Skip it to test that theory. */
     { static int _ns=-1; if(_ns<0)_ns=getenv("FLOW_NOSPILL")?1:0;
       if(!_ns) vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); }
+
+    /* LIBSRE_OWN: our own SPURS queue families (libs/spurs/spurs_queues.h),
+     * ahead of a loaded libsre and of the HLE table. Off (the default) this is
+     * one switch on the NID, and the table's old handlers, the unresolved
+     * imports and the LIBSRE_LLE_ONLY routing below all stay as they were. */
+    if (spurs_own_nid(nid)) {
+        const char* nm = spurs_own_name(nid);
+        g_last_hle_name = nm;
+        ps3_msf("hle:own:%s", nm);
+        { unsigned t = (unsigned)ctx->thread_id;
+          if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nm; }
+        /* libsre returns an int: sign-extended in r3. */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)spurs_own_call(nid, ctx->gpr);
+        return;   /* the guard clears the in-flight slot */
+    }
 
     /* Real libsre (loaded PRX) takes priority over the HLE stub -- EXCEPT for NIDs
      * listed in YDKJ_FORCE_HLE (comma-separated hex). Some LLE entry points fail
