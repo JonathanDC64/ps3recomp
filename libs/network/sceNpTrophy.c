@@ -22,6 +22,7 @@
 #include "np_trophy_set.h"
 #include "../system/cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/sys_lang.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,9 +73,10 @@ _Static_assert(sizeof(SceNpTrophyFlagArray) == 16, "SceNpTrophyFlagArray layout"
 _Static_assert(sizeof(sceNpTrophyUnlockEvent) == 1192, "sceNpTrophyUnlockEvent layout");
 _Static_assert(offsetof(sceNpTrophyUnlockEvent, name) == 40, "sceNpTrophyUnlockEvent.name");
 
-/* English (US): the language cellSysutil reports for SYSTEMPARAM_ID_LANG. It
- * picks TROP_01.SFM over TROP.SFM when a set has one. */
-#define TROPHY_SYSTEM_LANG      1
+/* The language cellSysutil reports for SYSTEMPARAM_ID_LANG (ps3emu/sys_lang.h:
+ * PS3_SYS_LANG, else English (US)). It picks TROP_<nn>.SFM over TROP.SFM when
+ * a set has one. */
+#define TROPHY_SYSTEM_LANG      ps3_sys_lang()
 /* CellRtcTick (microseconds since 0001-01-01) of the Unix epoch */
 #define TROPHY_TICK_UNIX_EPOCH  62135596800000000ULL
 /* Without a trophy set: ids accepted and the count GetTrophyUnlockState reports */
