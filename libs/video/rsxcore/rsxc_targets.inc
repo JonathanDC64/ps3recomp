@@ -655,11 +655,13 @@ static u32 samp_key_slot(const u32* k)
  * texture with another's function and size, and faults. So a table new to the
  * session waits for the parts first: rare, and with no split nothing runs here. */
 static int s_split_running;
+static u32 s_samp_wr;   /* sampler tables written so far (RSX_SAMP_SAME) */
 
-static u32 vp_sampler_table(const D3D12DrawRecord* dr)
+/* The table holding dr's sampler key, made or rewritten when none does; ~0
+ * when the tables are full (table 0 is bound then, and the answer is not
+ * kept by vp_sampler_table). */
+static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UNITS * SAMP_KEY_W], u64* last)
 {
-    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
-    static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
     u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
         const int set = dr && dr->tex[u].set;
@@ -707,7 +709,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
             if (!said) { said = 1;
                 fprintf(stderr, "[D3D12] one frame uses more than %u sampler "
                                 "combinations; the rest share table 0%c", cap, 10); }
-            return 0;
+            return ~0u;
         }
         if (last[t] + FRAME_COUNT > now) wait_for_gpu();
         { static int n = 0;
@@ -716,6 +718,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
                                (unsigned long long)last[t], 10); }
     }
     last[t] = now;
+    s_samp_wr++;
     memcpy(keys[t], k, sizeof k);
     hint[hs] = (u16)(t + 1);
     /* Each unit's sampler is the GPU layer's, made once per description
@@ -763,6 +766,58 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
                                      gpu_sampler_get(s_rc_dev, &sd));
     }
     return t;
+}
+
+/* RSX_SAMP_SAME (live, default 1; 0 builds every draw's key): a draw whose
+ * units hold the last draw's sampler inputs takes the last draw's table
+ * without building its key, as most draws sample like the one before. The
+ * inputs are each unit's set flag and, for a set unit, TEXTURE_ADDRESS, the
+ * filter, the border colour and the format (whether it compares depth): all
+ * the key reads (tex_filter_key, dr_unit_shadow, addr_has_border). The table
+ * still holds that key while no table has been written since, the pool has
+ * as many tables (a new device starts again from none) and no live knob has
+ * changed (tex_filter_key reads two). Deep Palace capture, null
+ * route: the key was ~1.4% of the FIFO thread; 3.8% of the Deck's render
+ * thread was this function. */
+#define SAMP_IN_W 5
+static u32 s_samp_in[RSX_FP_UNITS * SAMP_IN_W];
+static u32 s_samp_in_t, s_samp_in_wr, s_samp_in_gen, s_samp_in_n;
+static int s_samp_in_ok;
+
+static u32 vp_sampler_table(const D3D12DrawRecord* dr)
+{
+    static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
+    static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
+    static int same = 1;
+    PS3_KNOB(same, ps3_env_int("RSX_SAMP_SAME", 1) != 0);
+    u32 in[RSX_FP_UNITS * SAMP_IN_W];
+    if (same && dr) {
+        for (int u = 0; u < RSX_FP_UNITS; u++) {
+            const RcTexUnit* const x = &dr->tex[u];
+            const u32 on = x->set ? ~0u : 0u;
+            in[u * SAMP_IN_W]     = on;
+            in[u * SAMP_IN_W + 1] = x->addr & on;
+            in[u * SAMP_IN_W + 2] = x->filt & on;
+            in[u * SAMP_IN_W + 3] = x->border & on;
+            in[u * SAMP_IN_W + 4] = x->fmt & on;
+        }
+        if (s_samp_in_ok && s_samp_in_wr == s_samp_wr && s_samp_in_n == s_d3d.samp_n &&
+            s_samp_in_gen == ps3_env_gen &&
+            !memcmp(in, s_samp_in, sizeof in)) {
+            last[s_samp_in_t] = s_d3d.frame_count;
+            return s_samp_in_t;
+        }
+    }
+    const u32 t = vp_sampler_table_key(dr, keys, last);
+    s_samp_in_ok = same && dr && t != ~0u;
+    if (s_samp_in_ok) {
+        memcpy(s_samp_in, in, sizeof in);
+        s_samp_in_t = t;
+        s_samp_in_wr = s_samp_wr;
+        s_samp_in_n = s_d3d.samp_n;
+        s_samp_in_gen = ps3_env_gen;
+    }
+    return t == ~0u ? 0u : t;
 }
 
 /* Table t of the sampler pool (gpu_fast_table_ref: today's heap start +

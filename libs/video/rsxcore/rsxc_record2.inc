@@ -76,18 +76,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                                   | ((st->alpha_func & 0xFFu) << 8)
                                   | (st->alpha_ref & 0xFFu);
                 for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-                    dr->tex[_u].off = s_d3d.cur_texs[_u].off;
-                    dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
-                    dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
-                    dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
-                    dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
-                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
-                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
-                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
-                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
-                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
-                    dr->tex[_u].set = s_d3d.cur_texs[_u].set;
+                    dr->tex[_u] = s_d3d.cur_texs[_u];
                     dr->tex_rt[_u]  = -1;
                 }
                 dr->tex_slot = -1;
@@ -216,18 +205,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                               | ((st->alpha_func & 0xFFu) << 8)
                               | (st->alpha_ref & 0xFFu);
             for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-                dr->tex[_u].off = s_d3d.cur_texs[_u].off;
-                dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
-                dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
-                dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
-                dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
-                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
-                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
-                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
-                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
-                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
-                dr->tex[_u].set = s_d3d.cur_texs[_u].set;
+                dr->tex[_u] = s_d3d.cur_texs[_u];
                 dr->tex_rt[_u]  = -1;
             }
             dr->tex_slot = -1;
@@ -443,18 +421,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                           | ((st->alpha_func & 0xFFu) << 8)
                           | (st->alpha_ref & 0xFFu);
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-            dr->tex[_u].off = s_d3d.cur_texs[_u].off;
-            dr->tex[_u].raw = s_d3d.cur_texs[_u].raw;
-            dr->tex[_u].w   = s_d3d.cur_texs[_u].w;
-            dr->tex[_u].h   = s_d3d.cur_texs[_u].h;
-            dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
-                    dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
-                    dr->tex[_u].addr  = s_d3d.cur_texs[_u].addr;
-                    dr->tex[_u].filt  = s_d3d.cur_texs[_u].filt;
-                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
-                    dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
-                    dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
-            dr->tex[_u].set = s_d3d.cur_texs[_u].set;
+            dr->tex[_u] = s_d3d.cur_texs[_u];
             dr->tex_rt[_u]  = -1;
         }
         dr->tex_slot = -1;

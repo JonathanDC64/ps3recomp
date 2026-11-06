@@ -46,6 +46,29 @@
 #define VP_FPCB_CHUNK_MASK  ((1u << VP_FPCB_CHUNK_SHIFT) - 1u)
 #define VERTEX_STRIDE       36  /* bytes per host vertex: pos3 + col4 + uv2 */
 
+/* One texture unit as a draw takes it: the draw record's tex[] and the
+ * current units it copies them from (cur_texs) share the struct, so a draw
+ * takes all sixteen with one copy. */
+typedef struct {
+    u32 off;        /* resolved vm offset (guest upload source), 0 = none */
+    u32 raw;        /* raw RSX offset (offscreen-RT matching) */
+    u32 w, h, fmt;  /* dims + RSX base format */
+    u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
+    u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
+                     * filt bits 20-22 (unused by the register) hold
+                     * TEXTURE_CONTROL0's max anisotropy */
+    u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
+                     * address mode reads outside the texture */
+    u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
+                     * Cube faces sit one whole mip pyramid apart, so this
+                     * is what sets the face stride. */
+    int cube;       /* SET_TEXTURE_FORMAT bit 2: a cube texture. Sampled
+                     * with a 3-component direction, not a 2D uv -- treating
+                     * one as 2D is what makes an environment-mapped chrome
+                     * surface come out with black patches and banding. */
+    int set;
+} RcTexUnit;
+
 typedef struct {
     u32 vb_byte_offset; /* offset into vb_mapped where this draw's verts live */
     u32 vertex_count;
@@ -70,25 +93,7 @@ typedef struct {
                          * maps; ignoring the mask stomped persistent state) */
     /* Per-unit textures (t0-t3): decompiled FPs sample up to 4 units
      * (demosaic's interpolation passes read 3). Captured at draw time. */
-    struct {
-        u32 off;        /* resolved vm offset (guest upload source), 0 = none */
-        u32 raw;        /* raw RSX offset (offscreen-RT matching) */
-        u32 w, h, fmt;  /* dims + RSX base format */
-        u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
-        u32 addr, filt; /* NV4097 TEXTURE_ADDRESS / TEXTURE_FILTER: sampler state;
-                         * filt bits 20-22 (unused by the register) hold
-                         * TEXTURE_CONTROL0's max anisotropy */
-        u32 border;     /* NV4097 TEXTURE_BORDER_COLOR (ARGB8): what a border
-                         * address mode reads outside the texture */
-        u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
-                         * Cube faces sit one whole mip pyramid apart, so this
-                         * is what sets the face stride. */
-        int cube;       /* SET_TEXTURE_FORMAT bit 2: a cube texture. Sampled
-                         * with a 3-component direction, not a 2D uv -- treating
-                         * one as 2D is what makes an environment-mapped chrome
-                         * surface come out with black patches and banding. */
-        int set;
-    } tex[RSX_FP_UNITS];
+    RcTexUnit tex[RSX_FP_UNITS];
     int tex_rt[RSX_FP_UNITS];   /* pre-pass: OffRT index sampled by unit, -1 = none */
     int tex_z[RSX_FP_UNITS];    /* pre-pass: depth surface (s_zeta) sampled by unit, -1 = none */
     u32 d2c_mask;       /* pre-pass: units reading a depth surface through a colour
@@ -372,7 +377,7 @@ typedef struct {
     VPFPEntry*            vp_fp;                /* guest-FP PSO cache            */
     int                   vp_fp_n, vp_fp_cap;
     /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, ctrl1, mips, addr, filt, border; int cube; int set; } cur_texs[RSX_FP_UNITS];
+    RcTexUnit             cur_texs[RSX_FP_UNITS];
     u32                   samp_n;               /* 4-sampler tables created so far */
 
     /* Render-to-texture: offscreen RT pool (their RTVs are views). */
