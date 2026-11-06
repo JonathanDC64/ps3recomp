@@ -223,7 +223,20 @@ static int audio_backend_init(void)
     want.freq     = CELL_AUDIO_SAMPLE_RATE;
     want.format   = AUDIO_F32SYS;
     want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
+    /* The device's buffer. SDL hands it to PulseAudio as the stream's whole
+     * target latency (tlength), and to PipeWire as the node's latency, so one
+     * block (256 frames, 5.3 ms) left the server 5.3 ms to cover any late
+     * write: crackle on a busy desktop (a Demon's Souls player on CachyOS,
+     * PipeWire, at 240 fps).
+     * 1024 frames, 21.3 ms, is SDL's usual size for games; with the queue
+     * below the sound leaves about 50 ms after it is mixed (it was 15-20).
+     * Beside four busy threads on two CPUs (the standalone test below), the
+     * server went without data 12% of the time at 256 frames and 1-3% at
+     * 1024. AUDIO_SDL_FRAMES=<n> sets it (256 is the size before). */
+    { static int frames = -1;
+      PS3_KNOB(frames, ps3_env_int("AUDIO_SDL_FRAMES", 1024));
+      want.samples = (Uint16)(frames < CELL_AUDIO_BLOCK_SAMPLES ? CELL_AUDIO_BLOCK_SAMPLES
+                              : frames > 8192 ? 8192 : frames); }
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
     s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
@@ -233,7 +246,9 @@ static int audio_backend_init(void)
     }
 
     s_sdl_chunk = have.samples > CELL_AUDIO_BLOCK_SAMPLES ? have.samples : CELL_AUDIO_BLOCK_SAMPLES;
-    printf("[cellAudio] SDL audio: %s, %d Hz, %d channels, %u frames at a time\n",
+    /* (stderr, unbuffered: a report made mid-session must show the driver;
+     * stdout reaches des.log only when its buffer fills) */
+    fprintf(stderr, "[cellAudio] SDL audio: %s, %d Hz, %d channels, %u frames at a time\n",
            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", have.freq, have.channels,
            (unsigned)have.samples);
 
@@ -268,19 +283,38 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     SDL_QueueAudio(s_sdl_audio_dev, stereo_samples, num_samples * 2 * sizeof(float));
 }
 
-/* SDL queues without bound: keep up to three blocks beyond what the device
- * takes at a time (four blocks with SDL's usual 256 frames). */
+/* SDL queues without bound: keep up to two of the device's takes and two
+ * blocks more (2560 frames, 53 ms, with the 1024-frame buffer; 1024 frames
+ * with 256, as before). A server may take twice within a few ms: WSLg's
+ * PulseAudio did so every few seconds, and one take's worth plus three
+ * blocks then ran dry. */
 static int audio_backend_room(void)
 {
     if (!s_sdl_audio_dev) return -1;
     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           s_sdl_chunk + CELL_AUDIO_BLOCK_SAMPLES * 3 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+           2 * s_sdl_chunk + CELL_AUDIO_BLOCK_SAMPLES * 2 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
-/* The device is about to run dry: less queued than it takes at a time. */
+/* The device is about to run dry. SDL takes s_sdl_chunk frames at a time, so
+ * the queue climbs a block a mix and drops a chunk at each take: its level
+ * right after a take is the margin. The lowest level over two takes under
+ * half a take (at least a block) is starving, decided once per two takes.
+ * The level at one moment (under a chunk, as this read before) calls nearly
+ * every take starving once a chunk is larger than a block. With 1024 frames,
+ * in a standalone test against WSLg's PulseAudio on two CPUs, 30 s each: a
+ * one-block margin ran the queue dry 14 times idle; half a take, never, idle
+ * or beside four busy threads. */
 static int audio_backend_starving(void)
 {
-    return s_sdl_audio_dev && SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) < s_sdl_chunk;
+    if (!s_sdl_audio_dev) return 0;
+    static u32 low = 0xFFFFFFFFu, seen;
+    const u32 q = SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
+    if (q < low) low = q;
+    if (++seen < 2 * s_sdl_chunk / CELL_AUDIO_BLOCK_SAMPLES) return 0;
+    const u32 margin = s_sdl_chunk / 2 > CELL_AUDIO_BLOCK_SAMPLES ? s_sdl_chunk / 2 : CELL_AUDIO_BLOCK_SAMPLES;
+    const int starving = low < margin;
+    low = 0xFFFFFFFFu; seen = 0;
+    return starving;
 }
 
 static u32 audio_backend_queued_samples(void)
@@ -939,6 +973,7 @@ static void audio_mix_loop(void)
     const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * 1000000000LL / CELL_AUDIO_SAMPLE_RATE;
     long long t0 = mix_clock_ns();
     unsigned long long blocks = 0;
+    int gain_left = 0;   /* quarters of a block still to gain */
     while (s_mix_thread_running) {
         const long long now = mix_clock_ns();
         const long long due = t0 + (long long)blocks * period;
@@ -952,7 +987,12 @@ static void audio_mix_loop(void)
         audio_backend_follow();
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { t0 += period; g_mix_slip++; continue; }   /* DAC slower: slip */
-        if (blocks > 8 && audio_backend_starving()) { t0 -= period; g_mix_gain++; }                 /* DAC faster: gain */
+        /* DAC faster: gain a block, a quarter at a time over the next four
+         * mixes. A whole block at once mixed two back to back, and the title,
+         * which writes one block per notify, had no time for the second: it
+         * played as silence. Now each of the four comes 4 ms after the last. */
+        if (!gain_left && blocks > 8 && audio_backend_starving()) { gain_left = 4; g_mix_gain++; }
+        if (gain_left) { t0 -= period / 4; gain_left--; }
         blocks++;
         { static long long last_mix; const long long m = mix_clock_ns();
           if (last_mix && m - last_mix < period / 2) g_mix_b2b++;
