@@ -48,7 +48,9 @@ static void wait_for_gpu(void)
  * and a half is written again only after the batch before last, its last
  * user, is done (batch_wait at render_frame's end). The last batch's
  * write-back copies are stored once its GPU work is done, at the next
- * render_frame's start or the one after (wb_store_done). */
+ * render_frame's start or the one after (wb_store_done), or earlier, after a
+ * wait, when the pre-pass would drop their target or read the memory they
+ * land in (wb_land_target, wb_land_range). */
 static int frames_in_flight_on(void)
 {
     static int on = -1;
@@ -79,6 +81,15 @@ static void batch_wait(u32 par)
                (unsigned long long)s_batch_fence[par],
                (unsigned long long)gpu_fence_completed(s_rc_dev), (unsigned long)gpu_lost(s_rc_dev));
 }
+
+/* The last batch's write-back copies, landed in guest memory early, before
+ * the pre-pass reads what they write (rsxc_writeback.inc): a target's before
+ * it is dropped, and those landing in [addr, addr + len) before a target's
+ * first upload or a texture's reads that memory. Each waits for the last
+ * batch first, if it has queued copies that apply. FIFO thread (render_frame's
+ * pre-pass). */
+static void wb_land_target(int slot);
+static void wb_land_range(u32 addr, u64 len);
 
 /* RSX_HANG_GPU_AT_FRAME=<n> (a test): the first indexed draw of the n-th
  * batch is drawn over and over, about 4G vertices in all, so the GPU takes
@@ -119,12 +130,12 @@ static void lose_device_test(void)
 /* The end of a frame: a point on the timeline for its slot, the swap chain's
  * next buffer, and a wait (2 s at most) until the GPU is done with that
  * buffer's slot's use before this frame. When the buffer does not change
- * (RSX_PRESENT=0 presents nothing) that is the frame before, which
- * render_frame's opening wait_for_gpu has already seen through: the GPU runs
- * this frame while the next batch records, as in today's renderer (its slot's
- * fence value there is the opening wait's, already reached). The batch's
- * vertices go to the other parity half, and frame_cmd_begin waits for the
- * slot before its recorder is reset. */
+ * (RSX_PRESENT=0 presents nothing) that is the frame before, which may still
+ * be running with frames in flight (RSX_FRAMES_IN_FLIGHT; without them
+ * render_frame's opening wait_for_gpu has seen it through). The GPU runs this
+ * frame while the next batch records. The batch's vertices go to the other
+ * parity half, and frame_cmd_begin waits for the slot before its recorder is
+ * reset. */
 /* RSX_GPU_TIMES=1 or 2 (gpu/gpu_times.h): every 600 batches (render_frame
  * calls), the GPU's own time from the backend's timestamps, a game frame
  * (the title's flips that drew: s_pc_flip_render) or, with no flips (a

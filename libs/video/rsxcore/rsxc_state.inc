@@ -209,7 +209,13 @@ typedef struct {
  * cached that many textures, each new upload rewrote a descriptor of one of
  * the frame's first 63 draws. */
 #define VP_TEX_SRV_BASE (DRAW_SRV_BASE + DRAW_SRV_SETS * MAX_DRAWS * RSX_FP_UNITS)
-#define SRV_HEAP_SIZE (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
+/* The post passes' descriptors (rsxc_post.inc), a set per parity half as
+ * the windows (RSX_FRAMES_IN_FLIGHT: the last batch's AA pass may still read
+ * its set): SMAA's six at POST_SRV_SMAA + 6 * half (its two 3-wide windows),
+ * the AA source at POST_SRV_AA + half. (They were slots 21-27, one set.) */
+#define POST_SRV_SMAA (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
+#define POST_SRV_AA   (POST_SRV_SMAA + 12)
+#define SRV_HEAP_SIZE (POST_SRV_AA + 2)
 
 /* Counts render_frame calls. What one call's pre-pass leaves for its later
  * passes carries this stamp (D3D12DrawRecord.pso, the TEX_CSUM_THREADS sums),

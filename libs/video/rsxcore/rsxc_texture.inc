@@ -280,20 +280,37 @@ static void tcj_order_add(int i)
     if (s_tcj_order_n < VP_TEX_SLOTS) s_tcj_order[s_tcj_order_n++] = (u16)i;
 }
 
+/* Before a write-back lands in guest memory during the pre-pass
+ * (wb_land_target, wb_land_range): the workers stop, so none reads what it
+ * writes, and as they may have summed it already, none of their sums is used
+ * for the rest of this render_frame. A worker in the job loop finishes its
+ * list first (as in tcj_dispatch). */
+static u32 s_tcj_void_serial;
+static void tcj_stop(void)
+{
+    s_tcj_void_serial = s_rf_serial;
+    AcquireSRWLockExclusive(&s_tcj.lk);
+    s_tcj.n = 0;
+    ReleaseSRWLockExclusive(&s_tcj.lk);
+    while (s_tcj_busy) YieldProcessor();
+}
+
 /* The checksum of slot i's source bytes [off, +nb): a worker's from this
  * render_frame when its job covered the same bytes, else taken here. */
 static u32 tcj_sum(int i, u32 off, u32 nb)
 {
     extern uint8_t* vm_base;
     const u64 pre = (u64)s_tcj_pre[i];
-    if ((u32)(pre >> 32) == s_rf_serial && s_tcj_pre_off[i] == off && s_tcj_pre_nb[i] == nb)
+    if ((u32)(pre >> 32) == s_rf_serial && s_tcj_void_serial != s_rf_serial &&
+        s_tcj_pre_off[i] == off && s_tcj_pre_nb[i] == nb)
         return (u32)pre;
     return tex_csum(vm_base + off, nb);
 }
 
-/* Texture staging: one upload buffer, persistently mapped, that every
- * texture upload of a frame decodes into, from the start again each frame
- * (render_frame waits for the GPU before the pre-pass uploads anything).
+/* Texture staging: an upload buffer per parity half, persistently mapped,
+ * that every texture upload of a frame decodes into, from the start again
+ * each frame (the GPU finished the half's last batch, the one before last,
+ * before this one started: render_frame's end waited for it).
  *
  * Each texture slot used to own an upload buffer of its own. Creating it
  * was half of a texture's first upload: a camera turn in Demon's Souls'
@@ -583,6 +600,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     u32 blkrow  = dxt ? tl.row_bytes : 0;
     u32 blkrows = dxt ? tl.rows      : 0;
     const u32 key_off = off;         /* lookup key: the offset as bound */
+    /* The guest bytes the texture can read, its faces and mips included
+     * (a level's chain is under twice its first level): the last batch's
+     * write-backs that land there are stored before they are read. */
+    const u64 span = (u64)(dxt ? blkrow * blkrows : w * h * bpp) * (cube ? 6u : 1u) * 2u;
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
     /* (portable helper tex_csum() -- see above; a statement-expression macro
@@ -600,6 +621,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+            wb_land_range(c->off, span);
             u32 cs = tcj_sum(i, c->off, nb);
             /* TEX_VERIFY=1 (live): hash every byte of each cache hit as well,
              * and re-upload one the sparse checksum called unchanged. Slow; it
@@ -683,6 +705,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                             "draw unbound%c", VP_TEX_SLOTS, 10); }
         return -1;
     }
+    wb_land_range(off, span);
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;

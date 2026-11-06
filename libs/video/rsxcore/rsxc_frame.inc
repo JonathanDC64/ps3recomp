@@ -39,8 +39,8 @@ static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso)
 /* RSX_SUBMIT_SPLIT=<records> (live, 0 = off): a batch goes to the GPU in
  * parts, a part ending before the first draw once it has that many records
  * (and that many are still to come), so the GPU starts on the batch while
- * the rest is recorded, and the next batch's opening wait for it is
- * shorter. The same commands in the same order: only where the submits fall
+ * the rest is recorded, and it is done sooner (the next batch's opening
+ * wait, with RSX_FRAMES_IN_FLIGHT=0, is shorter). The same commands in the same order: only where the submits fall
  * moves, and that by the records, not by time. */
 static u32 submit_split_draws(void)
 {
@@ -630,7 +630,7 @@ rtt_dump_done:;
          * allocation failed. The pass is skipped rather than faulting.) */
         if (any && vpso.v && s_vb.n && s_rc_vpcb.n) {
             s_vp_topo_strip = 0;
-            s_split_running = 0;   /* (the opening wait saw the last batch's parts through) */
+            s_split_running = 0;   /* (the last batch's parts: gpu_draws_may_run) */
             vp_pass_binds(rc, vpso);
             const u32 split_n = submit_split_draws();
             u32 split_from = 0;                    /* the record the part being recorded starts at */

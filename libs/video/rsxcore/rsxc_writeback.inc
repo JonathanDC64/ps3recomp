@@ -349,8 +349,10 @@ static int wbg_place(u32 dst, u64 len, gpu_buffer* buf, u64* offset)
 /* A write-back copy rt_writeback_record made, as the target was then. Its
  * store waits until the GPU is done with the batch (wb_store_half): with
  * frames in flight that can come after the next batch's pre-pass has moved
- * the target on, so the store works from these fields, and one whose target
- * was dropped since (gen) is not stored. */
+ * the target on, so the store works from these fields. The pre-pass stores
+ * the copy first when it would drop the target or read the guest memory the
+ * copy lands in (wb_land_target, wb_land_range); one whose target was
+ * dropped anyway (gen) is not stored. */
 enum { WB_CPU, WB_GPU, WB_CHECK };   /* stored by the CPU; by the GPU (wbg_record); both, compared */
 typedef struct {
     int        slot, kind;
@@ -358,18 +360,37 @@ typedef struct {
     u32        off, w, h, gdxgi, gfmt, gpitch, gdma;
     u32        gpu_dst;       /* WB_GPU, WB_CHECK: where the GPU stored it */
     gpu_buffer rb;            /* WB_CPU, WB_CHECK: the readback copy */
+    u32        dst, len;      /* the guest memory it lands in (len 0: none) */
 } WbCopy;
 /* The copies of each parity half's last batch: at most one per target. */
 static struct { WbCopy c[MAX_OFF_RTS]; int n; } s_wb_q[2];
 
+static int wb_swizzled(u32 gfmt) { return ((gfmt >> 8) & 0xF) == 2; }
+
+/* The guest bytes copy c covers at its guest address: the swizzled
+ * surface's whole power-of-two square, or its rows at the guest's pitch.
+ * 0 for a swizzled size past what RSX can have (log2 above 12). */
+static u32 wb_guest_len(const WbCopy* c)
+{
+    if (!wb_swizzled(c->gfmt)) return c->gpitch * c->h;
+    const u32 lw = (c->gfmt >> 16) & 0xFF, lh = (c->gfmt >> 24) & 0xFF;
+    if (lw > 12 || lh > 12) return 0;
+    return ((1u << lw) << lh) * rt_guest_bpp(c->gdxgi);
+}
+
 static void wb_queue(int i, int kind, u32 gpu_dst, gpu_buffer rb)
 {
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
     OffRT* r = &s_d3d.off_rt[i];
     WbCopy* c = &s_wb_q[s_rf_par].c[s_wb_q[s_rf_par].n++];
     c->slot = i; c->kind = kind; c->gen = r->gen; c->serial = s_rf_serial;
     c->off = r->off; c->w = r->w; c->h = r->h; c->gdxgi = r->gdxgi;
     c->gfmt = r->gfmt; c->gpitch = r->gpitch; c->gdma = r->gdma;
     c->gpu_dst = gpu_dst; c->rb = rb;
+    /* Where wb_store_cpu will put it (the GPU's own address for the rest). */
+    c->dst = kind != WB_CPU ? gpu_dst
+                            : cellGcmResolveLocated(c->gdma != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER, c->off);
+    c->len = c->dst && c->dst != 0xFFFFFFFFu ? wb_guest_len(c) : 0;
     r->wb_queued++;
 }
 
@@ -542,7 +563,7 @@ static u32 wb_store_cpu(const WbCopy* c)
     u32 swz = ((c->gfmt >> 8) & 0xF) == 2;
     u32 lw = (c->gfmt >> 16) & 0xFF, lh = (c->gfmt >> 24) & 0xFF;
     u32 gp = c->gpitch;
-    if (swz) { if ((1u << lw) < c->w || (1u << lh) < c->h) return 0; }
+    if (swz) { if (!wb_guest_len(c) || (1u << lw) < c->w || (1u << lh) < c->h) return 0; }
     else if (gp < c->w * bpp || gp > 0x10000) return 0;
     /* The surface's context DMA says which memory the offset is in: local
      * and IO offsets are overlapping number spaces, so the offset alone
@@ -611,9 +632,19 @@ static u32 wb_store_cpu(const WbCopy* c)
     return dst;
 }
 
+/* Is copy c still to be stored, its target the one it was made from? */
+static int wb_copy_live(const WbCopy* c)
+{
+    const OffRT* r = &s_d3d.off_rt[c->slot];
+    return GPU_VALID(r->tex) && r->gen == c->gen;
+}
+
 /* Store half par's queued copies in guest memory, once the GPU has finished
  * their batch (it waits for that). A copy of a target dropped since is not
- * stored: the title may have put something else in that memory. */
+ * stored: the title may have put something else in that memory. The
+ * pre-pass lands a copy before it drops the target (wb_land_target), so
+ * that is a bug, said in a "[wb] not stored" line (test_rsx_synth fails on
+ * it). */
 static void wb_store_half(u32 par)
 {
     extern uint8_t* vm_base;
@@ -622,16 +653,19 @@ static void wb_store_half(u32 par)
     for (int k = 0; k < s_wb_q[par].n; k++) {
         const WbCopy* c = &s_wb_q[par].c[k];
         OffRT* r = &s_d3d.off_rt[c->slot];
-        if (!GPU_VALID(r->tex) || r->gen != c->gen) continue;
+        if (!wb_copy_live(c)) {
+            static int n = 0;
+            if (n < 20 && ++n) fprintf(stderr, "[wb] not stored: 0x%X (%ux%u), its target dropped first%c",
+                                  c->off, c->w, c->h, 10);
+            continue;
+        }
         r->wb_queued--;
         if (!write_color_on() || !vm_base) continue;
         if (c->kind == WB_CHECK) { wbg_check(c, r); continue; }
         const u32 dst = c->kind == WB_GPU ? c->gpu_dst : wb_store_cpu(c);
         if (!dst) continue;
-        const u32 swz = ((c->gfmt >> 8) & 0xF) == 2;
-        const u32 lw = (c->gfmt >> 16) & 0xFF, lh = (c->gfmt >> 24) & 0xFF;
         r->gaddr = dst;
-        r->glen = swz ? ((1u << lw) << lh) * rt_guest_bpp(c->gdxgi) : c->gpitch * c->h;
+        r->glen = wb_guest_len(c);
         r->gsum_new = 1;
     }
     s_wb_q[par].n = 0;
@@ -673,6 +707,39 @@ static void wb_store_all(void)
     wb_store_queued();
 }
 
+/* The last batch's copies, stored now (waiting for that batch first): the
+ * pre-pass is about to drop a target or read memory one of them lands in.
+ * The other half holds only this batch's own copies, recorded at its end,
+ * after the pre-pass: wb_store_done stored the batch before last's. The
+ * texture workers stop first (tcj_stop): they read guest memory. */
+static void wb_land_last(void)
+{
+    tcj_stop();
+    wb_store_half(s_rf_par ^ 1u);
+}
+
+static void wb_land_target(int slot)
+{
+    if (!s_d3d.off_rt[slot].wb_queued) return;
+    const u32 h = s_rf_par ^ 1u;
+    for (int k = 0; k < s_wb_q[h].n; k++) {
+        const WbCopy* c = &s_wb_q[h].c[k];
+        if (c->slot == slot && wb_copy_live(c)) { wb_land_last(); return; }
+    }
+}
+
+static void wb_land_range(u32 addr, u64 len)
+{
+    const u32 h = s_rf_par ^ 1u;
+    for (int k = 0; k < s_wb_q[h].n; k++) {
+        const WbCopy* c = &s_wb_q[h].c[k];
+        if (c->len && c->dst < (u64)addr + len && addr < (u64)c->dst + c->len && wb_copy_live(c)) {
+            wb_land_last();
+            return;
+        }
+    }
+}
+
 /* Drop offscreen targets whose guest memory the title rewrote after our last
  * write-back: it streamed a texture or copied an image there. A texture bound
  * at that offset then reads the guest bytes, and a later draw into it starts
@@ -707,8 +774,10 @@ static void off_rt_drop_rewritten(void)
  * binds the same textures as it did the frame before, and at 5-6k draws a
  * frame (Demon's Souls's Boletarian Palace) re-creating all 16 views of
  * every window was ~11 ms of the render thread's frame. An unchanged view is
- * left as it is. The heap is only written after the GPU has finished the
- * previous frame (render_frame waits first), so skipping a write is safe.
+ * left as it is. A descriptor a batch writes is the GPU's again only after
+ * its last reader is done (the windows and the AA and SMAA sets are a set per
+ * parity half, and render_frame's end waited for the half's last batch), so
+ * skipping a write is safe.
  * The memo compares the whole view, the texture by its handle, and a handle
  * names one texture for the device's life, so no stamp is needed: today's
  * memo rewrote every window after any resource was made, and those rewrites
@@ -957,7 +1026,9 @@ static void guest_fb_present(u32 fi)
 {
     static int inited = 0;
     static u32 off, gw, gh, gpitch, up_pitch;
-    static gpu_buffer up_buf;   /* step C2: the upload buffer, mapped for its life */
+    /* Step C2: the upload buffers, mapped for their life, one per parity
+     * half (RSX_FRAMES_IN_FLIGHT: the last batch may still copy from its). */
+    static gpu_buffer up_bufs[2];
     if (!inited) {
         inited = 1;
         const char* e = getenv("GCM_GUEST_FB");
@@ -965,10 +1036,12 @@ static void guest_fb_present(u32 fi)
         if (!e || sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) != 4 || !b || !c) return;
         off = a; gw = b; gh = c; gpitch = d;
         up_pitch = (gw * 4u + 255u) & ~255u;      /* D3D12 wants 256-byte rows */
-        rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_buf, NULL);   /* none if none */
+        for (int k = 0; k < 2; k++)   /* none if none */
+            rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_bufs[k], NULL);
         fprintf(stderr, "[GUESTFB] presenting guest 0x%08X %ux%u pitch %u -> backbuffer%c",
                 off, gw, gh, gpitch, 10);
     }
+    const gpu_buffer up_buf = up_bufs[s_rf_par];
     if (!GPU_VALID(up_buf)) return;
     { extern u8* vm_base;
       if (!vm_base) return;
