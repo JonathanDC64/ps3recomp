@@ -79,6 +79,12 @@ static uint64_t spu_host_ns(void)
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
 void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+/* LIBSRE_TRACE (libs/spurs/libsre_trace.c): told of each PUTLLC and PUTLLUC
+ * under the lock-line lock, just before the store: the line as it is, the
+ * bytes going in, the task's image and lr, and whether it stores (0: the
+ * PUTLLC fails). Null unless the trace is on. */
+void (*g_spu_line_store_watch)(uint32_t ea, const uint8_t* before, const uint8_t* after,
+                               int image, uint32_t lr, int stored) = 0;
 /* PPU reservations on a line an SPU atomic writes (installed by ppu_loader.cpp).
  * On Cell the reservation granule is the whole 128-byte line: a PUTLLC that
  * changes ANY word of it kills a PPU lwarx/ldarx reservation on another word.
@@ -1115,6 +1121,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
               spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+            if (g_spu_line_store_watch)
+                g_spu_line_store_watch(ea, mem, ls, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK, 1);
             memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
             if (g_ppu_resv_line_break) g_ppu_resv_line_break(ea);
             /* A committing PUTLLC is a line write like any other, so every
@@ -1152,6 +1160,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
         } else {
             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+            if (g_spu_line_store_watch)
+                g_spu_line_store_watch(ea, mem, ls, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK, 0);
             /* SPU_PUTLLC_WHY=1: which of the three conditions failed.
              * A PUTLLC retry loop that never succeeds is a livelock, and
              * "failed" alone cannot distinguish a lost reservation from a line
@@ -1229,6 +1239,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_lock_ea(ea & ~127u, MFC_ATOMIC_LINE);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
+        if (g_spu_line_store_watch)
+            g_spu_line_store_watch(ea, mem, ls, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK, 1);
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
         if (g_ppu_resv_line_break) g_ppu_resv_line_break(ea);
         /* Unconditional, so it invalidates EVERY reservation on the line --
