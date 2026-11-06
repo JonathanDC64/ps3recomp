@@ -21,6 +21,7 @@
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ppu_waits.h"     /* console waits */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "../../libs/spurs/libsre_trace.h" /* LIBSRE_TRACE */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -378,6 +379,14 @@ static void hle_lr_seen(uint32_t nid, const char* name, ppu_context* ctx)
 
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* LIBSRE_TRACE=<file>: the SPURS queue calls, whichever side serves them,
+     * and what their threads do inside them (libs/spurs/libsre_trace.h). The
+     * record of the end is written last, once every other guard has run. */
+    struct _LsreTraceGuard { void* tok; ppu_context* c;
+        ~_LsreTraceGuard() { if (tok) libsre_trace_leave(tok, c->gpr[3]); }
+    } _ltg{ (ctx && libsre_trace_active())
+                ? libsre_trace_enter(nid, ctx->gpr, (uint32_t)ctx->thread_id, (uint32_t)ctx->lr)
+                : nullptr, ctx };
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
@@ -825,6 +834,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 }
             }
             uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
+            libsre_trace_lle(_ltg.tok);
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
             /* FLOW_REENTRY_ISO: the libsre fn re-enters lifted guest code at the PPU

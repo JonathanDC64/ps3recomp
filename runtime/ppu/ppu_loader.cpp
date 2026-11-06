@@ -267,6 +267,11 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 
 #endif /* _WIN32 */
 
+/* LIBSRE_TRACE (libs/spurs/libsre_trace.c): told of each lv2 syscall as it
+ * starts (phase 0, the arguments in gpr) and ends (phase 1, the results).
+ * Null unless the trace is on. */
+extern "C" { void (*g_ppu_sc_watch)(int phase, uint64_t num, const uint64_t* gpr, uint32_t tid) = 0; }
+
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
  * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
  * that returns an error is silent, and that is the harder failure to find:
@@ -275,6 +280,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
                      uint64_t a5, uint64_t a6)
 {
+    if (g_ppu_sc_watch) g_ppu_sc_watch(1, num, ctx->gpr, (uint32_t)ctx->thread_id);
     static int mode = -1;
     if (mode < 0) { const char* e = getenv("PS3_SCTRACE");
         mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
@@ -3547,6 +3553,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    if (g_ppu_sc_watch) g_ppu_sc_watch(0, num, ctx->gpr, (uint32_t)ctx->thread_id);
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
