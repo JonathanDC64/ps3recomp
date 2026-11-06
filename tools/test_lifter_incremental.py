@@ -73,7 +73,15 @@ def main():
         assert names == ['ppu_recomp.c', 'ppu_recomp.h'], names
         single = (out / 'ppu_recomp.c').read_text()
         assert HOOK_DECL in single and 'host_hook(ctx, 0x00010000u);' in single
-    print('PASS: re-lift rewrites only changed files; insn-hook declarations in the calling chunk')
+
+        # sym@key: the hook gets the key in place of the address, and is declared by its name.
+        lift(root, out, hooks='0x10000=host_hook@0x2468')
+        chunk = (out / 'ppu_recomp_000.cpp').read_text()
+        assert HOOK_DECL in chunk, 'a keyed insn hook is not declared by its name'
+        assert 'host_hook(ctx, 0x00002468u);' in chunk, 'a keyed insn hook does not get its key'
+        assert 'host_hook(ctx, 0x00010000u);' not in chunk
+    print('PASS: re-lift rewrites only changed files; insn-hook declarations in the calling chunk; '
+          'keyed insn hooks')
 
 
 if __name__ == '__main__':

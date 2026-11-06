@@ -974,8 +974,12 @@ class PPULifter:
                 func.body_lines.append(f"    {c_line}")
             hook = self.insn_hooks.get(insn.addr)
             if hook is not None:
+                # "sym@key": the host function gets key in place of the
+                # address (--insn-hooks).
+                sym, _, key = hook.partition("@")
+                arg = int(key, 0) if key else insn.addr
                 func.body_lines.append(
-                    f"    {hook}(ctx, 0x{insn.addr:08X}u);  {_HOOK_MARK}")
+                    f"    {sym}(ctx, 0x{arg:08X}u);  {_HOOK_MARK}")
 
         # An in-range branch target with no decoded instruction at its address
         # (a branch into a data / undecoded region inside a too-large function
@@ -4553,8 +4557,11 @@ def main() -> None:
                              "each addr (not a branch), letting a title adjust what "
                              "that instruction produced without replacing the whole "
                              "function. A symbol may be listed for many addresses. "
-                             "@FILE reads the pairs from FILE instead, one or more "
-                             "per line, with # starting a comment.")
+                             "addr=symbol@key passes key in place of addr: a title "
+                             "lifting another release of a game keeps its hooks' "
+                             "keys (the first release's addresses) while the hooks "
+                             "move. @FILE reads the pairs from FILE instead, one or "
+                             "more per line, with # starting a comment.")
     parser.add_argument("--shadow-stack", action="store_true",
                         help="Emit a per-function shadow-call-stack guard (DS_FRAME) "
                              "and define DS_SHADOW_STACK, so the runtime keeps a "
@@ -4586,7 +4593,14 @@ def main() -> None:
             if not pair:
                 continue
             addr_s, _, sym = pair.partition("=")
-            insn_hooks[int(addr_s, 0)] = sym.strip()
+            sym = sym.strip()
+            if "@" in sym:
+                name, _, key = sym.partition("@")
+                try:
+                    sym = f"{name.strip()}@0x{int(key.strip(), 0):08X}"
+                except ValueError:
+                    parser.error(f"--insn-hooks: {pair!r}: the key after @ is not a number")
+            insn_hooks[int(addr_s, 0)] = sym
         print(f"  insn hooks: {len(insn_hooks)} instruction(s) -> host symbols")
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
