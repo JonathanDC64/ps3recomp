@@ -278,7 +278,7 @@ static int init_d3d12(u32 width, u32 height)
             pd.kind = GPU_TABLE_TEX;
             pd.count = SRV_HEAP_SIZE;
             pd.nregions = 4;
-            pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
+            pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = DRAW_SRV_SETS * MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
             pd.region[1].first = 21; pd.region[1].tables = 1; pd.region[1].size = 1;
             pd.region[2].first = 22; pd.region[2].tables = 1; pd.region[2].size = 3;
             pd.region[3].first = 25; pd.region[3].tables = 1; pd.region[3].size = 3;

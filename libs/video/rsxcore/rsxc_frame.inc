@@ -1,5 +1,11 @@
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 
+/* The first entry of draw d's SRV window in this batch's half's set. */
+static inline u32 draw_srv(u32 d)
+{
+    return DRAW_SRV_BASE + (s_rf_par * MAX_DRAWS + d) * RSX_FP_UNITS;
+}
+
 /* The VP pass's binds for the whole batch: at its start, and again after
  * each part RSX_SUBMIT_SPLIT submits (a part's submit drops every bind,
  * gpu.h's cmd_split). Each draw binds the rest itself. */
@@ -19,7 +25,7 @@ static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso)
      * entry; each draw binds its own window before it draws). */
     gpu_cmd_set_table_pools(rc, s_rc_srv_pool, s_rc_samp_pool);
     vp_bind_sampler_table(NULL);
-    gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, DRAW_SRV_BASE));
+    gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(s_rc_dev, s_rc_srv_pool, draw_srv(0)));
     /* vp_vb's and vf_buf's first chunks (rc_arena: no parity offset, the
      * arena keeps the frames apart); render_frame's draws bind another
      * chunk when theirs lies outside. */
@@ -60,18 +66,21 @@ static void render_frame(void)
       PS3_KNOB(fs, ps3_env_int("RSX_FRAME_SLEEP", 0));
       if (fs > 0) Sleep((DWORD)fs); }
 
-    /* Drain the GPU before touching shared upload resources (vp_vb vertices,
-     * vp_cb constants, per-frame texture staging): the previous frame's draws
-     * may still be reading them, and overwriting mid-flight tears geometry
-     * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
-     * polygons). These workloads are a few draws/frame, so full serialisation
-     * costs little. */
+    /* What this batch writes for the GPU (vp_vb vertices, vp_cb constants,
+     * texture staging, the per-draw texture tables, the write-back's readback
+     * buffers) is in its parity half, which the GPU's last use of, the batch
+     * before last, render_frame's end waited for: overwriting data a draw
+     * still reads tears geometry (gcm/cube: triangles mixing stale and new
+     * vertices -> missing/sliver polygons). Without frames in flight
+     * (RSX_FRAMES_IN_FLIGHT=0), or with the last batch's occlusion counts
+     * still to store, the GPU is drained here instead. */
     { LARGE_INTEGER _w0, _w1, _w2, _f;
       QueryPerformanceCounter(&_w0);
-      wait_for_gpu();
+      if (!frames_in_flight_on() || s_zq_pend) wait_for_gpu();
+      s_rf_par = (u32)s_d3d.vp_parity;
       QueryPerformanceCounter(&_w1);
       /* Before the pre-pass below resets `used` and reassigns slots. */
-      if (s_wb_pending) { s_wb_pending = 0; rt_writeback_store(); }
+      wb_store_done();
       /* The last batch's counts, when no ZPASS method came since (zq_hook). */
       if (s_zq_pend) { s_zq_pend = 0; zq_finish(s_zq_pend_nev, s_zq_pend_on); }
       QueryPerformanceCounter(&_w2); QueryPerformanceFrequency(&_f);
@@ -82,6 +91,7 @@ static void render_frame(void)
     rc_grave_release();          /* what the previous frame dropped (step C8a: the one grave) */
     rc_ring_release();           /* the rings it outgrew (step C2) */
     rc_arena_release(&s_vb);     /* a big buffer the last frame outgrew */
+    tex_pool_reclaim();          /* texture memory the GPU is done with, to reuse */
     tex_stage_frame();           /* this frame's texture uploads start over */
     RF_CP(1);
 
@@ -369,7 +379,7 @@ rtt_dump_done:;
                               dr->tex[_u].fmt, dr->fp_addr, dr->vertex_count,
                               dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
               } }
-        /* Fill this draw's SRV window (DRAW_SRV_BASE + d*RSX_FP_UNITS): each unit
+        /* Fill this draw's SRV window (draw_srv): each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
@@ -389,7 +399,7 @@ rtt_dump_done:;
               if (foff != 0xFFFFFFFFu) _used = fp_units_at(foff);
           } }
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-            u32 wslot = DRAW_SRV_BASE + _d * RSX_FP_UNITS + (u32)_u;
+            u32 wslot = draw_srv(_d) + (u32)_u;
             dr->tex_rt[_u] = -1;
             dr->tex_z[_u] = -1;
             if (!(_used & (1u << _u))) {
@@ -973,7 +983,7 @@ rtt_dump_done:;
                         if (tz == cur_z && cur_zro)   /* bound read-only: readable */
                             ;
                         else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
-                            srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, k_rc_no_tex,
+                            srv_write(draw_srv(d) + (u32)_u, k_rc_no_tex,
                                       GPU_FORMAT_R8G8B8A8_UNORM,
                                       GPU_SWIZZLE_IDENTITY);
                             fpwatch_unreadable(dr->fp_addr);
@@ -990,11 +1000,11 @@ rtt_dump_done:;
                         continue;
                     }
                     /* Sampling a bound colour target: read a copy (above). */
-                    srv_write(DRAW_SRV_BASE + d * RSX_FP_UNITS + (u32)_u, off_rt_snapshot(rt),
+                    srv_write(draw_srv(d) + (u32)_u, off_rt_snapshot(rt),
                               (gpu_format)s_d3d.off_rt[rt].dxgi,
                               GPU_SWIZZLE_IDENTITY);
                 }
-                gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, DRAW_SRV_BASE + d * RSX_FP_UNITS));
+                gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, draw_srv(d)));
                 vp_bind_sampler_table(dr);
                 /* Per-draw constants: this draw's vp_cb bank + FP texscale
                  * block, each in its chunk (a shift and a mask: no divide). */
@@ -1348,7 +1358,8 @@ rtt_dump_done:;
             fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
                     rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
                     (unsigned long long)((u64)pitch * r->hh));
-            if (GPU_VALID(s_rtsave_b) && s_rtsave_cap < (u64)pitch * r->hh) {   /* (GPU idle: render_frame's wait) */
+            if (GPU_VALID(s_rtsave_b) && s_rtsave_cap < (u64)pitch * r->hh) {   /* (the last save read it) */
+                wait_for_gpu();
                 gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; }
             if (!GPU_VALID(s_rtsave_b)) {
                 s_rtsave_cap = (u64)pitch * r->hh;
@@ -1512,14 +1523,11 @@ skip_dump_consider: ;
     frame_cmd_submit();
 
     dred_report("frame submit");
-    if (write_color_on() && write_color_defer()) {
-        s_wb_pending = 1;
-    } else if (write_color_on()) {
+    if (write_color_on() && !write_color_defer()) {   /* (deferred: wb_store_done) */
         double _g = perf_on() ? perf_now() : 0.0;
-        wait_for_gpu();
+        wb_store_all();
         dred_report("write-back wait");
         if (perf_on()) s_perf_gpu += perf_now() - _g;
-        rt_writeback_store();
     }
     if (s_zq_n && (!write_color_on() || write_color_defer())) {
         if (zq_defer_on()) {   /* stored by zq_hook or the next render_frame */
@@ -1685,6 +1693,11 @@ skip_dump_consider: ;
     if (s_present_this_frame) prof_record(s_rf_cp[9]);
 
     move_to_next_frame();
+    s_last_batch_fence = s_batch_fence[s_rf_par] = rc_last_frame_fence();
+    /* The next batch writes the other half from its first record on: the
+     * batch before this one, its last user, must be done first. (Without
+     * frames in flight the next render_frame's drain covers it too.) */
+    batch_wait(s_rf_par ^ 1u);
     swap_resize();
 
     s_d3d.frame_count++;

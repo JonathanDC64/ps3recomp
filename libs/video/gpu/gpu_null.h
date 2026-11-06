@@ -127,6 +127,14 @@ void gpu_null_counts_get(gpu_device* d, gpu_null_counts* out);
  * at once. */
 void gpu_null_test_lose(gpu_device* d, uint32_t reason);
 
+/* Test hook: gpu_fence_completed reads `signals` short of the last fence
+ * signalled (0, the default, reads the last), so code that takes the latest
+ * work as done without waiting for it fails the freed, table and fence
+ * checks, as it would race a real GPU still running that work. Waits still
+ * pass at once. The GPU_NULL_LAG=<signals> environment variable sets it at
+ * creation. */
+void gpu_null_test_lag(gpu_device* d, uint32_t signals);
+
 #ifdef __cplusplus
 }
 #endif

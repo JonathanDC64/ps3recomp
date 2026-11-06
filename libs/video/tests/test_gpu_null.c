@@ -11,7 +11,7 @@
  *     does not;
  *   - buffers' bytes from upload to GPU to readback memory, a host import, a
  *     texture's readback (zeroes), footprints and sizes;
- *   - fences, the caps, and a lost device; pipelines made only for the
+ *   - fences, the caps, a lost device and a lagging one; pipelines made only for the
  *     cache (GPU_PIPELINE_STORE_ONLY) keep nothing;
  *   - a case for each kind of check, each on its own device, which fails
  *     that check the number of times it should and no other. The first
@@ -941,6 +941,37 @@ static void neg_freed(void)
     gpu_destroy(d);
 }
 
+/* With a lag (gpu_null_test_lag) the timeline reads behind the last signal
+ * until waited for, so a free that takes the latest work as done fails, as
+ * it would race a GPU still running it; the work of a fence that reads done
+ * frees cleanly, and a wait catches up. */
+static void neg_lag(void)
+{
+    gpu_device* const d = dev_new(0);
+    if (!d) return;
+    const gpu_swapchain none = {0};
+    gpu_null_test_lag(d, 1);
+    const gpu_buffer a = upload_new(d, 4096, 0);
+    const gpu_buffer g = buf_new(d, 4096, GPU_USE_COPY_SRC | GPU_USE_COPY_DST, GPU_MEM_GPU, GPU_STATE_COMMON);
+    const gpu_buffer g2 = buf_new(d, 4096, GPU_USE_COPY_SRC | GPU_USE_COPY_DST, GPU_MEM_GPU, GPU_STATE_COMMON);
+    gpu_cmd* c = gpu_cmd_begin(d, 0);
+    gpu_cmd_copy_buffer(c, g, 0, a, 0, 16);
+    CHECK(submit(d, c, GPU_SUBMIT_SIGNAL, none) == 1);
+    CHECK(gpu_fence_completed(d) == 0);             /* one signal behind */
+    c = gpu_cmd_begin(d, 1);
+    gpu_cmd_copy_buffer(c, g2, 0, a, 0, 16);
+    CHECK(submit(d, c, GPU_SUBMIT_SIGNAL, none) == 2);
+    CHECK(gpu_fence_completed(d) == 1);
+    gpu_buffer_destroy(d, g, 0);                    /* (fence 1 read as passed: fine) */
+    gpu_buffer_destroy(d, g2, 0);                   /* 1: fence 2 not seen to pass */
+    CHECK(gpu_fence_wait(d, 2, 0) == 0 && gpu_fence_completed(d) == 1);   /* a wait passes; the read stays behind */
+    gpu_buffer_destroy(d, a, 0);                    /* (the wait saw fence 2 pass) */
+    gpu_null_test_lag(d, 0);
+    CHECK(gpu_fence_completed(d) == 2);
+    expect(d, GPU_NULL_ERR_FREED, 1);
+    gpu_destroy(d);
+}
+
 /* A barrier's before state against the tracked one, subresource by
  * subresource. */
 static void neg_barrier(void)
@@ -1260,6 +1291,7 @@ int main(void)
     fflush(stdout);
     neg_handle();
     neg_freed();
+    neg_lag();
     neg_barrier();
     neg_state();
     neg_draw();

@@ -905,6 +905,8 @@ static void off_rt_drop_target(OffRT* r)
     r->tex.id = 0;
     r->up_buf.id = 0;
     r->rtv.id = 0;
+    r->gen++;   /* its queued write-backs are not stored: the memory may be the title's again */
+    r->wb_queued = 0;
 }
 
 static int off_rt_find(u32 off)

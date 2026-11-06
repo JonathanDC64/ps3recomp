@@ -68,10 +68,19 @@ static void read_rsx_vertex(const rsx_state* state, u32 vindex, BasicVertex* out
     }
 }
 
+/* The fixed-function vertex buffer has one half: a batch's first write to it
+ * waits until the GPU is done with the last batch (s_rf_par is still its
+ * half here), which may draw from it (RSX_FRAMES_IN_FLIGHT). */
+static void legacy_vb_claim(void)
+{
+    if (s_d3d.vb_offset == 0 && frames_in_flight_on()) batch_wait(s_rf_par);
+}
+
 /* Upload `count` sequential vertices [first, first+count). Returns the count
  * actually written (clamped to the remaining per-frame buffer). */
 static u32 upload_vertices_from_rsx(u32 first, u32 count)
 {
+    legacy_vb_claim();
     BasicVertex* verts = (BasicVertex*)((u8*)s_d3d.vb_mapped + s_d3d.vb_offset);
     u32 max_verts = (MAX_VERTICES * VERTEX_STRIDE - s_d3d.vb_offset) / sizeof(BasicVertex);
     if (count > max_verts) count = max_verts;
@@ -88,6 +97,7 @@ static u32 upload_vertices_from_rsx(u32 first, u32 count)
  * Returns the number of triangle-list vertices emitted (6 per quad). */
 static u32 upload_quads_from_rsx(u32 first, u32 count)
 {
+    legacy_vb_claim();
     const rsx_state* state = s_d3d.current_rsx_state;
     u32 quads = count / 4;
     u32 max_verts = (MAX_VERTICES * VERTEX_STRIDE - s_d3d.vb_offset) / sizeof(BasicVertex);

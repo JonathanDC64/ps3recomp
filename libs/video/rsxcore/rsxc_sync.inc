@@ -39,6 +39,47 @@ static void wait_for_gpu(void)
     }
 }
 
+/* RSX_FRAMES_IN_FLIGHT (read once; the default is the backend's,
+ * rc_be_frames_in_flight): 1 lets the GPU run one batch while the next is
+ * recorded and submitted, 0 drains the GPU at the start of every batch, as
+ * before 2026-11-06. With it on, what a batch writes for the GPU is in its
+ * parity half (s_rf_par: the vertex, index and constant rings, the texture
+ * staging, the per-draw texture tables, the write-back's readback buffers),
+ * and a half is written again only after the batch before last, its last
+ * user, is done (batch_wait at render_frame's end). The last batch's
+ * write-back copies are stored once its GPU work is done, at the next
+ * render_frame's start or the one after (wb_store_done). */
+static int frames_in_flight_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = ps3_env_int("RSX_FRAMES_IN_FLIGHT", rc_be_frames_in_flight()) != 0;
+    return on;
+}
+
+/* The fence ending each parity half's last batch (set at render_frame's end;
+ * 0 before any), the last batch's, and the half the batch render_frame is
+ * drawing writes (set at its start, s_d3d.vp_parity then). */
+static gpu_fence s_batch_fence[2];
+static gpu_fence s_last_batch_fence;
+static u32 s_rf_par;
+
+/* Has the GPU finished half par's last batch? Does not wait. */
+static int batch_done(u32 par)
+{
+    return gpu_fence_completed(s_rc_dev) >= s_batch_fence[par];
+}
+
+/* Until the GPU has finished half par's last batch (2 s at most, as
+ * frame_slot_wait). */
+static void batch_wait(u32 par)
+{
+    if (batch_done(par)) return;
+    if (gpu_fence_wait(s_rc_dev, s_batch_fence[par], 2000))
+        printf("[rsx] batch wait STUCK 2s: want %llu got %llu removed=0x%08lX\n",
+               (unsigned long long)s_batch_fence[par],
+               (unsigned long long)gpu_fence_completed(s_rc_dev), (unsigned long)gpu_lost(s_rc_dev));
+}
+
 /* RSX_HANG_GPU_AT_FRAME=<n> (a test): the first indexed draw of the n-th
  * batch is drawn over and over, about 4G vertices in all, so the GPU takes
  * far longer than Windows' 2 s and the driver resets it, as it does for a

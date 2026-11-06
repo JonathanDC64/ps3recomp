@@ -35,7 +35,6 @@ static int write_color_defer(void)
     PS3_KNOB(on, ps3_env_int("RSX_WRITE_COLOR_DEFER", 1));
     return on;
 }
-static int s_wb_pending;   /* copies recorded, store not yet done */
 static double s_fl_wait_ms, s_fl_store_ms;   /* FRAME_LOG: frame-start wait, store */
 
 static inline __attribute__((always_inline)) void rt_pitch_record(D3D12DrawRecord* dr)
@@ -347,8 +346,36 @@ static int wbg_place(u32 dst, u64 len, gpu_buffer* buf, u64* offset)
 #endif
 }
 
-/* Target i straight into guest memory, if it can go that way: 1 recorded. */
-static int wbg_record(int i)
+/* A write-back copy rt_writeback_record made, as the target was then. Its
+ * store waits until the GPU is done with the batch (wb_store_half): with
+ * frames in flight that can come after the next batch's pre-pass has moved
+ * the target on, so the store works from these fields, and one whose target
+ * was dropped since (gen) is not stored. */
+enum { WB_CPU, WB_GPU, WB_CHECK };   /* stored by the CPU; by the GPU (wbg_record); both, compared */
+typedef struct {
+    int        slot, kind;
+    u32        gen, serial;   /* the target's generation, and the batch's s_rf_serial */
+    u32        off, w, h, gdxgi, gfmt, gpitch, gdma;
+    u32        gpu_dst;       /* WB_GPU, WB_CHECK: where the GPU stored it */
+    gpu_buffer rb;            /* WB_CPU, WB_CHECK: the readback copy */
+} WbCopy;
+/* The copies of each parity half's last batch: at most one per target. */
+static struct { WbCopy c[MAX_OFF_RTS]; int n; } s_wb_q[2];
+
+static void wb_queue(int i, int kind, u32 gpu_dst, gpu_buffer rb)
+{
+    OffRT* r = &s_d3d.off_rt[i];
+    WbCopy* c = &s_wb_q[s_rf_par].c[s_wb_q[s_rf_par].n++];
+    c->slot = i; c->kind = kind; c->gen = r->gen; c->serial = s_rf_serial;
+    c->off = r->off; c->w = r->w; c->h = r->h; c->gdxgi = r->gdxgi;
+    c->gfmt = r->gfmt; c->gpitch = r->gpitch; c->gdma = r->gdma;
+    c->gpu_dst = gpu_dst; c->rb = rb;
+    r->wb_queued++;
+}
+
+/* Target i straight into guest memory, if it can go that way: its guest
+ * address, or 0 when it goes through a readback copy. */
+static u32 wbg_record(int i)
 {
     extern u32 cellGcmResolveLocated(int local, u32 offset);
     OffRT* r = &s_d3d.off_rt[i];
@@ -376,60 +403,67 @@ static int wbg_record(int i)
     to.row_pitch = gp;
     gpu_cmd_copy_tex_to_buf(s_rc_cmd, into, &to, from, 0, NULL);
     off_rt_transition(i, prior);
-    r->gpu_dst = dst;
-    r->used = 3;   /* stored by the GPU: the store only takes its checksum */
+    return dst;   /* stored by the GPU: the store only takes its checksum */
+}
+
+/* Target i's readback copy, into its buffer for this batch's half: 1 recorded. */
+static int wb_record_copy(int i)
+{
+    OffRT* r = &s_d3d.off_rt[i];
+    /* A scaled target, or a promoted one (HDR), goes through the draw down
+     * to the guest's size and format. */
+    const int scaled = r->hw != r->w || r->hh != r->h || r->dxgi != r->gdxgi;
+    const u32 pitch = (r->w * rt_guest_bpp(r->gdxgi) + 255) & ~255u;
+    const u64 need = (u64)pitch * r->h;
+    /* The readback buffer is the GPU layer's (step C5b; rb its resource,
+     * borrowed). One too small goes with the last batch's fence: its last
+     * copy was the batch before last's, stored by now (wb_store_done). */
+    gpu_buffer* const rb = &r->rb_buf[s_rf_par];
+    if (GPU_VALID(*rb) && r->rb_size[s_rf_par] < need) {
+        const gpu_texture none = {0};
+        rc_grave_put(none, *rb);
+        rb->id = 0;
+    }
+    if (!GPU_VALID(*rb)) {
+        gpu_buffer_desc bd;
+        memset(&bd, 0, sizeof bd);
+        bd.size = need;
+        bd.use = GPU_USE_COPY_DST;
+        bd.memory = GPU_MEM_READBACK;
+        bd.state = GPU_STATE_COPY_DEST;
+        *rb = gpu_buffer_create(s_rc_dev, &bd);
+        if (!GPU_VALID(*rb)) return 0;
+        r->rb_size[s_rf_par] = need;
+    }
+    gpu_state prior = r->st;
+    gpu_texture from = r->tex;
+    if (scaled) { if (!GPU_VALID(from = off_rt_downscale(i, 0))) return 0; }
+    else off_rt_transition(i, GPU_STATE_COPY_SOURCE);
+    gpu_footprint fp;
+    memset(&fp, 0, sizeof fp);
+    fp.format    = (gpu_format)r->gdxgi;
+    fp.width     = r->w;
+    fp.height    = r->h;
+    fp.depth     = 1;
+    fp.row_pitch = pitch;
+    gpu_cmd_copy_tex_to_buf(s_rc_cmd, *rb, &fp, from, 0, NULL);
+    off_rt_transition(i, prior);
     return 1;
 }
 
-/* Record the copies (before the frame's command list closes). */
+/* Record the copies (before the frame's command list closes), each queued
+ * for its store in this batch's half. */
 static void rt_writeback_record(void)
 {
     if (!write_color_on()) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!GPU_VALID(r->tex) || !r->used) continue;
-        r->gpu_check = 0;
-        if (wbg_record(i)) {
-            if (wbg_mode() != 2) continue;
-            r->gpu_check = 1;   /* and the CPU store's copy, to compare */
-        }
-        /* A scaled target, or a promoted one (HDR), goes through the draw down
-         * to the guest's size and format. */
-        const int scaled = r->hw != r->w || r->hh != r->h || r->dxgi != r->gdxgi;
-        u32 pitch = (r->w * rt_guest_bpp(r->gdxgi) + 255) & ~255u;
-        u64 need = (u64)pitch * r->h;
-        /* The readback buffer is the GPU layer's (step C5b; rb its resource,
-         * borrowed). One too small goes now, as today: the GPU and the last
-         * store are done with it (render_frame's wait came first). */
-        if (GPU_VALID(r->rb_buf) && r->rb_size < need) {
-            gpu_buffer_destroy(s_rc_dev, r->rb_buf, 0);
-            r->rb_buf.id = 0;
-        }
-        if (!GPU_VALID(r->rb_buf)) {
-            gpu_buffer_desc bd;
-            memset(&bd, 0, sizeof bd);
-            bd.size = need;
-            bd.use = GPU_USE_COPY_DST;
-            bd.memory = GPU_MEM_READBACK;
-            bd.state = GPU_STATE_COPY_DEST;
-            r->rb_buf = gpu_buffer_create(s_rc_dev, &bd);
-            if (!GPU_VALID(r->rb_buf)) continue;
-            r->rb_size = need;
-        }
-        gpu_state prior = r->st;
-        gpu_texture from = r->tex;
-        if (scaled) { if (!GPU_VALID(from = off_rt_downscale(i, 0))) continue; }
-        else off_rt_transition(i, GPU_STATE_COPY_SOURCE);
-        gpu_footprint fp;
-        memset(&fp, 0, sizeof fp);
-        fp.format    = (gpu_format)r->gdxgi;
-        fp.width     = r->w;
-        fp.height    = r->h;
-        fp.depth     = 1;
-        fp.row_pitch = pitch;
-        gpu_cmd_copy_tex_to_buf(s_rc_cmd, r->rb_buf, &fp, from, 0, NULL);
-        off_rt_transition(i, prior);
-        r->used = 2;   /* copy pending */
+        const u32 gpu_dst = wbg_record(i);
+        const gpu_buffer none = {0};
+        if (gpu_dst && wbg_mode() != 2) { wb_queue(i, WB_GPU, gpu_dst, none); continue; }
+        if (!wb_record_copy(i)) continue;   /* (RSX_WB_GPU=2: the CPU store's copy too, to compare) */
+        wb_queue(i, gpu_dst ? WB_CHECK : WB_CPU, gpu_dst, r->rb_buf[s_rf_par]);
     }
 }
 
@@ -460,137 +494,150 @@ static void wb_conv_row(u8* d, const u8* s, u32 n, int kind)
 
 /* RSX_WB_GPU=2: the CPU store of a target the GPU stored, made into a scratch
  * copy and compared with guest memory. */
-static void wbg_check(OffRT* r)
+static void wbg_check(const WbCopy* c, OffRT* r)
 {
     extern uint8_t* vm_base;
     static u8* tmp; static size_t tmp_n;
     static unsigned long long n_ok, n_bad;
-    const u32 pitch = (r->w * 4u + 255) & ~255u, gp = r->gpitch, row = r->w * 4u;
+    const u32 pitch = (c->w * 4u + 255) & ~255u, gp = c->gpitch, row = c->w * 4u;
     if (tmp_n < (size_t)row) { free(tmp); tmp = (u8*)malloc(row); tmp_n = tmp ? row : 0; }
     void* mp = NULL;   /* (the GPU layer's map: today's Map(0, {0, n}), step C5b) */
-    if (!tmp || !(mp = gpu_buffer_map(s_rc_dev, r->rb_buf, 0, (u64)pitch * r->h))) return;
+    if (!tmp || !(mp = gpu_buffer_map(s_rc_dev, c->rb, 0, (u64)pitch * c->h))) return;
     u32 bad_y = ~0u, bad_x = 0;
-    for (u32 y = 0; y < r->h && bad_y == ~0u; y++) {
-        wb_conv_row(tmp, (const u8*)mp + (u64)y * pitch, r->w, 0);
-        const u8* g = vm_base + r->gpu_dst + (u64)y * gp;
+    for (u32 y = 0; y < c->h && bad_y == ~0u; y++) {
+        wb_conv_row(tmp, (const u8*)mp + (u64)y * pitch, c->w, 0);
+        const u8* g = vm_base + c->gpu_dst + (u64)y * gp;
         if (memcmp(tmp, g, row))
             for (u32 x = 0; x < row; x++) if (tmp[x] != g[x]) { bad_y = y; bad_x = x; break; }
     }
-    gpu_buffer_unmap(s_rc_dev, r->rb_buf, 0, 0);   /* nothing written: Unmap(0, {0, 0}) */
+    gpu_buffer_unmap(s_rc_dev, c->rb, 0, 0);   /* nothing written: Unmap(0, {0, 0}) */
     if (bad_y == ~0u) n_ok++;
     else {
         n_bad++;
         static int lines = 0;
         if (lines < 40 && ++lines) {
-            const u8* g = vm_base + r->gpu_dst + (u64)bad_y * gp + (bad_x & ~3u);
-            const u8* c = tmp + (bad_x & ~3u);
+            const u8* g = vm_base + c->gpu_dst + (u64)bad_y * gp + (bad_x & ~3u);
+            const u8* t = tmp + (bad_x & ~3u);
             fprintf(stderr, "[wb-gpu] 0x%08X %ux%u differs at row %u byte %u: gpu %02X%02X%02X%02X cpu %02X%02X%02X%02X%c",
-                    r->gpu_dst, r->w, r->h, bad_y, bad_x, g[0], g[1], g[2], g[3], c[0], c[1], c[2], c[3], 10);
+                    c->gpu_dst, c->w, c->h, bad_y, bad_x, g[0], g[1], g[2], g[3], t[0], t[1], t[2], t[3], 10);
         }
     }
     if ((n_ok + n_bad) % 1024u == 0)
         fprintf(stderr, "[wb-gpu] check: %llu targets equal, %llu differ%c", n_ok, n_bad, 10);
-    r->gaddr = r->gpu_dst;
-    r->glen = gp * r->h;
+    r->gaddr = c->gpu_dst;
+    r->glen = gp * c->h;
     r->gsum_new = 1;
 }
 
-/* Store the copies in guest memory (after the GPU finished the frame). */
+/* Copy c's readback into guest memory, converted to the guest's layout: the
+ * guest address it went to, or 0 when it could not go. */
 static u8* s_wc_shadow; static u32 s_wc_len;   /* RSX_WRITE_COLOR_LOG */
-static void rt_writeback_store(void)
+static u32 wb_store_cpu(const WbCopy* c)
 {
     extern uint8_t* vm_base;
     extern u32 cellGcmResolveLocated(int local, u32 offset);
-    if (!write_color_on() || !vm_base) return;
-    for (int i = 0; i < MAX_OFF_RTS; i++) {
-        OffRT* r = &s_d3d.off_rt[i];
-        if (GPU_VALID(r->tex) && r->used == 3) {   /* the GPU stored it (wbg_record) */
-            r->used = 1;
-            r->gaddr = r->gpu_dst;
-            r->glen = r->gpitch * r->h;
-            r->gsum_new = 1;
-            continue;
+    const int i = c->slot;
+    u32 bpp = rt_guest_bpp(c->gdxgi);
+    u32 pitch = (c->w * bpp + 255) & ~255u;
+    u32 swz = ((c->gfmt >> 8) & 0xF) == 2;
+    u32 lw = (c->gfmt >> 16) & 0xFF, lh = (c->gfmt >> 24) & 0xFF;
+    u32 gp = c->gpitch;
+    if (swz) { if ((1u << lw) < c->w || (1u << lh) < c->h) return 0; }
+    else if (gp < c->w * bpp || gp > 0x10000) return 0;
+    /* The surface's context DMA says which memory the offset is in: local
+     * and IO offsets are overlapping number spaces, so the offset alone
+     * cannot place a surface the title keeps in main memory. */
+    u32 dst = cellGcmResolveLocated(c->gdma != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER, c->off);
+    if (!dst || dst == 0xFFFFFFFFu) return 0;
+    { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
+      if (lg > 0) { lg--;
+        /* Did anything else write the surface since our last store? */
+        static u8* shadow[MAX_OFF_RTS]; static u32 shoff[MAX_OFF_RTS], shlen[MAX_OFF_RTS];
+        u32 len = swz ? ((1u << lw) << lh) * bpp : gp * c->h;
+        u32 ndiff = 0, first = 0;
+        if (shadow[i] && shoff[i] == c->off && shlen[i] == len)
+            for (u32 k = 0; k < len; k++)
+                if (shadow[i][k] != vm_base[dst + k]) { if (!ndiff) first = k; ndiff++; }
+        fprintf(stderr, "[WRITE-COLOR] off=0x%X -> 0x%08X %ux%u fmt=0x%08X pitch=%u dma=0x%X%s foreign=%u first=+0x%X%c",
+                c->off, dst, c->w, c->h, c->gfmt, gp, c->gdma, swz ? " swz" : "", ndiff, first, 10);
+        /* The guest ranges of the fragment programs drawn with (rsxc_fp_seen),
+         * so a write-back that lands on live ucode is reported. */
+        for (int q = 0, nq = rsxc_fp_seen(-1, NULL, NULL); q < nq; q++) {
+            u32 fa = 0, fl = 0;
+            rsxc_fp_seen(q, &fa, &fl);
+            if (fa < dst + len && dst < fa + fl)
+                fprintf(stderr, "[WRITE-COLOR] !! surface 0x%X [0x%08X,+0x%X) overlaps FP ucode 0x%08X+0x%X%c",
+                        c->off, dst, len, fa, fl, 10);
         }
-        if (!GPU_VALID(r->tex) || !GPU_VALID(r->rb_buf) || r->used != 2) continue;
-        r->used = 1;
-        if (r->gpu_check) { wbg_check(r); continue; }
-        u32 bpp = rt_guest_bpp(r->gdxgi);
-        u32 pitch = (r->w * bpp + 255) & ~255u;
-        u32 swz = ((r->gfmt >> 8) & 0xF) == 2;
-        u32 lw = (r->gfmt >> 16) & 0xFF, lh = (r->gfmt >> 24) & 0xFF;
-        u32 gp = r->gpitch;
-        if (swz) { if ((1u << lw) < r->w || (1u << lh) < r->h) continue; }
-        else if (gp < r->w * bpp || gp > 0x10000) continue;
-        /* The surface's context DMA says which memory the offset is in: local
-         * and IO offsets are overlapping number spaces, so the offset alone
-         * cannot place a surface the title keeps in main memory. */
-        u32 dst = cellGcmResolveLocated(r->gdma != CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER, r->off);
-        if (!dst || dst == 0xFFFFFFFFu) continue;
-        { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
-          if (lg > 0) { lg--;
-            /* Did anything else write the surface since our last store? */
-            static u8* shadow[MAX_OFF_RTS]; static u32 shoff[MAX_OFF_RTS], shlen[MAX_OFF_RTS];
-            u32 len = swz ? ((1u << lw) << lh) * bpp : gp * r->h;
-            u32 ndiff = 0, first = 0;
-            if (shadow[i] && shoff[i] == r->off && shlen[i] == len)
-                for (u32 k = 0; k < len; k++)
-                    if (shadow[i][k] != vm_base[dst + k]) { if (!ndiff) first = k; ndiff++; }
-            fprintf(stderr, "[WRITE-COLOR] off=0x%X -> 0x%08X %ux%u fmt=0x%08X pitch=%u dma=0x%X%s foreign=%u first=+0x%X%c",
-                    r->off, dst, r->w, r->h, r->gfmt, gp, r->gdma, swz ? " swz" : "", ndiff, first, 10);
-            /* The guest ranges of the fragment programs drawn with (rsxc_fp_seen),
-             * so a write-back that lands on live ucode is reported. */
-            for (int q = 0, nq = rsxc_fp_seen(-1, NULL, NULL); q < nq; q++) {
-                u32 fa = 0, fl = 0;
-                rsxc_fp_seen(q, &fa, &fl);
-                if (fa < dst + len && dst < fa + fl)
-                    fprintf(stderr, "[WRITE-COLOR] !! surface 0x%X [0x%08X,+0x%X) overlaps FP ucode 0x%08X+0x%X%c",
-                            r->off, dst, len, fa, fl, 10);
-            }
-            if (!shadow[i] || shlen[i] != len) { free(shadow[i]); shadow[i] = (u8*)malloc(len); shlen[i] = len; }
-            shoff[i] = r->off;
-            s_wc_shadow = shadow[i]; s_wc_len = len;
-          } }
-        /* The GPU layer's map and unmap (step C5b): today's Map(0, {0, n}) and
-         * Unmap(0, {0, 0}). */
-        void* mp = gpu_buffer_map(s_rc_dev, r->rb_buf, 0, (u64)pitch * r->h);
-        if (!mp) continue;
-        /* A word at a time: every format here is whole 32-bit words per
-         * texel, converted the same way. RGBA8 R,G,B,A -> A,R,G,B is a rotate,
-         * FP16 swaps the bytes of each half, 32-bit lanes swap all four.
-         * Byte by byte, this was 3.5-6 ms of each Demon's Souls frame (about
-         * 25 MB: a 1280x720 target several times per frame, and others). */
-        const int kind = r->gdxgi == GPU_FORMAT_R8G8B8A8_UNORM ? 0 :
-                         r->gdxgi == GPU_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
-        const u32 wpt = bpp / 4;                     /* words per texel */
-        if (!swz) {
-            for (u32 y = 0; y < r->h; y++)
-                wb_conv_row(vm_base + dst + (u64)y * gp, (const u8*)mp + (u64)y * pitch,
-                            r->w * wpt, kind);
-        } else {
-            /* rsx_swz_index(x, y) is the x bits' part OR the y bits' part. */
-            static u32* xpart; static u32 xpart_n;
-            if (xpart_n < r->w) {
-                u32* nx = (u32*)realloc(xpart, (size_t)r->w * sizeof *nx);
-                if (!nx) { gpu_buffer_unmap(s_rc_dev, r->rb_buf, 0, 0); continue; }
-                xpart = nx; xpart_n = r->w;
-            }
-            for (u32 x = 0; x < r->w; x++) xpart[x] = rsx_swz_index(x, 0, lw, lh);
-            for (u32 y = 0; y < r->h; y++) {
-                const u32 ypart = rsx_swz_index(0, y, lw, lh);
-                const u8* srow = (const u8*)mp + (u64)y * pitch;
-                for (u32 x = 0; x < r->w; x++)
-                    wb_conv_row(vm_base + dst + (u64)(xpart[x] | ypart) * bpp,
-                                srow + (u64)x * bpp, wpt, kind);
-            }
+        if (!shadow[i] || shlen[i] != len) { free(shadow[i]); shadow[i] = (u8*)malloc(len); shlen[i] = len; }
+        shoff[i] = c->off;
+        s_wc_shadow = shadow[i]; s_wc_len = len;
+      } }
+    /* The GPU layer's map and unmap (step C5b): today's Map(0, {0, n}) and
+     * Unmap(0, {0, 0}). */
+    void* mp = gpu_buffer_map(s_rc_dev, c->rb, 0, (u64)pitch * c->h);
+    if (!mp) { s_wc_shadow = NULL; return 0; }
+    /* A word at a time: every format here is whole 32-bit words per
+     * texel, converted the same way. RGBA8 R,G,B,A -> A,R,G,B is a rotate,
+     * FP16 swaps the bytes of each half, 32-bit lanes swap all four.
+     * Byte by byte, this was 3.5-6 ms of each Demon's Souls frame (about
+     * 25 MB: a 1280x720 target several times per frame, and others). */
+    const int kind = c->gdxgi == GPU_FORMAT_R8G8B8A8_UNORM ? 0 :
+                     c->gdxgi == GPU_FORMAT_R16G16B16A16_FLOAT ? 1 : 2;
+    const u32 wpt = bpp / 4;                     /* words per texel */
+    if (!swz) {
+        for (u32 y = 0; y < c->h; y++)
+            wb_conv_row(vm_base + dst + (u64)y * gp, (const u8*)mp + (u64)y * pitch,
+                        c->w * wpt, kind);
+    } else {
+        /* rsx_swz_index(x, y) is the x bits' part OR the y bits' part. */
+        static u32* xpart; static u32 xpart_n;
+        if (xpart_n < c->w) {
+            u32* nx = (u32*)realloc(xpart, (size_t)c->w * sizeof *nx);
+            if (!nx) { gpu_buffer_unmap(s_rc_dev, c->rb, 0, 0); s_wc_shadow = NULL; return 0; }
+            xpart = nx; xpart_n = c->w;
         }
-        gpu_buffer_unmap(s_rc_dev, r->rb_buf, 0, 0);
-        if (s_wc_shadow) { memcpy(s_wc_shadow, vm_base + dst, s_wc_len); s_wc_shadow = NULL; }
+        for (u32 x = 0; x < c->w; x++) xpart[x] = rsx_swz_index(x, 0, lw, lh);
+        for (u32 y = 0; y < c->h; y++) {
+            const u32 ypart = rsx_swz_index(0, y, lw, lh);
+            const u8* srow = (const u8*)mp + (u64)y * pitch;
+            for (u32 x = 0; x < c->w; x++)
+                wb_conv_row(vm_base + dst + (u64)(xpart[x] | ypart) * bpp,
+                            srow + (u64)x * bpp, wpt, kind);
+        }
+    }
+    gpu_buffer_unmap(s_rc_dev, c->rb, 0, 0);
+    if (s_wc_shadow) { memcpy(s_wc_shadow, vm_base + dst, s_wc_len); s_wc_shadow = NULL; }
+    return dst;
+}
+
+/* Store half par's queued copies in guest memory, once the GPU has finished
+ * their batch (it waits for that). A copy of a target dropped since is not
+ * stored: the title may have put something else in that memory. */
+static void wb_store_half(u32 par)
+{
+    extern uint8_t* vm_base;
+    if (!s_wb_q[par].n) return;
+    batch_wait(par);
+    for (int k = 0; k < s_wb_q[par].n; k++) {
+        const WbCopy* c = &s_wb_q[par].c[k];
+        OffRT* r = &s_d3d.off_rt[c->slot];
+        if (!GPU_VALID(r->tex) || r->gen != c->gen) continue;
+        r->wb_queued--;
+        if (!write_color_on() || !vm_base) continue;
+        if (c->kind == WB_CHECK) { wbg_check(c, r); continue; }
+        const u32 dst = c->kind == WB_GPU ? c->gpu_dst : wb_store_cpu(c);
+        if (!dst) continue;
+        const u32 swz = ((c->gfmt >> 8) & 0xF) == 2;
+        const u32 lw = (c->gfmt >> 16) & 0xFF, lh = (c->gfmt >> 24) & 0xFF;
         r->gaddr = dst;
-        r->glen = swz ? ((1u << lw) << lh) * bpp : gp * r->h;
+        r->glen = swz ? ((1u << lw) << lh) * rt_guest_bpp(c->gdxgi) : c->gpitch * c->h;
         r->gsum_new = 1;
     }
+    s_wb_q[par].n = 0;
     /* Checksums after every store, so targets that share memory do not
      * count each other's write-back as a foreign write. */
+    if (!vm_base) return;
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!r->gsum_new) continue;
@@ -598,6 +645,32 @@ static void rt_writeback_store(void)
         r->gsum = tex_csum(vm_base + r->gaddr, r->glen);
         r->gsum_ok = 1;
     }
+}
+
+/* Both halves' copies, the older batch's first. */
+static void wb_store_queued(void)
+{
+    const u32 older = s_wb_q[0].n && s_wb_q[1].n && s_wb_q[1].c[0].serial < s_wb_q[0].c[0].serial;
+    wb_store_half(older);
+    wb_store_half(older ^ 1u);
+}
+
+/* At render_frame's start (s_rf_par set): the batch before last's copies,
+ * its GPU work done (render_frame's end waited for it), then the last
+ * batch's if the GPU is done with it too. Without frames in flight the GPU
+ * is idle here and both are stored. */
+static void wb_store_done(void)
+{
+    wb_store_half(s_rf_par);
+    if (batch_done(s_rf_par ^ 1u)) wb_store_half(s_rf_par ^ 1u);
+}
+
+/* Every queued copy stored, the GPU idle first: before what drops the
+ * targets or needs the write-back current (RSX_SCALE, RSX_WRITE_COLOR_DEFER=0). */
+static void wb_store_all(void)
+{
+    wait_for_gpu();
+    wb_store_queued();
 }
 
 /* Drop offscreen targets whose guest memory the title rewrote after our last
@@ -614,6 +687,7 @@ static void off_rt_drop_rewritten(void)
     for (int i = 0; i < MAX_OFF_RTS; i++) {
         OffRT* r = &s_d3d.off_rt[i];
         if (!GPU_VALID(r->tex) || !r->gsum_ok) continue;
+        if (r->wb_queued) continue;   /* our own write-back may still be landing there */
         if (tex_csum(vm_base + r->gaddr, r->glen) == r->gsum) continue;
         { static int n = 0;
           if (n < 40 && ++n) fprintf(stderr, "[RT] 0x%X (%ux%u) rewritten by the title: "

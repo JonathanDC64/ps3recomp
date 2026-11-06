@@ -261,6 +261,11 @@ static int rc_be_pso_unrecord(const rc_be_pso_desc* rec, u32 nel, gpu_pipeline_d
     return 1;
 }
 
+/* No frames in flight by default (RSX_FRAMES_IN_FLIGHT, rsxc_sync.inc): the
+ * GPU wait measured 0.2% of the render thread here (docs/67), and this route
+ * has not been run with them. */
+static int rc_be_frames_in_flight(void) { return 0; }
+
 #include "rsxc_core.inc"
 
 #include "rsx_out.h"
