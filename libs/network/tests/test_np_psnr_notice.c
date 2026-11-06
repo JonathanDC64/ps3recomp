@@ -6,7 +6,8 @@
  * notice from co-op would only replace the first before it is shown. Also:
  * a run locked offline (developer cheats) ends its open session. A loopback
  * psnr that answers each HELLO with an error or a welcome. And the HELLO over
- * TLS (ps3emu/ps3_tls.h), never to a psnr without it. Nothing leaves the PC.
+ * TLS (ps3emu/ps3_tls.h), never to a psnr without it. And a connection the
+ * server drops is dialled again (PSNR_REDIAL). Nothing leaves the PC.
  *
  *   clang-cl /I include /I third_party/mbedtls/include /Fe:test_np_psnr_notice.exe libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
  *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_np_psnr_notice libs/network/tests/test_np_psnr_notice.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c libmbedtls.a -lpthread
@@ -43,6 +44,8 @@ static int s_hello_len;   /* the last HELLO's body: 30 bytes, 64 with a session 
 static volatile int s_hangups;   /* connections the client has closed */
 static volatile int s_tls;       /* this psnr speaks TLS (tls_test_server.h) */
 static volatile int s_tls_hellos;   /* TLS hellos it got while it didn't */
+static volatile int s_kick;      /* connections to drop right after their welcome */
+static volatile int s_welcomes;  /* HELLOs it welcomed */
 
 static int c_recv(sock_t c, ps3_tls* t, uint8_t* p, int n)
 {
@@ -93,7 +96,14 @@ static void* psnr_main(void* arg)
                 psnr_put16(out + 1, 12);
                 psnr_put32(out + 7, 7);
                 memcpy(out + 11, "\x7f\x00\x00\x01", 4);
+                s_welcomes++;
                 c_send(c, t, out, 15);
+            }
+            if (s_kick > 0) {   /* the server goes away (a restart): the client only sees the close */
+                s_kick--;
+                ps3_tls_close(t);
+                sock_close(c);
+                continue;
             }
             while (c_recv(c, t, in, sizeof in) > 0) {}   /* until the client hangs up */
             s_hangups++;
@@ -182,6 +192,67 @@ int main(void)
     remove(key);
     env("PS3_NET_SIGNIN", "");
     env("PS3_NET_KEY_FILE", "");
+
+    /* The server drops the connection (it restarted): the next pump finds it
+     * gone, and a thread dials again until it is back. PSNR_REDIAL=0: it
+     * stays gone, as before. */
+    {
+        int welcomes = s_welcomes;
+        env("PSNR_REDIAL", "0");
+        s_kick = 1;
+        assert(hello(0) == 0);
+        for (int i = 0; i < 500 && np_psnr_connected(); i++) {
+            np_psnr_pump();
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(!np_psnr_connected() && s_welcomes == welcomes + 1);
+#ifdef _WIN32
+        Sleep(300);
+#else
+        usleep(300000);
+#endif
+        assert(!np_psnr_connected() && s_welcomes == welcomes + 1);   /* no redial */
+
+        env("PSNR_REDIAL", "1");
+        env("PSNR_REDIAL_MS", "50");
+        s_kick = 2;   /* (this connection, and the redial's: so it ends below) */
+        assert(hello(0) == 0);
+        for (int i = 0; i < 500 && np_psnr_connected(); i++) {
+            np_psnr_pump();
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(!np_psnr_connected());
+        for (int i = 0; i < 500 && !np_psnr_connected(); i++) {   /* the redial thread */
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(np_psnr_connected() && s_welcomes == welcomes + 3);
+        assert(np_psnr_connect("NPWR00881_00") == 0);   /* a context start finds it up */
+        /* (the server dropped that one too: with PSNR_REDIAL=0 it ends here) */
+        env("PSNR_REDIAL", "0");
+        for (int i = 0; i < 500 && np_psnr_connected(); i++) {
+            np_psnr_pump();
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(!np_psnr_connected());
+        env("PSNR_REDIAL", "");
+        env("PSNR_REDIAL_MS", "");
+    }
 
     /* With PS3_NET_TLS: a psnr without TLS gets a TLS hello and no HELLO,
      * and there is no connection; one with TLS gets the HELLO inside it. */

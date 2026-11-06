@@ -33,6 +33,8 @@ extern const char* np_fake_username(void);
 static psnr_client* s_client;
 static uint32_t     s_user_id;   /* ours, from HELLO: our own member entry needs no punch */
 static int          s_tried;
+static char         s_comm_id[16];   /* the connection's, for a redial */
+static int          s_redialing;     /* a redial thread is running (LOCK) */
 static struct { uint32_t req; np_psnr_reply_fn fn; void* user; } s_pending[PENDING_MAX];
 static void (*s_push_fn)(const psnr_msg*);
 
@@ -150,10 +152,43 @@ int np_psnr_connected(void)
     return s_client != NULL;
 }
 
+/* PSNR_SERVER as host and port (36100 when it names none). */
+static void server_addr(char host[256], uint16_t* port)
+{
+    *port = 36100;
+    snprintf(host, 256, "%s", getenv("PSNR_SERVER"));
+    char* colon = strrchr(host, ':');
+    if (colon) { *colon = 0; *port = (uint16_t)atoi(colon + 1); }
+}
+
+/* One connection to psnr. With a sign-in (ps3emu/ps3_net_signin.h) HELLO
+ * carries the session; a server that says it has ended gets one new sign-in.
+ * Blocks for the TCP connect, TLS and the HELLO. *err: 0, or why psnr turned
+ * it away (psnr_connect_error); 0 with no client is a psnr out of reach. */
+static psnr_client* dial(const char* comm_id, const char* host, uint16_t port, uint32_t* user_id,
+                         uint8_t ip[4], int* signed_in_out, int* err)
+{
+    uint8_t session[32];
+    int signed_in = ps3_net_session(NULL, 0, session);
+    psnr_client* c = psnr_connect(host, port, comm_id, np_psnr_online_id(),
+                                  np_psnr_p2p_port(), signed_in ? session : NULL, user_id, ip);
+    if (!c && signed_in && psnr_connect_error() == PSNR_E_SIGN_IN) {
+        ps3_net_session_drop();
+        signed_in = ps3_net_session(NULL, 0, session);
+        if (signed_in)
+            c = psnr_connect(host, port, comm_id, np_psnr_online_id(),
+                             np_psnr_p2p_port(), session, user_id, ip);
+    }
+    memset(session, 0, sizeof(session));
+    *signed_in_out = signed_in;
+    *err = c ? 0 : psnr_connect_error();
+    return c;
+}
+
 int np_psnr_connect(const char* comm_id)
 {
     char host[256];
-    uint16_t port = 36100;
+    uint16_t port;
     uint32_t user_id = 0;
     uint8_t ip[4] = {0};
 
@@ -165,29 +200,15 @@ int np_psnr_connect(const char* comm_id)
         return r;
     }
     /* ponytail: one attempt per process; retry on the next context start if a
-     * server that comes up late turns out to matter. */
+     * server that comes up late turns out to matter. A connection that was
+     * up and is lost is dialled again (redial_main). */
     s_tried = 1;
-    snprintf(host, sizeof(host), "%s", getenv("PSNR_SERVER"));
-    char* colon = strrchr(host, ':');
-    if (colon) { *colon = 0; port = (uint16_t)atoi(colon + 1); }
-
-    /* With a sign-in (ps3emu/ps3_net_signin.h) HELLO carries the session; a
-     * server that says it has ended gets one new sign-in. */
-    uint8_t session[32];
-    int signed_in = ps3_net_session(NULL, 0, session);
-    s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
-                            np_psnr_p2p_port(), signed_in ? session : NULL, &user_id, ip);
-    if (!s_client && signed_in && psnr_connect_error() == PSNR_E_SIGN_IN) {
-        ps3_net_session_drop();
-        signed_in = ps3_net_session(NULL, 0, session);
-        if (signed_in)
-            s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
-                                    np_psnr_p2p_port(), session, &user_id, ip);
-    }
-    memset(session, 0, sizeof(session));
+    server_addr(host, &port);
+    int signed_in = 0, err = 0;
+    s_client = dial(comm_id, host, port, &user_id, ip, &signed_in, &err);
     s_user_id = user_id;
+    if (s_client) snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
     UNLOCK();
-    const int err = s_client ? 0 : psnr_connect_error();
     /* A HELLO with no session because the sign-in itself failed says nothing
      * more: the sign-in has given its own reason (a ban, maintenance), which
      * a second notice would replace before it is shown. */
@@ -528,6 +549,114 @@ static void nat_tick(void)
     UNLOCK();
 }
 
+/* PSNR_REDIAL (default 1; 0: one connection a run, as before): a connection
+ * to psnr that was up and is lost (the server restarted, the network
+ * dropped) is dialled again on a thread of its own, after 2 s, then 4, 8, 16
+ * and 30, then every 60 s, until it connects, psnr turns the sign-in or the
+ * name away, or the run is locked offline. Dialling blocks (TCP, TLS, the HELLO: about 21 s with
+ * the network gone), so it is never done on the title's thread. The title's
+ * context stays started: its requests fail with SERVER_NOT_AVAILABLE while
+ * the connection is down (as they did for the rest of the run), and go
+ * through again once it is back. A restarted server has forgotten the rooms;
+ * the title makes and finds new ones as it does anyway. PSNR_REDIAL_MS sets
+ * the first wait (tests). */
+static int redial_on(void)
+{
+    const char* e = getenv("PSNR_REDIAL");
+    return !e || atoi(e) != 0;
+}
+
+static void nap_ms(unsigned ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000u);
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI redial_main(LPVOID arg)
+#else
+static void* redial_main(void* arg)
+#endif
+{
+    (void)arg;
+    char host[256], comm[sizeof(s_comm_id)];
+    uint16_t port;
+    server_addr(host, &port);
+    LOCK();
+    memcpy(comm, s_comm_id, sizeof(comm));
+    UNLOCK();
+    const char* first = getenv("PSNR_REDIAL_MS");
+    unsigned wait = first && atoi(first) > 0 ? (unsigned)atoi(first) : 2000u;
+    for (int tries = 1;; tries++) {
+        nap_ms(wait);
+        if (ps3_net_locked_offline() || !np_psnr_enabled()) break;
+        uint32_t user = 0;
+        uint8_t ip[4] = {0};
+        int signed_in = 0, err = 0;
+        psnr_client* c = dial(comm, host, port, &user, ip, &signed_in, &err);
+        if (c) {
+            LOCK();
+            if (!s_client) {
+                s_client = c;
+                s_user_id = user;
+                c = NULL;
+            }
+            UNLOCK();
+            if (c) psnr_close(c);   /* (connected meanwhile: keep that one) */
+            else printf("[psnr] connected again to %s:%u as \"%s\" (%s), user %u, after %d tr%s%s\n",
+                        host, port, np_psnr_online_id(), comm, user, tries, tries == 1 ? "y" : "ies",
+                        signed_in ? ", signed in" : "");
+            break;
+        }
+        /* The sign-in or the name turned away: that lasts. Anything else may
+         * pass (our own old connection still holds the name until the server
+         * notices it is gone; maintenance ends). */
+        if (err == PSNR_E_SIGN_IN || err == PSNR_E_NOT_YOUR_NAME) {
+            printf("[psnr] %s:%u refused the HELLO (error %d) -- NP stays offline\n", host, port, err);
+            break;
+        }
+        if (tries == 1) {
+            if (err) printf("[psnr] %s:%u turned the HELLO away for now (error %d); trying again now and then\n",
+                            host, port, err);
+            else printf("[psnr] could not reach %s:%u yet; trying again now and then\n", host, port);
+        }
+        wait = wait >= 30000u ? 60000u : wait >= 16000u ? 30000u : wait * 2u;
+    }
+    LOCK();
+    s_redialing = 0;
+    UNLOCK();
+    return 0;
+}
+
+/* Under LOCK: a redial thread, unless one runs, PSNR_REDIAL=0, or there was
+ * never a connection. 1 if one runs now. */
+static int redial_start(void)
+{
+    if (s_redialing) return 1;
+    if (!redial_on() || !s_comm_id[0]) return 0;
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, redial_main, NULL, 0, NULL);
+    if (!th) return 0;
+    CloseHandle(th);
+#else
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    const int bad = pthread_create(&th, &at, redial_main, NULL);
+    pthread_attr_destroy(&at);
+    if (bad) return 0;
+#endif
+    s_redialing = 1;
+    return 1;
+}
+
 void np_psnr_pump(void)
 {
     psnr_msg m;
@@ -546,21 +675,30 @@ void np_psnr_pump(void)
         int r = locked ? -1 : psnr_poll(s_client, &m);
         if (r < 0) {
             /* Gone: fail every outstanding request so no title waits forever. */
-            printf("[psnr] %s\n", locked ? "closed: the network is locked offline" : "connection lost");
             psnr_close(s_client);
             s_client = NULL;
-            psnr_msg dead;
-            memset(&dead, 0, sizeof(dead));
+            s_probed = 0;   /* (the next connection probes its P2P address again) */
+            s_next_probe = 0;
+            const int again = !locked && redial_start();
+            printf("[psnr] %s\n", locked ? "closed: the network is locked offline"
+                                 : again ? "connection lost; dialling again in the background" : "connection lost");
+            /* The requests of the lost connection, taken all at once: a redial
+             * may connect while their handlers run, and its requests must not
+             * be failed with them. */
+            struct { np_psnr_reply_fn fn; void* user; } lost[PENDING_MAX];
+            int nlost = 0;
             for (int i = 0; i < PENDING_MAX; i++)
                 if (s_pending[i].req) {
-                    np_psnr_reply_fn f = s_pending[i].fn;
-                    void* u = s_pending[i].user;
+                    lost[nlost].fn = s_pending[i].fn;
+                    lost[nlost].user = s_pending[i].user;
+                    nlost++;
                     s_pending[i].req = 0;
-                    UNLOCK();
-                    if (f) f(u, &dead);
-                    LOCK();
                 }
             UNLOCK();
+            psnr_msg dead;
+            memset(&dead, 0, sizeof(dead));
+            for (int k = 0; k < nlost; k++)
+                if (lost[k].fn) lost[k].fn(lost[k].user, &dead);
             return;
         }
         if (r == 0) { UNLOCK(); return; }
