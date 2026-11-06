@@ -7,6 +7,7 @@
 
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/sys_lang.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -297,7 +298,7 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
     s32 v = 0;
     switch (id) {
     case CELL_SYSUTIL_SYSTEMPARAM_ID_LANG:
-        v = CELL_SYSUTIL_LANG_ENGLISH_US;
+        v = ps3_sys_lang();   /* PS3_SYS_LANG, else English (US) */
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_ENTER_BUTTON_ASSIGN:
         v = CELL_SYSUTIL_ENTER_BUTTON_ASSIGN_CROSS;
