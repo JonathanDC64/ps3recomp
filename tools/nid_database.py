@@ -533,7 +533,7 @@ class NIDDatabase:
             re.M)
         count = 0
         for sub in ("libs", "runtime"):
-            for path in glob.glob(os.path.join(repo_root, sub, "**", "*.c"), recursive=True):
+            for path in glob.glob(os.path.join(glob.escape(repo_root), sub, "**", "*.c"), recursive=True):
                 try:
                     txt = open(path, encoding="latin1").read()
                 except OSError:
