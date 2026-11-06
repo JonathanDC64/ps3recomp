@@ -34,7 +34,7 @@ def find_vcvars():
     hits = []
     for root in roots:
         hits += glob.glob(os.path.join(
-            root, "Microsoft Visual Studio", "*", "*",
+            glob.escape(root), "Microsoft Visual Studio", "*", "*",
             "VC", "Auxiliary", "Build", "vcvars64.bat"))
     # Newest version, then edition, by plain reverse sort: "2022" > "2019", and
     # within a year "Enterprise" > "Community". Any of them can compile this.

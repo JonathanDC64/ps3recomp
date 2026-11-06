@@ -5143,9 +5143,10 @@ def main() -> None:
     # last one) so a build doesn't pick up both. This runs after the writes,
     # not before them, so that the files this lift kept are not deleted.
     keep = {os.path.normcase(os.path.abspath(p)) for p in paths}
+    out_pat = os.path.join(_glob.escape(args.output), _glob.escape(base))   # (a folder named "x [PS3]")
     for stale in ([os.path.join(args.output, args.source_name)] +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.c")) +
-                  _glob.glob(os.path.join(args.output, f"{base}_*.cpp"))):
+                  _glob.glob(out_pat + "_*.c") +
+                  _glob.glob(out_pat + "_*.cpp")):
         if os.path.exists(stale) and os.path.normcase(os.path.abspath(stale)) not in keep:
             os.remove(stale)
             print(f"Removed stale {os.path.basename(stale)}")

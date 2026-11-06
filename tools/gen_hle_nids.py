@@ -20,6 +20,9 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ROOT as a glob pattern. A folder name with brackets, "Demon's Souls [PS3]",
+# reads as a character class, and every pattern under it matched nothing.
+LIBS = os.path.join(glob.escape(ROOT), "libs")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from nid_database import compute_nid
 
@@ -72,7 +75,7 @@ def discover_all():
     cmake_excluded = {"sceNpCommerce"}
     names = set()
     for d in dirs:
-        for p in glob.glob(os.path.join(ROOT, "libs", d, "*.c")):
+        for p in glob.glob(os.path.join(LIBS, d, "*.c")):
             n = os.path.splitext(os.path.basename(p))[0]
             if n in cmake_excluded:
                 continue
@@ -104,7 +107,7 @@ def main():
 
     regs, seen, nlibs, missing = [], set(), 0, []
     for lib in args.libs:
-        cs = glob.glob(os.path.join(ROOT, "libs", "**", lib + ".c"), recursive=True)
+        cs = glob.glob(os.path.join(LIBS, "**", glob.escape(lib) + ".c"), recursive=True)
         if not cs:
             missing.append(lib); continue
         nlibs += 1
@@ -127,7 +130,7 @@ def main():
     # registered. Fail loudly instead, and suggest the file that probably meant.
     if missing:
         have = sorted(os.path.splitext(os.path.basename(p))[0]
-                      for p in glob.glob(os.path.join(ROOT, "libs", "**", "*.c"),
+                      for p in glob.glob(os.path.join(LIBS, "**", "*.c"),
                                          recursive=True))
         print("error: these module names match no libs/**/<name>.c, so every NID "
               "they export would go unregistered and silently fake CELL_OK:",
