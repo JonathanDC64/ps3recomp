@@ -22,6 +22,7 @@
 #include "../spurs_queues.h"
 #include "../spurs_taskset.h"
 #include "../../../runtime/syscalls/sys_event.h"
+#include "../../../runtime/spu/spu_coherency.h"   /* the line's stripe: spu_lockline_read_begin, _ok */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,6 +258,31 @@ static void test_sq(void)
     CHECK(port >= 16 && port < 64 && spurs_port_queue(port) == sq_rd32(SQ + 0x74), "port %u, event queue", port);
     CHECK(spurs_q_pop(SQ, ENTRY, 0) == SQ_ERR_AGAIN, "an empty pop");
     CHECK(sq_rd32(SQ + 0x00) == 0, "an empty non-blocking pop leaves the line");
+    /* Nor does it take the line's lock: the stripe's sequence word stays, so
+     * an SPU's reservation or lock-free read on any line of it holds. */
+    long seq = 0;
+    CHECK(spu_lockline_read_begin(SQ, &seq), "the line's stripe is free");
+    CHECK(spurs_q_pop(SQ, ENTRY, 0) == SQ_ERR_AGAIN, "an empty pop, again");
+    CHECK(spu_lockline_read_ok(SQ, seq), "an empty non-blocking pop took the line's lock");
+    /* A non-blocking pop of a ready entry, pushed as the SPU does. */
+    {
+        const uint32_t v = 0xC0FFEEu;
+        memset(vm_base + SQ_BUF, 0, 0x10);
+        memcpy(vm_base + SQ_BUF, &v, 4);
+        sq_line_lock(SQ);
+        sq_wr32(SQ + 0x04, 1);
+        sq_line_unlock(SQ, 1);
+        uint32_t got = 0;
+        CHECK(spurs_q_pop(SQ, ENTRY, 0) == 0, "a non-blocking pop of a ready entry");
+        memcpy(&got, vm_base + ENTRY, 4);
+        CHECK(got == v && sq_rd32(SQ + 0x00) == 1, "it got the entry (0x%X) and moved the pop count", got);
+        CHECK(spurs_q_pop(SQ, ENTRY, 0) == SQ_ERR_AGAIN, "then empty");
+        /* Back to an empty line for the load test: counts 0. */
+        sq_line_lock(SQ);
+        sq_wr32(SQ + 0x00, 0);
+        sq_wr32(SQ + 0x04, 0);
+        sq_line_unlock(SQ, 1);
+    }
 
     const long slept0 = g_sq_stats.q_pop_slept, lost0 = g_sq_stats.lost_wakeups;
     th_t t = th_start(sq_pusher, NULL);
