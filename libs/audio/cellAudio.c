@@ -1035,7 +1035,22 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
+#if AUDIO_BACKEND_SDL2
+    /* Off Windows there is no MMCSS. At the default priority the mixer wakes
+     * late when every core is busy (a fight on a 4-core handheld), and each
+     * late block is mixed with no time left for the title to write the next
+     * one: a gap. On Linux SDL asks for nice -20 and, without the privilege
+     * for that, asks RealtimeKit over D-Bus (the service PipeWire and
+     * PulseAudio use) for the best nice level it grants, -15 by default; the
+     * thread stays in the ordinary class, not a real-time one. (macOS: SDL's
+     * round-robin class, as Apple asks of audio threads.) If neither works it
+     * runs as before. */
+    const int raised = SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL) == 0;
+    fprintf(stderr, "[cellAudio] Mixing thread started (%s%s)\n", raised ? "raised priority" : "normal priority: ",
+           raised ? "" : SDL_GetError());
+#else
     printf("[cellAudio] Mixing thread started\n");
+#endif
     audio_mix_loop();
     printf("[cellAudio] Mixing thread stopped\n");
     return NULL;

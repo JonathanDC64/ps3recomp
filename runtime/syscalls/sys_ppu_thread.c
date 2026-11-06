@@ -41,6 +41,59 @@ void (*g_ds_register_shadow_hook)(unsigned long long guest_tid) = 0;
                         * leaves per-thread CRT state uninit -> buffered fread() silently
                         * returns 0 on those threads). */
 #endif
+#if defined(__linux__)
+#include <SDL2/SDL.h>     /* SDL_LinuxSetThreadPriority: nice through RealtimeKit */
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+/* Which guest threads get a raised host priority. A title orders its threads
+ * from 0 (most urgent) to 3071. Its main thread and most workers sit at the
+ * SDK's default, 1001; what it puts ahead of them are the threads that must
+ * not wait, its audio and I/O pollers. On the PS3 those preempt the rest
+ * (RPCS3 likewise runs two guest threads at a time, chosen by priority). Here
+ * every guest thread is a host thread of one priority, so under a busy frame
+ * they wake late:
+ * - The Simpsons Arcade Game's music thread (prio 0) polls the audio read
+ *   index every 2.5 ms and misses a 5.3 ms block whenever it is delayed.
+ * - Demon's Souls' libmixer threads (400-404) write each 5.3 ms block when
+ *   cellAudio's notify wakes them. Held to 2 CPUs, the game had 216 and 317
+ *   gaps in two 4-minute runs at normal priority, and 15 with those three
+ *   raised. Raising only the thread that takes the notify left 39: the
+ *   other two do part of the work.
+ * Each miss is an audible gap. The boost is mild (above normal on Windows,
+ * nice -5 elsewhere), not TIME_CRITICAL: these threads sleep between blocks.
+ * PPU_RAISE_BELOW=<prio> moves the line: 256 is where it was before, 0 turns
+ * it off. */
+static int ppu_host_raised(int32_t prio)
+{
+    static int below = -1;
+    PS3_KNOB(below, ps3_env_int("PPU_RAISE_BELOW", 1000));
+    return prio < below;
+}
+
+#ifndef _WIN32
+/* The calling thread to the raised level. Linux: nice -5 by setpriority, or,
+ * without the right to lower its own nice, through RealtimeKit (SDL asks it
+ * over D-Bus; desktop Linux and SteamOS run it for PipeWire and PulseAudio).
+ * Elsewhere the shim's mapping (macOS: QoS user-interactive). Best effort: a
+ * refusal leaves the thread as it was, and the first one is logged. */
+static void ppu_host_raise_self(void)
+{
+#if defined(__linux__)
+    if (SDL_LinuxSetThreadPriority((Sint64)syscall(SYS_gettid), -5) != 0) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "[SYS] guest threads ahead of the rest stay at normal priority: %s\n",
+                    SDL_GetError());
+        }
+    }
+#else
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -145,6 +198,8 @@ static void* ppu_host_thread_proc(void* param)
      * then dies silently with an access violation INSIDE the handler and the
      * backtrace that would name the recursing function is lost. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+#else
+    if (ppu_host_raised(info->priority)) ppu_host_raise_self();
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
@@ -531,14 +586,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
-    /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
-     * I/O pollers. At normal host priority they wake late under a busy frame:
-     * The Simpsons Arcade Game's music thread (prio 0) polls the audio read
-     * index every 2.5 ms and misses a 5.3 ms block whenever it is delayed, and
-     * each miss is an audible gap. A mild boost, not TIME_CRITICAL: these
-     * threads sleep between polls.
-     * ponytail: two host levels only; map the full range if a title needs it. */
-    if (priority < 256)
+    /* (ppu_host_raised. Off Windows the new thread raises itself, in
+     * ppu_host_thread_proc: Linux's nice is per thread id, macOS's QoS only
+     * for the calling thread.) */
+    if (ppu_host_raised(priority))
         SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
