@@ -427,7 +427,8 @@ static u32 wbg_record(int i)
     return dst;   /* stored by the GPU: the store only takes its checksum */
 }
 
-/* Target i's readback copy, into its buffer for this batch's half: 1 recorded. */
+/* Target i's readback copy, into its buffer for this batch's half (s_rf_buf):
+ * 1 recorded. */
 static int wb_record_copy(int i)
 {
     OffRT* r = &s_d3d.off_rt[i];
@@ -438,9 +439,11 @@ static int wb_record_copy(int i)
     const u64 need = (u64)pitch * r->h;
     /* The readback buffer is the GPU layer's (step C5b; rb its resource,
      * borrowed). One too small goes with the last batch's fence: its last
-     * copy was the batch before last's, stored by now (wb_store_done). */
-    gpu_buffer* const rb = &r->rb_buf[s_rf_par];
-    if (GPU_VALID(*rb) && r->rb_size[s_rf_par] < need) {
+     * copy was the batch before last's (without frames in flight, the last
+     * batch's), stored by now (wb_store_done). */
+    const u32 h = s_rf_buf;
+    gpu_buffer* const rb = &r->rb_buf[h];
+    if (GPU_VALID(*rb) && r->rb_size[h] < need) {
         const gpu_texture none = {0};
         rc_grave_put(none, *rb);
         rb->id = 0;
@@ -454,7 +457,7 @@ static int wb_record_copy(int i)
         bd.state = GPU_STATE_COPY_DEST;
         *rb = gpu_buffer_create(s_rc_dev, &bd);
         if (!GPU_VALID(*rb)) return 0;
-        r->rb_size[s_rf_par] = need;
+        r->rb_size[h] = need;
     }
     gpu_state prior = r->st;
     gpu_texture from = r->tex;
@@ -484,7 +487,7 @@ static void rt_writeback_record(void)
         const gpu_buffer none = {0};
         if (gpu_dst && wbg_mode() != 2) { wb_queue(i, WB_GPU, gpu_dst, none); continue; }
         if (!wb_record_copy(i)) continue;   /* (RSX_WB_GPU=2: the CPU store's copy too, to compare) */
-        wb_queue(i, gpu_dst ? WB_CHECK : WB_CPU, gpu_dst, r->rb_buf[s_rf_par]);
+        wb_queue(i, gpu_dst ? WB_CHECK : WB_CPU, gpu_dst, r->rb_buf[s_rf_buf]);   /* (wb_record_copy's) */
     }
 }
 
@@ -1027,7 +1030,8 @@ static void guest_fb_present(u32 fi)
     static int inited = 0;
     static u32 off, gw, gh, gpitch, up_pitch;
     /* Step C2: the upload buffers, mapped for their life, one per parity
-     * half (RSX_FRAMES_IN_FLIGHT: the last batch may still copy from its). */
+     * half (RSX_FRAMES_IN_FLIGHT: the last batch may still copy from its),
+     * or one without frames in flight (s_rf_buf). */
     static gpu_buffer up_bufs[2];
     if (!inited) {
         inited = 1;
@@ -1036,12 +1040,12 @@ static void guest_fb_present(u32 fi)
         if (!e || sscanf(e, "%i,%u,%u,%u", &a, &b, &c, &d) != 4 || !b || !c) return;
         off = a; gw = b; gh = c; gpitch = d;
         up_pitch = (gw * 4u + 255u) & ~255u;      /* D3D12 wants 256-byte rows */
-        for (int k = 0; k < 2; k++)   /* none if none */
+        for (int k = 0; k < (frames_in_flight_on() ? 2 : 1); k++)   /* none if none */
             rc_buf_make((u64)up_pitch * gh, GPU_USE_COPY_SRC, GPU_MEM_UPLOAD, &up_bufs[k], NULL);
         fprintf(stderr, "[GUESTFB] presenting guest 0x%08X %ux%u pitch %u -> backbuffer%c",
                 off, gw, gh, gpitch, 10);
     }
-    const gpu_buffer up_buf = up_bufs[s_rf_par];
+    const gpu_buffer up_buf = up_bufs[s_rf_buf];
     if (!GPU_VALID(up_buf)) return;
     { extern u8* vm_base;
       if (!vm_base) return;

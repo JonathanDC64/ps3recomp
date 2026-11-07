@@ -1,9 +1,10 @@
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 
-/* The first entry of draw d's SRV window in this batch's half's set. */
+/* The first entry of draw d's SRV window in this batch's set (s_rf_buf: its
+ * parity half's with frames in flight, the one set without). */
 static inline u32 draw_srv(u32 d)
 {
-    return DRAW_SRV_BASE + (s_rf_par * MAX_DRAWS + d) * RSX_FP_UNITS;
+    return DRAW_SRV_BASE + (s_rf_buf * MAX_DRAWS + d) * RSX_FP_UNITS;
 }
 
 /* The VP pass's binds for the whole batch: at its start, and again after
@@ -73,11 +74,14 @@ static void render_frame(void)
      * still reads tears geometry (gcm/cube: triangles mixing stale and new
      * vertices -> missing/sliver polygons). Without frames in flight
      * (RSX_FRAMES_IN_FLIGHT=0), or with the last batch's occlusion counts
-     * still to store, the GPU is drained here instead. */
+     * still to store, the GPU is drained here instead; without frames in
+     * flight, the texture staging, readback buffers and windows are then
+     * always half 0's (s_rf_buf). */
     { LARGE_INTEGER _w0, _w1, _w2, _f;
       QueryPerformanceCounter(&_w0);
       if (!frames_in_flight_on() || s_zq_pend) wait_for_gpu();
       s_rf_par = (u32)s_d3d.vp_parity;
+      s_rf_buf = frames_in_flight_on() ? s_rf_par : 0u;
       QueryPerformanceCounter(&_w1);
       /* Before the pre-pass below resets `used` and reassigns slots. */
       wb_store_done();

@@ -65,6 +65,17 @@ static gpu_fence s_batch_fence[2];
 static gpu_fence s_last_batch_fence;
 static u32 s_rf_par;
 
+/* The half whose texture staging, readback buffers and per-draw windows the
+ * batch uses (set with s_rf_par): s_rf_par with frames in flight, else always
+ * half 0. Without them the GPU is drained at each batch's start and the last
+ * batch's write-back copies are stored before anything is written again
+ * (render_frame, wb_store_done), so one of each does, as before 2026-11-06,
+ * and the second half's are never made: on the D3D12 route, where frames in
+ * flight are off, Demon's Souls kept ~40 MB of RAM and ~8 MB of video memory
+ * that way. What is not memory (the write-back queues, the fences, the post
+ * passes' few descriptors) stays per parity half. */
+static u32 s_rf_buf;
+
 /* Has the GPU finished half par's last batch? Does not wait. */
 static int batch_done(u32 par)
 {

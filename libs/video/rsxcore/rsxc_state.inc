@@ -173,7 +173,8 @@ typedef struct {
     gpu_state             st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
     gpu_buffer            rb_buf[2];   /* colour write-back readback buffers: the GPU layer's (step C5b),
-                                        * one per parity half (a batch's copy waits there for its store) */
+                                        * one per parity half (a batch's copy waits there for its store);
+                                        * only [0] without frames in flight (s_rf_buf) */
     u64                   rb_size[2];
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
@@ -196,9 +197,13 @@ typedef struct {
 /* Per-draw SRV windows: each VP draw gets RSX_FP_UNITS consecutive descriptors
  * (t0-t15) so multi-unit fragment programs see all their textures. One set
  * of MAX_DRAWS windows per parity half (draw_srv): a batch rewrites its own
- * while the GPU may still read the last batch's (RSX_FRAMES_IN_FLIGHT). */
+ * while the GPU may still read the last batch's (RSX_FRAMES_IN_FLIGHT).
+ * Without frames in flight, one set (s_rf_buf): s_draw_srv_sets, set by the
+ * init before it makes the pool, so the heap's layout below is decided then. */
 #define DRAW_SRV_BASE 32
-#define DRAW_SRV_SETS 2
+static int frames_in_flight_on(void);   /* (rsxc_sync.inc) */
+static u32 s_draw_srv_sets = 2;
+#define DRAW_SRV_SETS s_draw_srv_sets
 #define VP_SAMP_TABLES (2048 / RSX_FP_UNITS)
                              /* per-draw sampler tables (D3D12 caps a shader-
                               * visible sampler heap at 2048 samplers). When all

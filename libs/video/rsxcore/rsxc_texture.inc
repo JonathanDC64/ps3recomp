@@ -325,7 +325,9 @@ static u32 tcj_sum(int i, u32 off, u32 nb)
  *
  * The buffers are the GPU layer's upload buffers, mapped for their life
  * (step C4), one per parity half (RSX_FRAMES_IN_FLIGHT: the GPU may still
- * copy from the last batch's while this one's fill). One that a frame stops
+ * copy from the last batch's while this one's fill), or one without frames
+ * in flight (s_rf_buf: half 0's, the GPU drained at each batch's start, as
+ * before 2026-11-06; the second half's is never made). One that a frame stops
  * using (a one-off buffer, or a buffer a later frame outgrew) goes at the
  * start of the frame after, with the fence of the batch that last read it. */
 static gpu_buffer      s_ts_buf[2];
@@ -362,7 +364,7 @@ static void tex_stage_drop(gpu_buffer b)
 static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
 {
     const u64 a = (s_ts_off + 511u) & ~511ull;
-    const u32 h = s_rf_par;
+    const u32 h = s_rf_buf;
     s_ts_off = a + bytes;               /* counted either way: next frame's size */
     if (s_ts_map[h] && a + bytes <= s_ts_cap[h]) { *buf = s_ts_buf[h]; *at = a; return s_ts_map[h] + a; }
     u8* mp = NULL;
@@ -373,15 +375,16 @@ static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
     return mp;
 }
 
-/* Start of a frame's uploads (s_rf_par set): the last batch's one-off
- * buffers go once the GPU is past it, and this half's buffer grows to what
- * the last frame used. The GPU is done with this half's buffer: its last
- * reader was the batch before last. */
+/* Start of a frame's uploads (s_rf_par, s_rf_buf set): the last batch's
+ * one-off buffers go once the GPU is past it, and this half's buffer grows
+ * to what the last frame used. The GPU is done with this half's buffer: its
+ * last reader was the batch before last (without frames in flight, the last
+ * batch, which the start of render_frame waited for). */
 static void tex_stage_frame(void)
 {
     for (int i = 0; i < s_ts_grave_n; i++) gpu_buffer_destroy(s_rc_dev, s_ts_grave[i], s_last_batch_fence);
     s_ts_grave_n = 0;
-    const u32 h = s_rf_par;
+    const u32 h = s_rf_buf;
     const u64 used = s_ts_off;
     s_ts_off = 0;
     static u64 limit = 0;

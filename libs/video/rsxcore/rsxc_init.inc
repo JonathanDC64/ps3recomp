@@ -273,6 +273,7 @@ static int init_d3d12(u32 width, u32 height)
          * per-draw windows, the AA source (POST_SRV_AA, a table per half)
          * and SMAA's 3-wide windows (POST_SRV_SMAA: two per half). */
         {
+            s_draw_srv_sets = frames_in_flight_on() ? 2u : 1u;   /* (the windows' sets: draw_srv) */
             gpu_table_pool_desc pd;
             memset(&pd, 0, sizeof pd);
             pd.kind = GPU_TABLE_TEX;
