@@ -134,14 +134,14 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0x7cc8823823ef6bc7ull, 0xd0374939e7ac2044ull },
-    { "draws",     0x25da2542d0362cf6ull, 0x9bb7d6508127040eull },
-    { "states",    0xdd0a5dfa52e23f39ull, 0xc23be0dae1928019ull },
-    { "textures",  0x39b4de7b1c6fc306ull, 0x966fdeb3f05b1ed7ull },
-    { "offscreen", 0x2f8bbc05cfa9103bull, 0xdbcfb6818ad85188ull },
-    { "zpass",     0x5b13e9a905aca346ull, 0x583c334571a902e7ull },
-    { "frames",    0x223c37dded569713ull, 0x52e766ad2dfa066eull },
-    { "mainmem",   0xe6b2e903d4eeed00ull, 0xc895078656c4e462ull },
+    { "clears",    0x7cc8823823ef6bc7ull, 0xba64dc6fa62b09c6ull },
+    { "draws",     0x9cec4cdd76ac2e72ull, 0x014340ac39721076ull },
+    { "states",    0x0427f9e45d6110f5ull, 0xdc0bc5abe87369a1ull },
+    { "textures",  0x70540c21a54ccaaaull, 0x618f1d9d382bb94full },
+    { "offscreen", 0x9f93c1f19fff9d4full, 0x931b688e44b78a90ull },
+    { "zpass",     0x02ed13586cb83382ull, 0xd5cf0327c8befd9full },
+    { "frames",    0xc4011934a75f91edull, 0xe1bf028ec9f817c5ull },
+    { "mainmem",   0x83291788f3d3f66eull, 0xd6fcbc4059463f41ull },
 };
 
 /* ---------------------------------------------------------------------------
@@ -752,6 +752,11 @@ static void scene_draws(int k)
     M(NV4097_SET_RESTART_INDEX_ENABLE, 1);
     M(NV4097_SET_RESTART_INDEX, 0xFFFF);
     draw_indexed(RSX_PRIMITIVE_TRIANGLE_STRIP, IB_AT(2), 0, 1, 0, 64);
+    /* A restart triangle list over two ranges, 256 + 32: the first leaves a
+     * triangle open (85 and one index), which carries into the second, so
+     * the second's 32 indices make 33 vertices (issue #400: the room must
+     * hold them, or the core says "[VPVB] past its room"). */
+    draw_indexed(RSX_PRIMITIVE_TRIANGLES, IB_AT(1), 0, 0, 0, 288);
     M(NV4097_SET_RESTART_INDEX_ENABLE, 0);
     /* Other vertex formats: half positions, snorm16 and s16 normals, ubyte 0-255. */
     attrs_off();
@@ -1353,7 +1358,7 @@ static int run_parse(const char* dir, Run* r)
         } else if (sscanf(line, "[null] present %u: stream %llx, %u failed checks", &n, &h, &fails) == 3) {
             if (cp >= 0) { r->hash[cp][cf] = h; r->presents[cp][cf]++; }
             r->failed = fails;
-        } else if (strstr(line, "[GPU null] check failed")) {
+        } else if (strstr(line, "[GPU null] check failed") || strstr(line, "[VPVB] past its room")) {
             if (!r->check_lines++) snprintf(r->first_check, sizeof r->first_check, "%s", line);
         } else if (strstr(line, "[GPU null]") && strstr(line, "checks failed")) {
             r->shutdown_fail = 1;
