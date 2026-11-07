@@ -790,14 +790,14 @@ static void off_rt_drop_rewritten(void)
  * a write calls out. Through the pool's writer, found once at init (step
  * C8a): the 16 calls of a draw look nothing up before the memo. */
 static void srv_write_ex(u32 heap_slot, gpu_texture tex, gpu_format fmt,
-                         u32 swizzle, int cube)
+                         u32 swizzle, int cube, u32 mips)
 {
     gpu_view_desc sv;
     sv.texture = tex;
     sv.kind = GPU_VIEW_SRV;
     sv.dim = cube ? GPU_DIM_CUBE : GPU_DIM_2D;   /* a cube must match the TextureCube declaration in the HLSL */
     sv.flags = 0;
-    sv.mips = 1;
+    sv.mips = (u8)(mips ? mips : 1u);   /* a guest texture's levels (VPTexSlot.lv) */
     sv.format = fmt;
     sv.swizzle = swizzle;
     sv.mip = 0;
@@ -807,7 +807,7 @@ static void srv_write_ex(u32 heap_slot, gpu_texture tex, gpu_format fmt,
 
 static void srv_write(u32 heap_slot, gpu_texture tex, gpu_format fmt, u32 swizzle)
 {
-    srv_write_ex(heap_slot, tex, fmt, swizzle, 0);
+    srv_write_ex(heap_slot, tex, fmt, swizzle, 0, 1);
 }
 
 /* On the frame's recorder (step C5b). Inline (the backend's command header), so a draw's

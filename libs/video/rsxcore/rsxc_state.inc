@@ -236,6 +236,7 @@ typedef struct {
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
     u32 fsum;           /* full checksum of them, kept while TEX_VERIFY is on */
     u32 face_bytes;     /* guest bytes from one cube face to the next */
+    u32 lv;             /* mip levels the texture holds (RSX_TEX_MIPS) */
     gpu_heap blk;       /* tex is placed here (tex_pool), at blk_off; none = committed (step C4) */
     u64 blk_off;
     int blk_class;
