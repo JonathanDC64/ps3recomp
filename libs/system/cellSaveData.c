@@ -1410,9 +1410,9 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
-    dirName = savedata_host_str(dirName);
+    const char* name = savedata_host_str(dirName);
     printf("[cellSaveData] AutoSave2(version=%u, dir='%s')\n",
-           version, dirName ? dirName : "<null>");
+           version, name ? name : "<null>");
 
     /* Delegate to the non-_2 entry, which marshals. This used to call
      * savedata_execute(), which invokes funcStat as a HOST function pointer
@@ -1426,7 +1426,14 @@ s32 cellSaveDataAutoSave2(u32 version, const char* dirName,
      * savedata_execute() is still behind the List* and Fixed* entries and
      * carries the same defect for each of them. Fixing those needs list/file
      * marshalling that dispatch_func_stat does not do yet, so they are left
-     * alone until a title actually reaches one. */
+     * alone until a title actually reaches one.
+     *
+     * dirName goes on as the title gave it, because cellSaveDataAutoSave
+     * translates it itself. Translated here as well, it went wrong whenever
+     * guest memory's host address was below 4 GB, which happens where a
+     * process's allocations aren't randomized: the second translation pointed
+     * into the guest arena, the name check failed, and Demon's Souls asked for
+     * its first save again and again. */
     return cellSaveDataAutoSave(version, dirName, errDialog, setBuf,
                                 funcStat, funcFile, container, userdata);
 }
