@@ -2,6 +2,7 @@
  * -Wl,-dead_strip -o /tmp/test_savedata_io && /tmp/test_savedata_io */
 #include "../cellSaveData.c"
 #include <assert.h>
+#include <sys/mman.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -89,6 +90,16 @@ static void write_callback(u32 opd, u64 cb, u64 get, u64 set,
     vm_write32(set + 40, sizeof(payload));
     vm_write32(set + 44, 0x400);
 }
+/* Guest memory whose host address is below 4 GB, as on Windows where a
+ * process's allocations aren't randomized; NULL where none can be had (macOS
+ * keeps the first 4 GB for itself). */
+static uint8_t* low_arena(size_t n)
+{
+    void* p = mmap((void*)0x40000000, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if ((uintptr_t)p + n > 0x100000000ull) { munmap(p, n); return NULL; }
+    return (uint8_t*)p;
+}
 static s32 auto_save(const char* dir)
 {
     strcpy((char*)vm_base + 0xB00, dir);
@@ -168,6 +179,27 @@ int main(void)
         FILE* sfo = fopen(p2, "rb"); assert(sfo);
         assert(fgets(line, sizeof(line), sfo)); fclose(sfo);
         assert(strcmp(line, "TITLE=Save test\n") == 0);
+    }
+    /* With guest memory below 4 GB, AutoSave2 still saves: the game's name is
+     * translated to a host pointer once. Translated twice, it pointed into
+     * the guest arena, and Demon's Souls asked for its first save forever. */
+    {
+        uint8_t* high = vm_base;
+        uint8_t* low = low_arena(0x200000);
+        if (low) {
+            memcpy(low, high, 0x200000);
+            vm_base = low;
+            assert(auto_save("TEST00003") == CELL_OK);
+            assert(stat_calls == 1 && file_calls == 2);
+            snprintf(p2, sizeof(p2), "%s/TEST00003/DATA.BIN", root); assert(unlink(p2) == 0);
+            snprintf(p2, sizeof(p2), "%s/TEST00003/PARAM.SFO", root); assert(unlink(p2) == 0);
+            snprintf(p2, sizeof(p2), "%s/TEST00003", root); assert(rmdir(p2) == 0);
+            memcpy(high, low, 0x200000);
+            vm_base = high;
+            munmap(low, 0x200000);
+        } else {
+            puts("(no memory below 4 GB here: the low guest memory case is skipped)");
+        }
     }
     /* A file that cannot be written fails the save. */
     snprintf(p2, sizeof(p2), "%s/TEST00000/.DATA.BIN.tmp", root); assert(mkdir(p2, 0755) == 0);

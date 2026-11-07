@@ -2333,7 +2333,18 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
  * it committed), so the colour write-back goes straight from the GPU into
  * guest memory. The addresses are the same either way. Without placeholders
  * (VirtualAlloc2: Windows 10 1803 and later) it is one reservation, as before,
- * and the backend stores on the CPU. */
+ * and the backend stores on the CPU.
+ *
+ * Either way it goes on a 4 GB boundary, as the POSIX branch in main and
+ * vm_init (vm.h) place it. GUEST_EA (libs/guest_struct.h) turns a host
+ * pointer back into a guest address by keeping its low 32 bits, and the HLE's
+ * string helpers (savedata_host_str and the like) take a value below 4 GB for
+ * a guest address. A reservation with no address asked for promises neither.
+ * In a test it went at 0x2556BAD0000: above 4 GB, off any boundary. With the
+ * process's allocations not randomized (bottom-up ASLR off, for one process
+ * or the whole PC), it went at 0x7FFF0000. There a guest string's host
+ * address is below 4 GB, so cellSaveDataAutoSave2's name, translated twice,
+ * pointed elsewhere, and Demon's Souls could never write a new save. */
 static uint8_t* vm_reserve(void)
 {
 #ifndef MEM_RESERVE_PLACEHOLDER
@@ -2342,10 +2353,26 @@ static uint8_t* vm_reserve(void)
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
 #endif
     typedef PVOID (WINAPI *va2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
-    const uint64_t lo = 0xC0000000ull, n = 0x10000000ull;
+    const uint64_t lo = 0xC0000000ull, n = 0x10000000ull, A = 0x100000000ull;
     va2_fn va2 = (va2_fn)(void*)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2");
-    uint8_t* b = va2 ? (uint8_t*)va2(NULL, NULL, VM_SIZE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                     PAGE_NOACCESS, NULL, 0) : NULL;
+    /* A placeholder 4 GB bigger than needed. The part on the boundary is
+     * kept, and the head and the tail go back. A placeholder splits and frees
+     * in parts, so nothing else can take the address in between. */
+    uint8_t* b = NULL;
+    if (uint8_t* raw = va2 ? (uint8_t*)va2(NULL, NULL, VM_SIZE + A, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                           PAGE_NOACCESS, NULL, 0) : NULL) {
+        uint8_t* at = (uint8_t*)(((uintptr_t)raw + A - 1u) & ~(uintptr_t)(A - 1u));
+        if ((at == raw || (VirtualFree(raw, (SIZE_T)(at - raw), MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+                           VirtualFree(raw, 0, MEM_RELEASE))) &&
+            VirtualFree(at, VM_SIZE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+            VirtualFree(at + VM_SIZE, 0, MEM_RELEASE))
+            b = at;
+        else {   /* give back whatever is left (a piece not made fails harmlessly) */
+            VirtualFree(raw, 0, MEM_RELEASE);
+            VirtualFree(at, 0, MEM_RELEASE);
+            VirtualFree(at + VM_SIZE, 0, MEM_RELEASE);
+        }
+    }
     if (b && VirtualFree(b, lo + n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
         VirtualFree(b, lo, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
         va2(NULL, b, lo, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
@@ -2356,6 +2383,16 @@ static uint8_t* vm_reserve(void)
         VirtualFree(b, 0, MEM_RELEASE);
         VirtualFree(b + lo, 0, MEM_RELEASE);
         VirtualFree(b + lo + n, 0, MEM_RELEASE);
+    }
+    /* One reservation: see where a 4 GB larger one lands, give it back and
+     * take the boundary inside it. Another allocation could take that address
+     * in between, hence the tries. Anywhere at all is the last resort. */
+    for (int i = 0; i < 8; i++) {
+        uint8_t* probe = (uint8_t*)VirtualAlloc(NULL, VM_SIZE + A, MEM_RESERVE, PAGE_NOACCESS);
+        if (!probe) break;
+        uint8_t* at = (uint8_t*)(((uintptr_t)probe + A - 1u) & ~(uintptr_t)(A - 1u));
+        VirtualFree(probe, 0, MEM_RELEASE);
+        if (uint8_t* r = (uint8_t*)VirtualAlloc(at, VM_SIZE, MEM_RESERVE, PAGE_READWRITE)) return r;
     }
     return (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
 }
@@ -2486,6 +2523,8 @@ int main(int argc, char** argv)
     ppu_vm_size = 0;   /* full 32-bit space backed, as on Windows */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+    printf("[vm] guest memory at %p%s\n", (void*)vm_base, ((uintptr_t)vm_base & 0xFFFFFFFFu)
+           ? ", off a 4 GB boundary: host pointers into it lose their guest address" : "");
     if (s_window_only) {
         /* The window alone (ps3_title_launch): the title's init, then only the
          * present thread, which ends the process when the window closes. The
