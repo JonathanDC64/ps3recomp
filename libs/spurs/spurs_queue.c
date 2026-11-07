@@ -292,6 +292,26 @@ uint32_t spurs_q_pop(uint32_t q, uint32_t dest, uint32_t blocking)
     const uint32_t span = depth * 2u;
     int rechecked = 0;
     __atomic_add_fetch(&g_sq_stats.q_pop, 1, __ATOMIC_RELAXED);
+    /* A non-blocking pop of an empty queue reads the counts without the line's
+     * lock and returns AGAIN having taken and stored nothing, as libsre's
+     * lwarx loop does. Demon's Souls' HighGraphics polls its queue this way
+     * thousands of times a level. Taking the lock for each poll moved the
+     * stripe's sequence word, so the SPU reservations and lock-free reads of
+     * every line on that stripe failed and were redone; held to 2 CPUs the
+     * game drew about a third fewer frames than on libsre. A pop that reads
+     * the queue empty as a push lands returns AGAIN, as libsre's would, and
+     * the caller polls again; one that finds it non-empty pops under the lock
+     * below, which reads the counts again. */
+    if (!blocking) {
+        const uint32_t popw  = __atomic_load_n((const uint32_t*)(vm_base + q + Q_POP), __ATOMIC_ACQUIRE);
+        const uint32_t pushw = __atomic_load_n((const uint32_t*)(vm_base + q + Q_PUSH), __ATOMIC_ACQUIRE);
+        const uint32_t pop  = (uint32_t)sq_normal(__builtin_bswap32(popw));
+        const uint32_t push = (uint32_t)sq_normal(__builtin_bswap32(pushw));
+        if (!((push + span - pop) % span)) {
+            __atomic_add_fetch(&g_sq_stats.q_again, 1, __ATOMIC_RELAXED);
+            return SQ_ERR_AGAIN;
+        }
+    }
     for (;;) {
         sq_line_lock(q);
         const uint32_t pop  = (uint32_t)sq_normal(sq_rd32(q + Q_POP));
