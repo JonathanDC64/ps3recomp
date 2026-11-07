@@ -1319,6 +1319,9 @@ static void spu_rate_tick(spu_context* ctx)
     if ((++wr & 1023u) != 0) return;
     LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
     const unsigned long long now = (unsigned long long)q.QuadPart;
+#ifdef SPU_HAVE_MXCSR
+    if (!t0) _mm_setcsr(_mm_getcsr() & ~0x3Fu);   /* clear the sticky flags: see the second line */
+#endif
     if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
                ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
                pt0 = t_poll_ticks; lu0 = t_llu_n; ls0 = t_llu_same; return; }
@@ -1335,6 +1338,14 @@ static void spu_rate_tick(spu_context* ctx)
             (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
             100.0 * poll_s / s, (t_llu_n - lu0) / s, (t_llu_same - ls0) / s,
             s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
+#ifdef SPU_HAVE_MXCSR
+    /* The thread's float mode and sticky flags since the last line: a
+     * denormal operand (DE) or an underflow (UE) in its code. With SPU_FTZ=0
+     * either means x86 worked on a denormal the SPU would have flushed. */
+    { const unsigned csr = _mm_getcsr(); _mm_setcsr(csr & ~0x3Fu);
+      fprintf(stderr, "[spu-rate] img=%d mxcsr %04X: denormal operand %d, underflow %d%c", s_img, csr,
+              (int)((csr >> 1) & 1u), (int)((csr >> 4) & 1u), 10); }
+#endif
     t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
     ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; pt0 = t_poll_ticks;
     lu0 = t_llu_n; ls0 = t_llu_same;
