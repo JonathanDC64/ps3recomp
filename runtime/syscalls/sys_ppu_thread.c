@@ -62,7 +62,8 @@ void (*g_ds_register_shadow_hook)(unsigned long long guest_tid) = 0;
  *   raised. Raising only the thread that takes the notify left 39: the
  *   other two do part of the work.
  * Each miss is an audible gap. The boost is mild (above normal on Windows,
- * nice -5 elsewhere), not TIME_CRITICAL: these threads sleep between blocks.
+ * nice -5 elsewhere; libmixer's threads a step more, ppu_host_raise_level),
+ * not TIME_CRITICAL: these threads sleep between blocks.
  * PPU_RAISE_BELOW=<prio> moves the line: 256 is where it was before, 0 turns
  * it off. */
 static int ppu_host_raised(int32_t prio)
@@ -72,16 +73,35 @@ static int ppu_host_raised(int32_t prio)
     return prio < below;
 }
 
+/* How far up a new guest thread goes: 0, 1 (ppu_host_raised) or 2. Level 2
+ * is libmixer's three threads, by the names the SDK's cellSurMixer gives them
+ * in every title that links it: they write each block cellAudio asks for.
+ * One step up still left them behind the busy threads one step up with them
+ * (Demon's Souls' Havok, 80-200): held to 2 CPUs, 31 and 20 gaps in two
+ * 4-minute runs; two steps up, 2 in one. Each uses well under 1% of a CPU, so
+ * going ahead of the title's own order costs the rest nothing. PPU_MIXER_RAISE=1
+ * leaves them at one step. */
+static int ppu_host_raise_level(int32_t prio, const char* name)
+{
+    static int mixer = -1;
+    PS3_KNOB(mixer, ps3_env_int("PPU_MIXER_RAISE", 2));
+    if (mixer >= 2 && name && (strcmp(name, "_cellsurMixerMain") == 0 || strcmp(name, "_sys_mixerSurBusReq") == 0 ||
+                               strcmp(name, "_sys_MixerChStripMain") == 0))
+        return 2;
+    return ppu_host_raised(prio) ? 1 : 0;
+}
+
 #ifndef _WIN32
-/* The calling thread to the raised level. Linux: nice -5 by setpriority, or,
- * without the right to lower its own nice, through RealtimeKit (SDL asks it
- * over D-Bus; desktop Linux and SteamOS run it for PipeWire and PulseAudio).
- * Elsewhere the shim's mapping (macOS: QoS user-interactive). Best effort: a
- * refusal leaves the thread as it was, and the first one is logged. */
-static void ppu_host_raise_self(void)
+/* The calling thread to a raised level. Linux: nice -5 (level 2: -10) by
+ * setpriority, or, without the right to lower its own nice, through
+ * RealtimeKit (SDL asks it over D-Bus; desktop Linux and SteamOS run it for
+ * PipeWire and PulseAudio). Elsewhere the shim's mapping (macOS: QoS
+ * user-interactive). Best effort: a refusal leaves the thread as it was, and
+ * the first one is logged. */
+static void ppu_host_raise_self(int level)
 {
 #if defined(__linux__)
-    if (SDL_LinuxSetThreadPriority((Sint64)syscall(SYS_gettid), -5) != 0) {
+    if (SDL_LinuxSetThreadPriority((Sint64)syscall(SYS_gettid), level > 1 ? -10 : -5) != 0) {
         static int told;
         if (!told) {
             told = 1;
@@ -90,7 +110,7 @@ static void ppu_host_raise_self(void)
         }
     }
 #else
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 }
 #endif
@@ -199,7 +219,7 @@ static void* ppu_host_thread_proc(void* param)
      * backtrace that would name the recursing function is lost. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #else
-    if (ppu_host_raised(info->priority)) ppu_host_raise_self();
+    { const int lv = ppu_host_raise_level(info->priority, info->name); if (lv) ppu_host_raise_self(lv); }
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
@@ -586,11 +606,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
-    /* (ppu_host_raised. Off Windows the new thread raises itself, in
+    /* (ppu_host_raise_level. Off Windows the new thread raises itself, in
      * ppu_host_thread_proc: Linux's nice is per thread id, macOS's QoS only
      * for the calling thread.) */
-    if (ppu_host_raised(priority))
-        SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    { const int lv = ppu_host_raise_level(priority, t->name);
+      if (lv) SetThreadPriority(t->host_thread, lv > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL); }
 #else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
