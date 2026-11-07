@@ -93,6 +93,9 @@ uint64_t ppu_thread_register_main(void);
 
 /* 1 while a guest thread of this name is alive. */
 int ppu_thread_named(const char* name);
+
+/* The calling host thread one (1) or two (2) steps up, best effort. */
+void ps3_host_raise_current(int level);
 int64_t sys_ppu_thread_exit(ppu_context* ctx);
 int64_t sys_ppu_thread_join(ppu_context* ctx);
 int64_t sys_ppu_thread_detach(ppu_context* ctx);

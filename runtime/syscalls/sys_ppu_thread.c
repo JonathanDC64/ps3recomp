@@ -115,6 +115,18 @@ static void ppu_host_raise_self(int level)
 }
 #endif
 
+/* The calling host thread one or two steps up, as a raised guest thread goes:
+ * for a runtime thread doing a guest's work, such as an SPU group's thread
+ * (lv2_register.c). */
+void ps3_host_raise_current(int level)
+{
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+#else
+    ppu_host_raise_self(level);
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/

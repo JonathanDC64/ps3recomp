@@ -828,6 +828,39 @@ static void test_stop_inside_call(void)
     free(ctx);
 }
 
+/* The SPU's single precision has no denormals, so lifted code runs with DAZ
+ * and FTZ, and whoever called it gets its own float mode back (#403). x86
+ * only: that is where the mode is MXCSR. */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>
+static unsigned mode_inside;
+static volatile float tiny_a = 1e-20f, tiny_b = 1e-20f, tiny_product = -1.0f;
+static void reads_float_mode(spu_context* ctx)
+{
+    (void)ctx;
+    mode_inside  = _mm_getcsr();
+    tiny_product = tiny_a * tiny_b;   /* 1e-40: a denormal, or zero */
+}
+static void test_float_mode(void)
+{
+    spu_context* ctx = (spu_context*)calloc(1, sizeof *ctx);
+    if (!ctx) { check(0, "allocate float-mode context"); return; }
+    spu_context_init(ctx, 0);
+    ctx->image_id = 92;
+    const unsigned before = _mm_getcsr();
+    _mm_setcsr(before & ~0x8040u);    /* the host default: neither flag */
+    spu_run_with_halt(reads_float_mode, ctx);
+    const unsigned after = _mm_getcsr();
+    check((mode_inside & 0x8040u) == 0x8040u, "SPU code runs with DAZ and FTZ");
+    check(tiny_product == 0.0f, "a product too small to be normal is zero, as on the SPU");
+    check((after & 0x8040u) == 0, "the caller's float mode is back afterwards");
+    _mm_setcsr(before);
+    free(ctx);
+}
+#else
+static void test_float_mode(void) {}
+#endif
+
 int main(void)
 {
     printf("SPU lifted thread-group start\n");
@@ -844,6 +877,7 @@ int main(void)
     test_alternate_link_return();
     test_nonzero_link_return();
     test_stop_inside_call();
+    test_float_mode();
 
     signal(SIGSEGV, guard_fault);
     signal(SIGBUS,  guard_fault);
@@ -1022,6 +1056,7 @@ void ppu_guard_page(uint32_t ea)                 { (void)ea; }
 void ppu_guest_caller(char* out, size_t n)       { if (out && n) out[0] = 0; }
 void ppu_guest_callstack(const char* tag)        { (void)tag; }
 void ppu_log_host_chain(const char* tag)         { (void)tag; }
+void ps3_host_raise_current(int level)          { (void)level; }
 void ps3_hle_register_ctx(uint32_t nid, const char* name,
                           void (*fn)(ppu_context*))
 {

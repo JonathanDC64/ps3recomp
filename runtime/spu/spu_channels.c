@@ -24,6 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>   /* _mm_getcsr / _mm_setcsr: the SPU's float mode, spu_run_with_halt */
+#define SPU_HAVE_MXCSR 1
+#endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -351,6 +355,22 @@ static int spu_interp_img(uint32_t* entry_lsa);
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
+#ifdef SPU_HAVE_MXCSR
+    /* The SPU's single precision has no denormals: one read is zero, and a
+     * result too small to be normal is zero. RPCS3 runs its SPU threads with
+     * DAZ and FTZ for that (gv_set_zeroing_denormals). Without them x86 does
+     * the full IEEE work, which costs extra on many CPUs (Intel takes a
+     * microcode assist each time) -- and an audio synth's decaying filters
+     * make denormals all the time: Demon's Souls' MultiStream synth raises the
+     * denormal and underflow flags in every 2 s window. Its mixer fell behind
+     * and the sound looped (#403). The caller's mode comes back on the way
+     * out, as a PPU thread can run a job inline; a halt's longjmp restores the
+     * mode setjmp saw, which is this one. SPU_FTZ=0 keeps the host's mode. */
+    static int s_ftz = -1;
+    PS3_KNOB(s_ftz, ps3_env_int("SPU_FTZ", 1));
+    const unsigned csr_in = _mm_getcsr();
+    if (s_ftz) _mm_setcsr(csr_in | 0x8040u);   /* FTZ (bit 15) and DAZ (bit 6) */
+#endif
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
      * and stamp every image-1 run here to find the argless caller. */
@@ -429,6 +449,9 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_unregister(ctx);   /* leave the ring; hand the token onward */
     s_spu_halt_armed = outer_armed;
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
+#ifdef SPU_HAVE_MXCSR
+    if (s_ftz) _mm_setcsr(csr_in);
+#endif
     return halted;
 }
 
@@ -1296,6 +1319,9 @@ static void spu_rate_tick(spu_context* ctx)
     if ((++wr & 1023u) != 0) return;
     LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
     const unsigned long long now = (unsigned long long)q.QuadPart;
+#ifdef SPU_HAVE_MXCSR
+    if (!t0) _mm_setcsr(_mm_getcsr() & ~0x3Fu);   /* clear the sticky flags: see the second line */
+#endif
     if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
                ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
                pt0 = t_poll_ticks; lu0 = t_llu_n; ls0 = t_llu_same; return; }
@@ -1312,6 +1338,14 @@ static void spu_rate_tick(spu_context* ctx)
             (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
             100.0 * poll_s / s, (t_llu_n - lu0) / s, (t_llu_same - ls0) / s,
             s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
+#ifdef SPU_HAVE_MXCSR
+    /* The thread's float mode and sticky flags since the last line: a
+     * denormal operand (DE) or an underflow (UE) in its code. With SPU_FTZ=0
+     * either means x86 worked on a denormal the SPU would have flushed. */
+    { const unsigned csr = _mm_getcsr(); _mm_setcsr(csr & ~0x3Fu);
+      fprintf(stderr, "[spu-rate] img=%d mxcsr %04X: denormal operand %d, underflow %d%c", s_img, csr,
+              (int)((csr >> 1) & 1u), (int)((csr >> 4) & 1u), 10); }
+#endif
     t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
     ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; pt0 = t_poll_ticks;
     lu0 = t_llu_n; ls0 = t_llu_same;
