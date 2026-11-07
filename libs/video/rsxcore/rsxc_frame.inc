@@ -523,7 +523,7 @@ rtt_dump_done:;
                                   (_bf == 0x81) ? 0x1000
                                   : _x8 ? rsx_remap_to_swizzle(dr->tex[_u].ctrl1, _bf)
                                         : GPU_SWIZZLE_IDENTITY,
-                                  _cube);
+                                  _cube, s_d3d.vp_tex[ts].lv);
                         continue;
                     }
                 }

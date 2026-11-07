@@ -602,6 +602,29 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;
     u32 blkrows = dxt ? tl.rows      : 0;
+    /* The mip levels to upload (RSX_TEX_MIPS, live, default 1; 0 uploads
+     * level 0 only, as before 2026-11-07). SET_TEXTURE_FORMAT's count says
+     * how many levels the game stored, level 0 first, and its mipmapped
+     * filters read the smaller ones for distant and slanted surfaces. With
+     * level 0 alone those were sampled at full detail, so far walls and
+     * floors glittered and crawled where the PS3 and RPCS3 draw them smooth
+     * (Demon's Souls, issue #413). Packed textures only: rsx_texture_mip_chain
+     * gives the packed layout, and the levels of a linear one (LN) follow its
+     * pitch register (RPCS3), which this upload does not read. A compressed
+     * chain stops before a level whose sides are not whole 4x4 blocks, where
+     * RPCS3's get_exact_mipmap_count stops too: a block-compressed copy moves
+     * whole blocks. */
+    static int use_mips = -1;
+    PS3_KNOB(use_mips, ps3_env_int("RSX_TEX_MIPS", 1) != 0);
+    rsx_tex_level lvl[RSX_MAX_TEXTURE_LEVELS];
+    u32 nlv = 1;
+    if (use_mips && mips > 1 && !(fmt & 0x20)) {
+        nlv = rsx_texture_mip_chain(fmt, w, h, mips, 0, lvl);
+        if (dxt)
+            for (u32 l = 1; l < nlv; l++)
+                if ((lvl[l].w & 3u) || (lvl[l].h & 3u)) { nlv = l; break; }
+        if (!nlv) nlv = 1;
+    }
     const u32 key_off = off;         /* lookup key: the offset as bound */
     /* The guest bytes the texture can read, its faces and mips included
      * (a level's chain is under twice its first level): the last batch's
@@ -617,6 +640,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         VPTexSlot* c = &s_d3d.vp_tex[i];
         {
             if (c->used) return i;                /* already bound this frame */
+            if (c->lv != nlv) { slot = i; break; } /* RSX_TEX_MIPS changed: redo */
             { static int nocache = -1;            /* TEX_NOCACHE=1 (live): always re-upload */
               PS3_KNOB(nocache, ps3_env_int("TEX_NOCACHE", 0));
               if (nocache) { slot = i; break; } }
@@ -759,20 +783,34 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * dst_row_bytes -- w * bpp is the source row, which is narrower for any
      * format rsx_texture_decode unpacks. */
     u32 pitch = (tl.dst_row_bytes + 255) & ~255u;
+    /* Where each level goes in a face's part of the upload buffer: level 0
+     * first, as before, and each level after it at a 512-byte boundary, which
+     * a placed footprint's offset must be on. One level: face_dst is the old
+     * face stride. */
+    u64 lvl_at[RSX_MAX_TEXTURE_LEVELS];
+    u32 lvl_pitch[RSX_MAX_TEXTURE_LEVELS];
+    u64 face_dst = (u64)pitch * (dxt ? blkrows : h);
+    lvl_at[0] = 0; lvl_pitch[0] = pitch;
+    for (u32 l = 1; l < nlv; l++) {
+        lvl_at[l] = (face_dst + 511u) & ~511ull;
+        lvl_pitch[l] = (lvl[l].tl.dst_row_bytes + 255u) & ~255u;
+        face_dst = lvl_at[l] + (u64)lvl_pitch[l] * lvl[l].tl.rows;
+    }
+    if (nlv > 1) face_dst = (face_dst + 511u) & ~511ull;
     int fresh = 0;
 
     /* Also recreate when the CUBE-ness changes: a slot holding a 2D texture of
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (GPU_VALID(t->tex) && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube))
+    if (GPU_VALID(t->tex) && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->lv != nlv))
         tex_res_release(t);
     if (!GPU_VALID(t->tex)) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
         td.width = w; td.height = h;
         td.layers = cube ? 6 : 1;   /* cube = 6 array slices */
-        td.mips = 1;
+        td.mips = (uint16_t)nlv;
         td.format = (gpu_format)dxfmt; td.samples = 1;
         td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COPY_DEST;
@@ -782,7 +820,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     }
 
     gpu_buffer up = {0}; u64 up_at = 0;
-    void* mapped = tex_stage_alloc_buf((u64)pitch * (dxt ? blkrows : h) * (cube ? 6 : 1), &up, &up_at);
+    void* mapped = tex_stage_alloc_buf(face_dst * (cube ? 6 : 1), &up, &up_at);
     if (!mapped) {
         /* A fresh resource has never been through the copy below, so it
          * would be left in COPY_DEST: drop it and try again next frame. */
@@ -832,12 +870,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         for (u32 _i = 0; _i < _face_bytes; _i += 97) _s = _s*131 + _p[_i];
         fprintf(stderr, "[CUBEFACE] f=%u off=0x%X bytes=%u bpp=%u swz=%d csum=%08X%c",
                 _f, off, _face_bytes, bpp, swz, _s, 10); }
-    mapped = _map0 + (u64)_f * pitch * _face_rows;
+    mapped = _map0 + (u64)_f * face_dst;
     /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
      * semantics and lives in rsx_texture_layout.c, so a second backend gets
      * it by calling this rather than porting the loops again. */
     rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
                        rsx_texture_argb_is_rgba());
+    for (u32 l = 1; l < nlv; l++)   /* the levels below, each packed after the last */
+        rsx_texture_decode((u8*)mapped + lvl_at[l], lvl_pitch[l], vm_base + off + lvl[l].offset,
+                           lvl[l].w, lvl[l].h, &lvl[l].tl, rsx_texture_argb_is_rgba());
 
     /* The diagnostics below only apply to the linear 8-bit case (Bink video
      * planes); they used to sit inside that branch of the conversion. */
@@ -987,7 +1028,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                 hd[26]=1; hd[28]=24;
                 fwrite(hd, 1, 54, f);
                 for (int y = (int)h - 1; y >= 0; y--) {
-                    const u8* srow = _map0 + (u64)_face * pitch * _face_rows
+                    const u8* srow = _map0 + (u64)_face * face_dst
                                      + (u64)y * pitch;
                     for (u32 x = 0; x < w; x++) {
                         u8 px[3];
@@ -1109,11 +1150,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     fp.width     = w;
     fp.height    = h;
     fp.depth     = 1;
-    fp.row_pitch = pitch;
-    for (u32 _f = 0; _f < _nfaces; _f++) {    /* cube face = array slice */
-        fp.offset = up_at + (u64)_f * pitch * _face_rows;
-        gpu_cmd_copy_buf_to_tex(s_rc_cmd, t->tex, _f, 0, 0, 0, up, &fp);
-    }
+    for (u32 _f = 0; _f < _nfaces; _f++)      /* cube face = array slice */
+        for (u32 l = 0; l < nlv; l++) {         /* subresource: level + face * levels */
+            fp.width     = l ? lvl[l].w : w;
+            fp.height    = l ? lvl[l].h : h;
+            fp.row_pitch = lvl_pitch[l];
+            fp.offset    = up_at + (u64)_f * face_dst + lvl_at[l];
+            gpu_cmd_copy_buf_to_tex(s_rc_cmd, t->tex, l + _f * nlv, 0, 0, 0, up, &fp);
+        }
     gpu_cmd_barrier(s_rc_cmd, t->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
     /* SRV at heap slot VP_TEX_SRV_BASE+slot */
     gpu_view_desc sv;
@@ -1121,7 +1165,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     sv.texture = t->tex;
     sv.kind = GPU_VIEW_SRV;
     sv.dim = cube ? GPU_DIM_CUBE : GPU_DIM_2D;   /* a cube must match the TextureCube declaration in the HLSL */
-    sv.mips = 1;
+    sv.mips = (u8)nlv;
     sv.format = (gpu_format)dxfmt;
     /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
      * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
@@ -1133,7 +1177,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     if (t->key != key_off || t->w != w || t->h != h || t->fmt != fmt || t->cube != cube)
         s_vp_tex_index_dirty = 1;
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
-    t->cube = cube; t->used = 1; t->face_bytes = _face_bytes;
+    t->cube = cube; t->used = 1; t->face_bytes = _face_bytes; t->lv = nlv;
     tcj_order_add(slot);
     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
       t->csum = TEX_CSUM(vm_base + off, nb);
