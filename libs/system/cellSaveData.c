@@ -102,13 +102,39 @@ static int file_sync(FILE* fp)
 #endif
 }
 
+/* Whether the Windows file call that just failed met another program's hold
+ * on the file. A virus scanner, or a folder's sync client, opens a file the
+ * moment it is written, to read it; until it lets go, Windows refuses a rename
+ * onto it or of it as a file in use (sharing or lock violation) or as access
+ * denied. On a player's PC with Avast every save failed on its first file,
+ * ICON0.PNG, while PARAM.SFO, written the same way just before, went through;
+ * Demon's Souls then calls the save corrupted. POSIX renames never meet such
+ * a hold, so nothing is held there. */
+static int save_file_held(void)
+{
+#ifdef _WIN32
+    const DWORD e = GetLastError();
+    return e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION || e == ERROR_ACCESS_DENIED;
+#else
+    return 0;
+#endif
+}
+
 /* Replace `dst` with `tmp`, a written and synced file, and put the rename on
- * the disk before returning. Until then the old file is the one that stays. */
+ * the disk before returning. Until then the old file is the one that stays.
+ * A hold by another program (save_file_held) is waited out, as RPCS3's rename
+ * does (vfs::host::rename): 1, 2, 4 ... 512 ms between tries, then 1 s, about
+ * 2 s in all. A rename that is still refused leaves the reason in
+ * GetLastError for the caller. */
 static int file_replace(const char* tmp, const char* dst, const char* dir)
 {
 #ifdef _WIN32
     (void)dir;
-    return MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
+    for (unsigned i = 0;; i++) {
+        if (MoveFileExA(tmp, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return 0;
+        if (i == 11 || !save_file_held()) return -1;
+        Sleep(i < 10 ? 1u << i : 1000u);
+    }
 #else
     if (rename(tmp, dst) != 0) return -1;
     const int fd = open(dir, O_RDONLY);   /* the folder's entry for it */
@@ -135,6 +161,79 @@ static const char* savedata_os_error(char* buf, size_t n, int win32)
     snprintf(buf, n, "%s (errno %d)", strerror(e), e);
 #endif
     return buf;
+}
+
+/* Write `n` bytes of `buf` into `path` at `off`, opened with `mode`, and put
+ * them on the disk. "r+b" (a title's write that keeps the rest of the file)
+ * makes the file when there is none. NULL when done; otherwise the step that
+ * failed, with the system's reason in `why` and, in *held, whether the open
+ * met another program's hold on the file (save_file_held). */
+static const char* save_write_file(const char* path, const char* mode, u32 off, const void* buf, size_t n,
+                                   char* why, size_t wn, int* held)
+{
+    *held = 0;
+    FILE* fp = fopen(path, mode);
+    if (!fp && mode[0] == 'r') fp = fopen(path, "wb");
+    if (!fp) {
+        *held = save_file_held();
+        savedata_os_error(why, wn, 0);
+        return "the open";
+    }
+    if (off > 0) {
+#ifdef _MSC_VER
+        _fseeki64(fp, (long long)off, SEEK_SET);
+#else
+        fseeko(fp, (off_t)off, SEEK_SET);
+#endif
+    }
+    const char* step = NULL;
+    if (fwrite(buf, 1, n, fp) != n) step = "the write";
+    else if (file_sync(fp) != 0) step = "the flush to the disk";
+    if (step) savedata_os_error(why, wn, 0);
+    if (fclose(fp) != 0 && !step) { step = "the close"; savedata_os_error(why, wn, 0); }
+    return step;
+}
+
+/* A whole file: written to `tmp` beside it, synced, then swapped in for `path`
+ * (file_replace), so a crash, a full disk or a power cut at any point leaves
+ * the old file whole or the new one, never a short or zeroed one (an
+ * autosave's character data). When another program's hold still refuses the
+ * temp file's open or the swap after file_replace's waits, every save would
+ * fail the same way, so the file is written in place instead, as a title's
+ * partial write is: only a crash during that one write can then leave it
+ * short. A write that fails for any other reason (a full disk) leaves the old
+ * file as it was. Each failure is logged, `what` first. 0 when written, -2
+ * when another program refused the file both ways, -1 for any other failure. */
+static int save_replace_file(const char* what, const char* path, const char* tmp, const char* dir,
+                             const void* buf, size_t n)
+{
+    char why[160];
+    int held = 0;
+    const char* step = save_write_file(tmp, "wb", 0, buf, n, why, sizeof why, &held);
+    const char* where = tmp;
+    if (!step && file_replace(tmp, path, dir) != 0) {
+        step = "the replace";
+        where = path;
+        held = save_file_held();
+        savedata_os_error(why, sizeof why, 1);
+    }
+    if (!step) return 0;
+    if (where == path || strcmp(step, "the open")) remove(tmp);   /* (one this made; not what a failed open met) */
+    if (!held) {
+        printf("[cellSaveData] %s: %s of '%s' failed, old file kept: %s\n", what, step, where, why);
+        return -1;
+    }
+    char why2[160], other[1100] = "";
+    if (where != path) snprintf(other, sizeof other, " as '%s'", path);
+    const char* step2 = save_write_file(path, "wb", 0, buf, n, why2, sizeof why2, &held);
+    if (!step2) {
+        printf("[cellSaveData] %s: %s of '%s' was refused (%s), so it was written in place%s\n",
+               what, step, where, why, other);
+        return 0;
+    }
+    printf("[cellSaveData] %s: %s of '%s' was refused (%s), and in place%s %s failed%s: %s\n",
+           what, step, where, why, other, step2, strcmp(step2, "the open") ? "" : ", old file kept", why2);
+    return held && !strcmp(step2, "the open") ? -2 : -1;
 }
 
 /* A save directory name the title gives: one name that fits, no separators,
@@ -786,56 +885,44 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
                    savedata_os_error(why, sizeof why, 0));
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
-        /* A whole-file write goes to ".<name>.tmp", which is synced and then
-         * replaces the file, so a crash, a full disk or a power cut at any
-         * point leaves the old file whole or the new one, never a short or
-         * zeroed one (an autosave's character data). The listing skips names
-         * starting with '.', so a leftover is never shown. */
-        const int whole = set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0;
-        char tmp_path[1024 + 8];
-        snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.tmp", save_path, name);
-#ifdef _WIN32
-        for (char* p = tmp_path; *p; p++) {
-            if (*p == '/') *p = '\\';
-        }
-#endif
-        FILE* fp = whole ? fopen(tmp_path, "wb") : fopen(file_path, "r+b");
-        if (!fp && !whole) {
-            fp = fopen(file_path, "wb");
-        }
-        if (!fp) {
-            printf("[cellSaveData] file write: cannot open '%s': %s\n", whole ? tmp_path : file_path,
-                   savedata_os_error(why, sizeof why, 0));
-            return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
-        }
-        if (set->fileOffset > 0) {
-#ifdef _MSC_VER
-            _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
-#else
-            fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
-#endif
-        }
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
-        size_t wrote = fwrite(set->fileBuf, 1, write_size, fp);
-        const char* step = NULL;
-        if (wrote != write_size) step = "the write";
-        else if (file_sync(fp) != 0) step = "the flush to the disk";
-        if (step) savedata_os_error(why, sizeof why, 0);
-        if (fclose(fp) != 0 && !step) { step = "the close"; savedata_os_error(why, sizeof why, 0); }
-        if (whole && !step && file_replace(tmp_path, file_path, save_path) != 0) {
-            step = "the replace";
-            savedata_os_error(why, sizeof why, 1);
-        }
-        int failed = step != NULL;
-        if (failed) {
-            if (whole) remove(tmp_path);
-            printf("[cellSaveData] file write: %s of '%s' failed%s: %s\n", step, file_path,
-                   whole ? ", old file kept" : "", why);
+        int failed;
+        if (set->fileOperation == CELL_SAVEDATA_FILEOP_WRITE && set->fileOffset == 0) {
+            /* A whole file goes through ".<name>.tmp" (save_replace_file). The
+             * listing skips names starting with '.', so a leftover is never
+             * shown. */
+            char tmp_path[1024 + 8];
+            snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.tmp", save_path, name);
+#ifdef _WIN32
+            for (char* p = tmp_path; *p; p++) {
+                if (*p == '/') *p = '\\';
+            }
+#endif
+            const int rc = save_replace_file("file write", file_path, tmp_path, save_path, set->fileBuf, write_size);
+            failed = rc != 0;
+            /* The picture, icon and sound the PS3's own menus show for a save
+             * are not the title's data: Demon's Souls loads its save without
+             * ICON0.PNG and PIC1.PNG. One that another program refuses outright
+             * (a virus scanner that guards pictures) is left out, and the save
+             * goes on; failing the whole save for it gets the save called
+             * corrupted, again and again. */
+            if (rc == -2 && set->fileType != CELL_SAVEDATA_FILETYPE_SECUREFILE &&
+                set->fileType != CELL_SAVEDATA_FILETYPE_NORMALFILE) {
+                printf("[cellSaveData] file write: '%s' is left out of the save; the title's own files go on\n",
+                       file_path);
+                failed = 0;
+            }
+        } else {
+            int held;
+            const char* step = save_write_file(file_path, "r+b", set->fileOffset, set->fileBuf, write_size,
+                                               why, sizeof why, &held);
+            if (step) printf("[cellSaveData] file write: %s of '%s' failed: %s\n", step, file_path, why);
+            failed = step != NULL;
         }
         if (!failed && set->fileType == CELL_SAVEDATA_FILETYPE_SECUREFILE)
             pfd_add(save_path, name);
-        return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)wrote;
+        return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)write_size;
     }
 
     case CELL_SAVEDATA_FILEOP_DELETE:
@@ -865,35 +952,17 @@ static int write_param_sfo(const char* save_path, const CellSaveDataSystemFilePa
     }
 #endif
 
-    /* Written beside it and swapped in, as the files are (process_file_op). */
-    char why[160];
-    FILE* fp = fopen(tmp_path, "wb");
-    if (!fp) {
-        printf("[cellSaveData] PARAM.SFO: cannot open '%s': %s\n", tmp_path,
-               savedata_os_error(why, sizeof why, 0));
-        return -1;
-    }
-
-    /* Write a simplified text-based PARAM.SFO for easy debugging.
-       Games don't read this directly - our stat callback fills it from here. */
-    fprintf(fp, "TITLE=%s\n", param->title);
-    fprintf(fp, "SUB_TITLE=%s\n", param->subTitle);
-    fprintf(fp, "DETAIL=%s\n", param->detail);
-    fprintf(fp, "ATTRIBUTE=%u\n", param->attribute);
-    fprintf(fp, "LIST_PARAM=%s\n", param->listParam);
-    const char* step = NULL;
-    if (ferror(fp)) step = "the write";
-    else if (file_sync(fp) != 0) step = "the flush to the disk";
-    if (step) savedata_os_error(why, sizeof why, 0);
-    if (fclose(fp) != 0 && !step) { step = "the close"; savedata_os_error(why, sizeof why, 0); }
-    if (!step && file_replace(tmp_path, sfo_path, save_path) != 0) {
-        step = "the replace";
-        savedata_os_error(why, sizeof why, 1);
-    }
-    if (!step) return 0;
-    remove(tmp_path);
-    printf("[cellSaveData] PARAM.SFO: %s of '%s' failed: %s\n", step, sfo_path, why);
-    return -1;
+    /* A simplified text-based PARAM.SFO for easy debugging. Games don't read
+     * this directly - our stat callback fills it from here. Written beside it
+     * and swapped in, as the files are (save_replace_file). */
+    char text[2048];   /* (the fields' sizes and the names: at most about 1350) */
+    const int len = snprintf(text, sizeof text,
+                             "TITLE=%.*s\nSUB_TITLE=%.*s\nDETAIL=%.*s\nATTRIBUTE=%u\nLIST_PARAM=%.*s\n",
+                             (int)sizeof param->title, param->title, (int)sizeof param->subTitle, param->subTitle,
+                             (int)sizeof param->detail, param->detail, param->attribute,
+                             (int)sizeof param->listParam, param->listParam);
+    if (len < 0 || (size_t)len >= sizeof text) return -1;
+    return save_replace_file("PARAM.SFO", sfo_path, tmp_path, save_path, text, (size_t)len);
 }
 
 /* Read simplified PARAM.SFO */

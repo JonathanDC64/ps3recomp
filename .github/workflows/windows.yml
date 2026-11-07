@@ -303,6 +303,18 @@ jobs:
           .\test_vfs_path.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # A save file that another program holds (a virus scanner or a sync
+      # client reading it the moment it is written): the swap of its temp file
+      # waits the hold out, a longer one gets the file written in place, and a
+      # save's picture refused outright is left out (cellSaveData.c).
+      - name: Run the held save file test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_savedata_held.exe libs/system/tests/test_savedata_held.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_savedata_held.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # A host stick to the PS3's axis bytes: the radial deadzone and RPCS3's
       # squircling (pad_stick.h), on directions, lengths and the deadzone's edge.
       - name: Run the stick conversion test
