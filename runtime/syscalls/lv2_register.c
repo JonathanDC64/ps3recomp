@@ -720,6 +720,20 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    /* libsynth2's synth: the one thread of the group the SDK names "_synth2
+     * Group" mixes every voice of the title's sound engine, which waits on it
+     * each round with the next block due (Demon's Souls: about 47 rounds a
+     * second). Behind the title's busy threads its replies came late, the
+     * mixer fell behind and the sound looped (#403). Two steps up, as
+     * libmixer's threads are (sys_ppu_thread.c). SPU_SYNTH_RAISE=0 leaves it
+     * at normal priority. */
+    { static int lv = -1;
+      PS3_KNOB(lv, ps3_env_int("SPU_SYNTH_RAISE", 2));
+      const spu_group_t* g = lv > 0 ? spu_find_group(t->group_id) : NULL;
+      if (g && strcmp(g->name, "_synth2 Group") == 0) {
+          ps3_host_raise_current(lv > 1 ? 2 : 1);
+          fprintf(stderr, "[SPU] libsynth2's synth (thread 0x%X) %s up%c", t->tid, lv > 1 ? "two steps" : "one step", 10);
+      } }
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     /* Out of the lock-line reserver set on this thread, the only one that can
