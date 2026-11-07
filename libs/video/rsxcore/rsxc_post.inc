@@ -35,7 +35,8 @@
  * every batch.
  * -----------------------------------------------------------------------*/
 #include "rsx_fxaa.h"
-#define AA_SRV_SLOT  21   /* SRV heap: the pass's source (slots 21-31 were spare) */
+/* The pass's source descriptor: this batch's half's (rsxc_state.inc). */
+static u32 aa_srv(void) { return POST_SRV_AA + s_rf_par; }
 #define AA_MIN_SCENE 16   /* depth-tested draws into T that make a 3D frame */
 #define AA_FP_MAX    8
 #define AA_LOG_MAX   100  /* change lines per run at RSX_AA_LOG=1 */
@@ -147,15 +148,15 @@ static void aa_target(gpu_view rtv)
 /* One pass: src (a copy of the target in format fmt, RGBA8 or FP16, in
  * PIXEL_SHADER_RESOURCE) filtered into the target behind rtv, w x h, in
  * RENDER_TARGET. Binds its own root signature, pipeline, target, viewport and
- * topology; the shader-visible heap must be srv_heap. The backend waits for
- * the GPU before each batch, so the one descriptor at AA_SRV_SLOT is free to
- * rewrite. src is the copy's handle (step C4: the SRV pool's write). On the
- * frame's recorder (step C6): rtv is the target's view, the table the SRV
- * pool's at AA_SRV_SLOT. */
+ * topology; the shader-visible heap must be srv_heap. The source descriptor
+ * is this batch's half's (aa_srv), which the GPU finished with before the
+ * batch started, so it is free to rewrite. src is the copy's handle (step
+ * C4: the SRV pool's write). On the frame's recorder (step C6): rtv is the
+ * target's view, the table the SRV pool's at aa_srv. */
 static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     gpu_cmd* const c = s_rc_cmd;
-    srv_write(AA_SRV_SLOT, src, fmt, GPU_SWIZZLE_IDENTITY);
+    srv_write(aa_srv(), src, fmt, GPU_SWIZZLE_IDENTITY);
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
     const gpu_viewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
     const gpu_rect sc = {0, 0, (int32_t)w, (int32_t)h};
@@ -164,7 +165,7 @@ static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
     gpu_cmd_set_scissor(c, &sc);
     gpu_cmd_set_layout(c, s_aa.layout);
     gpu_cmd_set_pipeline(c, fmt == GPU_FORMAT_R16G16B16A16_FLOAT ? s_aa.pso16 : s_aa.pso);
-    gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_srv_pool, AA_SRV_SLOT));
+    gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_srv_pool, aa_srv()));
     gpu_cmd_push_const(c, 1, 4, k, 0);
     gpu_cmd_set_topology(c, GPU_TOPO_TRIANGLELIST);
     gpu_cmd_draw(c, 3, 1, 0, 0);
@@ -173,7 +174,7 @@ static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 /* SMAA 1x (RSX_AA=2): the three passes of rsx_smaa.h in place of aa_draw's
  * one. The lookup textures (AreaTex, SearchTex) are uploaded once; the edges
  * (R8G8) and weights (RGBA8) targets follow the size asked for. Descriptors,
- * all written again each run: SMAA_SRV_SLOT + 0 the colour, + 1 the weights,
+ * all written again each run: smaa_srv() + 0 the colour, + 1 the weights,
  * + 3 the edges, + 4 AreaTex, + 5 SearchTex (+ 2 stays the pool's null). A
  * pass's t0-t2 is a window of three of them: the edge and blend passes'
  * starts at + 0, the weight pass's at + 3. So no window holds the target
@@ -183,7 +184,8 @@ static void aa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 #include "rsx_smaa_src.h"
 #include "../../third_party/smaa/AreaTex.h"
 #include "../../third_party/smaa/SearchTex.h"
-#define SMAA_SRV_SLOT 22   /* SRV heap slots 22-27, after AA_SRV_SLOT */
+/* SMAA's six descriptors: this batch's half's (rsxc_state.inc), as aa_srv. */
+static u32 smaa_srv(void) { return POST_SRV_SMAA + 6u * s_rf_par; }
 
 static struct {
     gpu_layout            layout;      /* (step C3b) */
@@ -378,18 +380,19 @@ static int smaa_targets(u32 w, u32 h)
 /* SMAA's three passes: src (as aa_draw's) into the target behind rtv, w x h,
  * in RENDER_TARGET. Needs smaa_targets(w, h) and smaa_luts_load() first. On
  * the frame's recorder (step C6): the tables are the SRV pool's windows at
- * SMAA_SRV_SLOT and SMAA_SRV_SLOT + 3 (its regions of three). */
+ * smaa_srv() and smaa_srv() + 3 (its region of threes). */
 static void smaa_draw(gpu_texture src, gpu_format fmt, gpu_view rtv, u32 w, u32 h)
 {
     gpu_cmd* const c = s_rc_cmd;
     const u32 map = GPU_SWIZZLE_IDENTITY;
-    srv_write(SMAA_SRV_SLOT + 0, src, fmt, map);
-    srv_write(SMAA_SRV_SLOT + 1, s_smaa.weights_tex, GPU_FORMAT_R8G8B8A8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 3, s_smaa.edges_tex, GPU_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 4, s_smaa.area_tex, GPU_FORMAT_R8G8_UNORM, map);
-    srv_write(SMAA_SRV_SLOT + 5, s_smaa.search_tex, GPU_FORMAT_R8_UNORM, map);
-    const gpu_table g0 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT);
-    const gpu_table g3 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, SMAA_SRV_SLOT + 3);
+    const u32 at = smaa_srv();
+    srv_write(at + 0, src, fmt, map);
+    srv_write(at + 1, s_smaa.weights_tex, GPU_FORMAT_R8G8B8A8_UNORM, map);
+    srv_write(at + 3, s_smaa.edges_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(at + 4, s_smaa.area_tex, GPU_FORMAT_R8G8_UNORM, map);
+    srv_write(at + 5, s_smaa.search_tex, GPU_FORMAT_R8_UNORM, map);
+    const gpu_table g0 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, at);
+    const gpu_table g3 = gpu_table_ref(s_rc_dev, s_rc_srv_pool, at + 3);
     const float k[4] = {1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h};
     const gpu_viewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
     const gpu_rect sc = {0, 0, (int32_t)w, (int32_t)h};

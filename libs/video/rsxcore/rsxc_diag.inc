@@ -542,6 +542,7 @@ static void rsx_scale_apply(void)
 {
     const u32 want = rsx_scale_wanted();
     if (want == rsx_scale_pct()) return;
+    wb_store_all();   /* the GPU idle and every write-back stored before the targets go */
     s_scale_pct = want;
     printf("[D3D12] RSX_SCALE: render targets at %u%%%c", want, 10);
     for (int i = 0; i < MAX_OFF_RTS; i++) {

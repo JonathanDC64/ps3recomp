@@ -653,8 +653,15 @@ static u32 samp_key_slot(const u32* k)
  * texture's function table when it meets a new sampler, with no lock against
  * its running draws (llvmpipe_register_sampler), and a draw then reads one
  * texture with another's function and size, and faults. So a table new to the
- * session waits for the parts first: rare, and with no split nothing runs here. */
+ * session waits for the GPU first (#241): rare. */
 static int s_split_running;
+
+/* Can draws run on the GPU while this batch records? A part of it was
+ * submitted, or the last batch is not done yet (RSX_FRAMES_IN_FLIGHT). */
+static int gpu_draws_may_run(void)
+{
+    return s_split_running || !batch_done(s_rf_par ^ 1u);
+}
 static u32 s_samp_wr;   /* sampler tables written so far (RSX_SAMP_SAME) */
 
 /* The table holding dr's sampler key, made or rewritten when none does; ~0
@@ -692,7 +699,7 @@ static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UN
     }
     for (u32 i = 0; i < s_d3d.samp_n; i++)
         if (!memcmp(keys[i], k, sizeof k)) { last[i] = now; hint[hs] = (u16)(i + 1); return i; }
-    if (s_split_running) { s_split_running = 0; wait_for_gpu(); }
+    if (gpu_draws_may_run()) { s_split_running = 0; wait_for_gpu(); }
     u32 t;
     if (s_d3d.samp_n < cap) {
         t = s_d3d.samp_n++;
@@ -832,9 +839,10 @@ static void vp_bind_sampler_table(const D3D12DrawRecord* dr)
 /* The grave (step C8a: the one deferred-destroy list; step C5a's and step
  * C5b's write-back grave were two). Textures and buffers dropped while a
  * frame is being recorded may still be used by that frame's list: they wait
- * here, and at the next render_frame's start, after its opening wait
- * (rc_grave_release), each goes to gpu_*_destroy with the fence of the last
- * frame submitted, which the GPU layer frees it after. One dropped while a
+ * here, and at the next render_frame's start (rc_grave_release), each goes
+ * to gpu_*_destroy with the fence of the last frame submitted, which the GPU
+ * layer frees it after (the GPU may still run that frame:
+ * RSX_FRAMES_IN_FLIGHT). One dropped while a
  * frame is recorded was last used by that frame, and one dropped before
  * (rsx_scale_apply) by an earlier one. A texture's views go with it. Grows
  * as needed: a frame that flips a surface between two formats draw by draw
@@ -898,13 +906,20 @@ static void rc_grave_tex(gpu_texture* t)
 }
 
 /* An offscreen target and its init staging, dropped (step C5a): the handles
- * go into the grave, and the RTV is cleared. */
+ * go into the grave, and the RTV is cleared. The last batch's write-back of
+ * it is stored first (wb_land_target), as it was when every batch started
+ * with a drain: the guest memory is the title's again, and a new target
+ * there starts from it (Demon's Souls's exposure: off_rt_get's format
+ * change). */
 static void off_rt_drop_target(OffRT* r)
 {
+    wb_land_target((int)(r - s_d3d.off_rt));
     rc_grave_put(r->tex, r->up_buf);
     r->tex.id = 0;
     r->up_buf.id = 0;
     r->rtv.id = 0;
+    r->gen++;   /* (none of its write-backs is queued but this batch's own, recorded later) */
+    r->wb_queued = 0;
 }
 
 static int off_rt_find(u32 off)
@@ -1107,6 +1122,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         u32 src = cellGcmResolveOffset(off);
         u8* wide = (hw != w) ? (u8*)malloc((size_t)w * bpp) : NULL;
         if (vm_base && src != 0xFFFFFFFFu) {
+            wb_land_range(src, (u64)w * h * sbpp);   /* the last batch's write-backs there first */
             /* The staging: a GPU layer upload buffer, mapped for its life
              * (step C5a). */
             gpu_buffer_desc bd;

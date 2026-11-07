@@ -236,6 +236,10 @@ static void rc_be_presented(gpu_device* d)
  * when nothing is presented). FRAME_COUNT is the core's: defined below it. */
 static u32 rc_be_frame_slot(u32 prev, u32 image);
 
+/* Frames in flight by default (RSX_FRAMES_IN_FLIGHT, rsxc_sync.inc): on Linux
+ * the GPU's frame was the render thread's longest wait (2026-11-06). */
+static int rc_be_frames_in_flight(void) { return 1; }
+
 #include "rsxc_core.inc"
 
 static u32 rc_be_frame_slot(u32 prev, u32 image)

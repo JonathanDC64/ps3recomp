@@ -31,10 +31,10 @@ static void frame_slot_wait(u32 slot)
 /* Recording on a frame slot's recorder (the GPU layer's, one allocator and
  * list per slot): today's allocator and list Reset. s_rc_cmd is the recorder
  * every command goes to (step C8a: there is no native list beside it). The
- * slot's last frame is done first: after render_frame's opening wait_for_gpu
- * that is a read of the fence, but a repaint opens the slot right after a
- * present, and a slot the present did not move on from is still in flight
- * (move_to_next_frame waits only for its use before). */
+ * slot's last frame is done first: move_to_next_frame waited for it, so that
+ * is normally a read of the fence, but a repaint opens the slot right after
+ * a present, and a slot the present did not move on from may still be in
+ * flight (move_to_next_frame waits only for its use before). */
 static void frame_cmd_begin(u32 slot)
 {
     frame_slot_wait(slot);
@@ -270,18 +270,18 @@ static int init_d3d12(u32 width, u32 height)
          * root signature binds t0-t3) is valid on tier-1 hardware. */
         /* The GPU layer's table pool, its entries made as these R8_UNORM
          * null SRVs (step C4). The regions name its tables for Vulkan: the
-         * per-draw windows, the AA source (AA_SRV_SLOT, rsxc_post.inc) and
-         * SMAA's two 3-wide windows (SMAA_SRV_SLOT + 0 and + 3). */
+         * per-draw windows, the AA source (POST_SRV_AA, a table per half)
+         * and SMAA's 3-wide windows (POST_SRV_SMAA: two per half). */
         {
+            s_draw_srv_sets = frames_in_flight_on() ? 2u : 1u;   /* (the windows' sets: draw_srv) */
             gpu_table_pool_desc pd;
             memset(&pd, 0, sizeof pd);
             pd.kind = GPU_TABLE_TEX;
             pd.count = SRV_HEAP_SIZE;
-            pd.nregions = 4;
-            pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
-            pd.region[1].first = 21; pd.region[1].tables = 1; pd.region[1].size = 1;
-            pd.region[2].first = 22; pd.region[2].tables = 1; pd.region[2].size = 3;
-            pd.region[3].first = 25; pd.region[3].tables = 1; pd.region[3].size = 3;
+            pd.nregions = 3;
+            pd.region[0].first = DRAW_SRV_BASE; pd.region[0].tables = DRAW_SRV_SETS * MAX_DRAWS; pd.region[0].size = RSX_FP_UNITS;
+            pd.region[1].first = POST_SRV_AA; pd.region[1].tables = 2; pd.region[1].size = 1;
+            pd.region[2].first = POST_SRV_SMAA; pd.region[2].tables = 4; pd.region[2].size = 3;
             s_rc_srv_pool = gpu_table_pool_create(s_rc_dev, &pd);
             if (!GPU_VALID(s_rc_srv_pool)) printf("[D3D12] SRV heap creation failed\n");
             else s_rc_srv_w = gpu_table_writer_get(s_rc_dev, s_rc_srv_pool);

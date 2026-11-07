@@ -826,6 +826,13 @@ if(PS3RECOMP_RSX_HAL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     )
     set_target_properties(test_rsx_synth PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME rsx_synth COMMAND test_rsx_synth)
+    # The same with the null GPU a batch behind (GPU_NULL_LAG=1): what the core writes or frees while the last
+    # batch may still run must wait for it (RSX_FRAMES_IN_FLIGHT). No goldens; every other check.
+    add_test(NAME rsx_synth_lag COMMAND test_rsx_synth --lag 1 --out test_rsx_synth_lag.out)
+    # The same without frames in flight, as the D3D12 route runs: one set of the per-draw windows and one texture
+    # staging and readback buffer, reused by every batch after the drain at its start (rsxc_sync.inc's s_rf_buf).
+    add_test(NAME rsx_synth_lag_off COMMAND test_rsx_synth --lag 1 --env RSX_FRAMES_IN_FLIGHT=0
+             --out test_rsx_synth_lag_off.out)
 
     # The route switch's choice (libs/video/rsx_out.c: RSX_BACKEND, the starts that fall back, Vulkan's to the
     # default and the new path's D3D12 to the legacy renderer, and Vulkan's start mark), built here against

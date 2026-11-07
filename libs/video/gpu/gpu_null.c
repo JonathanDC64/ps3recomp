@@ -3360,11 +3360,14 @@ static gpu_fence nl_signal(gpu_device* d)
     return do_signal(GPU_NULL_DEV(d));
 }
 
-/* Any thread. A lost device reads UINT64_MAX, as D3D12's fences do. */
+/* Any thread. A lost device reads UINT64_MAX, as D3D12's fences do. With a
+ * lag (gpu_null_test_lag) it reads that many signals short of the last, as a
+ * GPU still running the latest work would: only a wait sees that work pass. */
 static uint64_t nl_fence_completed(gpu_device* d)
 {
     gpu_null_device* const nd = GPU_NULL_DEV(d);
-    const uint64_t f = at_load32(&nd->lost) ? UINT64_MAX : at_load64(&nd->fence);
+    const uint64_t last = at_load64(&nd->fence), lag = at_load64(&nd->lag);
+    const uint64_t f = at_load32(&nd->lost) ? UINT64_MAX : last > lag ? last - lag : 0;
     at_max64(&nd->seen, f);
     return f;
 }
@@ -3775,6 +3778,8 @@ gpu_device* gpu_null_create(const gpu_device_desc* desc)
     }
     const char* dump = getenv("GPU_NULL_DUMP");
     if (dump && dump[0]) gpu_null_dump(&nd->base, dump);
+    const char* lag = getenv("GPU_NULL_LAG");
+    if (lag && lag[0]) gpu_null_test_lag(&nd->base, (uint32_t)strtoul(lag, NULL, 10));
     return &nd->base;
 }
 
@@ -3838,6 +3843,11 @@ void gpu_null_counts_get(gpu_device* d, gpu_null_counts* out)
 void gpu_null_test_lose(gpu_device* d, uint32_t reason)
 {
     at_store32(&GPU_NULL_DEV(d)->lost, reason ? reason : 1u);
+}
+
+void gpu_null_test_lag(gpu_device* d, uint32_t signals)
+{
+    at_store64(&GPU_NULL_DEV(d)->lag, signals);
 }
 
 #endif /* PS3RECOMP_RSX_HAL */

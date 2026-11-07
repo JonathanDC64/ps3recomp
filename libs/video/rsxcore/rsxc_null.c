@@ -147,6 +147,11 @@ static void rc_be_presented(gpu_device* d)
 /* The frame slot after an acquire: the image's index, as on D3D12. */
 static u32 rc_be_frame_slot(u32 prev, u32 image) { (void)prev; return image; }
 
+/* As the Vulkan route (RSX_FRAMES_IN_FLIGHT, rsxc_sync.inc), so CI checks its
+ * waits: with GPU_NULL_LAG the null GPU is behind, and a free, table write
+ * or readback that races the batch still running fails a check. */
+static int rc_be_frames_in_flight(void) { return 1; }
+
 #include "rsxc_core.inc"
 
 #include "rsx_out.h"

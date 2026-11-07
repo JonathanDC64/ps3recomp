@@ -172,8 +172,10 @@ typedef struct {
                                         * RGBA8 target HDR promotes (rt_target_format) */
     gpu_state             st;          /* tracked resource state */
     int                   used;        /* referenced this frame */
-    gpu_buffer            rb_buf;      /* colour write-back readback buffer: the GPU layer's (step C5b) */
-    u64                   rb_size;
+    gpu_buffer            rb_buf[2];   /* colour write-back readback buffers: the GPU layer's (step C5b),
+                                        * one per parity half (a batch's copy waits there for its store);
+                                        * only [0] without frames in flight (s_rf_buf) */
+    u64                   rb_size[2];
     u32                   gfmt, gpitch;/* guest SET_SURFACE_FORMAT word + pitch */
     u32                   gdma;        /* guest context DMA (local / main) */
     gpu_texture           snap_tex;    /* copy sampled by draws that also render here (step C5b) */
@@ -186,14 +188,22 @@ typedef struct {
      * If they differ later, the title put something else there. */
     u32                   gaddr, glen, gsum;
     int                   gsum_ok, gsum_new;
-    u32                   gpu_dst;     /* used == 3: the GPU stored it at this guest address */
-    int                   gpu_check;   /* RSX_WB_GPU=2: the CPU store goes to a scratch copy to compare */
+    u32                   gen;         /* bumped when the target is dropped: a queued write-back of the old one
+                                        * is not stored (WbCopy) */
+    int                   wb_queued;   /* write-back copies of this target recorded, not stored yet */
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..20 hold offscreen-RT SRVs */
 /* Per-draw SRV windows: each VP draw gets RSX_FP_UNITS consecutive descriptors
- * (t0-t15) so multi-unit fragment programs see all their textures. */
+ * (t0-t15) so multi-unit fragment programs see all their textures. One set
+ * of MAX_DRAWS windows per parity half (draw_srv): a batch rewrites its own
+ * while the GPU may still read the last batch's (RSX_FRAMES_IN_FLIGHT).
+ * Without frames in flight, one set (s_rf_buf): s_draw_srv_sets, set by the
+ * init before it makes the pool, so the heap's layout below is decided then. */
 #define DRAW_SRV_BASE 32
+static int frames_in_flight_on(void);   /* (rsxc_sync.inc) */
+static u32 s_draw_srv_sets = 2;
+#define DRAW_SRV_SETS s_draw_srv_sets
 #define VP_SAMP_TABLES (2048 / RSX_FP_UNITS)
                              /* per-draw sampler tables (D3D12 caps a shader-
                               * visible sampler heap at 2048 samplers). When all
@@ -203,8 +213,14 @@ typedef struct {
  * index 1+slot, inside the windows from slot 31 on: once a session had
  * cached that many textures, each new upload rewrote a descriptor of one of
  * the frame's first 63 draws. */
-#define VP_TEX_SRV_BASE (DRAW_SRV_BASE + MAX_DRAWS * RSX_FP_UNITS)
-#define SRV_HEAP_SIZE (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
+#define VP_TEX_SRV_BASE (DRAW_SRV_BASE + DRAW_SRV_SETS * MAX_DRAWS * RSX_FP_UNITS)
+/* The post passes' descriptors (rsxc_post.inc), a set per parity half as
+ * the windows (RSX_FRAMES_IN_FLIGHT: the last batch's AA pass may still read
+ * its set): SMAA's six at POST_SRV_SMAA + 6 * half (its two 3-wide windows),
+ * the AA source at POST_SRV_AA + half. (They were slots 21-27, one set.) */
+#define POST_SRV_SMAA (VP_TEX_SRV_BASE + VP_TEX_SLOTS)
+#define POST_SRV_AA   (POST_SRV_SMAA + 12)
+#define SRV_HEAP_SIZE (POST_SRV_AA + 2)
 
 /* Counts render_frame calls. What one call's pre-pass leaves for its later
  * passes carries this stamp (D3D12DrawRecord.pso, the TEX_CSUM_THREADS sums),

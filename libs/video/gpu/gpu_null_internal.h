@@ -232,6 +232,7 @@ typedef struct gpu_null_device {
     uint64_t        fence;         /* the last value signalled: all of it is done */
     uint64_t        seen;          /* the highest fence the caller has seen pass */
     uint32_t        lost;          /* gpu_null_test_lose's reason */
+    uint64_t        lag;           /* gpu_null_test_lag's: signals fence_completed is behind */
 
     gpu_null_slots  tex_slots, buf_slots, view_slots, samp_slots, shader_slots, layout_slots,
                     qpool_slots, heap_slots, tpool_slots, swap_slots;

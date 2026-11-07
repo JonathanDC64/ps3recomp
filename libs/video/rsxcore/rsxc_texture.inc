@@ -280,20 +280,37 @@ static void tcj_order_add(int i)
     if (s_tcj_order_n < VP_TEX_SLOTS) s_tcj_order[s_tcj_order_n++] = (u16)i;
 }
 
+/* Before a write-back lands in guest memory during the pre-pass
+ * (wb_land_target, wb_land_range): the workers stop, so none reads what it
+ * writes, and as they may have summed it already, none of their sums is used
+ * for the rest of this render_frame. A worker in the job loop finishes its
+ * list first (as in tcj_dispatch). */
+static u32 s_tcj_void_serial;
+static void tcj_stop(void)
+{
+    s_tcj_void_serial = s_rf_serial;
+    AcquireSRWLockExclusive(&s_tcj.lk);
+    s_tcj.n = 0;
+    ReleaseSRWLockExclusive(&s_tcj.lk);
+    while (s_tcj_busy) YieldProcessor();
+}
+
 /* The checksum of slot i's source bytes [off, +nb): a worker's from this
  * render_frame when its job covered the same bytes, else taken here. */
 static u32 tcj_sum(int i, u32 off, u32 nb)
 {
     extern uint8_t* vm_base;
     const u64 pre = (u64)s_tcj_pre[i];
-    if ((u32)(pre >> 32) == s_rf_serial && s_tcj_pre_off[i] == off && s_tcj_pre_nb[i] == nb)
+    if ((u32)(pre >> 32) == s_rf_serial && s_tcj_void_serial != s_rf_serial &&
+        s_tcj_pre_off[i] == off && s_tcj_pre_nb[i] == nb)
         return (u32)pre;
     return tex_csum(vm_base + off, nb);
 }
 
-/* Texture staging: one upload buffer, persistently mapped, that every
- * texture upload of a frame decodes into, from the start again each frame
- * (render_frame waits for the GPU before the pre-pass uploads anything).
+/* Texture staging: an upload buffer per parity half, persistently mapped,
+ * that every texture upload of a frame decodes into, from the start again
+ * each frame (the GPU finished the half's last batch, the one before last,
+ * before this one started: render_frame's end waited for it).
  *
  * Each texture slot used to own an upload buffer of its own. Creating it
  * was half of a texture's first upload: a camera turn in Demon's Souls'
@@ -307,12 +324,15 @@ static u32 tcj_sum(int i, u32 off, u32 nb)
  * 512). TEX_STAGE_MB sets the starting size (default 32).
  *
  * The buffers are the GPU layer's upload buffers, mapped for their life
- * (step C4). One that a frame stops using (a one-off buffer, or the buffer
- * the next frame outgrew) is destroyed at the start of the frame after, once
- * the GPU is idle: when today's off_rt_defer_release let it go. */
-static gpu_buffer      s_ts_buf;
-static u8*             s_ts_map;
-static u64             s_ts_cap, s_ts_off;
+ * (step C4), one per parity half (RSX_FRAMES_IN_FLIGHT: the GPU may still
+ * copy from the last batch's while this one's fill), or one without frames
+ * in flight (s_rf_buf: half 0's, the GPU drained at each batch's start, as
+ * before 2026-11-06; the second half's is never made). One that a frame stops
+ * using (a one-off buffer, or a buffer a later frame outgrew) goes at the
+ * start of the frame after, with the fence of the batch that last read it. */
+static gpu_buffer      s_ts_buf[2];
+static u8*             s_ts_map[2];
+static u64             s_ts_cap[2], s_ts_off;
 static gpu_buffer*     s_ts_grave;   /* destroyed by the next tex_stage_frame */
 static int             s_ts_grave_n, s_ts_grave_cap;
 static gpu_buffer tex_stage_create(u64 bytes, u8** map)
@@ -344,8 +364,9 @@ static void tex_stage_drop(gpu_buffer b)
 static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
 {
     const u64 a = (s_ts_off + 511u) & ~511ull;
+    const u32 h = s_rf_buf;
     s_ts_off = a + bytes;               /* counted either way: next frame's size */
-    if (s_ts_map && a + bytes <= s_ts_cap) { *buf = s_ts_buf; *at = a; return s_ts_map + a; }
+    if (s_ts_map[h] && a + bytes <= s_ts_cap[h]) { *buf = s_ts_buf[h]; *at = a; return s_ts_map[h] + a; }
     u8* mp = NULL;
     const gpu_buffer b = tex_stage_create(bytes, &mp);
     if (!GPU_VALID(b)) return NULL;
@@ -354,34 +375,39 @@ static u8* tex_stage_alloc_buf(u64 bytes, gpu_buffer* buf, u64* at)
     return mp;
 }
 
-/* Start of a frame's uploads; the GPU is idle. */
+/* Start of a frame's uploads (s_rf_par, s_rf_buf set): the last batch's
+ * one-off buffers go once the GPU is past it, and this half's buffer grows
+ * to what the last frame used. The GPU is done with this half's buffer: its
+ * last reader was the batch before last (without frames in flight, the last
+ * batch, which the start of render_frame waited for). */
 static void tex_stage_frame(void)
 {
-    for (int i = 0; i < s_ts_grave_n; i++) gpu_buffer_destroy(s_rc_dev, s_ts_grave[i], 0);
+    for (int i = 0; i < s_ts_grave_n; i++) gpu_buffer_destroy(s_rc_dev, s_ts_grave[i], s_last_batch_fence);
     s_ts_grave_n = 0;
+    const u32 h = s_rf_buf;
     const u64 used = s_ts_off;
     s_ts_off = 0;
     static u64 limit = 0;
     if (!limit) limit = (u64)ps3_env_int("TEX_STAGE_MAX_MB", 512) << 20;
-    u64 cap = s_ts_cap ? s_ts_cap : (u64)ps3_env_int("TEX_STAGE_MB", 32) << 20;
+    u64 cap = s_ts_cap[h] ? s_ts_cap[h] : (u64)ps3_env_int("TEX_STAGE_MB", 32) << 20;
     while (cap < used + used / 4 && cap < limit) cap *= 2;
     if (cap > limit) cap = limit;
-    if (GPU_VALID(s_ts_buf) && cap <= s_ts_cap) return;
+    if (GPU_VALID(s_ts_buf[h]) && cap <= s_ts_cap[h]) return;
     u8* mp = NULL;
     const gpu_buffer r = tex_stage_create(cap, &mp);
     if (!GPU_VALID(r)) {
         static int warned = 0;
         if (!warned++) fprintf(stderr, "[TEXSTAGE] no %llu MB staging buffer; staying at %llu MB%c",
-                               (unsigned long long)(cap >> 20), (unsigned long long)(s_ts_cap >> 20), 10);
-        limit = s_ts_cap ? s_ts_cap : 1;
+                               (unsigned long long)(cap >> 20), (unsigned long long)(s_ts_cap[h] >> 20), 10);
+        limit = s_ts_cap[h] ? s_ts_cap[h] : 1;
         return;
     }
-    if (GPU_VALID(s_ts_buf)) {
+    if (GPU_VALID(s_ts_buf[h])) {
         fprintf(stderr, "[TEXSTAGE] a frame staged %llu MB of textures: buffer grown to %llu MB%c",
                 (unsigned long long)(used >> 20), (unsigned long long)(cap >> 20), 10);
-        tex_stage_drop(s_ts_buf);
+        tex_stage_drop(s_ts_buf[h]);
     }
-    s_ts_buf = r; s_ts_map = mp; s_ts_cap = cap;
+    s_ts_buf[h] = r; s_ts_map[h] = mp; s_ts_cap[h] = cap;
 }
 
 /* Texture memory: placed resources in 64 MB heaps, in power-of-two blocks
@@ -493,16 +519,47 @@ static int tex_res_create(VPTexSlot* t, const gpu_texture_desc* td)
     t->tex = gpu_texture_create(s_rc_dev, td);   /* committed */
     return GPU_VALID(t->tex);
 }
-/* Release the slot's texture; a placed one's block goes back to its list.
- * The GPU is idle (render_frame waits before the pre-pass), and a slot
- * that is replaced was not used this frame, so it goes at once, as the
- * Release did. */
+/* Blocks of released textures the last batch may still sample, each back to
+ * its list once the GPU is past the fence (tex_pool_reclaim). */
+typedef struct { TexBlock b; int k; gpu_fence after; } TexBlockLate;
+static TexBlockLate* s_tp_late;
+static int s_tp_late_n, s_tp_late_cap;
+
+/* At render_frame's start: the blocks the GPU is done with, to reuse. */
+static void tex_pool_reclaim(void)
+{
+    if (!s_tp_late_n) return;
+    const gpu_fence done = gpu_fence_completed(s_rc_dev);
+    int keep = 0;
+    for (int i = 0; i < s_tp_late_n; i++) {
+        const TexBlockLate* e = &s_tp_late[i];
+        if (e->after <= done) tex_pool_put(e->k, e->b.heap, e->b.off);
+        else s_tp_late[keep++] = *e;
+    }
+    s_tp_late_n = keep;
+}
+
+/* Release the slot's texture. A slot that is replaced was not used by this
+ * batch, but the last one may still sample it (RSX_FRAMES_IN_FLIGHT): the
+ * texture goes with the last batch's fence, and a placed one's block back to
+ * its list once the GPU is past that fence. */
 static void tex_res_release(VPTexSlot* t)
 {
     if (!GPU_VALID(t->tex)) return;
-    gpu_texture_destroy(s_rc_dev, t->tex, 0);
+    const gpu_fence after = s_last_batch_fence;
+    gpu_texture_destroy(s_rc_dev, t->tex, after);
     t->tex.id = 0;
-    if (GPU_VALID(t->blk)) tex_pool_put(t->blk_class, t->blk, t->blk_off);
+    if (GPU_VALID(t->blk)) {
+        if (s_tp_late_n == s_tp_late_cap) {
+            const int nc = s_tp_late_cap ? s_tp_late_cap * 2 : 64;
+            TexBlockLate* g = (TexBlockLate*)realloc(s_tp_late, (size_t)nc * sizeof *g);
+            if (g) { s_tp_late = g; s_tp_late_cap = nc; }
+        }
+        if (s_tp_late_n < s_tp_late_cap) {
+            TexBlockLate* e = &s_tp_late[s_tp_late_n++];
+            e->b.heap = t->blk; e->b.off = t->blk_off; e->k = t->blk_class; e->after = after;
+        }   /* (else the block is lost, not reused, as tex_pool_put's) */
+    }
     t->blk.id = 0; t->blk_class = -1;
 }
 
@@ -546,6 +603,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     u32 blkrow  = dxt ? tl.row_bytes : 0;
     u32 blkrows = dxt ? tl.rows      : 0;
     const u32 key_off = off;         /* lookup key: the offset as bound */
+    /* The guest bytes the texture can read, its faces and mips included
+     * (a level's chain is under twice its first level): the last batch's
+     * write-backs that land there are stored before they are read. */
+    const u64 span = (u64)(dxt ? blkrow * blkrows : w * h * bpp) * (cube ? 6u : 1u) * 2u;
     /* Sparse checksum of a texture's source bytes -- enough to notice an
      * animated surface changing, cheap enough to run on every bind. */
     /* (portable helper tex_csum() -- see above; a statement-expression macro
@@ -563,6 +624,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
              * changed. Most of this scene's textures are static, and converting
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+            wb_land_range(c->off, span);
             u32 cs = tcj_sum(i, c->off, nb);
             /* TEX_VERIFY=1 (live): hash every byte of each cache hit as well,
              * and re-upload one the sparse checksum called unchanged. Slow; it
@@ -646,6 +708,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                             "draw unbound%c", VP_TEX_SLOTS, 10); }
         return -1;
     }
+    wb_land_range(off, span);
     /* TEX_SRCDBG=<N>: is the guest memory this slot uploads FROM actually
      * populated? An empty source and a broken sampler both render flat. */
     { static int cap = -1, n = 0;

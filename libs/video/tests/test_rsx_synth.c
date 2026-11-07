@@ -4,6 +4,7 @@
  * backend's stream hash, against a golden list.
  *
  *   test_rsx_synth [--update-golden] [--keep] [--out <dir>] [--env NAME=VALUE]...
+ *   test_rsx_synth --lag <signals> [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan [--no-validation] [--keep] [--out <dir>] [--env NAME=VALUE]...
  *   test_rsx_synth --route vulkan --fallback <step>|mark [...]   the start falls back to the default
  *   test_rsx_synth --stores vulkan|d3d12 [--out <dir>] [--env NAME=VALUE]...
@@ -37,7 +38,9 @@
  * and PSO_THREADS=4, VP_FETCH_THREADS=2, the second with PSO_THREADS=1,
  * VP_FETCH_THREADS=0 and no dump. It passes
  * when
- *   - no null check failed, in the frames or at the shutdown;
+ *   - no null check failed, in the frames or at the shutdown, and the core
+ *     dropped no write-back ("[wb] not stored": its target went before the
+ *     copy was stored);
  *   - every frame presented once;
  *   - both children give the same hashes: no timing, thread order, shader
  *     compiler (the null route names a shader by its text's key) or machine
@@ -52,6 +55,13 @@
  * to diff against a good run's) and the captures. --keep keeps it on a pass
  * too. --update-golden prints the list for a deliberate change.
  *
+ * --lag <n> runs both children with GPU_NULL_LAG=<n> (gpu_null.h's
+ * gpu_null_test_lag): the null GPU reads n signals behind, as a real one
+ * still running the last batch would, so a free, table write or readback
+ * that takes that batch as done without waiting for it fails a null check
+ * (RSX_FRAMES_IN_FLIGHT). The lag moves the waits the stream records, so
+ * there are no goldens; the rest is as above.
+ *
  * To look at a scene: test_rsx_synth --caps <dir>, then rsx_replay on its
  * captures, on any route (RSX_BACKEND=d3d12, hal-d3d12 or null). All of them
  * in their order, twice, is the child's chain:
@@ -63,7 +73,7 @@
  * synchronization validation). There is no stream hash there; it passes
  * when every frame played, the child got to the end, the layer was there
  * (--no-validation runs without it) and it said nothing: any validation
- * message fails. --env RSX_VK_MASK=<bits> runs the backend's fallbacks.
+ * message fails, as does a write-back not stored. --env RSX_VK_MASK=<bits> runs the backend's fallbacks.
  *
  * --route vulkan --fallback <step> asks for Vulkan with the start made to
  * fail at that step (RSX_FAIL_START_AT=vulkan:<step>, rsxc_init.inc's steps),
@@ -134,14 +144,14 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0x7cc8823823ef6bc7ull, 0xba64dc6fa62b09c6ull },
-    { "draws",     0x9cec4cdd76ac2e72ull, 0x014340ac39721076ull },
-    { "states",    0x0427f9e45d6110f5ull, 0xdc0bc5abe87369a1ull },
-    { "textures",  0x70540c21a54ccaaaull, 0x618f1d9d382bb94full },
-    { "offscreen", 0x9f93c1f19fff9d4full, 0x931b688e44b78a90ull },
-    { "zpass",     0x02ed13586cb83382ull, 0xd5cf0327c8befd9full },
-    { "frames",    0xc4011934a75f91edull, 0xe1bf028ec9f817c5ull },
-    { "mainmem",   0x83291788f3d3f66eull, 0xd6fcbc4059463f41ull },
+    { "clears",    0x83f1ad48a9c74665ull, 0xe8c382dbbe96fa43ull },
+    { "draws",     0x48b3ccf4d1d905a3ull, 0x968c27ffe5dfc15bull },
+    { "states",    0xaf44cfa459cca7f1ull, 0xca7c5215befe19eaull },
+    { "textures",  0x71bc5ef7930cea86ull, 0x52e05fe5c0b34fc9ull },
+    { "offscreen", 0x4a0a3f7a022e2416ull, 0x2e15e722c1324134ull },
+    { "zpass",     0x2651ad1301b3e7cdull, 0x3dc88c453eba8338ull },
+    { "frames",    0x6d34fc7e97e1e1d5ull, 0xc820c52fc0ee3453ull },
+    { "mainmem",   0xac46065637bb4144ull, 0x04c97a12a93a9cd0ull },
 };
 
 /* ---------------------------------------------------------------------------
@@ -1319,11 +1329,13 @@ static char* read_file(const char* path, size_t* len)
 enum { MAXFRAMES = 64 };
 typedef struct {
     int code, done, shutdown_fail, check_lines;
+    int wb_lost;         /* "[wb] not stored" lines: a write-back the core dropped */
     uint64_t hash[NPASSES][MAXFRAMES];
     int presents[NPASSES][MAXFRAMES];
     unsigned failed;     /* at the last present */
     int played;          /* frames begun */
     char first_check[256];
+    char first_wb[256];      /* the first "[wb] not stored" line */
     int vk_seen, no_layer;   /* the Vulkan route: its count line; "no validation layer" */
     unsigned vk_msgs;        /* the validation layer's messages, by the count line */
     char first_vk[512];      /* the first message, and its text's line */
@@ -1360,6 +1372,8 @@ static int run_parse(const char* dir, Run* r)
             r->failed = fails;
         } else if (strstr(line, "[GPU null] check failed") || strstr(line, "[VPVB] past its room")) {
             if (!r->check_lines++) snprintf(r->first_check, sizeof r->first_check, "%s", line);
+        } else if (!strncmp(line, "[wb] not stored", 15)) {
+            if (!r->wb_lost++) snprintf(r->first_wb, sizeof r->first_wb, "%s", line);
         } else if (strstr(line, "[GPU null]") && strstr(line, "checks failed")) {
             r->shutdown_fail = 1;
             if (!r->first_check[0]) snprintf(r->first_check, sizeof r->first_check, "%s", line);
@@ -1558,6 +1572,10 @@ static int vk_test(const char* exe, const char* out, const char* const* user, in
         }
         if (r.vk_msgs || r.first_vk[0]) {
             printf("[synth] FAIL: %u validation messages; the first: %s\n", r.vk_msgs, r.first_vk);
+            ok = 0;
+        }
+        if (r.wb_lost) {
+            printf("[synth] FAIL: %d write-backs not stored; first: %s\n", r.wb_lost, r.first_wb);
             ok = 0;
         }
         /* The route, and why when it is SYNTH_FALLBACK: the step's name in
@@ -1975,6 +1993,8 @@ static int test_main(int argc, char** argv)
     int update = 0, keep = 0, verbose = 0, vulkan = 0, validation = 1;
     const char* fallback = NULL;
     const char* stores = NULL;
+    const char* lag = NULL;   /* --lag: GPU_NULL_LAG for the children, no goldens */
+    char lag_env[32];
     const char* extra[48];
     int nextra = 0;
     extra[nextra++] = "RSX_BACKEND=null";
@@ -1985,6 +2005,11 @@ static int test_main(int argc, char** argv)
         else if (!strcmp(argv[i], "--verbose")) verbose = 1;
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!strcmp(argv[i], "--env") && i + 1 < argc && nextra < 40) extra[nextra++] = argv[++i];
+        else if (!strcmp(argv[i], "--lag") && i + 1 < argc && nextra < 40 && !lag) {
+            lag = argv[++i];
+            snprintf(lag_env, sizeof lag_env, "GPU_NULL_LAG=%s", lag);
+            extra[nextra++] = lag_env;
+        }
         else if (!strcmp(argv[i], "--route") && i + 1 < argc && (!strcmp(argv[i + 1], "null") ||
                                                                  !strcmp(argv[i + 1], "vulkan")))
             vulkan = !strcmp(argv[++i], "vulkan");
@@ -1996,12 +2021,17 @@ static int test_main(int argc, char** argv)
             stores = strcmp(argv[++i], "vulkan") ? "d3d12" : "vulkan";   /* (hal-d3d12: its old name) */
         else {
             fprintf(stderr, "usage: test_rsx_synth [--update-golden] [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
+                            "       test_rsx_synth --lag <signals> [--keep] [--verbose] [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --route vulkan [--no-validation] [--fallback <step>|mark] [--keep] [--out <dir>]\n"
                             "                      [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --stores vulkan|d3d12 [--out <dir>] [--env NAME=VALUE]...\n"
                             "       test_rsx_synth --caps <dir> | --run <dir>\n");
             return 2;
         }
+    }
+    if (lag && (vulkan || stores || update)) {
+        fprintf(stderr, "test_rsx_synth: --lag is the null route's, with no goldens to update\n");
+        return 2;
     }
     if (fallback && (!vulkan || !SYNTH_SWITCH)) {
         fprintf(stderr, "test_rsx_synth: --fallback is --route vulkan's, in a build with the route switch\n");
@@ -2062,6 +2092,10 @@ static int test_main(int argc, char** argv)
             printf("[synth] FAIL: the child in %s played %d frames of %d\n", dirs[c], r->played, NPASSES * nf);
             ok = 0;
         }
+        if (r->wb_lost) {
+            printf("[synth] FAIL: %d write-backs not stored in %s; first: %s\n", r->wb_lost, dirs[c], r->first_wb);
+            ok = 0;
+        }
         if (r->failed || r->check_lines || r->shutdown_fail) {
             printf("[synth] FAIL: null checks failed in %s: %u by the last present%s; first: %s\n", dirs[c],
                    r->failed, r->shutdown_fail ? ", and at the shutdown" : "", r->first_check);
@@ -2095,7 +2129,10 @@ static int test_main(int argc, char** argv)
         const Golden* g = s < (int)(sizeof k_golden / sizeof k_golden[0]) && !strcmp(k_golden[s].scene, k_scene[s].name)
                               ? &k_golden[s] : NULL;
         const int gok = g && g->pass1 == got[0] && g->pass2 == got[1];
-        if (!gok && !update) {
+        if (lag) {   /* (the lag moves the waits the stream records: no golden) */
+            if (verbose) printf("[synth] %-9s %016llx %016llx (lag %s)\n", k_scene[s].name,
+                                (unsigned long long)got[0], (unsigned long long)got[1], lag);
+        } else if (!gok && !update) {
             printf("[synth] FAIL %-9s expected %016llx %016llx, got %016llx %016llx\n", k_scene[s].name,
                    g ? (unsigned long long)g->pass1 : 0ull, g ? (unsigned long long)g->pass2 : 0ull,
                    (unsigned long long)got[0], (unsigned long long)got[1]);
@@ -2132,7 +2169,9 @@ static int test_main(int argc, char** argv)
         return ok ? 0 : 1;
     }
     if (ok) {
-        printf("[synth] PASS: %d hashes as their goldens in both processes, 0 failed checks\n", NSCENES * NPASSES);
+        if (lag) printf("[synth] PASS: GPU_NULL_LAG=%s, %d hashes the same in both processes, 0 failed checks\n",
+                        lag, NSCENES * NPASSES);
+        else printf("[synth] PASS: %d hashes as their goldens in both processes, 0 failed checks\n", NSCENES * NPASSES);
         if (!keep) out_remove(out);
         return 0;
     }
