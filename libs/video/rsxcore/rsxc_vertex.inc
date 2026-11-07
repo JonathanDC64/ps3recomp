@@ -988,6 +988,11 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     return o;
 }
 
+/* Primitive restart's triangle left open at the end of a TRIANGLES range
+ * (upload_tris_vp_indexed): its 1-2 indices, for the next contiguous range of
+ * the same BEGIN/END. */
+static struct { int valid; u32 epoch, next, n, tri[2]; } s_ix_carry;
+
 static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
 {
     extern uint8_t* vm_base;
@@ -997,12 +1002,20 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     VPSlot* out;
-    u32 maxv = vb_room(count, &out);
-    if (count > maxv) { s_drop_draws++;
+    /* With primitive restart, the triangle the last range left open goes
+     * ahead of this range's indices (below), so its 1-2 vertices need room
+     * too. Room for `count` alone let a range write up to 2 vertices past
+     * it, and past the end of a vertex buffer chunk's mapping when the room
+     * ended there: a crash in frames heavy with particles (issue #400). */
+    const u32 lead = state->restart_index_enable && s_ix_carry.valid && s_ix_carry.epoch == state->begin_epoch &&
+                     s_ix_carry.next == first ? s_ix_carry.n : 0;
+    u32 maxv = vb_room(count + lead, &out);
+    if (count + lead > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
-                    state->shader_program, count, maxv, 10); }
-        count = maxv - (maxv % 3); }
+                    state->shader_program, count + lead, maxv, 10); }
+        count = maxv > lead ? maxv - lead : 0;
+        if (!state->restart_index_enable) count -= count % 3; }
     { double _tv = perf_on() ? perf_now() : 0.0;
       if (!state->restart_index_enable) {
           for (u32 k = 0; k < count; k++)
@@ -1019,23 +1032,34 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
            * of phase, so sparks and smoke drew as slivers joining one
            * particle to the next, different every frame. The partial
            * triangle now carries into the next contiguous range of the same
-           * BEGIN/END. */
-          static struct { int valid; u32 epoch, next, n, tri[2]; } carry;
+           * BEGIN/END (s_ix_carry; `lead`, above, is its part here). Every
+           * index makes at most one vertex, so they stay within the room for
+           * count + lead; a triangle that would not is dropped and said
+           * (test_rsx_synth fails on the line). */
           u32 o = 0, n = 0, tri[3];
-          if (carry.valid && carry.epoch == state->begin_epoch && carry.next == first) {
-              n = carry.n; tri[0] = carry.tri[0]; tri[1] = carry.tri[1];
-          }
+          int over = 0;
+          if (lead) { n = lead; tri[0] = s_ix_carry.tri[0]; tri[1] = s_ix_carry.tri[1]; }
           for (u32 k = 0; k < count; k++) {
               const u32 ix = read_guest_index(state, first + k);
               if (ix == state->restart_index) { n = 0; continue; }
               tri[n++] = ix;
               if (n == 3) {
+                  if (o + 3 > maxv) { over = 1; break; }
                   for (int j = 0; j < 3; j++) read_vp_vertex_c(state, tri[j], &out[(o + j)*16]);
                   o += 3; n = 0;
               }
           }
-          carry.valid = 1; carry.epoch = state->begin_epoch; carry.next = first + count;
-          carry.n = n; carry.tri[0] = tri[0]; carry.tri[1] = tri[1];
+          if (over) {
+              s_drop_draws++;
+              static int said = 0;
+              if (said < 8 && ++said)
+                  fprintf(stderr, "[VPVB] past its room: a restart list's range of %u indices (+%u carried) had room "
+                          "for %u vertices; its last triangles are dropped%c", count, lead, maxv, 10);
+              s_ix_carry.valid = 0;
+          } else {
+              s_ix_carry.valid = 1; s_ix_carry.epoch = state->begin_epoch; s_ix_carry.next = first + count;
+              s_ix_carry.n = n; s_ix_carry.tri[0] = tri[0]; s_ix_carry.tri[1] = tri[1];
+          }
           count = o;
       }
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
