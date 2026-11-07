@@ -2523,6 +2523,8 @@ int main(int argc, char** argv)
     ppu_vm_size = 0;   /* full 32-bit space backed, as on Windows */
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+    printf("[vm] guest memory at %p%s\n", (void*)vm_base, ((uintptr_t)vm_base & 0xFFFFFFFFu)
+           ? ", off a 4 GB boundary: host pointers into it lose their guest address" : "");
     if (s_window_only) {
         /* The window alone (ps3_title_launch): the title's init, then only the
          * present thread, which ends the process when the window closes. The
