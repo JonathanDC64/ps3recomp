@@ -134,6 +134,7 @@ void gpu_d3d12_swap_destroy(gpu_device* d, gpu_swapchain sc)
     gpu_d3d12_swap* const s = swap_of(dd, sc);
     if (!s) return;
     images_drop(dd, s);
+    if (s->sc && s->exclusive) s->sc->lpVtbl->SetFullscreenState(s->sc, FALSE, NULL);   /* (windowed to be released) */
     if (s->sc) s->sc->lpVtbl->Release(s->sc);
     memset(s, 0, sizeof *s);
     AcquireSRWLockExclusive(&dd->lock);
@@ -194,9 +195,24 @@ int gpu_d3d12_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
 {
     gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
     if (!s) return GPU_PRESENT_FAILED;
+    if (s->exclusive) flags &= ~(uint32_t)GPU_PRESENT_TEARING;   /* (refused in fullscreen, where interval 0 tears anyway) */
     const HRESULT hr = s->sc->lpVtbl->Present(s->sc, interval, flags);
     if (!FAILED(hr)) return GPU_PRESENTED;
     return gpu_lost(d) ? GPU_PRESENT_LOST : GPU_PRESENT_FAILED;
+}
+
+/* gpu_swap_exclusive: DXGI's fullscreen state, on the output the window is on. A failure (another program has the
+ * display, or the window is not in front) leaves it as it was, to be asked again. */
+int gpu_d3d12_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on)
+{
+    gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
+    if (!s) return 0;
+    BOOL now = FALSE;
+    if (FAILED(s->sc->lpVtbl->GetFullscreenState(s->sc, &now, NULL))) now = FALSE;
+    if (on >= 0 && !!now != !!on && SUCCEEDED(s->sc->lpVtbl->SetFullscreenState(s->sc, on ? TRUE : FALSE, NULL)))
+        now = on ? TRUE : FALSE;
+    s->exclusive = now ? 1 : 0;
+    return s->exclusive;
 }
 
 /* GetFrameStatistics (display_note) and GetLastPresentCount

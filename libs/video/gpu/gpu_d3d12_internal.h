@@ -140,6 +140,7 @@ typedef struct gpu_d3d12_swap {
     uint32_t         buffers, width, height;
     gpu_format       format;
     uint32_t         dxgi_flags;   /* DXGI_SWAP_CHAIN_FLAG_* it was made with */
+    int             exclusive;   /* in DXGI fullscreen (gpu_swap_exclusive) */
     gpu_texture      image[GPU_D3D12_MAX_IMAGES];
 } gpu_d3d12_swap;
 
@@ -280,6 +281,7 @@ uint32_t      gpu_d3d12_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_textur
 uint32_t      gpu_d3d12_swap_image_count(gpu_device* d, gpu_swapchain sc);
 gpu_texture   gpu_d3d12_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t i);   /* also the bridge's */
 int           gpu_d3d12_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags);
+int           gpu_d3d12_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on);
 int           gpu_d3d12_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out);
 int           gpu_d3d12_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space,
                                  const gpu_hdr_metadata* meta);

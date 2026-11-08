@@ -669,16 +669,80 @@ static void swap_present(int game_frame)
 
 static void wait_for_gpu(void);
 
+#ifdef _WIN32
+/* Exclusive fullscreen (the window's side: fullscreen_set). The display is
+ * taken only while the window is in front, and again when it comes back from
+ * Alt+Tab. A try that fails waits a second's frames: another program may have
+ * the display, or the driver has no such thing. The window stays borderless. */
+static int s_excl_held, s_excl_force, s_excl_wait, s_excl_tries, s_excl_sent;
+
+static void exclusive_note(int on)
+{
+    printf("[D3D12] exclusive fullscreen: %s\n", on ? "on" : "off");
+}
+
+static void exclusive_step(void)
+{
+    const int want = s_excl_want != 0;
+    if (!want && !s_excl_held && s_excl_then < 0) {
+        s_excl_sent = 0;
+        return;
+    }
+    const int held = gpu_swap_exclusive(s_rc_dev, s_rc_swap, -1);
+    if (held != s_excl_held) {   /* taken at last, or Alt+Tab ended it */
+        s_excl_held = held;
+        s_excl_force = 1;
+        s_excl_tries = 0;
+        exclusive_note(held);
+    }
+    if (want) {
+        if (held) return;
+        if (s_excl_wait > 0) { s_excl_wait--; return; }
+        if (window_hidden() || GetForegroundWindow() != s_d3d.hwnd) return;
+        wait_for_gpu();
+        if (gpu_swap_exclusive(s_rc_dev, s_rc_swap, 1)) {
+            s_excl_held = 1;
+            s_excl_force = 1;
+            s_excl_tries = 0;
+            exclusive_note(1);
+        } else {
+            s_excl_wait = 60;
+            if (++s_excl_tries == 5) printf("[D3D12] exclusive fullscreen: the display could not be taken; staying borderless\n");
+        }
+        return;
+    }
+    /* Leaving: the display first, then the window (fullscreen_set clears s_excl_then when it gets there). */
+    if (held) wait_for_gpu();
+    gpu_swap_exclusive(s_rc_dev, s_rc_swap, 0);
+    if (held) {
+        s_excl_held = 0;
+        s_excl_force = 1;
+        exclusive_note(0);
+    }
+    if (s_excl_then >= 0 && !s_excl_sent) {
+        s_excl_sent = 1;
+        PostMessageA(s_d3d.hwnd, WM_RSX_BORDERLESS, (WPARAM)s_excl_then, 0);
+    }
+}
+#endif
+
 /* Between frames, on the render thread: the swap chain follows the window's
  * client size (s_win_req). The GPU is idled first and the overlay drops its
  * views of the old buffers, or ResizeBuffers fails on the references. */
 static void swap_resize(void)
 {
+#ifdef _WIN32
+    exclusive_step();
+    const int force = s_excl_force;   /* a change of fullscreen state needs ResizeBuffers at the same size too */
+    s_excl_force = 0;
+#else
+    const int force = 0;
+#endif
     const LONG req = s_win_req;
     u32 w = (u32)req >> 16, h = (u32)req & 0xFFFF;
     if (!w || !h) { w = s_d3d.win_w; h = s_d3d.win_h; }
     const int hdr = hdr_want();   /* and its format follows RSX_HDR (see HDR output) */
-    if (w == s_d3d.win_w && h == s_d3d.win_h && hdr == s_hdr.active) return;
+    if (w == s_d3d.win_w && h == s_d3d.win_h && hdr == s_hdr.active && !force) return;
     wait_for_gpu();
     if (s_overlay_on && s_overlay.release) s_overlay.release(s_overlay.user);
     /* The buffers are the swap chain's (borrowed): the resize drops them and

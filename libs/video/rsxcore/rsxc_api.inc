@@ -490,14 +490,23 @@ static void rc_set_borderless(int on)
 {
 #ifdef _WIN32
     if (s_d3d.hwnd) {
-        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_RSX_BORDERLESS, (WPARAM)!!on, 0);
-        else set_borderless(s_d3d.hwnd, on);
+        if (s_window_thread) PostMessageA(s_d3d.hwnd, WM_RSX_BORDERLESS, (WPARAM)on, 0);
+        else fullscreen_set(s_d3d.hwnd, on);
     }
 #else
     if (s_d3d.hwnd) win_post(WIN_MAIL_BORDERLESS, !!on);
 #endif
 }
+#ifdef _WIN32
+static int      rc_borderless(void)
+{
+    const LONG then = s_excl_then;   /* (on its way there, the display being given back) */
+    if (then >= 0) return (int)then;
+    return s_borderless ? (s_excl_want ? 2 : 1) : 0;
+}
+#else
 static int      rc_borderless(void)   { return s_borderless; }
+#endif
 /* The menu renderer takes the device, the queue and the swap chain's
  * buffers as the backend's own objects, and the overlay's frame callback
  * the buffer it draws over: the instance file's hooks (step C8b:

@@ -838,6 +838,11 @@ typedef struct gpu_device_desc {
     /* Shows it after `interval` vblanks (0: at once, GPU_PRESENT_TEARING to tear). GPU_PRESENTED (0) on \
      * success, else a GPU_PRESENT_* code (step VC2, at the end). */ \
     X(swap_present,      R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags), (d, sc, interval, flags)) \
+    /* Exclusive fullscreen, on Windows. on: 1 take the display, 0 give it back, -1 only ask. 1 when the \
+     * swap chain holds the display afterwards. It can end by itself (Alt+Tab). The GPU must be idle for \
+     * 0 and 1, and a swap_resize follows a change. Vulkan makes the swap chain again first, so a 1 can \
+     * answer 0 and hold it after the next acquire. */ \
+    X(swap_exclusive,    R, int,            (gpu_device* d, gpu_swapchain sc, int on), (d, sc, on)) \
     /* 0 with *out filled; else nonzero (no statistics yet). Vulkan has them with \
      * GPU_CAP_PRESENT_WAIT: the last present seen on the display, sync_qpc when it was seen, \
      * no refresh counts. */ \
