@@ -5,6 +5,8 @@
  * either it stops at the #error below rather than compare a loop with itself.
  *
  *   - spu_shufb against spu_shufb_ref;
+ *   - the float ops (fs, fm, fma, fms, fnms, fceq, fcgt, csflt) against their
+ *     loops, as the host leaves the float mode and with DAZ and FTZ;
  *   - the quadword byte shifts and rotates, and the cbd/chd/cwd/cdd controls,
  *     against byte loops;
  *   - spu_diff_hook.c's block: diff_run(ctx, 1) against diff_run(ctx, 0);
@@ -123,6 +125,71 @@ static void test_helpers(void)
         char what[64];
         snprintf(what, sizeof what, "%s vs the byte loop", nm[i]);
         check(what, qb[i]);
+    }
+}
+
+/* ---- the float ops against their loops ---- */
+#if !defined(SPU_FLOAT_SIMD)
+#error "the float ops were built without their SIMD forms"
+#endif
+/* A lane worth testing: special values (both zeros, the smallest and largest
+ * normals and denormals, infinities, NaNs), random bits, or a float near 1,
+ * whose products and sums are the common case. */
+static uint32_t rnd_lane(void)
+{
+    static const uint32_t sp[] = {
+        0x00000000u, 0x80000000u, 0x00000001u, 0x807FFFFFu, 0x00800000u, 0x80800000u,
+        0x7F7FFFFFu, 0xFF7FFFFFu, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0xFFC00001u,
+        0x7F800001u, 0x3F800000u, 0xBF800000u, 0x33800000u, 0x0C000000u, 0x8C000000u,
+    };
+    const uint32_t k = rnd() % 8;
+    if (k == 0) return sp[rnd() % (sizeof sp / sizeof sp[0])];
+    if (k <= 3) return (rnd() << 16) ^ rnd();
+    return (rnd() & 0x807FFFFFu) | ((uint32_t)(112 + rnd() % 32) << 23);   /* 2^-15 .. 2^16 */
+}
+static u128 rnd_f(void) { u128 r; for (int k = 0; k < 4; k++) r._u32[k] = rnd_lane(); return r; }
+/* Equal bits, or NaN in both: which NaN an op returns follows its operand
+ * order, which the compiler may swap for either form (the SPU has no NaN). */
+static int f_eq(u128 a, u128 b)
+{
+    for (int k = 0; k < 4; k++) {
+        const int na = (a._u32[k] & 0x7FFFFFFFu) > 0x7F800000u, nb = (b._u32[k] & 0x7FFFFFFFu) > 0x7F800000u;
+        if (na != nb || (!na && a._u32[k] != b._u32[k])) return 0;
+    }
+    return 1;
+}
+static void test_float_ops(void)
+{
+    /* As the host leaves it, and as SPU code runs: DAZ and FTZ (spu_run_with_halt). */
+    for (int mode = 0; mode < 2; mode++) {
+#if defined(__SSE4_1__)
+        const unsigned csr = _mm_getcsr();
+        if (mode) _mm_setcsr(csr | 0x8040u);
+#else
+        if (mode) break;   /* arm64: the host's mode only */
+#endif
+        int bad[8] = {0};
+        for (int it = 0; it < 300000; it++) {
+            const u128 a = rnd_f(), b = rnd_f(), c = rnd_f();
+            bad[0] += !f_eq(spu_fs(a, b), spu_fs_ref(a, b));
+            bad[1] += !f_eq(spu_fm(a, b), spu_fm_ref(a, b));
+            bad[2] += !f_eq(spu_fma(a, b, c), spu_fma_ref(a, b, c));
+            bad[3] += !f_eq(spu_fms(a, b, c), spu_fms_ref(a, b, c));
+            bad[4] += !f_eq(spu_fnms(a, b, c), spu_fnms_ref(a, b, c));
+            bad[5] += !q_eq(spu_fceq(a, b), spu_fceq_ref(a, b));
+            bad[6] += !q_eq(spu_fcgt(a, b), spu_fcgt_ref(a, b));
+            const int i8 = 155 + (int)(rnd() % 64) - 32;   /* the identity scale and around it */
+            bad[7] += !f_eq(spu_csflt(a, i8), spu_csflt_ref(a, i8));
+        }
+#if defined(__SSE4_1__)
+        _mm_setcsr(csr);
+#endif
+        static const char* nm[8] = { "fs", "fm", "fma", "fms", "fnms", "fceq", "fcgt", "csflt" };
+        for (int i = 0; i < 8; i++) {
+            char what[64];
+            snprintf(what, sizeof what, "%s vs the loop%s", nm[i], mode ? " (DAZ, FTZ)" : "");
+            check(what, bad[i]);
+        }
     }
 }
 
@@ -254,6 +321,7 @@ int main(void)
     }
     s_ctx[0]->image_id = s_ctx[1]->image_id = 0x7FFF;
     test_helpers();
+    test_float_ops();
     test_diff();
     test_scan();
     printf("test_spu_simd_paths: %d passed, %d failed\n", g_pass, g_fail);
