@@ -885,10 +885,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
  * (bit 15 of the size halfword) it PARKS the remainder in the context, raises
  * SPU event 0x2 (MFC DMA list stall-and-notify) and returns -- the WWS
  * jobmanager's interrupt handler processes the arrived portion and writes
- * MFC_WrListStallAck to resume the rest (mfc_list_stall_ack below). */
+ * MFC_WrListStallAck to resume the rest (mfc_list_stall_ack below).
+ * lean (from mfc_fast_list): an element the lean path takes skips
+ * mfc_do_transfer's probes, as a plain transfer does in mfc_fast_xfer. */
+static inline int mfc_lean_ok(const spu_context* spu, uint32_t lsa_raw, uint64_t ea, uint32_t size);
+static inline void mfc_lean_move(spu_context* spu, uint32_t lsa, uint32_t ea32, uint32_t size, uint32_t cmd);
 static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                                uint32_t num_left, uint32_t dest_lsa,
-                               uint64_t ea_base, uint32_t base_cmd, uint32_t tag)
+                               uint64_t ea_base, uint32_t base_cmd, uint32_t tag,
+                               int lean)
 {
     for (uint32_t i = 0; i < num_left; i++) {
         uint32_t el = (elem_lsa + i * 8) & SPU_LS_MASK;
@@ -909,7 +914,11 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
              * 1/2/4/8-byte transfers. The EA supplies its byte offset within
              * the first quadword. Keep the rounded cursor for stall/resume. */
             uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
-            int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
+            int rc = 0;
+            if (lean && mfc_lean_ok(spu, transfer_lsa, ea, xfer_size))
+                mfc_lean_move(spu, transfer_lsa & SPU_LS_MASK, (uint32_t)ea, xfer_size, base_cmd);
+            else
+                rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
             if (rc != 0) return rc;
             dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
@@ -983,7 +992,7 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
       fprintf(stderr, "\n"); }
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
-                          spu->list_stall_cmd[t], t);
+                          spu->list_stall_cmd[t], t, 0);
     if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
         mfc->tag_completed |= (1u << t);
     return rc;
@@ -991,14 +1000,27 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
 
 static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
                                         uint64_t ea_base, uint32_t list_size,
-                                        uint32_t cmd)
+                                        uint32_t cmd, int lean)
 {
     /* list_size is in bytes; each element is 8 bytes */
     uint32_t num_elements = list_size / 8;
     uint32_t base_cmd = cmd & ~0x04u; /* strip the 'list' bit to get base GET/PUT */
     return mfc_run_list(spu, list_lsa & SPU_LS_MASK, num_elements,
                         spu->mfc_lsa & SPU_LS_MASK, ea_base, base_cmd,
-                        spu->mfc_tag);
+                        spu->mfc_tag, lean);
+}
+
+/* The note mfc_submit makes of a list's issue, the first 32, from either
+ * path: one count for both. */
+static MFC_NOINLINE void mfc_list_issue_note(const spu_context* spu, uint32_t cmd, uint32_t lsa,
+                                             uint64_t ea, uint32_t size, uint32_t tag)
+{
+    static int _l = 0;
+    if (_l < 32 && ++_l)
+        fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
+                "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
+                spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
+                size, size / 8, tag);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1158,25 +1180,23 @@ static inline int mfc_is_plain_xfer(uint32_t cmd)
 /* The result (0) when done; -1 = take the full path. (A result through a
  * pointer would put a local's address in every caller, and a /GS cookie
  * check with it.) */
-static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+/* The MFC's rules for one lean transfer, the ones mfc_do_transfer enforces
+ * (and the images with hooks of their own): 0 leaves the transfer to it, to
+ * reject or report. */
+static inline int mfc_lean_ok(const spu_context* spu, uint32_t lsa_raw, uint64_t ea, uint32_t size)
 {
-    extern uint32_t g_barrier_sync_watch;
-    if (!mfc_is_plain_xfer(cmd) || spu->policy_mode || g_barrier_sync_watch || mfc_diag())
-        return -1;
-    const uint32_t lsa_raw = spu->mfc_lsa;
-    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     const uint32_t ea32 = (uint32_t)ea;
-    const uint32_t size = spu->mfc_size;
-    const uint32_t tag = spu->mfc_tag & 0x1F;
     const uint32_t lsa = lsa_raw & SPU_LS_MASK;
-    if (size == 0 || size > MFC_MAX_DMA_SIZE || (size >= 16 && (size & 15)) ||
-        ((lsa_raw ^ ea32) & 15) != 0 || ea32 < 0x10000u ||
-        (uint64_t)lsa + size > (uint64_t)SPU_LS_SIZE ||
-        spu->image_id == 22 || spu->image_id == 23 ||
-        !mfc_ea_range_committed(ea, size))
-        return -1;
-    mfc_repeat_check(mfc, spu, ea32, lsa_raw);
-    mfc->tag_completed &= ~(1u << tag);
+    return !(size == 0 || size > MFC_MAX_DMA_SIZE || (size >= 16 && (size & 15)) ||
+             ((lsa_raw ^ ea32) & 15) != 0 || ea32 < 0x10000u ||
+             (uint64_t)lsa + size > (uint64_t)SPU_LS_SIZE ||
+             spu->image_id == 22 || spu->image_id == 23 ||
+             !mfc_ea_range_committed(ea, size));
+}
+/* One lean transfer, its rules checked: the copy, a GET's overlay
+ * bookkeeping, a PUT's lock-line coherence and pushbuffer hook. */
+static inline void mfc_lean_move(spu_context* spu, uint32_t lsa, uint32_t ea32, uint32_t size, uint32_t cmd)
+{
     t_spu_xfers++;
     uint8_t* ls_ptr = &spu->ls[lsa];
     uint8_t* ea_ptr = vm_base + ea32;
@@ -1217,10 +1237,60 @@ static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook(ea32, size); }
     }
+}
+static inline int mfc_fast_xfer(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    extern uint32_t g_barrier_sync_watch;
+    if (!mfc_is_plain_xfer(cmd) || spu->policy_mode || g_barrier_sync_watch || mfc_diag())
+        return -1;
+    const uint32_t lsa_raw = spu->mfc_lsa;
+    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    const uint32_t ea32 = (uint32_t)ea;
+    const uint32_t size = spu->mfc_size;
+    const uint32_t tag = spu->mfc_tag & 0x1F;
+    if (!mfc_lean_ok(spu, lsa_raw, ea, size))
+        return -1;
+    mfc_repeat_check(mfc, spu, ea32, lsa_raw);
+    mfc->tag_completed &= ~(1u << tag);
+    mfc_lean_move(spu, lsa_raw & SPU_LS_MASK, ea32, size, cmd);
     if (spu->image_id == 2 && lsa_raw == 0xC00 && cmd == 0x40) {
         extern volatile unsigned g_wws_batch_gets;
         g_wws_batch_gets++;
     }
+    if (!(spu->list_stall_mask & (1u << tag)))
+        mfc->tag_completed |= (1u << tag);
+    return 0;
+}
+
+/* A DMA list (GETL, PUTL and their fence and barrier forms) without the
+ * diagnostics, under the same conditions as mfc_fast_xfer. What mfc_submit
+ * does for one then: the repeat limit on the list's own address, the tag, the
+ * issue note, each element (mfc_run_list, lean: an element mfc_lean_ok
+ * refuses still goes to mfc_do_transfer, as before), a stall-and-notify
+ * element parking the rest. libsynth2's synth, which mixes Demon's Souls'
+ * sound, makes ~1.35 million DMA transfers a second in a busy area
+ * (Stonefang Tunnel), most of them list elements, and each went through
+ * every probe of mfc_submit and mfc_do_transfer: ~10% of its busy time.
+ * -1 = take the full path. */
+static inline int mfc_is_plain_list(uint32_t cmd)
+{
+    return cmd == 0x44 || cmd == 0x45 || cmd == 0x46 ||   /* GETL, GETLB, GETLF */
+           cmd == 0x24 || cmd == 0x25 || cmd == 0x26;     /* PUTL, PUTLB, PUTLF */
+}
+static inline int mfc_fast_list(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+{
+    extern uint32_t g_barrier_sync_watch;
+    if (!mfc_is_plain_list(cmd) || spu->policy_mode || g_barrier_sync_watch || mfc_diag() ||
+        spu->image_id == 22 || spu->image_id == 23)
+        return -1;
+    const uint32_t lsa = spu->mfc_lsa;
+    const uint64_t ea = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
+    const uint32_t size = spu->mfc_size;
+    const uint32_t tag = spu->mfc_tag & 0x1F;
+    mfc_repeat_check(mfc, spu, (uint32_t)ea, lsa);
+    mfc->tag_completed &= ~(1u << tag);
+    mfc_list_issue_note(spu, cmd, lsa, ea, size, tag);
+    mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK, ea & 0xFFFFFFFF00000000ull, size, cmd, 1);
     if (!(spu->list_stall_mask & (1u << tag)))
         mfc->tag_completed |= (1u << tag);
     return 0;
@@ -1735,17 +1805,13 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * supplies the low-32 EA; only EAH carries through. Passing `lsa` as the
      * list address read list elements from the transfer DESTINATION. */
     if (mfc_is_list(cmd)) {
-        /* List DMAs are rare, and they skip the per-element trace above, so
-         * they are easy to miss entirely while diagnosing a pipeline that
-         * never fills. Always report the issue: the DESTINATION lsa is the
-         * value the whole transfer hangs on. */
-        { static int _l = 0; if (_l < 32 && ++_l)
-            fprintf(stderr, "[mfc-list] ISSUE img=%d cmd=0x%02X dest_lsa=0x%05X "
-                    "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
-                    spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
-                    size, size / 8, tag); }
+        /* List DMAs skip the per-element trace above, so they are easy to
+         * miss entirely while diagnosing a pipeline that never fills. Always
+         * report the issue: the DESTINATION lsa is the value the whole
+         * transfer hangs on. */
+        mfc_list_issue_note(spu, cmd, lsa, ea, size, tag);
         rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
-                                  ea & 0xFFFFFFFF00000000ull, size, cmd);
+                                  ea & 0xFFFFFFFF00000000ull, size, cmd, 0);
     } else {
         rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
     }

@@ -1571,8 +1571,8 @@ int spu_llar_noop_commit(spu_context* ctx, uint32_t lsa, uint32_t ea)
  * cookie on every one of those writes. Latch them here and leave the rest.
  *
  * The other frequent ones are answered here too, exactly as spu_wrch_full
- * would: a plain GET/PUT command (mfc_submit; atomics and lists still go the
- * long way), the tag-status update, the event mask and acknowledge. */
+ * would: a plain GET/PUT command or DMA list (mfc_submit's work without its
+ * probes), the tag-status update, the event mask and acknowledge. */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     const uint32_t v = value._u32[0];
@@ -1591,6 +1591,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                 if (mfc_fast_xfer(e, ctx, v) < 0) mfc_submit(e, ctx, v);
                 return;
             }
+            /* A list the same way; one it leaves (a policy module's, say)
+             * takes spu_wrch_full and mfc_submit as before. */
+            if (mfc_is_plain_list(v) && mfc_fast_list(mfc_for(ctx), ctx, v) >= 0) return;
             if ((v == MFC_GETLLAR_CMD || v == MFC_PUTLLC_CMD) && spu_atomic_lean(ctx, v)) return;
             break;
         case MFC_WrTagUpdate:
