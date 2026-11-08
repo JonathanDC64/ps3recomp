@@ -119,6 +119,26 @@ static inline int ps3_vfs_guest_path(const char* in, char* out, size_t cap, cons
     return 0;
 }
 
+/* A disc game's update, read in place of the disc's files. PS3_VFS_UPDATE=<folder> holds what a PS3 installs to
+ * /dev_hdd0/game/<id> (USRDIR/..., PARAM.SFO, ...). This gives where a translated path's file would be in that
+ * folder: what follows the path's last PS3_GAME component, or, with none, its last USRDIR component and what follows
+ * (a flattened tree). 1 and the path in out, with '/' separators; 0 when the path has neither, or it does not fit. */
+static inline int ps3_vfs_update_path(const char* host, const char* update, char* out, size_t cap)
+{
+    const char* game = NULL, *usr = NULL;
+    for (const char* p = host; *p; p++) {
+        if (*p != '/' && *p != '\\') continue;
+        if (!strncmp(p + 1, "PS3_GAME", 8) && (p[9] == '/' || p[9] == '\\')) game = p + 10;
+        if (!strncmp(p + 1, "USRDIR", 6) && (p[7] == '/' || p[7] == '\\')) usr = p + 1;
+    }
+    const char* rel = game ? game : usr;
+    if (!rel) return 0;
+    int n = snprintf(out, cap, "%s/%s", update, rel);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    for (char* c = out; *c; c++) if (*c == '\\') *c = '/';
+    return 1;
+}
+
 /* Where a refused guest path goes: a host path every file call fails on, with
  * anything appended to it too (Windows: characters no name may have; POSIX:
  * below a file that is not a directory). */

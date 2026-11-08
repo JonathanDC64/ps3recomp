@@ -673,30 +673,44 @@ static int edat_plain_size(const char* host_path, uint64_t* size)
     return 1;
 }
 
-/* The player's own decrypted copy of host_path, with PS3_EDAT_PLAIN=<folder>: the file at host_path's path below
- * PS3_VFS_ROOT in that folder, named as RPCS3's Decrypt PS3 Binaries names its output ("<name>.unedat"), and only as
- * long as the header says the plaintext is (a copy of another size is not this file's). Then nothing is decrypted and
- * nothing is written. Its path goes into buf; 0 when there is none. */
-static int edat_plain_copy(const char* host_path, char* buf, size_t cap)
+/* What follows `root` in host_path, or NULL when host_path is not below it. */
+static const char* below_root(const char* host_path, const char* root)
 {
-    const char* plain = getenv("PS3_EDAT_PLAIN");
-    const char* root = getenv("PS3_VFS_ROOT");
-    if (!plain || !plain[0] || !root || !root[0]) return 0;
+    if (!root || !root[0]) return NULL;
     size_t n = strlen(root);
     while (n && (root[n - 1] == '/' || root[n - 1] == '\\')) --n;
     for (size_t i = 0; i < n; ++i) {                   /* (either separator; on Windows, either case) */
         int a = (unsigned char)host_path[i], b = (unsigned char)root[i];
-        if (!a) return 0;
+        if (!a) return NULL;
         if (a == '\\') a = '/';
         if (b == '\\') b = '/';
 #ifdef _WIN32
         a = tolower(a);
         b = tolower(b);
 #endif
-        if (a != b) return 0;
+        if (a != b) return NULL;
     }
-    if (host_path[n] != '/' && host_path[n] != '\\') return 0;
-    const int len = snprintf(buf, cap, "%s/%s.unedat", plain, host_path + n + 1);
+    if (host_path[n] != '/' && host_path[n] != '\\') return NULL;
+    return host_path + n + 1;
+}
+
+/* The player's own decrypted copy of host_path, with PS3_EDAT_PLAIN=<folder>: the file at host_path's path below
+ * PS3_VFS_ROOT in that folder, or, for a file of the game's update (PS3_VFS_UPDATE), below that folder's PS3_GAME,
+ * named as RPCS3's Decrypt PS3 Binaries names its output ("<name>.unedat"), and only as long as the header says the
+ * plaintext is (a copy of another size is not this file's). Then nothing is decrypted and nothing is written. Its
+ * path goes into buf; 0 when there is none. */
+static int edat_plain_copy(const char* host_path, char* buf, size_t cap)
+{
+    const char* plain = getenv("PS3_EDAT_PLAIN");
+    if (!plain || !plain[0]) return 0;
+    const char* rel = below_root(host_path, getenv("PS3_VFS_ROOT"));
+    const char* game = "";
+    if (!rel) {
+        rel = below_root(host_path, getenv("PS3_VFS_UPDATE"));
+        game = "PS3_GAME/";
+    }
+    if (!rel) return 0;
+    const int len = snprintf(buf, cap, "%s/%s%s.unedat", plain, game, rel);
     if (len < 0 || (size_t)len >= cap) return 0;
     struct stat st;
     uint64_t size;

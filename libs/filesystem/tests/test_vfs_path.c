@@ -99,6 +99,18 @@ int main(void)
     assert(!ps3_vfs_name_ok("a/b") && !ps3_vfs_name_ok("a\\b") && !ps3_vfs_name_ok("a:b"));
     assert(!ps3_vfs_name_ok("PRN") && !ps3_vfs_name_ok(NULL));
 
+    /* The game's update: what follows PS3_GAME, or USRDIR and what follows on a flattened tree. */
+    {
+        char out[128];
+        assert(ps3_vfs_update_path("D:/g/PS3_GAME/USRDIR/a/b.bin", "U", out, sizeof out) && !strcmp(out, "U/USRDIR/a/b.bin"));
+        assert(ps3_vfs_update_path("D:\\g\\PS3_GAME\\PARAM.SFO", "U", out, sizeof out) && !strcmp(out, "U/PARAM.SFO"));
+        assert(ps3_vfs_update_path("D:/g/USRDIR/a.bin", "U", out, sizeof out) && !strcmp(out, "U/USRDIR/a.bin"));
+        assert(ps3_vfs_update_path("D:/PS3_GAME/x/PS3_GAME/USRDIR/a.bin", "U", out, sizeof out) && !strcmp(out, "U/USRDIR/a.bin"));
+        assert(ps3_vfs_update_path("D:/USRDIR/x/PS3_GAME/USRDIR/a.bin", "U", out, sizeof out) && !strcmp(out, "U/USRDIR/a.bin"));
+        assert(!ps3_vfs_update_path("D:/g/dev_hdd0/a.bin", "U", out, sizeof out));
+        assert(!ps3_vfs_update_path("D:/g/PS3_GAME/USRDIR/a.bin", "U", out, 8));
+    }
+
     /* A refusal goes to the log once, the guest's bytes shown safely. */
     {
         char out[64];
