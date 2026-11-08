@@ -16,6 +16,7 @@ static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RS
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include "rsx_texture_override.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

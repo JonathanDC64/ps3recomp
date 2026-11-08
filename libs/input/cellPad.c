@@ -52,6 +52,7 @@
   #include "pad_hid_sony.h"   /* (pad_hid_sony_poll off Windows: the SDL pads, below) */
 #endif
 #include "pad_controller.h"   /* (the devices on the ports, and PAD_CONTROLLER's rules) */
+#include "pad_glyph.h"        /* (the last device used, for a title's button icons) */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -567,6 +568,8 @@ static int pad_host_is_steam_deck(void)
 
 /* Keys and mouse leaving port 0 to its pad (below). */
 static volatile int s_keys_out;
+/* A bound key or mouse button went down in the keyboard poll (for pad_glyph.h: the device last used). */
+static volatile int s_kb_fresh;
 int cellPad_host_keys_out(void) { return s_keys_out; }
 
 /* One keyboard poll (pad_poll_keyboard runs one at a time). */
@@ -629,6 +632,7 @@ static void pad_poll_keyboard_once(void)
     for (int c = 0; c < PAD_IN_WHEEL_UP; c++) {   /* an input that just went down counts for its plain bindings... */
         fresh[c] = down[c] && !s_held[c];
         s_held[c] = down[c];
+        if (fresh[c]) s_kb_fresh = 1;
         if (fresh[c]) s_held_mod[c] = 0;
     }
     for (int t = 0; t < PAD_TARGETS; t++)   /* ...or for a chord whose modifier is held then, until it is let go */
@@ -1196,6 +1200,82 @@ static void pad_publish_devices(void)
         if (s_rumble_dev[i] != s_poll_dev[i]) InterlockedExchange(&s_rumble_dev[i], s_poll_dev[i]);
 }
 
+/* The device whose button icons the title shows (pad_glyph.h, cellPad_host_glyph_device). */
+static PadGlyphState s_glyph;
+static volatile long s_glyph_device;   /* PAD_GLYPH_*, as the last update left it (any thread reads it) */
+static volatile long s_glyph_busy;     /* two threads can poll in the same tick: one updates */
+
+/* The icons a pad on a port takes: PlayStation for Sony's pads over HID, Xbox for XInput, and for SDL's pads the type
+ * SDL gives (a pad SDL does not know takes Xbox's, the usual layout of the others). */
+static int pad_glyph_kind(long dev)
+{
+    if (dev == RUMBLE_NONE) return PAD_GLYPH_NONE;
+    if (dev & RUMBLE_HID) return PAD_GLYPH_PLAYSTATION;
+#if PAD_BACKEND_SDL2
+    if ((dev & 0xFF) == RUMBLE_SDL) {
+        const int k = pad_dev_index(dev);
+        SDL_GameController* gc = k < PAD_MAX_HOST_PORTS ? s_sdl_controllers[k] : NULL;
+        switch (gc ? SDL_GameControllerGetType(gc) : SDL_CONTROLLER_TYPE_UNKNOWN) {
+        case SDL_CONTROLLER_TYPE_PS3:
+        case SDL_CONTROLLER_TYPE_PS4:
+        case SDL_CONTROLLER_TYPE_PS5:
+            return PAD_GLYPH_PLAYSTATION;
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+            return PAD_GLYPH_NINTENDO;
+        default:
+            return PAD_GLYPH_XBOX;
+        }
+    }
+#endif
+    return PAD_GLYPH_XBOX;
+}
+
+/* Port 0's pad as the poll found it (after PAD_MAP and PAD_CONTROLLER, before the keyboard). */
+static void pad_glyph_sample(PadGlyphSample* s)
+{
+    static long dev = -1;
+    static int kind = PAD_GLYPH_NONE;
+    const PadHostState* hs = &s_host_state[0];
+    memset(s, 0, sizeof *s);
+    if (s_poll_dev[0] != dev) {   /* (SDL's type once per pad, not every poll) */
+        dev = s_poll_dev[0];
+        kind = pad_glyph_kind(dev);
+    }
+    s->pad_kind = hs->connected ? kind : PAD_GLYPH_NONE;
+    s->pad_buttons = hs->buttons;
+    s->lx = hs->analog_lx;
+    s->ly = hs->analog_ly;
+    s->rx = hs->analog_rx;
+    s->ry = hs->analog_ry;
+    s->l2 = hs->trigger_l2;
+    s->r2 = hs->trigger_r2;
+}
+
+static void pad_glyph_update(PadGlyphSample* s)
+{
+    s->keys_fresh = s_kb_fresh;
+    s_kb_fresh = 0;
+    if (InterlockedExchange(&s_glyph_busy, 1)) return;
+    const int was = s_glyph.device, now = pad_glyph_step(&s_glyph, s);
+    if (now != was) {
+        InterlockedExchange(&s_glyph_device, now);
+        static int log = -1;
+        PS3_KNOB(log, ps3_env_int("PAD_GLYPH_LOG", 0));
+        if (log) {
+            static const char* const names[] = {"none", "keyboard and mouse", "PlayStation", "Xbox", "Nintendo"};
+            printf("[cellPad] button icons: %s\n", names[now >= 0 && now <= 4 ? now : 0]);
+            fflush(stdout);
+        }
+    }
+    InterlockedExchange(&s_glyph_busy, 0);
+}
+
+/* cellPad.h */
+int cellPad_host_glyph_device(void) { return (int)s_glyph_device; }
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -1223,9 +1303,12 @@ static void pad_poll_backend(void)
     pad_apply_controller();
     pad_publish_devices();
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
+    PadGlyphSample glyph;
+    pad_glyph_sample(&glyph);   /* port 0's pad before the keys are merged in */
 #if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
     pad_poll_keyboard();
 #endif
+    pad_glyph_update(&glyph);
     if (s_host_hold || pad_background_hold())
         for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
             PadHostState* hs = &s_host_state[i];

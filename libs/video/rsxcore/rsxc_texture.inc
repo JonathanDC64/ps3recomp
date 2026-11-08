@@ -563,6 +563,86 @@ static void tex_res_release(VPTexSlot* t)
     t->blk.id = 0; t->blk_class = -1;
 }
 
+/* vp_upload_tex_slot for a texture the port draws its own image in place of (rsx_texture_override.h): the image
+ * into the slot as an RGBA8 texture of its own size and levels. The slot keeps the guest texture's shape, offset
+ * and checksum, so the cache finds it, and re-uploads it, as it would the guest's; draws view it through tov_lv
+ * (rsxc_frame.inc). The port's images change rarely (another pad picked up), so the slot's texture is made anew
+ * each time, the old one going with the last batch's fence as any other. -1 to try again next frame. */
+static int vp_upload_override(int slot, u32 key_off, u32 off, u32 w, u32 h, u32 fmt, u32 nlv, u32 nb,
+                              const rsx_texture_override_image* im)
+{
+    extern uint8_t* vm_base;
+    VPTexSlot* t = &s_d3d.vp_tex[slot];
+    u32 lv = im->levels;
+    { u32 most = 1;
+      for (u32 s = im->width > im->height ? im->width : im->height; s > 1; s >>= 1) most++;
+      if (lv > most) lv = most;
+      if (lv > 16u) lv = 16u; }
+    if (GPU_VALID(t->tex)) tex_res_release(t);
+    t->tov_lv = 0;
+    gpu_texture_desc td;
+    memset(&td, 0, sizeof td);
+    td.width = im->width; td.height = im->height;
+    td.layers = 1;
+    td.mips = (uint16_t)lv;
+    td.format = GPU_FORMAT_R8G8B8A8_UNORM; td.samples = 1;
+    td.use = GPU_USE_SAMPLED | GPU_USE_COPY_DST;
+    td.state = GPU_STATE_COPY_DEST;
+    if (!tex_res_create(t, &td)) return -1;
+    /* Each level's rows on a 256-byte pitch, each level at a 512-byte boundary (a placed footprint's). */
+    u64 at[16];
+    u32 pitch[16];
+    u64 total = 0;
+    for (u32 l = 0, lw = im->width, lh = im->height; l < lv; l++) {
+        at[l] = (total + 511u) & ~511ull;
+        pitch[l] = (lw * 4u + 255u) & ~255u;
+        total = at[l] + (u64)pitch[l] * lh;
+        if (lw > 1) lw >>= 1;
+        if (lh > 1) lh >>= 1;
+    }
+    gpu_buffer up = {0}; u64 up_at = 0;
+    u8* mapped = tex_stage_alloc_buf(total, &up, &up_at);
+    if (!mapped) { tex_res_release(t); return -1; }
+    const u8* src = (const u8*)im->rgba;
+    gpu_footprint fp;
+    fp.format = GPU_FORMAT_R8G8B8A8_UNORM;
+    fp.depth = 1;
+    for (u32 l = 0, lw = im->width, lh = im->height; l < lv; l++) {
+        for (u32 y = 0; y < lh; y++, src += (size_t)lw * 4u)
+            memcpy(mapped + at[l] + (u64)y * pitch[l], src, (size_t)lw * 4u);
+        fp.width = lw;
+        fp.height = lh;
+        fp.row_pitch = pitch[l];
+        fp.offset = up_at + at[l];
+        gpu_cmd_copy_buf_to_tex(s_rc_cmd, t->tex, l, 0, 0, 0, up, &fp);
+        if (lw > 1) lw >>= 1;
+        if (lh > 1) lh >>= 1;
+    }
+    gpu_cmd_barrier(s_rc_cmd, t->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
+    gpu_view_desc sv;
+    memset(&sv, 0, sizeof sv);
+    sv.texture = t->tex;
+    sv.kind = GPU_VIEW_SRV;
+    sv.dim = GPU_DIM_2D;
+    sv.mips = (u8)lv;
+    sv.format = GPU_FORMAT_R8G8B8A8_UNORM;
+    sv.swizzle = GPU_SWIZZLE_IDENTITY;
+    gpu_table_write_tex(s_rc_dev, s_rc_srv_pool, VP_TEX_SRV_BASE + (u32)slot, &sv);
+    if (t->key != key_off || t->w != w || t->h != h || t->fmt != fmt || t->cube)
+        s_vp_tex_index_dirty = 1;
+    t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+    t->cube = 0; t->used = 1; t->face_bytes = nb; t->lv = nlv;
+    t->tov_lv = lv; t->tov_redo = 0;
+    tcj_order_add(slot);
+    t->csum = tex_csum(vm_base + off, nb);
+    t->fsum = ps3_env_int("TEX_VERIFY", 0) ? tex_csum_full(vm_base + off, nb) : 0;
+    { static int n = 0;
+      if (n < 8 && ++n)
+          fprintf(stderr, "[TEX] the port's image for 0x%X %ux%u fmt 0x%02X: %ux%u, %u levels%c",
+                  key_off, w, h, fmt, im->width, im->height, lv, 10); }
+    return slot;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
@@ -641,6 +721,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
         {
             if (c->used) return i;                /* already bound this frame */
             if (c->lv != nlv) { slot = i; break; } /* RSX_TEX_MIPS changed: redo */
+            if (c->tov_redo) { slot = i; break; }  /* the port's image changed: ask it again */
             { static int nocache = -1;            /* TEX_NOCACHE=1 (live): always re-upload */
               PS3_KNOB(nocache, ps3_env_int("TEX_NOCACHE", 0));
               if (nocache) { slot = i; break; } }
@@ -779,6 +860,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
                   start_delta, w * h * bpp, 10); } } }
     if (slot < 0) slot = freeslot;
     VPTexSlot* t = &s_d3d.vp_tex[slot];
+    /* The port's own image in place of the guest's, for the shapes it watches (rsx_texture_override.h): asked at
+     * each upload, so again when the guest's bytes change, and when the port's image does (tov_redo). */
+    t->tov_redo = 0;
+    if (!cube) {
+        rsx_texture_override_image ovr;
+        const u32 nb0 = dxt ? blkrow * blkrows : w * h * bpp;
+        if (rsx_texture_override_ask(vm_base + off, nb0, w, h, fmt, &ovr) == 1)
+            return vp_upload_override(slot, key_off, off, w, h, fmt, nlv, nb0, &ovr);
+    }
     /* The upload buffer's rows hold the DECODED image, so they are sized from
      * dst_row_bytes -- w * bpp is the source row, which is narrower for any
      * format rsx_texture_decode unpacks. */
@@ -803,8 +893,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
      * the same dimensions would otherwise be reused with 1 array slice while the
      * cube path copies 6 subresources and writes a 6x upload buffer -- which
      * crashes. */
-    if (GPU_VALID(t->tex) && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->lv != nlv))
+    if (GPU_VALID(t->tex) && (t->w != w || t->h != h || t->fmt != fmt || t->cube != cube || t->lv != nlv ||
+                              t->tov_lv))   /* (the port's image was in it: another size and format) */
         tex_res_release(t);
+    t->tov_lv = 0;
     if (!GPU_VALID(t->tex)) {
         gpu_texture_desc td;
         memset(&td, 0, sizeof td);
