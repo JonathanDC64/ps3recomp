@@ -304,6 +304,19 @@ rtt_dump_done:;
     tcj_dispatch();
     s_psj_defer = psj_threads() > 0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
+    /* The port's images changed (rsx_texture_override.h): each texture of a shape it watches, and each holding
+     * one of its images, asks again at its next bind. One read a frame; the walk only when they change. */
+    { static u32 tov_seen = 1;
+      const u32 e = rsx_texture_override_epoch();
+      if (e != tov_seen) {
+          tov_seen = e;
+          for (int _i = 0; _i < VP_TEX_SLOTS; _i++) {
+              VPTexSlot* _t = &s_d3d.vp_tex[_i];
+              if (GPU_VALID(_t->tex) && !_t->cube &&
+                  (_t->tov_lv || rsx_texture_override_watched(_t->w, _t->h, _t->fmt)))
+                  _t->tov_redo = 1;
+          }
+      } }
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
@@ -519,11 +532,15 @@ rtt_dump_done:;
                          * ones are viewed as stored, like an offscreen RT. */
                         const int _x8 = _tl.fmt == RSX_TEXFMT_R8G8B8A8 ||
                                         _tl.fmt == RSX_TEXFMT_R8G8 || _tl.compressed;
-                        srv_write_ex(wslot, s_d3d.vp_tex[ts].tex, rsx_texfmt_format(_tl.fmt),
+                        /* (A port's image in the slot, tov_lv: RGBA8 with its own levels, under the
+                         * guest's swizzle: rsx_texture_override.h.) */
+                        const VPTexSlot* _ts = &s_d3d.vp_tex[ts];
+                        srv_write_ex(wslot, _ts->tex,
+                                  _ts->tov_lv ? GPU_FORMAT_R8G8B8A8_UNORM : rsx_texfmt_format(_tl.fmt),
                                   (_bf == 0x81) ? 0x1000
                                   : _x8 ? rsx_remap_to_swizzle(dr->tex[_u].ctrl1, _bf)
                                         : GPU_SWIZZLE_IDENTITY,
-                                  _cube, s_d3d.vp_tex[ts].lv);
+                                  _cube, _ts->tov_lv ? _ts->tov_lv : _ts->lv);
                         continue;
                     }
                 }

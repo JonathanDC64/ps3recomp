@@ -246,6 +246,9 @@ typedef struct {
                          * shift it, so keying on off never matches the raw offset
                          * a later draw arrives with, and every draw re-uploads. */
     int used;           /* referenced this frame */
+    u32 tov_lv;         /* holds the port's image in place of the guest's (rsx_texture_override.h): its
+                         * levels, the texture RGBA8 at the image's size; 0: the guest's own */
+    int tov_redo;       /* the port's image changed: ask again at the next bind */
 } VPTexSlot;
 /* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style
  * frame but not for a scene: this title binds ~20 distinct textures per frame,

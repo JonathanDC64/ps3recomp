@@ -648,6 +648,16 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_pad_glyph PRIVATE -UNDEBUG)
     endif()
     add_test(NAME pad_glyph COMMAND test_pad_glyph)
+    # A port's own image in place of a title's texture: the table of hooks (rsx_texture_override.c).
+    add_executable(test_rsx_texture_override libs/video/tests/test_rsx_texture_override.c
+                   libs/video/rsx_texture_override.c)
+    target_include_directories(test_rsx_texture_override PRIVATE libs/video)
+    if(MSVC)
+        target_compile_options(test_rsx_texture_override PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_rsx_texture_override PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME rsx_texture_override COMMAND test_rsx_texture_override)
     # Event queues made and destroyed while host threads push to them (#311). It links the whole runtime, with
     # host_stubs.c for the loader's symbols, as test_rsx_synth does (Windows and Linux).
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
