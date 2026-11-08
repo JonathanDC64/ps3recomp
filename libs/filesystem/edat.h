@@ -45,7 +45,8 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  * an open() failure it cannot attribute). Otherwise returns a path written into
  * `buf`:
  *   - with PS3_EDAT_PLAIN=<folder>, the player's own decrypted copy when that folder
- *     has one: at the file's path below PS3_VFS_ROOT, named "<name>.unedat" (RPCS3's
+ *     has one: at the file's path below PS3_VFS_ROOT (a file of the game's update, in
+ *     PS3_VFS_UPDATE: below the folder's PS3_GAME), named "<name>.unedat" (RPCS3's
  *     Decrypt PS3 Binaries' name), of the size the header gives. Nothing is
  *     decrypted or written then.
  *   - else a cache of the runtime's own decryption: beside the source as

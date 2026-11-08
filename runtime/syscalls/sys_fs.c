@@ -90,7 +90,7 @@ static void fs_normalize_sep(char* p) {
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
  * their own translation (see docs), and a guest path can arrive at any of them. */
-void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+static void ps3game_shape(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
@@ -121,6 +121,26 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     if (stat(alt, &st) != 0)
         return;
     snprintf(path, cap, "%s", alt);
+}
+
+/* A disc game's update (PS3_VFS_UPDATE, vfs_path.h): a file the update has is the one the guest gets, as on a PS3
+ * that installed it. Also a file the disc does not have. */
+static void update_overlay(char* path, size_t cap)
+{
+    static const char* update = NULL;
+    static int init = 0;
+    if (!init) { update = getenv("PS3_VFS_UPDATE"); init = 1; }
+    if (!update || !*update || !path || !*path) return;
+    char alt[1024];
+    struct stat st;
+    if (ps3_vfs_update_path(path, update, alt, sizeof alt) && stat(alt, &st) == 0 && (st.st_mode & S_IFMT) != S_IFDIR)
+        snprintf(path, cap, "%s", alt);
+}
+
+void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    ps3game_shape(path, cap);
+    update_overlay(path, cap);
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)

@@ -37,6 +37,8 @@ static int g_fail = 0;
 #define PLAIN TMP "/plain"
 #define PLAIN_COPY PLAIN "/PS3_GAME/USRDIR/a.sdat.unedat"
 #define NOT_NPD TMP "/game/PS3_GAME/USRDIR/b.dat"
+#define UPDATE_SRC TMP "/update/USRDIR/u.sdat"
+#define UPDATE_PLAIN PLAIN "/PS3_GAME/USRDIR/u.sdat.unedat"
 
 static void set_env(const char* name, const char* value)
 {
@@ -137,9 +139,9 @@ static void clean(void)
     char c1[512], c2[512];
     cache_name(c1, sizeof c1, SRC);
     cache_name(c2, sizeof c2, SRC2);
-    const char* files[] = {SRC, SRC ".dec", SRC2, NOT_NPD, c1, c2, PLAIN_COPY};
+    const char* files[] = {SRC, SRC ".dec", SRC2, NOT_NPD, c1, c2, PLAIN_COPY, UPDATE_SRC, UPDATE_PLAIN};
     for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) remove(files[i]);
-    const char* dirs[] = {TMP "/game/PS3_GAME/USRDIR", TMP "/game/PS3_GAME", TMP "/game", TMP "/other",
+    const char* dirs[] = {TMP "/game/PS3_GAME/USRDIR", TMP "/game/PS3_GAME", TMP "/game", TMP "/other", TMP "/update/USRDIR", TMP "/update",
                           CACHE, TMP "/cache/x", TMP "/cache", PLAIN "/PS3_GAME/USRDIR", PLAIN "/PS3_GAME", PLAIN, TMP};
     for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) rmdir(dirs[i]);
 }
@@ -149,10 +151,12 @@ int main(void)
     clean();
     make_dirs(TMP "/game/PS3_GAME/USRDIR");
     make_dirs(TMP "/other");
+    make_dirs(TMP "/update/USRDIR");
     make_dirs(PLAIN "/PS3_GAME/USRDIR");
     set_env("PS3_EDAT_CACHE", NULL);
     set_env("PS3_EDAT_PLAIN", NULL);
     set_env("PS3_VFS_ROOT", NULL);
+    set_env("PS3_VFS_UPDATE", NULL);
 
     uint8_t plain[200];
     for (size_t i = 0; i < sizeof plain; i++) plain[i] = (uint8_t)(i * 7 + 3);
@@ -233,6 +237,21 @@ int main(void)
     set_env("PS3_VFS_ROOT", NULL);
     r = edat_resolve(SRC, buf, sizeof buf);
     CHECK(r == buf && !strcmp(buf, c1));
+
+    /* A file of the game's update (PS3_VFS_UPDATE): its copy is below the plain folder's PS3_GAME. Without the
+     * knob the file is below neither root, so no copy is looked for and the runtime decrypts it into its cache. */
+    CHECK(write_sdat(UPDATE_SRC, plain, sizeof plain, 0x40));
+    CHECK(write_file(UPDATE_PLAIN, plain, sizeof plain));
+    set_env("PS3_VFS_ROOT", TMP "/game");
+    set_env("PS3_VFS_UPDATE", TMP "/update");
+    r = edat_resolve(UPDATE_SRC, buf, sizeof buf);
+    CHECK(r == buf && !strcmp(buf, UPDATE_PLAIN));
+    set_env("PS3_VFS_UPDATE", NULL);
+    r = edat_resolve(UPDATE_SRC, buf, sizeof buf);
+    CHECK(r == buf && strcmp(buf, UPDATE_PLAIN) != 0);
+    if (r == buf) remove(buf);
+    remove(UPDATE_PLAIN);
+    remove(UPDATE_SRC);
 
     /* A copy of another size than the header gives is not this file's: the runtime decrypts into its cache. */
     remove(c1);
