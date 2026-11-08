@@ -639,6 +639,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_pad_controller PRIVATE -UNDEBUG)
     endif()
     add_test(NAME pad_controller COMMAND test_pad_controller)
+    # Which device's button icons a title shows: the last one used (pad_glyph.h).
+    add_executable(test_pad_glyph libs/input/tests/test_pad_glyph.c)
+    target_include_directories(test_pad_glyph PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_glyph PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_glyph PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_glyph COMMAND test_pad_glyph)
     # Event queues made and destroyed while host threads push to them (#311). It links the whole runtime, with
     # host_stubs.c for the loader's symbols, as test_rsx_synth does (Windows and Linux).
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")

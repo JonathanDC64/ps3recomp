@@ -242,6 +242,12 @@ int cellPad_host_controllers(char* out, int n);
  * Both are always terminated. 0 when there is no i-th. */
 int cellPad_host_controller(int i, char* id, int idn, char* name, int namen);
 
+/* The device whose button icons the title shows: the last one used on port 0, by pad_glyph.h's rules. 0 before
+ * the first poll and with PS3_NO_USER_INPUT, 1 the keyboard and mouse, 2 a PlayStation pad, 3 an Xbox (or other
+ * XInput, or unknown) pad, 4 a Nintendo pad (off Windows, where SDL reads it; Steam Input shows one as Xbox).
+ * PAD_GLYPH_LOG=1 logs each change. Any thread. */
+int cellPad_host_glyph_device(void);
+
 /* One of the title's menus is open: PAD_KEYS bindings marked "menu:" count,
  * and the other bindings of the same inputs do not. */
 void cellPad_host_set_menu(int open);
