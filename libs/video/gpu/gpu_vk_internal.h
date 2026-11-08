@@ -436,6 +436,9 @@ typedef struct gpu_vk_swap {
     VkCommandPool    blit_pool;
     VkCommandBuffer  blit_cb[GPU_VK_MAX_IMAGES];
     VkFence          blit_fence[GPU_VK_MAX_IMAGES];   /* the image's last blit done */
+    /* Exclusive fullscreen (swap_exclusive): the swap chain is made for the
+     * program to take the display, and it has it now. */
+    uint32_t         excl_app, excl_held;
 } gpu_vk_swap;
 
 enum { GPU_VK_DEFER_BUFFER = 0, GPU_VK_DEFER_TEXTURE = 1 };
@@ -576,6 +579,7 @@ typedef struct gpu_vk_device {
     char                       driver[64];
 
     /* What was enabled (after RSX_VK_MASK). */
+    uint32_t has_fse;   /* VK_EXT_full_screen_exclusive (Windows) */
     uint32_t has_gs, has_null_desc, has_robust2, has_host_import, has_present_id, has_present_wait,
              has_swap_maint1, has_fault, has_checkpoints, has_hdr_meta, has_unused_att, has_debug_utils,
              has_colorspace, has_surface_caps2, has_surface_maint1, has_mirror, has_aniso, has_precise,
@@ -772,6 +776,7 @@ uint32_t      gpu_vk_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* 
 uint32_t      gpu_vk_swap_image_count(gpu_device* d, gpu_swapchain sc);
 gpu_texture   gpu_vk_swap_image(gpu_device* d, gpu_swapchain sc, uint32_t index);
 int           gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint32_t flags);
+int           gpu_vk_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on);
 int           gpu_vk_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out);
 int           gpu_vk_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, const gpu_hdr_metadata* meta);
 /* Under qlock, in a submit: the waits and signals its swap chain options ask. */

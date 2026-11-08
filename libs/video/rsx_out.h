@@ -83,6 +83,7 @@ struct rsx_d3d12_overlay;   /* rsx_d3d12_backend.h (the port's des_ui.cpp has it
     R(unsigned,    back_buffer_count,     rsx_d3d12_back_buffer_count,     (void), ()) \
     R(unsigned,    back_buffer_format,    rsx_d3d12_back_buffer_format,    (void), ()) \
     R(int,         hdr,                   rsx_d3d12_hdr,                   (float* ui_scale, int* srgb), (ui_scale, srgb)) \
+    /* on: 0 window, 1 borderless fullscreen, 2 exclusive fullscreen (Windows; 1 elsewhere). */ \
     V(             set_borderless,        rsx_d3d12_set_borderless,        (int on), (on)) \
     R(int,         borderless,            rsx_d3d12_borderless,            (void), ()) \
     R(long long,   display_timing,        rsx_d3d12_display_timing,        (long long* vblank), (vblank)) \

@@ -88,6 +88,28 @@ static void set_borderless(HWND hwnd, int on)
     s_borderless = !!on;
 }
 
+/* Exclusive fullscreen is the borderless window with the display taken as
+ * well, by the thread that presents (exclusive_step, between frames). Leaving
+ * it, that thread gives the display back first and sends the mode back here,
+ * so the window never changes under a display still held. */
+static volatile LONG s_excl_want;        /* take the display, and take it again after Alt+Tab */
+static volatile LONG s_excl_then = -1;   /* the mode to go to once the display is given back */
+static int s_fullscreen_last = 1;        /* what Alt+Enter goes back to. Window-thread state. */
+
+/* 0 window, 1 borderless, 2 exclusive. */
+static void fullscreen_set(HWND hwnd, int mode)
+{
+    if (s_excl_want && mode != 2) {
+        InterlockedExchange(&s_excl_then, mode);
+        InterlockedExchange(&s_excl_want, 0);
+        return;
+    }
+    InterlockedExchange(&s_excl_then, -1);
+    if (mode == 2) InterlockedExchange(&s_excl_want, 1);   /* (first: rc_borderless shows no borderless step on the way) */
+    set_borderless(hwnd, mode != 0);
+    if (mode) s_fullscreen_last = mode;
+}
+
 static int window_dpi(HWND hwnd);
 
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -104,7 +126,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InterlockedExchange(&s_win_req, (LONG)(((u32)LOWORD(lp) << 16) | HIWORD(lp)));
         break;
     case WM_RSX_BORDERLESS:
-        set_borderless(hwnd, (int)wp);
+        fullscreen_set(hwnd, (int)wp);
         return 0;
     case WM_ACTIVATE:
     case WM_DISPLAYCHANGE:   /* HDR switched, or the SDR white level moved meanwhile (hdr_display_check) */
@@ -126,7 +148,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && (lp & (1 << 29)) && !(lp & (1 << 30))) {   /* Alt+Enter, not repeat */
-            set_borderless(hwnd, !s_borderless);
+            fullscreen_set(hwnd, s_borderless ? 0 : s_fullscreen_last);
             return 0;
         }
         break;

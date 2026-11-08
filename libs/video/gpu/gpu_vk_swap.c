@@ -222,6 +222,30 @@ static int modes_compatible(gpu_vk_device* dd, const gpu_vk_swap* s)
     return 0;
 }
 
+#ifdef _WIN32
+/* Whether this surface can be held exclusively, on the display the window is on. */
+static int excl_supported(gpu_vk_device* dd, const gpu_vk_swap* s)
+{
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fw;
+    VkPhysicalDeviceSurfaceInfo2KHR si;
+    VkSurfaceCapabilitiesFullScreenExclusiveEXT fc;
+    VkSurfaceCapabilities2KHR c2;
+    memset(&fw, 0, sizeof fw);
+    memset(&si, 0, sizeof si);
+    memset(&fc, 0, sizeof fc);
+    memset(&c2, 0, sizeof c2);
+    fw.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+    fw.hmonitor = MonitorFromWindow((HWND)s->window, MONITOR_DEFAULTTONEAREST);
+    si.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+    si.pNext = &fw;
+    si.surface = s->surface;
+    fc.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_FULL_SCREEN_EXCLUSIVE_EXT;
+    c2.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+    c2.pNext = &fc;
+    return vkGetPhysicalDeviceSurfaceCapabilities2KHR(dd->phys, &si, &c2) == VK_SUCCESS && fc.fullScreenExclusiveSupported;
+}
+#endif
+
 /* The presents' fences (maintenance1): once they signal, the presents are
  * done with their semaphores. */
 static void presents_wait(gpu_vk_device* dd, gpu_vk_swap* s)
@@ -438,6 +462,29 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
         pm.pPresentModes = both;
         ci.pNext = &pm;
     }
+#ifdef _WIN32
+    if (s->excl_held && s->sc) dd->vk.vkReleaseFullScreenExclusiveModeEXT(dd->device, s->sc);   /* (before it is retired) */
+    s->excl_held = 0;
+    /* Unless the program takes the display itself (swap_exclusive), the driver
+     * may not take it on its own: Fullscreen is a borderless window. */
+    VkSurfaceFullScreenExclusiveInfoEXT fse;
+    VkSurfaceFullScreenExclusiveWin32InfoEXT fw;
+    memset(&fse, 0, sizeof fse);
+    memset(&fw, 0, sizeof fw);
+    if (dd->has_fse) {
+        fse.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT;
+        fse.fullScreenExclusive = s->excl_app ? VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT
+                                              : VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        fse.pNext = (void*)ci.pNext;
+        ci.pNext = &fse;
+        if (s->excl_app) {
+            fw.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
+            fw.hmonitor = MonitorFromWindow((HWND)s->window, MONITOR_DEFAULTTONEAREST);
+            fw.pNext = fse.pNext;
+            fse.pNext = &fw;
+        }
+    }
+#endif
     VkSwapchainKHR sc = VK_NULL_HANDLE;
     const VkResult r = dd->vk.vkCreateSwapchainKHR(dd->device, &ci, NULL, &sc);
     if (s->sc) dd->vk.vkDestroySwapchainKHR(dd->device, s->sc, NULL);   /* (retired either way) */
@@ -512,6 +559,10 @@ static int chain_make(gpu_vk_device* dd, gpu_vk_swap* s)
     s->period = refresh_ticks(s->window);   /* (step VC2: present_gate; a new chain, maybe a new display) */
     s->vblank = 0;
     s->chain_id0 = s->present_id;
+#ifdef _WIN32
+    s->excl_held = s->excl_app && IsWindowVisible((HWND)s->window) && GetForegroundWindow() == (HWND)s->window
+                && dd->vk.vkAcquireFullScreenExclusiveModeEXT(dd->device, s->sc) == VK_SUCCESS;
+#endif
     return 0;
 }
 
@@ -632,6 +683,9 @@ int gpu_vk_swap_resize(gpu_device* d, gpu_swapchain sc, uint32_t width, uint32_t
     gpu_vk_swap* const s = swap_of(dd, sc);
     const VkFormat vkfmt = vkfmt_of(format);
     if (!s || !vkfmt) return -1;
+    /* (Exclusive fullscreen asks for a resize at the same size, which D3D12 needs. A new swap chain here would only make
+     * the display switch twice.) */
+    if (s->excl_app && s->sc && !s->recreate && width == s->width && height == s->height && format == s->format) return 0;
     s->width = width;
     s->height = height;
     s->format = format;
@@ -673,7 +727,9 @@ uint32_t gpu_vk_swap_acquire(gpu_device* d, gpu_swapchain sc, gpu_texture* image
             surface_again(dd, s);
             continue;
         }
-        if (r != VK_ERROR_OUT_OF_DATE_KHR) {
+        if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
+            s->excl_held = 0;   /* (Alt+Tab: a new swap chain, borderless until the window is back) */
+        } else if (r != VK_ERROR_OUT_OF_DATE_KHR) {
             gpu_vk_lost_note(dd, r);
             return 0;
         }
@@ -819,6 +875,7 @@ int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint
     const int code = gpu_vk_present_code(r);
     if (code == GPU_PRESENTED) {
         if (s->present_fence[idx]) s->fence_pending[idx] = 1;
+        if (r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) s->excl_held = 0;
         if (r != VK_SUCCESS) s->recreate = 1;
         return GPU_PRESENTED;
     }
@@ -830,6 +887,40 @@ int gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, uint
     return code;
 }
 
+/* gpu_swap_exclusive. Taking the display needs a swap chain made for it, which
+ * the next acquire makes (chain_make takes the display); after that, a display
+ * lost to Alt+Tab is asked for again here. */
+int gpu_vk_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on)
+{
+#ifdef _WIN32
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    gpu_vk_swap* const s = swap_of(dd, sc);
+    if (!s || !dd->has_fse) return 0;
+    if (on < 0) return (int)s->excl_held;
+    if (!on) {
+        if (s->excl_held && s->sc) dd->vk.vkReleaseFullScreenExclusiveModeEXT(dd->device, s->sc);
+        s->excl_held = 0;
+        if (s->excl_app) {
+            s->excl_app = 0;
+            s->recreate = 1;
+        }
+        return 0;
+    }
+    if (!s->excl_app) {
+        if (!excl_supported(dd, s)) return 0;
+        s->excl_app = 1;
+        s->recreate = 1;
+        return 0;
+    }
+    if (!s->excl_held && s->sc && !s->recreate)
+        s->excl_held = dd->vk.vkAcquireFullScreenExclusiveModeEXT(dd->device, s->sc) == VK_SUCCESS;
+    return (int)s->excl_held;
+#else
+    (void)d; (void)sc; (void)on;
+    return 0;
+#endif
+}
+
 /* ---- step VC2 ---- */
 /* What a present's (or an acquire's) VkResult means, as gpu.h's codes. */
 int gpu_vk_present_code(VkResult r)
@@ -838,6 +929,7 @@ int gpu_vk_present_code(VkResult r)
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
     case VK_ERROR_OUT_OF_DATE_KHR:   /* (made again at the next acquire) */
+    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:   /* (Alt+Tab) */
         return GPU_PRESENTED;
     case VK_ERROR_DEVICE_LOST:      return GPU_PRESENT_LOST;
     case VK_ERROR_SURFACE_LOST_KHR: return GPU_PRESENT_SURFACE_LOST;

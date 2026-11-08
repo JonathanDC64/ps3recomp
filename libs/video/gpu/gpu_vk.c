@@ -462,6 +462,9 @@ static int device_make(gpu_vk_device* dd, const gpu_device_desc* desc, uint32_t 
     const int e_host = ext_has(ep, n, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     const int e_cp = ext_has(ep, n, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     const int e_hdr = e_swap && ext_has(ep, n, VK_EXT_HDR_METADATA_EXTENSION_NAME);
+#ifdef _WIN32
+    const int e_fse = e_swap && dd->has_surface_caps2 && ext_has(ep, n, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+#endif
     free(ep);
     {
         void** tail = &a2.pNext;
@@ -584,6 +587,9 @@ static int device_make(gpu_vk_device* dd, const gpu_device_desc* desc, uint32_t 
     if (use_host) list_add(&ext, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (use_cp) list_add(&ext, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     if (use_hdr) list_add(&ext, VK_EXT_HDR_METADATA_EXTENSION_NAME);
+#ifdef _WIN32
+    if (e_fse) list_add(&ext, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+#endif
 
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qi;
@@ -630,6 +636,9 @@ static int device_make(gpu_vk_device* dd, const gpu_device_desc* desc, uint32_t 
     dd->has_host_import = (uint32_t)use_host;
     dd->has_checkpoints = (uint32_t)use_cp;
     dd->has_hdr_meta = (uint32_t)use_hdr;
+#ifdef _WIN32
+    dd->has_fse = (uint32_t)e_fse;
+#endif
     if (!e_swap) dd->has_surface = 0;
     {
         VkFormatProperties fp;
@@ -2093,6 +2102,7 @@ static void* vkb_native(gpu_device* d, uint32_t kind, uint64_t handle)
 #define vkb_swap_image_count     gpu_vk_swap_image_count
 #define vkb_swap_image           gpu_vk_swap_image
 #define vkb_swap_present         gpu_vk_swap_present
+#define vkb_swap_exclusive       gpu_vk_swap_exclusive
 #define vkb_swap_stats           gpu_vk_swap_stats
 #define vkb_swap_hdr             gpu_vk_swap_hdr
 

@@ -3617,6 +3617,13 @@ static int nl_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t interval, u
     return at_load32(&nd->lost) ? GPU_PRESENT_LOST : GPU_PRESENTED;
 }
 
+/* No display to take. */
+static int nl_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on)
+{
+    (void)d; (void)sc; (void)on;
+    return 0;
+}
+
 /* No display: no statistics. */
 static int nl_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out)
 {
