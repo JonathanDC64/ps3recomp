@@ -211,11 +211,17 @@ jobs:
 
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
-      # source, on an SDAT the test makes with edat.c's own AES.
+      # source, on an SDAT the test makes with edat_decrypt.c's own AES.
       - name: Run the EDAT path test
         run: |
           clang -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_paths libs/filesystem/tests/test_edat_paths.c
           /tmp/test_edat_paths
+
+      # The same with no decryptor (PS3RECOMP_NO_DECRYPT): edat.c alone, which only opens decrypted copies.
+      - name: Run the EDAT no-decrypt test
+        run: |
+          clang -std=gnu17 -Wall -Wextra -I include -I libs/filesystem -o /tmp/test_edat_no_decrypt libs/filesystem/tests/test_edat_no_decrypt.c
+          /tmp/test_edat_no_decrypt
 
       # Every guest path passes the same checks before it becomes a host path
       # (include/ps3emu/vfs_path.h): no '..' above the root, no ':', control

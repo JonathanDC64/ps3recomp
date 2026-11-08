@@ -4,7 +4,7 @@ Extract WWS SPU job code modules (C0DEC0DE) from a title's SDATA archives.
 
 Pipeline:
   1. SDATA-decrypt patch.sdat / data.sdat (same algorithm as the runtime's
-     sdata_decrypt.h -- verified against RPCS3 Crypto/unedat.cpp).
+     libs/filesystem/edat_decrypt.c -- verified against RPCS3 Crypto/unedat.cpp).
   2. Find every zlib stream in the plaintext and inflate it FULLY (no size cap
      -- the earlier extraction capped at 32 KiB and truncated 5 modules, one of
      which had its entry point past the 32 KiB boundary).

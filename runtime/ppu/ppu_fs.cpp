@@ -19,7 +19,6 @@
 #include "../../libs/filesystem/edat.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
-#include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -329,13 +328,8 @@ static void cellFsSdataOpen(ppu_context* ctx)
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
 
-    /* Same NPDRM step cellFsOpen does: an encrypted container is decrypted once
-     * into a cache file and that is opened in its place. This used to be a
-     * second, weaker decryptor local to this function (sdata_decrypt below),
-     * which handled the self-keyed SDATA form only and refused every real EDAT
-     * -- so a title whose data file was EDAT rather than SDATA got "success
-     * without a handle" here while the very same file opened fine through
-     * cellFsOpen. One decryptor, reached from both doors. */
+    /* Same NPDRM step cellFsOpen does: an encrypted container is opened as its
+     * decrypted copy or cache file. One decryptor, reached from both doors. */
     { char dec_path[1200];
       const char* use = edat_resolve(hpath, dec_path, sizeof dec_path);
       if (use != hpath) snprintf(hpath, sizeof hpath, "%s", use); }
@@ -356,38 +350,10 @@ static void cellFsSdataOpen(ppu_context* ctx)
     size_t got = fread(magic, 1, 4, f);
     fseek(f, 0, SEEK_SET);
     if (got == 4 && magic[0]=='N' && magic[1]=='P' && magic[2]=='D') {
-        /* NPD-encrypted SDATA: decrypt it in full and serve the plaintext from
-         * an anonymous tmpfile so the title's reads see the real container. */
-        fseek(f, 0, SEEK_END); long enc_sz = ftell(f); fseek(f, 0, SEEK_SET);
-        uint8_t* enc = (enc_sz > 0) ? (uint8_t*)malloc((size_t)enc_sz) : nullptr;
-        size_t rd = enc ? fread(enc, 1, (size_t)enc_sz, f) : 0;
         fclose(f);
-        size_t dec_sz = 0;
-        uint8_t* dec = (enc && rd == (size_t)enc_sz) ? sdata_decrypt(enc, rd, &dec_sz) : nullptr;
-        free(enc);
-        if (!dec) {
-            fprintf(stderr, "[fs] SdataOpen '%s' NPD decrypt FAILED (unsupported "
-                    "EDAT/needs license); returning success without a handle\n", gpath);
-            ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
-        }
-        char dmagic[4] = {0};
-        if (dec_sz >= 4) memcpy(dmagic, dec, 4);
-        FILE* tf = tmpfile();
-        if (!tf || fwrite(dec, 1, dec_sz, tf) != dec_sz) {
-            if (tf) fclose(tf); free(dec);
-            ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
-        }
-        free(dec);
-        rewind(tf);
-        int fd = fd_alloc_file(tf);
-        if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
-        if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
-        fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
-                gpath, fd, dec_sz,
-                dmagic[0]?dmagic[0]:'?', dmagic[1]?dmagic[1]:'?',
-                dmagic[2]?dmagic[2]:'?', dmagic[3]?dmagic[3]:'?');
-        ctx->gpr[3] = CELL_OK;
-        return;
+        fprintf(stderr, "[fs] SdataOpen '%s' is still encrypted (unsupported EDAT, needs a "
+                "license, or no decrypted copy); returning success without a handle\n", gpath);
+        ctx->gpr[3] = CELL_OK; return;   /* don't feed the title ciphertext */
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }

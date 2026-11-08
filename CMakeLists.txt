@@ -79,6 +79,16 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # (LNK4006) but lld-link errors on the duplicate symbols when linking an exe.
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/sceNpCommerce\\.c$")
 
+# Leaves the NPDRM decryptor and its keys out of the runtime. A title's encrypted files then need decrypted copies
+# (PS3_EDAT_PLAIN, libs/filesystem/edat.h). A source tree without the file builds this way.
+option(PS3RECOMP_NO_DECRYPT "Build without the NPDRM decryptor and its keys; encrypted files need decrypted copies" OFF)
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/filesystem/edat_decrypt.c")
+    set(PS3RECOMP_NO_DECRYPT ON)
+endif()
+if(PS3RECOMP_NO_DECRYPT)
+    list(FILTER HLE_SOURCES EXCLUDE REGEX "/edat_decrypt\\.c$")
+endif()
+
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
@@ -464,6 +474,9 @@ endif()
 # them, are the title's to compile, with the same definition and header): the
 # default library is unchanged. Windows (clang-cl) and x86-64 Linux (clang),
 # where the game is an ELF shared object.
+if(PS3RECOMP_NO_DECRYPT)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NO_DECRYPT=1)
+endif()
 option(PS3RECOMP_GAME_SPLIT "Build the runtime for a host that loads the game from a DLL" OFF)
 if(PS3RECOMP_GAME_SPLIT)
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3_GAME_SPLIT)

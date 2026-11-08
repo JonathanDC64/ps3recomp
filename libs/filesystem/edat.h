@@ -35,7 +35,8 @@ extern "C" {
 /* True if the file at host_path starts with the NPD magic. Cheap: one 4-byte read. */
 int edat_is_npd(const char* host_path);
 
-/* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged). */
+/* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged).
+ * Not in a build with PS3RECOMP_NO_DECRYPT, nor is edat_selftest. */
 int edat_decrypt_file(const char* in_path, const char* out_path);
 
 /* The path the FS layer should actually open for `host_path`.
@@ -53,6 +54,8 @@ int edat_decrypt_file(const char* in_path, const char* out_path);
  *     "<name>.dec", or, with PS3_EDAT_CACHE=<folder>, in that folder as
  *     "<name>.<hash of the source's path>.dec" (the game folder is then only read).
  *     It is reused while it is newer than the source.
+ * A build with PS3RECOMP_NO_DECRYPT has no decryptor and no keys: only the decrypted
+ * copy counts, and without one host_path comes back (the reason logged).
  * Set PS3_EDAT=0 to disable the whole path. */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap);
 

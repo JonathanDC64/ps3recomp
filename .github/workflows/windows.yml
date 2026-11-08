@@ -283,13 +283,22 @@ jobs:
 
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
-      # source, on an SDAT the test makes with edat.c's own AES.
+      # source, on an SDAT the test makes with edat_decrypt.c's own AES.
       - name: Run the EDAT path test
         if: ${{ !cancelled() }}
         run: |
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/filesystem /Fe:test_edat_paths.exe libs/filesystem/tests/test_edat_paths.c
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_edat_paths.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The same with no decryptor (PS3RECOMP_NO_DECRYPT): edat.c alone, which only opens decrypted copies.
+      - name: Run the EDAT no-decrypt test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/filesystem /Fe:test_edat_no_decrypt.exe libs/filesystem/tests/test_edat_no_decrypt.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_edat_no_decrypt.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # Every guest path passes the same checks before it becomes a host path
