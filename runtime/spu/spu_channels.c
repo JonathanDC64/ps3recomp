@@ -738,6 +738,8 @@ static inline void spu_llar_nap_check(spu_context* ctx, uint32_t ea)
 {
     { static int s_nap = -1;
       PS3_KNOB(s_nap, ps3_env_int("SPU_LLAR_NAP", 1));
+      static unsigned s_after = 64;
+      PS3_KNOB(s_after, (unsigned)ps3_env_int("SPU_LLAR_NAP_AFTER", 64));
       static SPU_THREAD_LOCAL uint32_t n_ea; static SPU_THREAD_LOCAL unsigned n_same;
       static SPU_THREAD_LOCAL unsigned long n_xfers;
       static SPU_THREAD_LOCAL uint8_t n_line[MFC_ATOMIC_LINE];
@@ -752,7 +754,7 @@ static inline void spu_llar_nap_check(spu_context* ctx, uint32_t ea)
               t_llar_last = (unsigned long long)q.QuadPart;
           }
           if (same) {
-              if (++n_same > 20000u) spu_llar_idle_wait(ctx);
+              if (++n_same > s_after) spu_llar_idle_wait(ctx);
           } else {
               n_ea = ea; n_same = 0; memcpy(n_line, ctx->resv_line, MFC_ATOMIC_LINE);
           }
@@ -1010,12 +1012,27 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * on hardware it would sleep on the lock-line-lost event. Here it ran
          * flat out -- Demon's Souls' HighGraphics ring consumer (img 2, pc
          * 0x5120) re-read the ring's write pointer ~8M times a second and
-         * pinned a core whenever it had caught up. After 20k unchanged reads in
-         * a row, block until a write to the line drops the reservation
-         * (spu_coh_notify_write -> spu_ch_wake; 2 ms timeout as the safety
-         * net for a missed wake): a waiter wakes on the write, at worst 2 ms
-         * late, and a busy consumer (whose line keeps
+         * pinned a core whenever it had caught up. After 64 unchanged reads in
+         * a row (SPU_LLAR_NAP_AFTER), block until a write to the line drops
+         * the reservation (spu_coh_notify_write -> spu_ch_wake; 2 ms timeout
+         * as the safety net for a missed wake): a waiter wakes on the write,
+         * at worst 2 ms late, and a busy consumer (whose line keeps
          * changing) never reaches the threshold. SPU_LLAR_NAP=0 disables it.
+         *
+         * Why 64 and not more: every SPU task is a host thread here, and a
+         * waiting one competes for the CPU with the threads it waits for. The
+         * threshold was 20000, which is 40-100 ms of polling for Demon's
+         * Souls' Havok tasks (image 8 waits on a semaphore line at about
+         * 2-5 us a read): they never napped inside a physics step, so after
+         * a barrel broke up to three of them spun on the cores the working
+         * task and the PPU threads needed. On 4 cores without SMT the frames
+         * after a break went to 16-40 ms, and on 2 cores at 60 fps to 12-45
+         * fps. 64 reads is about 130-320 us for image 8, the same order as
+         * RPCS3's GETLLAR polling before it sleeps on the reservation (400k
+         * TSC ticks, about 100-130 us), and held 2 cores at 52-59 fps there.
+         * Napping at once was slower even on 16 threads (the tasks hand jobs
+         * over about 15 times a step, and each wake costs more than a short
+         * spin), so the short spin stays.
          *
          * "Unchanged" must also mean "nothing else happened in between". The
          * same consumer re-reads the write pointer once per ring entry while
