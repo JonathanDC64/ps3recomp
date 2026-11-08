@@ -104,9 +104,9 @@ static void fullscreen_set(HWND hwnd, int mode)
         InterlockedExchange(&s_excl_want, 0);
         return;
     }
-    InterlockedExchange(&s_excl_then, -1);
     if (mode == 2) InterlockedExchange(&s_excl_want, 1);   /* (first: rc_borderless shows no borderless step on the way) */
     set_borderless(hwnd, mode != 0);
+    InterlockedExchange(&s_excl_then, -1);   /* (only now: until the window has changed, rc_borderless reports where it is going) */
     if (mode) s_fullscreen_last = mode;
 }
 
