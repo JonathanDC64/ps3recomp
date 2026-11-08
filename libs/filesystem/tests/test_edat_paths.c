@@ -5,13 +5,14 @@
  *   cc -std=gnu17 -I include -I libs/filesystem -o /tmp/t libs/filesystem/tests/test_edat_paths.c && /tmp/t
  *   clang-cl /nologo /D_CRT_SECURE_NO_WARNINGS /I include /I libs/filesystem /Fe:t.exe libs/filesystem/tests/test_edat_paths.c
  *
- * edat.c is included rather than linked, so the test can make an SDAT with edat.c's own AES and CMAC, each block
+ * edat.c and edat_decrypt.c are included rather than linked, so the test can make an SDAT with their own AES and CMAC, each block
  * encrypted and hashed the way edat_decrypt_file reads it, and needs no game file. The plaintext can be in three
  * places: beside the source (no knob), in a cache folder (PS3_EDAT_CACHE), or the player's own decrypted copy
  * (PS3_EDAT_PLAIN, at the file's path below PS3_VFS_ROOT). The test works in ./test_edat_paths.tmp and removes what
  * it made there when every check passes.
  */
 #include "../edat.c"
+#include "../edat_decrypt.c"
 
 #include <time.h>
 #ifdef _WIN32
