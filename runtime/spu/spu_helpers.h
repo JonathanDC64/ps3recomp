@@ -329,7 +329,7 @@ static inline float spu_clamp_smax(float v) {
     if ((u & 0x7FFFFFFFu) == 0x7F800000u) { u = (u & 0x80000000u) | 0x7F7FFFFFu; memcpy(&v, &u, 4); }
     return v;
 }
-static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-spu_clamp_smax(b._f32[i]); return r; }
+static inline u128 spu_fs_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=a._f32[i]-spu_clamp_smax(b._f32[i]); return r; }
 
 /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
  * The canonical immediates 173 and 155 are identity conversions. */
@@ -337,11 +337,11 @@ static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
 static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
     for(int i=0;i<4;i++){ double v=(double)a._f32[i]*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
-static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+static inline u128 spu_csflt_ref(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
 static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?0.0f:a._f32[i]*b._f32[i]; return r; }
+static inline u128 spu_fm_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?0.0f:a._f32[i]*b._f32[i]; return r; }
 /* Fused multiply-add. Without an FMA unit (__FMA__ unset), fmaf is the CRT
  * software routine (~3% of an SPU-heavy profile). The float product is exact
  * in double (24+24 bits < 53), so double mul+add then one rounding matches
@@ -352,11 +352,84 @@ static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._f32[
 #else
 #define SPU__FMA(a, b, c) ((float)((double)(a) * (double)(b) + (double)(c)))
 #endif
-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?c._f32[i]:SPU__FMA(a._f32[i], b._f32[i], c._f32[i]); return r; }
-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), spu_clamp_smax(b._f32[i]), -c._f32[i]); return r; }
-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), -spu_clamp_smax(b._f32[i]), c._f32[i]); return r; }
-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fma_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=(a._f32[i]==0.0f||b._f32[i]==0.0f)?c._f32[i]:SPU__FMA(a._f32[i], b._f32[i], c._f32[i]); return r; }
+static inline u128 spu_fms_ref(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), spu_clamp_smax(b._f32[i]), -c._f32[i]); return r; }
+static inline u128 spu_fnms_ref(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._f32[i]=SPU__FMA(spu_clamp_smax(a._f32[i]), -spu_clamp_smax(b._f32[i]), c._f32[i]); return r; }
+static inline u128 spu_fceq_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]==b._f32[i])?0xFFFFFFFFu:0; return r; }
+static inline u128 spu_fcgt_ref(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(a._f32[i]>b._f32[i])?0xFFFFFFFFu:0; return r; }
+
+/* The same float ops as four lanes in one register. The loops above were
+ * lane by lane, with a branch per lane for fm's and fma's zero rule and two
+ * conversions per operand for the double-precision fma, and each result
+ * reached ctx->gpr a lane at a time: the next 16-byte read of that register
+ * then waited for the four stores (no store forwarding). libsynth2's synth,
+ * which mixes Demon's Souls' sound on one SPU, runs these all the time; in
+ * Stonefang Tunnel its busiest instruction was such a read. Behind on a
+ * slower CPU, its mixer replayed the last 85 ms of sound (issue #435).
+ * The arithmetic is the loops': the float operands in
+ * double, one product and one sum (the float product is exact in double, so
+ * a fused sum gives the same), one rounding to float, under the thread's
+ * MXCSR as before. The loops stay as the reference
+ * (tests/test_spu_simd_paths.c checks each form against them). Off with
+ * __FMA__, where SPU__FMA is fmaf. */
+#if (defined(__SSE4_1__) || defined(PS3_SSE2NEON)) && !defined(__FMA__)
+static inline __m128 spu__ps(u128 a) { __m128 v; memcpy(&v, &a, 16); return v; }
+static inline u128 spu__q(__m128 v) { u128 r; memcpy(&r, &v, 16); return r; }
+static inline __m128 spu__fneg_ps(__m128 v) { return _mm_xor_ps(v, _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u))); }
+/* spu_clamp_smax on each lane: an infinity to the largest float of its sign. */
+static inline __m128 spu__clamp_smax_ps(__m128 v) {
+    const __m128i u = _mm_castps_si128(v);
+    const __m128i inf = _mm_cmpeq_epi32(_mm_and_si128(u, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x7F800000));
+    const __m128i big = _mm_or_si128(_mm_and_si128(u, _mm_set1_epi32((int)0x80000000u)), _mm_set1_epi32(0x7F7FFFFF));
+    return _mm_castsi128_ps(_mm_blendv_epi8(u, big, inf));
+}
+/* SPU__FMA on each lane: (float)((double)a * (double)b + (double)c). */
+static inline __m128 spu__fma_ps(__m128 a, __m128 b, __m128 c) {
+    const __m128d lo = _mm_add_pd(_mm_mul_pd(_mm_cvtps_pd(a), _mm_cvtps_pd(b)), _mm_cvtps_pd(c));
+    const __m128d hi = _mm_add_pd(_mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(a, a)), _mm_cvtps_pd(_mm_movehl_ps(b, b))),
+                                  _mm_cvtps_pd(_mm_movehl_ps(c, c)));
+    return _mm_movelh_ps(_mm_cvtpd_ps(lo), _mm_cvtpd_ps(hi));
+}
+/* The lanes where a or b is zero (fm's and fma's rule). */
+static inline __m128 spu__zero_op_ps(__m128 a, __m128 b) {
+    const __m128 z = _mm_setzero_ps();
+    return _mm_or_ps(_mm_cmpeq_ps(a, z), _mm_cmpeq_ps(b, z));
+}
+static inline u128 spu_fs(u128 a, u128 b) { return spu__q(_mm_sub_ps(spu__ps(a), spu__clamp_smax_ps(spu__ps(b)))); }
+static inline u128 spu_fm(u128 a, u128 b) {
+    const __m128 A = spu__ps(a), B = spu__ps(b);
+    return spu__q(_mm_andnot_ps(spu__zero_op_ps(A, B), _mm_mul_ps(A, B)));
+}
+static inline u128 spu_fma(u128 a, u128 b, u128 c) {
+    const __m128 A = spu__ps(a), B = spu__ps(b), C = spu__ps(c);
+    return spu__q(_mm_blendv_ps(spu__fma_ps(A, B, C), C, spu__zero_op_ps(A, B)));
+}
+static inline u128 spu_fms(u128 a, u128 b, u128 c) {
+    return spu__q(spu__fma_ps(spu__clamp_smax_ps(spu__ps(a)), spu__clamp_smax_ps(spu__ps(b)), spu__fneg_ps(spu__ps(c))));
+}
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) {
+    return spu__q(spu__fma_ps(spu__clamp_smax_ps(spu__ps(a)), spu__fneg_ps(spu__clamp_smax_ps(spu__ps(b))), spu__ps(c)));
+}
+static inline u128 spu_fceq(u128 a, u128 b) { return spu__q(_mm_cmpeq_ps(spu__ps(a), spu__ps(b))); }
+static inline u128 spu_fcgt(u128 a, u128 b) { return spu__q(_mm_cmpgt_ps(spu__ps(a), spu__ps(b))); }
+static inline u128 spu_csflt(u128 a, int i8) {
+    const __m128d f = _mm_set1_pd(exp2((double)(i8 - 155)));
+    __m128i v; memcpy(&v, &a, 16);
+    const __m128d lo = _mm_mul_pd(_mm_cvtepi32_pd(v), f);
+    const __m128d hi = _mm_mul_pd(_mm_cvtepi32_pd(_mm_shuffle_epi32(v, 0xEE)), f);
+    return spu__q(_mm_movelh_ps(_mm_cvtpd_ps(lo), _mm_cvtpd_ps(hi)));
+}
+#define SPU_FLOAT_SIMD 1
+#else
+static inline u128 spu_fs(u128 a, u128 b) { return spu_fs_ref(a, b); }
+static inline u128 spu_fm(u128 a, u128 b) { return spu_fm_ref(a, b); }
+static inline u128 spu_fma(u128 a, u128 b, u128 c)  { return spu_fma_ref(a, b, c); }
+static inline u128 spu_fms(u128 a, u128 b, u128 c)  { return spu_fms_ref(a, b, c); }
+static inline u128 spu_fnms(u128 a, u128 b, u128 c) { return spu_fnms_ref(a, b, c); }
+static inline u128 spu_fceq(u128 a, u128 b) { return spu_fceq_ref(a, b); }
+static inline u128 spu_fcgt(u128 a, u128 b) { return spu_fcgt_ref(a, b); }
+static inline u128 spu_csflt(u128 a, int i8) { return spu_csflt_ref(a, i8); }
+#endif
 
 /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
