@@ -18,8 +18,8 @@
  *
  * Layouts (SDK ABI):
  *   SceNpScoreRankData                                             128 bytes
- *     0 npId (36) | 36 onlineName (48) | 84 pcId | 88 serialRank | 92 rank
- *     96 highestRank | 104 scoreValue s64 | 112 hasGameData | 120 recordDate u64
+ *     0 npId (36) | 36 onlineName (52) | 88 pcId | 92 serialRank | 96 rank
+ *     100 highestRank | 104 hasGameData | 112 scoreValue s64 | 120 recordDate u64
  *   SceNpScorePlayerRankData { s32 hasData; pad[4]; RankData }    136 bytes
  *   SceNpScoreComment { char utf8Comment[64] }                     64 bytes
  */
@@ -243,10 +243,10 @@ static const u8* put_rank(u32 at, const u8* e, const u8* end, u32 comment_at)
     memset(vm_ptr8(at), 0, 128);
     memcpy(vm_ptr8(at), id, strnlen(id, 16));           /* npId.handle */
     memcpy(vm_ptr8(at + 36), id, strnlen(id, 16));      /* onlineName */
-    vm_write32(at + 88, rank);                          /* serialRank */
-    vm_write32(at + 92, rank);                          /* rank */
-    vm_write32(at + 96, rank);                          /* highestRank */
-    vm_write64(at + 104, score);
+    vm_write32(at + 92, rank);                          /* serialRank */
+    vm_write32(at + 96, rank);                          /* rank */
+    vm_write32(at + 100, rank);                         /* highestRank */
+    vm_write64(at + 112, score);
     /* CellRtcTick: microseconds since 0001-01-01 */
     vm_write64(at + 120, when ? (when + 62135596800ull) * 1000000ull : 0);
     if (comment_at) {

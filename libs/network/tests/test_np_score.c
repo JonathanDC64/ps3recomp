@@ -5,7 +5,8 @@
  * what would go to the server, and "pumping" delivers the reply the test put
  * there. Checks what a title paging through a board relies on: the number of
  * rows comes back while there are rows, and a range with none is the server's
- * GAME_RANKING_NOT_FOUND rather than a count of 0.
+ * GAME_RANKING_NOT_FOUND rather than a count of 0, and where each field of
+ * a row lands (the SDK's layout, which titles read directly).
  *
  *   clang-cl /I include /Fe:test_np_score.exe libs/network/tests/test_np_score.c
  *   cc -std=gnu17 -I include -o test_np_score libs/network/tests/test_np_score.c
@@ -73,7 +74,7 @@ static void set_reply(u32 total, u16 rows)
         p += 16;
         p = psnr_put64(p, 100u - i);        /* score */
         p = psnr_put16(p, 0);               /* no comment */
-        p = psnr_put64(p, 0);               /* recorded */
+        p = psnr_put64(p, 1000u);           /* recorded */
     }
     s_reply_len = (u32)(p - s_reply);
 }
@@ -116,8 +117,25 @@ int main(void)
     set_reply(150, 100);
     assert(get_range(trans, 1, 100) == 100);
     assert(vm_read32(TOTAL) == 150);
-    assert(vm_read32(RANKS + 92) == 1);
-    assert(vm_read32(RANKS + 128 + 92) == 2);
+    assert(!memcmp(vm_ptr8(RANKS), "player", 7));         /* npId.handle */
+    assert(!memcmp(vm_ptr8(RANKS + 36), "player", 7));    /* onlineName */
+    assert(vm_read32(RANKS + 88) == 0);                   /* pcId */
+    assert(vm_read32(RANKS + 92) == 1);                   /* serialRank */
+    assert(vm_read32(RANKS + 96) == 1);                   /* rank */
+    assert(vm_read32(RANKS + 100) == 1);                  /* highestRank */
+    assert(vm_read32(RANKS + 104) == 0);                  /* hasGameData */
+    assert(vm_read64(RANKS + 112) == 100);                /* scoreValue */
+    assert(vm_read64(RANKS + 120) == (1000u + 62135596800ull) * 1000000ull);
+    assert(vm_read32(RANKS + 128 + 96) == 2);
+    assert(vm_read64(RANKS + 128 + 112) == 99);
+
+    /* A score with its high word set is still only a score: it must not
+     * reach hasGameData. */
+    set_reply(1, 1);
+    psnr_put64(s_reply + 6 + 4 + 16, 0x07EA000B00080014ull);
+    assert(get_range(trans, 1, 100) == 1);
+    assert(vm_read32(RANKS + 104) == 0);
+    assert(vm_read64(RANKS + 112) == 0x07EA000B00080014ull);
 
     /* A short last page is still a count. */
     set_reply(150, 50);
