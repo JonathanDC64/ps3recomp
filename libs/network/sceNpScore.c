@@ -45,6 +45,7 @@ static void sleep_10ms(void) { struct timespec ts = { 0, 10000000L }; nanosleep(
 #define SCORE_ERROR_NO_SERVER      0x8002A1A1u   /* community server error: unavailable */
 #define SCORE_ERROR_INVALID_ID     0x8002A106u
 #define SCORE_ERROR_ABORTED        0x8002A10Au
+#define SCORE_ERROR_RANKING_NOT_FOUND 0x8002A412u   /* SCE_NP_COMMUNITY_SERVER_ERROR_GAME_RANKING_NOT_FOUND */
 
 #define TITLE_MAX 8
 #define TRANS_MAX 32
@@ -274,8 +275,11 @@ static void on_ranking(void* user, const psnr_msg* m)
     }
     if (t->total_ea) vm_write32(t->total_ea, total);
     if (t->last_sort_ea) vm_write64(t->last_sort_ea, 0);
-    /* The SDK returns the number of entries written. */
-    t->result = (s32)filled;
+    /* The SDK returns the number of entries written. A range with nothing in
+     * it (an empty board, or a start past the last rank) is the server's
+     * GAME_RANKING_NOT_FOUND, not a count of 0: titles page a board until they
+     * see it, and a 0 never advances their position. */
+    t->result = (!t->by_id && filled == 0) ? (s32)SCORE_ERROR_RANKING_NOT_FOUND : (s32)filled;
 }
 
 static u64 stack_arg(ppu_context* ctx, int n)   /* n >= 9 */
