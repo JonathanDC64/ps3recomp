@@ -339,7 +339,7 @@ static _Alignas(64) VPJCounter s_vpj_ctr[4];
 #define s_vpj_sleepers (s_vpj_ctr[3].v)
 /* FIFO thread only: jobs queued (published or not), and the vertices queued
  * since the last publish. Jobs are published in batches of VPJ_BATCH
- * vertices (read once, default 1024): one publish per draw was a locked
+ * vertices (live, default 1024): one publish per draw was a locked
  * increment of a line the workers spin on, ~6% of the FIFO thread. */
 static LONG s_vpj_q;
 static u32 s_vpj_qv;
@@ -387,24 +387,30 @@ static DWORD WINAPI vpj_worker(LPVOID arg)
     }
 }
 /* Let the workers take everything queued so far. The exchange is also the
- * full barrier the sleeper check needs (see vpj_worker). */
-static void vpj_publish(void)
+ * full barrier the sleeper check needs (see vpj_worker). `wake` 0 leaves a
+ * sleeping worker asleep, for a caller that takes the queue itself. */
+static void vpj_publish(int wake)
 {
     s_vpj_qv = 0;
     if (s_vpj_q == s_vpj_pub) return;
     InterlockedExchange(&s_vpj_pub, s_vpj_q);
     /* A worker counts itself a sleeper before it checks for work, so either
      * it sees these jobs or this sees it. */
-    if (s_vpj_sleepers) {
+    if (wake && s_vpj_sleepers) {
         AcquireSRWLockExclusive(&s_vpj_lk);
         WakeAllConditionVariable(&s_vpj_cv);
         ReleaseSRWLockExclusive(&s_vpj_lk);
     }
 }
-/* Wait for every queued vertex, converting what no worker has taken yet. */
+/* Wait for every queued vertex, converting what no worker has taken yet. A
+ * sleeping worker stays asleep (VPJ_SYNC_WAKE, live, default 0; 1 wakes it):
+ * this thread takes the jobs from here on, and the wake is a system call on
+ * the thread the frame waits on, 4 to 11 times a frame in Demon's Souls. */
 static void vpj_sync(void)
 {
-    vpj_publish();
+    static int wake = -1;
+    PS3_KNOB(wake, ps3_env_int("VPJ_SYNC_WAKE", 0));
+    vpj_publish(wake);
     if (!s_vpj_pub) return;
     LONG j;
     while ((j = vpj_claim()) >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); }
@@ -486,8 +492,22 @@ static int vpj_room(u32 nv)
 static u32 vpj_batch(void)
 {
     static int batch = -1;
-    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
+    PS3_KNOB(batch, ps3_env_int("VPJ_BATCH", 1024));
     return (u32)batch;
+}
+/* After queueing: hand the jobs over once there are enough. While no worker
+ * sleeps, VPJ_EAGER are enough (live, in VPJ_BATCH's units, default 64: 16 KB
+ * of span copies; 0: only whole batches): handing over is then one write and
+ * no system call, and what is not handed over by the next sync point this
+ * thread copies itself. With a sleeping worker the batch rule stands, a wake
+ * being worth it only for a whole batch. Demon's Souls, with VPJ_SYNC_WAKE
+ * off too, time at sync points a frame: Tutorial 151 to 57 us, 1-2 bridge 894
+ * to 619, Patches 390 to 233. */
+static void vpj_publish_maybe(void)
+{
+    static int eager = -1;
+    PS3_KNOB(eager, ps3_env_int("VPJ_EAGER", 64));
+    if (s_vpj_qv >= vpj_batch() || (eager && s_vpj_qv >= (u32)eager && !s_vpj_sleepers)) vpj_publish(1);
 }
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
@@ -498,7 +518,7 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     s_vpj_q++;
     s_vpj_conv = 1;
     s_vpj_qv += n;
-    if (s_vpj_qv >= vpj_batch()) vpj_publish();
+    vpj_publish_maybe();
 }
 /* The GPU fetch path's span copies, about 29 MB a frame at Demon's Souls'
  * deep Palace and a sixth of the FIFO thread, as jobs for the vertex worker
@@ -524,7 +544,7 @@ static void vf_copy(u8* dst, u32 src, u32 len)
         J->n = 0; J->clen = len; J->csrc = src; J->cdst = dst;
     }
     s_vpj_qv += len >> 8;
-    if (s_vpj_qv >= vpj_batch()) vpj_publish();
+    vpj_publish_maybe();
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
