@@ -54,8 +54,9 @@ PS3_SPLIT_DEFINE(void* volatile, g_pm_flow_ctx, 0);   /* the game module's once 
  * set the done bit on the pending records -- the faithful sync equivalent of
  * the completion interrupt. Env SPU_JOBDRAIN (default off while validating). */
 extern void spu_halt(spu_context*);
-/* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
- * ended where it should not have (spurs_policy.c, [pm-end]). */
+/* Last 32 drain steps on this host thread (pc), for post-mortems of a policy
+ * module's run that ended where it should not have (spurs_policy.c, [pm-end]).
+ * Nothing reports any other SPU's steps, so only policy-mode hops record. */
 static _Thread_local uint32_t t_recent[32];
 static _Thread_local uint32_t t_recent_n;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
@@ -73,10 +74,11 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 
 /* The per-step check runs on every trampoline hop -- ~12 million a second
  * in Demon's Souls' HighGraphics ring consumer -- so the common case is kept
- * to what every step needs: the recent-pc ring, the stack-reset entries and
- * the job-end test. The trace and drain knobs below it go through one cached
- * flag (re-read when the console changes the environment), and only a set
- * knob or an armed PM flow trace takes the full path. The knob read, the full
+ * to what every step needs: the stack-reset entries and the job-end test,
+ * and a policy module's recent-pc ring. The trace and drain knobs below it
+ * go through one cached flag (re-read when the console changes the
+ * environment), and only a set knob or an armed PM flow trace takes the full
+ * path. The knob read, the full
  * path and the job-end report are out of line: inlined into the check, they
  * made it a function of its own that saved six registers on every hop. */
 extern unsigned g_spu_stack_reset_n;   /* spu_channels.c */
@@ -124,7 +126,7 @@ static inline void spu_step_check(spu_context* ctx, void* fn)
     if (s_step_diag_gen != ps3_env_gen) spu_step_diag_load();
     if (s_step_diag || g_pm_flow_ctx) { spu_task_launch_check_full(ctx, fn); return; }
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
-    t_recent[t_recent_n++ & 31] = pc;
+    if (ctx->policy_mode) t_recent[t_recent_n++ & 31] = pc;
     if (g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode) {
         extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
