@@ -107,15 +107,27 @@ static int sony_kind(USHORT vid, USHORT pid)
     }
 }
 
-/* One stick's raw bytes (centre 128) through the radial deadzone and squircling. */
-static void stick(uint8_t rx, uint8_t ry, uint8_t* x, uint8_t* y)
+/* pad_hid_sony.h */
+void pad_hid_sony_stick_stage(int which, float rx, float ry, uint8_t* x, uint8_t* y)
 {
-    static int d = -1, a = -1, q = -1;
+    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0;
     PS3_KNOB(d, ps3_env_int("PAD_HID_DEADZONE", 20));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
     PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));
-    pad_stick_to_u8((rx - 128) / 127.0f, (ry - 128) / 127.0f, d / 128.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f,
-                    x, y);
+    PS3_KNOB(zl, pad_stick_zone_percent(getenv("PAD_DEADZONE_LEFT")));     /* (cellPad.c, pad_host_stick_stage) */
+    PS3_KNOB(zr, pad_stick_zone_percent(getenv("PAD_DEADZONE_RIGHT")));
+    PS3_KNOB(za, ps3_env_int("PAD_DEADZONE_ANTI", 0));
+    const int zone = which == 0 ? zl : which == 1 ? zr : -1;
+    if (zone >= 0)
+        pad_stick_tilt_to_u8(rx, ry, zone / 100.0f, za / 100.0f, q > 0 ? q / 1000.0f : 0.0f, x, y);
+    else
+        pad_stick_to_u8(rx, ry, d / 128.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f, x, y);
+}
+
+/* One stick's raw bytes (centre 128) through the radial deadzone and squircling. */
+static void stick(int which, uint8_t rx, uint8_t ry, uint8_t* x, uint8_t* y)
+{
+    pad_hid_sony_stick_stage(which, (rx - 128) / 127.0f, (ry - 128) / 127.0f, x, y);
 }
 
 static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
@@ -136,8 +148,9 @@ static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
     const uint8_t b1 = full ? q[8] : q[5];
     const uint8_t b2 = full ? q[9] : q[6];
     PadHidSonyState s;
-    stick(q[0], q[1], &s.lx, &s.ly);
-    stick(q[2], q[3], &s.rx, &s.ry);
+    stick(0, q[0], q[1], &s.lx, &s.ly);
+    stick(1, q[2], q[3], &s.rx, &s.ry);
+    for (int i = 0; i < 4; i++) s.raw[i] = (q[i] - 128) / 127.0f;
     s.l2 = full ? q[4] : q[7];
     s.r2 = full ? q[5] : q[8];
 

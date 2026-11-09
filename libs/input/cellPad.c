@@ -200,19 +200,39 @@ static int s_sdl_inited = 0;
 #endif
 
 #if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
-/* One stick, -32768..32767 per axis with down positive, through the radial
+/* One stick, -1 to 1 per axis with down positive, through the radial
  * deadzone and squircling (pad_stick.h). PAD_STICK_DEADZONE (of 32767,
  * default 7849, as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE and RPCS3),
  * PAD_STICK_ANTI_DEADZONE (percent, default 13, RPCS3's) and
- * PAD_STICK_SQUIRCLE (RPCS3's squircling factor, default 8000, 0 off). */
-static void pad_host_stick_to_u8(int x, int y, u8* out_x, u8* out_y)
+ * PAD_STICK_SQUIRCLE (RPCS3's squircling factor, default 8000, 0 off).
+ *
+ * PAD_DEADZONE_LEFT and PAD_DEADZONE_RIGHT, for a title that offers a deadzone
+ * by how far the stick is tilted: percent of the stick's travel where it
+ * starts counting, on every kind of pad (pad_hid_sony.c has the same), with
+ * PAD_DEADZONE_ANTI (percent, default 0) where the distance starts from there
+ * (pad_stick_tilt_to_u8). Unset or empty: the deadzone above, unchanged. Live.
+ *
+ * stick: 0 left, 1 right, -1 the deadzone above whatever those say. */
+static void pad_host_stick_stage(int stick, float x, float y, u8* out_x, u8* out_y)
 {
-    static int d = -1, a = -1, q = -1;
+    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0;
     PS3_KNOB(d, ps3_env_int("PAD_STICK_DEADZONE", 7849));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
     PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));
-    pad_stick_to_u8(x / 32767.0f, y / 32767.0f, d / 32767.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f,
-                    out_x, out_y);
+    PS3_KNOB(zl, pad_stick_zone_percent(getenv("PAD_DEADZONE_LEFT")));
+    PS3_KNOB(zr, pad_stick_zone_percent(getenv("PAD_DEADZONE_RIGHT")));
+    PS3_KNOB(za, ps3_env_int("PAD_DEADZONE_ANTI", 0));
+    const int zone = stick == 0 ? zl : stick == 1 ? zr : -1;
+    if (zone >= 0)
+        pad_stick_tilt_to_u8(x, y, zone / 100.0f, za / 100.0f, q > 0 ? q / 1000.0f : 0.0f, out_x, out_y);
+    else
+        pad_stick_to_u8(x, y, d / 32767.0f, a / 100.0f, q > 0 ? q / 1000.0f : 0.0f, out_x, out_y);
+}
+
+/* The same from a host stick's -32768..32767. */
+static void pad_host_stick_to_u8(int stick, int x, int y, u8* out_x, u8* out_y)
+{
+    pad_host_stick_stage(stick, x / 32767.0f, y / 32767.0f, out_x, out_y);
 }
 #endif
 
@@ -798,9 +818,9 @@ static void pad_poll_xinput(void)
          * before the conversion, so a centred stick stays 128. 127 would alias
          * SELECT+START (0x7F) and can make the guest self-exit.
          * (via sagemono, PR #42) */
-        pad_host_stick_to_u8(gp->sThumbLX, -gp->sThumbLY,
+        pad_host_stick_to_u8(0, gp->sThumbLX, -gp->sThumbLY,
                              &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
-        pad_host_stick_to_u8(gp->sThumbRX, -gp->sThumbRY,
+        pad_host_stick_to_u8(1, gp->sThumbRX, -gp->sThumbRY,
                              &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
 
         /* Triggers */
@@ -887,10 +907,10 @@ static void pad_sdl_read(SDL_GameController* gc, PadHostState* hs)
     hs->buttons = btns;
 
     /* Analog sticks */
-    pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
+    pad_host_stick_to_u8(0, SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
                          SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY),
                          &hs->analog_lx, &hs->analog_ly);
-    pad_host_stick_to_u8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
+    pad_host_stick_to_u8(1, SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
                          SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY),
                          &hs->analog_rx, &hs->analog_ry);
 
@@ -1078,11 +1098,18 @@ static long pad_parse_controller(const char* e)
     return dev;
 }
 
+static long pad_controller_wanted(void)
+{
+    static long want = RUMBLE_NONE;
+    PS3_KNOB(want, pad_parse_controller(getenv("PAD_CONTROLLER")));
+    return want;
+}
+
 static void pad_apply_controller(void)
 {
-    static long want = RUMBLE_NONE, said_want = RUMBLE_NONE;
+    static long said_want = RUMBLE_NONE;
     static int said_port = -2;   /* the port the chosen controller was on, -1 none, as last logged */
-    PS3_KNOB(want, pad_parse_controller(getenv("PAD_CONTROLLER")));
+    const long want = pad_controller_wanted();
     if (want == RUMBLE_NONE) return;
     const int found = pad_controller_find(s_poll_dev, PAD_MAX_HOST_PORTS, want);
     if (found != said_port || want != said_want) {   /* (when it changes: a tester's log says which pad played) */
@@ -1172,6 +1199,77 @@ int cellPad_host_controller(int i, char* id, int idn, char* name, int namen)
         return 1;
     }
     return 0;
+}
+
+/* cellPad.h. Reads the devices here and now, as the poll would find them: the
+ * game may not be polling (a start screen) and the poll's state is zeroed under
+ * the host hold (a title's menu). */
+int cellPad_host_stick_raw(int stick, float* x, float* y)
+{
+    *x = *y = 0.0f;
+    if (stick < 0 || stick > 1 || !cellPad_host_pads_on()) return 0;
+    long dev[PAD_MAX_HOST_PORTS];
+    float v[PAD_MAX_HOST_PORTS][4];
+    memset(dev, 0, sizeof dev);
+    memset(v, 0, sizeof v);
+#if PAD_BACKEND_XINPUT
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        XINPUT_STATE st;
+        memset(&st, 0, sizeof st);
+        dev[i] = RUMBLE_NONE;
+        if (XInputGetState((DWORD)i, &st) != ERROR_SUCCESS) continue;
+        dev[i] = PAD_DEV(RUMBLE_XINPUT, i);
+        v[i][0] = st.Gamepad.sThumbLX / 32767.0f;
+        v[i][1] = -st.Gamepad.sThumbLY / 32767.0f;
+        v[i][2] = st.Gamepad.sThumbRX / 32767.0f;
+        v[i][3] = -st.Gamepad.sThumbRY / 32767.0f;
+    }
+    PadHidSonyState hid[PAD_HID_SONY_MAX];
+    const int n = pad_hid_sony_poll(hid, PAD_HID_SONY_MAX);
+    for (int k = 0, i = 0; k < n; k++) {      /* (the ports XInput left empty, as pad_poll_hid) */
+        while (i < PAD_MAX_HOST_PORTS && dev[i] != RUMBLE_NONE) i++;
+        if (i >= PAD_MAX_HOST_PORTS) break;
+        dev[i] = RUMBLE_HID | hid[k].slot;
+        memcpy(v[i], hid[k].raw, sizeof v[i]);
+    }
+#elif PAD_BACKEND_SDL2
+    SDL_LockJoysticks();
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        dev[i] = RUMBLE_NONE;
+        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
+        dev[i] = PAD_DEV(RUMBLE_SDL, i);
+        v[i][0] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
+        v[i][1] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
+        v[i][2] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+        v[i][3] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+    }
+    SDL_UnlockJoysticks();
+#endif
+    const int found = pad_controller_find(dev, PAD_MAX_HOST_PORTS, pad_controller_wanted());
+    const int port = found > 0 ? found : 0;
+    if (dev[port] == RUMBLE_NONE) return 0;
+    *x = v[port][stick * 2];
+    *y = v[port][stick * 2 + 1];
+    return (dev[port] & RUMBLE_HID) ? 2 : 1;
+}
+
+/* cellPad.h */
+void cellPad_host_stick_stage(int path, int stick, float x, float y, unsigned char* out_x, unsigned char* out_y)
+{
+#if PAD_BACKEND_XINPUT
+    if (path == 2) {
+        pad_hid_sony_stick_stage(stick, x, y, out_x, out_y);
+        return;
+    }
+#endif
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
+    (void)path;
+    pad_host_stick_stage(stick, x, y, out_x, out_y);
+#else
+    (void)path; (void)stick; (void)x; (void)y;
+    *out_x = *out_y = 128;
+#endif
 }
 
 /* PS3_NO_USER_INPUT=1 (ps3_knob.h): no pad or key of the user's is read. Port

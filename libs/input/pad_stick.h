@@ -71,4 +71,44 @@ static inline void pad_stick_to_u8(float x, float y, float deadzone, float anti,
     *out_y = pad_stick_axis_u8(y);
 }
 
+/* A deadzone given as real stick travel: tilt (0 to 1) is how far from centre the stick starts counting, the same
+ * on every controller. Inside it the axes are exactly centred. Past it the distance runs from anti to 1 over the
+ * travel left, so a title whose own deadzone ends at anti sees movement start at tilt, from nothing, with no jump.
+ * Squircling grows in over that travel too (t: 0 at tilt, 1 at the rim); at full strength from the start a diagonal
+ * would clear the title's zone before a straight push did. */
+static inline void pad_stick_tilt_to_u8(float x, float y, float tilt, float anti, float squircle,
+                                        uint8_t* out_x, uint8_t* out_y)
+{
+    x = x < -1.0f ? -1.0f : x > 1.0f ? 1.0f : x;
+    y = y < -1.0f ? -1.0f : y > 1.0f ? 1.0f : y;
+    const float mag = sqrtf(x * x + y * y);
+    if (mag <= tilt) {
+        *out_x = *out_y = 128;
+        return;
+    }
+    const float m = mag < 1.0f ? mag : 1.0f;
+    const float t = m >= 1.0f ? 1.0f : (m - tilt) / (1.0f - tilt);
+    const float pos = anti + (1.0f - anti) * t;
+    float len = pos * mag / m;                  /* past the circle: the push keeps its length */
+    if (squircle > 0.0f) {
+        const float s2 = 2.0f * x * y / (mag * mag);        /* sin(2 * angle) */
+        len = pos * (1.0f + t * s2 * s2 / squircle);        /* pos: the distance held to the circle */
+    }
+    x *= len / mag;
+    y *= len / mag;
+    *out_x = pad_stick_axis_u8(x);
+    *out_y = pad_stick_axis_u8(y);
+}
+
+/* A deadzone percent from the environment, or -1 when it isn't one (unset, empty, not a number): -1 leaves the stick
+ * on pad_stick_to_u8. Above 100 counts as 100. */
+static inline int pad_stick_zone_percent(const char* e)
+{
+    if (!e || *e < '0' || *e > '9') return -1;
+    int v = 0;
+    for (; *e >= '0' && *e <= '9'; e++)
+        if (v < 1000) v = v * 10 + (*e - '0');
+    return *e ? -1 : v > 100 ? 100 : v;
+}
+
 #endif
