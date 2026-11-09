@@ -242,6 +242,16 @@ int cellPad_host_controllers(char* out, int n);
  * Both are always terminated. 0 when there is no i-th. */
 int cellPad_host_controller(int i, char* id, int idn, char* name, int namen);
 
+/* One stick (0 left, 1 right) of the pad on port 0, as the pad reports it: x and y -1 to 1 with down positive, before
+ * any deadzone. Reads the devices when called, so it works before the title polls and under the host hold; for a
+ * settings screen, once a frame at most. Returns which deadzone the pad goes through (for cellPad_host_stick_stage):
+ * 1 XInput's or SDL's, 2 the HID reader's for a Sony pad, 0 no pad (x and y 0). */
+int cellPad_host_stick_raw(int stick, float* x, float* y);
+
+/* What the title would read for that stick position: x and y through the deadzones in force on that path, to the
+ * pad's 0-255 bytes. stick -1 gives the default deadzone whatever PAD_DEADZONE_LEFT and _RIGHT say. */
+void cellPad_host_stick_stage(int path, int stick, float x, float y, unsigned char* out_x, unsigned char* out_y);
+
 /* The device whose button icons the title shows: the last one used on port 0, by pad_glyph.h's rules. 0 before
  * the first poll and with PS3_NO_USER_INPUT, 1 the keyboard and mouse, 2 a PlayStation pad, 3 an Xbox (or other
  * XInput, or unknown) pad, 4 a Nintendo pad (off Windows, where SDL reads it; Steam Input shows one as Xbox).

@@ -15,12 +15,17 @@ typedef struct {
     uint8_t  lx, ly, rx, ry;   /* 0-255, centre 128, up = 0 */
     uint8_t  l2, r2;           /* analog triggers 0-255 */
     uint8_t  slot;             /* the pad, for pad_hid_sony_rumble */
+    float    raw[4];           /* Windows: left x, y, right x, y as the pad reports them, -1 to 1, down positive */
 } PadHidSonyState;
 
 /* Starts the device scanner on first call. Fills up to max states, one per
  * connected Sony pad in connection order, and returns how many. Cheap: it
  * copies what the reader threads last parsed. PAD_NO_HID=1 returns 0. */
 int pad_hid_sony_poll(PadHidSonyState* out, int max);
+
+/* One stick through the deadzones the reader threads use, x and y -1 to 1 with down positive, to 0-255 bytes. stick:
+ * 0 left, 1 right, -1 the default deadzone whatever PAD_DEADZONE_LEFT and _RIGHT say. Windows only. */
+void pad_hid_sony_stick_stage(int stick, float x, float y, uint8_t* out_x, uint8_t* out_y);
 
 /* What the pad in a slot is, for a title's settings: "DualSense (USB)",
  * "DualShock 4 (Bluetooth)" and so on, into out (n bytes). 0, and out empty,
