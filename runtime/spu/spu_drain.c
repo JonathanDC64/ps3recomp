@@ -121,7 +121,9 @@ static SPU_DRAIN_NOINLINE void spu_step_ls0_end(spu_context* ctx)
                 ctx->image_id, 10);
     spu_halt(ctx);
 }
-static inline void spu_step_check(spu_context* ctx, void* fn)
+/* Forced: left to clang, the policy-mode branch made this a function of its
+ * own again, with a call and saved registers on every hop. */
+SPU_LS_INLINE void spu_step_check(spu_context* ctx, void* fn)
 {
     if (s_step_diag_gen != ps3_env_gen) spu_step_diag_load();
     if (s_step_diag || g_pm_flow_ctx) { spu_task_launch_check_full(ctx, fn); return; }
