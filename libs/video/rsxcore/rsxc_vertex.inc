@@ -1516,6 +1516,9 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
  * Palace) with no difference. VF_NATIVE_STRIP=0 goes back to the list. */
 #if defined(_M_X64) || defined(__x86_64__)
 #include <emmintrin.h>
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
 #endif
 #define VF_CUT 0xFFFFFFFFu
 static inline __attribute__((always_inline)) u32 vf_ix(const u8* src, const int w16, u32 k)
@@ -1548,6 +1551,53 @@ static inline __attribute__((always_inline)) u32 vf_strip_native_w(const u8* src
      * of the FIFO thread, a cmov chain per index. */
     static int sse = -1;
     PS3_KNOB(sse, ps3_env_int("VF_STRIP_SSE", 1));
+#if defined(__SSE4_1__)
+    /* SSE4.1 has the unsigned min and max, so no bias, and the lanes tell by
+     * themselves whether a real index reached them: a restart lane leaves
+     * vlo at all ones and vhi at zero. The last restart's position is worked
+     * out once, after the loop: finding it in the loop was a test and a
+     * branch every eight indices, and strips end at unpredictable places.
+     * VF_STRIP_SSE41=0 (live) uses the SSE2 loop below. */
+    static int sse41 = -1;
+    PS3_KNOB(sse41, ps3_env_int("VF_STRIP_SSE41", 1));
+    if (w16 && count >= 8 && sse && sse41) {
+        const __m128i swap = _mm_set_epi8(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
+        __m128i vlo = _mm_set1_epi16(-1), vhi = _mm_setzero_si128();
+        if (restart && ridx <= 0xFFFFu) {
+            const __m128i rv = _mm_set1_epi16((short)ridx);
+            u32 rk = 0, rm = 0;
+            for (; k + 8 <= count; k += 8) {
+                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (u64)k * 2)), swap);
+                const __m128i c = _mm_cmpeq_epi16(v, rv);
+                const __m128i o = _mm_or_si128(v, c);   /* restart lanes 0xFFFF */
+                _mm_storeu_si128((__m128i*)(b + k), _mm_unpacklo_epi16(o, c));
+                _mm_storeu_si128((__m128i*)(b + k + 4), _mm_unpackhi_epi16(o, c));
+                vlo = _mm_min_epu16(vlo, o);
+                vhi = _mm_max_epu16(vhi, _mm_andnot_si128(c, v));
+                const u32 mk = (u32)_mm_movemask_epi8(c);
+                rk = mk ? k : rk; rm = mk ? mk : rm;
+            }
+            if (rm) r = rk + ((31u - (u32)__builtin_clz(rm)) >> 1) + 1;
+        } else {
+            const __m128i z = _mm_setzero_si128();
+            for (; k + 8 <= count; k += 8) {
+                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (u64)k * 2)), swap);
+                _mm_storeu_si128((__m128i*)(b + k), _mm_unpacklo_epi16(v, z));
+                _mm_storeu_si128((__m128i*)(b + k + 4), _mm_unpackhi_epi16(v, z));
+                vlo = _mm_min_epu16(vlo, v);
+                vhi = _mm_max_epu16(vhi, v);
+            }
+        }
+        const __m128i ones = _mm_set1_epi16(-1), zero = _mm_setzero_si128();
+        if (_mm_movemask_epi8(_mm_cmpeq_epi16(vlo, ones)) != 0xFFFF ||
+            _mm_movemask_epi8(_mm_cmpeq_epi16(vhi, zero)) != 0xFFFF) {
+            const u32 l = (u32)_mm_extract_epi16(_mm_minpos_epu16(vlo), 0);
+            const u32 h = 0xFFFFu ^ (u32)_mm_extract_epi16(_mm_minpos_epu16(_mm_xor_si128(vhi, ones)), 0);
+            lo = l < lo ? l : lo; hi = h > hi ? h : hi;
+        }
+    }
+    else
+#endif
     if (w16 && count >= 8 && sse) {
         const __m128i bias = _mm_set1_epi16((short)0x8000);
         const __m128i rv = _mm_set1_epi16((short)ridx);
