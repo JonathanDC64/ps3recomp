@@ -183,8 +183,8 @@ s32 sceNpScorePollAsync(s32 transId, u32 result)
 {
     score_trans* t = trans_get(transId);
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    if (t->state == T_PENDING) np_psnr_pump();
-    if (t->state == T_PENDING) return 1;
+    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) np_psnr_pump();
+    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) return 1;
     if (result) vm_write32(result, (u32)t->result);
     return 0;
 }
@@ -193,11 +193,11 @@ s32 sceNpScoreWaitAsync(s32 transId, u32 result)
 {
     score_trans* t = trans_get(transId);
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    for (int i = 0; i < 1000 && t->state == T_PENDING; i++) {   /* ~10 s */
+    for (int i = 0; i < 1000 && __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING; i++) {   /* ~10 s */
         np_psnr_pump();
-        if (t->state == T_PENDING) sleep_10ms();
+        if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) sleep_10ms();
     }
-    if (t->state == T_PENDING) { t->state = T_DONE; t->result = (s32)SCORE_ERROR_NO_SERVER; }
+    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) { t->state = T_DONE; t->result = (s32)SCORE_ERROR_NO_SERVER; }
     if (result) vm_write32(result, (u32)t->result);
     return t->result;
 }
@@ -215,6 +215,12 @@ static s32 fail_now(score_trans* t, s32 err)
 }
 
 static s32 trans_id_of(score_trans* t) { return (s32)(t - s_trans); }
+
+/* A reply can be handled on another thread (cellSysutilCheckCallback pumps too)
+ * while the title's thread waits for it. So a handler writes everything the
+ * title will read first, and says it is done last. */
+static int trans_pending(score_trans* t) { return __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING; }
+static void trans_done(score_trans* t) { __atomic_store_n(&t->state, T_DONE, __ATOMIC_RELEASE); }
 
 /* Send a request in the newer messages when this session can, keeping the
  * first form in case the server turns out not to know them. Non-zero if sent. */
@@ -254,12 +260,15 @@ static int fall_back(score_trans* t, const psnr_msg* m)
 static void on_recorded(void* user, const psnr_msg* m)
 {
     score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || t->state != T_PENDING) return;
+    if (!t || !trans_pending(t)) return;
     if (fall_back(t, m)) return;
-    t->state = T_DONE;
-    if (m->type != PSNR_SCORE_RECORDED || m->len < 4) { t->result = (s32)SCORE_ERROR_NO_SERVER; return; }
-    if (t->tmp_rank_ea) vm_write32(t->tmp_rank_ea, psnr_get32(m->data));
-    t->result = CELL_OK;
+    if (m->type != PSNR_SCORE_RECORDED || m->len < 4) {
+        t->result = (s32)SCORE_ERROR_NO_SERVER;
+    } else {
+        if (t->tmp_rank_ea) vm_write32(t->tmp_rank_ea, psnr_get32(m->data));
+        t->result = CELL_OK;
+    }
+    trans_done(t);
 }
 
 /* RECORD_SCORE: board u32 | order u8 | score s64 | comment blob.
@@ -346,12 +355,8 @@ static const u8* put_rank(u32 at, const u8* e, const u8* end, u32 comment_at, in
     return c + cl + 8;
 }
 
-static void on_ranking(void* user, const psnr_msg* m)
+static void ranking_reply(score_trans* t, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || t->state != T_PENDING) return;
-    if (fall_back(t, m)) return;
-    t->state = T_DONE;
     if ((m->type != PSNR_RANKING && m->type != PSNR_RANKING2) || m->len < 6) {
         t->result = (s32)SCORE_ERROR_NO_SERVER;
         return;
@@ -375,6 +380,15 @@ static void on_ranking(void* user, const psnr_msg* m)
      * GAME_RANKING_NOT_FOUND, not a count of 0: titles page a board until they
      * see it, and a 0 never advances their position. */
     t->result = (!t->by_id && filled == 0) ? (s32)SCORE_ERROR_RANKING_NOT_FOUND : (s32)filled;
+}
+
+static void on_ranking(void* user, const psnr_msg* m)
+{
+    score_trans* t = trans_get((s32)(uintptr_t)user);
+    if (!t || !trans_pending(t)) return;
+    if (fall_back(t, m)) return;
+    ranking_reply(t, m);
+    trans_done(t);
 }
 
 static u64 stack_arg(ppu_context* ctx, int n)   /* n >= 9 */
@@ -477,9 +491,9 @@ static void hle_ranking_by_npid_pcid(ppu_context* ctx)
 static void on_game_data_recorded(void* user, const psnr_msg* m)
 {
     score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || t->state != T_PENDING) return;
-    t->state = T_DONE;
+    if (!t || !trans_pending(t)) return;
     t->result = m->type == PSNR_OK ? CELL_OK : (s32)SCORE_ERROR_NO_SERVER;
+    trans_done(t);
 }
 
 /* One chunk of a title's game data. RECORD_GAME_DATA goes out when the last
@@ -556,11 +570,8 @@ static void serve_game_data(score_trans* t)
 
 /* GAME_DATA: score s64 | data blob. Anything else, or a record the hook turns
  * down, is no game data for this row. */
-static void on_game_data(void* user, const psnr_msg* m)
+static void game_data_reply(score_trans* t, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || t->state != T_PENDING) return;
-    t->state = T_DONE;
     t->result = (s32)SCORE_ERROR_RANKING_NOT_FOUND;
     if (m->type != PSNR_GAME_DATA || m->len < 10) return;
     const u32 n = psnr_get16(m->data + 8);
@@ -575,6 +586,14 @@ static void on_game_data(void* user, const psnr_msg* m)
     serve_game_data(t);
 }
 
+static void on_game_data(void* user, const psnr_msg* m)
+{
+    score_trans* t = trans_get((s32)(uintptr_t)user);
+    if (!t || !trans_pending(t)) return;
+    game_data_reply(t, m);
+    trans_done(t);
+}
+
 /* GET_GAME_DATA: board u32 | online id [16] | character id u32 */
 static s32 get_game_data(s32 transId, u32 board, u32 npId, u32 total_ea, u32 recv, u32 data)
 {
@@ -587,8 +606,8 @@ static s32 get_game_data(s32 transId, u32 board, u32 npId, u32 total_ea, u32 rec
     t->down_data_ea = data;
     t->down_recv = recv;
     if (t->down && t->down_board == board && t->down_pc == t->pc_id && !memcmp(t->down_id, id, 16)) {
-        t->state = T_DONE;
         serve_game_data(t);
+        t->state = T_DONE;
         return CELL_OK;
     }
     free(t->down);
