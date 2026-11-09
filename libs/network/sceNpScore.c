@@ -60,10 +60,16 @@ static void sleep_10ms(void) { struct timespec ts = { 0, 10000000L }; nanosleep(
 #define TITLE_MAX 8
 #define TRANS_MAX 32
 
-enum { T_FREE, T_IDLE, T_PENDING, T_DONE };
+enum { T_FREE, T_IDLE, T_PENDING, T_DONE, T_BUSY };
+
+#define T_STATE_BITS 3u
+#define T_STATE_MASK 7u
+#define T_GEN_MASK   0x03FFFFFFu   /* beside the slot number, a cookie still fits 32 bits */
+#define T_SLOT_BITS  6u
+#define T_SLOT_MASK  63u
 
 typedef struct {
-    int state;
+    u32 gate;               /* first: generation << T_STATE_BITS | T_* */
     int title;
     s32 result;
     /* where the reply goes */
@@ -102,6 +108,86 @@ void np_score_set_game_data_hook(np_score_game_data_hook_fn fn) { s_game_data_ho
 static int use_v2(void) { return s_game_data_hook != NULL && !s_old_server; }
 
 /* ---------------------------------------------------------------------------
+ * Transaction state
+ *
+ * The state and the generation of the current request share one atomic word,
+ * so a reply is matched to its request and claims it in one step. A reply's
+ * cookie is its slot and generation: one that comes back after its transaction
+ * has moved on finds another generation and is dropped, even when the slot has
+ * a new transaction by then.
+ *
+ * A reply can run on another thread (cellSysutilCheckCallback pumps too) while
+ * the title's thread waits. T_BUSY is the claim: a handler holds it while it
+ * writes to guest memory, and timeout, abort and destroy wait for it, so the
+ * title's call can't return, and the stack buffer it passed go away, under a
+ * handler. Whoever holds it writes the result first and publishes last.
+ * -----------------------------------------------------------------------*/
+
+static u32 s_generation;
+
+static int trans_state(const score_trans* t)
+{
+    return (int)(__atomic_load_n(&t->gate, __ATOMIC_ACQUIRE) & T_STATE_MASK);
+}
+
+static int trans_running(const score_trans* t)
+{
+    const int s = trans_state(t);
+    return s == T_PENDING || s == T_BUSY;
+}
+
+/* Publish a state, keeping the generation. Only for the transaction's holder. */
+static void trans_set(score_trans* t, int state)
+{
+    const u32 w = __atomic_load_n(&t->gate, __ATOMIC_RELAXED);
+    __atomic_store_n(&t->gate, (w & ~T_STATE_MASK) | (u32)state, __ATOMIC_RELEASE);
+}
+
+/* The request is ready to go: a new generation, and the cookie for its reply. */
+static void* trans_begin(score_trans* t)
+{
+    const u32 gen = __atomic_add_fetch(&s_generation, 1, __ATOMIC_RELAXED) & T_GEN_MASK;
+    __atomic_store_n(&t->gate, gen << T_STATE_BITS | T_PENDING, __ATOMIC_RELEASE);
+    return (void*)((uintptr_t)gen << T_SLOT_BITS | (uintptr_t)(t - s_trans));
+}
+
+/* A reply's first step. NULL: its request is over, and the reply is dropped. */
+static score_trans* trans_claim(void* user)
+{
+    const u32 id = (u32)((uintptr_t)user & T_SLOT_MASK);
+    const u32 gen = (u32)((uintptr_t)user >> T_SLOT_BITS) & T_GEN_MASK;
+    if (id < 1 || id > TRANS_MAX) return NULL;
+    u32 want = gen << T_STATE_BITS | T_PENDING;
+    return __atomic_compare_exchange_n(&s_trans[id].gate, &want, gen << T_STATE_BITS | T_BUSY, 0,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) ? &s_trans[id] : NULL;
+}
+
+/* Take a transaction from any state, once a handler on it is out: it only
+ * writes, so that is brief. Returns the state it was in (T_FREE: nothing was
+ * taken); the taker ends the hold with trans_set. */
+static int trans_take(score_trans* t)
+{
+    for (;;) {
+        u32 w = __atomic_load_n(&t->gate, __ATOMIC_ACQUIRE);
+        const int s = (int)(w & T_STATE_MASK);
+        if (s == T_FREE) return T_FREE;
+        if (s == T_BUSY) { sleep_10ms(); continue; }
+        if (__atomic_compare_exchange_n(&t->gate, &w, (w & ~T_STATE_MASK) | T_BUSY, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return s;
+    }
+}
+
+/* Timeout and abort: a request still waiting for its reply ends with err. */
+static void trans_stop(score_trans* t, s32 err)
+{
+    const int was = trans_take(t);
+    if (was == T_FREE) return;
+    if (was == T_PENDING) { t->result = err; trans_set(t, T_DONE); return; }
+    trans_set(t, was);
+}
+
+/* ---------------------------------------------------------------------------
  * Contexts
  * -----------------------------------------------------------------------*/
 
@@ -137,27 +223,33 @@ s32 sceNpScoreCreateTransactionCtx(s32 titleCtxId)
     if (titleCtxId < 1 || titleCtxId > TITLE_MAX || !s_titles[titleCtxId])
         return (s32)SCORE_ERROR_INVALID_ID;
     for (int i = 1; i <= TRANS_MAX; i++)
-        if (s_trans[i].state == T_FREE) {
-            memset(&s_trans[i], 0, sizeof(s_trans[i]));
-            s_trans[i].state = T_IDLE;
+    {
+        u32 w = __atomic_load_n(&s_trans[i].gate, __ATOMIC_ACQUIRE);
+        if ((w & T_STATE_MASK) == T_FREE &&
+            __atomic_compare_exchange_n(&s_trans[i].gate, &w, (u32)T_BUSY, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            memset((char*)&s_trans[i] + sizeof(s_trans[i].gate), 0,
+                   sizeof(s_trans[i]) - sizeof(s_trans[i].gate));
             s_trans[i].title = titleCtxId;
+            trans_set(&s_trans[i], T_IDLE);
             return i;
         }
+    }
     return (s32)SCE_NP_ERROR_OUT_OF_MEMORY;
 }
 
 static score_trans* trans_get(s32 id)
 {
-    return (id >= 1 && id <= TRANS_MAX && s_trans[id].state != T_FREE) ? &s_trans[id] : NULL;
+    return (id >= 1 && id <= TRANS_MAX && trans_state(&s_trans[id]) != T_FREE) ? &s_trans[id] : NULL;
 }
 
 s32 sceNpScoreDestroyTransactionCtx(s32 transId)
 {
     score_trans* t = trans_get(transId);
-    if (!t) return (s32)SCORE_ERROR_INVALID_ID;
+    if (!t || trans_take(t) == T_FREE) return (s32)SCORE_ERROR_INVALID_ID;
     free(t->resend); free(t->up); free(t->down);
     t->resend = t->up = t->down = NULL;
-    t->state = T_FREE;   /* a reply still in flight finds the slot free and is dropped */
+    trans_set(t, T_FREE);   /* a reply still in flight finds the slot free and is dropped */
     return CELL_OK;
 }
 
@@ -174,7 +266,7 @@ s32 sceNpScoreAbortTransaction(s32 transId)
 {
     score_trans* t = trans_get(transId);
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    if (t->state == T_PENDING) { t->state = T_DONE; t->result = (s32)SCORE_ERROR_ABORTED; }
+    trans_stop(t, (s32)SCORE_ERROR_ABORTED);
     return CELL_OK;
 }
 
@@ -183,8 +275,8 @@ s32 sceNpScorePollAsync(s32 transId, u32 result)
 {
     score_trans* t = trans_get(transId);
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) np_psnr_pump();
-    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) return 1;
+    if (trans_running(t)) np_psnr_pump();
+    if (trans_running(t)) return 1;
     if (result) vm_write32(result, (u32)t->result);
     return 0;
 }
@@ -193,11 +285,11 @@ s32 sceNpScoreWaitAsync(s32 transId, u32 result)
 {
     score_trans* t = trans_get(transId);
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    for (int i = 0; i < 1000 && __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING; i++) {   /* ~10 s */
+    for (int i = 0; i < 1000 && trans_running(t); i++) {   /* ~10 s */
         np_psnr_pump();
-        if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) sleep_10ms();
+        if (trans_running(t)) sleep_10ms();
     }
-    if (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING) { t->state = T_DONE; t->result = (s32)SCORE_ERROR_NO_SERVER; }
+    if (trans_running(t)) trans_stop(t, (s32)SCORE_ERROR_NO_SERVER);
     if (result) vm_write32(result, (u32)t->result);
     return t->result;
 }
@@ -209,29 +301,20 @@ s32 sceNpScoreWaitAsync(s32 transId, u32 result)
 /* Finish a transaction that never reached the server. */
 static s32 fail_now(score_trans* t, s32 err)
 {
-    t->state = T_DONE;
     t->result = err;
+    trans_set(t, T_DONE);
     return CELL_OK;
 }
-
-static s32 trans_id_of(score_trans* t) { return (s32)(t - s_trans); }
-
-/* A reply can be handled on another thread (cellSysutilCheckCallback pumps too)
- * while the title's thread waits for it. So a handler writes everything the
- * title will read first, and says it is done last. */
-static int trans_pending(score_trans* t) { return __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == T_PENDING; }
-static void trans_done(score_trans* t) { __atomic_store_n(&t->state, T_DONE, __ATOMIC_RELEASE); }
 
 /* Send a request in the newer messages when this session can, keeping the
  * first form in case the server turns out not to know them. Non-zero if sent. */
 static int send_req(score_trans* t, u8 type2, const void* body2, u32 len2,
                     u8 type1, const void* body1, u32 len1, np_psnr_reply_fn fn)
 {
-    void* user = (void*)(uintptr_t)trans_id_of(t);
     free(t->resend);
     t->resend = NULL;
     t->v2 = 0;
-    if (!use_v2()) return np_psnr_request(type1, body1, len1, fn, user) != 0;
+    if (!use_v2()) return np_psnr_request(type1, body1, len1, fn, trans_begin(t)) != 0;
     t->resend = (u8*)malloc(len1 ? len1 : 1);
     if (!t->resend) return 0;
     memcpy(t->resend, body1, len1);
@@ -239,12 +322,12 @@ static int send_req(score_trans* t, u8 type2, const void* body2, u32 len2,
     t->resend_type = type1;
     t->resend_fn = fn;
     t->v2 = 1;
-    return np_psnr_request(type2, body2, len2, fn, user) != 0;
+    return np_psnr_request(type2, body2, len2, fn, trans_begin(t)) != 0;
 }
 
 /* ERROR bad-request to a newer message: the server predates them. Go back to
  * the first messages for this session and send this request again. Non-zero
- * if it went out; the reply then comes to the same handler. */
+ * if the reply was this; the handler has lost its claim and is finished. */
 static int fall_back(score_trans* t, const psnr_msg* m)
 {
     if (!t->v2 || !t->resend || m->type != PSNR_ERROR || m->len < 4 ||
@@ -253,14 +336,25 @@ static int fall_back(score_trans* t, const psnr_msg* m)
     s_old_server = 1;
     t->v2 = 0;
     printf("[sceNpScore] the server has no game data support; off for this session\n");
-    return np_psnr_request(t->resend_type, t->resend, t->resend_len, t->resend_fn,
-                           (void*)(uintptr_t)trans_id_of(t)) != 0;
+    u8* body = t->resend;
+    const u32 len = t->resend_len;
+    const u8 type = t->resend_type;
+    const np_psnr_reply_fn fn = t->resend_fn;
+    t->resend = NULL;
+    void* again = trans_begin(t);     /* the claim ends here: the reply may land at once */
+    const int sent = np_psnr_request(type, body, len, fn, again) != 0;
+    free(body);
+    if (!sent && (t = trans_claim(again)) != NULL) {
+        t->result = (s32)SCORE_ERROR_NO_SERVER;
+        trans_set(t, T_DONE);
+    }
+    return 1;
 }
 
 static void on_recorded(void* user, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || !trans_pending(t)) return;
+    score_trans* t = trans_claim(user);
+    if (!t) return;
     if (fall_back(t, m)) return;
     if (m->type != PSNR_SCORE_RECORDED || m->len < 4) {
         t->result = (s32)SCORE_ERROR_NO_SERVER;
@@ -268,7 +362,7 @@ static void on_recorded(void* user, const psnr_msg* m)
         if (t->tmp_rank_ea) vm_write32(t->tmp_rank_ea, psnr_get32(m->data));
         t->result = CELL_OK;
     }
-    trans_done(t);
+    trans_set(t, T_DONE);
 }
 
 /* RECORD_SCORE: board u32 | order u8 | score s64 | comment blob.
@@ -278,7 +372,6 @@ static s32 record(s32 transId, u32 boardId, s64 score, u32 comment, u32 tmpRank)
     score_trans* t = trans_get(transId);
     u8 body[4 + 1 + 8 + 2 + 64], body2[4 + 4 + 1 + 8 + 2 + 64];
     if (!t) return (s32)SCORE_ERROR_INVALID_ID;
-    t->state = T_PENDING;
     t->tmp_rank_ea = tmpRank;
     if (!np_psnr_connected()) return fail_now(t, (s32)SCORE_ERROR_NO_SERVER);
 
@@ -366,13 +459,17 @@ static void ranking_reply(score_trans* t, const psnr_msg* m)
     u16 n = psnr_get16(m->data + 4);
     const u8 *e = m->data + 6, *end = m->data + m->len;
     u32 filled = 0;
-    for (u16 i = 0; i < n && i < t->array_num && e; i++) {
+    for (u16 i = 0; i < n && i < t->array_num; i++) {
         u32 stride = t->by_id ? 136 : 128;
         u32 at = t->rank_ea + i * stride;
+        const u8* next = put_rank(t->by_id ? at + 8 : at, e, end, t->comment_ea ? t->comment_ea + i * 64 : 0, v2);
+        if (!next) break;                                       /* a row cut short ends the reply */
         if (t->by_id) vm_write32(at, psnr_get32(e) ? 1 : 0);   /* hasData */
-        e = put_rank(t->by_id ? at + 8 : at, e, end, t->comment_ea ? t->comment_ea + i * 64 : 0, v2);
+        e = next;
         filled++;
     }
+    if (t->by_id)                                               /* by id, the title reads every row */
+        for (u32 i = filled; i < t->array_num; i++) vm_write32(t->rank_ea + i * 136, 0);
     if (t->total_ea) vm_write32(t->total_ea, total);
     if (t->last_sort_ea) vm_write64(t->last_sort_ea, 0);
     /* The SDK returns the number of entries written. A range with nothing in
@@ -384,11 +481,11 @@ static void ranking_reply(score_trans* t, const psnr_msg* m)
 
 static void on_ranking(void* user, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || !trans_pending(t)) return;
+    score_trans* t = trans_claim(user);
+    if (!t) return;
     if (fall_back(t, m)) return;
     ranking_reply(t, m);
-    trans_done(t);
+    trans_set(t, T_DONE);
 }
 
 static u64 stack_arg(ppu_context* ctx, int n)   /* n >= 9 */
@@ -404,7 +501,6 @@ static void ranking_by_range(ppu_context* ctx)
     score_trans* t = trans_get((s32)ctx->gpr[3]);
     u8 body[10];
     if (!t) { ctx->gpr[3] = (u64)(s64)(s32)SCORE_ERROR_INVALID_ID; return; }
-    t->state = T_PENDING;
     t->by_id = 0;
     t->rank_ea = (u32)ctx->gpr[6];
     t->comment_ea = (u32)ctx->gpr[8];
@@ -436,7 +532,6 @@ static void ranking_by_npid(ppu_context* ctx, int with_pc)
 {
     score_trans* t = trans_get((s32)ctx->gpr[3]);
     if (!t) { ctx->gpr[3] = (u64)(s64)(s32)SCORE_ERROR_INVALID_ID; return; }
-    t->state = T_PENDING;
     t->by_id = 1;
     t->rank_ea = (u32)ctx->gpr[7];
     t->comment_ea = (u32)ctx->gpr[9];
@@ -490,10 +585,10 @@ static void hle_ranking_by_npid_pcid(ppu_context* ctx)
 
 static void on_game_data_recorded(void* user, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || !trans_pending(t)) return;
+    score_trans* t = trans_claim(user);
+    if (!t) return;
     t->result = m->type == PSNR_OK ? CELL_OK : (s32)SCORE_ERROR_NO_SERVER;
-    trans_done(t);
+    trans_set(t, T_DONE);
 }
 
 /* One chunk of a title's game data. RECORD_GAME_DATA goes out when the last
@@ -535,9 +630,8 @@ static s32 record_game_data(s32 transId, u32 board, s64 score, u32 total, u32 se
     memcpy(p, rec, total);
     p += total;
     free(rec);
-    t->state = T_PENDING;
     u32 sent = np_psnr_request(PSNR_RECORD_GAME_DATA, body, (u32)(p - body), on_game_data_recorded,
-                               (void*)(uintptr_t)trans_id_of(t));
+                               trans_begin(t));
     free(body);
     if (!sent) return fail_now(t, (s32)SCORE_ERROR_NO_SERVER);
     return CELL_OK;
@@ -588,10 +682,10 @@ static void game_data_reply(score_trans* t, const psnr_msg* m)
 
 static void on_game_data(void* user, const psnr_msg* m)
 {
-    score_trans* t = trans_get((s32)(uintptr_t)user);
-    if (!t || !trans_pending(t)) return;
+    score_trans* t = trans_claim(user);
+    if (!t) return;
     game_data_reply(t, m);
-    trans_done(t);
+    trans_set(t, T_DONE);
 }
 
 /* GET_GAME_DATA: board u32 | online id [16] | character id u32 */
@@ -607,7 +701,7 @@ static s32 get_game_data(s32 transId, u32 board, u32 npId, u32 total_ea, u32 rec
     t->down_recv = recv;
     if (t->down && t->down_board == board && t->down_pc == t->pc_id && !memcmp(t->down_id, id, 16)) {
         serve_game_data(t);
-        t->state = T_DONE;
+        trans_set(t, T_DONE);
         return CELL_OK;
     }
     free(t->down);
@@ -620,9 +714,7 @@ static s32 get_game_data(s32 transId, u32 board, u32 npId, u32 total_ea, u32 rec
     u8* p = psnr_put32(body, board);
     memcpy(p, id, 16);
     p = psnr_put32(p + 16, (u32)t->pc_id);
-    t->state = T_PENDING;
-    if (!np_psnr_request(PSNR_GET_GAME_DATA, body, (u32)(p - body), on_game_data,
-                         (void*)(uintptr_t)trans_id_of(t)))
+    if (!np_psnr_request(PSNR_GET_GAME_DATA, body, (u32)(p - body), on_game_data, trans_begin(t)))
         return fail_now(t, (s32)SCORE_ERROR_RANKING_NOT_FOUND);
     return CELL_OK;
 }
