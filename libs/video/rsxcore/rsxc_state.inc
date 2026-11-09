@@ -753,10 +753,14 @@ static inline gpu_addr rc_arena_va(const rc_arena* a, u64 off)
 /* The GPU address of chunk k's half for this frame (a whole-chunk bind; k at
  * RC_ARENA_MAX or more is the big buffer), its size, and the chunk of an
  * offset with the offset inside it. */
+static inline gpu_addr rc_arena_base_par(const rc_arena* a, u32 k, u32 par)
+{
+    if (k >= RC_ARENA_MAX) return a->big_va + (u64)par * a->big_half;
+    return a->va[k] + (u64)par * a->half;
+}
 static inline gpu_addr rc_arena_base(const rc_arena* a, u32 k)
 {
-    if (k >= RC_ARENA_MAX) return a->big_va + (u64)s_d3d.vp_parity * a->big_half;
-    return a->va[k] + (u64)s_d3d.vp_parity * a->half;
+    return rc_arena_base_par(a, k, (u32)s_d3d.vp_parity);
 }
 static inline u64 rc_arena_size(const rc_arena* a, u32 k)
 {

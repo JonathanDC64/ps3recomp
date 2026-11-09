@@ -12,8 +12,40 @@ static void dred_report(const char* where)
     if (s_rc_dev) gpu_fault_report(s_rc_dev, where);
 }
 
+/* The replay thread (RSX_RF_THREAD; rsxc_frame.inc): s_rf_busy from the
+ * hand-off until the replay is done. */
+static SRWLOCK s_rf_lk = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_rf_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG s_rf_busy;
+static HANDLE s_rf_thread;
+static volatile DWORD s_rf_tid;
+static double s_rf_join_ms;   /* the FIFO thread's waits for the replay, for GCM_RATES */
+
+/* Until the last batch's replay is done. Every user of the GPU objects on the
+ * FIFO thread (or any other but the replay thread itself) comes through here
+ * first. Not bounded, as a Present stuck in a driver isn't on the FIFO thread
+ * either; never silent. */
+static void rf_join(void)
+{
+    if (!InterlockedCompareExchange(&s_rf_busy, 0, 0)) return;
+    if (s_rf_tid && GetCurrentThreadId() == s_rf_tid) return;
+    LARGE_INTEGER a, b, f;
+    QueryPerformanceCounter(&a);
+    AcquireSRWLockExclusive(&s_rf_lk);
+    for (int s = 0; s_rf_busy; )
+        if (!SleepConditionVariableSRW(&s_rf_cv, &s_rf_lk, 2000, 0) && s_rf_busy) {
+            s += 2;
+            printf("[rsx] waiting %d s for the replay thread\n", s);
+        }
+    ReleaseSRWLockExclusive(&s_rf_lk);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    s_rf_join_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+
 static void wait_for_gpu(void)
 {
+    rf_join();
     const gpu_fence want = gpu_signal(s_rc_dev);
     /* NEVER wait unbounded here: this runs on the vblank ticker, which also
      * drives the guest's vblank handlers, the FIFO drain, and the fence

@@ -209,7 +209,9 @@ static void d3d12_fifo_flip(void)
     if (blink_dbg())
         printf("[FLIP] presenting %u draws at the title's flip%c", s_d3d.draw_count, 10);
     s_nodisp_run = 0;
+    s_rf_at_flip = 1;
     render_frame();
+    s_rf_at_flip = 0;
     s_pc_flip_render++;
     s_clear_presents++;   /* framed presents are on: the ticker stays out */
     { extern void cellGcm_rcap_cut(void); cellGcm_rcap_cut(); }

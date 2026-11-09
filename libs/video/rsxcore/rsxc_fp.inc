@@ -696,14 +696,14 @@ static void hdr_batch_start(void)
  * and T's slot for this batch's blit. The display copy as aa_pick finds it:
  * the last draw into a display buffer that writes colour and samples a
  * target; T is the largest target it samples, at the display's size. */
-static void hdr_mark_scan(void)
+static void hdr_mark_scan(const D3D12DrawRecord* draws, u32 ndraws)
 {
     if (!s_hdr.stage_b) return;
-    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    const u32 n = ndraws < MAX_DRAWS ? ndraws : MAX_DRAWS;
     int t = -1;
     u32 dc = 0;
     for (u32 d = n; d-- > 0; ) {
-        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        const D3D12DrawRecord* dr = &draws[d];
         if (!dr->is_vp || dr->is_clear || dr->rt_off || !(dr->cmask & 7u)) continue;
         u64 best = 0;
         for (int u = 0; u < RSX_FP_UNITS; u++) {
@@ -721,7 +721,7 @@ static void hdr_mark_scan(void)
     u32 x[4] = {0, 0, 0, 0};
     int nx = 0, after = 0;
     for (u32 d = 0; d < dc; d++) {
-        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        const D3D12DrawRecord* dr = &draws[d];
         if (!dr->is_vp || dr->is_clear) continue;
         if (!after) {
             if (dr->rt_off == T->off && hdr_scene_limit(dr->fp_addr) > 0.0f) after = 1;
