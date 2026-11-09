@@ -107,6 +107,16 @@ s32 sceNpTerm(void);
 s32 sceNpScoreInit(void);
 s32 sceNpScoreTerm(void);
 
+/* A title's port can take part in sceNpScore game data by setting this hook.
+ * With none set, nothing changes for the title: recording game data is
+ * accepted and dropped, reading finds nothing, and the server sees only the
+ * first score messages. The hook gets one whole record: upload != 0 before
+ * it is sent, 0 before the title can read it. It may change the bytes.
+ * Returning 0 drops the record: an upload is not sent, and a read counts as
+ * no game data for that row. */
+typedef int (*np_score_game_data_hook_fn)(int upload, uint32_t board_id, uint8_t* data, uint32_t size);
+void np_score_set_game_data_hook(np_score_game_data_hook_fn fn);
+
 s32 sceNpGetNpId(s32 userId, SceNpId* npId);
 s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId);
 s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName);
