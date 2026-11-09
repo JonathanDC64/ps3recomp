@@ -978,7 +978,7 @@ static void rf_tail(RfJob* const j)
         s_aa.present_logged = aa_mode();
         aa_run_display(fi);
     }
-    int dumping = (!j->threaded && s_d3d.dump_frames_left > 0 && GPU_VALID(s_rc_readback_buf)
+    int dumping = (j->threaded != 1 && s_d3d.dump_frames_left > 0 && GPU_VALID(s_rc_readback_buf)
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
@@ -1049,7 +1049,7 @@ static void rf_tail(RfJob* const j)
      * this route never enables the debug layer, so the queue holds nothing;
      * call map G16.) */
 
-    if (s_sc_dump_pending) {
+    if (s_sc_dump_pending && j->threaded != 1) {   /* (1: the next frame, which rf_may_thread keeps inline) */
         s_sc_dump_pending = 0;
         wait_for_gpu();
         s_dump_name = "screencopy";
@@ -1388,6 +1388,7 @@ static void rf_go(void)
 static void rf_stop(void)
 {
     if (!s_rf_thread) return;
+    printf("[rsx] replay thread stopping: %u batches threaded, %u inline\n", s_rf_thr, s_rf_inl);
     if (GetCurrentThreadId() != s_rf_tid) {
         for (int ms = 0; s_rf_busy && ms < 6000; ms++) Sleep(1);
         AcquireSRWLockExclusive(&s_rf_lk);
@@ -1417,15 +1418,17 @@ static int rf_may_thread(const RfJob* j)
     PS3_KNOB(dbg, (getenv("RTT_SAVERT") || getenv("RSX_CAP") || getenv("GCM_GUEST_FB") ||
                    getenv("RSX_HDR_SNAP") || getenv("VP_TESTTRI") || getenv("DRAW_SKIP") ||
                    ps3_env_int("RSX_PSO_IN_REC", 1) != 1) ? 1 : 0);
-    if (dbg || perf_on() || !s_rf_at_flip) return 0;
-    if (s_d3d.dump_frames_left > 0 || s_sc_dump_pending || s_composite_src) return 0;
+    /* 2 tests the worker: frames that get dumped and frames a replay presents go to
+     * it too, so an image comparison looks at a threaded frame. To play, use 1. */
+    if (dbg || perf_on() || (on < 2 && !s_rf_at_flip)) return 0;
+    if ((on < 2 && (s_d3d.dump_frames_left > 0 || s_sc_dump_pending)) || s_composite_src) return 0;
     if (!zq_defer_on() || (write_color_on() && !write_color_defer())) return 0;
 #ifdef _WIN32
     if (!s_window_thread) return 0;    /* (the FIFO thread pumps the window) */
 #endif
     if (s_vb.big_off || s_vf.big_off) return 0;   /* (a piece over a chunk: the big buffer may be replaced) */
     (void)j;
-    return rf_thread_start();
+    return rf_thread_start() ? on : 0;
 }
 
 static void render_frame(void)
