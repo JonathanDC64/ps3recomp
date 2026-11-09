@@ -195,6 +195,13 @@ jobs:
           clang -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
           /tmp/test_np_matching2
 
+      # sceNpScore over psnr without a server: a range with no rows is the
+      # server's not-found, so a title paging a board stops.
+      - name: Run the score test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_np_score libs/network/tests/test_np_score.c
+          /tmp/test_np_score
+
       # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
       # and PSN's online ID rules.
       - name: Run the player-name test
