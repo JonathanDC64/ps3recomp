@@ -343,7 +343,7 @@ static _Alignas(64) VPJCounter s_vpj_ctr[4];
  * increment of a line the workers spin on, ~6% of the FIFO thread. */
 static LONG s_vpj_q;
 static u32 s_vpj_qv;
-static int s_vpj_conv;   /* a vertex job (not a span copy) queued since the last sync */
+static int s_vpj_conv;   /* a vertex job whose reads aren't in s_vpg queued since the last sync */
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -430,9 +430,9 @@ static void vpj_sync_hook(void) { vpj_sync(); vfo_next(); }
  * it lands), so a title can't rely on one to reuse vertex memory. It needs
  * the queue done and the stretch ended only where it lands on a page a span
  * copy of this stretch read, so a later copy can't see the new bytes and a
- * later draw can't reuse the old ones; or while a vertex job is queued,
- * whose reads aren't tracked. VF_SYNC_2D (live, default 1): 0 syncs at every
- * write, as before. */
+ * later draw can't reuse the old ones; or while a vertex job is queued
+ * whose reads couldn't be marked (vpj_mark_reads). VF_SYNC_2D (live, default
+ * 1): 0 syncs at every write, as before. */
 static void vpj_sync_write_hook(u32 ea, u32 len)
 {
     static int on = -1;
@@ -509,6 +509,31 @@ static void vpj_publish_maybe(void)
     PS3_KNOB(eager, ps3_env_int("VPJ_EAGER", 64));
     if (s_vpj_qv >= vpj_batch() || (eager && s_vpj_qv >= (u32)eager && !s_vpj_sleepers)) vpj_publish(1);
 }
+/* Marks the guest pages a queued vertex job will read, as vf_copy marks a
+ * span's (s_vpg), so that a 2D write landing elsewhere needs no sync
+ * (vpj_sync_write_hook). A job reads each array from its lowest index to its
+ * highest at most. An array that doesn't resolve in one piece, or a range too
+ * wide to mark, sets s_vpj_conv and every 2D write syncs until the next sync.
+ * VPJ_MARK_READS (live, default 1): 0 always sets it. */
+static u32 vf_resolve(const rsx_fetch_slot* sl, u64 a, u64 b);
+static void vpj_mark_reads(const u32* vis, u32 n)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VPJ_MARK_READS", 1));
+    if (!on || !s_vpg || !n) { s_vpj_conv = 1; return; }
+    u32 lo = vis[0], hi = vis[0];
+    for (u32 i = 1; i < n; i++) { if (vis[i] < lo) lo = vis[i]; if (vis[i] > hi) hi = vis[i]; }
+    for (u32 k = 0; k < s_vp_plan.n_on; k++) {
+        const rsx_fetch_slot* sl = &s_vp_plan.on[k];
+        u32 elo = lo, ehi = hi;
+        if (sl->freq) { if (sl->modulo) { elo = 0; ehi = sl->freq - 1; } else { elo /= sl->freq; ehi /= sl->freq; } }
+        const u64 a = (u64)sl->off + (u64)elo * sl->stride;
+        const u64 b = (u64)sl->off + (u64)ehi * sl->stride + lv_elem_bytes(sl->type, sl->n);
+        const u32 ga = b - a > (16u << 20) ? 0xFFFFFFFFu : vf_resolve(sl, a, b);
+        if (ga == 0xFFFFFFFFu || (u64)ga + (b - a) > 0xFFFFFFFFull) { s_vpj_conv = 1; return; }
+        for (u32 p = ga >> 16; p <= (u32)((u64)ga + (b - a) - 1) >> 16; p++) s_vpg[p] = s_vfo_ep;
+    }
+}
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
     VPJob* J = &s_vpj[s_vpj_q];
@@ -516,7 +541,7 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
     s_vpj_q++;
-    s_vpj_conv = 1;
+    vpj_mark_reads(vis, n);
     s_vpj_qv += n;
     vpj_publish_maybe();
 }
