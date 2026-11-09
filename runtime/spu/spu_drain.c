@@ -418,7 +418,7 @@ void (*spu_take_interrupt(spu_context* ctx,
  * question is not "where are we" but "what cycle got us here" -- one pc names
  * a point, a ring names the loop. Shared by all SPU threads, it was a cache
  * line every thread wrote on each lifted call, and it mixed their loops. */
-enum { SPU_DEPTH_RING = 24 };
+enum { SPU_DEPTH_RING = 32 };   /* a power of two: masked on every lifted call */
 static _Thread_local uint32_t t_depth_ring[SPU_DEPTH_RING];
 static _Thread_local uint32_t t_depth_n;
 
@@ -442,7 +442,7 @@ static SPU_DRAIN_NOINLINE void spu_depth_trip(spu_context* ctx)
         const uint32_t n = t_depth_n;
         uint32_t start = (n > SPU_DEPTH_RING) ? (n - SPU_DEPTH_RING) : 0;
         for (uint32_t k = start; k < n; k++)
-            fprintf(stderr, " %05X", t_depth_ring[k % SPU_DEPTH_RING]);
+            fprintf(stderr, " %05X", t_depth_ring[k & (SPU_DEPTH_RING - 1)]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }
@@ -454,7 +454,7 @@ void spu_depth_guard(spu_context* ctx)
 {
     static uint32_t s_max = 0;
     if (!s_max) s_max = spu_depth_max_load();
-    t_depth_ring[t_depth_n % SPU_DEPTH_RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+    t_depth_ring[t_depth_n & (SPU_DEPTH_RING - 1)] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     t_depth_n++;
     if (ctx->host_depth >= s_max) spu_depth_trip(ctx);
 }
