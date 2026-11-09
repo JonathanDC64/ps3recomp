@@ -525,18 +525,18 @@ rtt_dump_done:;
                     if (s_duck_off && dr->tex[_u].off == s_duck_off)
                         s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
-                        rsx_tex_layout _tl;
-                        rsx_texture_layout(dr->tex[_u].fmt, dr->tex[_u].w, dr->tex[_u].h, &_tl);
+                        rsx_texfmt _tfmt; int _tcomp;
+                        tl_class(dr->tex[_u].fmt, &_tfmt, &_tcomp);
                         /* The crossbar is defined for the 8-bit colour classes
                          * (rsx_texture_component_remap); the 16- and 32-bit
                          * ones are viewed as stored, like an offscreen RT. */
-                        const int _x8 = _tl.fmt == RSX_TEXFMT_R8G8B8A8 ||
-                                        _tl.fmt == RSX_TEXFMT_R8G8 || _tl.compressed;
+                        const int _x8 = _tfmt == RSX_TEXFMT_R8G8B8A8 ||
+                                        _tfmt == RSX_TEXFMT_R8G8 || _tcomp;
                         /* (A port's image in the slot, tov_lv: RGBA8 with its own levels, under the
                          * guest's swizzle: rsx_texture_override.h.) */
                         const VPTexSlot* _ts = &s_d3d.vp_tex[ts];
                         srv_write_ex(wslot, _ts->tex,
-                                  _ts->tov_lv ? GPU_FORMAT_R8G8B8A8_UNORM : rsx_texfmt_format(_tl.fmt),
+                                  _ts->tov_lv ? GPU_FORMAT_R8G8B8A8_UNORM : rsx_texfmt_format(_tfmt),
                                   (_bf == 0x81) ? 0x1000
                                   : _x8 ? rsx_remap_to_swizzle(dr->tex[_u].ctrl1, _bf)
                                         : GPU_SWIZZLE_IDENTITY,
