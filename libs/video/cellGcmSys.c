@@ -4325,6 +4325,7 @@ int cellGcm_replay_load(const char* file, u32** methods)
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)   /* the restored list (s_io_pages) */
         if (s_io_mappings[i].active) gcm_io_pages_mark(s_io_mappings[i].ea, s_io_mappings[i].size);
     s_rcap_state0 = s_state;
+    { extern u32 g_rsx_vattr_ver; g_rsx_vattr_ver++; }   /* (the state came from the file) */
     s_inited = 1;
     s_gcm_initialized = 1;
     return n;
@@ -4334,6 +4335,7 @@ int cellGcm_replay_load(const char* file, u32** methods)
 void cellGcm_replay_reset(void)
 {
     s_state = s_rcap_state0;
+    { extern u32 g_rsx_vattr_ver; g_rsx_vattr_ver++; }
     rsx_reset_upload_claims();
 }
 

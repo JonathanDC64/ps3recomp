@@ -1764,12 +1764,45 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_ib_mapped || !state->vertex_attribs[0].enabled) return -1;
     if ((u64)s_vp_icap - s_d3d.vp_ib_offset < (u64)count * 3 + 4) { s_vf_stat[5]++; return -1; }
+    /* The plan, and whether its attribute types can go to the GPU as they
+     * are, stand while the attribute words have not changed
+     * (g_rsx_vattr_ver): the continuing ranges of a mesh ask again with the
+     * same state. Rebuilding it per range was 3% of the FIFO thread. local0:
+     * where local memory is mapped, read by the plan's local arrays.
+     * VF_PLAN_MEMO=0 (live) rebuilds it per range; VF_PLAN_CHECK=1 (live)
+     * rebuilds it anyway and reports a difference. */
+    extern u32 g_rsx_vattr_ver;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
     static rsx_fetch_plan pl;
-    rsx_fetch_plan_init(state, &pl);
-    for (u32 k = 0; k < pl.n_on; k++) {
-        const u32 t = pl.on[k].type;
-        if (t < 1 || t > 7 || t == 6) { s_vf_stat[4]++; return -1; }
-    }
+    static const rsx_state* pl_st;
+    static u32 pl_ver, pl_env, pl_local0;
+    static int pl_gpu;
+    { static int en = -1, chk = -1;
+      PS3_KNOB(en, ps3_env_int("VF_PLAN_MEMO", 1));
+      PS3_KNOB(chk, ps3_env_int("VF_PLAN_CHECK", 0));
+      const u32 local0 = cellGcmResolveLocated(1, 0);
+      if (!en || pl_st != state || pl_ver != g_rsx_vattr_ver || pl_env != ps3_env_gen ||
+          pl_local0 != local0) {
+          rsx_fetch_plan_init(state, &pl);
+          pl_st = state; pl_ver = g_rsx_vattr_ver; pl_env = ps3_env_gen; pl_local0 = local0;
+          pl_gpu = 1;
+          for (u32 k = 0; k < pl.n_on; k++) {
+              const u32 t = pl.on[k].type;
+              if (t < 1 || t > 7 || t == 6) pl_gpu = 0;
+          }
+      } else if (chk) {
+          static rsx_fetch_plan fresh;
+          static u64 n, bad;
+          memset(&fresh, 0, sizeof fresh);
+          rsx_fetch_plan_init(state, &fresh);
+          n++;
+          if (fresh.n_on != pl.n_on || memcmp(fresh.konst, pl.konst, sizeof pl.konst) ||
+              memcmp(fresh.on, pl.on, sizeof(pl.on[0]) * pl.n_on)) bad++;
+          if (n % 200000u == 0)
+              fprintf(stderr, "[VF] plan memo: %llu hits checked, %llu differ%c",
+                      (unsigned long long)n, (unsigned long long)bad, 10);
+      } }
+    if (!pl_gpu) { s_vf_stat[4]++; return -1; }
     /* The list, straight into the index buffer; it only counts once the
      * draw is accepted (vp_ib_offset, the carry). */
     const int restart = state->restart_index_enable != 0;

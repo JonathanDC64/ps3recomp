@@ -57,6 +57,13 @@ rsx_backend* rsx_get_backend(void)
  * while this stays the same. */
 u32 g_rsx_vp_ucode_ver = 1;
 
+/* The same for the vertex attribute arrays (format, offset, the frequency
+ * divider) and the constant attribute registers: bumped when one of those
+ * words changes on any rsx_state, and when a state is reset or restored
+ * (rsx_state_init; cellGcmSys.c after a capture is loaded or replayed). A
+ * word that re-sends the value already stored is not a change. */
+u32 g_rsx_vattr_ver = 1;
+
 /* A vertex-program or constant word that re-sends the value already stored
  * is not a change, so g_rsx_vp_ucode_ver and vertex_constants_gen stay put
  * and the backend keeps what it derived from them. Demon's Souls re-sends its
@@ -81,6 +88,7 @@ static int rsx_vconst_cmp(void)
 void rsx_state_init(rsx_state* state)
 {
     g_rsx_vp_ucode_ver++;
+    g_rsx_vattr_ver++;
     memset(state, 0, sizeof(rsx_state));
     /* RSX reset value for the constant vertex attributes is (0,0,0,1); a zeroed
      * struct would leave w at 0. */
@@ -339,6 +347,7 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
         method < NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + RSX_MAX_VERTEX_ATTRIBS * 4) {
         u32 index = (method - NV4097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4;
         rsx_vertex_attrib* attr = &state->vertex_attribs[index];
+        if (attr->format != data) g_rsx_vattr_ver++;
 
         /*
          * Format register layout:
@@ -366,6 +375,7 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
     if (method >= NV4097_SET_VERTEX_DATA_ARRAY_OFFSET &&
         method < NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + RSX_MAX_VERTEX_ATTRIBS * 4) {
         u32 index = (method - NV4097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4;
+        if (state->vertex_attribs[index].offset != data) g_rsx_vattr_ver++;
         state->vertex_attribs[index].offset = data;
         state->vertex_dirty = 1;
         return 0;
@@ -485,7 +495,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * value) for the sub-channel path. */
     /* NV4097_SET_FREQUENCY_DIVIDER_OPERATION: per-attribute modulo/divide mask
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
-    if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
+    if (method == 0x00001FC0) {
+        if (state->frequency_divider_op != data) g_rsx_vattr_ver++;
+        state->frequency_divider_op = data;
+        return 0;
+    }
 
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
@@ -784,6 +798,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
         u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
         float f; memcpy(&f, &data, 4);
+        { u32 was; memcpy(&was, &state->vertex_data4f[idx][lane], 4);
+          if (was != data) g_rsx_vattr_ver++; }
         state->vertex_data4f[idx][lane] = f;
         { static int _d = -1; PS3_KNOB(_d, getenv("VDATA_DBG") ? 1 : 0);
           static int _n = 0;
