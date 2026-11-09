@@ -21,10 +21,20 @@ extern "C" {
  * a few library sources on its own links without runtime/diag/ps3_knob.c. */
 #if defined(_MSC_VER)
 #define PS3_KNOB_SHARED __declspec(selectany)
+#define PS3_KNOB_LINE __declspec(align(64))
 #else
 #define PS3_KNOB_SHARED __attribute__((weak))
+#define PS3_KNOB_LINE __attribute__((aligned(64)))
 #endif
-PS3_KNOB_SHARED volatile unsigned ps3_env_gen = 1;   /* setenv increments it */
+/* ps3_env_gen fills a 64-byte cache line of its own. Every knob check on every
+ * thread reads it, and with a variable that each HLE call writes beside it,
+ * those reads missed the cache. The object keeps the name, and the macro makes
+ * the name read its first word, so the knob checks do not change and code that
+ * declares it as a plain unsigned without this header still links to that word.
+ * (A name does not expand inside its own macro.) */
+typedef struct ps3_env_gen_line { volatile unsigned gen; unsigned pad_[15]; } ps3_env_gen_line;
+PS3_KNOB_SHARED PS3_KNOB_LINE ps3_env_gen_line ps3_env_gen = { 1, { 0 } };
+#define ps3_env_gen (ps3_env_gen.gen)   /* setenv increments it */
 void ps3_env_bump(void);
 /* Set a variable for the getenv cache as well as the process (boot_main's
  * cached_setenv, which the console's setenv uses). _putenv_s alone is not

@@ -54,8 +54,9 @@ PS3_SPLIT_DEFINE(void* volatile, g_pm_flow_ctx, 0);   /* the game module's once 
  * set the done bit on the pending records -- the faithful sync equivalent of
  * the completion interrupt. Env SPU_JOBDRAIN (default off while validating). */
 extern void spu_halt(spu_context*);
-/* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
- * ended where it should not have (spurs_policy.c, [pm-end]). */
+/* Last 32 drain steps on this host thread (pc), for post-mortems of a policy
+ * module's run that ended where it should not have (spurs_policy.c, [pm-end]).
+ * Nothing reports any other SPU's steps, so only policy-mode hops record. */
 static _Thread_local uint32_t t_recent[32];
 static _Thread_local uint32_t t_recent_n;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
@@ -65,12 +66,21 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
     return k;
 }
 
+#if defined(_MSC_VER)
+#define SPU_DRAIN_NOINLINE __declspec(noinline)
+#else
+#define SPU_DRAIN_NOINLINE __attribute__((noinline))
+#endif
+
 /* The per-step check runs on every trampoline hop -- ~12 million a second
  * in Demon's Souls' HighGraphics ring consumer -- so the common case is kept
- * to what every step needs: the recent-pc ring, the stack-reset entries and
- * the job-end test. The trace and drain knobs below it go through one cached
- * flag (re-read when the console changes the environment), and only a set
- * knob or an armed PM flow trace takes the full path. */
+ * to what every step needs: the stack-reset entries and the job-end test,
+ * and a policy module's recent-pc ring. The trace and drain knobs below it
+ * go through one cached flag (re-read when the console changes the
+ * environment), and only a set knob or an armed PM flow trace takes the full
+ * path. The knob read, the full
+ * path and the job-end report are out of line: inlined into the check, they
+ * made it a function of its own that saved six registers on every hop. */
 extern unsigned g_spu_stack_reset_n;   /* spu_channels.c */
 extern volatile int g_yz_lockstep_on;  /* spu_lockstep.c; < 0 = not resolved yet */
 static int      s_step_diag, s_step_no_ls0;
@@ -90,7 +100,7 @@ volatile int g_spu_bi_switch = 0;
 #else
 PS3_SPLIT_DEFINE(volatile int, g_spu_bi_switch, 0);   /* the game module's once it loads */
 #endif
-static void spu_step_diag_load(void)
+static SPU_DRAIN_NOINLINE void spu_step_diag_load(void)
 {
     { const char* e = getenv("SPU_BI_SWITCH"); g_spu_bi_switch = !(e && e[0] == '0'); }
     s_step_no_ls0 = getenv("SPU_NO_LS0_END") ? 1 : 0;
@@ -101,26 +111,31 @@ static void spu_step_diag_load(void)
                       getenv("SPU_PCHIST");
     s_step_diag_gen = ps3_env_gen;
 }
-static void spu_task_launch_check_full(spu_context* ctx, void* fn);
-static inline void spu_step_check(spu_context* ctx, void* fn)
+static SPU_DRAIN_NOINLINE void spu_task_launch_check_full(spu_context* ctx, void* fn);
+/* As in the full path: a job branching back to LS 0 has finished. */
+static SPU_DRAIN_NOINLINE void spu_step_ls0_end(spu_context* ctx)
+{
+    static int _n = 0;
+    if (_n < 8 && ++_n)
+        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete%c",
+                ctx->image_id, 10);
+    spu_halt(ctx);
+}
+/* Forced: left to clang, the policy-mode branch made this a function of its
+ * own again, with a call and saved registers on every hop. */
+SPU_LS_INLINE void spu_step_check(spu_context* ctx, void* fn)
 {
     if (s_step_diag_gen != ps3_env_gen) spu_step_diag_load();
     if (s_step_diag || g_pm_flow_ctx) { spu_task_launch_check_full(ctx, fn); return; }
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
-    t_recent[t_recent_n++ & 31] = pc;
+    if (ctx->policy_mode) t_recent[t_recent_n++ & 31] = pc;
     if (g_spu_stack_reset_n && ctx->host_depth && !ctx->policy_mode) {
         extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
         spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     }
-    /* As in the full path: a job branching back to LS 0 has finished. */
     if (!s_step_no_ls0 && ctx->steps++ && pc == 0 &&
-        !ctx->policy_mode && ctx->image_id > 0) {
-        static int _n = 0;
-        if (_n < 8 && ++_n)
-            fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete%c",
-                    ctx->image_id, 10);
-        spu_halt(ctx);
-    }
+        !ctx->policy_mode && ctx->image_id > 0)
+        spu_step_ls0_end(ctx);
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
@@ -128,7 +143,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     spu_step_check(ctx, fn);
 }
 
-static void spu_task_launch_check_full(spu_context* ctx, void* fn)
+static SPU_DRAIN_NOINLINE void spu_task_launch_check_full(spu_context* ctx, void* fn)
 {
     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
@@ -403,25 +418,23 @@ void (*spu_take_interrupt(spu_context* ctx,
     return spu_indirect_branch;
 }
 
-/* See the declaration in spu_context.h. */
-void spu_depth_guard(spu_context* ctx)
+/* Ring of recent drain sites, one per thread. When the depth trips, the useful
+ * question is not "where are we" but "what cycle got us here" -- one pc names
+ * a point, a ring names the loop. Shared by all SPU threads, it was a cache
+ * line every thread wrote on each lifted call, and it mixed their loops. */
+enum { SPU_DEPTH_RING = 32 };   /* a power of two: masked on every lifted call */
+static _Thread_local uint32_t t_depth_ring[SPU_DEPTH_RING];
+static _Thread_local uint32_t t_depth_n;
+
+/* Out of line: inlined, the getenv and the prints made every guard call save
+ * six registers. */
+static SPU_DRAIN_NOINLINE uint32_t spu_depth_max_load(void)
 {
-    static uint32_t s_max = 0;
-    if (!s_max) {
-        const char* e = getenv("SPU_HOST_DEPTH_MAX");
-        s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
-    }
-
-    /* Ring of recent drain sites. When the depth trips, the useful question is
-     * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
-    enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
-    s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
-    s_n++;
-
-    if (ctx->host_depth < s_max) return;
+    const char* e = getenv("SPU_HOST_DEPTH_MAX");
+    return e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+}
+static SPU_DRAIN_NOINLINE void spu_depth_trip(spu_context* ctx)
+{
     static int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
@@ -430,13 +443,24 @@ void spu_depth_guard(spu_context* ctx)
                 ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
         fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
-        uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
-        for (uint32_t k = start; k < s_n; k++)
-            fprintf(stderr, " %05X", s_ring[k % RING]);
+        const uint32_t n = t_depth_n;
+        uint32_t start = (n > SPU_DEPTH_RING) ? (n - SPU_DEPTH_RING) : 0;
+        for (uint32_t k = start; k < n; k++)
+            fprintf(stderr, " %05X", t_depth_ring[k & (SPU_DEPTH_RING - 1)]);
         fprintf(stderr, "\n");
         fflush(stderr);
     }
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
+}
+
+/* See the declaration in spu_context.h. */
+void spu_depth_guard(spu_context* ctx)
+{
+    static uint32_t s_max = 0;
+    if (!s_max) s_max = spu_depth_max_load();
+    t_depth_ring[t_depth_n & (SPU_DEPTH_RING - 1)] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+    t_depth_n++;
+    if (ctx->host_depth >= s_max) spu_depth_trip(ctx);
 }
 
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
