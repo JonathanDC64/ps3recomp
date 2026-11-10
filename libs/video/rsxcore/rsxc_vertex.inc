@@ -339,11 +339,11 @@ static _Alignas(64) VPJCounter s_vpj_ctr[4];
 #define s_vpj_sleepers (s_vpj_ctr[3].v)
 /* FIFO thread only: jobs queued (published or not), and the vertices queued
  * since the last publish. Jobs are published in batches of VPJ_BATCH
- * vertices (read once, default 1024): one publish per draw was a locked
+ * vertices (live, default 1024): one publish per draw was a locked
  * increment of a line the workers spin on, ~6% of the FIFO thread. */
 static LONG s_vpj_q;
 static u32 s_vpj_qv;
-static int s_vpj_conv;   /* a vertex job (not a span copy) queued since the last sync */
+static int s_vpj_conv;   /* a vertex job whose reads aren't in s_vpg queued since the last sync */
 static SRWLOCK s_vpj_lk = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_vpj_cv = CONDITION_VARIABLE_INIT;
 
@@ -387,24 +387,30 @@ static DWORD WINAPI vpj_worker(LPVOID arg)
     }
 }
 /* Let the workers take everything queued so far. The exchange is also the
- * full barrier the sleeper check needs (see vpj_worker). */
-static void vpj_publish(void)
+ * full barrier the sleeper check needs (see vpj_worker). `wake` 0 leaves a
+ * sleeping worker asleep, for a caller that takes the queue itself. */
+static void vpj_publish(int wake)
 {
     s_vpj_qv = 0;
     if (s_vpj_q == s_vpj_pub) return;
     InterlockedExchange(&s_vpj_pub, s_vpj_q);
     /* A worker counts itself a sleeper before it checks for work, so either
      * it sees these jobs or this sees it. */
-    if (s_vpj_sleepers) {
+    if (wake && s_vpj_sleepers) {
         AcquireSRWLockExclusive(&s_vpj_lk);
         WakeAllConditionVariable(&s_vpj_cv);
         ReleaseSRWLockExclusive(&s_vpj_lk);
     }
 }
-/* Wait for every queued vertex, converting what no worker has taken yet. */
+/* Wait for every queued vertex, converting what no worker has taken yet. A
+ * sleeping worker stays asleep (VPJ_SYNC_WAKE, live, default 0; 1 wakes it):
+ * this thread takes the jobs from here on, and the wake is a system call on
+ * the thread the frame waits on, 4 to 11 times a frame in Demon's Souls. */
 static void vpj_sync(void)
 {
-    vpj_publish();
+    static int wake = -1;
+    PS3_KNOB(wake, ps3_env_int("VPJ_SYNC_WAKE", 0));
+    vpj_publish(wake);
     if (!s_vpj_pub) return;
     LONG j;
     while ((j = vpj_claim()) >= 0) { vpj_run(j); InterlockedIncrement(&s_vpj_done); }
@@ -424,9 +430,9 @@ static void vpj_sync_hook(void) { vpj_sync(); vfo_next(); }
  * it lands), so a title can't rely on one to reuse vertex memory. It needs
  * the queue done and the stretch ended only where it lands on a page a span
  * copy of this stretch read, so a later copy can't see the new bytes and a
- * later draw can't reuse the old ones; or while a vertex job is queued,
- * whose reads aren't tracked. VF_SYNC_2D (live, default 1): 0 syncs at every
- * write, as before. */
+ * later draw can't reuse the old ones; or while a vertex job is queued
+ * whose reads couldn't be marked (vpj_mark_reads). VF_SYNC_2D (live, default
+ * 1): 0 syncs at every write, as before. */
 static void vpj_sync_write_hook(u32 ea, u32 len)
 {
     static int on = -1;
@@ -486,8 +492,47 @@ static int vpj_room(u32 nv)
 static u32 vpj_batch(void)
 {
     static int batch = -1;
-    if (batch < 0) batch = ps3_env_int("VPJ_BATCH", 1024);
+    PS3_KNOB(batch, ps3_env_int("VPJ_BATCH", 1024));
     return (u32)batch;
+}
+/* After queueing: hand the jobs over once there are enough. While no worker
+ * sleeps, VPJ_EAGER are enough (live, in VPJ_BATCH's units, default 64: 16 KB
+ * of span copies; 0: only whole batches): handing over is then one write and
+ * no system call, and what is not handed over by the next sync point this
+ * thread copies itself. With a sleeping worker the batch rule stands, a wake
+ * being worth it only for a whole batch. Demon's Souls, with VPJ_SYNC_WAKE
+ * off too, time at sync points a frame: Tutorial 151 to 57 us, 1-2 bridge 894
+ * to 619, Patches 390 to 233. */
+static void vpj_publish_maybe(void)
+{
+    static int eager = -1;
+    PS3_KNOB(eager, ps3_env_int("VPJ_EAGER", 64));
+    if (s_vpj_qv >= vpj_batch() || (eager && s_vpj_qv >= (u32)eager && !s_vpj_sleepers)) vpj_publish(1);
+}
+/* Marks the guest pages a queued vertex job will read, as vf_copy marks a
+ * span's (s_vpg), so that a 2D write landing elsewhere needs no sync
+ * (vpj_sync_write_hook). A job reads each array from its lowest index to its
+ * highest at most. An array that doesn't resolve in one piece, or a range too
+ * wide to mark, sets s_vpj_conv and every 2D write syncs until the next sync.
+ * VPJ_MARK_READS (live, default 1): 0 always sets it. */
+static u32 vf_resolve(const rsx_fetch_slot* sl, u64 a, u64 b);
+static void vpj_mark_reads(const u32* vis, u32 n)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("VPJ_MARK_READS", 1));
+    if (!on || !s_vpg || !n) { s_vpj_conv = 1; return; }
+    u32 lo = vis[0], hi = vis[0];
+    for (u32 i = 1; i < n; i++) { if (vis[i] < lo) lo = vis[i]; if (vis[i] > hi) hi = vis[i]; }
+    for (u32 k = 0; k < s_vp_plan.n_on; k++) {
+        const rsx_fetch_slot* sl = &s_vp_plan.on[k];
+        u32 elo = lo, ehi = hi;
+        if (sl->freq) { if (sl->modulo) { elo = 0; ehi = sl->freq - 1; } else { elo /= sl->freq; ehi /= sl->freq; } }
+        const u64 a = (u64)sl->off + (u64)elo * sl->stride;
+        const u64 b = (u64)sl->off + (u64)ehi * sl->stride + lv_elem_bytes(sl->type, sl->n);
+        const u32 ga = b - a > (16u << 20) ? 0xFFFFFFFFu : vf_resolve(sl, a, b);
+        if (ga == 0xFFFFFFFFu || (u64)ga + (b - a) > 0xFFFFFFFFull) { s_vpj_conv = 1; return; }
+        for (u32 p = ga >> 16; p <= (u32)((u64)ga + (b - a) - 1) >> 16; p++) s_vpg[p] = s_vfo_ep;
+    }
 }
 static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
 {
@@ -496,9 +541,9 @@ static void vpj_queue(const u32* vis, u32 n, VPSlot* out)
     J->vis = vis; J->n = n; J->out = out;
     s_vpj_vis_n += n;
     s_vpj_q++;
-    s_vpj_conv = 1;
+    vpj_mark_reads(vis, n);
     s_vpj_qv += n;
-    if (s_vpj_qv >= vpj_batch()) vpj_publish();
+    vpj_publish_maybe();
 }
 /* The GPU fetch path's span copies, about 29 MB a frame at Demon's Souls'
  * deep Palace and a sixth of the FIFO thread, as jobs for the vertex worker
@@ -524,7 +569,7 @@ static void vf_copy(u8* dst, u32 src, u32 len)
         J->n = 0; J->clen = len; J->csrc = src; J->cdst = dst;
     }
     s_vpj_qv += len >> 8;
-    if (s_vpj_qv >= vpj_batch()) vpj_publish();
+    vpj_publish_maybe();
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
