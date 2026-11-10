@@ -643,6 +643,21 @@ static int vp_upload_override(int slot, u32 key_off, u32 off, u32 w, u32 h, u32 
     return slot;
 }
 
+/* What the SRV fill wants of rsx_texture_layout, its format class and whether
+ * it is compressed. They depend on the format byte alone, so they are worked
+ * out once per byte instead of for every unit of every draw. */
+static inline void tl_class(u32 fmt, rsx_texfmt* tfmt, int* compressed)
+{
+    static struct { rsx_texfmt fmt; u8 done, compressed; } tab[256];
+    const u32 b = fmt & 0xFFu;
+    if (!tab[b].done) {
+        rsx_tex_layout tl;
+        rsx_texture_layout(b, 4, 4, &tl);
+        tab[b].fmt = tl.fmt; tab[b].compressed = tl.compressed ? 1 : 0; tab[b].done = 1;
+    }
+    *tfmt = tab[b].fmt; *compressed = tab[b].compressed;
+}
+
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
@@ -659,6 +674,16 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
     extern uint8_t* vm_base;
 
     if (!off || !w || !h || !vm_base || !GPU_VALID(s_rc_srv_pool)) return -1;
+    /* A texture already bound this frame needs none of the work below: its
+     * format and mip chain were worked out for every unit of every draw
+     * before the lookup found it. RSX_TEX_EARLY=0 (live) looks it up
+     * afterwards, as before. */
+    { static int early = -1;
+      PS3_KNOB(early, ps3_env_int("RSX_TEX_EARLY", 1));
+      if (early) {
+          const int i = vp_tex_find(off, w, h, fmt, cube);
+          if (i >= 0 && s_d3d.vp_tex[i].used) return i;
+      } }
     /* Format classes (base = fmt & 0x9F). The LBP loading screen uses:
      * 0x85 A8R8G8B8 (swizzled UI art), 0x8B G8B8 (the 1024x2048 linear FONT
      * atlas -- without it no text renders at all), 0x86/87/88 DXT1/23/45

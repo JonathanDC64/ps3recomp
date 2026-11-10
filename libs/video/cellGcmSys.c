@@ -2116,11 +2116,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (lean && dea0 && gcm_io2ea(s_fifo_getoff + count * 4) == dea0 + (count - 1) * 4)
                     i0 = rsx_process_method_run(&s_state, method, vm_base + dea0, count);
             }
+            /* A word for the 3D engine with none of the per-word diagnostics
+             * below on, which is every word of a normal run, goes straight to
+             * its dispatch instead of through their knob tests.
+             * GCM_WORD_PLAIN=0 (live) takes the long way. */
+            static int plain = -1;
+            PS3_KNOB(plain, (ps3_env_int("GCM_WORD_PLAIN", 1) &&
+                             !getenv("GCM_SUBCH7") && !getenv("GCM_OBJDBG") && !getenv("GCM_SUBCH_GATE") &&
+                             !getenv("GCM_VAL_WATCH") && !getenv("RSX_LIVE_FEED_DBG") &&
+                             !rsx_live_draw_enabled() && !rsx_draw_engine_enabled()) ? 1 : 0);
             for (u32 i = i0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
                 if (s_rcap_on) rcap_method((subch << 13) | m, vm_read32(dea));
+                if (plain && subch == 0) goto word_dispatch;
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2232,6 +2242,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * FIFO word; the standard 11-bit extraction (w & 0x1FFC)
                  * truncates them.  Reconstruct the full address the same way
                  * the draw-engine call above does. */
+                word_dispatch:
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     GCM_RSX_SYNC();
@@ -4325,6 +4336,7 @@ int cellGcm_replay_load(const char* file, u32** methods)
     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++)   /* the restored list (s_io_pages) */
         if (s_io_mappings[i].active) gcm_io_pages_mark(s_io_mappings[i].ea, s_io_mappings[i].size);
     s_rcap_state0 = s_state;
+    { extern u32 g_rsx_vattr_ver; g_rsx_vattr_ver++; }   /* (the state came from the file) */
     s_inited = 1;
     s_gcm_initialized = 1;
     return n;
@@ -4334,6 +4346,7 @@ int cellGcm_replay_load(const char* file, u32** methods)
 void cellGcm_replay_reset(void)
 {
     s_state = s_rcap_state0;
+    { extern u32 g_rsx_vattr_ver; g_rsx_vattr_ver++; }
     rsx_reset_upload_claims();
 }
 

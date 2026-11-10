@@ -1516,6 +1516,9 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
  * Palace) with no difference. VF_NATIVE_STRIP=0 goes back to the list. */
 #if defined(_M_X64) || defined(__x86_64__)
 #include <emmintrin.h>
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
 #endif
 #define VF_CUT 0xFFFFFFFFu
 static inline __attribute__((always_inline)) u32 vf_ix(const u8* src, const int w16, u32 k)
@@ -1548,6 +1551,53 @@ static inline __attribute__((always_inline)) u32 vf_strip_native_w(const u8* src
      * of the FIFO thread, a cmov chain per index. */
     static int sse = -1;
     PS3_KNOB(sse, ps3_env_int("VF_STRIP_SSE", 1));
+#if defined(__SSE4_1__)
+    /* SSE4.1 has the unsigned min and max, so no bias, and the lanes tell by
+     * themselves whether a real index reached them: a restart lane leaves
+     * vlo at all ones and vhi at zero. The last restart's position is worked
+     * out once, after the loop: finding it in the loop was a test and a
+     * branch every eight indices, and strips end at unpredictable places.
+     * VF_STRIP_SSE41=0 (live) uses the SSE2 loop below. */
+    static int sse41 = -1;
+    PS3_KNOB(sse41, ps3_env_int("VF_STRIP_SSE41", 1));
+    if (w16 && count >= 8 && sse && sse41) {
+        const __m128i swap = _mm_set_epi8(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1);
+        __m128i vlo = _mm_set1_epi16(-1), vhi = _mm_setzero_si128();
+        if (restart && ridx <= 0xFFFFu) {
+            const __m128i rv = _mm_set1_epi16((short)ridx);
+            u32 rk = 0, rm = 0;
+            for (; k + 8 <= count; k += 8) {
+                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (u64)k * 2)), swap);
+                const __m128i c = _mm_cmpeq_epi16(v, rv);
+                const __m128i o = _mm_or_si128(v, c);   /* restart lanes 0xFFFF */
+                _mm_storeu_si128((__m128i*)(b + k), _mm_unpacklo_epi16(o, c));
+                _mm_storeu_si128((__m128i*)(b + k + 4), _mm_unpackhi_epi16(o, c));
+                vlo = _mm_min_epu16(vlo, o);
+                vhi = _mm_max_epu16(vhi, _mm_andnot_si128(c, v));
+                const u32 mk = (u32)_mm_movemask_epi8(c);
+                rk = mk ? k : rk; rm = mk ? mk : rm;
+            }
+            if (rm) r = rk + ((31u - (u32)__builtin_clz(rm)) >> 1) + 1;
+        } else {
+            const __m128i z = _mm_setzero_si128();
+            for (; k + 8 <= count; k += 8) {
+                const __m128i v = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(src + (u64)k * 2)), swap);
+                _mm_storeu_si128((__m128i*)(b + k), _mm_unpacklo_epi16(v, z));
+                _mm_storeu_si128((__m128i*)(b + k + 4), _mm_unpackhi_epi16(v, z));
+                vlo = _mm_min_epu16(vlo, v);
+                vhi = _mm_max_epu16(vhi, v);
+            }
+        }
+        const __m128i ones = _mm_set1_epi16(-1), zero = _mm_setzero_si128();
+        if (_mm_movemask_epi8(_mm_cmpeq_epi16(vlo, ones)) != 0xFFFF ||
+            _mm_movemask_epi8(_mm_cmpeq_epi16(vhi, zero)) != 0xFFFF) {
+            const u32 l = (u32)_mm_extract_epi16(_mm_minpos_epu16(vlo), 0);
+            const u32 h = 0xFFFFu ^ (u32)_mm_extract_epi16(_mm_minpos_epu16(_mm_xor_si128(vhi, ones)), 0);
+            lo = l < lo ? l : lo; hi = h > hi ? h : hi;
+        }
+    }
+    else
+#endif
     if (w16 && count >= 8 && sse) {
         const __m128i bias = _mm_set1_epi16((short)0x8000);
         const __m128i rv = _mm_set1_epi16((short)ridx);
@@ -1714,12 +1764,45 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_ib_mapped || !state->vertex_attribs[0].enabled) return -1;
     if ((u64)s_vp_icap - s_d3d.vp_ib_offset < (u64)count * 3 + 4) { s_vf_stat[5]++; return -1; }
+    /* The plan, and whether its attribute types can go to the GPU as they
+     * are, stand while the attribute words have not changed
+     * (g_rsx_vattr_ver): the continuing ranges of a mesh ask again with the
+     * same state. Rebuilding it per range was 3% of the FIFO thread. local0:
+     * where local memory is mapped, read by the plan's local arrays.
+     * VF_PLAN_MEMO=0 (live) rebuilds it per range; VF_PLAN_CHECK=1 (live)
+     * rebuilds it anyway and reports a difference. */
+    extern u32 g_rsx_vattr_ver;
+    extern u32 cellGcmResolveLocated(int local, u32 offset);
     static rsx_fetch_plan pl;
-    rsx_fetch_plan_init(state, &pl);
-    for (u32 k = 0; k < pl.n_on; k++) {
-        const u32 t = pl.on[k].type;
-        if (t < 1 || t > 7 || t == 6) { s_vf_stat[4]++; return -1; }
-    }
+    static const rsx_state* pl_st;
+    static u32 pl_ver, pl_env, pl_local0;
+    static int pl_gpu;
+    { static int en = -1, chk = -1;
+      PS3_KNOB(en, ps3_env_int("VF_PLAN_MEMO", 1));
+      PS3_KNOB(chk, ps3_env_int("VF_PLAN_CHECK", 0));
+      const u32 local0 = cellGcmResolveLocated(1, 0);
+      if (!en || pl_st != state || pl_ver != g_rsx_vattr_ver || pl_env != ps3_env_gen ||
+          pl_local0 != local0) {
+          rsx_fetch_plan_init(state, &pl);
+          pl_st = state; pl_ver = g_rsx_vattr_ver; pl_env = ps3_env_gen; pl_local0 = local0;
+          pl_gpu = 1;
+          for (u32 k = 0; k < pl.n_on; k++) {
+              const u32 t = pl.on[k].type;
+              if (t < 1 || t > 7 || t == 6) pl_gpu = 0;
+          }
+      } else if (chk) {
+          static rsx_fetch_plan fresh;
+          static u64 n, bad;
+          memset(&fresh, 0, sizeof fresh);
+          rsx_fetch_plan_init(state, &fresh);
+          n++;
+          if (fresh.n_on != pl.n_on || memcmp(fresh.konst, pl.konst, sizeof pl.konst) ||
+              memcmp(fresh.on, pl.on, sizeof(pl.on[0]) * pl.n_on)) bad++;
+          if (n % 200000u == 0)
+              fprintf(stderr, "[VF] plan memo: %llu hits checked, %llu differ%c",
+                      (unsigned long long)n, (unsigned long long)bad, 10);
+      } }
+    if (!pl_gpu) { s_vf_stat[4]++; return -1; }
     /* The list, straight into the index buffer; it only counts once the
      * draw is accepted (vp_ib_offset, the carry). */
     const int restart = state->restart_index_enable != 0;
