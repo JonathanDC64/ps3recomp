@@ -169,6 +169,16 @@ void vm_write64(uint64_t addr, uint64_t val);
 extern "C" uint32_t    g_last_hle_nid  = 0;
 extern "C" const char* g_last_hle_name = "";
 
+/* A title ending itself with a non-zero code: its own error path, or abort(),
+ * which ends in the same call. The host's own ways out end by TerminateProcess
+ * and never come here, nor does a code-0 exit. A port that wants to treat this
+ * as a crash sets it; unset, nothing changes. It runs on the calling guest
+ * thread before sys_process_exit ends the process, and another thread can be
+ * in it at the same moment. host_bt is the [exit-chain] HOST-bt line ("" where
+ * the platform has none). */
+extern "C" void (*g_ps3_guest_exit_hook)(uint32_t code, uint32_t guest_lr, uint32_t guest_sp,
+                                         const char* host_bt) = nullptr;
+
 /* Which HLE each guest thread is currently INSIDE, indexed by ctx->thread_id.
  *
  * g_last_hle_name is a single global, so with several threads calling it names
@@ -550,12 +560,15 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if(((v>=0x00010000u&&v<0x00900000u)||(v>=0x30000000u&&v<0x30100000u)) && v!=0x008969A8u){
               if(v!=prev){ p+=snprintf(b+p,sizeof(b)-p," %08X",v); prev=v; found++; } } }
           fprintf(stderr,"%s\n",b); }
+        char host_bt[1100] = "";
 #ifdef _WIN32
         { void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
-          char* mb=(char*)GetModuleHandleA(0); char line[1100]; int p=snprintf(line,sizeof line,"[exit-chain] HOST-bt rva:");
-          for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-          fprintf(stderr,"%s\n",line); }
+          char* mb=(char*)GetModuleHandleA(0); int p=snprintf(host_bt,sizeof host_bt,"[exit-chain] HOST-bt rva:");
+          for(int i=0;i<fr;i++) p+=snprintf(host_bt+p,sizeof(host_bt)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
+          fprintf(stderr,"%s\n",host_bt); }
 #endif
+        if ((uint32_t)ctx->gpr[3] != 0 && g_ps3_guest_exit_hook)
+            g_ps3_guest_exit_hook((uint32_t)ctx->gpr[3], (uint32_t)ctx->lr, sp, host_bt);
     }
     /* PPC64 ELFv1 cross-module ABI: the caller restores its TOC right after the
      * call with `ld r2, 0x28(r1)`, expecting the import stub to have saved the
