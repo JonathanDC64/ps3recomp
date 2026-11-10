@@ -139,6 +139,52 @@ static inline int ps3_vfs_update_path(const char* host, const char* update, char
     return 1;
 }
 
+/* Whether two path characters are the same: either separator; on Windows, either case (ASCII). */
+static inline int ps3_vfs_same_char(int a, int b)
+{
+    if (a == '\\') a = '/';
+    if (b == '\\') b = '/';
+#ifdef _WIN32
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+#endif
+    return a == b;
+}
+
+/* What follows the folder `root` in a host path, or NULL when the path is not below it (or root is NULL or ""). */
+static inline const char* ps3_vfs_below(const char* host, const char* root)
+{
+    if (!host || !root || !root[0]) return NULL;
+    size_t n = strlen(root);
+    while (n && (root[n - 1] == '/' || root[n - 1] == '\\')) --n;
+    for (size_t i = 0; i < n; ++i)
+        if (!host[i] || !ps3_vfs_same_char((unsigned char)host[i], (unsigned char)root[i])) return NULL;
+    if (host[n] != '/' && host[n] != '\\') return NULL;
+    return host + n + 1;
+}
+
+/* A mod's file (PS3_VFS_MODS, runtime/syscalls/sys_fs.c). A mod folder holds what the game's USRDIR holds (menu/,
+ * param/, ...). `rel` is a host path's part below the game's folder or its update's: "PS3_GAME/USRDIR/<file>" (a disc
+ * tree), or "USRDIR/<file>" (a flattened tree, or the update). This gives "<mod>/<file>", the mod given as its first
+ * `mod_len` characters. 1 and the path in out, with '/' separators; 0 when rel is not below USRDIR (PARAM.SFO and the
+ * other files beside it are not the game's data), or the path does not fit. */
+static inline int ps3_vfs_mod_path(const char* rel, const char* mod, size_t mod_len, char* out, size_t cap)
+{
+    static const char game[] = "PS3_GAME/", usr[] = "USRDIR/";
+    size_t i = 0;
+    while (game[i] && rel[i] && ps3_vfs_same_char((unsigned char)rel[i], (unsigned char)game[i])) i++;
+    if (game[i]) i = 0;   /* (no PS3_GAME component: a flattened tree) */
+    size_t j = 0;
+    while (usr[j] && rel[i + j] && ps3_vfs_same_char((unsigned char)rel[i + j], (unsigned char)usr[j])) j++;
+    if (usr[j] || !rel[i + j] || !mod_len) return 0;
+    const char* file = rel + i + j;
+    while (mod_len && (mod[mod_len - 1] == '/' || mod[mod_len - 1] == '\\')) mod_len--;
+    int n = snprintf(out, cap, "%.*s/%s", (int)mod_len, mod, file);
+    if (n < 0 || (size_t)n >= cap) return 0;
+    for (char* c = out; *c; c++) if (*c == '\\') *c = '/';
+    return 1;
+}
+
 /* Where a refused guest path goes: a host path every file call fails on, with
  * anything appended to it too (Windows: characters no name may have; POSIX:
  * below a file that is not a directory). */

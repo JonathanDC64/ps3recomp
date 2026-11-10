@@ -111,6 +111,33 @@ int main(void)
         assert(!ps3_vfs_update_path("D:/g/PS3_GAME/USRDIR/a.bin", "U", out, 8));
     }
 
+    /* Below a folder: either separator, a trailing one on the folder, only whole components. */
+    {
+        assert(!strcmp(ps3_vfs_below("D:/g/PS3_GAME/x", "D:/g"), "PS3_GAME/x"));
+        assert(!strcmp(ps3_vfs_below("D:\\g\\PS3_GAME\\x", "D:/g/"), "PS3_GAME\\x"));
+        assert(!ps3_vfs_below("D:/gg/PS3_GAME/x", "D:/g"));
+        assert(!ps3_vfs_below("D:/g", "D:/g"));
+        assert(!ps3_vfs_below("D:/g/x", "") && !ps3_vfs_below("D:/g/x", NULL) && !ps3_vfs_below(NULL, "D:/g"));
+#ifdef _WIN32
+        assert(!strcmp(ps3_vfs_below("d:/G/x", "D:/g"), "x"));
+#else
+        assert(!ps3_vfs_below("/G/x", "/g"));
+#endif
+    }
+
+    /* A mod's file: what follows USRDIR, in the mod folder; the mod is the first mod_len characters. */
+    {
+        char out[128];
+        assert(ps3_vfs_mod_path("PS3_GAME/USRDIR/menu/m.tpf.dcx", "M|N", 1, out, sizeof out) && !strcmp(out, "M/menu/m.tpf.dcx"));
+        assert(ps3_vfs_mod_path("USRDIR/param/p.dcx", "C:\\mods\\a\\", 10, out, sizeof out) && !strcmp(out, "C:/mods/a/param/p.dcx"));
+        assert(ps3_vfs_mod_path("PS3_GAME\\USRDIR\\a\\b.bin", "M", 1, out, sizeof out) && !strcmp(out, "M/a/b.bin"));
+        assert(!ps3_vfs_mod_path("PS3_GAME/PARAM.SFO", "M", 1, out, sizeof out));
+        assert(!ps3_vfs_mod_path("PS3_GAME/USRDIR/", "M", 1, out, sizeof out));
+        assert(!ps3_vfs_mod_path("dev_hdd0/USRDIR/a.bin", "M", 1, out, sizeof out));
+        assert(!ps3_vfs_mod_path("PS3_GAME/USRDIR/a.bin", "M", 0, out, sizeof out));
+        assert(!ps3_vfs_mod_path("PS3_GAME/USRDIR/a.bin", "M", 1, out, 6));
+    }
+
     /* A refusal goes to the log once, the guest's bytes shown safely. */
     {
         char out[64];
