@@ -833,7 +833,7 @@ static void device_free(gpu_vk_device* dd)
 
 static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
 {
-    const uint32_t mask = desc->cap_mask | env_u32("RSX_VK_MASK", 0);
+    uint32_t mask = desc->cap_mask | env_u32("RSX_VK_MASK", 0);
     if (!tables_init(dd)) return 0;
     if (!instance_make(dd, env_u32("RSX_VK_VALIDATION", 0) == 1)) return 0;
     if (!phys_pick(dd, desc)) return 0;
@@ -860,6 +860,18 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
             dd->luid_valid = 1;
         }
         snprintf(dd->driver, sizeof dd->driver, "%.31s %.31s", drv.driverName, drv.driverInfo);
+        /* Intel's Windows driver lists VK_EXT_external_memory_host, but memory
+         * imported through it is not reliable as guest memory: RPCS3 turns its
+         * passthrough DMA off on this driver ("host allocations won't work on
+         * INTEL despite the extension being present", VKGSRender.cpp). Issue
+         * #481 (HD 620): the world and characters missing on Vulkan, with the
+         * import on. The write-back then stores on the CPU, as D3D12 does
+         * without Device3. */
+        if (drv.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && !(mask & GPU_CAP_HOST_IMPORT)) {
+            mask |= GPU_CAP_HOST_IMPORT;
+            printf("[VK] Intel's Windows driver: no host memory import (the write-back stores on the CPU)
+");
+        }
         /* As the D3D12 backend's adapter line: testers' logs name the GPU,
          * even when the device is not made. */
         {
@@ -916,6 +928,20 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
         if (!dd->marks) dd->has_checkpoints = 0;
     }
     caps_make(dd, mask);
+    {   /* For problem reports: the optional features this device runs without, so their fallbacks are known */
+        const uint32_t b = dd->base.caps.bits;
+        printf("[VK] without:%s%s%s%s%s%s%s
+", (b & GPU_CAP_UNUSED_ATTACHMENTS) ? "" : " unused-attachments",
+               (b & GPU_CAP_ROBUST2) ? "" : " robustness2", (b & GPU_CAP_NULL_DESCRIPTOR) ? "" : " null-descriptor",
+               (b & GPU_CAP_HOST_IMPORT) ? "" : " host-import", (b & GPU_CAP_D24S8) ? "" : " d24s8",
+               (b & GPU_CAP_GS) ? "" : " geometry-shader",
+               (b & (GPU_CAP_UNUSED_ATTACHMENTS | GPU_CAP_ROBUST2 | GPU_CAP_NULL_DESCRIPTOR | GPU_CAP_HOST_IMPORT |
+                     GPU_CAP_D24S8 | GPU_CAP_GS)) == (GPU_CAP_UNUSED_ATTACHMENTS | GPU_CAP_ROBUST2 |
+                                                      GPU_CAP_NULL_DESCRIPTOR | GPU_CAP_HOST_IMPORT | GPU_CAP_D24S8 |
+                                                      GPU_CAP_GS)
+                   ? " (nothing)"
+                   : "");
+    }
     return gpu_vk_desc_init(dd);
 }
 
