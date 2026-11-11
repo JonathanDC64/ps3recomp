@@ -661,6 +661,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_pad_glyph PRIVATE -UNDEBUG)
     endif()
     add_test(NAME pad_glyph COMMAND test_pad_glyph)
+    # The log's controller lines: each one as it comes and goes, and a button held since it came (pad_held.h).
+    add_executable(test_pad_held libs/input/tests/test_pad_held.c)
+    target_include_directories(test_pad_held PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_held PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_held PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_held COMMAND test_pad_held)
     # A port's own image in place of a title's texture: the table of hooks (rsx_texture_override.c).
     add_executable(test_rsx_texture_override libs/video/tests/test_rsx_texture_override.c
                    libs/video/rsx_texture_override.c)
