@@ -137,10 +137,51 @@ static void update_overlay(char* path, size_t cap)
         snprintf(path, cap, "%s", alt);
 }
 
+/* Mods: PS3_VFS_MODS=<folder>[|<folder>...], the first one first. A file a mod folder has is the one the guest gets,
+ * in place of the update's and the disc's; also a file neither has. A mod folder holds what the game's USRDIR holds
+ * (ps3_vfs_mod_path). Only files below the game's folder (PS3_VFS_ROOT) or its update's (PS3_VFS_UPDATE) are looked
+ * for, never saves (/dev_hdd0) or the game's cache (/dev_hdd1), and only files: a mod's folder never stands in for
+ * the game's. The list is read at each call (a few short strings; about 1,300 opens a session), so it needs no lock.
+ * 1 when path now names a mod's file. */
+static int mods_overlay(char* path, size_t cap)
+{
+    const char* mods = getenv("PS3_VFS_MODS");
+    if (!mods || !*mods || !path || !*path) return 0;
+    const char* rel = ps3_vfs_below(path, getenv("PS3_VFS_ROOT"));
+    if (!rel) rel = ps3_vfs_below(path, getenv("PS3_VFS_UPDATE"));
+    if (!rel) return 0;
+    static int said_list, said_files;   /* (log lines only: a race costs a line) */
+    if (!said_list) {
+        said_list = 1;
+        fprintf(stderr, "[mods] mod folders, the first one first: %s\n", mods);
+    }
+    for (const char* m = mods; *m;) {
+        const char* end = strchr(m, '|');
+        const size_t n = end ? (size_t)(end - m) : strlen(m);
+        char alt[1024];
+        struct stat st;
+        if (n && ps3_vfs_mod_path(rel, m, n, alt, sizeof alt) && stat(alt, &st) == 0 &&
+            (st.st_mode & S_IFMT) != S_IFDIR) {
+            if (said_files < 100) {
+                said_files++;
+                fprintf(stderr, "[mods] %s: %s\n", rel, alt);
+            } else if (said_files == 100) {
+                said_files++;
+                fprintf(stderr, "[mods] (further files from mods are not logged)\n");
+            }
+            snprintf(path, cap, "%s", alt);
+            return 1;
+        }
+        if (!end) break;
+        m = end + 1;
+    }
+    return 0;
+}
+
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     ps3game_shape(path, cap);
-    update_overlay(path, cap);
+    if (!mods_overlay(path, cap)) update_overlay(path, cap);
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
