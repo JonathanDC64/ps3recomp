@@ -53,6 +53,7 @@
 #endif
 #include "pad_controller.h"   /* (the devices on the ports, and PAD_CONTROLLER's rules) */
 #include "pad_glyph.h"        /* (the last device used, for a title's button icons) */
+#include "pad_held.h"         /* (the log's lines for the controllers as they come and go) */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -922,11 +923,73 @@ static void pad_sdl_read(SDL_GameController* gc, PadHostState* hs)
     pad_press_from_buttons(hs);
 }
 
+static const char* pad_sdl_type_name(SDL_GameControllerType t)
+{
+    switch (t) {
+    case SDL_CONTROLLER_TYPE_XBOX360:             return "Xbox 360";
+    case SDL_CONTROLLER_TYPE_XBOXONE:             return "Xbox One";
+    case SDL_CONTROLLER_TYPE_PS3:                 return "PS3";
+    case SDL_CONTROLLER_TYPE_PS4:                 return "PS4";
+    case SDL_CONTROLLER_TYPE_PS5:                 return "PS5";
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return "Switch Pro";
+    case SDL_CONTROLLER_TYPE_VIRTUAL:             return "virtual";
+    case SDL_CONTROLLER_TYPE_UNKNOWN:             return "unknown";
+    default:                                      return "other";
+    }
+}
+
+/* For the log when an SDL controller connects (pad_tell_devices): its IDs, where SDL reads it, and SDL's mapping of
+ * its buttons, which is what a button held that nobody presses comes down to. */
+static void pad_sdl_tell(long dev)
+{
+    if ((dev & 0xFF) != RUMBLE_SDL) return;
+    const int k = pad_dev_index(dev);
+    SDL_LockJoysticks();   /* (the poll closes a controller under it) */
+    SDL_GameController* gc = k < PAD_MAX_HOST_PORTS ? s_sdl_controllers[k] : NULL;
+    if (gc) {
+        char guid[64] = "";
+        SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(gc)), guid, (int)sizeof guid);
+        const char* path = NULL;
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+        path = SDL_GameControllerPath(gc);
+#endif
+        printf("[cellPad] controller%d: USB ID %04X:%04X, SDL type %s, GUID %s, read from %s\n", k + 1,
+               (unsigned)SDL_GameControllerGetVendor(gc), (unsigned)SDL_GameControllerGetProduct(gc),
+               pad_sdl_type_name(SDL_GameControllerGetType(gc)), guid, path ? path : "(not given)");
+        char* map = SDL_GameControllerMapping(gc);
+        printf("[cellPad] controller%d: SDL's mapping %s\n", k + 1, map ? map : "(none)");
+        if (map) SDL_free(map);
+    }
+    SDL_UnlockJoysticks();
+}
+
+/* For the log, each time the number of SDL's joysticks changes: the ones that aren't gamepads to SDL, which cellPad
+ * doesn't open (pad_sdl_sync_slots). A player's controller that does nothing in a title can be one of these. */
+static void pad_sdl_tell_others(void)
+{
+    static int s_count = -1;
+    SDL_LockJoysticks();
+    const int num = SDL_NumJoysticks();
+    if (num != s_count) {
+        s_count = num;
+        for (int d = 0; d < num; d++) {
+            if (SDL_IsGameController(d)) continue;
+            const char* name = SDL_JoystickNameForIndex(d);
+            printf("[cellPad] SDL joystick %d isn't a gamepad to SDL, so it isn't read: %s (USB ID %04X:%04X)\n", d,
+                   name ? name : "(no name)", (unsigned)SDL_JoystickGetDeviceVendor(d),
+                   (unsigned)SDL_JoystickGetDeviceProduct(d));
+        }
+        fflush(stdout);
+    }
+    SDL_UnlockJoysticks();
+}
+
 static void pad_poll_sdl2(void)
 {
     SDL_GameControllerUpdate();
 
     pad_sdl_sync_slots(s_sdl_controllers, PAD_MAX_HOST_PORTS);
+    pad_sdl_tell_others();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         SDL_GameController* gc = s_sdl_controllers[i];
         if (!gc) {
@@ -1185,6 +1248,54 @@ static void pad_device_label(long dev, char* out, size_t n)
 #endif
 }
 
+/* The log: the controllers on the host ports as they come and go, and a button one has held since it came, never let
+ * go (pad_held.h): when a player finds a button pressed that nobody presses, which device and which button. Run after
+ * the backend's poll, before PAD_CONTROLLER and PAD_MAP: each device's own port and buttons. */
+#if PAD_MAX_HOST_PORTS != PAD_HELD_PORTS
+#error pad_held.h follows PAD_MAX_HOST_PORTS ports
+#endif
+static volatile long s_tell_busy;   /* two threads can poll in the same tick: one tells */
+
+static void pad_tell_devices(void)
+{
+    static PadHeldDevice s_tell[PAD_HELD_PORTS];
+    if (InterlockedExchange(&s_tell_busy, 1)) return;
+    long devs[PAD_HELD_PORTS];
+    unsigned btns[PAD_HELD_PORTS];
+    for (int p = 0; p < PAD_HELD_PORTS; p++) {
+        devs[p] = s_poll_dev[p];
+        btns[p] = s_host_state[p].connected ? s_host_state[p].buttons : 0;
+    }
+    PadHeldEvent ev[PAD_HELD_EVENTS];
+    const int n = pad_held_sweep(s_tell, devs, btns, pad_now_ms(), ev);
+    for (int k = 0; k < n; k++) {
+        char id[16] = "", what[96] = "";
+        pad_controller_name(ev[k].dev, id, sizeof id);
+        if (ev[k].what != PAD_HELD_GONE) pad_device_label(ev[k].dev, what, sizeof what);
+        if (ev[k].what == PAD_HELD_CAME) {
+            printf("[cellPad] %s connected, host port %d: %s\n", id, ev[k].port, *what ? what : "(no name)");
+#if PAD_BACKEND_SDL2
+            pad_sdl_tell(ev[k].dev);
+#endif
+        } else if (ev[k].what == PAD_HELD_GONE) {
+            printf("[cellPad] %s disconnected\n", id);
+        } else {
+            char names[128] = "";
+            size_t used = 0;
+            for (int b = 0; b < 16; b++) {
+                if (!(ev[k].buttons & s_pad_names[b].bit)) continue;
+                const int w = snprintf(names + used, sizeof names - used, "%s%s", used ? "+" : "", s_pad_names[b].name);
+                if (w < 0 || (size_t)w >= sizeof names - used) break;
+                used += (size_t)w;
+            }
+            printf("[cellPad] %s (%s): %s held since it connected %u s ago, never let go\n", id,
+                   *what ? what : "no name", names, (unsigned)(PAD_HELD_FOR_MS / 1000));
+        }
+    }
+    if (n) fflush(stdout);
+    InterlockedExchange(&s_tell_busy, 0);
+}
+
 /* cellPad.h */
 int cellPad_host_controller(int i, char* id, int idn, char* name, int namen)
 {
@@ -1398,6 +1509,7 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    pad_tell_devices();
     pad_apply_controller();
     pad_publish_devices();
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
