@@ -54,6 +54,11 @@ void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 int pad_hid_sony_poll(PadHidSonyState* out, int max) { (void)out; (void)max; return 0; }
 int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak) { (void)slot; (void)strong; (void)weak; return 0; }
 int pad_hid_sony_describe(int slot, char* out, size_t n) { (void)slot; (void)out; (void)n; return 0; }
+void pad_hid_sony_stick_stage(int stick, float x, float y, uint8_t* out_x, uint8_t* out_y)
+{
+    (void)stick; (void)x; (void)y;
+    *out_x = *out_y = 128;
+}
 
 #define EA 0x1000u
 
