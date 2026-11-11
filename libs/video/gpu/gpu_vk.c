@@ -869,8 +869,7 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
          * without Device3. */
         if (drv.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && !(mask & GPU_CAP_HOST_IMPORT)) {
             mask |= GPU_CAP_HOST_IMPORT;
-            printf("[VK] Intel's Windows driver: no host memory import (the write-back stores on the CPU)
-");
+            printf("[VK] Intel's Windows driver: no host memory import (the write-back stores on the CPU)\n");
         }
         /* As the D3D12 backend's adapter line: testers' logs name the GPU,
          * even when the device is not made. */
@@ -930,8 +929,7 @@ static int device_init(gpu_vk_device* dd, const gpu_device_desc* desc)
     caps_make(dd, mask);
     {   /* For problem reports: the optional features this device runs without, so their fallbacks are known */
         const uint32_t b = dd->base.caps.bits;
-        printf("[VK] without:%s%s%s%s%s%s%s
-", (b & GPU_CAP_UNUSED_ATTACHMENTS) ? "" : " unused-attachments",
+        printf("[VK] without:%s%s%s%s%s%s%s\n", (b & GPU_CAP_UNUSED_ATTACHMENTS) ? "" : " unused-attachments",
                (b & GPU_CAP_ROBUST2) ? "" : " robustness2", (b & GPU_CAP_NULL_DESCRIPTOR) ? "" : " null-descriptor",
                (b & GPU_CAP_HOST_IMPORT) ? "" : " host-import", (b & GPU_CAP_D24S8) ? "" : " d24s8",
                (b & GPU_CAP_GS) ? "" : " geometry-shader",
