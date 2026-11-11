@@ -144,14 +144,14 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0x83f1ad48a9c74665ull, 0x2eeb771b2457d017ull },
-    { "draws",     0x48b3ccf4d1d905a3ull, 0xff06bed09aad7b1full },
-    { "states",    0xaf44cfa459cca7f1ull, 0xe4621a95fdea35eeull },
-    { "textures",  0x8ce5577388fc6e7full, 0x5891b9eeaefdb6c9ull },
-    { "offscreen", 0xd16fd0321e4d36b7ull, 0x3bcbc789f9685634ull },
-    { "zpass",     0xeb4275e4bd3c72f0ull, 0x0774069c29f6d838ull },
-    { "frames",    0x1105f13496f46cb1ull, 0xfe79488d222915a0ull },
-    { "mainmem",   0xb9c4a26b4c59f950ull, 0x0417a9bc8d8b7babull },
+    { "clears",    0x83f1ad48a9c74665ull, 0x05851a624588244eull },
+    { "draws",     0x41bc3a52e35ce4b0ull, 0x652a6cada934afe3ull },
+    { "states",    0x6460811fc0b79f7cull, 0xeaac6e68b18102b2ull },
+    { "textures",  0x1ecd33b81cb99730ull, 0x86ee755bbcccfc05ull },
+    { "offscreen", 0xe9797a9b9fb94278ull, 0x12365db1b92ce390ull },
+    { "zpass",     0xb442d1e1571e2f25ull, 0xcaa0420a14ec0ef6ull },
+    { "frames",    0x5a4d97011f1d52c0ull, 0x843cb180c72d5818ull },
+    { "mainmem",   0xad010a8e6da50e79ull, 0xcc5b25fa0716a93full },
 };
 
 /* ---------------------------------------------------------------------------
@@ -756,6 +756,10 @@ static void scene_draws(int k)
     draw_arrays(RSX_PRIMITIVE_LINES, 0, 8);
     draw_arrays(RSX_PRIMITIVE_POINTS, 0, 4);
     draw_indexed(RSX_PRIMITIVE_TRIANGLES, IB_AT(0), 0, 1, 0, 48);
+    /* A triangle list over two ranges without restart, 256 + 44: the first
+     * leaves one index of a triangle open, which carries into the second
+     * (s_ix_carry), on the GPU fetch path and on the CPU path alike. */
+    draw_indexed(RSX_PRIMITIVE_TRIANGLES, IB_AT(1), 0, 0, 0, 300);
     draw_indexed(RSX_PRIMITIVE_QUADS, IB_AT(0), 0, 1, 48, 32);
     draw_indexed(RSX_PRIMITIVE_TRIANGLE_STRIP, IB_AT(1), 0, 0, 0, 700);   /* 256 + 256 + 188 */
     draw_indexed(RSX_PRIMITIVE_TRIANGLE_FAN, IB_AT(0), 0, 1, 0, 20);
@@ -1033,7 +1037,7 @@ static const Scene k_scene[] = {
     { "offscreen", 2, scene_offscreen, "texture_create:3 pass_begin:12 draw:10" },
     { "zpass",     2, scene_zpass,     "query_begin:8 query_end:8 query_resolve:2" },
     { "frames",    4, scene_frames,    "draw:42 draw_indexed:4 copy_buf_to_tex:5 texture_destroy:1" },
-    { "mainmem",   1, scene_mainmem,   "draw:3 draw_indexed:1 copy_buf_to_tex:1" },
+    { "mainmem",   1, scene_mainmem,   "draw:2 draw_indexed:1 copy_buf_to_tex:1" },
 };
 enum { NSCENES = sizeof k_scene / sizeof k_scene[0], NPASSES = 2 };
 

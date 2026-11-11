@@ -303,7 +303,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
      * right after that draw's, extends it instead. RSX_STRIP_MERGE=0 draws
      * each range on its own. */
     D3D12DrawRecord* mpv = NULL;
-    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
+    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN ||
+         primitive == RSX_PRIMITIVE_TRIANGLES) &&
         s_d3d.merge_strip == (int)primitive && s_d3d.merge_first_end == first &&
         s_d3d.draw_count > 0 && s_d3d.current_rsx_state && !late_on()) {
         static int en = -1;
@@ -317,20 +318,31 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
                            vb_fits((u64)count * 3))))   /* (its vertices stay in that draw's chunk) */
             mpv = pv;
     }
-    /* VP_GPU_FETCH (live, default 1; 0 = the CPU path): strips and fans go
-     * to the GPU as the guest's own indices and vertex bytes
-     * (upload_strip_vp_fetch); the CPU path below runs when a draw does not
-     * qualify. A range continues the last draw
-     * only if both are fetch draws reading the same attribute records. */
+    /* VP_GPU_FETCH (live, default 1; 0 = the CPU path): strips, fans and
+     * (VF_TRI_LIST, live, default 1) triangle lists go to the GPU as the
+     * guest's own indices and vertex bytes (upload_strip_vp_fetch); the CPU
+     * path below runs when a draw does not qualify. A range continues the
+     * last draw only if both are fetch draws reading the same attribute
+     * records.
+     *
+     * Lists always took the CPU path, which was cheap while the game's own
+     * lists were small. A mod's rebuilt level models come as triangle
+     * lists: at one spot the RSX thread converted every index of them to
+     * 256 bytes each frame, and the frame went from 224 fps without the mod
+     * to 80 with it. */
     int fetch = 0;
-    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
-        vf_on()) {
+    static int tl = -1;
+    PS3_KNOB(tl, ps3_env_int("VF_TRI_LIST", 1));
+    if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN ||
+         (primitive == RSX_PRIMITIVE_TRIANGLES && tl)) && vf_on()) {
         const int ni = upload_strip_vp_fetch(s_d3d.current_rsx_state, first, count,
-                                             primitive == RSX_PRIMITIVE_TRIANGLE_FAN,
+                                             primitive == RSX_PRIMITIVE_TRIANGLES ? 2
+                                             : primitive == RSX_PRIMITIVE_TRIANGLE_FAN,
                                              mpv && mpv->fetch ? mpv : NULL);
         if (ni >= 0) {
             fetch = s_up_strip ? 2 : 1;   /* 2: the indices are a strip */
-            s_vs_up[primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
+            s_vs_up[primitive == RSX_PRIMITIVE_TRIANGLES ? 1
+                    : primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ? 2 : 3]++;
             if (mpv) s_d3d.merge_first_end = first + count;
             if (!ni) return;
             if (mpv && mpv->fetch == (u32)fetch && mpv->fdesc == s_up_fdesc) {
@@ -447,7 +459,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         /* Anchor for merging the next batch of this indexed stream. */
         s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
         s_d3d.merge_strip = (s_up_icount && (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP ||
-                             primitive == RSX_PRIMITIVE_TRIANGLE_FAN)) ? (int)primitive : 0;
+                             primitive == RSX_PRIMITIVE_TRIANGLE_FAN ||
+                             (primitive == RSX_PRIMITIVE_TRIANGLES && fetch))) ? (int)primitive : 0;
         s_d3d.merge_first_end = first + count;
     }
 }

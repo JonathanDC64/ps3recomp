@@ -1043,9 +1043,10 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     return o;
 }
 
-/* Primitive restart's triangle left open at the end of a TRIANGLES range
- * (upload_tris_vp_indexed): its 1-2 indices, for the next contiguous range of
- * the same BEGIN/END. */
+/* The triangle left open at the end of a TRIANGLES range: its 1-2 indices,
+ * for the next contiguous range of the same BEGIN/END. Both paths read and
+ * write it (upload_tris_vp_indexed here, upload_strip_vp_fetch's list), so a
+ * mesh whose ranges go different ways stays in phase. */
 static struct { int valid; u32 epoch, next, n, tri[2]; } s_ix_carry;
 
 static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
@@ -1057,41 +1058,53 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
     vp_attrs_dbg(state);
     vp_plan_begin(state);
     VPSlot* out;
-    /* With primitive restart, the triangle the last range left open goes
-     * ahead of this range's indices (below), so its 1-2 vertices need room
-     * too. Room for `count` alone let a range write up to 2 vertices past
-     * it, and past the end of a vertex buffer chunk's mapping when the room
-     * ended there: a crash in frames heavy with particles (issue #400). */
-    const u32 lead = state->restart_index_enable && s_ix_carry.valid && s_ix_carry.epoch == state->begin_epoch &&
+    /* The triangle the last range left open goes ahead of this range's
+     * indices (below), so its 1-2 vertices need room too. Room for `count`
+     * alone let a range write up to 2 vertices past it, and past the end of
+     * a vertex buffer chunk's mapping when the room ended there: a crash in
+     * frames heavy with particles (issue #400). */
+    const u32 lead = s_ix_carry.valid && s_ix_carry.epoch == state->begin_epoch &&
                      s_ix_carry.next == first ? s_ix_carry.n : 0;
     u32 maxv = vb_room(count + lead, &out);
     if (count + lead > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n < 12 && ++_n)
             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
                     state->shader_program, count + lead, maxv, 10); }
-        count = maxv > lead ? maxv - lead : 0;
-        if (!state->restart_index_enable) count -= count % 3; }
+        count = maxv > lead ? maxv - lead : 0; }
     { double _tv = perf_on() ? perf_now() : 0.0;
+      /* One BEGIN/END can carry several DRAW_INDEX_ARRAY ranges (at most 256
+       * indices each), and the RSX assembles them as one stream: a triangle
+       * may start in one range and end in the next. Demon's Souls' particles
+       * come as (0,32) (32,256) (288,12). Dropping the two indices left over
+       * at the end of each range put the rest out of phase, so sparks and
+       * smoke drew as slivers joining one particle to the next, different
+       * every frame. The partial triangle carries into the next contiguous
+       * range of the same BEGIN/END (s_ix_carry; `lead`, above, is its part
+       * here), and each range draws only whole triangles. Every index makes
+       * at most one vertex, so they stay within the room for count + lead; a
+       * triangle that would not is dropped and said (test_rsx_synth fails on
+       * the line). */
       if (!state->restart_index_enable) {
-          for (u32 k = 0; k < count; k++)
-              read_vp_vertex_c(state, read_guest_index(state, first + k), &out[k*16]);
+          /* The carry, then this range: every whole triangle of that, in
+           * order, and the 0-2 indices after the last one carry on. */
+          u32 tri[2] = {0, 0};
+          if (lead) { tri[0] = s_ix_carry.tri[0]; tri[1] = s_ix_carry.tri[1]; }
+          const u32 all = lead + count, emit = all - all % 3;
+          for (u32 j = 0; j < lead && j < emit; j++) read_vp_vertex_c(state, tri[j], &out[j*16]);
+          for (u32 k = 0; k + lead < emit; k++)
+              read_vp_vertex_c(state, read_guest_index(state, first + k), &out[(lead + k)*16]);
+          u32 left[2] = {0, 0};
+          for (u32 r = 0; emit + r < all; r++) {
+              const u32 j = emit + r;
+              left[r] = j < lead ? tri[j] : read_guest_index(state, first + (j - lead));
+          }
+          s_ix_carry.valid = 1; s_ix_carry.epoch = state->begin_epoch; s_ix_carry.next = first + count;
+          s_ix_carry.n = all - emit; s_ix_carry.tri[0] = left[0]; s_ix_carry.tri[1] = left[1];
+          count = emit;
       } else {
           /* Primitive restart: the restart index drops the triangle in
-           * progress and the list resumes after it.
-           *
-           * One BEGIN/END can carry several DRAW_INDEX_ARRAY ranges (at most
-           * 256 indices each), and the RSX assembles them as one stream: a
-           * triangle may start in one range and end in the next. Demon's
-           * Souls' particles come as (0,32) (32,256) (288,12). Dropping the
-           * two indices left over at the end of each range put the rest out
-           * of phase, so sparks and smoke drew as slivers joining one
-           * particle to the next, different every frame. The partial
-           * triangle now carries into the next contiguous range of the same
-           * BEGIN/END (s_ix_carry; `lead`, above, is its part here). Every
-           * index makes at most one vertex, so they stay within the room for
-           * count + lead; a triangle that would not is dropped and said
-           * (test_rsx_synth fails on the line). */
-          u32 o = 0, n = 0, tri[3];
+           * progress and the list resumes after it. */
+          u32 o = 0, n = 0, tri[3] = {0, 0, 0};
           int over = 0;
           if (lead) { n = lead; tri[0] = s_ix_carry.tri[0]; tri[1] = s_ix_carry.tri[1]; }
           for (u32 k = 0; k < count; k++) {
@@ -1540,6 +1553,64 @@ static u32 vf_strip_list(const GuestIdx* gi, u32 first, u32 count, int restart, 
                            pm, pp0, pp1, ib, plo, phi);
 }
 
+/* A triangle list's indices for upload_strip_vp_fetch, as
+ * upload_tris_vp_indexed assembles them: the triangle the last range left
+ * open (*pn indices, *pt0 and *pt1, from s_ix_carry), then this range, as
+ * whole triangles in order; the 0-2 indices after the last one go back out
+ * for the next range. The restart index drops the triangle in progress.
+ * lo/hi cover every index written. */
+static inline __attribute__((always_inline)) u32 vf_ix_at(const u8* src, const int w16, u32 k)
+{
+    if (w16) { u16 v; memcpy(&v, src + (u64)k * 2, 2); return __builtin_bswap16(v); }
+    u32 v; memcpy(&v, src + (u64)k * 4, 4); return __builtin_bswap32(v);
+}
+static inline __attribute__((always_inline)) u32 vf_tri_list_w(const u8* src, const int w16, u32 count,
+                                       const int restart, const u32 ridx, u32* pn,
+                                       u32* pt0, u32* pt1, u32* ib, u32* plo, u32* phi)
+{
+    u32 n = *pn, t0 = *pt0, t1 = *pt1, lo = *plo, hi = *phi, ni = 0;
+    if (!restart) {
+        const u32 all = n + count, emit = all - all % 3;
+        if (emit) {
+            if (n >= 1) { ib[0] = t0; lo = t0 < lo ? t0 : lo; hi = t0 > hi ? t0 : hi; }
+            if (n >= 2) { ib[1] = t1; lo = t1 < lo ? t1 : lo; hi = t1 > hi ? t1 : hi; }
+            for (u32 k = 0; n + k < emit; k++) {
+                const u32 ix = vf_ix_at(src, w16, k);
+                ib[n + k] = ix;
+                lo = ix < lo ? ix : lo; hi = ix > hi ? ix : hi;
+            }
+            ni = emit;
+        }
+        u32 left[2] = {0, 0};
+        for (u32 r = 0; emit + r < all; r++) {
+            const u32 j = emit + r;
+            left[r] = j < n ? (j == 0 ? t0 : t1) : vf_ix_at(src, w16, j - n);
+        }
+        n = all - emit; t0 = left[0]; t1 = left[1];
+    } else {
+        for (u32 k = 0; k < count; k++) {
+            const u32 ix = vf_ix_at(src, w16, k);
+            if (ix == ridx) { n = 0; continue; }
+            if (n == 0) { t0 = ix; n = 1; continue; }
+            if (n == 1) { t1 = ix; n = 2; continue; }
+            ib[ni] = t0; ib[ni + 1] = t1; ib[ni + 2] = ix; ni += 3; n = 0;
+            lo = t0 < lo ? t0 : lo; hi = t0 > hi ? t0 : hi;
+            lo = t1 < lo ? t1 : lo; hi = t1 > hi ? t1 : hi;
+            lo = ix < lo ? ix : lo; hi = ix > hi ? ix : hi;
+        }
+    }
+    *pn = n; *pt0 = t0; *pt1 = t1; *plo = lo; *phi = hi;
+    return ni;
+}
+static u32 vf_tri_list(const GuestIdx* gi, u32 first, u32 count, int restart, u32 ridx,
+                       u32* pn, u32* pt0, u32* pt1, u32* ib, u32* plo, u32* phi)
+{
+    if (gi->w16) return vf_tri_list_w(gi->p + (u64)first * 2, 1, count, restart, ridx,
+                                      pn, pt0, pt1, ib, plo, phi);
+    return vf_tri_list_w(gi->p + (u64)first * 4, 0, count, restart, ridx,
+                         pn, pt0, pt1, ib, plo, phi);
+}
+
 /* The strip as a strip (VF_NATIVE_STRIP, live, default 1): the draw is a
  * TRIANGLESTRIP and the guest's indices go into the index buffer as they are,
  * byte-swapped, with the restart index as D3D12's cut value (every VP PSO
@@ -1800,12 +1871,13 @@ static void vfo_grow(u32 j, u32 g1)
     E->g1 = g1;
 }
 
-/* Returns the indices written (0 is a strip that made no triangle), or -1
- * when the draw has to take the CPU path. ext: the fetch draw this range
- * continues, or NULL. */
-static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, int fan,
+/* Returns the indices written (0 is a range that made no triangle), or -1
+ * when the draw has to take the CPU path. kind: 0 a strip, 1 a fan, 2 a
+ * triangle list. ext: the fetch draw this range continues, or NULL. */
+static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, int kind,
                                  const D3D12DrawRecord* ext)
 {
+    const int fan = kind == 1, list = kind == 2;
     extern uint8_t* vm_base;
     if (!state || !vm_base || !s_d3d.vp_ib_mapped || !state->vertex_attribs[0].enabled) return -1;
     if ((u64)s_vp_icap - s_d3d.vp_ib_offset < (u64)count * 3 + 4) { s_vf_stat[5]++; return -1; }
@@ -1853,7 +1925,13 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     const int restart = state->restart_index_enable != 0;
     const u32 ridx = state->restart_index;
     u32 m = 0, p0 = 0, p1 = 0;
-    if (s_strip_carry.valid && s_strip_carry.fan == fan &&
+    if (list) {
+        /* The list's carry is the CPU path's own (s_ix_carry), so ranges of
+         * one mesh can go either way. */
+        if (s_ix_carry.valid && s_ix_carry.epoch == state->begin_epoch && s_ix_carry.next == first) {
+            m = s_ix_carry.n; p0 = s_ix_carry.tri[0]; p1 = s_ix_carry.tri[1];
+        }
+    } else if (s_strip_carry.valid && s_strip_carry.fan == fan &&
         s_strip_carry.epoch == state->begin_epoch && s_strip_carry.next == first) {
         m = s_strip_carry.m; p0 = s_strip_carry.p0; p1 = s_strip_carry.p1;
     }
@@ -1862,8 +1940,9 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
     u32 ni = 0, lo = 0xFFFFFFFFu, hi = 0;
     static int nat = -1;
     PS3_KNOB(nat, ps3_env_int("VF_NATIVE_STRIP", 1));
-    s_up_strip = !fan && nat;
-    if (s_up_strip) {
+    s_up_strip = kind == 0 && nat;
+    if (list) ni = vf_tri_list(&gi, first, count, restart, ridx, &m, &p0, &p1, ib, &lo, &hi);
+    else if (s_up_strip) {
         ni = vf_strip_native(&gi, first, count, restart, ridx, &m, &p0, &p1, ib, &lo, &hi);
         if (lo > hi) ni = 0;   /* restarts only: no vertex, so no triangle */
     }
@@ -2026,9 +2105,14 @@ static int upload_strip_vp_fetch(const rsx_state* state, u32 first, u32 count, i
         }
         s_up_fdesc = s_fx.fdesc;
     }
-    s_strip_carry.valid = 1; s_strip_carry.fan = fan; s_strip_carry.epoch = state->begin_epoch;
-    s_strip_carry.next = first + count; s_strip_carry.m = m;
-    s_strip_carry.p0 = p0; s_strip_carry.p1 = p1;
+    if (list) {
+        s_ix_carry.valid = 1; s_ix_carry.epoch = state->begin_epoch; s_ix_carry.next = first + count;
+        s_ix_carry.n = m; s_ix_carry.tri[0] = p0; s_ix_carry.tri[1] = p1;
+    } else {
+        s_strip_carry.valid = 1; s_strip_carry.fan = fan; s_strip_carry.epoch = state->begin_epoch;
+        s_strip_carry.next = first + count; s_strip_carry.m = m;
+        s_strip_carry.p0 = p0; s_strip_carry.p1 = p1;
+    }
     s_vp_iwant += ni;
     s_up_icount = ni; s_up_ifirst = s_d3d.vp_ib_offset;
     s_d3d.vp_ib_offset += ni;
