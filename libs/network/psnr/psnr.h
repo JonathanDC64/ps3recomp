@@ -47,6 +47,9 @@ enum {
     PSNR_STREAM_OFFER = 0xA6, PSNR_ROUTE = 0xA7
 };
 #define PSNR_ROUTE_STREAM_RELAY 1   /* ROUTE flags: streams to that player go through the relay */
+#define PSNR_ROUTE_UDP_RELAY    2   /* ROUTE flags (ps3recomp's psnr_host): datagrams to that player go through the
+                                     * relay from the start (a hosted game: every player's traffic goes through
+                                     * the host's one open port) */
 
 /* ERROR codes */
 enum {

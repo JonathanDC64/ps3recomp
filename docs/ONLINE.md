@@ -37,6 +37,8 @@ the OS login name. Offline with no name, nothing changes ("PS3Player").
 | `PS3_NET_CA_FILE=path` | With `PS3_NET_TLS`: trust the roots in this PEM file instead of the built-in ones (a test server's own). |
 | `PS3_NET_CLIENT_VERSION=x.y.z` | The build's version, for the server's version gate. Default 0.0.0. |
 | `PS3_NET_NETWORK_VERSION=n` | Which builds play together. Default 1. |
+| `PSNR_KEY=<64 hex>` | A hosted game's key (see "A game one player hosts"). Without a sign-in, psnr's HELLO carries it as its session. |
+| `PS3_HTTP_LOCAL=port` | Every cellHttp request goes to `127.0.0.1:port` instead of its own host and port, with no session and no TLS: the port answers the title's servers in its own process. The requests themselves are unchanged. |
 | `PS3_NET_LAN=1` | Allow local addresses (this PC, the home network, link-local) for every server and peer. Without it, a local address is used only when a server this run was pointed at (`PS3_NET_HOSTS`, `PSNR_SERVER`, `PS3_NET_SIGNIN`) is on one itself, or when a co-op peer is on the same /24 as this machine; other local addresses are refused, and the first refusal of each is logged. |
 
 `ps3_net_lock_offline()` (`include/ps3emu/ps3_net.h`) keeps a process offline for good, whatever the variables say later: cellNetCtl, NP, the sys_net host sockets and cellHttp all report no network. A port calls it for sessions that must never reach other players. Called before the title starts, the host sockets are never registered.
@@ -119,6 +121,42 @@ Redirect stderr to a file and the runtime logs every wait (see
 stage starts, and the title drops the peer as "not responding". Set
 `PS3_VERBOSE=0` for play; at that setting both hold 40-50 fps.
 
+## A game one player hosts
+
+A port can let one player's game be the server, with no outside server.
+Three pieces are in the runtime:
+
+- **The room server**, `psnr_host_start()` in `include/ps3emu/psnr_host.h`
+  (`libs/network/psnr/psnr_host.c`). It speaks psnr's protocol on one port,
+  TCP and UDP, in a thread of its own, so the title's NP code is the same as
+  with a psnr server. The host's own game connects to it at `127.0.0.1`, and
+  each guest's game connects to the host's address. It differs from psnr:
+  - Every player's datagrams go through the host's port, so only the host needs
+    an open port. ROUTE tells each client so (`PSNR_ROUTE_UDP_RELAY`), and the
+    client switches at once.
+  - With a key, a HELLO without it is refused. An address that sends five
+    wrong keys is ignored for a minute.
+  - No relay streams and no leaderboards (they get an ERROR).
+  - Small limits: 12 connections, and 4 rooms of up to 8 members.
+  - No player addresses in the log.
+- **The invite code**, `net_invite_encode()` and `net_invite_decode()` in
+  `include/ps3emu/net_invite.h`. Sixteen letters and digits in groups of four
+  (Crockford's base 32, with no I, L, O or U) carry the host's public IPv4
+  address, the port, 28 bits of the key and a 4-bit check. Reading is lenient:
+  case, dashes and spaces don't matter, and O, I and L read as 0, 1 and 1.
+  `NET_INVITE_TYPO` means the check failed. `net_invite_key_hex()` turns the
+  code's key into `PSNR_KEY`'s form; the host passes the same key's bytes
+  (`net_invite_key_blob()`) to the room server.
+  - The code holds the host's address. A port should tell players not to
+    post it in public.
+- **`PS3_HTTP_LOCAL`**, for a title that also asks its own servers over cellHttp
+  (see the table above). The port answers those requests in its own process.
+
+Opening the port on the player's router is the port's job (UPnP, or by hand).
+
+`libs/network/tests/test_psnr_host.c` runs the room server against the real
+psnr client: keys, rooms, ROUTE, the UDP relay and the invite code.
+
 ## What is implemented
 
 | Module | State |
@@ -131,6 +169,7 @@ stage starts, and the title drops the peer as "not responding". Set
 | cellNetCtl | Connected only online. The net-start dialog reports `CELL_NET_CTL_ERROR_DIALOG_CANCELED` offline, 0 online. |
 | Sign-in | The key, the challenge and session calls, the session on cellHttp's requests to that server and in psnr's HELLO (see "Sign-in"). |
 | TLS | The sign-in calls, cellHttp's requests to the sign-in server and psnr's connection, with the certificate checked (see "TLS"). |
+| Hosted games | The room server in the host's process, the invite code, and cellHttp answered in-process (see "A game one player hosts"). |
 | sys_net | P2P sockets map to UDP/TCP on `PS3_NET_P2P_PORT`. Datagram P2P sockets share the port by vport: each datagram carries an 8-byte vport header (`VP01`, destination and source vport), so both peers need a runtime with it. Stream P2P sockets share the port as plain TCP. |
 
 ## How it was verified
