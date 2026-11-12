@@ -51,6 +51,15 @@ uint16_t   psnr_host_port(const psnr_host* h);
 int        psnr_host_players(psnr_host* h);
 void       psnr_host_stop(psnr_host* h);
 
+/* The hosted game's own messages between its players (a port's, never the title's), from any player's game connected
+ * to a psnr_host (np_psnr.c's connection, PSNR_SERVER): psnr_app_send hands a blob of up to PSNR_APP_MAX bytes to the
+ * server, which passes it to every other player's game there; their handler gets it with the sender's user number
+ * (the HELLO's). 0 if sent; -1 with no connection, or too long. The handler runs on the title's own polling thread
+ * (np_psnr_pump, from cellSysutilCheckCallback), in order. A psnr server (not a psnr_host) refuses APP_SEND. */
+#define PSNR_APP_MAX 1024
+int  psnr_app_send(const void* data, uint32_t len);
+void psnr_app_on_message(void (*fn)(uint32_t from_user, const uint8_t* data, uint32_t len));
+
 #ifdef __cplusplus
 }
 #endif

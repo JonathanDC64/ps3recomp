@@ -137,6 +137,9 @@ Three pieces are in the runtime:
   - With a key, a HELLO without it is refused. An address that sends five
     wrong keys is ignored for a minute.
   - No relay streams and no leaderboards (they get an ERROR).
+  - The port's own messages: `psnr_app_send()` sends a blob of up to 1 KB, and every other player's game on the
+    server gets it through `psnr_app_on_message()`'s handler, never the title. They need no room, and keep going
+    while the title loads (a game that follows its host to a new area hears where it arrived).
   - Small limits: 12 connections, and 4 rooms of up to 8 members.
   - No player addresses in the log.
 - **The invite code**, `net_invite_encode()` and `net_invite_decode()` in

@@ -623,6 +623,24 @@ static void ph_message(psnr_host* h, int ci, uint32_t req, ph_rd* r)
     ph_free(&w);
 }
 
+/* APP_SEND: blob (at most PSNR_APP_MAX bytes) -> APP_MSG: from user u32 | blob, to every other player past HELLO.
+ * The hosted game's own messages (psnr_app_send), with no room needed: everyone on this server is one group. */
+static void ph_app(psnr_host* h, int ci, uint32_t req, ph_rd* r)
+{
+    ph_client* c = &h->cl[ci];
+    size_t n;
+    const uint8_t* data = ph_rblob(r, &n);
+    if (r->err || n > PSNR_APP_MAX) { ph_reply_err(c, req, PSNR_E_BAD_REQUEST); return; }
+    ph_reply_ok(c, req);
+    ph_buf w = {0};
+    ph_u32(&w, c->id);
+    ph_u16(&w, (uint16_t)n);
+    ph_put(&w, data, n);
+    for (int i = 0; i < PH_CLIENTS; i++)
+        if (i != ci && h->cl[i].s != PH_BAD && h->cl[i].hello) ph_send(&h->cl[i], PSNR_APP_MSG, &w);
+    ph_free(&w);
+}
+
 /* KICK_MEMBER: room u64 | member u16; owner only; the target gets KICKED (room u64), the rest MEMBER_LEFT */
 static void ph_kick(psnr_host* h, int ci, uint32_t req, ph_rd* r)
 {
@@ -669,7 +687,8 @@ static void ph_message_in(psnr_host* h, int ci, uint8_t type, const uint8_t* p, 
     case PSNR_SET_ROOM_DATA: ph_set_data(h, ci, req, &r); break;
     case PSNR_ROOM_MESSAGE: ph_message(h, ci, req, &r); break;
     case PSNR_KICK_MEMBER:  ph_kick(h, ci, req, &r); break;
-    default:                ph_reply_err(c, req, PSNR_E_BAD_REQUEST); break;   /* scores: not here */
+    case PSNR_APP_SEND:     ph_app(h, ci, req, &r); break;
+    default:              ph_reply_err(c, req, PSNR_E_BAD_REQUEST); break;   /* scores: not here */
     }
 }
 

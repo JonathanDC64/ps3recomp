@@ -5,6 +5,7 @@
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_locked_offline */
 #include "ps3emu/ps3_net_signin.h"
 #include "ps3emu/ps3_tls.h"
+#include "ps3emu/psnr_host.h"   /* psnr_app_send, psnr_app_on_message */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -504,6 +505,19 @@ int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port)
 }
 
 /* Pushes np_psnr handles itself: ROUTE and STREAM_OFFER. 1 if it took it. */
+/* APP_MSG (from user u32 | blob): a hosted game's own message, for the port's handler, never the title's */
+static void (*s_app_fn)(uint32_t from_user, const uint8_t* data, uint32_t len);
+static int app_push(const psnr_msg* m)
+{
+    if (m->type != PSNR_APP_MSG) return 0;
+    if (m->len >= 6) {
+        const uint32_t from = psnr_get32(m->data);
+        const uint16_t n = psnr_get16(m->data + 4);
+        if (6u + n <= m->len && s_app_fn) s_app_fn(from, m->data + 6, n);
+    }
+    return 1;
+}
+
 static int nat_push(const psnr_msg* m)
 {
     if (m->type == PSNR_ROUTE && m->len >= 13) {
@@ -743,7 +757,23 @@ void np_psnr_pump(void)
 
         /* Handlers run unlocked: they send follow-up requests. */
         if (m.req && fn) fn(user, &m);
-        else if (!m.req && !nat_push(&m) && s_push_fn) s_push_fn(&m);
+        else if (!m.req && !nat_push(&m) && !app_push(&m) && s_push_fn) s_push_fn(&m);
         psnr_msg_free(&m);
     }
+}
+
+/* ---- A hosted game's own messages (ps3emu/psnr_host.h: psnr_app_send) ---- */
+
+int psnr_app_send(const void* data, uint32_t len)
+{
+    if (len > PSNR_APP_MAX || (len && !data)) return -1;
+    uint8_t body[2 + PSNR_APP_MAX];
+    psnr_put16(body, (uint16_t)len);
+    if (len) memcpy(body + 2, data, len);
+    return np_psnr_request(PSNR_APP_SEND, body, 2 + len, NULL, NULL) ? 0 : -1;
+}
+
+void psnr_app_on_message(void (*fn)(uint32_t from_user, const uint8_t* data, uint32_t len))
+{
+    s_app_fn = fn;
 }

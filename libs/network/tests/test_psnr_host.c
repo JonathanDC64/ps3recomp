@@ -260,6 +260,21 @@ int main(void)
     CHECK(psnr_get64(m.data) == room && psnr_get16(m.data + 8) == 1 && !memcmp(m.data + 14, "msg", 3));
     psnr_msg_free(&m);
 
+    /* a hosted game's own message from B reaches A, with B's user number; one too long is refused */
+    p = body;
+    p = psnr_put16(p, 4); *p++ = 'f'; *p++ = 'o'; *p++ = 'l'; *p++ = 'w';
+    CHECK(psnr_call(b, PSNR_APP_SEND, body, (uint32_t)(p - body), &m, 2000) == 1 && m.type == PSNR_OK);
+    psnr_msg_free(&m);
+    CHECK(wait_push(a, PSNR_APP_MSG, &m, 2000));
+    CHECK(m.len == 10 && psnr_get32(m.data) == idb && psnr_get16(m.data + 4) == 4 && !memcmp(m.data + 6, "folw", 4));
+    psnr_msg_free(&m);
+    {
+        static uint8_t big[2 + PSNR_APP_MAX + 1];
+        psnr_put16(big, PSNR_APP_MAX + 1);
+        CHECK(psnr_call(b, PSNR_APP_SEND, big, sizeof big, &m, 2000) == 1 && m.type == PSNR_ERROR);
+        psnr_msg_free(&m);
+    }
+
     /* only the owner sets room data */
     p = body;
     p = psnr_put64(p, room);

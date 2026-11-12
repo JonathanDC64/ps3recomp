@@ -46,6 +46,10 @@ enum {
     PSNR_STREAM_CONNECT = 0x30, PSNR_STREAM_ACCEPT = 0x31, PSNR_STREAM_READY = 0x96,
     PSNR_STREAM_OFFER = 0xA6, PSNR_ROUTE = 0xA7
 };
+/* ps3recomp's psnr_host only (a psnr server answers ERROR): a hosted game's own messages between its players, not
+ * the title's. APP_SEND: blob -> every other player on the server gets APP_MSG: from user u32 | blob. */
+#define PSNR_APP_SEND 0x17
+#define PSNR_APP_MSG  0xA8
 #define PSNR_ROUTE_STREAM_RELAY 1   /* ROUTE flags: streams to that player go through the relay */
 #define PSNR_ROUTE_UDP_RELAY    2   /* ROUTE flags (ps3recomp's psnr_host): datagrams to that player go through the
                                      * relay from the start (a hosted game: every player's traffic goes through
