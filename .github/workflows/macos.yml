@@ -216,6 +216,13 @@ jobs:
           clang -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_nat
 
+      # A game one player hosts: the room server in the host's own process
+      # against the real client, and the invite code.
+      - name: Run the hosted rooms test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_psnr_host libs/network/tests/test_psnr_host.c -lpthread
+          /tmp/test_psnr_host
+
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
       # source, on an SDAT the test makes with edat_decrypt.c's own AES.
