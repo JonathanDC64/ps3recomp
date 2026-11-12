@@ -281,16 +281,6 @@ jobs:
           .\test_np_identity.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
-      # packets before the title sees them, punching toward peers.
-      - name: Run the NAT traversal test
-        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
-        run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          .\test_np_nat.exe
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-
       # A game one player hosts: the room server in the host's own process
       # against the real client, and the invite code.
       - name: Run the hosted rooms test
@@ -299,6 +289,16 @@ jobs:
           clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_psnr_host.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+      # packets before the title sees them, punching toward peers.
+      - name: Run the NAT traversal test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_np_nat.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
