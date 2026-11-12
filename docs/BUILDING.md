@@ -42,7 +42,7 @@ Complete guide to building the ps3recomp runtime library and game projects.
 **Windows:**
 - Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
 - Windows SDK 10.0.19041+
-- System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
+- System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`, `iphlpapi.lib`
 
 **Linux:**
 - GCC 12+ or Clang 14+
@@ -132,6 +132,7 @@ cmake --install build --prefix /usr/local
 | `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2; cellSail's movies) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded) |
 | `PS3RECOMP_FFMPEG_DOWNLOAD` | `ON` | Windows, with `PS3RECOMP_FFMPEG_RUNTIME` off: download the pinned FFmpeg build and turn it on -- see [FFmpeg](#ffmpeg-run-time-loaded) |
+| `PS3RECOMP_UPNP` | `ON` | UPnP port mapping on the player's router (`ps3emu/net_upnp.h`, miniupnpc in `third_party/miniupnpc`). Off: `net_upnp_map` says "UPnP not built in" |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
 
@@ -394,6 +395,7 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 - `xinput` — XInput for gamepad (cellPad)
 - `ole32` — COM initialization for WASAPI audio (cellAudio)
 - `bcrypt` — BCryptGenRandom for cryptographic RNG (cellSsl)
+- `iphlpapi` — IP Helper, for miniupnpc's router search (UPnP port mapping, `PS3RECOMP_UPNP`)
 
 **MSVC Compiler Flags:**
 - `/W3` — Warning level 3
@@ -590,7 +592,7 @@ target_include_directories(my_game PRIVATE
 On Windows, your game project must also link:
 ```cmake
 target_link_libraries(my_game PRIVATE
-    ws2_32 xinput ole32 bcrypt d3d12 dxgi d3dcompiler uuid
+    ws2_32 xinput ole32 bcrypt iphlpapi d3d12 dxgi d3dcompiler uuid
 )
 ```
 
@@ -601,6 +603,7 @@ target_link_libraries(my_game PRIVATE
 | `xinput` | cellPad gamepad input |
 | `ole32` | COM initialization (WASAPI audio) |
 | `bcrypt` | NID SHA-1 computation |
+| `iphlpapi` | UPnP port mapping (miniupnpc's router search) |
 | `d3d12` | RSX D3D12 backend |
 | `dxgi` | Swap chain creation |
 | `d3dcompiler` | Runtime HLSL shader compilation |
@@ -611,6 +614,8 @@ target_link_libraries(my_game PRIVATE
 - `stb_truetype.h` v1.26 — TTF font rendering for cellFont
 
 Both are single-header public domain libraries from [nothings/stb](https://github.com/nothings/stb).
+`third_party/` holds the larger ones, each with a README giving its source, version and licence
+(miniupnpc 2.3.3, BSD-3-Clause, for UPnP port mapping, is one).
 
 On Linux with SDL2:
 ```cmake
