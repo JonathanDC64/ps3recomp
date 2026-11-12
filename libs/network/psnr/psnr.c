@@ -333,6 +333,14 @@ int psnr_is_control(const void* buf, size_t len)
     return len >= 5 && memcmp(buf, "PSNR", 4) == 0;
 }
 
+int psnr_punch_user(const void* buf, size_t len, uint32_t* user)
+{
+    const uint8_t* p = (const uint8_t*)buf;
+    if (len < PSNR_UDP_PUNCH_LEN || !psnr_is_control(p, len) || p[4] != 0x02) return 0;
+    *user = psnr_get32(p + 5);
+    return 1;
+}
+
 int psnr_probe_reply(const void* buf, size_t len, uint8_t ip[4], uint16_t* port)
 {
     const uint8_t* p = (const uint8_t*)buf;

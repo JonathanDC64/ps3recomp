@@ -28,6 +28,7 @@ static int s_nsent;
 
 static int fake_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
 {
+    assert(s_nsent < 64);
     memcpy(s_sent[s_nsent].pkt, buf, len < 64 ? len : 64);
     s_sent[s_nsent].len = len;
     memcpy(s_sent[s_nsent].ip, ip, 4);
@@ -194,6 +195,87 @@ int main(void)
     len = 4;
     memcpy(buf, "game", 4);
     assert(np_psnr_p2p_filter(buf, &len, (uint8_t*)sym, &p) == 0);   /* (user 11 is still in the room) */
+
+    /* Without the relay. Some routers send to each destination from a port of
+     * their own, so a member's punches come from another port than the one
+     * psnr saw. They carry its user id: that port is learned. */
+    {
+        memset(s_peers, 0, sizeof(s_peers));
+        memset(s_early, 0, sizeof(s_early));
+        c->relay = 0;
+        np_psnr_set_p2p_sender(fake_send);
+        s_nsent = 0;
+        const uint8_t strict[4] = { 203, 0, 113, 77 }, quiet[4] = { 198, 51, 100, 23 },
+                      shared[4] = { 192, 0, 2, 31 }, late[4] = { 192, 0, 2, 41 };
+        uint8_t at[4];
+        uint16_t ap;
+#define PUNCH_FROM(user, ip, port) \
+        (len = 9, memcpy(buf, "PSNR\x02", 5), psnr_put32(buf + 5, (user)), memcpy(at, (ip), 4), ap = (port), \
+         np_psnr_p2p_filter(buf, &len, at, &ap))
+#define DATA_FROM(ip, port) \
+        (len = 4, memcpy(buf, "game", 4), memcpy(at, (ip), 4), ap = (port), np_psnr_p2p_filter(buf, &len, at, &ap))
+
+        np_psnr_punch(21, strict, 3658);   /* psnr saw user 21 at 3658 */
+        nat_tick();
+        assert(count_to(strict, 3658, 0x02) == 1);
+
+        /* Its punch comes from 11996: learned, and punched back at once. */
+        assert(PUNCH_FROM(21, strict, 11996) == 1);
+        assert(peer_by_user(21)->seen_port == 11996 && peer_by_user(21)->heard_at);
+        nat_tick();
+        assert(count_to(strict, 11996, 0x02) == 1);
+
+        /* Its data reaches the title as from the port psnr gave... */
+        assert(DATA_FROM(strict, 11996) == 0 && len == 4 && ap == 3658);
+        /* ...and what the title sends there goes to the learned port. */
+        int n0 = s_nsent;
+        assert(np_psnr_p2p_route("hello", 5, strict, 3658) == 1);
+        assert(s_nsent == n0 + 1 && s_sent[n0].port == 11996 && !memcmp(s_sent[n0].ip, strict, 4));
+        assert(s_sent[n0].len == 5 && !memcmp(s_sent[n0].pkt, "hello", 5));
+
+        /* Once it answered, a punch from yet another port doesn't move it. */
+        assert(PUNCH_FROM(21, strict, 22222) == 1 && peer_by_user(21)->seen_port == 11996);
+
+        /* A punch naming a member from another address teaches nothing. */
+        np_psnr_punch(23, quiet, 3658);
+        assert(PUNCH_FROM(23, strict, 5555) == 1);
+        assert(PUNCH_FROM(21, quiet, 5555) == 1);
+        assert(!peer_by_user(23)->seen_port && !peer_by_user(23)->heard_at);
+        assert(!np_psnr_p2p_route("x", 1, quiet, 3658));   /* (sent directly, as usual) */
+
+        /* Two members behind one router: each punch names its own. */
+        np_psnr_punch(31, shared, 3658);
+        np_psnr_punch(32, shared, 3659);
+        assert(PUNCH_FROM(32, shared, 40032) == 1 && PUNCH_FROM(31, shared, 40031) == 1);
+        assert(peer_by_user(31)->seen_port == 40031 && peer_by_user(32)->seen_port == 40032);
+        assert(DATA_FROM(shared, 40032) == 0 && ap == 3659);
+        assert(DATA_FROM(shared, 40031) == 0 && ap == 3658);
+
+        /* Punches that come before Matching2 names the member are kept a while:
+         * from another port, it is learned; from psnr's port, it is heard. */
+        assert(PUNCH_FROM(41, late, 12345) == 1 && PUNCH_FROM(43, late, 3700) == 1);
+        assert(PUNCH_FROM(42, late, 12346) == 1);
+        for (int i = 0; i < EARLY_MAX; i++)
+            if (s_early[i].user == 42) s_early[i].at = nat_now_ms() - EARLY_MS - 1;
+        np_psnr_punch(41, late, 3658);
+        np_psnr_punch(42, late, 3659);
+        np_psnr_punch(43, late, 3700);
+        assert(peer_by_user(41)->seen_port == 12345 && peer_by_user(41)->heard_at);
+        assert(!peer_by_user(42)->seen_port && !peer_by_user(42)->heard_at);   /* (too old) */
+        assert(!peer_by_user(43)->seen_port && peer_by_user(43)->heard_at);
+        for (int i = 0; i < EARLY_MAX; i++) assert(!s_early[i].user);
+
+        /* A member that never answers: no relay to move it to, so it is said
+         * once, and its datagrams still go directly. */
+        nat_tick();
+        peer_by_user(23)->punched_at = nat_now_ms() - RELAY_AFTER - 1;
+        nat_tick();
+        assert(peer_by_user(23)->said_silent && !peer_by_user(23)->relay_udp);
+        assert(!np_psnr_p2p_route("x", 1, quiet, 3658));
+        assert(!peer_by_user(21)->said_silent);
+#undef PUNCH_FROM
+#undef DATA_FROM
+    }
 
     printf("test_np_nat: all passed\n");
     return 0;

@@ -91,7 +91,13 @@ void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
  * A datagram a peer sent through the relay is unwrapped in place: len, and
  * the sender, become the peer's payload and address. With psnr on, 1 too for
  * a datagram from an address no room member has, and for a relayed one that
- * did not come from the psnr server. */
+ * did not come from the psnr server.
+ * Some routers send to each destination from a port of their own, so a
+ * member's datagrams can come from another port than the one psnr gave. Its
+ * punches carry its psnr user id: a punch from the member's own address names
+ * that port (taken only while nothing came from the member yet). From then on
+ * from_port is set back to the port psnr gave, which is the one the title
+ * knows the member by, and np_psnr_p2p_route sends to the learned one. */
 int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port);
 
 /* A peer's P2P endpoint became known (Matching2 member entries): punch toward
@@ -106,10 +112,13 @@ void np_psnr_peer_left(uint32_t user);
  * on the same network has an address beside it). */
 int np_psnr_local_ip(uint8_t ip[4]);
 
-/* The relay (psnr docs/api.md, "Relay"), when psnr runs with -relay.
+/* Where a datagram for a peer goes. np_psnr_p2p_route returns 1 when it sent
+ * it, 0 to send directly as usual:
+ * - to a peer whose punches came from another port (np_psnr_p2p_filter), it
+ *   goes to that port;
+ * The relay (psnr docs/api.md, "Relay"), when psnr runs with -relay.
  * - A peer that never answered our punches gets our datagrams through the
- *   relay: np_psnr_p2p_route sends them there and returns 1; 0 means send
- *   directly as usual.
+ *   relay.
  * - psnr says (ROUTE) which peers take streams only through the relay:
  *   np_psnr_stream_connect opens one to such a peer and returns its socket,
  *   -2 when the peer takes direct connections, -1 when the relay failed.
