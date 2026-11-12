@@ -529,8 +529,18 @@ static int32_t p2p_open_port(void)
     a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons(np_psnr_p2p_port());
     if (bind(fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
+#ifdef _WIN32
+        const int e = WSAGetLastError();
+#else
+        const int e = errno;
+#endif
         int32_t r = host_fail();
         host_closesocket(fd);
+        /* The title's bind fails with it, and a game then gives up on its
+         * session (Demon's Souls: "Failed to create the session."). Said each
+         * time, so a report shows why: usually another program on the port. */
+        printf("[sys_net] P2P port %u (UDP) can't be opened (error %d): its sessions fail\n",
+               np_psnr_p2p_port(), e);
         return r;
     }
     s_p2p_fd = fd;
