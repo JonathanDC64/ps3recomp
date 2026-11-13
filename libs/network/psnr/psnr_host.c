@@ -137,6 +137,7 @@ struct psnr_host {
     uint8_t   key_now[PSNR_HOST_KEY_LEN], key_next[PSNR_HOST_KEY_LEN];
     int       key_bad;
     atomic_int key_spent, key_pending;
+    atomic_int max_players;       /* the most members of a room: cfg.max_players, then psnr_host_set_max_players's */
     volatile int stop;
     int       players;            /* read by psnr_host_players */
 #ifdef _WIN32
@@ -626,6 +627,13 @@ static void ph_join(psnr_host* h, int ci, uint32_t req, ph_rd* r)
         ph_free(&w);
         return;
     }
+    /* (max_players: the host's own limit, below the room's size; the player stays connected, and may try again) */
+    const int most = atomic_load(&h->max_players);
+    if (most > 0 && room->n >= most) {
+        printf("[psnr_host] \"%s\" can't join yet: the game is full (the host takes %d)\n", c->name, most);
+        ph_reply_err(c, req, PSNR_E_ROOM_FULL);
+        return;
+    }
     if (room->n >= room->max || !(me = ph_add_member(room, ci, mine, nm))) {
         ph_reply_err(c, req, PSNR_E_ROOM_FULL);
         return;
@@ -976,6 +984,7 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
     if (!h) return NULL;
     h->cfg = *cfg;
     memcpy(h->key_now, cfg->key, PSNR_HOST_KEY_LEN);
+    atomic_store(&h->max_players, cfg->max_players > 0 ? cfg->max_players : 0);
     atomic_init(&h->key_spent, 0);
     atomic_init(&h->key_pending, 0);
     h->lis = h->udp = PH_BAD;
@@ -1061,6 +1070,20 @@ void psnr_host_new_key(psnr_host* h, const uint8_t key[PSNR_HOST_KEY_LEN])
 int psnr_host_key_spent(psnr_host* h)
 {
     return h ? atomic_load(&h->key_spent) : 0;
+}
+
+void psnr_host_set_max_players(psnr_host* h, int n)
+{
+    if (h) atomic_store(&h->max_players, n > 0 ? n : 0);
+}
+
+int psnr_host_members(psnr_host* h)
+{
+    int most = 0;
+    if (h)   /* (the server's thread changes the rooms: a count read across a change is one off for a moment) */
+        for (int i = 0; i < PH_ROOMS; i++)
+            if (h->rooms[i].used && h->rooms[i].n > most) most = h->rooms[i].n;
+    return most;
 }
 
 void psnr_host_stop(psnr_host* h)

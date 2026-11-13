@@ -18,6 +18,9 @@
  *     addresses the key is spent: no one else gets in until the caller sets
  *     a new one (psnr_host_new_key). A connection must say HELLO within 10 s,
  *     and one address may have only two connections waiting to.
+ *   - With max_players, a room takes at most that many members: one more
+ *     JOIN_ROOM is refused as full, and the player stays connected to try
+ *     again (the port tells its players when the game is full).
  *   - No relay streams and no scores (ERROR replies).
  *   - Small fixed limits (a few rooms of a few players).
  *   - No player addresses in the log.
@@ -44,6 +47,9 @@ typedef struct {
     uint8_t  key[PSNR_HOST_KEY_LEN];  /* with has_key: the HELLO's session blob must be exactly this */
     int      own_key_local;           /* 1: `key` stays good from this PC (127.0.0.0/8) after a new key, for the
                                        * hosting game's own connection, which keeps the key it started with */
+    int      max_players;             /* >0: at most this many members in a room, its creator counted; one more
+                                       * JOIN_ROOM is refused as the room being full (PSNR_E_ROOM_FULL), though the
+                                       * player stays connected. 0: the room's own size only */
     uint8_t  public_ip[4];            /* the host's address as guests reach it (0.0.0.0: unknown) */
     int      bind_loopback;           /* 1: listen on 127.0.0.1 only (tests) */
     /* Other releases of the same game that play together, as the psnr server's sameGames: a player whose HELLO
@@ -64,6 +70,11 @@ int        psnr_host_players(psnr_host* h);
 void       psnr_host_new_key(psnr_host* h, const uint8_t key[PSNR_HOST_KEY_LEN]);
 /* 1 once too many wrong keys came for the current key: it lets no one else in until psnr_host_new_key. */
 int        psnr_host_key_spent(psnr_host* h);
+/* The most members of a room from now on (as max_players; 0: the room's own size). Members already in stay, even past
+ * it. */
+void       psnr_host_set_max_players(psnr_host* h, int n);
+/* The members of the fullest room (a hosted game has one: the host's), 0 with none. */
+int        psnr_host_members(psnr_host* h);
 void       psnr_host_stop(psnr_host* h);
 
 /* The hosted game's own messages between its players (a port's, never the title's), from any player's game connected

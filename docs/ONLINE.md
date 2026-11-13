@@ -136,6 +136,12 @@ Three pieces are in the runtime:
     client switches at once.
   - With a key, a HELLO without it is refused. An address that sends five
     wrong keys is ignored for a minute.
+  - `max_players` caps a room's members, its creator counted, below the size
+    the title asked for. One more JOIN_ROOM is refused as full, and the player
+    stays connected, so its game stays online and can try again.
+    `psnr_host_set_max_players()` changes the cap while it runs (members
+    already in stay), and `psnr_host_members()` counts the fullest room's
+    members, for the port to tell its players when the game is full.
   - No relay streams and no leaderboards (they get an ERROR).
   - The port's own messages: `psnr_app_send()` sends a blob of up to 1 KB, and every other player's game on the
     server gets it through `psnr_app_on_message()`'s handler, never the title. They need no room, and keep going

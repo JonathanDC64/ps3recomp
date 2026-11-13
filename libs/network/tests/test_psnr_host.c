@@ -260,6 +260,74 @@ static void test_keys(void)
     }
 }
 
+/* A JOIN_ROOM's answer: 1 joined, 0 refused as full, -1 anything else. */
+static int join_room(psnr_client* c, uint64_t room)
+{
+    uint8_t body[16], *p = body;
+    p = psnr_put64(p, room);
+    p = psnr_put16(p, 0);
+    psnr_msg m;
+    if (psnr_call(c, PSNR_JOIN_ROOM, body, (uint32_t)(p - body), &m, 2000) != 1) return -1;
+    const int r = m.type == PSNR_ROOM_JOINED                                                  ? 1
+                  : m.type == PSNR_ERROR && m.len >= 4 && psnr_get32(m.data) == PSNR_E_ROOM_FULL ? 0
+                                                                                                  : -1;
+    psnr_msg_free(&m);
+    return r;
+}
+
+/* max_players: a room of 4 takes 2 members; the third's join is refused as full and it stays connected; once a member
+ * leaves it joins; a lower limit refuses the next while the members stay, a higher one lets it in. */
+static void test_full(void)
+{
+    psnr_host_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.bind_loopback = 1;
+    cfg.max_players = 2;
+    char err[128] = "";
+    psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+    CHECK(h != NULL);
+    if (!h) return;
+    const uint16_t port = psnr_host_port(h);
+    uint32_t uid = 0;
+    uint8_t ip[4];
+    psnr_client* a = psnr_connect("127.0.0.1", port, kComm, "Alpha", 3721, NULL, &uid, ip);
+    psnr_client* b = psnr_connect("127.0.0.1", port, kComm, "Bravo", 3722, NULL, &uid, ip);
+    psnr_client* c = psnr_connect("127.0.0.1", port, kComm, "Charlie", 3723, NULL, &uid, ip);
+    psnr_client* d = psnr_connect("127.0.0.1", port, kComm, "Delta", 3724, NULL, &uid, ip);
+    CHECK(a && b && c && d);   /* everyone connects */
+    if (!a || !b || !c || !d) return;
+    CHECK(psnr_host_members(h) == 0);
+    uint8_t body[16], *p = body;
+    *p++ = 4;   /* the room's own size: 4 */
+    p = psnr_put32(p, 0);
+    p = psnr_put16(p, 0);
+    p = psnr_put16(p, 0);
+    p = psnr_put16(p, 0);
+    psnr_msg m;
+    CHECK(psnr_call(a, PSNR_CREATE_ROOM, body, (uint32_t)(p - body), &m, 2000) == 1 && m.type == PSNR_ROOM_JOINED);
+    const uint64_t room = psnr_get64(m.data);
+    psnr_msg_free(&m);
+    CHECK(join_room(b, room) == 1);
+    CHECK(psnr_host_members(h) == 2);
+    CHECK(join_room(c, room) == 0);   /* full at 2 */
+    CHECK(psnr_host_members(h) == 2 && psnr_host_players(h) == 4);   /* (still connected) */
+    p = psnr_put64(body, room);
+    CHECK(psnr_call(b, PSNR_LEAVE_ROOM, body, 8, &m, 2000) == 1 && m.type == PSNR_OK);
+    psnr_msg_free(&m);
+    CHECK(join_room(c, room) == 1);   /* a place freed */
+    psnr_host_set_max_players(h, 1);
+    CHECK(join_room(d, room) == 0);
+    CHECK(psnr_host_members(h) == 2);   /* Alpha and Charlie stay */
+    psnr_host_set_max_players(h, 3);
+    CHECK(join_room(d, room) == 1);
+    CHECK(psnr_host_members(h) == 3);
+    psnr_close(d);
+    psnr_close(c);
+    psnr_close(b);
+    psnr_close(a);
+    psnr_host_stop(h);
+}
+
 /* A connection that says nothing */
 static ph_sock tcp_raw(uint16_t port)
 {
@@ -325,6 +393,7 @@ int main(void)
     test_invite();
     test_same_game();
     test_keys();
+    test_full();
     test_early();
 
     psnr_host_config cfg;
