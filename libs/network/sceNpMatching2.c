@@ -147,6 +147,7 @@ typedef struct {
 
 typedef struct {
     int in;
+    u32 conn;   /* the psnr connection it was joined on (np_psnr_connection) */
     u64 id;
     u16 me, owner;
     u8  max;
@@ -412,6 +413,7 @@ static int parse_joined(m2_room* r, const psnr_msg* m)
         r->n++;
     }
     r->in = 1;
+    r->conn = np_psnr_connection();
     return 0;
 }
 
@@ -1202,6 +1204,26 @@ static s32 send_simple(m2_ctx* c, u16 ctxId, u16 event, u32 opt, u32 reqId,
 /* SceNpMatching2LeaveRoomRequest { u64 roomId; PresenceOptionData optData; pad } */
 s32 sceNpMatching2LeaveRoom(u16 ctxId, u32 req, u32 opt, u32 reqId)
 {
+    /* A room joined on a connection that has since been lost: the server let
+     * this member go when that connection closed (psnr and psnr_host both
+     * do), so it is out already. Answered here, as left. Asked of the server
+     * it would fail for as long as there is no connection, and a title that
+     * tries again until it is out (Demon's Souls: every 15 s, each time with
+     * a "session has ended" box) would never get out. */
+    m2_ctx* lost = ctx_get(ctxId);
+    if (lost && lost->started && req && lost->room.in && lost->room.conn != np_psnr_connection()) {
+        printf("[sceNpMatching2] room %llu: out of it already (its connection was lost)\n",
+               (unsigned long long)lost->room.id);
+        m2_op* op = op_new(lost, ctxId, EV_LeaveRoom, opt, reqId);
+        rb_t img = {0};
+        u32 o = rb_alloc(&img, 8, 8);   /* SceNpMatching2LeaveRoomResponse { u64 roomId } */
+        rb_64(&img, o, lost->room.id);
+        room_gone(lost);
+        answer(op, 0, &img);
+        rb_free(&img);
+        free(op);
+        return CELL_OK;
+    }
     REQUIRE_STARTED(c, ctxId);
     if (!req) return (s32)SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     u8 body[8];

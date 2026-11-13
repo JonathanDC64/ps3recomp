@@ -37,6 +37,12 @@ int np_psnr_signed_in(void);
 int np_psnr_connect(const char* comm_id);
 int np_psnr_connected(void);
 
+/* Which connection this is: one more at each dial that connects (a redial
+ * too), 0 while there is none. Rooms last only as long as the connection
+ * they were joined on: the server lets a member go when its connection
+ * closes. */
+uint32_t np_psnr_connection(void);
+
 /* Take the player's name and server at startup, before the title runs; the
  * runtime's main passes --username and --psnr (either may be NULL).
  *   --psnr host[:port]  sets PS3_NET_ONLINE=1 and PSNR_SERVER at once.
