@@ -141,10 +141,66 @@ static void test_invite(void)
     CHECK(strtoul(two, NULL, 16) == blob[0]);
 }
 
+/* Another release of the same game (same_game): its player finds and joins the room; a third game's doesn't. */
+static void test_same_game(void)
+{
+    psnr_host_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.bind_loopback = 1;
+    snprintf(cfg.same_game[0].other, sizeof cfg.same_game[0].other, "%s", "NPWR01249_00");
+    snprintf(cfg.same_game[0].game, sizeof cfg.same_game[0].game, "%s", "NPWR00881_00");
+    char err[128] = "";
+    psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+    CHECK(h != NULL);
+    if (!h) return;
+    const uint16_t port = psnr_host_port(h);
+    uint32_t ida = 0, idb = 0, idc = 0;
+    uint8_t ip[4];
+    psnr_client* a = psnr_connect("127.0.0.1", port, "NPWR00881_00", "Alpha", 3711, NULL, &ida, ip);
+    psnr_client* b = psnr_connect("127.0.0.1", port, "NPWR01249_00", "Bravo", 3712, NULL, &idb, ip);
+    psnr_client* c = psnr_connect("127.0.0.1", port, "NPWR00000_00", "Charlie", 3713, NULL, &idc, ip);
+    CHECK(a && b && c);
+    if (!a || !b || !c) return;
+    uint8_t body[64], *p = body;
+    *p++ = 4;
+    p = psnr_put32(p, 0);
+    p = psnr_put16(p, 0);
+    p = psnr_put16(p, 0);
+    p = psnr_put16(p, 0);
+    psnr_msg m;
+    CHECK(psnr_call(a, PSNR_CREATE_ROOM, body, (uint32_t)(p - body), &m, 2000) == 1);
+    CHECK(m.type == PSNR_ROOM_JOINED);
+    const uint64_t room = psnr_get64(m.data);
+    psnr_msg_free(&m);
+    p = body;
+    p = psnr_put16(p, 0);
+    p = psnr_put16(p, 10);
+    CHECK(psnr_call(b, PSNR_SEARCH_ROOMS, body, 4, &m, 2000) == 1);   /* the other release sees it */
+    CHECK(m.type == PSNR_ROOM_LIST && psnr_get16(m.data + 2) == 1 && psnr_get64(m.data + 4) == room);
+    psnr_msg_free(&m);
+    CHECK(psnr_call(c, PSNR_SEARCH_ROOMS, body, 4, &m, 2000) == 1);   /* another game doesn't */
+    CHECK(m.type == PSNR_ROOM_LIST && psnr_get16(m.data + 2) == 0);
+    psnr_msg_free(&m);
+    p = body;
+    p = psnr_put64(p, room);
+    p = psnr_put16(p, 0);
+    CHECK(psnr_call(c, PSNR_JOIN_ROOM, body, (uint32_t)(p - body), &m, 2000) == 1);
+    CHECK(m.type != PSNR_ROOM_JOINED);
+    psnr_msg_free(&m);
+    CHECK(psnr_call(b, PSNR_JOIN_ROOM, body, (uint32_t)(p - body), &m, 2000) == 1);
+    CHECK(m.type == PSNR_ROOM_JOINED && psnr_get16(m.data + 8) == 2);
+    psnr_msg_free(&m);
+    psnr_close(c);
+    psnr_close(b);
+    psnr_close(a);
+    psnr_host_stop(h);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     test_invite();
+    test_same_game();
 
     psnr_host_config cfg;
     memset(&cfg, 0, sizeof cfg);

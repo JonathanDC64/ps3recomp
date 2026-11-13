@@ -443,13 +443,24 @@ static void ph_hello(psnr_host* h, int ci, uint32_t req, ph_rd* r)
         printf("[psnr_host] \"%s\" reconnected\n", name);
         ph_drop(h, i);
     }
-    memcpy(c->comm, comm, sizeof comm);
+    /* another release of the same game: its rooms are that game's (the psnr server does this at HELLO too) */
+    const char* game = comm;
+    for (int i = 0; i < PSNR_HOST_SAME_GAMES; i++)
+        if (h->cfg.same_game[i].other[0] && !strncmp(h->cfg.same_game[i].other, comm, 12)) {
+            game = h->cfg.same_game[i].game;
+            break;
+        }
+    snprintf(c->comm, sizeof c->comm, "%.12s", game);
     memcpy(c->name, name, sizeof name);
     c->p2p_port = port;
     c->token = (uint32_t)ph_rand(h) | 1u;
     c->hello = 1;
     h->players++;
-    printf("[psnr_host] player %u: \"%s\" (%s)%s\n", c->id, name, comm, ph_loopback(c->ip) ? ", this PC" : "");
+    if (game != comm)
+        printf("[psnr_host] player %u: \"%s\" (%s, in %s's rooms)%s\n", c->id, name, comm, c->comm,
+               ph_loopback(c->ip) ? ", this PC" : "");
+    else
+        printf("[psnr_host] player %u: \"%s\" (%s)%s\n", c->id, name, comm, ph_loopback(c->ip) ? ", this PC" : "");
     ph_buf w = {0};
     ph_u32(&w, req);
     ph_u32(&w, c->id);

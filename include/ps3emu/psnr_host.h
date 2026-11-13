@@ -33,6 +33,7 @@ extern "C" {
 #endif
 
 #define PSNR_HOST_KEY_LEN 32
+#define PSNR_HOST_SAME_GAMES 4
 
 typedef struct {
     uint16_t port;                    /* TCP and UDP; 0 picks a free one */
@@ -40,6 +41,11 @@ typedef struct {
     uint8_t  key[PSNR_HOST_KEY_LEN];  /* with has_key: the HELLO's session blob must be exactly this */
     uint8_t  public_ip[4];            /* the host's address as guests reach it (0.0.0.0: unknown) */
     int      bind_loopback;           /* 1: listen on 127.0.0.1 only (tests) */
+    /* Other releases of the same game that play together, as the psnr server's sameGames: a player whose HELLO
+     * names `other` as its communication ID ("NPWR01249_00") uses `game`'s rooms. Unused pairs are empty. */
+    struct {
+        char other[13], game[13];
+    } same_game[PSNR_HOST_SAME_GAMES];
 } psnr_host_config;
 
 typedef struct psnr_host psnr_host;
