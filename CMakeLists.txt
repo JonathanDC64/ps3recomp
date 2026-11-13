@@ -716,6 +716,21 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spurs_queues COMMAND test_spurs_queues)
         set_tests_properties(spurs_queues PROPERTIES TIMEOUT 120)
     endif()
+    # sys_lwmutex with PPU_LWM_HANDOFF (#502): a thread that unlocks and locks again at once must not keep a
+    # sleeper out. It includes runtime/ppu/ppu_sysprx.cpp with its own stand-ins, so it links nothing else.
+    if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(test_lwmutex_handoff runtime/ppu/tests/test_lwmutex_handoff.cpp)
+        target_include_directories(test_lwmutex_handoff PRIVATE include runtime runtime/ppu)
+        if(MSVC)
+            target_compile_options(test_lwmutex_handoff PRIVATE /UNDEBUG)
+        else()
+            target_compile_options(test_lwmutex_handoff PRIVATE -UNDEBUG)
+            find_package(Threads REQUIRED)
+            target_link_libraries(test_lwmutex_handoff PRIVATE Threads::Threads)
+        endif()
+        add_test(NAME lwmutex_handoff COMMAND test_lwmutex_handoff)
+        set_tests_properties(lwmutex_handoff PROPERTIES TIMEOUT 120)
+    endif()
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so
