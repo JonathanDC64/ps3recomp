@@ -583,11 +583,21 @@ static void hle_ranking_by_npid_pcid(ppu_context* ctx)
  * Game data
  * -----------------------------------------------------------------------*/
 
+/* Any reply finishes the upload with CELL_OK. The server answers ERROR when it
+ * turns a record down (its own checks), and a title must not take that for a
+ * failed upload: Demon's Souls' upload job (0x00E9A144) then records the
+ * board's score again, sends the record again, and on a second failure gives
+ * up on every board after it. The record is lost either way; the scores after
+ * it are not. Only no reply at all (WaitAsync's timeout) stays a failure. */
 static void on_game_data_recorded(void* user, const psnr_msg* m)
 {
+    static int s_said;
     score_trans* t = trans_claim(user);
     if (!t) return;
-    t->result = m->type == PSNR_OK ? CELL_OK : (s32)SCORE_ERROR_NO_SERVER;
+    if (m->type != PSNR_OK && __atomic_fetch_add(&s_said, 1, __ATOMIC_RELAXED) < 8)
+        printf("[sceNpScore] the server turned down our game data for board %u (reply 0x%02X, error %u);"
+               " the score stands\n", t->up_board, m->type, m->len >= 4 ? psnr_get32(m->data) : 0u);
+    t->result = CELL_OK;
     trans_set(t, T_DONE);
 }
 

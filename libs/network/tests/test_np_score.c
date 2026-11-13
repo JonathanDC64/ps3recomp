@@ -461,10 +461,31 @@ static void game_data_checks(s32 trans)
     assert(s_sent == before);
     s_hook_refuse = 0;
 
-    /* A server's refusal fails only that call. */
+    /* A server that turns the record down: the record was sent, and the title
+     * hears CELL_OK, so it goes on to its next board (a failure makes Demon's
+     * Souls drop every board after this one). The session keeps the newer
+     * messages, and the next upload goes out as usual. */
     set_error(PSNR_ERR_BAD_REQUEST);
-    assert(record_chunk(trans, 1, 100, size, size, DATA) < 0);
+    before = s_sent;
+    assert(record_chunk(trans, 1, 100, size, chunk, DATA) == 0);
+    assert(record_chunk(trans, 1, 100, size, size - chunk, DATA + chunk) == 0);
+    assert(s_sent == before + 1 && s_sent_type == PSNR_RECORD_GAME_DATA);
     assert(!s_old_server);
+    set_error(6);                           /* any other error reads the same */
+    assert(record_chunk(trans, 2, 100, size, size, DATA) == 0);
+    assert(s_sent == before + 2 && psnr_get32(s_body) == 2);
+    s_reply_type = PSNR_OK;
+    s_reply_len = 0;
+    assert(record_chunk(trans, 3, 100, size, size, DATA) == 0);
+    assert(s_sent == before + 3 && psnr_get32(s_body) == 3);
+
+    /* Offline is still a failure: nothing was sent. */
+    {
+        int keep = s_connected;
+        s_connected = 0;
+        assert(record_chunk(trans, 1, 100, size, size, DATA) < 0);
+        s_connected = keep;
+    }
 
     /* A read fetches once and serves the title's chunks. */
     {
