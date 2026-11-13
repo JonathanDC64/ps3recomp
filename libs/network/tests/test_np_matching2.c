@@ -7,6 +7,7 @@
  * Simpsons Arcade or could silently: GetEventData relocating the pointers in
  * a response into the title's buffer, attributes packed for psnr and unpacked
  * back, and the RoomDataInternal / member structs built from a ROOM_JOINED.
+ * Also: a LeaveRoom after the room's connection was lost is answered at once.
  *
  *   clang-cl /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_np_matching2 libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c
@@ -32,16 +33,18 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; 
 s32 sceNpInit(u32 poolSize, void* poolPtr) { (void)poolSize; (void)poolPtr; return 0; }
 s32 sceNpTerm(void) { return 0; }
 
-/* psnr: always connected; requests are captured, not sent */
+/* psnr: connection 1 until the test drops it; requests are captured, not sent */
 static np_psnr_reply_fn s_fn;
 static void* s_user;
 static u8 s_body[4096];
 static u32 s_len;
 static uint8_t s_type;
 static void (*s_push)(const psnr_msg*);
+static uint32_t s_conn_now = 1;   /* np_psnr_connection: 0 while there is none */
 int np_psnr_enabled(void) { return 1; }
 int np_psnr_connect(const char* comm_id) { (void)comm_id; return 0; }
-int np_psnr_connected(void) { return 1; }
+int np_psnr_connected(void) { return s_conn_now != 0; }
+uint32_t np_psnr_connection(void) { return s_conn_now; }
 uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len, np_psnr_reply_fn fn, void* user)
 {
     s_type = type; s_len = len; memcpy(s_body, body, len); s_fn = fn; s_user = user;
@@ -162,6 +165,38 @@ int main(void)
     vm_write32(REQ, 0);
     assert(sceNpMatching2SignalingGetConnectionStatus(ctx, 9, 2, REQ, REQ + 4, REQ + 8) == 0);
     assert(vm_read32(REQ) == 2 && vm_read8(REQ + 4) == 127 && vm_read16(REQ + 8) == 3659);
+
+    /* LeaveRoom on the connection the room was joined on: asked of the server. */
+    vm_write64(REQ, 9);
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 9 && s_ctx[ctx].room.in);
+    /* (no answer: the connection drops first, and np_psnr fails that request itself) */
+
+    /* The connection is lost. The server lets a member go when its connection closes, so the room is gone
+     * too: a LeaveRoom is answered at once, as left, with nothing sent. */
+    s_conn_now = 0;
+    s_type = 0;
+    s_cb_opd = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && !s_ctx[ctx].room.in);
+    assert(s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0 && s_cb[6] == 0xA0);   /* LeaveRoom, no error */
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+    /* Out of the room with no connection: as any other request. */
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+
+    /* Connected again (a redial: another connection) while the title still holds the old room: out of it
+     * already, answered at once. */
+    s_conn_now = 2;
+    s_ctx[ctx].room.in = 1;
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && !s_ctx[ctx].room.in && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    /* A room joined on this connection is asked of the server again. */
+    s_ctx[ctx].room.in = 1;
+    s_ctx[ctx].room.conn = 2;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && s_ctx[ctx].room.in);
 
     printf("test_np_matching2: all passed\n");
     return 0;

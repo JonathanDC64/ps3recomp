@@ -31,6 +31,7 @@ extern const char* np_fake_username(void);
 #define PENDING_MAX 64
 
 static psnr_client* s_client;
+static uint32_t     s_conn;      /* which connection s_client is: one more at each dial that connects (LOCK) */
 static uint32_t     s_user_id;   /* ours, from HELLO: our own member entry needs no punch */
 static int          s_tried;
 static char         s_comm_id[16];   /* the connection's, for a redial */
@@ -152,6 +153,14 @@ int np_psnr_connected(void)
     return s_client != NULL;
 }
 
+uint32_t np_psnr_connection(void)
+{
+    LOCK();
+    const uint32_t n = s_client ? s_conn : 0;
+    UNLOCK();
+    return n;
+}
+
 /* PSNR_SERVER as host and port (36100 when it names none). */
 static void server_addr(char host[256], uint16_t* port)
 {
@@ -207,7 +216,10 @@ int np_psnr_connect(const char* comm_id)
     int signed_in = 0, err = 0;
     s_client = dial(comm_id, host, port, &user_id, ip, &signed_in, &err);
     s_user_id = user_id;
-    if (s_client) snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+    if (s_client) {
+        snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+        s_conn++;
+    }
     UNLOCK();
     /* A HELLO with no session because the sign-in itself failed says nothing
      * more: the sign-in has given its own reason (a ban, maintenance), which
@@ -605,6 +617,7 @@ static void* redial_main(void* arg)
             if (!s_client) {
                 s_client = c;
                 s_user_id = user;
+                s_conn++;
                 c = NULL;
             }
             UNLOCK();
