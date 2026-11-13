@@ -46,6 +46,24 @@
 
 #define HEARTBEAT_SECS 20
 
+/* A write to a connection the other end has closed fails (EPIPE), and doesn't end the process with SIGPIPE: this
+ * code may run before the runtime's online switch ignores SIGPIPE (ps3_net_online), as in a hosting game's own
+ * room server, or in a test. macOS has no MSG_NOSIGNAL: SO_NOSIGPIPE on each socket. */
+#ifdef MSG_NOSIGNAL
+#  define PSNR_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define PSNR_SEND_FLAGS 0
+#endif
+static void psnr_no_sigpipe(sock_t s)
+{
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#else
+    (void)s;
+#endif
+}
+
 static uint64_t now_ms(void)
 {
 #ifdef _WIN32
@@ -82,7 +100,7 @@ static int send_all(psnr_client* c, const uint8_t* p, size_t n)
         return 0;
     }
     while (n) {
-        int k = send(c->s, (const char*)p, (int)n, 0);
+        int k = send(c->s, (const char*)p, (int)n, PSNR_SEND_FLAGS);
         if (k < 0) {
             pollfd_t pf;
             if (!WOULD_BLOCK()) { c->dead = 1; return -1; }
@@ -222,6 +240,7 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     for (ai = res; ai; ai = ai->ai_next) {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == BAD_SOCK) continue;
+        psnr_no_sigpipe(s);
         if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
         sock_close(s);
         s = BAD_SOCK;
@@ -392,6 +411,7 @@ static int64_t stream_leg(const psnr_client* c, uint8_t type, const uint8_t* bod
     int one = 1;
     sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == BAD_SOCK) return -1;
+    psnr_no_sigpipe(s);
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     memcpy(&a.sin_addr, c->server_ip, 4);
@@ -403,7 +423,7 @@ static int64_t stream_leg(const psnr_client* c, uint8_t type, const uint8_t* bod
     psnr_put16(f + 1, (uint16_t)(4 + len));
     psnr_put32(f + 3, 1);
     memcpy(f + 7, body, len);
-    if (send(s, (const char*)f, 7 + len, 0) != 7 + len) goto fail;
+    if (send(s, (const char*)f, 7 + len, PSNR_SEND_FLAGS) != 7 + len) goto fail;
 
     /* The reply: READY, or an ERROR. The server waits up to 10 s for the
      * other side to accept. */

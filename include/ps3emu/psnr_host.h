@@ -14,7 +14,10 @@
  *     so with PSNR_ROUTE_UDP_RELAY, and the clients switch at once.
  *   - With a key, a HELLO must carry it as its 32-byte session blob, or the
  *     player is refused (PSNR_E_REFUSED). An address that sends wrong keys
- *     is ignored for a minute after a few.
+ *     is ignored for a minute after a few. After 100 wrong keys from any
+ *     addresses the key is spent: no one else gets in until the caller sets
+ *     a new one (psnr_host_new_key). A connection must say HELLO within 10 s,
+ *     and one address may have only two connections waiting to.
  *   - No relay streams and no scores (ERROR replies).
  *   - Small fixed limits (a few rooms of a few players).
  *   - No player addresses in the log.
@@ -39,6 +42,8 @@ typedef struct {
     uint16_t port;                    /* TCP and UDP; 0 picks a free one */
     int      has_key;
     uint8_t  key[PSNR_HOST_KEY_LEN];  /* with has_key: the HELLO's session blob must be exactly this */
+    int      own_key_local;           /* 1: `key` stays good from this PC (127.0.0.0/8) after a new key, for the
+                                       * hosting game's own connection, which keeps the key it started with */
     uint8_t  public_ip[4];            /* the host's address as guests reach it (0.0.0.0: unknown) */
     int      bind_loopback;           /* 1: listen on 127.0.0.1 only (tests) */
     /* Other releases of the same game that play together, as the psnr server's sameGames: a player whose HELLO
@@ -55,6 +60,10 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
 uint16_t   psnr_host_port(const psnr_host* h);
 /* Players connected and past HELLO (the host's own game counts). */
 int        psnr_host_players(psnr_host* h);
+/* A new key: HELLOs need it from now on (players already in stay), and the wrong keys count from 0 again. */
+void       psnr_host_new_key(psnr_host* h, const uint8_t key[PSNR_HOST_KEY_LEN]);
+/* 1 once too many wrong keys came for the current key: it lets no one else in until psnr_host_new_key. */
+int        psnr_host_key_spent(psnr_host* h);
 void       psnr_host_stop(psnr_host* h);
 
 /* The hosted game's own messages between its players (a port's, never the title's), from any player's game connected

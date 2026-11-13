@@ -1,7 +1,8 @@
 /*
  * test_psnr_host - the in-process room server (psnr/psnr_host.c) against the
  * real client (psnr/psnr.c) on loopback: the key, rooms, pushes, the probe,
- * the relay, a reconnect and the ban; and the invite code (net_invite.c).
+ * the relay, a reconnect and the ban; a spent key, a new key and connections
+ * that never say HELLO; and the invite code (net_invite.c).
  *
  *   clang-cl /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_psnr_host libs/network/tests/test_psnr_host.c -lpthread
@@ -10,6 +11,11 @@
 #  define _CRT_RAND_S   /* net_invite.c's rand_s, before the first stdlib.h of this one file */
 #endif
 #include "../psnr/psnr.c"
+/* smaller limits, so the test reaches them: wrong keys before the key is spent (and before an address is
+ * ignored, a few more), and the time to say HELLO */
+#define PH_KEY_TRIES 4
+#define PH_BAD_KEYS  8
+#define PH_HELLO_MS  300
 #include "../psnr/psnr_host.c"
 #include "../net_invite.c"
 
@@ -196,11 +202,130 @@ static void test_same_game(void)
     psnr_host_stop(h);
 }
 
+/* PH_KEY_TRIES wrong keys spend the key: no new player then, the ones in stay; a new key works and the old one
+ * doesn't. With own_key_local the key the server started with stays good from this PC. */
+static void test_keys(void)
+{
+    uint8_t k0[32], k1[32], wrong[32];
+    net_invite_key_blob(0x1234567, k0);
+    net_invite_key_blob(0x7654321, k1);
+    net_invite_key_blob(0x0BADBAD, wrong);
+    for (int own = 0; own < 2; own++) {
+        psnr_host_config cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.has_key = 1;
+        memcpy(cfg.key, k0, 32);
+        cfg.bind_loopback = 1;
+        cfg.own_key_local = own;
+        char err[128] = "";
+        psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+        CHECK(h != NULL);
+        if (!h) return;
+        const uint16_t port = psnr_host_port(h);
+        uint32_t uid = 0;
+        uint8_t ip[4];
+        if (own) {
+            psnr_host_new_key(h, k1);
+            for (int i = 0; i < PH_KEY_TRIES; i++)
+                CHECK(psnr_connect("127.0.0.1", port, kComm, "Mallory", 3720, wrong, &uid, ip) == NULL);
+            CHECK(psnr_host_key_spent(h));
+            CHECK(psnr_connect("127.0.0.1", port, kComm, "Bravo", 3722, k1, &uid, ip) == NULL);
+            psnr_client* a = psnr_connect("127.0.0.1", port, kComm, "Alpha", 3721, k0, &uid, ip);
+            CHECK(a != NULL);   /* the hosting game's own key, from this PC */
+            if (a) psnr_close(a);
+            psnr_host_stop(h);
+            continue;
+        }
+        for (int i = 0; i < PH_KEY_TRIES - 1; i++)
+            CHECK(psnr_connect("127.0.0.1", port, kComm, "Mallory", 3720, wrong, &uid, ip) == NULL);
+        CHECK(!psnr_host_key_spent(h));
+        psnr_client* a = psnr_connect("127.0.0.1", port, kComm, "Alpha", 3721, k0, &uid, ip);
+        CHECK(a != NULL);
+        CHECK(psnr_connect("127.0.0.1", port, kComm, "Mallory", 3720, wrong, &uid, ip) == NULL);
+        CHECK(psnr_host_key_spent(h));
+        CHECK(psnr_connect("127.0.0.1", port, kComm, "Bravo", 3722, k0, &uid, ip) == NULL);
+        CHECK(psnr_connect_error() == PSNR_E_REFUSED);
+        sleep_ms(50);
+        CHECK(psnr_host_players(h) == 1);   /* Alpha stays */
+        psnr_host_new_key(h, k1);
+        CHECK(!psnr_host_key_spent(h));
+        CHECK(psnr_connect("127.0.0.1", port, kComm, "Bravo", 3722, k0, &uid, ip) == NULL);
+        psnr_client* c = psnr_connect("127.0.0.1", port, kComm, "Charlie", 3723, k1, &uid, ip);
+        CHECK(c != NULL);
+        sleep_ms(50);
+        CHECK(psnr_host_players(h) == 2);
+        if (c) psnr_close(c);
+        if (a) psnr_close(a);
+        psnr_host_stop(h);
+    }
+}
+
+/* A connection that says nothing */
+static ph_sock tcp_raw(uint16_t port)
+{
+    ph_sock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == PH_BAD) return PH_BAD;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr*)&a, sizeof a) != 0) { ph_close(s); return PH_BAD; }
+    return s;
+}
+
+/* 1 if the server ended s within ms */
+static int ended_within(ph_sock s, int ms)
+{
+    ph_pollfd p;
+    p.fd = s;
+    p.events = POLLIN;
+    p.revents = 0;
+    if (PH_POLL(&p, 1, ms) <= 0) return 0;
+    char b[16];
+    return recv(s, b, (int)sizeof b, 0) <= 0;
+}
+
+/* Connections that never say HELLO: two from one address wait, until PH_HELLO_MS; a third from there is ended at
+ * once. Then a player from that address gets in. */
+static void test_early(void)
+{
+    psnr_host_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.bind_loopback = 1;
+    char err[128] = "";
+    psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+    CHECK(h != NULL);
+    if (!h) return;
+    const uint16_t port = psnr_host_port(h);
+    ph_sock s1 = tcp_raw(port), s2 = tcp_raw(port);
+    CHECK(s1 != PH_BAD && s2 != PH_BAD);
+    sleep_ms(50);
+    ph_sock s3 = tcp_raw(port);
+    CHECK(s3 != PH_BAD);
+    CHECK(ended_within(s3, 200));
+    CHECK(!ended_within(s1, 50));
+    CHECK(ended_within(s1, PH_HELLO_MS + 400) && ended_within(s2, 200));
+    uint32_t uid = 0;
+    uint8_t ip[4];
+    psnr_client* a = psnr_connect("127.0.0.1", port, kComm, "Alpha", 3731, NULL, &uid, ip);
+    CHECK(a != NULL);
+    sleep_ms(PH_HELLO_MS + 100);
+    CHECK(psnr_host_players(h) == 1);   /* past HELLO: no deadline */
+    if (a) psnr_close(a);
+    ph_close(s1);
+    ph_close(s2);
+    ph_close(s3);
+    psnr_host_stop(h);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     test_invite();
     test_same_game();
+    test_keys();
+    test_early();
 
     psnr_host_config cfg;
     memset(&cfg, 0, sizeof cfg);

@@ -8,6 +8,7 @@
 #include "ps3emu/psnr_host.h"
 #include "psnr.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,8 +62,29 @@
 #define PH_MEMBERS     8
 #define PH_TIMEOUT_MS  90000   /* as the psnr server: HELLO/HEARTBEAT keep a client */
 #define PH_TX_MAX      (1u << 20)
-#define PH_BAD_KEYS    5       /* wrong keys from one address before it is ignored */
+#ifndef PH_BAD_KEYS
+#  define PH_BAD_KEYS  5       /* wrong keys from one address before it is ignored */
+#endif
 #define PH_BAN_MS      60000
+/* Wrong keys, from any address, before the key lets no one else in (psnr_host_key_spent): a guess at the invite
+ * code's 28-bit key gets that many tries a code, whatever the number of addresses it comes from. */
+#ifndef PH_KEY_TRIES
+#  define PH_KEY_TRIES 100
+#endif
+/* A connection that hasn't said HELLO: dropped after this long, and at most PH_EARLY_PER_IP from one address, so
+ * connections that never send a key can't hold the players' places. */
+#ifndef PH_HELLO_MS
+#  define PH_HELLO_MS  10000
+#endif
+#define PH_EARLY_PER_IP 2
+
+/* A write to a connection the other end has closed fails (EPIPE) and doesn't end the process with SIGPIPE: the
+ * server starts before the runtime's online switch ignores SIGPIPE (ps3_net_online). macOS: SO_NOSIGPIPE. */
+#ifdef MSG_NOSIGNAL
+#  define PH_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define PH_SEND_FLAGS 0
+#endif
 
 typedef struct { uint8_t* b; size_t n, cap; } ph_buf;
 
@@ -78,6 +100,7 @@ typedef struct {
     uint8_t  udp_ip[4], local_ip[4];
     uint16_t udp_port;
     uint64_t last_rx;
+    uint64_t born;                /* when it connected (the HELLO's deadline counts from here) */
     ph_buf   rx, tx;
     int      closing;             /* drop once tx is out */
 } ph_client;
@@ -109,6 +132,11 @@ struct psnr_host {
     uint32_t  next_id;
     uint64_t  next_seq, rng;
     struct { uint8_t ip[4]; int bad; uint64_t until; } bans[16];
+    /* The key HELLOs need now (cfg.key until psnr_host_new_key), the wrong ones since it was set, and whether it is
+     * spent. A new one comes from another thread through key_next and key_pending. */
+    uint8_t   key_now[PSNR_HOST_KEY_LEN], key_next[PSNR_HOST_KEY_LEN];
+    int       key_bad;
+    atomic_int key_spent, key_pending;
     volatile int stop;
     int       players;            /* read by psnr_host_players */
 #ifdef _WIN32
@@ -128,6 +156,16 @@ static uint64_t ph_now(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static void ph_sleep_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
 #endif
 }
 
@@ -215,7 +253,7 @@ static int ph_loopback(const uint8_t ip[4]) { return ip[0] == 127; }
 static void ph_flush(ph_client* c)
 {
     while (c->tx.n) {
-        int k = (int)send(c->s, (const char*)c->tx.b, (int)c->tx.n, 0);
+        int k = (int)send(c->s, (const char*)c->tx.b, (int)c->tx.n, PH_SEND_FLAGS);
         if (k <= 0) {
             if (k < 0 && PH_WOULD_BLOCK()) return;
             c->closing = 2;   /* gone */
@@ -389,6 +427,12 @@ static int ph_banned(psnr_host* h, const uint8_t ip[4], int add_bad)
         }
         if (!h->bans[i].bad && free_slot < 0) free_slot = i;
     }
+    if (add_bad && free_slot < 0) {   /* full: the entry not ignored now with the fewest wrong keys makes way */
+        for (int i = 0; i < 16; i++) {
+            const int ignored = h->bans[i].until && now < h->bans[i].until;
+            if (!ignored && (free_slot < 0 || h->bans[i].bad < h->bans[free_slot].bad)) free_slot = i;
+        }
+    }
     if (add_bad && free_slot >= 0) {
         memcpy(h->bans[free_slot].ip, ip, 4);
         h->bans[free_slot].bad = 1;
@@ -397,13 +441,33 @@ static int ph_banned(psnr_host* h, const uint8_t ip[4], int add_bad)
     return 0;
 }
 
-static int ph_key_ok(const psnr_host* h, const uint8_t* blob, size_t n)
+static int ph_key_eq(const uint8_t* a, const uint8_t* b)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < PSNR_HOST_KEY_LEN; i++) d |= (uint8_t)(a[i] ^ b[i]);
+    return d == 0;
+}
+
+/* A HELLO's key: the one set now, unless it is spent. With own_key_local the key the server started with stays good
+ * from this PC, for the host's own game (it keeps the key it started with). */
+static int ph_key_ok(psnr_host* h, const uint8_t* blob, size_t n, const uint8_t ip[4])
 {
     if (!h->cfg.has_key) return 1;
     if (!blob || n != PSNR_HOST_KEY_LEN) return 0;
-    uint8_t d = 0;
-    for (size_t i = 0; i < n; i++) d |= (uint8_t)(blob[i] ^ h->cfg.key[i]);
-    return d == 0;
+    if (h->cfg.own_key_local && ph_loopback(ip) && ph_key_eq(blob, h->cfg.key)) return 1;
+    if (atomic_load(&h->key_spent)) return 0;
+    return ph_key_eq(blob, h->key_now);
+}
+
+/* A new key from psnr_host_new_key, at the top of each round of the server's loop: the wrong keys count again. */
+static void ph_take_key(psnr_host* h)
+{
+    if (!atomic_load(&h->key_pending)) return;
+    memcpy(h->key_now, h->key_next, PSNR_HOST_KEY_LEN);
+    h->key_bad = 0;
+    atomic_store(&h->key_spent, 0);
+    atomic_store(&h->key_pending, 0);
+    printf("[psnr_host] a new key: HELLOs need it from now on\n");
 }
 
 static int ph_name_eq(const char* a, const char* b)
@@ -428,9 +492,17 @@ static void ph_hello(psnr_host* h, int ci, uint32_t req, ph_rd* r)
     size_t bn = 0;
     if (!r->err && r->n) blob = ph_rblob(r, &bn);
     if (r->err || !comm[0]) { ph_reply_err(c, req, PSNR_E_BAD_REQUEST); return; }
-    if (!ph_key_ok(h, blob, bn)) {
+    if (!ph_key_ok(h, blob, bn, c->ip)) {
         ph_banned(h, c->ip, 1);
-        printf("[psnr_host] a HELLO with a wrong key was turned away\n");
+        if (!atomic_load(&h->key_spent)) {
+            if (++h->key_bad >= PH_KEY_TRIES) {
+                atomic_store(&h->key_spent, 1);
+                printf("[psnr_host] %d wrong keys: this key lets no one else in until there is a new one\n",
+                       PH_KEY_TRIES);
+            } else if (h->key_bad <= 5) {   /* (a few lines, not one per guess) */
+                printf("[psnr_host] a HELLO with a wrong key was turned away\n");
+            }
+        }
         ph_reply_err(c, req, PSNR_E_REFUSED);
         c->closing = 1;
         return;
@@ -794,10 +866,12 @@ static void ph_accept(psnr_host* h)
     if (s == PH_BAD) return;
     uint8_t ip[4];
     memcpy(ip, &a.sin_addr, 4);
-    int ci = -1;
-    for (int i = 0; i < PH_CLIENTS && ci < 0; i++)
-        if (h->cl[i].s == PH_BAD) ci = i;
-    if (ci < 0 || ph_banned(h, ip, 0)) { ph_close(s); return; }
+    int ci = -1, early = 0;
+    for (int i = 0; i < PH_CLIENTS; i++) {
+        if (h->cl[i].s == PH_BAD) { if (ci < 0) ci = i; }
+        else if (!h->cl[i].hello && !h->cl[i].closing && !memcmp(h->cl[i].ip, ip, 4)) early++;   /* still to say it */
+    }
+    if (ci < 0 || early >= PH_EARLY_PER_IP || ph_banned(h, ip, 0)) { ph_close(s); return; }
     ph_client* c = &h->cl[ci];
     memset(c, 0, sizeof *c);
     c->s = s;
@@ -805,9 +879,12 @@ static void ph_accept(psnr_host* h)
     memcpy(c->ip, ip, 4);
     n = (ph_socklen)sizeof a;
     if (getsockname(s, (struct sockaddr*)&a, &n) == 0) memcpy(c->via, &a.sin_addr, 4);
-    c->last_rx = ph_now();
+    c->last_rx = c->born = ph_now();
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+#ifdef SO_NOSIGPIPE
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
     ph_nonblock(s);
 }
 
@@ -846,6 +923,7 @@ static void* ph_main(void* arg)
     int who[2 + PH_CLIENTS];
     uint8_t pkt[2048];
     while (!h->stop) {
+        ph_take_key(h);
         int n = 0;
         fds[n].fd = h->lis; fds[n].events = POLLIN; fds[n].revents = 0; who[n++] = -1;
         fds[n].fd = h->udp; fds[n].events = POLLIN; fds[n].revents = 0; who[n++] = -2;
@@ -879,7 +957,9 @@ static void* ph_main(void* arg)
         for (int i = 0; i < PH_CLIENTS; i++) {
             ph_client* c = &h->cl[i];
             if (c->s == PH_BAD) continue;
-            if (c->closing == 2 || (c->closing == 1 && !c->tx.n) || now - c->last_rx > PH_TIMEOUT_MS) ph_drop(h, i);
+            if (c->closing == 2 || (c->closing == 1 && !c->tx.n) || now - c->last_rx > PH_TIMEOUT_MS ||
+                (!c->hello && now - c->born > PH_HELLO_MS))
+                ph_drop(h, i);
         }
     }
     return 0;
@@ -895,6 +975,9 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
     psnr_host* h = (psnr_host*)calloc(1, sizeof *h);
     if (!h) return NULL;
     h->cfg = *cfg;
+    memcpy(h->key_now, cfg->key, PSNR_HOST_KEY_LEN);
+    atomic_init(&h->key_spent, 0);
+    atomic_init(&h->key_pending, 0);
     h->lis = h->udp = PH_BAD;
     for (int i = 0; i < PH_CLIENTS; i++) h->cl[i].s = PH_BAD;
     h->rng = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)h;
@@ -963,6 +1046,21 @@ uint16_t psnr_host_port(const psnr_host* h)
 int psnr_host_players(psnr_host* h)
 {
     return h ? h->players : 0;
+}
+
+void psnr_host_new_key(psnr_host* h, const uint8_t key[PSNR_HOST_KEY_LEN])
+{
+    if (!h || !key) return;
+    for (int i = 0; i < 200 && atomic_load(&h->key_pending); i++) ph_sleep_ms(10);   /* (one before it, still due) */
+    memcpy(h->key_next, key, PSNR_HOST_KEY_LEN);
+    atomic_store(&h->key_pending, 1);
+    /* the server's loop takes it within a round (100 ms at most): then key_spent reads as the new key's */
+    for (int i = 0; i < 200 && atomic_load(&h->key_pending); i++) ph_sleep_ms(10);
+}
+
+int psnr_host_key_spent(psnr_host* h)
+{
+    return h ? atomic_load(&h->key_spent) : 0;
 }
 
 void psnr_host_stop(psnr_host* h)
