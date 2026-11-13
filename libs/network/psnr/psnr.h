@@ -103,6 +103,8 @@ void psnr_local_addr(const psnr_client* c, uint8_t ip[4]);
 void psnr_probe_packet(const psnr_client* c, uint8_t out[PSNR_UDP_PROBE_LEN]);
 void psnr_punch_packet(const psnr_client* c, uint8_t out[PSNR_UDP_PUNCH_LEN]);
 int  psnr_is_control(const void* buf, size_t len);
+/* 1 if buf is a peer's PUNCH; fills the psnr user id it carries. */
+int  psnr_punch_user(const void* buf, size_t len, uint32_t* user);
 /* 1 if buf is a probe reply; fills the public endpoint the server saw. */
 int  psnr_probe_reply(const void* buf, size_t len, uint8_t ip[4], uint16_t* port);
 

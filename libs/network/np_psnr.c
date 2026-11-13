@@ -32,6 +32,7 @@ extern const char* np_fake_username(void);
 #define PENDING_MAX 64
 
 static psnr_client* s_client;
+static uint32_t     s_conn;      /* which connection s_client is: one more at each dial that connects (LOCK) */
 static uint32_t     s_user_id;   /* ours, from HELLO: our own member entry needs no punch */
 static int          s_tried;
 static char         s_comm_id[16];   /* the connection's, for a redial */
@@ -153,6 +154,14 @@ int np_psnr_connected(void)
     return s_client != NULL;
 }
 
+uint32_t np_psnr_connection(void)
+{
+    LOCK();
+    const uint32_t n = s_client ? s_conn : 0;
+    UNLOCK();
+    return n;
+}
+
 /* PSNR_SERVER as host and port (36100 when it names none). */
 static void server_addr(char host[256], uint16_t* port)
 {
@@ -227,7 +236,10 @@ int np_psnr_connect(const char* comm_id)
     int signed_in = 0, err = 0;
     s_client = dial(comm_id, host, port, &user_id, ip, &signed_in, &err);
     s_user_id = user_id;
-    if (s_client) snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+    if (s_client) {
+        snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+        s_conn++;
+    }
     UNLOCK();
     /* A HELLO with no session because the sign-in itself failed says nothing
      * more: the sign-in has given its own reason (a ban, maintenance), which
@@ -298,15 +310,28 @@ static int      s_probed;
 static uint64_t s_next_probe;
 
 /* Everyone Matching2 told us about. relay_stream comes from psnr's ROUTE
- * pushes; relay_udp is ours to decide: punched, never heard from directly. */
+ * pushes; relay_udp is ours to decide: punched, never heard from directly.
+ * seen_port: the port the peer's datagrams really come from, when its router
+ * sends from another port than the one psnr saw (a strict router gives each
+ * destination a port of its own). Learned from its punches, which carry its
+ * user id; 0 while the port psnr gave is the one. The title keeps the address
+ * psnr gave: datagrams from seen_port reach it as from `port`, and what it
+ * sends to `port` goes to seen_port. */
 static struct peer {
     uint32_t user;
     uint8_t  ip[4];
-    uint16_t port;
+    uint16_t port, seen_port;
     int      punches_left;
     uint64_t next_punch, punched_at, heard_at;
     int      relay_stream, relay_udp;
+    int      said_silent;   /* "no answer" logged */
 } s_peers[MAX_PEERS];
+
+/* Punches from members we did not know yet: Matching2 can tell us about a
+ * member after its first punches arrive. np_psnr_punch looks here. */
+#define EARLY_MAX    8
+#define EARLY_MS     10000
+static struct { uint32_t user; uint8_t ip[4]; uint16_t port; uint64_t at; } s_early[EARLY_MAX];
 
 static uint64_t nat_now_ms(void)
 {
@@ -333,6 +358,34 @@ static struct peer* peer_at(const uint8_t ip[4], uint16_t port)
         if (s_peers[i].user && s_peers[i].port == port && !memcmp(s_peers[i].ip, ip, 4))
             return &s_peers[i];
     return NULL;
+}
+
+/* The member a datagram from ip:port is from: at the port psnr gave, or at the
+ * one its punches showed (seen_port). */
+static struct peer* peer_from(const uint8_t ip[4], uint16_t port)
+{
+    struct peer* p = peer_at(ip, port);
+    if (p || !port) return p;
+    for (int i = 0; i < MAX_PEERS; i++)
+        if (s_peers[i].user && s_peers[i].seen_port == port && !memcmp(s_peers[i].ip, ip, 4))
+            return &s_peers[i];
+    return NULL;
+}
+
+/* A punch from `port` of the member's own address names it: it answers from
+ * there. Taken only while nothing came from it yet, so a stranger can't move
+ * a member that works. Then punch that port back at once, which opens our
+ * router toward it too. Callers hold LOCK. */
+static int learn_port(struct peer* p, const uint8_t ip[4], uint16_t port, uint64_t now)
+{
+    if (!p || p->heard_at || port == p->port || memcmp(p->ip, ip, 4) != 0) return 0;
+    p->seen_port = port;
+    p->heard_at = now;
+    p->punches_left = PUNCHES;
+    p->next_punch = 0;
+    printf("[psnr] user %u answers from port %u, not %u (its router changes ports): using %u\n",
+           p->user, port, p->port, port);
+    return 1;
 }
 
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn)
@@ -397,8 +450,11 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
         /* With psnr, P2P traffic comes from the room's members only. */
         const int rooms = np_psnr_enabled();
         LOCK();
-        struct peer* p = peer_at(from_ip, *from_port);
-        if (p) p->heard_at = nat_now_ms();   /* the direct path works */
+        struct peer* p = peer_from(from_ip, *from_port);
+        if (p) {
+            p->heard_at = nat_now_ms();   /* the direct path works */
+            *from_port = p->port;         /* (from seen_port: the title knows the peer at psnr's port) */
+        }
         const int member = p || peer_ip_known(from_ip);
         UNLOCK();
         if (rooms && !member) {
@@ -438,9 +494,27 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
             printf("[psnr] P2P socket seen at %u.%u.%u.%u:%u\n", ip[0], ip[1], ip[2], ip[3], port);
         }
     } else {   /* a punch */
+        uint32_t user = 0;
+        const uint64_t now = nat_now_ms();
         LOCK();
-        struct peer* p = peer_at(from_ip, *from_port);
-        if (p) p->heard_at = nat_now_ms();
+        struct peer* p = peer_from(from_ip, *from_port);
+        if (p) {
+            p->heard_at = now;
+        } else if (psnr_punch_user(buf, *len, &user) && user && user != s_user_id) {
+            p = peer_by_user(user);
+            if (p) {
+                if (!learn_port(p, from_ip, *from_port, now) && !memcmp(p->ip, from_ip, 4))
+                    dropped("a punch from another port of a member that already answered", from_ip, *from_port);
+            } else {   /* a member Matching2 hasn't told us about yet: kept for np_psnr_punch */
+                int k = 0;   /* its own slot, else the oldest */
+                for (int i = 1; i < EARLY_MAX && s_early[k].user != user; i++)
+                    if (s_early[i].user == user || s_early[i].at < s_early[k].at) k = i;
+                s_early[k].user = user;
+                memcpy(s_early[k].ip, from_ip, 4);
+                s_early[k].port = *from_port;
+                s_early[k].at = now;
+            }
+        }
         UNLOCK();
     }
     return 1;
@@ -468,6 +542,15 @@ void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
             p->punches_left = PUNCHES;
             p->next_punch = 0;
         }
+        /* Its punches may have come before Matching2 named it. */
+        const uint64_t now = nat_now_ms();
+        for (int i = 0; i < EARLY_MAX; i++) {
+            if (s_early[i].user != user) continue;
+            if (now - s_early[i].at < EARLY_MS && !learn_port(p, s_early[i].ip, s_early[i].port, now) &&
+                s_early[i].port == p->port && !memcmp(s_early[i].ip, p->ip, 4))
+                p->heard_at = now;   /* (from the port psnr gave: the direct path works) */
+            memset(&s_early[i], 0, sizeof(s_early[i]));
+        }
     }
     UNLOCK();
 }
@@ -475,12 +558,17 @@ void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
 int np_psnr_p2p_route(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
 {
     uint8_t stack[1536], *pkt = stack, sip[4];
-    uint16_t sport;
+    uint16_t sport, seen = 0;
     uint32_t to = 0;
     LOCK();
     struct peer* p = peer_at(ip, port);
     if (p && p->relay_udp) to = p->user;
+    else if (p) seen = p->seen_port;
     UNLOCK();
+    if (seen && s_p2p_send) {   /* the peer's router answers from another port: send there */
+        s_p2p_send(buf, len, ip, seen);
+        return 1;
+    }
     if (!to || !s_client || !s_p2p_send) return 0;
     if (len + 17 > sizeof(stack) && !(pkt = (uint8_t*)malloc(len + 17))) return 0;
     size_t n = psnr_relay_wrap(s_client, to, buf, len, pkt, len + 17);
@@ -576,16 +664,22 @@ static void nat_tick(void)
         if (!p->user) continue;
         if (p->punches_left && now >= p->next_punch) {
             psnr_punch_packet(s_client, pkt);
-            s_p2p_send(pkt, PSNR_UDP_PUNCH_LEN, p->ip, p->port);
+            s_p2p_send(pkt, PSNR_UDP_PUNCH_LEN, p->ip, p->seen_port ? p->seen_port : p->port);
             if (!p->punched_at) p->punched_at = now;
             p->punches_left--;
             p->next_punch = now + PUNCH_MS;
         }
-        if (!p->relay_udp && !p->heard_at && p->punched_at && now - p->punched_at > RELAY_AFTER &&
-            psnr_relay_available(s_client)) {
-            p->relay_udp = 1;
-            printf("[psnr] nothing direct from %u.%u.%u.%u:%u; its datagrams go through the relay\n",
-                   p->ip[0], p->ip[1], p->ip[2], p->ip[3], p->port);
+        if (!p->relay_udp && !p->heard_at && p->punched_at && now - p->punched_at > RELAY_AFTER) {
+            if (psnr_relay_available(s_client)) {
+                p->relay_udp = 1;
+                printf("[psnr] nothing direct from %u.%u.%u.%u:%u; its datagrams go through the relay\n",
+                       p->ip[0], p->ip[1], p->ip[2], p->ip[3], p->port);
+            } else if (!p->said_silent) {   /* (no relay: the session will end; say why, once) */
+                p->said_silent = 1;
+                printf("[psnr] nothing direct from user %u at %u.%u.%u.%u:%u after our punches, and no relay: "
+                       "no way through between the two routers\n",
+                       p->user, p->ip[0], p->ip[1], p->ip[2], p->ip[3], p->port);
+            }
         }
     }
     UNLOCK();
@@ -647,6 +741,7 @@ static void* redial_main(void* arg)
             if (!s_client) {
                 s_client = c;
                 s_user_id = user;
+                s_conn++;
                 c = NULL;
             }
             UNLOCK();
