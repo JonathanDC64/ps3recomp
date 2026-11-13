@@ -123,6 +123,7 @@ static void env(const char* k, const char* v)
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);   /* sysNet's lines reach a CI log even when an assert aborts */
     env("PS3_NET_ONLINE", "1");   /* the host sockets are the online path */
     env("PS3_NET_HOSTS", "");
     vm_base = (uint8_t*)calloc(1, 1u << 20);
@@ -318,7 +319,14 @@ int main(void)
     vm_write32(LEN, 16);
     assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == 36659);
     vm_write16(ADDR_A + 8, 36658);               /* vport = the peer's P2P port */
-    assert(C3("connect", out, ADDR_A, 16) == 0);
+    int32_t cr = C3("connect", out, ADDR_A, 16);
+    if (cr != 0) {   /* fails now and then on CI's Linux runners: say why */
+        vm_write32(LEN, 16);
+        C3("getsockname", l1, ADDR_B, LEN);
+        fprintf(stderr, "P2P stream connect: 0x%08X, errno %u; the listener is on port %u\n", (uint32_t)cr,
+                errno_cell(), vm_read16(ADDR_B + 2));
+    }
+    assert(cr == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
     assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
