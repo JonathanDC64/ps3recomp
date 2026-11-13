@@ -37,6 +37,7 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>   /* nanosleep */
 
 #ifdef PS3RECOMP_UPNP
 #  ifdef __clang__
@@ -54,6 +55,8 @@ static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static char s_err[192];   /* the last failure's reason (LOCK) */
 static char s_lan[64];    /* this PC's address toward the router (LOCK) */
 static int  s_lease = -1;
+static volatile int s_mapped;      /* something of ours is mapped: read without the lock (net_upnp_unmap_bounded) */
+static volatile int s_unmap_done;  /* net_upnp_unmap_bounded's thread finished */
 
 static UPNP_TLS char t_err[sizeof(s_err)];
 static UPNP_TLS char t_lan[sizeof(s_lan)];
@@ -139,6 +142,8 @@ int net_upnp_map(uint16_t port, const char* description, int timeout_ms, char ex
 }
 
 void net_upnp_unmap(void) {}
+
+void net_upnp_unmap_bounded(int ms) { (void)ms; }
 
 #else   /* PS3RECOMP_UPNP */
 
@@ -227,14 +232,16 @@ static int map_one(const char* ctl, const char* st, const char* proto, uint16_t 
         here = 1;   /* ours, from this run or an earlier one: renew it */
     }
 
-    /* A permanent lease first; a router that refuses one for any reason that isn't about the port gets 3600 s.
-     * If it then says it takes only permanent leases (725), the first refusal is the real one. */
-    int l = 0;
-    r = UPNP_AddPortMapping(ctl, st, eport, eport, lan, desc, proto, NULL, "0");
-    if (r > 0 && r != 606 && r != 718 && r != 725 && r != 728 && r != 729) {
-        int r2 = UPNP_AddPortMapping(ctl, st, eport, eport, lan, desc, proto, NULL, "3600");
-        if (r2 == UPNPCOMMAND_SUCCESS) { r = 0; l = 3600; }
-        else if (r2 != 725) r = r2;
+    /* A 1-hour lease first: the caller renews it by mapping again, so a forward a crash left behind, or one no longer
+     * renewed, ends by itself within the hour. A router that takes only permanent leases (725), or refuses the lease
+     * for another reason that isn't about the port, gets a permanent one (net_upnp_unmap removes it). If that is
+     * refused too, the first refusal is the real one, unless it was 725. */
+    int l = 3600;
+    r = UPNP_AddPortMapping(ctl, st, eport, eport, lan, desc, proto, NULL, "3600");
+    if (r > 0 && r != 606 && r != 718 && r != 728 && r != 729) {
+        int r2 = UPNP_AddPortMapping(ctl, st, eport, eport, lan, desc, proto, NULL, "0");
+        if (r2 == UPNPCOMMAND_SUCCESS) { r = 0; l = 0; }
+        else if (r == 725) r = r2;
     }
     if (r == UPNPCOMMAND_SUCCESS) {
         *owned = 1;
@@ -278,6 +285,7 @@ static void unmap_locked(void)
     s_ctl = NULL;
     s_port = 0;
     s_lease = -1;
+    s_mapped = 0;
 }
 
 void net_upnp_unmap(void)
@@ -285,6 +293,48 @@ void net_upnp_unmap(void)
     LOCK();
     unmap_locked();
     UNLOCK();
+}
+
+#ifdef _WIN32
+static DWORD WINAPI unmap_thread(LPVOID p)
+{
+    (void)p;
+    net_upnp_unmap();
+    s_unmap_done = 1;
+    return 0;
+}
+#else
+static void* unmap_thread(void* p)
+{
+    (void)p;
+    net_upnp_unmap();
+    s_unmap_done = 1;
+    return NULL;
+}
+#endif
+
+void net_upnp_unmap_bounded(int ms)
+{
+    if (!s_mapped) return;
+    s_unmap_done = 0;
+    int started = 0;
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, unmap_thread, NULL, 0, NULL);
+    if (th) { CloseHandle(th); started = 1; }
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, unmap_thread, NULL) == 0) { pthread_detach(th); started = 1; }
+#endif
+    if (!started) return;
+    for (int t = 0; t < ms && !s_unmap_done; t += 10) {
+#ifdef _WIN32
+        Sleep(10);
+#else
+        struct timespec ts = { 0, 10000000L };
+        nanosleep(&ts, NULL);
+#endif
+    }
+    if (!s_unmap_done) printf("[upnp] the router didn't answer the removal within %d ms: its lease ends it\n", ms);
 }
 
 /* The router's control URL and service type, or a NET_UPNP_ERR_* code. (LOCK) */
@@ -406,6 +456,7 @@ int net_upnp_map(uint16_t port, const char* description, int timeout_ms, char ex
         s_added[i] = owned[i];
         if (lease[i] > 0 && (s_lease == 0 || lease[i] < s_lease)) s_lease = lease[i];
     }
+    s_mapped = s_added[0] || s_added[1];
     free(s_ctl);
     s_ctl = (char*)malloc(strlen(ctl) + 1);
     if (s_ctl) memcpy(s_ctl, ctl, strlen(ctl) + 1);

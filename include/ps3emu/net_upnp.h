@@ -28,14 +28,19 @@ extern "C" {
  * port on this PC's LAN address (net_upnp_lan_ip). description (NULL: "ps3recomp") names the mappings in the
  * router's list. A mapping for the port that already points at this PC and port counts as done; one with our
  * description is renewed, and removed by net_upnp_unmap. A mapping to another device fails (NET_UPNP_ERR_TAKEN).
- * Permanent leases first; a router that won't take one gets 3600 s (net_upnp_lease): call again within that time
- * to renew. A different port than the last call's: the old mappings go first. If only one protocol maps, the other
- * is undone. NET_UPNP_OK with the public address in ext_ip_out, or a NET_UPNP_ERR_* code with the reason in
- * net_upnp_last_error. */
+ * A 3600 s lease first (net_upnp_lease): call again within that time to renew it, so a forward nobody renews, or
+ * removes after a crash, ends by itself. A router that refuses leases gets a permanent mapping. A different port
+ * than the last call's: the old mappings go first. If only one protocol maps, the other is undone. NET_UPNP_OK with
+ * the public address in ext_ip_out, or a NET_UPNP_ERR_* code with the reason in net_upnp_last_error. */
 int net_upnp_map(uint16_t port, const char* description, int timeout_ms, char ext_ip_out[16]);
 
 /* Remove the mappings this process added (both protocols), ignoring errors. */
 void net_upnp_unmap(void);
+
+/* net_upnp_unmap, waiting at most ms for it (it goes on a thread of its own), for a process about to end at once
+ * (TerminateProcess: no atexit handlers). Returns at once if nothing is mapped. A forward the router didn't remove in
+ * time ends with its lease. */
+void net_upnp_unmap_bounded(int ms);
 
 /* A short plain-English reason for the last failure ("" after a success). The calling thread's copy. */
 const char* net_upnp_last_error(void);

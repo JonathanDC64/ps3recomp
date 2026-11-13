@@ -102,6 +102,7 @@ void     ps3_title_window_only_init(void) {}
 #include <stdlib.h>
 #include <signal.h>
 #include "ps3emu/ps3_knob.h"
+#include "ps3emu/net_upnp.h"   /* net_upnp_unmap_bounded: a router forward, removed at the window's close */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -832,6 +833,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * locks the DLL-detach path would wait on. */
             if (rsx_pump_messages() != 0) {
                 printf("[boot] window closed -- exiting%c", 10);
+                /* A router forward the game asked for (net_upnp, a hosted game's port):
+                 * removed now, as TerminateProcess runs no atexit handlers. A router that
+                 * doesn't answer within 1.5 s keeps it until its lease ends. Nothing to do
+                 * without one. */
+                net_upnp_unmap_bounded(1500);
                 fflush(stdout); fflush(stderr);
                 TerminateProcess(GetCurrentProcess(), 0);
             }

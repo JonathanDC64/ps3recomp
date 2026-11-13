@@ -1,8 +1,9 @@
 /*
  * test_net_upnp - UPnP port mapping (net_upnp.c) without needing a router: the address check, the argument and
  * offline gates, and one real search with a short timeout. With no UPnP router on the network (CI) the search must
- * say so; where one answers, the outcome must be a documented code with a reason, a second call must give the same
- * answer (the renewal), and whatever was mapped is removed again. Built without -DPS3RECOMP_UPNP it checks the stub.
+ * say so; where one answers, the outcome must be a documented code with a reason, the lease 3600 s (or permanent,
+ * for a router that refuses leases), a second call must give the same answer (the renewal), and whatever was mapped
+ * is removed again, the second time by net_upnp_unmap_bounded. Built without -DPS3RECOMP_UPNP it checks the stub.
  *
  *   clang-cl /I include /I third_party/miniupnpc/include /DPS3RECOMP_UPNP /DMINIUPNP_STATICLIB /Fe:test_net_upnp.exe libs/network/tests/test_net_upnp.c miniupnpc.lib ws2_32.lib iphlpapi.lib
  *   cc -std=gnu17 -I include -I third_party/miniupnpc/include -DPS3RECOMP_UPNP -DMINIUPNP_STATICLIB -o test_net_upnp libs/network/tests/test_net_upnp.c libminiupnpc.a -lpthread
@@ -19,10 +20,12 @@
 
 #define TEST_PORT 47923   /* unlikely to be in use */
 
+#ifdef PS3RECOMP_UPNP
 static int documented(int r)
 {
     return r == NET_UPNP_OK || (r <= NET_UPNP_ERR_ARGS && r >= NET_UPNP_ERR_PRIVATE_IP);
 }
+#endif
 
 int main(void)
 {
@@ -57,6 +60,7 @@ int main(void)
 
     assert(net_upnp_lease() == -1);
     net_upnp_unmap();   /* nothing mapped: nothing to do */
+    net_upnp_unmap_bounded(1000);   /* likewise, at once */
 
     char ext[16] = "";
 #ifndef PS3RECOMP_UPNP
@@ -76,13 +80,19 @@ int main(void)
     if (r == NET_UPNP_OK || r == NET_UPNP_ERR_PRIVATE_IP) {
         /* Mapped: the address and the lease are known, the reason says why it isn't public (or nothing). */
         assert(net_upnp_is_private_ipv4(ext) == (r == NET_UPNP_ERR_PRIVATE_IP));
-        assert(*net_upnp_lan_ip() && net_upnp_lease() >= 0);
+        assert(*net_upnp_lan_ip() && (net_upnp_lease() == 3600 || net_upnp_lease() == 0));
+        printf("test_net_upnp: lease %d s (0: the router takes only permanent ones)\n", net_upnp_lease());
         assert((r == NET_UPNP_OK) == !*net_upnp_last_error());
         /* Again for the same port: it is ours already, so the same answer (a renewal). */
         char ext2[16] = "";
         assert(net_upnp_map(TEST_PORT, "ps3recomp test", 300, ext2) == r && !strcmp(ext, ext2));
         net_upnp_unmap();
         assert(net_upnp_lease() == -1);
+        /* Mapped again, then removed the way a closing window does: within the time given. */
+        assert(net_upnp_map(TEST_PORT, "ps3recomp test", 300, ext2) == r);
+        assert(s_mapped);
+        net_upnp_unmap_bounded(5000);
+        assert(s_unmap_done && !s_mapped && net_upnp_lease() == -1);
     } else {
         /* Not mapped: a reason, and nothing left to remove. */
         assert(*net_upnp_last_error() && net_upnp_lease() == -1 && !ext[0]);
