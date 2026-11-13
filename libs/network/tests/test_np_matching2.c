@@ -7,7 +7,9 @@
  * Simpsons Arcade or could silently: GetEventData relocating the pointers in
  * a response into the title's buffer, attributes packed for psnr and unpacked
  * back, and the RoomDataInternal / member structs built from a ROOM_JOINED.
- * Also: a LeaveRoom after the room's connection was lost is answered at once.
+ * Also: a LeaveRoom after the room's connection was lost is answered at once,
+ * and so is one of a room it was kicked out of, which leaves the room it is
+ * in now as it is.
  *
  *   clang-cl /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_np_matching2 libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c
@@ -197,6 +199,51 @@ int main(void)
     s_ctx[ctx].room.conn = 2;
     assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
     assert(s_type == PSNR_LEAVE_ROOM && s_ctx[ctx].room.in);
+    reply(PSNR_OK, NULL, 0);
+    assert(!s_ctx[ctx].room.in && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+
+    /* Kicked out of room 9: the room is gone here, and the title is told. */
+    s_ctx[ctx].room.in = 1;
+    s_ctx[ctx].room.id = 9;
+    w = psnr_put64(r, 9);
+    psnr_msg kicked = { PSNR_KICKED, 0, r, (u32)(w - r) };
+    s_push(&kicked);
+    assert(!s_ctx[ctx].room.in && s_cb_opd == 0x1100 && s_cb[2] == 0x1103);   /* Kickedout */
+    /* It joins room 10. Then it leaves room 9, as Demon's Souls does after a kick (again every 15 s): out of
+     * it already, answered at once with nothing sent, and room 10 stays. */
+    s_ctx[ctx].room.in = 1;
+    s_ctx[ctx].room.id = 10;
+    vm_write64(REQ, 9);
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && s_ctx[ctx].room.in && s_ctx[ctx].room.id == 10);
+    assert(s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+    /* A room it was never in: asked of the server, which says no; room 10 still stays. */
+    vm_write64(REQ, 7);
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 7);
+    u8 not_in[4];
+    psnr_put32(not_in, PSNR_E_NOT_IN_ROOM);
+    reply(PSNR_ERROR, not_in, 4);
+    assert(s_cb[2] == 0x0103 && (s32)s_cb[4] == (s32)SCE_NP_MATCHING2_SERVER_ERROR_BAD_REQUEST);
+    assert(s_ctx[ctx].room.in && s_ctx[ctx].room.id == 10);
+    /* Room 10 itself: asked of the server, and gone once it says yes. */
+    vm_write64(REQ, 10);
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 10);
+    reply(PSNR_OK, NULL, 0);
+    assert(!s_ctx[ctx].room.in && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 10);
+    /* Back in room 9 (joined again): a leave of it is the server's to answer again. */
+    s_ctx[ctx].room.in = 1;
+    s_ctx[ctx].room.id = 9;
+    vm_write64(REQ, 9);
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 9 && s_ctx[ctx].room.in);
 
     printf("test_np_matching2: all passed\n");
     return 0;
