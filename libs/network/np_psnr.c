@@ -758,6 +758,15 @@ static void* redial_main(void* arg)
             printf("[psnr] %s:%u refused the HELLO (error %d) -- NP stays offline\n", host, port, err);
             break;
         }
+        /* A hosted game's room server (psnr_host.c) turns away a wrong key: the host's game started again, with a
+         * new key, so this one never comes right. Trying on would only get this address ignored for a while (its
+         * wrong keys are counted), with no word to the player. */
+        if (err == PSNR_E_REFUSED && getenv("PSNR_KEY")) {
+            printf("[psnr] %s:%u no longer takes this invite code (the host's game has a new one) -- NP stays "
+                   "offline\n", host, port);
+            ps3_net_signin_post_notice("The host's game did not accept this invite code. Ask the host for it again.");
+            break;
+        }
         if (tries == 1) {
             if (err) printf("[psnr] %s:%u turned the HELLO away for now (error %d); trying again now and then\n",
                             host, port, err);
