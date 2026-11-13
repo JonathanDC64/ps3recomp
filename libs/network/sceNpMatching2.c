@@ -166,6 +166,7 @@ typedef struct {
     u32 sig_cb, sig_arg;
     u32 def_cb, def_arg;   /* default request opt param */
     m2_room room;
+    u64 kicked_from;       /* the room this member was last kicked out of (0: none) */
 } m2_ctx;
 
 static int    s_init;
@@ -225,6 +226,8 @@ typedef struct {
     /* SetRoomDataInternal: what changed, for the owner's own update event */
     u32 prev_flags;
     u8  flags_changed, bins_changed;
+    /* LeaveRoom: the room it asked to leave */
+    u64 room;
 } m2_op;
 
 static void answer(const m2_op* op, s32 err, rb_t* img)
@@ -724,6 +727,7 @@ static void on_push(const psnr_msg* m)
         rb_t img = {0};
         u32 o = rb_alloc(&img, 28, 4);
         rb_8(&img, o, CAUSE_KICKOUT_ACTION);
+        c->kicked_from = room_id;
         room_gone(c);
         room_event(c, ROOM_EV_Kickedout, &img);
         break;
@@ -1180,8 +1184,12 @@ static void on_done(void* user, const psnr_msg* m)
     if (op->event == EV_LeaveRoom && c) {
         /* SceNpMatching2LeaveRoomResponse { u64 roomId } */
         u32 o = rb_alloc(&img, 8, 8);
-        rb_64(&img, o, c->room.id);
-        room_gone(c);
+        rb_64(&img, o, op->room);
+        /* Only the room it asked to leave. A leave of a room it isn't in (the
+         * server answers "not in the room") mustn't take down the room it is
+         * in now: its members' connections would go dead under the title. */
+        if (c->room.in && c->room.id == op->room)
+            room_gone(c);
     }
     answer(op, err, img.len ? &img : NULL);
     if (op->event == EV_SetRoomDataInternal && !err && c && c->room.in)
@@ -1226,9 +1234,32 @@ s32 sceNpMatching2LeaveRoom(u16 ctxId, u32 req, u32 opt, u32 reqId)
     }
     REQUIRE_STARTED(c, ctxId);
     if (!req) return (s32)SCE_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
+    const u64 room = vm_read64(req);
+    /* A room the server kicked this member out of: it is out already, so it is
+     * answered here, as left. Asked of the server it would fail ("not in the
+     * room"), and Demon's Souls answers a kick by leaving that room, again
+     * every 15 s until it is out, each time with a "session has ended" box;
+     * by then it may have joined another room, which stays as it is. */
+    if (room && room == c->kicked_from && !(c->room.in && c->room.id == room)) {
+        printf("[sceNpMatching2] room %llu: out of it already (kicked out)\n", (unsigned long long)room);
+        m2_op* op = op_new(c, ctxId, EV_LeaveRoom, opt, reqId);
+        rb_t img = {0};
+        u32 o = rb_alloc(&img, 8, 8);   /* SceNpMatching2LeaveRoomResponse { u64 roomId } */
+        rb_64(&img, o, room);
+        answer(op, 0, &img);
+        rb_free(&img);
+        free(op);
+        return CELL_OK;
+    }
     u8 body[8];
-    psnr_put64(body, vm_read64(req));
-    return send_simple(c, ctxId, EV_LeaveRoom, opt, reqId, PSNR_LEAVE_ROOM, body, 8);
+    psnr_put64(body, room);
+    m2_op* op = op_new(c, ctxId, EV_LeaveRoom, opt, reqId);
+    op->room = room;
+    if (!np_psnr_request(PSNR_LEAVE_ROOM, body, 8, on_done, op)) {
+        free(op);
+        return (s32)SCE_NP_MATCHING2_ERROR_NOT_CONNECTED;
+    }
+    return CELL_OK;
 }
 
 /* SceNpMatching2KickoutRoomMemberRequest { u64 roomId; u16 target; u8 blockKickFlag; ... } */
