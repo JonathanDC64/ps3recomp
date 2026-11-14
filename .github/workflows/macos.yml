@@ -216,6 +216,20 @@ jobs:
           clang -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_nat
 
+      # UPnP port mapping (net_upnp.c, with miniupnpc from third_party/miniupnpc
+      # and the definitions CMakeLists.txt gives it): the address check, the
+      # gates, and one short search, which finds no router here. Then the same
+      # test without UPnP built in (the stub).
+      - name: Run the UPnP test
+        run: |
+          mkdir -p /tmp/miniupnpc
+          (cd /tmp/miniupnpc && clang -std=gnu17 -O2 -w -c -DMINIUPNP_STATICLIB -DMINIUPNPC_SET_SOCKET_TIMEOUT -DMINIUPNPC_GET_SRC_ADDR -D_BSD_SOURCE -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -I "$GITHUB_WORKSPACE/third_party/miniupnpc/include" -I "$GITHUB_WORKSPACE/third_party/miniupnpc" "$GITHUB_WORKSPACE"/third_party/miniupnpc/src/*.c)
+          ar rcs /tmp/libminiupnpc.a /tmp/miniupnpc/*.o
+          clang -std=gnu17 -DPS3RECOMP_UPNP -DMINIUPNP_STATICLIB -I include -I third_party/miniupnpc/include -o /tmp/test_net_upnp libs/network/tests/test_net_upnp.c /tmp/libminiupnpc.a -lpthread
+          /tmp/test_net_upnp
+          clang -std=gnu17 -I include -o /tmp/test_net_upnp_off libs/network/tests/test_net_upnp.c
+          /tmp/test_net_upnp_off
+
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
       # source, on an SDAT the test makes with edat_decrypt.c's own AES.

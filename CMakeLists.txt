@@ -137,6 +137,39 @@ list(APPEND HLE_SOURCES ${MONOCYPHER_SOURCES})
 file(GLOB MBEDTLS_SOURCES CONFIGURE_DEPENDS "third_party/mbedtls/library/*.c")
 set_source_files_properties(${MBEDTLS_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${MBEDTLS_SOURCES})
+# UPnP port mapping on the player's router (libs/network/net_upnp.c, ps3emu/net_upnp.h): miniupnpc 2.3.3,
+# BSD-3-Clause (third_party/miniupnpc -- see its README.txt). Its sources and net_upnp.c get its headers and
+# definitions as source properties, so no other source's command line changes. Off: net_upnp.c builds alone and
+# says "UPnP not built in".
+option(PS3RECOMP_UPNP "Build UPnP port mapping (miniupnpc) into the runtime" ON)
+set(MINIUPNPC_SOURCES "")
+if(PS3RECOMP_UPNP)
+    file(GLOB MINIUPNPC_SOURCES CONFIGURE_DEPENDS "third_party/miniupnpc/src/*.c")
+    # Upstream's own definitions (its CMakeLists.txt): off Windows, socket timeouts, the source address of SSDP
+    # answers, and the feature macros. Windows keeps the SDK's _WIN32_WINNT (upstream sets XP's), so miniupnpc
+    # takes its Vista-and-later paths.
+    set(MINIUPNPC_DEFS MINIUPNP_STATICLIB)
+    if(NOT WIN32)
+        list(APPEND MINIUPNPC_DEFS MINIUPNPC_SET_SOCKET_TIMEOUT MINIUPNPC_GET_SRC_ADDR _BSD_SOURCE _DEFAULT_SOURCE)
+        if(APPLE)
+            list(APPEND MINIUPNPC_DEFS _DARWIN_C_SOURCE)
+        elseif(NOT CMAKE_SYSTEM_NAME MATCHES ".*BSD")
+            list(APPEND MINIUPNPC_DEFS _XOPEN_SOURCE=600)
+        endif()
+    endif()
+    set_source_files_properties(${MINIUPNPC_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-w"   # upstream code
+        COMPILE_DEFINITIONS "${MINIUPNPC_DEFS}"
+        # include/ for its headers; the folder itself for our miniupnpcstrings.h (see the README)
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnpc/include;${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnpc")
+    set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/network/net_upnp.c" PROPERTIES
+        COMPILE_DEFINITIONS "PS3RECOMP_UPNP;MINIUPNP_STATICLIB"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnpc/include")
+    list(APPEND HLE_SOURCES ${MINIUPNPC_SOURCES})
+    message(STATUS "  UPnP:         port mapping with miniupnpc 2.3.3 (third_party/miniupnpc)")
+else()
+    message(STATUS "  UPnP:         off (net_upnp.c says \"UPnP not built in\")")
+endif()
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
@@ -196,6 +229,11 @@ if(WIN32)
         bcrypt      # BCryptGenRandom for SSL RNG
         user32 gdi32  # cellOskDialog's host text-input window
     )
+    if(PS3RECOMP_UPNP)
+        # miniupnpc: GetAdaptersAddresses. net_upnp.c names it too (#pragma comment), for a host that links the
+        # runtime as an imported library.
+        target_link_libraries(ps3recomp_runtime PRIVATE iphlpapi)
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
@@ -680,6 +718,27 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_rsx_texture_override PRIVATE -UNDEBUG)
     endif()
     add_test(NAME rsx_texture_override COMMAND test_rsx_texture_override)
+    # UPnP port mapping (net_upnp.c, which the test includes) with no router needed: the address check, the
+    # gates, one short search. With PS3RECOMP_UPNP off it checks the stub.
+    add_executable(test_net_upnp libs/network/tests/test_net_upnp.c ${MINIUPNPC_SOURCES})
+    target_include_directories(test_net_upnp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(PS3RECOMP_UPNP)
+        target_compile_definitions(test_net_upnp PRIVATE PS3RECOMP_UPNP MINIUPNP_STATICLIB)
+        target_include_directories(test_net_upnp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniupnpc/include")
+    endif()
+    if(WIN32)
+        target_compile_definitions(test_net_upnp PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_link_libraries(test_net_upnp PRIVATE ws2_32 iphlpapi)
+    else()
+        target_link_libraries(test_net_upnp PRIVATE Threads::Threads)
+    endif()
+    if(MSVC)
+        target_compile_options(test_net_upnp PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_net_upnp PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME net_upnp COMMAND test_net_upnp)
+    set_tests_properties(net_upnp PROPERTIES TIMEOUT 120)
     # Event queues made and destroyed while host threads push to them (#311). It links the whole runtime, with
     # host_stubs.c for the loader's symbols, as test_rsx_synth does (Windows and Linux).
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")

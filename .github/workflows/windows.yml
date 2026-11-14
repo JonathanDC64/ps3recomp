@@ -291,6 +291,27 @@ jobs:
           .\test_np_nat.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # UPnP port mapping (net_upnp.c, with miniupnpc from third_party/miniupnpc
+      # as CMakeLists.txt builds it): the address check, the gates, and one
+      # short search, which finds no router here. Then the same test without
+      # UPnP built in (the stub).
+      - name: Run the UPnP test
+        if: ${{ !cancelled() }}
+        run: |
+          New-Item -ItemType Directory -Force miniupnpc_obj | Out-Null
+          clang-cl /nologo /c /O2 /W0 /D_CRT_SECURE_NO_WARNINGS /DMINIUPNP_STATICLIB /I third_party/miniupnpc/include /I third_party/miniupnpc /Fo:miniupnpc_obj\ (Get-ChildItem third_party/miniupnpc/src/*.c).FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          lib /nologo /out:miniupnpc.lib (Get-ChildItem miniupnpc_obj\*.obj).FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /DPS3RECOMP_UPNP /DMINIUPNP_STATICLIB /I include /I third_party/miniupnpc/include /Fe:test_net_upnp.exe libs/network/tests/test_net_upnp.c miniupnpc.lib ws2_32.lib iphlpapi.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_upnp.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_net_upnp_off.exe libs/network/tests/test_net_upnp.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_upnp_off.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # Where an EDAT/SDAT file's plaintext comes from: the player's decrypted
       # copy (PS3_EDAT_PLAIN), a cache folder (PS3_EDAT_CACHE) or beside the
       # source, on an SDAT the test makes with edat_decrypt.c's own AES.
