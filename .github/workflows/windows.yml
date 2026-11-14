@@ -261,6 +261,15 @@ jobs:
           .\test_np_matching2.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # The STUN client (net_stun.c): the request, and answers built in the test. No network.
+      - name: Run the STUN test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_net_stun.exe libs/network/tests/test_net_stun.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_net_stun.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # sceNpScore over psnr without a server: a range with no rows is the
       # server's not-found, so a title paging a board stops.
       - name: Run the score test
