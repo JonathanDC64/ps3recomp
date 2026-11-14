@@ -228,6 +228,24 @@ int main(void)
     assert(vm_read32((uint32_t)call("_sys_net_h_errno_loc", 0, 0, 0, 0, 0, 0)) == SYS_NET_HOST_NOT_FOUND);
     env("PS3_NET_HOSTS", "");
 
+    /* The P2P port held by another program: the title's bind fails (and says
+     * so), and the port opens on a later bind once it is free (below). */
+    {
+        host_socket_t other = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in o;
+        memset(&o, 0, sizeof(o));
+        o.sin_family = AF_INET;
+        o.sin_addr.s_addr = htonl(INADDR_ANY);
+        o.sin_port = htons(36658);
+        assert(bind(other, (struct sockaddr*)&o, sizeof(o)) == 0);
+        int32_t busy = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
+        put_sockaddr(ADDR_A, 0x0A000001u, 3658);
+        vm_write16(ADDR_A + 8, 1000);
+        assert(C3("bind", busy, ADDR_A, 16) < 0 && errno_cell() == SYS_NET_EADDRINUSE);
+        assert(C1("socketclose", busy) == 0);
+        host_closesocket(other);
+    }
+
     /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
      * socket lands on this instance's P2P port on every interface, so a peer
      * on loopback reaches it, and received addresses carry the vport back. */

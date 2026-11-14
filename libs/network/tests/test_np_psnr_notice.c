@@ -46,6 +46,7 @@ static volatile int s_tls;       /* this psnr speaks TLS (tls_test_server.h) */
 static volatile int s_tls_hellos;   /* TLS hellos it got while it didn't */
 static volatile int s_kick;      /* connections to drop right after their welcome */
 static volatile int s_welcomes;  /* HELLOs it welcomed */
+static volatile int s_hellos;    /* HELLOs it answered */
 
 static int c_recv(sock_t c, ps3_tls* t, uint8_t* p, int n)
 {
@@ -85,6 +86,7 @@ static void* psnr_main(void* arg)
         if (have >= 7) {
             uint8_t out[15];
             s_hello_len = psnr_get16(in + 1) - 4;
+            s_hellos++;
             memcpy(out + 3, in + 3, 4);   /* the request id */
             if (s_error) {
                 out[0] = PSNR_ERROR;
@@ -250,6 +252,47 @@ int main(void)
 #endif
         }
         assert(!np_psnr_connected());
+        env("PSNR_REDIAL", "");
+        env("PSNR_REDIAL_MS", "");
+    }
+
+    /* A hosted game (PSNR_KEY, psnr_host.h): the host's game closed and
+     * started again with a new key, and its room server turns this key away.
+     * The redial tries once, tells the player, and stops: an old key never
+     * comes right, and each try counts against this address there. */
+    {
+        env("PSNR_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        env("PSNR_REDIAL", "1");
+        env("PSNR_REDIAL_MS", "50");
+        s_kick = 1;
+        assert(hello(0) == 0 && s_hello_len == 64);   /* (the key went as the session blob) */
+        s_error = PSNR_E_REFUSED;   /* the host's new game, from here on */
+        const int hellos = s_hellos;
+        for (int i = 0; i < 500 && np_psnr_connected(); i++) {
+            np_psnr_pump();
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(!np_psnr_connected());
+        for (int i = 0; i < 500 && s_hellos == hellos; i++) {   /* the redial's try */
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+        }
+        assert(s_hellos == hellos + 1);
+#ifdef _WIN32
+        Sleep(1500);   /* (tries at 50, 100, 200, 400, 800 ms more if it went on) */
+#else
+        usleep(1500000);
+#endif
+        assert(s_hellos == hellos + 1 && !np_psnr_connected());
+        assert(ps3_net_signin_notice(notice, sizeof notice) && strstr(notice, "did not accept this invite code"));
+        env("PSNR_KEY", "");
         env("PSNR_REDIAL", "");
         env("PSNR_REDIAL_MS", "");
     }

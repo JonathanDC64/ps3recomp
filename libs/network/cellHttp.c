@@ -625,7 +625,17 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port   = htons((u16)t->port);
-    if (ps3_net_resolve(t->hostname, (uint8_t*)&addr.sin_addr) != 0) {
+    /* PS3_HTTP_LOCAL=<port>: every request goes to 127.0.0.1:<port> instead,
+     * whatever its host and port, with no sign-in session and no TLS: the
+     * title answers its own servers inside the process (a game one player
+     * hosts, with no outside server). The request itself is unchanged. */
+    const char* local_port = getenv("PS3_HTTP_LOCAL");
+    const int local = local_port && atoi(local_port) > 0 && atoi(local_port) < 65536;
+    if (local) {
+        addr.sin_addr.s_addr = htonl(0x7F000001u);
+        addr.sin_port = htons((u16)atoi(local_port));
+        printf("[cellHttp]   answered in this process (PS3_HTTP_LOCAL)\n");
+    } else if (ps3_net_resolve(t->hostname, (uint8_t*)&addr.sin_addr) != 0) {
         printf("[cellHttp]   could not resolve '%s'\n", t->hostname);
         if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
         return CELL_HTTP_ERROR_CONNECTION_FAILED;
@@ -634,7 +644,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     /* The sign-in's session (ps3emu/ps3_net_signin.h), for its server only;
      * taken before connecting, as signing in can take a moment. */
     char session[64];
-    int has_session = ps3_net_signin_server((const uint8_t*)&addr.sin_addr) &&
+    int has_session = !local && ps3_net_signin_server((const uint8_t*)&addr.sin_addr) &&
                       ps3_net_session(session, sizeof session, NULL);
 
     /* ---- Create socket and connect ---- */
@@ -662,7 +672,7 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     /* TLS to the sign-in server when PS3_NET_TLS says it speaks it
      * (ps3emu/ps3_tls.h); then nothing goes to it without. */
     ps3_tls* tls = NULL;
-    if (ps3_tls_enabled() && ps3_net_signin_server((const uint8_t*)&addr.sin_addr)) {
+    if (!local && ps3_tls_enabled() && ps3_net_signin_server((const uint8_t*)&addr.sin_addr)) {
         char name[256], why[256] = "no server name (PS3_NET_TLS, PS3_NET_SIGNIN)";
         if (ps3_tls_server_name(name, sizeof name) == 0)
             tls = ps3_tls_connect((intptr_t)sock, name, http_tls_ms(c->connect_timeout), why, sizeof why);

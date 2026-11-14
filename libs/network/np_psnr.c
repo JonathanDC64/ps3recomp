@@ -5,6 +5,7 @@
 #include "ps3emu/ps3_net.h"   /* ps3_net_online, ps3_net_locked_offline */
 #include "ps3emu/ps3_net_signin.h"
 #include "ps3emu/ps3_tls.h"
+#include "ps3emu/psnr_host.h"   /* psnr_app_send, psnr_app_on_message */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -170,6 +171,23 @@ static void server_addr(char host[256], uint16_t* port)
     if (colon) { *colon = 0; *port = (uint16_t)atoi(colon + 1); }
 }
 
+/* PSNR_KEY: a hosted game's key (ps3emu/psnr_host.h), 64 hex digits, sent as HELLO's session blob when
+ * there is no sign-in. 1 if set and well formed. */
+static int hosted_key(uint8_t key[32])
+{
+    const char* k = getenv("PSNR_KEY");
+    if (!k || strlen(k) != 64) return 0;
+    for (int i = 0; i < 64; i++) {
+        const char ch = k[i];
+        const int v = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                    : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (v < 0) return 0;
+        if (i & 1) key[i / 2] = (uint8_t)(key[i / 2] | v);
+        else key[i / 2] = (uint8_t)(v << 4);
+    }
+    return 1;
+}
+
 /* One connection to psnr. With a sign-in (ps3emu/ps3_net_signin.h) HELLO
  * carries the session; a server that says it has ended gets one new sign-in.
  * Blocks for the TCP connect, TLS and the HELLO. *err: 0, or why psnr turned
@@ -177,10 +195,12 @@ static void server_addr(char host[256], uint16_t* port)
 static psnr_client* dial(const char* comm_id, const char* host, uint16_t port, uint32_t* user_id,
                          uint8_t ip[4], int* signed_in_out, int* err)
 {
-    uint8_t session[32];
+    uint8_t session[32], key[32];
     int signed_in = ps3_net_session(NULL, 0, session);
+    const int keyed = !signed_in && hosted_key(key);
     psnr_client* c = psnr_connect(host, port, comm_id, np_psnr_online_id(),
-                                  np_psnr_p2p_port(), signed_in ? session : NULL, user_id, ip);
+                                  np_psnr_p2p_port(), signed_in ? session : keyed ? key : NULL, user_id, ip);
+    memset(key, 0, sizeof(key));
     if (!c && signed_in && psnr_connect_error() == PSNR_E_SIGN_IN) {
         ps3_net_session_drop();
         signed_in = ps3_net_session(NULL, 0, session);
@@ -226,6 +246,8 @@ int np_psnr_connect(const char* comm_id)
      * a second notice would replace before it is shown. */
     if ((err == PSNR_E_SIGN_IN && (signed_in || !ps3_net_signin_enabled())) || err == PSNR_E_NOT_YOUR_NAME)
         ps3_net_signin_post_notice("Co-op is not available: the matchmaking server did not accept this sign-in.");
+    else if (err == PSNR_E_REFUSED && getenv("PSNR_KEY"))   /* a hosted game (psnr_host.h): the key is wrong */
+        ps3_net_signin_post_notice("The host's game did not accept this invite code. Ask the host for it again.");
     else if (err == PSNR_E_REFUSED)
         ps3_net_signin_post_notice("Co-op is not available right now.");
     if (s_client)
@@ -508,11 +530,13 @@ void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
         int known = p->user == user && p->port == port && !memcmp(p->ip, ip, 4);
         if (!known) {
             int relay_stream = p->user == user ? p->relay_stream : 0;
+            int relay_udp = p->user == user ? p->relay_udp : 0;   /* (a ROUTE push may come first) */
             memset(p, 0, sizeof(*p));
             p->user = user;
             memcpy(p->ip, ip, 4);
             p->port = port;
             p->relay_stream = relay_stream;
+            p->relay_udp = relay_udp;
         }
         if (!p->punches_left) {
             p->punches_left = PUNCHES;
@@ -569,20 +593,38 @@ int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port)
 }
 
 /* Pushes np_psnr handles itself: ROUTE and STREAM_OFFER. 1 if it took it. */
+/* APP_MSG (from user u32 | blob): a hosted game's own message, for the port's handler, never the title's */
+static void (*s_app_fn)(uint32_t from_user, const uint8_t* data, uint32_t len);
+static int app_push(const psnr_msg* m)
+{
+    if (m->type != PSNR_APP_MSG) return 0;
+    if (m->len >= 6) {
+        const uint32_t from = psnr_get32(m->data);
+        const uint16_t n = psnr_get16(m->data + 4);
+        if (6u + n <= m->len && s_app_fn) s_app_fn(from, m->data + 6, n);
+    }
+    return 1;
+}
+
 static int nat_push(const psnr_msg* m)
 {
     if (m->type == PSNR_ROUTE && m->len >= 13) {
         uint32_t user = psnr_get32(m->data + 8);
         int relay = (m->data[12] & PSNR_ROUTE_STREAM_RELAY) != 0;
+        int relay_udp = (m->data[12] & PSNR_ROUTE_UDP_RELAY) != 0;   /* a hosted game (psnr_host.h) */
         LOCK();
         struct peer* p = peer_by_user(user);
         if (!p && (p = peer_by_user(0))) {
             memset(p, 0, sizeof(*p));
             p->user = user;
         }
-        if (p) p->relay_stream = relay;
+        if (p) {
+            p->relay_stream = relay;
+            if (relay_udp) p->relay_udp = 1;
+        }
         UNLOCK();
         if (relay) printf("[psnr] streams to user %u go through the relay\n", user);
+        if (relay_udp) printf("[psnr] datagrams to user %u go through the host\n", user);
         return 1;
     }
     if (m->type == PSNR_STREAM_OFFER && m->len >= 10) {
@@ -716,6 +758,15 @@ static void* redial_main(void* arg)
             printf("[psnr] %s:%u refused the HELLO (error %d) -- NP stays offline\n", host, port, err);
             break;
         }
+        /* A hosted game's room server (psnr_host.c) turns away a wrong key: the host's game started again, with a
+         * new key, so this one never comes right. Trying on would only get this address ignored for a while (its
+         * wrong keys are counted), with no word to the player. */
+        if (err == PSNR_E_REFUSED && getenv("PSNR_KEY")) {
+            printf("[psnr] %s:%u no longer takes this invite code (the host's game has a new one) -- NP stays "
+                   "offline\n", host, port);
+            ps3_net_signin_post_notice("The host's game did not accept this invite code. Ask the host for it again.");
+            break;
+        }
         if (tries == 1) {
             if (err) printf("[psnr] %s:%u turned the HELLO away for now (error %d); trying again now and then\n",
                             host, port, err);
@@ -810,7 +861,23 @@ void np_psnr_pump(void)
 
         /* Handlers run unlocked: they send follow-up requests. */
         if (m.req && fn) fn(user, &m);
-        else if (!m.req && !nat_push(&m) && s_push_fn) s_push_fn(&m);
+        else if (!m.req && !nat_push(&m) && !app_push(&m) && s_push_fn) s_push_fn(&m);
         psnr_msg_free(&m);
     }
+}
+
+/* ---- A hosted game's own messages (ps3emu/psnr_host.h: psnr_app_send) ---- */
+
+int psnr_app_send(const void* data, uint32_t len)
+{
+    if (len > PSNR_APP_MAX || (len && !data)) return -1;
+    uint8_t body[2 + PSNR_APP_MAX];
+    psnr_put16(body, (uint16_t)len);
+    if (len) memcpy(body + 2, data, len);
+    return np_psnr_request(PSNR_APP_SEND, body, 2 + len, NULL, NULL) ? 0 : -1;
+}
+
+void psnr_app_on_message(void (*fn)(uint32_t from_user, const uint8_t* data, uint32_t len))
+{
+    s_app_fn = fn;
 }

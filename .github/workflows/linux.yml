@@ -569,6 +569,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_np_identity
 
+      # A game one player hosts: the room server in the host's own process
+      # against the real client, and the invite code.
+      - name: Run the hosted rooms test
+        if: ${{ !cancelled() }}
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_psnr_host libs/network/tests/test_psnr_host.c -lpthread
+          /tmp/test_psnr_host
+
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
       - name: Run the NAT traversal test
