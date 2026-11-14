@@ -13,6 +13,7 @@
 #include "ps3emu/ppu_lift.h"   /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 #include "ps3emu/ps3_net.h" /* ps3_net_online */
+#include "ps3emu/ps3_knob.h" /* PS3_KNOB: PPU_LWM_HANDOFF */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -105,7 +106,7 @@ static void sys_process_is_stack(ppu_context* ctx)
 
 struct LwmSlot;
 static LwmSlot* lwm_slot(uint32_t addr);   /* fwd (defined below) */
-static void lwm_release(LwmSlot* s);
+static void lwm_release(LwmSlot* s, int handoff);
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -123,7 +124,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
-    { LwmSlot* s = lwm_slot(lwm); if (s) lwm_release(s); }
+    { LwmSlot* s = lwm_slot(lwm); if (s) lwm_release(s, 0); }
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
@@ -155,12 +156,51 @@ static void sys_lwmutex_create(ppu_context* ctx)
 static struct LwmSlot { volatile long addr;
     volatile long cnt;               /* 1 free, 0 taken */
     volatile long waiters;           /* lockers asleep on cv, or about to be */
+    unsigned q_next, q_head;         /* under lk: the queued sleepers' tickets (lwm_wait); those before q_head are served */
     SRWLOCK lk; CONDITION_VARIABLE cv;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
 static inline int lwm_try(LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
-/* Take the count, waiting up to ms (INFINITE: forever). 1 if taken. */
-static int lwm_wait(LwmSlot* s, DWORD ms)
+
+/* Who gets a contended lwmutex when its holder unlocks it.
+ *
+ * lv2 hands it to a thread asleep on it: the unlock marks the owner reserved
+ * and the kernel gives the mutex to the waiter (RPCS3: sys_lwmutex_unlock
+ * stores lwmutex_reserved, then _sys_lwmutex_unlock reowns it). Only a mutex
+ * made SYS_SYNC_RETRY lets the lockers race for it again. Without the hand-off
+ * the unlocking thread takes the mutex straight back if it locks again at
+ * once, before the sleeper is even running, and a thread that does that in a
+ * loop keeps the sleeper out for as long as the loop lasts.
+ *
+ * Demon's Souls' MultiStream: MOMixerThread holds one lwmutex for a whole
+ * mixing round (it waits there for libsynth2's eight replies) and starts the
+ * next round at once when it is behind. MOMainThread, which starts and stops
+ * the sounds the game asks for, then waited on that mutex for 99 ms on
+ * average and got it 8 times a second (#403, a Ryzen 5 2600), and on a
+ * Linux laptop it waited behind every round from the title screen on (#502:
+ * attack sounds 2 s late or not heard). With the hand-off it gets the mutex
+ * at the end of the round it waited behind.
+ *
+ * PPU_LWM_HANDOFF=1: the hand-off, for every lwmutex that is not
+ * SYS_SYNC_RETRY. Sleepers are served in the order they went to sleep; lv2
+ * picks by the mutex's protocol (FIFO, or the highest priority), so between
+ * waiters of different priorities this order can differ from the console's.
+ * A locker with a timeout keeps racing for the mutex, as before. 0, the
+ * default for now: as before, whoever takes the count first gets it. Live
+ * (PS3_KNOB): a change is safe with sleepers queued, since an unlock looks at
+ * the queue, not the mode. */
+static int lwm_handoff_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("PPU_LWM_HANDOFF", 0));
+    return on;
+}
+/* Take the count, waiting up to ms (INFINITE: forever). 1 if taken, or
+ * handed over by lwm_release (the count then stays taken: it is this thread's).
+ * With handoff, an untimed sleeper takes a ticket and waits its turn: it is
+ * served by an unlock that hands it the mutex, or, the oldest, takes a free
+ * count. */
+static int lwm_wait(LwmSlot* s, DWORD ms, int handoff)
 {
     for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
         if (s->cnt && lwm_try(s)) return 1;
@@ -170,8 +210,15 @@ static int lwm_wait(LwmSlot* s, DWORD ms)
     int got = 0;
     AcquireSRWLockExclusive(&s->lk);
     InterlockedIncrement(&s->waiters);      /* before the retry: see lwm_release */
+    const int queued = handoff && ms == INFINITE;
+    const unsigned me = queued ? s->q_next++ : 0;
     for (;;) {
-        if (lwm_try(s)) { got = 1; break; }
+        if (queued && (int)(me - s->q_head) < 0) { got = 1; break; }   /* handed over */
+        if ((!queued || me == s->q_head) && lwm_try(s)) {
+            got = 1;
+            if (queued) s->q_head++;
+            break;
+        }
         DWORD w = INFINITE;
         if (ms != INFINITE) {
             const ULONGLONG el = GetTickCount64() - t0;
@@ -188,15 +235,39 @@ static int lwm_wait(LwmSlot* s, DWORD ms)
  * it free, as the kernel semaphore's max count of 1 did. A locker counts
  * itself a waiter under lk before its last try, and the exchange is a full
  * barrier: either it sees the count, or this sees it and wakes it, under lk
- * so the wake cannot fall between its try and its sleep. */
-static void lwm_release(LwmSlot* s)
+ * so the wake cannot fall between its try and its sleep.
+ *
+ * With handoff and a queued sleeper, the count stays taken and passes to the
+ * oldest sleeper (under lk, which its check also holds), so no other locker
+ * can take it in between. Queued sleepers wait their turn, so a wake for them
+ * wakes them all and each looks at its ticket. */
+static void lwm_release(LwmSlot* s, int handoff)
 {
+    if (handoff && s->waiters) {
+        AcquireSRWLockExclusive(&s->lk);
+        if (s->q_next != s->q_head && !s->cnt) {
+            s->q_head++;
+            ReleaseSRWLockExclusive(&s->lk);
+            WakeAllConditionVariable(&s->cv);
+            return;
+        }
+        ReleaseSRWLockExclusive(&s->lk);
+    }
     InterlockedExchange(&s->cnt, 1);
     if (s->waiters) {
         AcquireSRWLockExclusive(&s->lk);
+        const int queued = s->q_next != s->q_head;
         ReleaseSRWLockExclusive(&s->lk);
-        WakeConditionVariable(&s->cv);
+        if (queued) WakeAllConditionVariable(&s->cv);
+        else WakeConditionVariable(&s->cv);
     }
+}
+/* Whether an unlock of the guest lwmutex at lwm hands it over: PPU_LWM_HANDOFF,
+ * unless the title made it SYS_SYNC_RETRY (protocol 4; LWM_ATTR holds the
+ * protocol, sys_lwmutex_create). */
+static inline int lwm_handoff(uint32_t lwm)
+{
+    return lwm_handoff_on() && (vm_read32(lwm + LWM_ATTR) & 0xFu) != 4u;
 }
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
@@ -288,7 +359,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
-            if (!lwm_wait(s, ms)) {             /* honor the timeout: ETIMEDOUT, no acquire */
+            if (!lwm_wait(s, ms, lwm_handoff(lwm))) {   /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
@@ -364,7 +435,7 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     /* Release works from ANY thread (unlike a CS) -- guest code hands
      * lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) leaves it free (lwm_release). */
-    if (s) lwm_release(s);
+    if (s) lwm_release(s, lwm_handoff(lwm));
     ctx->gpr[3] = 0;
 }
 
@@ -406,9 +477,9 @@ static void sys_lwcond_wait(ppu_context* ctx)
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
-        lwm_release(s);
+        lwm_release(s, lwm_handoff(lwmutex));
         Sleep(1);
-        lwm_wait(s, INFINITE);
+        lwm_wait(s, INFINITE, lwm_handoff(lwmutex));
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
