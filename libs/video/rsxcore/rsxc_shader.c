@@ -349,7 +349,8 @@ static u32 fp_units_at(u32 off)
  * fwidth over a host pixel times the scale. A quad split into two triangles
  * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
  * untouched. RSX_SCALE_UVCLAMP=0 turns it off. Below 100% the draw also
- * reads its mipmapped textures at their 1x level of detail (dr_lod_pct).
+ * reads its mipmapped textures at their 1x level of detail (dr_lod_pct). At
+ * 100% it is off unless RSX_UVCLAMP_1X=1 (a resized HUD, dr_uvclamp).
  *
  * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
  * not in its text: one shader and one pipeline serve every scale, so a

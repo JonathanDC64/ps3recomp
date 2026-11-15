@@ -434,17 +434,27 @@ static u32 fp_units_at(u32 off) { return rsxc_fp_units_at(off); }
  * untouched. RSX_SCALE_UVCLAMP=0 turns it off. Below 100% the draw also
  * reads its mipmapped textures at their 1x level of detail (dr_lod_pct).
  *
+ * At 100% the clamp is off, unless RSX_UVCLAMP_1X=1 (live; a title sets it
+ * while it draws 2D art at another size than its own, such as a resized HUD,
+ * whose edges get the same lines at any scale). Every draw on any target is
+ * then a candidate, as all targets are 1:1. The margin is still half a guest
+ * pixel: for art drawn at half size that is one texel, which keeps the
+ * filter inside the sprite, and for art drawn 1:1 it is the edge texel's
+ * centre, where 1:1 already samples. Art drawn larger than 1:1 is not helped
+ * (its margin stays under half a texel).
+ *
  * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
  * not in its text: one shader and one pipeline serve every scale, so a
  * precompile at any scale (rsx_shader_precompile, RSX_PRECOMPILE_2D) builds the
  * shader a scaled draw looks up, and a change of scale compiles nothing. */
 static u32 dr_uvclamp(const D3D12DrawRecord* dr)
 {
-    static int en = -1;
+    static int en = -1, at1x = -1;
     PS3_KNOB(en, ps3_env_int("RSX_SCALE_UVCLAMP", 1));
+    PS3_KNOB(at1x, ps3_env_int("RSX_UVCLAMP_1X", 0));
     const u32 pct = rsx_scale_pct();
-    if (!en || pct == 100 || (dr->depth & 1u)) return 0;
-    if (dr->rt_off) {   /* an offscreen target: scaled unless it is small (rt_host_dim) */
+    if (!en || (pct == 100 && !at1x) || (dr->depth & 1u)) return 0;
+    if (dr->rt_off && pct != 100) {   /* an offscreen target: scaled unless it is small (rt_host_dim) */
         const u32 w = dr->rt_w ? dr->rt_w : s_d3d.width, h = dr->rt_h ? dr->rt_h : s_d3d.height;
         if (rt_host_dim(w, h, w) == w && rt_host_dim(w, h, h) == h) return 0;
     }
