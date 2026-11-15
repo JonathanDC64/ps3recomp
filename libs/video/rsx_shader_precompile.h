@@ -27,7 +27,7 @@
  *     cache), which covers whatever the rules above do not;
  *   - for a program queued with RSX_PRECOMPILE_2D, each of the above once more
  *     with the sprite-edge clamp that draws without a depth test use on a
- *     scaled target (RSX_SCALE above 100: HUD, menus, post passes). The clamp
+ *     scaled target (RSX_SCALE other than 100: HUD, menus, post passes). The clamp
  *     takes the scale from the draw's constants, so these serve every scale.
  *
  * Decompiling is not thread-safe with draws: run it before the title draws.
