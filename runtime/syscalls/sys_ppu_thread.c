@@ -43,6 +43,7 @@ void (*g_ds_register_shadow_hook)(unsigned long long guest_tid) = 0;
 #endif
 #if defined(__linux__)
 #include <SDL2/SDL.h>     /* SDL_LinuxSetThreadPriority: nice through RealtimeKit */
+#include <sys/prctl.h>    /* PR_SET_NAME: declared without _GNU_SOURCE */
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -232,6 +233,15 @@ static void* ppu_host_thread_proc(void* param)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #else
     { const int lv = ppu_host_raise_level(info->priority, info->name); if (lv) ppu_host_raise_self(lv); }
+#endif
+#if defined(__linux__)
+    /* The host thread takes the guest thread's name (the kernel keeps its
+     * first 15 characters), so the CPU table of a problem report on Linux
+     * (ps3_diag_report) and a system monitor can tell the guest's threads
+     * apart. The main thread, which runs on the boot thread, keeps the
+     * program's name. */
+    if (info->name[0])
+        prctl(PR_SET_NAME, info->name, 0, 0, 0);
 #endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation

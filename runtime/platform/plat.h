@@ -8,7 +8,8 @@
  * small mutex), then time and sleep (one monotonic clock, a thread's sleep
  * timer, and the precise sleep written once on them), then a file mapped
  * read-only (the D3D12 pipeline library's), then a core kept for one thread
- * (the RSX thread's, RSX_CORE).
+ * (the RSX thread's, RSX_CORE), then the process's threads as the kernel
+ * counts them (the problem report's CPU table on Linux).
  *
  * On Windows each call is the Win32 call it stands for, inline, so code moved
  * onto this header makes the same calls in the same order as before. Off
@@ -390,6 +391,29 @@ void plat_core_keep(void);
 #else
 static inline int  plat_core_reserve(int mode) { (void)mode; return -1; }
 static inline void plat_core_keep(void) {}
+#endif
+
+/* ---- The process's threads, as the kernel counts them (Linux) ------------- */
+
+/* For the problem report's CPU table off Windows (ps3_diag_report).
+ * plat_threads_list writes up to `max` kernel thread ids of this process and
+ * gives how many it wrote. plat_thread_times gives a thread's time on a CPU
+ * and its time ready to run but waiting for one, in nanoseconds since it
+ * started: 2 when both are known (the kernel's schedstat), 1 when only the
+ * time on a CPU is (its stat file, to the clock tick; *wait_ns is 0), 0 when
+ * neither (the thread has ended). plat_thread_name gives the thread's name
+ * (15 characters at most), 0 if it has none to read. Off Linux all three
+ * give 0. */
+#if defined(__linux__)
+int plat_threads_list(long* tids, int max);
+int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns);
+int plat_thread_name(long tid, char* out, size_t cap);
+#else
+static inline int plat_threads_list(long* tids, int max) { (void)tids; (void)max; return 0; }
+static inline int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns)
+{ (void)tid; *run_ns = 0; *wait_ns = 0; return 0; }
+static inline int plat_thread_name(long tid, char* out, size_t cap)
+{ (void)tid; if (cap) out[0] = 0; return 0; }
 #endif
 
 #ifdef __cplusplus

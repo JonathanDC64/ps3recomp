@@ -3,8 +3,9 @@
 # runtime/platform/plat.h's threads, events and mutex, and the SPU async job
 # pool built on them (runtime/spu/spu_async_pool.c); its time and sleep
 # (test_plat_time: the monotonic clock and the precise sleep); its file
-# mapped read-only (test_plat_file); and its core kept for one thread
-# (test_plat_core). Standalone project with
+# mapped read-only (test_plat_file); its core kept for one thread
+# (test_plat_core); and the process's threads as the kernel counts them
+# (test_plat_thread_times). Standalone project with
 # its own build dir, and also added from the top-level CMakeLists under
 # PS3RECOMP_BUILD_TESTS.
 #
@@ -118,3 +119,40 @@ set_tests_properties(plat_core PROPERTIES
     LABELS "runtime;platform;threads"
     TIMEOUT 60
 )
+
+# The process's threads as the kernel counts them (the problem report's CPU
+# table on Linux): plat.h alone (and plat_posix.c off Windows). On Linux a
+# second build reads the stat file alone, the path for a kernel without
+# schedstat.
+add_executable(test_plat_thread_times
+    test_plat_thread_times.c
+    "${PS3RECOMP_TREE_ROOT}/runtime/platform/plat_posix.c"
+)
+target_include_directories(test_plat_thread_times PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime")
+if(MSVC)
+    target_compile_options(test_plat_thread_times PRIVATE /W3)
+    target_compile_definitions(test_plat_thread_times PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_plat_thread_times PRIVATE -Wall -Wextra)
+    target_link_libraries(test_plat_thread_times PRIVATE Threads::Threads)
+endif()
+add_test(NAME plat_thread_times COMMAND test_plat_thread_times)
+set_tests_properties(plat_thread_times PROPERTIES
+    LABELS "runtime;platform;threads"
+    TIMEOUT 60
+)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test_plat_thread_times_stat
+        test_plat_thread_times.c
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/plat_posix.c"
+    )
+    target_include_directories(test_plat_thread_times_stat PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime")
+    target_compile_definitions(test_plat_thread_times_stat PRIVATE PLAT_THREAD_TIMES_NO_SCHEDSTAT)
+    target_compile_options(test_plat_thread_times_stat PRIVATE -Wall -Wextra)
+    target_link_libraries(test_plat_thread_times_stat PRIVATE Threads::Threads)
+    add_test(NAME plat_thread_times_stat COMMAND test_plat_thread_times_stat)
+    set_tests_properties(plat_thread_times_stat PROPERTIES
+        LABELS "runtime;platform;threads"
+        TIMEOUT 60
+    )
+endif()
