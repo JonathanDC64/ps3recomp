@@ -405,6 +405,9 @@ void (*g_rsx_sync_hook)(void) = NULL;
  * don't call g_rsx_sync_hook. */
 void (*g_rsx_sync_write_hook)(u32 ea, u32 len) = NULL;
 
+/* See rsx_commands.h: the new path's renderer counts into it. */
+rsx_waits g_rsx_waits;
+
 /* See rsx_commands.h. The per-word handlers these replace are the
  * NV4097_SET_TRANSFORM_PROGRAM, _CONSTANT_LOAD and _CONSTANT cases of
  * rsx_process_method; the stores, counters and dirty range are the same. */
