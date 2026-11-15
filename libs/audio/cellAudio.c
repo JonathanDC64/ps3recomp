@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#if defined(__linux__)
+#include <sys/prctl.h>   /* PR_SET_NAME: declared without _GNU_SOURCE */
+#endif
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -1078,7 +1081,7 @@ static void* audio_mix_thread_func(void* arg)
 #if defined(__linux__)
     /* Named for the CPU table of a problem report on Linux (ps3_diag_report)
      * and for a system monitor. */
-    pthread_setname_np(pthread_self(), "cellAudio mix");
+    prctl(PR_SET_NAME, "cellAudio mix", 0, 0, 0);
 #endif
 #if AUDIO_BACKEND_SDL2
     /* Off Windows there is no MMCSS. At the default priority the mixer wakes
