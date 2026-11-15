@@ -128,10 +128,12 @@ static void zq_finish(int nev, int on_after)
             memcpy(cnt, mp, (size_t)s_zq_n * sizeof(u64));
             gpu_buffer_unmap(s_rc_dev, s_zq_rb_buf, 0, 0);
         }
-        /* A scaled target covers more samples; report what the guest's size would,
-         * rounded up so a sliver that showed is never reported as hidden. */
+        /* A target scaled up covers more samples, and one scaled down (RSX_SCALE
+         * below 100) fewer: report what the guest's size would, rounded up so a
+         * sliver that showed is never reported as hidden. */
         for (int i = 0; i < s_zq_n; i++)
-            if (s_zq_area[i] > 1.0f && cnt[i]) cnt[i] = (u64)ceil((double)cnt[i] / s_zq_area[i]);
+            if (s_zq_area[i] > 0.0f && s_zq_area[i] != 1.0f && cnt[i])
+                cnt[i] = (u64)ceil((double)cnt[i] / s_zq_area[i]);
     }
     extern void cellGcm_report_store(u32 index, u32 value);
     static int logn = -1, logged = 0;
