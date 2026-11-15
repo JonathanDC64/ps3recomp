@@ -511,6 +511,7 @@ extern "C" long long ps3_ms_since_frame(void)
 #include "../../syscalls/sys_cond.h"          /* sync history ring (console synchist) */
 #include "../../spu/spu_workload.h"          /* SPU history ring (console spuhist) */
 #include "../ppu_waits.h"                     /* console waits */
+#include "../../../libs/video/rsx_commands.h"   /* g_rsx_waits (ps3_diag_report's FIFO thread) */
 extern "C" void (*volatile g_rsx_trace_mark)(const char*, uint32_t, uint32_t);   /* trace marks */
 extern "C" void (*volatile g_spu_trace_mark)(const char*, uint32_t, uint32_t);   /* spu_channels.c */
 extern "C" volatile long g_rsx_prof_toggle;   /* F11 profile sessions (profile_thread) */
@@ -692,6 +693,11 @@ static DWORD WINAPI vblank_clock(LPVOID)
     return 0;
 }
 
+/* The ticker's waits for the title's next commands (cellGcm_fifo_kick_wait),
+ * in performance-counter ticks since the start: ps3_diag_report's "waiting
+ * for the game's commands". Only the ticker writes it. */
+static volatile long long s_kick_wait_qpc = 0;
+
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
 #if defined(__linux__)
@@ -786,7 +792,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
          * ~15.8 presents/s for ~15% of a core on this thread. */
         { static int kms = -1;
           PS3_KNOB(kms, ps3_env_int("FIFO_KICK_MS", 1));
-          cellGcm_fifo_kick_wait(kms >= 1 ? (unsigned)kms : 1u); }
+          LARGE_INTEGER k0, k1;
+          QueryPerformanceCounter(&k0);
+          cellGcm_fifo_kick_wait(kms >= 1 ? (unsigned)kms : 1u);
+          QueryPerformanceCounter(&k1);
+          s_kick_wait_qpc = s_kick_wait_qpc + (k1.QuadPart - k0.QuadPart); }
         ULONGLONG now = GetTickCount64();
         QueryPerformanceCounter(&qpc);
         int fired = 0;
@@ -2248,14 +2258,41 @@ extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
     memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
     g_waits_dropped = 0;
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const rsx_waits rw0 = g_rsx_waits;            /* (the FIFO thread's, over the same window) */
+    const long long kick0 = s_kick_wait_qpc;
     const uint64_t w0 = ppu_waits_now();
     g_waits_armed = 1;
     dbg_cpu(sample_sec);
     g_waits_armed = 0;
     const double win_ms = (double)(ppu_waits_now() - w0) * 1000.0 / (double)f.QuadPart;
+    const rsx_waits rw1 = g_rsx_waits;
+    const long long kick1 = s_kick_wait_qpc;
     Sleep(100);   /* calls in flight at the close land */
     dbg_printf("%c--- calls each guest thread finished in that time (a call still blocked is not here) ---%c", 10, 10);
     dbg_waits_report(win_ms, 30);
+
+    /* Where the FIFO thread's time went in the same window: the waits the
+     * new path's renderer counts (rsx_commands.h) and the ticker's own wait
+     * for commands. The rest is its work: the FIFO's commands, recording
+     * the draws. Most of the window in the GPU waits says the GPU's side
+     * holds the frame (its work, the bus to it, or a present held back);
+     * most of it waiting for commands says the game's side does. */
+    dbg_printf("%c--- the FIFO thread in that time (it reads the game's commands, draws and presents) ---%c", 10, 10);
+    dbg_printf("  waiting for the game's commands: %.1f ms%c",
+               (double)(kick1 - kick0) * 1000.0 / (double)f.QuadPart, 10);
+    if (rw1.measured) {
+        dbg_printf("  waiting for the GPU to finish work: %.1f ms in %llu waits%c",
+                   (double)(rw1.gpu_us - rw0.gpu_us) / 1000.0, (unsigned long long)(rw1.gpu_n - rw0.gpu_n), 10);
+        dbg_printf("  presenting: %.1f ms in %llu presents%c",
+                   (double)(rw1.present_us - rw0.present_us) / 1000.0,
+                   (unsigned long long)(rw1.present_n - rw0.present_n), 10);
+        dbg_printf("  getting the window's next image: %.1f ms in %llu%c",
+                   (double)(rw1.acquire_us - rw0.acquire_us) / 1000.0,
+                   (unsigned long long)(rw1.acquire_n - rw0.acquire_n), 10);
+        dbg_printf("  batches drawn: %llu%c", (unsigned long long)(rw1.batches - rw0.batches), 10);
+    } else {
+        dbg_printf("  (this renderer does not count its waits)%c", 10);
+    }
 
     dbg_printf("%c--- host threads ---%c", 10, 10);
     dump_threads("report", self, 0);

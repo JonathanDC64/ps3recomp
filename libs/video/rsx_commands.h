@@ -473,6 +473,23 @@ void rsx_set_backend(rsx_backend* backend);
 /* Get the current backend (or NULL if none set). */
 rsx_backend* rsx_get_backend(void);
 
+/* What the thread that draws and presents (the FIFO thread) waited on,
+ * counted from the start by a renderer that measures it (the new path,
+ * libs/video/rsxcore; the legacy renderer leaves `measured` at 0): the GPU
+ * finishing work (its fence waits, the drain at a batch's start included),
+ * presents, and the window's next image. A problem report reads it before
+ * and after its window and subtracts (ps3_diag_report). Plain counters,
+ * written by the thread that waits: a read in the middle of an update is a
+ * few microseconds off, which a report can live with. */
+typedef struct rsx_waits {
+    u64 measured;                 /* non-zero once a renderer that counts has drawn */
+    u64 gpu_us, gpu_n;            /* waits for the GPU to finish work */
+    u64 present_us, present_n;    /* presents */
+    u64 acquire_us, acquire_n;    /* the window's next image */
+    u64 batches;                  /* batches drawn (one or more a frame) */
+} rsx_waits;
+extern rsx_waits g_rsx_waits;
+
 #ifdef __cplusplus
 }
 #endif

@@ -558,7 +558,10 @@ static struct gpu_cmd* rc_overlay_gpu_flush(void)
     if (!s_overlay_gpu_cmd) return NULL;
     const gpu_fence f = overlay_gpu_submit(GPU_SUBMIT_SIGNAL);
     s_overlay_gpu_cmd = NULL;
-    if (gpu_fence_wait(s_rc_dev, f, 2000)) {
+    const double t0 = perf_now();
+    const int late = gpu_fence_wait(s_rc_dev, f, 2000);
+    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    if (late) {
         printf("[D3D12] overlay: the GPU has not finished its work after 2 s (fence %llu)\n", (unsigned long long)f);
         return NULL;
     }

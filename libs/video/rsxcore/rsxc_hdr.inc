@@ -654,7 +654,9 @@ static void swap_present(int game_frame)
     }
     const int tear = !vsync && s_d3d.tearing;
     const UINT interval = tear ? 0 : vsync <= 1 || !game_frame ? 1 : vsync > 4 ? 4 : (UINT)vsync;
+    const double t0 = perf_now();
     const int pr = gpu_swap_present(s_rc_dev, s_rc_swap, interval, tear ? GPU_PRESENT_TEARING : 0);
+    rc_wait_note(&g_rsx_waits.present_us, &g_rsx_waits.present_n, t0);
     if (pr == GPU_PRESENT_SURFACE_LOST) {   /* (step VC2: gpu.h's codes; never on D3D12) */
         if (!s_device_lost) device_lost_say("present", (HRESULT)rc_be_surface_lost);
     } else if (pr) {

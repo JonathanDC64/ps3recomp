@@ -24,9 +24,10 @@ static void wait_for_gpu(void)
      * Degrade loudly instead: bounded waits + the removal reason, then
      * carry on (subsequent D3D calls fail visibly but the game keeps
      * running headless). */
+    const double t0 = perf_now();
     for (int tries = 0; tries < 3; tries++) {
         if (!gpu_fence_wait(s_rc_dev, want, 2000))
-            return;
+            break;
         const u32 rr = gpu_lost(s_rc_dev);
         printf("[D3D12] wait_for_gpu STUCK %ds: want %llu got %llu removed=0x%08lX\n",
                2 * (tries + 1),
@@ -37,6 +38,7 @@ static void wait_for_gpu(void)
         if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
             break;
     }
+    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
 }
 
 /* RSX_FRAMES_IN_FLIGHT (read once; the default is the backend's,
@@ -87,7 +89,10 @@ static int batch_done(u32 par)
 static void batch_wait(u32 par)
 {
     if (batch_done(par)) return;
-    if (gpu_fence_wait(s_rc_dev, s_batch_fence[par], 2000))
+    const double t0 = perf_now();
+    const int late = gpu_fence_wait(s_rc_dev, s_batch_fence[par], 2000);
+    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    if (late)
         printf("[rsx] batch wait STUCK 2s: want %llu got %llu removed=0x%08lX\n",
                (unsigned long long)s_batch_fence[par],
                (unsigned long long)gpu_fence_completed(s_rc_dev), (unsigned long)gpu_lost(s_rc_dev));
@@ -188,4 +193,6 @@ static void move_to_next_frame(void)
     lose_device_test();
     frame_slot_wait(s_d3d.frame_index);
     s_rc_frame_fence[prev] = mine;
+    g_rsx_waits.batches++;
+    g_rsx_waits.measured = 1;
 }

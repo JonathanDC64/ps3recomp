@@ -18,7 +18,11 @@ static void frame_slot_wait(u32 slot)
     const gpu_fence want = s_rc_frame_fence[slot];
     const u64 done = gpu_fence_completed(s_rc_dev);
     if (done == UINT64_MAX) check_device("frame fence");   /* (what a lost device's fences read) */
-    if (done < want && gpu_fence_wait(s_rc_dev, want, 2000)) {
+    if (done >= want) return;
+    const double t0 = perf_now();
+    const int late = gpu_fence_wait(s_rc_dev, want, 2000);
+    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    if (late) {
         const u32 rr = gpu_lost(s_rc_dev);
         printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
                (unsigned long long)want,
