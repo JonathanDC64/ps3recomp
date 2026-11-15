@@ -484,9 +484,17 @@ static int rsx_pump_messages(void)
 static volatile LONG g_frames_presented = 0;
 extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
 static volatile ULONGLONG s_last_frame_ms = 0;   /* GetTickCount64 at the last one */
+static unsigned s_frames_flip = 0;   /* the flip count the last counted frame had (ticker only) */
 static void present_guest_frame(void)
 {
     rsx_present_frame();
+    /* One count a flip. The ticker calls this twice for a flip its own drain
+     * reached: at the end of that pass, when the flip count has moved, and
+     * at the start of the next, when it takes the flip's pending flag. So a
+     * game at a steady 60 fps read 120 frames a second in a problem report. */
+    const unsigned fc = cellGcm_flip_request_count();
+    if (fc == s_frames_flip) return;
+    s_frames_flip = fc;
     /* The ticker increments, a guest thread reads: interlocked rather than a
      * volatile ++, which is neither atomic nor a fence on arm64. */
     InterlockedIncrement(&g_frames_presented);
