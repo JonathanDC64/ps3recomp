@@ -631,6 +631,32 @@ static int addr_has_border(u32 a)
  * the border colour (0 when no axis uses it, so those units still share). */
 #define SAMP_KEY_W 3
 
+/* RSX_SCALE below 100%: a draw with the sprite-edge clamp (dr_uvclamp) reads
+ * its mipmapped textures at the level of detail it has at 1x. Drawn smaller
+ * than at 1x, a sprite's level of detail goes up by log2 of 1 / scale, and the
+ * filter also reads the next level, whose texels are two guest pixels wide
+ * for a sprite drawn 1:1: the clamp's half guest pixel no longer keeps that
+ * filter inside the sprite, and it reads what lies past the edge. The
+ * loading screens' two pictures meet at guest x 1024, and a darker line ran
+ * down there (3% at 90%, 8-12% at 70% and 50%; none with RSX_TEX_MIPS=0).
+ * The units get a bias of log2 of the scale instead: the levels they read
+ * at 1x, with the clamp's margin as at 1x.
+ * Depth comparison and units without mipmaps are left as they are. The scale
+ * rides in the filter word's bits 8-14 (0: no bias), so 100% and above make
+ * the same keys and samplers as before. RSX_SCALE_LOD=0 (live) turns it off. */
+static u32 dr_lod_pct(const D3D12DrawRecord* dr)
+{
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_SCALE_LOD", 1));
+    if (!en || !dr || rsx_scale_pct() >= 100) return 0;
+    return dr_uvclamp(dr);
+}
+static u32 samp_key_lod(u32 f, u32 pct)
+{
+    const u32 minf = (f >> 16) & 7;
+    return pct && minf >= 3 && minf <= 6 && !(f & 0x80000000u) ? f | (pct << 8) : f;
+}
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
@@ -666,14 +692,14 @@ static u32 s_samp_wr;   /* sampler tables written so far (RSX_SAMP_SAME) */
 
 /* The table holding dr's sampler key, made or rewritten when none does; ~0
  * when the tables are full (table 0 is bound then, and the answer is not
- * kept by vp_sampler_table). */
-static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UNITS * SAMP_KEY_W], u64* last)
+ * kept by vp_sampler_table). lod_pct is dr_lod_pct's. */
+static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 lod_pct, u32 (*keys)[RSX_FP_UNITS * SAMP_KEY_W], u64* last)
 {
     u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
         const int set = dr && dr->tex[u].set;
         k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+        k[u * SAMP_KEY_W + 1] = set ? samp_key_lod(tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u)), lod_pct)
                                     : (u ? 0x02060001u : 0x01010001u);
         k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
@@ -769,6 +795,8 @@ static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UN
         sd.border[3] = (float)(bc >> 24) / 255.0f;
         sd.min_lod = 0.0f;
         sd.max_lod = (minf == 1 || minf == 2) ? 0.0f : GPU_LOD_MAX;  /* no mipmapping */
+        if ((f >> 8) & 0x7Fu)   /* samp_key_lod's scale */
+            sd.mip_lod_bias = log2f((float)((f >> 8) & 0x7Fu) / 100.0f);
         gpu_fast_table_write_sampler(s_rc_dev, s_rc_samp_pool, t * RSX_FP_UNITS + (u32)u,
                                      gpu_sampler_get(s_rc_dev, &sd));
     }
@@ -780,7 +808,8 @@ static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UN
  * without building its key, as most draws sample like the one before. The
  * inputs are each unit's set flag and, for a set unit, TEXTURE_ADDRESS, the
  * filter, the border colour and the format (whether it compares depth): all
- * the key reads (tex_filter_key, dr_unit_shadow, addr_has_border). The table
+ * the key reads (tex_filter_key, dr_unit_shadow, addr_has_border), and
+ * dr_lod_pct's answer. The table
  * still holds that key while no table has been written since, the pool has
  * as many tables (a new device starts again from none) and no live knob has
  * changed (tex_filter_key reads two). Deep Palace capture, null
@@ -788,7 +817,7 @@ static u32 vp_sampler_table_key(const D3D12DrawRecord* dr, u32 (*keys)[RSX_FP_UN
  * thread was this function. */
 #define SAMP_IN_W 5
 static u32 s_samp_in[RSX_FP_UNITS * SAMP_IN_W];
-static u32 s_samp_in_t, s_samp_in_wr, s_samp_in_gen, s_samp_in_n;
+static u32 s_samp_in_t, s_samp_in_wr, s_samp_in_gen, s_samp_in_n, s_samp_in_lod;
 static int s_samp_in_ok;
 
 static u32 vp_sampler_table(const D3D12DrawRecord* dr)
@@ -797,6 +826,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
     static int same = 1;
     PS3_KNOB(same, ps3_env_int("RSX_SAMP_SAME", 1) != 0);
+    const u32 lod_pct = dr_lod_pct(dr);
     u32 in[RSX_FP_UNITS * SAMP_IN_W];
     if (same && dr) {
         for (int u = 0; u < RSX_FP_UNITS; u++) {
@@ -809,13 +839,13 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
             in[u * SAMP_IN_W + 4] = x->fmt & on;
         }
         if (s_samp_in_ok && s_samp_in_wr == s_samp_wr && s_samp_in_n == s_d3d.samp_n &&
-            s_samp_in_gen == ps3_env_gen &&
+            s_samp_in_gen == ps3_env_gen && s_samp_in_lod == lod_pct &&
             !memcmp(in, s_samp_in, sizeof in)) {
             last[s_samp_in_t] = s_d3d.frame_count;
             return s_samp_in_t;
         }
     }
-    const u32 t = vp_sampler_table_key(dr, keys, last);
+    const u32 t = vp_sampler_table_key(dr, lod_pct, keys, last);
     s_samp_in_ok = same && dr && t != ~0u;
     if (s_samp_in_ok) {
         memcpy(s_samp_in, in, sizeof in);
@@ -823,6 +853,7 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         s_samp_in_wr = s_samp_wr;
         s_samp_in_n = s_d3d.samp_n;
         s_samp_in_gen = ps3_env_gen;
+        s_samp_in_lod = lod_pct;
     }
     return t == ~0u ? 0u : t;
 }

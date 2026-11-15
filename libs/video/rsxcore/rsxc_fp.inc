@@ -431,7 +431,8 @@ static u32 fp_units_at(u32 off) { return rsxc_fp_units_at(off); }
  * pixel in texture units is half the coordinate's change over one guest pixel:
  * fwidth over a host pixel times the scale. A quad split into two triangles
  * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
- * untouched. RSX_SCALE_UVCLAMP=0 turns it off.
+ * untouched. RSX_SCALE_UVCLAMP=0 turns it off. Below 100% the draw also
+ * reads its mipmapped textures at their 1x level of detail (dr_lod_pct).
  *
  * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
  * not in its text: one shader and one pipeline serve every scale, so a

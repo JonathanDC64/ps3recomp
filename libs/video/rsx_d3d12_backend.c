@@ -5603,7 +5603,8 @@ static u32 fp_units_at(u32 off)
  * pixel in texture units is half the coordinate's change over one guest pixel:
  * fwidth over a host pixel times the scale. A quad split into two triangles
  * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
- * untouched. RSX_SCALE_UVCLAMP=0 turns it off.
+ * untouched. RSX_SCALE_UVCLAMP=0 turns it off. Below 100% the draw also
+ * reads its mipmapped textures at their 1x level of detail (dr_lod_pct).
  *
  * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
  * not in its text: one shader and one pipeline serve every scale, so a
@@ -8359,6 +8360,35 @@ static int addr_has_border(u32 a)
  * the border colour (0 when no axis uses it, so those units still share). */
 #define SAMP_KEY_W 3
 
+/* RSX_SCALE below 100%: a draw with the sprite-edge clamp (dr_uvclamp) reads
+ * its mipmapped textures at the level of detail it has at 1x. Drawn smaller
+ * than at 1x, a sprite's level of detail goes up by log2 of 1 / scale, and the
+ * filter also reads the next level, whose texels are two guest pixels wide
+ * for a sprite drawn 1:1: the clamp's half guest pixel no longer keeps that
+ * filter inside the sprite, and it reads what lies past the edge. The
+ * loading screens' two pictures meet at guest x 1024, and a darker line ran
+ * down there (3% at 90%, 8-12% at 70% and 50%; none with RSX_TEX_MIPS=0).
+ * The units get a bias of log2 of the scale instead: the levels they read
+ * at 1x, with the clamp's margin as at 1x.
+ * Depth comparison and units without mipmaps are left as they are. The scale
+ * rides in the filter word's bits 8-14 (0: no bias), so 100% and above make
+ * the same keys and samplers as before. RSX_SCALE_LOD=0 (live) turns it off.
+ * This renderer uploads only each texture's first level, so here the bias
+ * changes nothing yet (the line was the core's, which reads the game's
+ * levels); it is kept in step with the core's copy (rsxc_targets.inc). */
+static u32 dr_lod_pct(const D3D12DrawRecord* dr)
+{
+    static int en = -1;
+    PS3_KNOB(en, ps3_env_int("RSX_SCALE_LOD", 1));
+    if (!en || !dr || rsx_scale_pct() >= 100) return 0;
+    return dr_uvclamp(dr);
+}
+static u32 samp_key_lod(u32 f, u32 pct)
+{
+    const u32 minf = (f >> 16) & 7;
+    return pct && minf >= 3 && minf <= 6 && !(f & 0x80000000u) ? f | (pct << 8) : f;
+}
+
 /* vp_sampler_table's hint slot for a key: four multiply-xor lanes over its
  * words, folded. */
 #define VP_SAMP_HINTS 1024
@@ -8380,11 +8410,12 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
 {
     static u32 keys[VP_SAMP_TABLES][RSX_FP_UNITS * SAMP_KEY_W];
     static u64 last[VP_SAMP_TABLES];   /* frame_count of the last draw using it */
+    const u32 lod_pct = dr_lod_pct(dr);
     u32 k[RSX_FP_UNITS * SAMP_KEY_W];
     for (int u = 0; u < RSX_FP_UNITS; u++) {
         const int set = dr && dr->tex[u].set;
         k[u * SAMP_KEY_W]     = set ? dr->tex[u].addr : (u ? 0x10101u : 0x30303u);
-        k[u * SAMP_KEY_W + 1] = set ? tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u))
+        k[u * SAMP_KEY_W + 1] = set ? samp_key_lod(tex_filter_key(dr->tex[u].filt, dr_unit_shadow(dr, u)), lod_pct)
                                     : (u ? 0x02060001u : 0x01010001u);
         k[u * SAMP_KEY_W + 2] = set && addr_has_border(dr->tex[u].addr) ? dr->tex[u].border : 0;
     }
@@ -8475,6 +8506,8 @@ static u32 vp_sampler_table(const D3D12DrawRecord* dr)
         sd.BorderColor[3] = (float)(bc >> 24) / 255.0f;
         sd.MinLOD = 0.0f;
         sd.MaxLOD = (minf == 1 || minf == 2) ? 0.0f : D3D12_FLOAT32_MAX;  /* no mipmapping */
+        if ((f >> 8) & 0x7Fu)   /* samp_key_lod's scale */
+            sd.MipLODBias = log2f((float)((f >> 8) & 0x7Fu) / 100.0f);
         D3D12_CPU_DESCRIPTOR_HANDLE hs = h;
         hs.ptr += (SIZE_T)(t * RSX_FP_UNITS + (u32)u) * s_d3d.samp_inc;
         s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, hs);
