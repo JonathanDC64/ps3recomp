@@ -720,6 +720,17 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+#if defined(__linux__)
+    /* The host thread takes the group's name (its first 15 characters), so
+     * the CPU table of a problem report on Linux (ps3_diag_report) and a
+     * system monitor can tell an SPU group's thread from the rest. */
+    { const spu_group_t* g = spu_find_group(t->group_id);
+      if (g && g->name[0]) {
+          char n[16];
+          snprintf(n, sizeof n, "%s", g->name);
+          pthread_setname_np(pthread_self(), n);
+      } }
+#endif
     /* libsynth2's synth: the one thread of the group the SDK names "_synth2
      * Group" mixes every voice of the title's sound engine, which waits on it
      * each round with the next block due (Demon's Souls: about 47 rounds a

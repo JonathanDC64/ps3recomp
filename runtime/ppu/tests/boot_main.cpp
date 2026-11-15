@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #ifndef _WIN32
 #include <sys/mman.h>
+#include <unistd.h>   /* getpid: the CPU table's main thread */
 #endif
 
 extern "C" {
@@ -618,6 +619,9 @@ extern "C" void ps3_vblank_lock_display(int n)
 
 static DWORD WINAPI vblank_clock(LPVOID)
 {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "vblank clock");   /* the report's CPU table */
+#endif
     if (uint32_t sp = sys_ppu_thread_alloc_host_stack(0x10000u)) ppu_guest_call_set_stack(sp);
     else fprintf(stderr, "[vblank] no guest stack for the clock thread; sharing the callback stack%c", 10);
 #ifdef _WIN32
@@ -690,6 +694,9 @@ static DWORD WINAPI vblank_clock(LPVOID)
 
 static DWORD WINAPI vblank_ticker(LPVOID)
 {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "RSX");   /* the report's CPU table */
+#endif
     /* Window caption: $PS3_TITLE wins, else the TITLE field PARAM.SFO already
      * gave cellGame, else a neutral name. It used to fall back to a specific
      * other title, so every port announced itself as that game. */
@@ -887,6 +894,43 @@ static DWORD WINAPI vblank_ticker(LPVOID)
 
 extern "C" uint32_t    g_last_hle_nid;
 extern "C" const char* g_last_hle_name;
+extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" volatile unsigned long long g_spu_image_runs[64];  /* spu_workload.c */
+extern "C" ppu_context* volatile g_ppu_main_ctx;            /* ppu_loader.cpp: main thread ctx */
+
+/* What the debug console and ps3_diag_report (the runtime's part of a problem
+ * report) print, on every platform: the console and most of its commands are
+ * Windows-only (below); the report is not. Off Windows, dbg_printf only
+ * writes the report. */
+#ifndef _WIN32
+extern "C" { extern char** environ; }
+static FILE* s_dbg_redirect = NULL;   /* set: dbg_printf writes only here */
+static void dbg_printf(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(s_dbg_redirect ? s_dbg_redirect : stderr, fmt, ap);
+    va_end(ap);
+}
+#endif
+
+/* A NAME=value of the environment that is one of the runtime's knobs (its own
+ * namespaces, not the whole shell environment), and under `prefix` if one is
+ * given: the console's `knobs` and the report's last part. */
+static int dbg_knob_shown(const char* kv, const char* prefix)
+{
+    const char* eq = strchr(kv, '=');
+    if (!eq || eq == kv) return 0;
+    static const char* known[] = {
+        "PS3_", "SPU_", "SPURS_", "GCM_", "RSX_", "LD_", "YZ_", "YDKJ_",
+        "LBP_", "FLOW_", "RD_", "TEX_", "FP_", "VP_", "PPU_", "PS1_",
+        "CELLMARK_", "RTT_", "PAD_", "FS_", "WATCHDOG_", "SYNC_", NULL };
+    int match = 0;
+    for (int k = 0; known[k]; k++)
+        if (strncmp(kv, known[k], strlen(known[k])) == 0) { match = 1; break; }
+    if (!match) return 0;
+    return !(prefix && *prefix && strncmp(kv, prefix, strlen(prefix)) != 0);
+}
 
 /* Windows-only from here to the end of hang_watchdog. Snapshotting every
  * OTHER thread and reading its instruction pointer needs tlhelp32 plus
@@ -1149,18 +1193,7 @@ static void dbg_knobs(const char* prefix)
     if (!env) return;
     int n = 0;
     for (LPCH p = env; *p; p += strlen(p) + 1) {
-        const char* eq = strchr(p, '=');
-        if (!eq || eq == p) continue;
-        /* Only the runtime's own namespaces, not the whole shell environment. */
-        static const char* known[] = {
-            "PS3_", "SPU_", "SPURS_", "GCM_", "RSX_", "LD_", "YZ_", "YDKJ_",
-            "LBP_", "FLOW_", "RD_", "TEX_", "FP_", "VP_", "PPU_", "PS1_",
-            "CELLMARK_", "RTT_", "PAD_", "FS_", "WATCHDOG_", "SYNC_", NULL };
-        int match = 0;
-        for (int k = 0; known[k]; k++)
-            if (strncmp(p, known[k], strlen(known[k])) == 0) { match = 1; break; }
-        if (!match) continue;
-        if (prefix && *prefix && strncmp(p, prefix, strlen(prefix)) != 0) continue;
+        if (!dbg_knob_shown(p, prefix)) continue;
         dbg_printf("  %s%c", p, 10);
         n++;
     }
@@ -1498,6 +1531,9 @@ static void prof_print(unsigned samples, int by_rip)
         }
     }
 }
+#endif /* _WIN32: the console's Windows half, so far */
+
+/* From here to dbg_report_head: every platform (ps3_diag_report). */
 
 /* waits [s]: what guest threads spend their time inside, over s seconds.
  * Every lv2 syscall and HLE call is timed per (thread, call, r3); r3 is
@@ -1533,21 +1569,6 @@ static const char* sc_name(uint32_t n)
     case SYS_FS_LSEEK:            return "fs_lseek";
     default: return "";
     }
-}
-
-static void dbg_waits_report(double win_ms, unsigned rows);
-static void dbg_waits(unsigned sec, unsigned rows)
-{
-    memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
-    g_waits_dropped = 0;
-    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
-    const uint64_t a = ppu_waits_now();
-    g_waits_armed = 1;
-    Sleep(sec * 1000u);
-    g_waits_armed = 0;
-    const double win_ms = (double)(ppu_waits_now() - a) * 1000.0 / (double)f.QuadPart;
-    Sleep(100);   /* calls in flight at the close land */
-    dbg_waits_report(win_ms, rows);
 }
 
 static void dbg_waits_report(double win_ms, unsigned rows)
@@ -1631,6 +1652,59 @@ static void dbg_spuhist(unsigned img, unsigned want)
         dbg_printf("  t=%u %c img=%u a=0x%08X b=0x%08X c=0x%08X htid=%u%c", e->t_ms, e->op,
                    e->image, e->a, e->b, e->c, e->htid, 10);
     }
+}
+
+/* ps3_diag_report's first parts: frames, the last HLE call, every guest
+ * thread's state and last call, and the SPU programs' runs. */
+static void dbg_report_head(void)
+{
+    const long long since = ps3_ms_since_frame();
+    dbg_printf("frames %u (flip requests %u); ", (unsigned)g_frames_presented, cellGcm_flip_request_count());
+    if (since < 0) dbg_printf("no frame yet%c", 10);
+    else dbg_printf("the last frame %.1f s ago%c", (double)since / 1000.0, 10);
+    dbg_printf("last HLE call 0x%08X (%s)%c", g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "", 10);
+
+    dbg_printf("%c--- guest threads (lr: the last direct call; r11: the last syscall's number) ---%c", 10, 10);
+    for (int g = 0; g < PPU_THREAD_MAX; g++) {
+        const ppu_thread_info* t = &g_ppu_threads[g];
+        if (t->state == PPU_THREAD_STATE_FREE) continue;
+        const ppu_context* c = (g == 0 && g_ppu_main_ctx) ? g_ppu_main_ctx : &t->ctx;
+        const unsigned tid = (unsigned)c->thread_id;
+        const char* hle = tid < 64 ? g_hle_inflight[tid] : NULL;
+        const uint32_t sc = (uint32_t)c->gpr[11];
+        const char* scn = sc < 1024 ? sc_name(sc) : "";
+#ifdef _WIN32
+        char host[24];
+        snprintf(host, sizeof host, " host %-6lu", (unsigned long)t->host_tid);
+#else
+        const char* host = "";   /* the CPU table names host threads after their guest threads */
+#endif
+        dbg_printf("  %-3u %-28.28s %-8s%s cia=0x%08X lr=0x%08X r3=0x%08X r11=%u%s%s%s%s%c",
+                   tid, t->name,
+                   t->state == PPU_THREAD_STATE_RUNNING ? "running" :
+                   t->state == PPU_THREAD_STATE_FINISHED ? "finished" : "detached",
+                   host, (unsigned)c->cia, (unsigned)c->lr, (unsigned)c->gpr[3],
+                   (unsigned)sc, scn[0] ? " " : "", scn, hle ? "  in HLE " : "", hle ? hle : "", 10);
+    }
+
+    dbg_printf("%c--- SPU program runs per lifted image ---%c", 10, 10);
+    for (int k = 0; k < 64; k++)
+        if (g_spu_image_runs[k]) dbg_printf("  image %2d: %llu run(s)%c", k, g_spu_image_runs[k], 10);
+}
+
+#ifdef _WIN32   /* the console's Windows half, again: to the end of hang_watchdog */
+static void dbg_waits(unsigned sec, unsigned rows)
+{
+    memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
+    g_waits_dropped = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t a = ppu_waits_now();
+    g_waits_armed = 1;
+    Sleep(sec * 1000u);
+    g_waits_armed = 0;
+    const double win_ms = (double)(ppu_waits_now() - a) * 1000.0 / (double)f.QuadPart;
+    Sleep(100);   /* calls in flight at the close land */
+    dbg_waits_report(win_ms, rows);
 }
 
 static DWORD WINAPI debug_console(LPVOID param)
@@ -2168,32 +2242,7 @@ extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
                        (LPCSTR)&ps3_diag_report, &self);
     s_dbg_redirect = out;
 
-    const long long since = ps3_ms_since_frame();
-    dbg_printf("frames %u (flip requests %u); ", (unsigned)g_frames_presented, cellGcm_flip_request_count());
-    if (since < 0) dbg_printf("no frame yet%c", 10);
-    else dbg_printf("the last frame %.1f s ago%c", (double)since / 1000.0, 10);
-    dbg_printf("last HLE call 0x%08X (%s)%c", g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "", 10);
-
-    dbg_printf("%c--- guest threads (lr: the last direct call; r11: the last syscall's number) ---%c", 10, 10);
-    for (int g = 0; g < PPU_THREAD_MAX; g++) {
-        const ppu_thread_info* t = &g_ppu_threads[g];
-        if (t->state == PPU_THREAD_STATE_FREE) continue;
-        const ppu_context* c = (g == 0 && g_ppu_main_ctx) ? g_ppu_main_ctx : &t->ctx;
-        const unsigned tid = (unsigned)c->thread_id;
-        const char* hle = tid < 64 ? g_hle_inflight[tid] : NULL;
-        const uint32_t sc = (uint32_t)c->gpr[11];
-        const char* scn = sc < 1024 ? sc_name(sc) : "";
-        dbg_printf("  %-3u %-28.28s %-8s host %-6lu cia=0x%08X lr=0x%08X r3=0x%08X r11=%u%s%s%s%s%c",
-                   tid, t->name,
-                   t->state == PPU_THREAD_STATE_RUNNING ? "running" :
-                   t->state == PPU_THREAD_STATE_FINISHED ? "finished" : "detached",
-                   (unsigned long)t->host_tid, (unsigned)c->cia, (unsigned)c->lr, (unsigned)c->gpr[3],
-                   (unsigned)sc, scn[0] ? " " : "", scn, hle ? "  in HLE " : "", hle ? hle : "", 10);
-    }
-
-    dbg_printf("%c--- SPU program runs per lifted image ---%c", 10, 10);
-    for (int k = 0; k < 64; k++)
-        if (g_spu_image_runs[k]) dbg_printf("  image %2d: %llu run(s)%c", k, g_spu_image_runs[k], 10);
+    dbg_report_head();
 
     dbg_printf("%c--- CPU per host thread over %u s ---%c", 10, sample_sec, 10);
     memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
@@ -2271,10 +2320,100 @@ static DWORD WINAPI hang_watchdog(LPVOID)
     return 0;
 }
 #else
+/* ---- ps3_diag_report off Windows ----
+ * The same report less what needs a debugger's hold on other threads (the
+ * host threads' stacks, each thread's hot function). It was one line until
+ * the Linux report of Demon's Souls issue #502 (game sounds seconds late):
+ * nothing in it could say which thread waited on what. */
+
+/* The CPU table: each thread's time on a CPU over `sec` seconds and its time
+ * ready to run with no CPU free (the kernel's own counts, plat_thread_times),
+ * the most of both first. A thread that answers late while it waited long for
+ * a CPU was held up by the others; one that waited little, by what it waited
+ * on. Each by the name the kernel has for it: a guest thread's host thread
+ * carries the guest thread's name, an SPU group's its group's, cut to 15
+ * characters (the main thread keeps the program's). macOS has no table yet. */
+static void dbg_cpu_posix(unsigned sec)
+{
+    enum { MAXT = 512, ROWS = 32 };
+    static long tid[MAXT];
+    static uint64_t run0[MAXT], wait0[MAXT], run1[MAXT], wait1[MAXT];
+    static int kind[MAXT], ord[MAXT];
+    const int nt = plat_threads_list(tid, MAXT);
+    for (int i = 0; i < nt; i++) kind[i] = plat_thread_times(tid[i], &run0[i], &wait0[i]);
+    const int64_t t0 = plat_clock_now();
+    plat_sleep_us((uint64_t)sec * 1000000u);
+    const double wall_ns = (double)(plat_clock_now() - t0) * 1e9 / (double)plat_clock_freq();
+    if (nt <= 0) { dbg_printf("  (not on this platform yet)%c", 10); return; }
+    int n = 0, waits_known = 1;
+    double busy = 0;
+    for (int i = 0; i < nt; i++) {
+        if (!kind[i] || plat_thread_times(tid[i], &run1[i], &wait1[i]) != kind[i]) continue;   /* gone */
+        if (kind[i] < 2) waits_known = 0;
+        busy += (double)(run1[i] - run0[i]);
+        ord[n++] = i;
+    }
+    for (int a = 1; a < n; a++)   /* most time on a CPU plus waiting for one first */
+        for (int b = a; b > 0; b--) {
+            const int x = ord[b], y = ord[b - 1];
+            if ((run1[x] - run0[x]) + (wait1[x] - wait0[x]) <= (run1[y] - run0[y]) + (wait1[y] - wait0[y])) break;
+            ord[b] = y; ord[b - 1] = x;
+        }
+    dbg_printf("  %d threads, %.2f cores busy over %.1f s (cpu%% and waited%% = of one core)%s%c", n,
+               busy / wall_ns, wall_ns / 1e9, waits_known ? "" : "; this kernel does not count waits", 10);
+    dbg_printf("  %-7s %6s %8s  %s%c", "host", "cpu%", "waited%", "thread", 10);
+    for (int r = 0; r < n && r < ROWS; r++) {
+        const int i = ord[r];
+        const double cpu = 100.0 * (double)(run1[i] - run0[i]) / wall_ns;
+        const double waited = 100.0 * (double)(wait1[i] - wait0[i]) / wall_ns;
+        if (cpu + waited < 0.5) break;
+        char nm[32], who[64];
+        snprintf(who, sizeof who, "%s%s", plat_thread_name(tid[i], nm, sizeof nm) ? nm : "?",
+                 tid[i] == (long)getpid() ? " (the main thread)" : "");
+        char wcol[16];
+        if (kind[i] == 2) snprintf(wcol, sizeof wcol, "%.1f", waited);
+        else snprintf(wcol, sizeof wcol, "-");
+        dbg_printf("  %-7ld %6.1f %8s  %s%c", tid[i], cpu, wcol, who, 10);
+    }
+}
+
+/* As the Windows one above says, with the CPU table above; the calls each
+ * guest thread finished are counted over the same seconds. */
 extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
 {
-    (void)sample_sec;
-    if (out) fprintf(out, "(the runtime snapshot is not available on this platform yet)%c", 10);
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    if (!out) return;
+    if (!sample_sec) sample_sec = 1;
+    pthread_mutex_lock(&lock);
+    s_dbg_redirect = out;
+
+    dbg_report_head();
+
+    dbg_printf("%c--- CPU per host thread over %u s (waited: ready to run, with no CPU free) ---%c", 10,
+               sample_sec, 10);
+    memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
+    g_waits_dropped = 0;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const uint64_t w0 = ppu_waits_now();
+    g_waits_armed = 1;
+    dbg_cpu_posix(sample_sec);
+    g_waits_armed = 0;
+    const double win_ms = (double)(ppu_waits_now() - w0) * 1000.0 / (double)f.QuadPart;
+    Sleep(100);   /* calls in flight at the close land */
+    dbg_printf("%c--- calls each guest thread finished in that time (a call still blocked is not here) ---%c", 10, 10);
+    dbg_waits_report(win_ms, 30);
+
+    dbg_printf("%c--- SPU history, the last 60 events ---%c", 10, 10);
+    dbg_spuhist(0, 60);
+    dbg_printf("%c--- diagnostic knobs set ---%c", 10, 10);
+    int n = 0;
+    for (char** e = environ; e && *e; e++)
+        if (dbg_knob_shown(*e, NULL)) { dbg_printf("  %s%c", *e, 10); n++; }
+    dbg_printf("  (%d set; docs/DIAGNOSTICS.md lists all of them)%c", n, 10);
+
+    s_dbg_redirect = NULL;
+    fflush(out);
+    pthread_mutex_unlock(&lock);
 }
 #endif
 

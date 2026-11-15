@@ -1075,6 +1075,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
+#if defined(__linux__)
+    /* Named for the CPU table of a problem report on Linux (ps3_diag_report)
+     * and for a system monitor. */
+    pthread_setname_np(pthread_self(), "cellAudio mix");
+#endif
 #if AUDIO_BACKEND_SDL2
     /* Off Windows there is no MMCSS. At the default priority the mixer wakes
      * late when every core is busy (a fight on a 4-core handheld), and each

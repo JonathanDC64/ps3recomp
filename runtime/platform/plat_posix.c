@@ -350,6 +350,82 @@ void plat_core_keep(void)
     s_core_threads = n;
     core_sweep();
 }
+
+/* ---- The process's threads, as the kernel counts them (Linux) ------------- */
+
+int plat_threads_list(long* tids, int max)
+{
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return 0;
+    int n = 0;
+    for (struct dirent* e; n < max && (e = readdir(d)) != NULL;) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        tids[n++] = strtol(e->d_name, NULL, 10);
+    }
+    closedir(d);
+    return n;
+}
+
+/* schedstat is "<ns on a CPU> <ns waiting in a run queue> <timeslices>"
+ * (Documentation/scheduler/sched-stats.rst). A kernel built without
+ * CONFIG_SCHED_INFO has no such file; stat's fields 14 and 15 (user and
+ * system time, in clock ticks) still give the time on a CPU. Its field 2,
+ * the name, can hold spaces and brackets, so fields count from its last ')'.
+ * (A build with PLAT_THREAD_TIMES_NO_SCHEDSTAT reads stat alone: the test of
+ * that path, tests/plat_threads.) */
+int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns)
+{
+    char path[64], buf[512];
+    *run_ns = 0;
+    *wait_ns = 0;
+    FILE* f = NULL;
+#ifndef PLAT_THREAD_TIMES_NO_SCHEDSTAT
+    snprintf(path, sizeof path, "/proc/self/task/%ld/schedstat", tid);
+    f = fopen(path, "r");
+#endif
+    if (f) {
+        unsigned long long run = 0, wait = 0;
+        const int got = fscanf(f, "%llu %llu", &run, &wait);
+        fclose(f);
+        if (got == 2) {
+            *run_ns = run;
+            *wait_ns = wait;
+            return 2;
+        }
+    }
+    snprintf(path, sizeof path, "/proc/self/task/%ld/stat", tid);
+    f = fopen(path, "r");
+    if (!f) return 0;
+    const size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    const char* p = strrchr(buf, ')');
+    if (!p) return 0;
+    for (int field = 2; field < 14 && p; field++) p = strchr(p + 1, ' ');   /* to the space before field 14 */
+    if (!p) return 0;
+    char* end;
+    const unsigned long long utime = strtoull(p + 1, &end, 10);
+    const unsigned long long stime = strtoull(end, NULL, 10);
+    const long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) return 0;
+    *run_ns = (utime + stime) * (1000000000ull / (unsigned long long)hz);
+    return 1;
+}
+
+int plat_thread_name(long tid, char* out, size_t cap)
+{
+    if (!cap) return 0;
+    out[0] = 0;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/comm", tid);
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    const int got = fgets(out, (int)cap, f) != NULL;
+    fclose(f);
+    if (!got) { out[0] = 0; return 0; }
+    out[strcspn(out, "\n")] = 0;
+    return out[0] != 0;
+}
 #endif
 
 #else

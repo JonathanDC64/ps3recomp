@@ -233,6 +233,18 @@ static void* ppu_host_thread_proc(void* param)
 #else
     { const int lv = ppu_host_raise_level(info->priority, info->name); if (lv) ppu_host_raise_self(lv); }
 #endif
+#if defined(__linux__)
+    /* The host thread takes the guest thread's name (its first 15
+     * characters), so the CPU table of a problem report on Linux
+     * (ps3_diag_report) and a system monitor can tell the guest's threads
+     * apart. The main thread, which runs on the boot thread, keeps the
+     * program's name. */
+    if (info->name[0]) {
+        char n[16];
+        snprintf(n, sizeof n, "%s", info->name);
+        pthread_setname_np(pthread_self(), n);
+    }
+#endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
