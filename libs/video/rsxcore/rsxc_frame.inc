@@ -1,5 +1,36 @@
 static int s_vp_topo_strip;   /* the VP pass's topology is TRIANGLESTRIP */
 
+/* RSX_RF_THREAD=1 (live, off by default): the replay of a recorded batch -- the
+ * VP pass, the post passes, the submit, the Present -- runs on a thread of its
+ * own while the FIFO thread goes on walking the next frame's commands. What
+ * reads guest memory (the pre-pass: texture uploads, the fragment programs,
+ * the targets' checks) stays on the FIFO thread, as do the end-of-frame resets;
+ * the next render_frame waits for the replay first, and so does everything else
+ * that uses the GPU objects (wait_for_gpu, the overlay's repaint, a counted
+ * batch's ZPASS report). What the replay reads that the FIFO thread goes on
+ * changing is in the job: the draw records (two lists), the parity half, the
+ * index buffer, the ZPASS events. Without the knob a batch runs on the FIFO
+ * thread, in the same order as before. */
+typedef struct RfJob {
+    u32 fi;                     /* the frame slot */
+    gpu_cmd* rc;
+    gpu_pass disp_pass;
+    double rf0;                 /* render_frame's start (PERF=1) */
+    D3D12DrawRecord* draws;     /* this batch's records */
+    u32 n;                      /* s_d3d.draw_count */
+    u32 par;                    /* s_d3d.vp_parity */
+    int present;                /* s_present_this_frame */
+    gpu_buffer ib;              /* s_rc_vp_ib, s_vp_icap: vp_ib_grow may replace them */
+    u32 icap;
+    int threaded;               /* 1: the replay thread runs it */
+    const RcZqEv* ev;           /* the batch's ZPASS events, as zq_counted_in reads them */
+    int zq_nev, zq_on_start;
+    RcZqEv ev_copy[ZQ_EV_MAX];  /* the events of a threaded batch: zq_hook goes on adding */
+} RfJob;
+static RfJob s_rf_job;
+static int s_rf_at_flip;        /* render_frame is at a guest flip (d3d12_fifo_flip) */
+static u32 s_rf_thr, s_rf_inl;  /* batches each way, for GCM_RATES */
+
 /* The first entry of draw d's SRV window in this batch's set (s_rf_buf: its
  * parity half's with frames in flight, the one set without). */
 static inline u32 draw_srv(u32 d)
@@ -10,7 +41,7 @@ static inline u32 draw_srv(u32 d)
 /* The VP pass's binds for the whole batch: at its start, and again after
  * each part RSX_SUBMIT_SPLIT submits (a part's submit drops every bind,
  * gpu.h's cmd_split). Each draw binds the rest itself. */
-static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso)
+static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso, const RfJob* j)
 {
     gpu_cmd_set_layout(rc, s_d3d.vp_layout);
     gpu_cmd_set_pipeline(rc, vpso);
@@ -30,11 +61,11 @@ static void vp_pass_binds(gpu_cmd* rc, gpu_pipeline vpso)
     /* vp_vb's and vf_buf's first chunks (rc_arena: no parity offset, the
      * arena keeps the frames apart); render_frame's draws bind another
      * chunk when theirs lies outside. */
-    gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, 0), (u32)s_vb.half, 256);   /* 16 float4 attrib slots */
-    if (GPU_VALID(s_rc_vp_ib))
-        gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, s_rc_vp_ib) + (u64)s_d3d.vp_parity * s_vp_icap * 4,
-                       s_vp_icap * 4, GPU_FORMAT_R32_UINT);
-    if (s_vf_cap) gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, 0));
+    gpu_cmd_set_vb(rc, 0, rc_arena_base_par(&s_vb, 0, j->par), (u32)s_vb.half, 256);   /* 16 float4 attrib slots */
+    if (GPU_VALID(j->ib))
+        gpu_cmd_set_ib(rc, gpu_buffer_addr(s_rc_dev, j->ib) + (u64)j->par * j->icap * 4,
+                       j->icap * 4, GPU_FORMAT_R32_UINT);
+    if (s_vf_cap) gpu_cmd_bind_raw(rc, 4, rc_arena_base_par(&s_vf, 0, j->par));
 }
 
 /* RSX_SUBMIT_SPLIT=<records> (live, 0 = off): a batch goes to the GPU in
@@ -50,8 +81,1359 @@ static u32 submit_split_draws(void)
     return n > 0 ? (u32)n : 0u;
 }
 
+/* The VP pass. On the FIFO thread, or on the replay thread (RSX_RF_THREAD):
+ * everything it reads of the batch comes from the job. */
+static void rf_vp_pass(RfJob* const j)
+{
+    const u32 fi = j->fi;
+    gpu_cmd* const rc = j->rc;
+    const gpu_pass disp_pass = j->disp_pass;
+    D3D12DrawRecord* const draws = j->draws;
+    RF_CP(5);
+    /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
+     * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
+    if (s_d3d.vp_ready && j->n > 0) {
+        int any = 0;
+        for (u32 d = 0; d < j->n && d < MAX_DRAWS; d++)
+            if (draws[d].is_vp) { any = 1; break; }
+        /* The colour-only PS (untextured 3D, vkcube); the atlas's sampling PS
+         * when there is none. (With no atlas upload, step C8a, there is no
+         * atlas for that PS to sample.) */
+        gpu_pipeline vpso = s_d3d.pipeline_state_vp_color;
+        if (!vpso.v) vpso = s_d3d.pipeline_state_vp;
+        { static int cap = -1, n = 0;
+          PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
+          if (cap && n < cap) { n++;
+            u32 nvp = 0, nclr = 0;
+            for (u32 d2 = 0; d2 < j->n && d2 < MAX_DRAWS; d2++) {
+                if (draws[d2].is_vp)    nvp++;
+                if (draws[d2].is_clear) nclr++;
+            }
+            fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
+                    j->n, nvp, nclr, any,
+                    (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
+        /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
+         * allocation failed. The pass is skipped rather than faulting.) */
+        if (any && vpso.v && s_vb.n && s_rc_vpcb.n) {
+            s_vp_topo_strip = 0;
+            s_split_running = 0;   /* (the last batch's parts: gpu_draws_may_run) */
+            vp_pass_binds(rc, vpso, j);
+            const u32 split_n = submit_split_draws();
+            u32 split_from = 0;                    /* the record the part being recorded starts at */
+            u32 split_parts = 1;
+            /* The bound chunks, the first of each after vp_pass_binds. vp_vb's
+             * is the virtual [vb_lo, vb_hi); a draw in another one binds that
+             * (rare: a frame past one chunk's vertices). The fetch draws' is
+             * the virtual [vf_lo, vf_lo + vf_in) at t20 (rc_arena; vf_in 0 while
+             * t20 holds another buffer): a draw whose fdesc lies outside binds
+             * its own, so a draw costs a compare, and a bind only where the
+             * frame crossed a chunk's end. */
+            u32 vb_chunk = 0;
+            u64 vb_lo = 0, vb_hi = s_vb.half;
+            u32 vf_lo = 0, vf_in = s_vf_cap;
+            int cur_rt = -1;                       /* target A: -1 = backbuffer */
+            float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
+            /* its host size over guest size (RSX_SCALE). The batch starts on the display
+             * buffer, already bound: a batch that never changes target (a loading
+             * screen) draws with this ratio, and at 1.0 it drew at the guest size, in
+             * the top-left quarter of every other frame. */
+            float tgt_sx = (float)s_d3d.host_w / (float)s_d3d.width;
+            float tgt_sy = (float)s_d3d.host_h / (float)s_d3d.height;
+            float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
+            int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
+            int cur_z = -1;                        /* zeta: -1 = shared buffer  */
+            int cur_zro = 0;                       /* cur_z bound read-only     */
+            int cur_nocol = 0;                     /* depth-only pass bound     */
+            double _rec0 = perf_on() ? perf_now() : 0.0;
+            int seen_small_vp = 0, captured = 0;
+            /* DRAW_SKIP=a-b (live, diagnostic): leave out the frame's ops a..b
+             * (manifest op numbers), to bisect which op hides or breaks a
+             * later one. Mostly for rsx_replay. */
+            static unsigned skip_gen; static u32 skip_a = 1, skip_b = 0;
+            if (skip_gen != ps3_env_gen) { const char* e = getenv("DRAW_SKIP");
+                skip_gen = ps3_env_gen; skip_a = 1; skip_b = 0;
+                if (e && sscanf(e, "%u-%u", &skip_a, &skip_b) == 1) skip_b = skip_a; }
+            /* RSX_AA: this batch's anti-aliasing pass, on target aa_t before
+             * op aa_before (aa_pick). A batch with fewer draws than a 3D
+             * frame needs is left alone and not logged: Demon's Souls shows
+             * every other present from a one-op batch that copies the last
+             * frame out again, which would make the log alternate. */
+            hdr_mark_scan(draws, j->n);
+            int aa_t = -1;
+            u32 aa_before = 0;
+            if (!aa_mode() || knob_aa_at_present())
+                s_aa.log_valid = 0;   /* when it comes back on, log the first choice */
+            else if (j->present && j->n >= AA_MIN_SCENE) {
+                int why = AA_RUN;
+                aa_t = aa_pick(draws, j->n, &aa_before, &why);
+                aa_log(draws, j->n, aa_t, aa_before, why);
+            }
+            /* Read once for the loop (step C7): the device, the texture pool and
+             * the constant buffers' addresses, made at init and fixed through a
+             * frame, so a draw's binds look nothing up (today's took gh_base and
+             * the srv_inc it was given). */
+            gpu_device* const rdev = s_rc_dev;
+            const gpu_table_pool rsrv = s_rc_srv_pool;
+            /* The constants' chunks (made at record time, none while the
+             * frame renders), this frame's half's offset in each, and how
+             * many vp_fpcb has (0: none, slot 2 is not bound). */
+            const gpu_addr* const cb_va = s_rc_vpcb.va;
+            const gpu_addr* const fpcb_va = s_rc_fpcb.va;
+            const u64 cb_par = (u64)j->par * s_rc_vpcb.half;
+            const u64 fpcb_par = (u64)j->par * s_rc_fpcb.half;
+            const u32 fpcb_n = s_rc_fpcb.n;
+            /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
+             * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
+            for (u32 d = 0; d < j->n && d < MAX_DRAWS; d++) {
+                const D3D12DrawRecord* dr = &draws[d];
+                if (!dr->is_vp) continue;
+                /* The pass binds its own pipeline. Then the VP pass's state
+                 * goes back: its root signature, which drops every root
+                 * argument (vf_buf's is set again here, the rest per draw
+                 * below), its topology, and the targets bound now. */
+                if (aa_t >= 0 && d >= aa_before) {
+                    if (aa_run_rt(aa_t)) {
+                        gpu_cmd_set_layout(rc, s_d3d.vp_layout);
+                        if (s_vf_cap) {   /* the chunk bound before */
+                            gpu_cmd_bind_raw(rc, 4, rc_arena_base_par(&s_vf, vf_lo >> s_vf_shift, j->par));
+                            vf_in = s_vf_cap;
+                        }
+                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
+                        s_vp_topo_strip = 0;
+                        gpu_pass ap;
+                        ap.nrt = 0;
+                        if (!cur_nocol) {
+                            ap.rt[ap.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
+                            for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
+                                ap.rt[ap.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
+                        }
+                        ap.ds = cur_z < 0 ? s_rc_depth_dsv
+                              : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
+                        gpu_cmd_pass_begin(rc, &ap);
+                    }
+                    aa_t = -1;
+                }
+                if (d >= skip_a && d <= skip_b && !dr->is_clear) continue;
+                /* The reduced-viewport passes (this title's reflection, drawn
+                 * into a region of the same target) finish here -- snapshot
+                 * before the full-screen scene overwrites them. */
+                if (!dr->is_clear && dr->ctgt) {
+                    if (dr->vp_w && dr->vp_w < s_d3d.width) {
+                        seen_small_vp = 1;
+                        subvp_note(dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h);
+                    }
+                    else if (seen_small_vp && !captured &&
+                             dr->vp_w == s_d3d.width && dr->rt_off == 0) {
+                        captured = 1;
+                        screen_copy_capture(fi);
+                        subvp_capture(fi);
+                        gpu_cmd_pass_begin(rc, &disp_pass);
+                    }
+                }
+                /* Render-to-texture: retarget when this op's surfaces differ.
+                 * Depth is a single shared buffer, so clear it per switch. */
+                int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
+                /* Remember where geometry actually went: off_rt_find() matches
+                 * on offset alone and slots share offsets at different sizes,
+                 * so the composite cannot just look the source up by address. */
+                if (want >= 0) { s_last_drawn_slot = want; s_last_drawn_off = dr->rt_off; }
+                int wantm[3];
+                for (int _m = 0; _m < 3; _m++)
+                    wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
+                /* Depth follows the op's zeta when it has one; ops without a
+                 * depth surface (or not using depth) keep the shared buffer. */
+                int wz = dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u))
+                       ? zeta_find(dr->zeta) : -1;
+                if (wz < 0 && cur_z >= 0 && !(dr->depth & 1u) && !(dr->clr_flags & 3u))
+                    wz = cur_z;   /* depth unused: don't rebind just to drop it */
+                /* A draw that samples the depth surface it is bound to and does
+                 * not write depth (Demon's Souls's light shafts test against
+                 * the scene depth and fade by it) binds it read-only, so it can
+                 * be a depth target and a texture at once, as on RSX. */
+                int wro = 0;
+                if (wz >= 0 && !(dr->depth & 2u) && !(dr->clr_flags & 3u))
+                    for (int _u = 0; _u < RSX_FP_UNITS; _u++)
+                        if (dr->tex_z[_u] == wz) { wro = 1; break; }
+                /* Colour target NONE: a depth-only pass. It binds no colour
+                 * target and takes the depth surface's size -- bound to the
+                 * backbuffer, the 2048x2048 shadow atlas was clipped to the
+                 * window and its cascade viewports fell back to full-target. */
+                const int nocol = dr->ctgt == 0;
+                if (want != cur_rt || wantm[0] != cur_m[0] ||
+                    wantm[1] != cur_m[1] || wantm[2] != cur_m[2] || wz != cur_z ||
+                    wro != cur_zro || nocol != cur_nocol) {
+                    gpu_pass tp;   /* the op's targets (views: step C5a) */
+                    tp.ds = wz < 0 ? s_rc_depth_dsv : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
+                    if (wz >= 0) zeta_transition(wz, wro ? ZETA_READ_STATE
+                                                         : GPU_STATE_DEPTH_WRITE);
+                    tp.nrt = 1;
+                    tp.rt[0] = s_rc_rt_rtv[fi];
+                    gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
+                    float gw = (float)s_d3d.width, gh = (float)s_d3d.height;   /* the guest's size of it */
+                    if (want >= 0) {
+                        off_rt_transition(want, GPU_STATE_RENDER_TARGET);
+                        tp.rt[0] = s_d3d.off_rt[want].rtv;
+                        vp.width  = (float)s_d3d.off_rt[want].hw;
+                        vp.height = (float)s_d3d.off_rt[want].hh;
+                        gw = (float)s_d3d.off_rt[want].w;
+                        gh = (float)s_d3d.off_rt[want].h;
+                    }
+                    for (int _m = 0; _m < 3 && wantm[_m] >= 0; _m++) {
+                        off_rt_transition(wantm[_m], GPU_STATE_RENDER_TARGET);
+                        tp.rt[tp.nrt++] = s_d3d.off_rt[wantm[_m]].rtv;
+                    }
+                    if (nocol) {
+                        tp.nrt = 0;
+                        vp.width  = wz >= 0 ? (float)s_zeta[wz].hw : (float)s_d3d.host_w;
+                        vp.height = wz >= 0 ? (float)s_zeta[wz].hh : (float)s_d3d.host_h;
+                        gw = wz >= 0 ? (float)s_zeta[wz].w : (float)s_d3d.width;
+                        gh = wz >= 0 ? (float)s_zeta[wz].h : (float)s_d3d.height;
+                    }
+                    const gpu_rect sc = {0, 0, (int32_t)vp.width, (int32_t)vp.height};
+                    vp_last_w = gw; vp_last_h = gh;
+                    tgt_sx = vp.width / gw; tgt_sy = vp.height / gh;
+                    gpu_cmd_pass_begin(rc, &tp);
+                    gpu_cmd_set_viewport(rc, &vp);
+                    gpu_cmd_set_scissor(rc, &sc);
+                    /* The shared buffer stands in for "no guest depth surface",
+                     * so it starts each target fresh; a zeta keeps its content. */
+                    if (wz < 0)
+                        gpu_cmd_clear_depth(rc, s_rc_depth_dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0,
+                                            NULL);
+                    cur_z = wz;
+                    cur_zro = wro;
+                    cur_nocol = nocol;
+                    /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
+                     * at the moment they bind it. The guest's own clears may go
+                     * to a different surface entirely (they do here: clears to
+                     * 0xAB0000, draws to 0x1BE0000), so clearing on the clear
+                     * path tests the wrong target. Anything not magenta
+                     * afterwards was rasterised. */
+                    { static int cd2 = -1;
+                      PS3_KNOB(cd2, ps3_env_int("RT_CLEARDBG", 0));
+                      if (cd2 >= 2 && want >= 0) {
+                          const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+                          gpu_cmd_clear_color(rc, s_d3d.off_rt[want].rtv, mag, NULL);
+                      } }
+                    /* VP_TESTTRI=1: our own triangle, through the game's exact
+                     * pipeline -- same vpso, same root signature, same vertex
+                     * buffer, same RTV just bound. Written at vertex 1000 so it
+                     * cannot collide with the guest's data. Pair with
+                     * VP_BYPASS=1 so the shader is a trivial passthrough.
+                     *
+                     * If this renders, the GPU does read vp_vb and the fault is
+                     * in the guest draws' own state. If it does not, nothing
+                     * this backend draws reaches a render target at all. */
+                    { static int tt = -1;
+                      PS3_KNOB(tt, ps3_env_int("VP_TESTTRI", 0));
+                      if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
+                          float* vtx = (float*)rc_arena_ptr(&s_vb, vb_lo + (u64)1000 * 256u);
+                          static const float tri[3][4] = {
+                              {-2.0f, -2.0f, 0.0f, 1.0f},
+                              { 2.0f, -2.0f, 0.0f, 1.0f},
+                              { 0.0f,  2.0f, 0.0f, 1.0f} };
+                          for (int _v = 0; _v < 3; _v++) {
+                              float* dstv = vtx + (size_t)_v * (256u / 4u);
+                              dstv[0] = tri[_v][0]; dstv[1] = tri[_v][1];
+                              dstv[2] = tri[_v][2]; dstv[3] = tri[_v][3];
+                          }
+                          gpu_cmd_draw(rc, 3, 1, 1000, 0);
+                          { static int _n = 0;
+                            if (_n < 3 && ++_n) fprintf(stderr, "[TESTTRI] issued on rt=%d off=0x%08X%c",
+                                                  want, s_d3d.off_rt[want].off, 10); }
+                      } }
+                    cur_rt = want;
+                    for (int _m = 0; _m < 3; _m++) cur_m[_m] = wantm[_m];
+                }
+                if (dr->is_clear && (dr->clr_flags & 3u) && cur_z >= 0) {
+                    const u32 zf = ((dr->clr_flags & 1u) ? GPU_CLEAR_DEPTH : 0) |
+                                   ((dr->clr_flags & 2u) ? GPU_CLEAR_STENCIL : 0);
+                    gpu_cmd_clear_depth(rc, zeta_dsv(cur_z), zf, dr->clr_z, (uint8_t)dr->clr_s, NULL);
+                }
+                if (dr->is_clear && (!(dr->clr_flags & 0xF0u) || nocol)) continue;   /* depth/stencil only */
+                if (dr->is_clear) {
+                    const gpu_view rh = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
+                    /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
+                     * than the guest colour. "0.000% nonzero" cannot tell an
+                     * untouched surface from one written black, and that
+                     * ambiguity invalidates every read of an offscreen target.
+                     * If the surface comes back magenta the clears land and the
+                     * draws are writing black; if it stays black, nothing
+                     * reaches it at all. */
+                    { static int cd = -1;
+                      PS3_KNOB(cd, ps3_env_int("RT_CLEARDBG", 0));
+                      if (cd && cur_rt >= 0) {
+                          const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+                          gpu_cmd_clear_color(rc, rh, mag, NULL);
+                      } else
+                          gpu_cmd_clear_color(rc, rh, dr->cc, NULL); }
+                    for (int _m = 0; _m < 3; _m++)
+                        if (cur_m[_m] >= 0)
+                            gpu_cmd_clear_color(rc, s_d3d.off_rt[cur_m[_m]].rtv, dr->cc, NULL);
+                    continue;
+                }
+                /* RSX_SUBMIT_SPLIT: the part so far goes to the GPU before this
+                 * draw, and the rest goes on in the same targets, as the AA
+                 * pass's return binds them (no query is open: each draw's ends
+                 * with it). */
+                if (split_n && d - split_from >= split_n && j->n - d >= split_n &&
+                    !gpu_cmd_split(rdev, rc, NULL)) {
+                    split_from = d;
+                    split_parts++;
+                    s_split_running = 1;
+                    vp_pass_binds(rc, vpso, j);
+                    vb_chunk = 0; vb_lo = 0; vb_hi = s_vb.half;   /* the first chunks again */
+                    vf_lo = 0; vf_in = s_vf_cap;
+                    gpu_pass sp;
+                    sp.nrt = 0;
+                    if (!cur_nocol) {
+                        sp.rt[sp.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
+                        for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
+                            sp.rt[sp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
+                    }
+                    sp.ds = cur_z < 0 ? s_rc_depth_dsv : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
+                    gpu_cmd_pass_begin(rc, &sp);
+                }
+                /* Per-draw pipeline: prefer the guest's own compiled FP; fall
+                 * back to the hardcoded atlas/colour PS pair. The pre-pass
+                 * looked it up already and kept it in the record.
+                 * RSX_PSO_IN_REC (live): 1 (default) binds the record's,
+                 * 0 looks it up again here, 2 does both and reports a
+                 * difference. A draw whose pre-pass lookup failed looks
+                 * again, as before. */
+                static int pso_in_rec = -1;
+                PS3_KNOB(pso_in_rec, ps3_env_int("RSX_PSO_IN_REC", 1));
+                gpu_pipeline dpso = {0};
+                if (dr->fp_addr) {
+                    if (pso_in_rec && dr->pso.v && dr->pso_serial == s_rf_serial) dpso = dr->pso;
+                    if (!j->threaded && (!dpso.v || pso_in_rec == 2)) {
+                        const gpu_pipeline look =
+                            vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
+                                          dr_num_rts(dr),
+                                          dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
+                                                     : GPU_FORMAT_R8G8B8A8_UNORM,
+                                          dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                          dr_cube_mask(dr), dr->d2c_mask,
+                                          s_uvc_vs && !dr->uvc ? 0u : dr_uvclamp(dr), dr_hdrv(dr));
+                        if (dpso.v && look.v != dpso.v) {
+                            static int n = 0;
+                            if (n < 8) {
+                                n++;
+                                fprintf(stderr, "[PSO] draw %u: the record's pipeline differs "
+                                                "from a new lookup (frame %llu)\n",
+                                        d, (unsigned long long)s_d3d.frame_count);
+                            }
+                        }
+                        dpso = look;
+                    }
+                }
+                gpu_cmd_set_pipeline(rc, dpso.v ? dpso : vpso);
+                /* Per-draw viewport: the guest rect when sane, else the
+                 * full target. Scissor tracks the same rect. */
+                {
+                    float tw = cur_nocol ? vp_last_w
+                             : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
+                    float th = cur_nocol ? vp_last_h
+                             : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
+                    gpu_viewport dvp = {0, 0, tw, th, 0.0f, 1.0f};
+                    if (dr->vp_w >= 2 && dr->vp_h >= 2 &&
+                        (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
+                        (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
+                        dvp.x      = (float)dr->vp_x;
+                        dvp.y      = (float)dr->vp_y;
+                        dvp.width  = (float)dr->vp_w;
+                        dvp.height = (float)dr->vp_h;
+                    }
+                    gpu_rect dsc = {(int32_t)dvp.x, (int32_t)dvp.y,
+                                    (int32_t)(dvp.x + dvp.width),
+                                    (int32_t)(dvp.y + dvp.height)};
+                    dvp_x = dvp.x;     dvp_y = dvp.y;
+                    dvp_w = dvp.width; dvp_h = dvp.height;
+                    if (tgt_sx != 1.0f || tgt_sy != 1.0f) {   /* RSX_SCALE: the guest rect, scaled */
+                        dvp.x *= tgt_sx; dvp.width  *= tgt_sx;
+                        dvp.y *= tgt_sy; dvp.height *= tgt_sy;
+                        dsc.left   = lroundf(dvp.x);
+                        dsc.top    = lroundf(dvp.y);
+                        dsc.right  = lroundf(dvp.x + dvp.width);
+                        dsc.bottom = lroundf(dvp.y + dvp.height);
+                    }
+                    gpu_cmd_set_viewport(rc, &dvp);
+                    gpu_cmd_set_scissor(rc, &dsc);
+                }
+                /* Per-draw textures: bind this draw's SRV window.
+                 * Any sampled offscreen RT transitions to PSR first (never
+                 * one of the currently-bound colour targets). */
+                for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
+                    int tz = dr->tex_z[_u];
+                    if (tz >= 0) {
+                        if (tz == cur_z && cur_zro)   /* bound read-only: readable */
+                            ;
+                        else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
+                            srv_write(draw_srv(d) + (u32)_u, k_rc_no_tex,
+                                      GPU_FORMAT_R8G8B8A8_UNORM,
+                                      GPU_SWIZZLE_IDENTITY);
+                            fpwatch_unreadable(dr->fp_addr);
+                        }
+                        else
+                            zeta_transition(tz, GPU_STATE_PIXEL_SHADER_RESOURCE);
+                        continue;
+                    }
+                    int rt = dr->tex_rt[_u];
+                    if (rt < 0) continue;
+                    if (rt != cur_rt &&
+                        rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2]) {
+                        off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
+                        continue;
+                    }
+                    /* Sampling a bound colour target: read a copy (above). */
+                    srv_write(draw_srv(d) + (u32)_u, off_rt_snapshot(rt),
+                              (gpu_format)s_d3d.off_rt[rt].dxgi,
+                              GPU_SWIZZLE_IDENTITY);
+                }
+                gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, draw_srv(d)));
+                vp_bind_sampler_table(dr);
+                /* Per-draw constants: this draw's vp_cb bank + FP texscale
+                 * block, each in its chunk (a shift and a mask: no divide). */
+                gpu_cmd_bind_cb(rc, 0, cb_va[dr->vcb_slot >> VP_CB_CHUNK_SHIFT] + cb_par
+                    + (u64)(dr->vcb_slot & VP_CB_CHUNK_MASK) * VP_CB_STRIDE);
+                if ((dr->cb_slot >> VP_FPCB_CHUNK_SHIFT) < fpcb_n)
+                    gpu_cmd_bind_cb(rc, 2, fpcb_va[dr->cb_slot >> VP_FPCB_CHUNK_SHIFT] + fpcb_par
+                        + (u64)(dr->cb_slot & VP_FPCB_CHUNK_MASK) * VP_FPCB_STRIDE);
+                /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
+                 * the target they are aimed at. A zero vertex count, or a start
+                 * vertex past the buffer, rasterises nothing while every other
+                 * check upstream still says the draw is fine. */
+                { static int dcap = -1, dn = 0;
+                  PS3_KNOB(dcap, ps3_env_int("DRAWARGS", 0));
+                  if (dcap && dn < dcap) { dn++;
+                      fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d rec=0x%08X bound=0x%08X"
+                              " tex0=0x%08X texrt=%d dvp=%.0f,%.0f %.0fx%.0f%c",
+                              dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
+                              dr->rt_off,
+                              (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].off : 0u,
+                              dr->tex[0].raw, dr->tex_rt[0],
+                              (double)dvp_x, (double)dvp_y,
+                              (double)dvp_w, (double)dvp_h, 10); } }
+                /* RT_REBIND=1: re-issue OMSetRenderTargets immediately before
+                 * every draw instead of only when the target changes. A clear
+                 * proves the RTV descriptor is good but not that the binding is
+                 * still live at draw time -- ClearRenderTargetView writes
+                 * through the descriptor and never consults the OM. If anything
+                 * between the retarget and here drops the binding, this restores
+                 * it. */
+                { static int rb = -1;
+                  PS3_KNOB(rb, ps3_env_int("RT_REBIND", 0));
+                  if (rb) {
+                      gpu_pass bp;
+                      bp.nrt = 1;
+                      bp.rt[0] = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
+                      for (int _m = 0; _m < 3; _m++)
+                          if (cur_m[_m] >= 0) bp.rt[bp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
+                      bp.ds = s_rc_depth_dsv;
+                      gpu_cmd_pass_begin(rc, &bp);
+                  } }
+                /* A fetch draw reads its descriptor's chunk at t20 (vf_lo); a
+                 * clamp draw of converted vertices leaves its vp_vb chunk there,
+                 * so the next fetch draw binds its own again. */
+                if (dr->fetch && dr->fdesc - vf_lo >= vf_in) {
+                    vf_lo = dr->fdesc >> s_vf_shift << s_vf_shift;
+                    vf_in = s_vf_cap;
+                    gpu_cmd_bind_raw(rc, 4, rc_arena_base_par(&s_vf, dr->fdesc >> s_vf_shift, j->par));
+                } else if (dr->uvc && !dr->fetch) vf_in = 0;
+                { int zq = -1;
+                  if (g_rsx_report_hook && (j->zq_nev || j->zq_on_start) &&
+                      s_zq_n < ZQ_MAX && zq_counted_in(j->ev, j->zq_nev, j->zq_on_start, dr->cb_slot) && zq_ready()) {
+                      zq = s_zq_n++;
+                      s_zq_rec[zq] = dr->cb_slot;
+                      s_zq_area[zq] = tgt_sx * tgt_sy;
+                      /* The batch's queries are reset before its first one
+                       * (Vulkan's rule; nothing on D3D12). */
+                      if (!zq) gpu_cmd_query_reset(rc, s_zq_pool, 0, ZQ_MAX);
+                      gpu_cmd_query_begin(rc, s_zq_pool, (u32)zq);
+                  }
+                if (dr->uvc) {
+                    /* Step V5: the clamp's vertex-shader form, a list of its
+                     * triangles' corners (uvc_table); t20 as the table's ring,
+                     * and back to vf_buf for the draws after. With no
+                     * pipeline it is not drawn (the fallback reads vertices). */
+                    if (!dr->fetch)   /* (the chunk that holds the draw's vertices and table) */
+                        gpu_cmd_bind_raw(rc, 4, rc_arena_base_par(&s_vb, rc_arena_chunk(&s_vb, dr->vb_byte_offset), j->par));
+                    gpu_cmd_push_const1(rc, 5, dr->uvc_tab, 0);
+                    if (s_vp_topo_strip) {
+                        s_vp_topo_strip = 0;
+                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
+                    }
+                    dred_mark(d, dr);
+                    if (dpso.v && dr->uvc_n) gpu_cmd_draw(rc, dr->uvc_n, 1, 0, 0);
+                    { static u32 said;   /* the first of each kind */
+                      const u32 kind = 1u << (dr->fetch ? 1 + dr->fetch : dr->index_count ? 1 : 0);
+                      if (!(said & kind)) {
+                          said |= kind;
+                          printf("[D3D12] sprite-edge clamp in the vertex shader: a draw %s, %u vertices\n",
+                                 dr->fetch == 2 ? "of a fetch strip" : dr->fetch ? "of a fetch list"
+                                 : dr->index_count ? "indexed" : "not indexed", dr->uvc_n);
+                      } }
+                } else {
+                    if (dr->fetch)   /* the records' offset in the chunk bound */
+                        gpu_cmd_push_const1(rc, 5, dr->fdesc - vf_lo, 0);
+                    /* A strip draw's indices are a strip (vf_strip_native). */
+                    if ((dr->fetch == 2) != s_vp_topo_strip) {
+                        s_vp_topo_strip = dr->fetch == 2;
+                        gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
+                    }
+                    /* vp_vb's chunk with the draw's vertices, when it is
+                     * not the one bound (a compare per draw, no divide). */
+                    if (!dr->fetch && (dr->vb_byte_offset < vb_lo || dr->vb_byte_offset >= vb_hi)) {
+                        vb_chunk = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
+                        vb_lo = vb_chunk >= RC_ARENA_MAX ? s_vb_big : (u64)vb_chunk * s_vb.half;
+                        vb_hi = vb_lo + rc_arena_size(&s_vb, vb_chunk);
+                        gpu_cmd_set_vb(rc, 0, rc_arena_base_par(&s_vb, vb_chunk, j->par), (u32)rc_arena_size(&s_vb, vb_chunk), 256);
+                    }
+                    const u32 vb_first = dr->fetch ? 0 : (u32)((dr->vb_byte_offset - vb_lo) / 256);
+                    dred_mark(d, dr);
+                    if (dr->index_count)
+                        gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count),
+                                             dr->ib_first, (int32_t)vb_first, 0);
+                    else
+                        gpu_cmd_draw(rc, dr->vertex_count, 1, vb_first, 0);
+                }
+                  if (zq >= 0)
+                      gpu_cmd_query_end(rc, s_zq_pool, (u32)zq); }
+                /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
+                 * "records exist" and "draws were submitted" are different
+                 * claims, and every blank-output investigation conflates them. */
+                { static int cap = -1, n = 0;
+                  PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
+                  if (cap && n < cap) { n++;
+                    fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
+                            d, dr->vertex_count, dpso.v ? "guest-fp" : "fallback",
+                            dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
+                            dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10);
+                    fprintf(stderr, "            vs_idx=%d cb_slot=%u vbofs=%u cull=%u blend=%d%c",
+                            dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
+                            dr->cull, dr->blend, 10); } }
+            }
+            if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
+            fpwatch_batch(draws, j->n);
+            { static int said;   /* RSX_SUBMIT_SPLIT: the first batch that went in parts */
+              if (split_parts > 1 && !said) {
+                  said = 1;
+                  printf("[D3D12] RSX_SUBMIT_SPLIT=%u: batch %u went to the GPU in %u parts (%u records)\n",
+                         split_n, s_rf_serial, split_parts, j->n);
+              } }
+            /* Leave the backbuffer bound for the dump/present epilogue. */
+            if (cur_rt >= 0) {
+                gpu_cmd_pass_begin(rc, &disp_pass);
+                const gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
+                const gpu_rect sc = {0, 0, (int32_t)s_d3d.host_w, (int32_t)s_d3d.host_h};
+                gpu_cmd_set_viewport(rc, &vp);
+                gpu_cmd_set_scissor(rc, &sc);
+            }
+        }
+    }
+
+    RF_CP(6);
+}
+
+/* The end of the frame's bookkeeping: the FIFO thread's, whichever thread
+ * replays the batch (its resets come before the next frame's records). */
+static void rf_after1(RfJob* const j)
+{
+    if (perf_on()) s_perf_rf += perf_now() - j->rf0;
+    /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
+     * with a min/max so a buffer of constants is distinguishable from real data. */
+    { const char* mp = getenv("MEMPEEK");
+      if (mp) { extern uint8_t* vm_base; static int _n = 0;
+        u32 addr = 0; int cnt = 8; sscanf(mp, "%x:%d", &addr, &cnt);
+        if (vm_base && addr && _n < 6 && ++_n) {
+            float lo = 1e30f, hi = -1e30f; u32 nz = 0;
+            for (int i = 0; i < cnt; i++) {
+                const u8* q = vm_base + addr + i * 4;
+                u32 bits = ((u32)q[0]<<24)|((u32)q[1]<<16)|((u32)q[2]<<8)|q[3];
+                float f; memcpy(&f, &bits, 4);
+                if (f == f && f < 1e30f && f > -1e30f) { if (f < lo) lo = f; if (f > hi) hi = f; }
+                if (bits) nz++;
+            }
+            fprintf(stderr, "[MEMPEEK] 0x%08X n=%d nonzero=%u range[%g..%g]%c",
+                    addr, cnt, nz, lo, hi, 10);
+        } } }
+    /* VRAMSCAN=1: which 64 KB blocks of guest memory change between frames.
+     * "nothing writes the buffer we read" is only half an answer -- this says
+     * where the producer IS writing, so the two can be matched up. */
+    { static int vs = -1; PS3_KNOB(vs, getenv("VRAMSCAN") ? 1 : 0);
+      if (vs) { extern uint8_t* vm_base;
+        static u32 prev[512]; static int have = 0; static int reported = 0;
+        u32 base = 0xC6000000u; u32 nblk = 512;          /* 32 MB window */
+        const char* bs = getenv("VRAMSCAN_BASE");
+        if (bs) base = (u32)strtoul(bs, NULL, 0);
+        if (vm_base && reported < 6) {
+            u32 changed = 0; char list[512]; int ln = 0;
+            for (u32 b = 0; b < nblk; b++) {
+                const u8* p = vm_base + base + b * 0x10000u;
+                u32 h = 2166136261u;
+                for (u32 i = 0; i < 0x10000u; i += 61) h = (h ^ p[i]) * 16777619u;
+                if (have && h != prev[b]) { changed++;
+                    if (ln < 400) ln += snprintf(list + ln, sizeof(list) - ln,
+                                                 " +0x%X", b * 0x10000u); }
+                prev[b] = h;
+            }
+            if (have && changed) { reported++;
+                fprintf(stderr, "[VRAMSCAN] base=0x%08X %u/512 blocks changed:%s%c",
+                        base, changed, list, 10); }
+            have = 1;
+        } } }
+    /* FRAME_BUDGET=1: geometry a frame asked for vs what the batch can hold.
+     * Reported from render_frame so it works under RSX_ACCUM_FRAME too -- it
+     * used to live in the clear-boundary present path, which accum bypasses, so
+     * it silently produced nothing in exactly the configuration being used. */
+    { static int fb = -1;
+      PS3_KNOB(fb, ps3_env_int("FRAME_BUDGET", 0));
+      if (fb && s_req_draws) { static int n = 0; if (n < 40 && ++n)
+        fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
+                        "buffer holds %u verts, %llu draws truncated%c",
+                (unsigned long long)s_req_verts, (unsigned long long)s_req_draws,
+                s_vp_cap, (unsigned long long)s_drop_draws, 10); }
+      s_req_verts = 0; s_req_draws = 0; s_drop_draws = 0; }
+    if (perf_on()) {
+        static double s_t_prev = 0.0; static int s_n = 0;
+        double now = perf_now();
+        if (s_t_prev > 0.0) s_perf_frame += now - s_t_prev;
+        s_t_prev = now;
+        if (++s_n % 20 == 0) {
+            double fr = s_perf_frame > 0 ? s_perf_frame : 1;
+            gpu_sc_stats sc;   /* the shader compiles: the compile service's counters */
+            gpu_sc_stats_take(&sc, 1);
+            if (perf_print()) fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
+                            " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
+                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
+                            " [vs compile %.2fs, %d] [fxc %.2fs %d, disk %d | create pso %.2fs %d | misses %.2fs]%c",
+                    20.0 / fr,
+                    s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
+                    s_perf_vtx, 100.0 * s_perf_vtx / fr,
+                    (double)s_perf_nverts / 1000.0,
+                    s_perf_rf, 100.0 * s_perf_rf / fr,
+                    s_perf_pre, 100.0 * s_perf_pre / fr,
+                    s_perf_srv, 100.0 * s_perf_srv / fr,
+                    s_perf_pso, 100.0 * s_perf_pso / fr,
+                    s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
+                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr,
+                    s_perf_vs, s_perf_vs_compiles,
+                    sc.compile_s, sc.compiles, sc.cache_hits, s_perf_cpso, s_perf_cpso_n, s_perf_pmiss, 10);
+            s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
+            s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
+            s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
+            s_perf_vs_compiles = 0; s_perf_vs = 0.0;
+            s_perf_cpso = 0.0; s_perf_cpso_n = 0; s_perf_pmiss = 0.0;
+            s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
+        }
+    }
+    { static int dt = -1;
+      PS3_KNOB(dt, ps3_env_int("RSX_DBG_TRACK", 0));
+      if (dt) { static int fr = 0; fr++;
+        if (s_lock_n)
+            fprintf(stderr, "[RSX_DBG_TRACK] frame %d: %u duck draws, ndc=(%.3f,%.3f)%c",
+                    fr, s_lock_n, (float)(s_lock_sx/s_lock_n), (float)(s_lock_sy/s_lock_n), 10);
+        else if (fr % 20 == 0)
+            fprintf(stderr, "[RSX_DBG_TRACK] frame %d: NO duck draws%c", fr, 10);
+      } }
+    if (s_lock_n) {                       /* publish this frame's centroid */
+        s_lock_x = (float)(s_lock_sx / s_lock_n);
+        s_lock_y = (float)(s_lock_sy / s_lock_n);
+        s_lock_valid = 1;
+        s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
+    }
+    s_dbg_last_draws = s_d3d.draw_count;
+    vpj_sync();           /* nothing may still write the half being reset */
+    /* The ends the banks, the b1 blocks and the fetch ring reached (they ask
+     * rc_arena_fit only for a chunk's first piece), for the chunk ahead. */
+    rc_arena_mark(&s_rc_vpcb, (u64)s_vcb_n * VP_CB_STRIDE);
+    rc_arena_mark(&s_rc_fpcb, (u64)s_d3d.draw_count * VP_FPCB_STRIDE);
+    if (s_vf_cap) rc_arena_mark(&s_vf, s_vf_off);
+    s_d3d.vb_offset  = 0; /* reset for next frame */
+    s_d3d.vp_vb_offset = 0;
+    s_vb_cursor = 0;
+    s_d3d.draw_count = 0;
+    s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
+    s_vf_off = 0;
+    s_vf_lo = s_vf_end = 0;   /* the next frame's first descriptor finds its chunk (rc_arena_fit) */
+    s_fx.valid = 0;
+    vfo_next();
+    { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
+      PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
+      emit += s_vp_want;
+      if (vst > 0 && ++fr >= (u32)vst) {
+          fprintf(stderr, "[VSTAT] per frame: fetched %llu emitted %llu (%.1f MB) attrs/fetch %.2f"
+                  " | uploads quad %llu tri %llu strip %llu fan %llu%c",
+                  (unsigned long long)(s_vs_fetch / fr), (unsigned long long)(emit / fr),
+                  (double)emit / fr * 256.0 / 1048576.0,
+                  s_vs_fetch ? (double)s_vs_attr / s_vs_fetch : 0.0,
+                  (unsigned long long)(s_vs_up[0] / fr), (unsigned long long)(s_vs_up[1] / fr),
+                  (unsigned long long)(s_vs_up[2] / fr), (unsigned long long)(s_vs_up[3] / fr), 10);
+          fr = 0; emit = 0; s_vs_fetch = s_vs_attr = 0; memset(s_vs_up, 0, sizeof s_vs_up);
+      } }
+    rc_arena_frame_end(&s_vb);   /* (a chunk ahead when the frame got near the last) */
+    s_vp_want = 0;
+    s_d3d.vp_ib_offset = 0;
+    s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
+    s_vcb_n = 0; s_fpcb_hi = 0;   /* numbered from 0 again, their chunks marked again */
+    rc_arena_frame_end(&s_rc_vpcb);
+    rc_arena_frame_end(&s_rc_fpcb);
+    if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
+    s_vp_iwant = 0;
+    if (s_vf_cap) rc_arena_frame_end(&s_vf);   /* a chunk ahead when this frame reached the last */
+
+    /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
+     * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program
+     * compiles once. When any of them changes (the console's setenv), bump the
+     * pipeline generation so every program rebuilds with the new value: one
+     * live run can then look at register after register. */
+    { static char last[512] = ""; static int init = 0;
+      static const char* const knobs[] = { "FP_SHOW", "FP_TEX", "FP_ONE", "FP_KILL",
+                                           "FP_IDCOLOR", "FP_TEX_FP" };
+      char cur[512]; size_t at = 0;
+      cur[0] = 0;
+      for (int k = 0; k < 6; k++) {
+          const char* v = getenv(knobs[k]);
+          int w = snprintf(cur + at, sizeof cur - at, "%s=%s;", knobs[k], v ? v : "");
+          if (w > 0 && (size_t)w < sizeof cur - at) at += (size_t)w;
+      }
+      if (init && strcmp(cur, last)) {
+          s_d3d.vp_gen++;
+          fprintf(stderr, "[FP] debug knobs changed (%s): rebuilding pipelines%c", cur, 10);
+      }
+      init = 1;
+      memcpy(last, cur, sizeof last);
+    }
+
+}
+
+    /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
+     * into a readback buffer this frame and writes rt_save_<offset>.bmp
+     * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
+     * the console's setenv can save one target after another in a live run. */
+static gpu_buffer s_rtsave_b;   /* the readback buffer (step C2) */
+static u64 s_rtsave_cap = 0;
+static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
+static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi, s_rtsave_off;
+static void rf_rtsave(u32 fi, gpu_cmd* const rc)
+{
+    { const char* sv = getenv("RTT_SAVERT");
+      static int _done = 0;
+      static char _last[32] = "";
+      if (sv && strncmp(sv, _last, sizeof _last - 1) != 0) {
+          strncpy(_last, sv, sizeof _last - 1); _done = 0; }
+      static u32 _skip = 0xFFFFFFFFu;
+      if (_skip == 0xFFFFFFFFu) { const char* sk = getenv("RTT_SAVERT_SKIP");
+          _skip = sk ? (u32)strtoul(sk, NULL, 0) : 0; }   /* frame 60 is far too
+          early for a title that takes a minute to reach its menu */
+      /* RTT_SAVERT_AFTER=<seconds> triggers on wall time instead of a frame
+       * count. This title runs its menu at a few frames a second, so a frame
+       * number is not a usable way to say "once it has settled". */
+      static u32 _after = 0xFFFFFFFFu;
+      if (_after == 0xFFFFFFFFu) { const char* sa = getenv("RTT_SAVERT_AFTER");
+          _after = sa ? (u32)strtoul(sa, NULL, 0) : 0; }
+      static clock_t _t0 = 0;
+      if (!_t0) _t0 = clock();
+      const int _due = _after
+          ? ((u32)((clock() - _t0) / CLOCKS_PER_SEC) >= _after)
+          : (s_d3d.frame_count > 60 + _skip);
+      { static int _p1 = 0;
+        if (sv && _due && !_p1) { _p1 = 1;
+            printf("[RTT_SAVERT] due: want=0x%lX found_rt=%d frame=%u\n",
+                   strtoul(sv, NULL, 16), off_rt_find((u32)strtoul(sv, NULL, 16)),
+                   (unsigned)s_d3d.frame_count); fflush(stdout); } }
+      if (sv && !_done && _due) {
+        int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
+        fprintf(stderr, "[RTT_SAVERT] rt=%d res=%p\n", rt,
+                rt >= 0 ? (void*)(uintptr_t)s_d3d.off_rt[rt].tex.id : NULL);
+        if (rt >= 0 && GPU_VALID(s_d3d.off_rt[rt].tex)) {
+            OffRT* r = &s_d3d.off_rt[rt];
+            u32 bpp = (r->dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) ? 8 :
+                      (r->dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
+            u32 pitch = (r->hw * bpp + 255) & ~255u;
+            fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
+                    rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
+                    (unsigned long long)((u64)pitch * r->hh));
+            if (GPU_VALID(s_rtsave_b) && s_rtsave_cap < (u64)pitch * r->hh) {   /* (the last save read it) */
+                wait_for_gpu();
+                gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; }
+            if (!GPU_VALID(s_rtsave_b)) {
+                s_rtsave_cap = (u64)pitch * r->hh;
+                rc_buf_make(s_rtsave_cap, GPU_USE_COPY_DST, GPU_MEM_READBACK, &s_rtsave_b, NULL);
+            }
+            if (!GPU_VALID(s_rtsave_b)) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
+            if (GPU_VALID(s_rtsave_b)) {
+                off_rt_transition(rt, GPU_STATE_COPY_SOURCE);
+                gpu_footprint cfp;
+                memset(&cfp, 0, sizeof cfp);
+                cfp.format    = (gpu_format)r->dxgi;
+                cfp.width     = r->hw;
+                cfp.height    = r->hh;
+                cfp.depth     = 1;
+                cfp.row_pitch = pitch;
+                gpu_cmd_copy_tex_to_buf(rc, s_rtsave_b, &cfp, r->tex, 0, NULL);
+                off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
+                s_rtsave_state = 1;
+                s_rtsave_w = r->hw; s_rtsave_h = r->hh;
+                s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
+                s_rtsave_off = (u32)strtoul(sv, NULL, 16);
+                fprintf(stderr, "[RTT_SAVERT] copy queued: rt=%d %ux%u pitch=%u\n",
+                        rt, r->hw, r->hh, pitch);
+                _done = 1;
+            }
+        }
+      } }
+
+}
+
+static void rf_after2(void)
+{
+    /* CELLMARK_DUMP_MINDRAWS=<N>: only consider frames carrying at least N draw
+     * records. Most render_frame calls come from the guest flip with a batch the
+     * clear boundary already drained, so they present an empty backbuffer -- and
+     * sampling those wastes every dump on a black image while the frames that do
+     * hold the scene go uncaptured. */
+    { static int mind = -1;
+      if (mind < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                      mind = e ? atoi(e) : 0; }
+      /* draw_count is already reset by here; s_dbg_last_draws holds the
+       * count this frame actually rendered. */
+      if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
+    if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
+skip_dump_consider: ;
+    /* CELLMARK_DUMP_NOW=<n> (live): dump the next n presents, every one, from
+     * the console -- the frames around a flicker, once the game is showing it.
+     * CELLMARK_DUMP is read at init, and its skip count cannot know when a
+     * hand-driven run reaches the spot. Each dump line gives the batch's draws. */
+    /* An F9 capture started: save the presents that follow it as
+     * cap_NNN_live_XX_d<draws>.bmp, RSX_HOTKEY_LIVE of them (default 4, 0 =
+     * off). A replay rebuilds one batch from guest memory with no targets
+     * from earlier frames and no flips; these show what was on screen. */
+    { extern volatile long g_rcap_live_arm; extern char g_rcap_live_name[32];
+      static long seen;
+      if (g_rcap_live_arm != seen) {
+          seen = g_rcap_live_arm;
+          const int n = ps3_env_int("RSX_HOTKEY_LIVE", 4);
+          if (n > 0 && s_hotshot_left <= 0) {
+              snprintf(s_hotshot_name, sizeof s_hotshot_name, "%s", g_rcap_live_name);
+              s_hotshot_n = 0;
+              s_hotshot_left = n;
+              s_d3d.dump_frames_left = n; s_d3d.dump_skip_left = 0;
+              const char* hd = getenv("RSX_HOTKEY_DIR");
+              if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
+              snprintf(s_dp_prefix, sizeof s_dp_prefix, "%s/%s_draws", hd, g_rcap_live_name);
+              s_dp_left = n; s_dp_n = 0;
+          }
+      } }
+    if (s_hotshot_arm) {   /* F10, armed from the window procedure */
+        s_hotshot_arm = 0;
+        s_hotshot_name[0] = 0;
+        const int n = ps3_env_int("RSX_HOTKEY_SHOTS", 12);
+        const char* hd = getenv("RSX_HOTKEY_DIR");
+        if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
+        CreateDirectoryA(hd, NULL);
+        char probe[512];
+        do {   /* the first burst number not already on disk */
+            s_hotshot_burst++;
+            snprintf(probe, sizeof probe, "%s%sshot_%03d_00_d*.bmp", hd ? hd : "", hd ? "/" : "",
+                     s_hotshot_burst);
+#ifdef _WIN32
+            WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(probe, &fd);
+            if (fh == INVALID_HANDLE_VALUE) break;
+            FindClose(fh);
+#else
+            glob_t g;
+            const int found = glob(probe, 0, NULL, &g) == 0 && g.gl_pathc > 0;
+            globfree(&g);
+            if (!found) break;
+#endif
+        } while (s_hotshot_burst < 999);
+        s_hotshot_n = 0;
+        s_hotshot_left = n > 0 ? n : 12;
+        s_d3d.dump_frames_left = s_hotshot_left; s_d3d.dump_skip_left = 0;
+        printf("[F10] dumping the next %d presents as shot_%03d_*%c", s_hotshot_left,
+               s_hotshot_burst, 10);
+    }
+    { static unsigned gen; static int last;
+      if (gen != ps3_env_gen) { gen = ps3_env_gen;
+          const int v = ps3_env_int("CELLMARK_DUMP_NOW", 0);
+          if (v != last) { last = v;
+              if (v > 0) { s_d3d.dump_frames_left = v; s_d3d.dump_skip_left = 0; } } } }
+}
+
+/* The rest: post passes, the submit, the Present and the move to the next
+ * frame (also where the replay thread leaves off). */
+static void rf_tail(RfJob* const j)
+{
+    const u32 fi = j->fi;
+    gpu_cmd* const rc = j->rc;
+    guest_fb_present(fi);
+    composite_present(fi);
+    if (!aa_mode() || !knob_aa_at_present())
+        s_aa.present_logged = 0;
+    else if (j->present) {
+        if (s_aa.present_logged != aa_mode() && knob_aa_log() > 0)
+            printf("[AA] %s on the finished frame, HUD included (RSX_AA_AT=present)\n",
+                   aa_mode() == 2 ? "SMAA" : "FXAA");
+        s_aa.present_logged = aa_mode();
+        aa_run_display(fi);
+    }
+    int dumping = (j->threaded != 1 && s_d3d.dump_frames_left > 0 && GPU_VALID(s_rc_readback_buf)
+                   && s_d3d.dump_skip_left == 0);
+    { static int mind2 = -1;
+      if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                       mind2 = e ? atoi(e) : 0; }
+      if (mind2 > 0 && s_dbg_last_draws < (u32)mind2) dumping = 0; }
+    /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
+     * run instead of one contiguous window, so a short burst of real content
+     * can't fall between the dumped frames. */
+    if (dumping) {
+        static int s_every = -1;
+        if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
+                           s_every = e ? atoi(e) : 0; }
+        if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
+    }
+    if (dumping) {
+        /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
+
+        gpu_footprint dfp;
+        memset(&dfp, 0, sizeof dfp);
+        dfp.format    = GPU_FORMAT_R8G8B8A8_UNORM;
+        dfp.width     = s_d3d.host_w;
+        dfp.height    = s_d3d.host_h;
+        dfp.depth     = 1;
+        dfp.row_pitch = s_d3d.readback_pitch;
+        gpu_cmd_copy_tex_to_buf(rc, s_rc_readback_buf, &dfp, s_rc_rt_tex[fi], 0, NULL);
+
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT);
+    } else {
+        /* End-of-frame fallback snapshot: used when the frame never contained a
+         * reduced-viewport pass to capture mid-frame. */
+        screen_copy_capture(fi);
+        /* Transition render target to PRESENT state */
+        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
+    }
+
+    RF_CP(7);
+    rt_writeback_record();
+    if (s_zq_n)
+        gpu_cmd_query_resolve(rc, s_zq_pool, 0, (u32)s_zq_n, s_zq_rb_buf, 0);
+
+    /* The game's frame, scaled into the window's buffer (and held for the
+     * overlay's repaints). */
+    if (j->present) {
+        hold_frame(fi);
+        blit_to_window(fi);
+    }
+
+    /* Close and execute */
+    frame_cmd_submit();
+
+    dred_report("frame submit");
+    if (!j->threaded && write_color_on() && !write_color_defer()) {   /* (deferred: wb_store_done) */
+        double _g = perf_on() ? perf_now() : 0.0;
+        wb_store_all();
+        dred_report("write-back wait");
+        if (perf_on()) s_perf_gpu += perf_now() - _g;
+    }
+    if (!j->threaded) {   /* (a threaded batch: rf_zq_handoff, on the FIFO thread) */
+        if (s_zq_n && (!write_color_on() || write_color_defer())) {
+            if (zq_defer_on()) {   /* stored by zq_hook or the next render_frame */
+                s_zq_pend = 1; s_zq_pend_nev = s_zq_nev; s_zq_pend_on = s_zq_on;
+            } else { wait_for_gpu(); zq_finish(s_zq_nev, s_zq_on); }
+        } else zq_finish(s_zq_nev, s_zq_on);
+    }
+
+    /* (The drain of the debug layer's message queue is not copied:
+     * this route never enables the debug layer, so the queue holds nothing;
+     * call map G16.) */
+
+    if (s_sc_dump_pending && j->threaded != 1) {   /* (1: the next frame, which rf_may_thread keeps inline) */
+        s_sc_dump_pending = 0;
+        wait_for_gpu();
+        s_dump_name = "screencopy";
+        dump_backbuffer_bmp();
+        s_dump_name = NULL;
+    }
+    if (dumping) {
+        wait_for_gpu();            /* ensure the copy finished before mapping */
+        dump_backbuffer_bmp();
+        s_d3d.dump_frames_left--;
+    }
+
+    if (s_rtsave_state) {
+        char _rtname[64];
+        snprintf(_rtname, sizeof _rtname, "rt_save_%08X.bmp", s_rtsave_off);
+        fprintf(stderr, "[RTT_SAVERT] writing %s %ux%u\n", _rtname, s_rtsave_w, s_rtsave_h);
+        if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
+                        wait_for_gpu();
+                        if (perf_on()) s_perf_gpu += perf_now() - _g; }
+        void* mp = gpu_buffer_map(s_rc_dev, s_rtsave_b, 0, (u64)s_rtsave_pitch * s_rtsave_h);
+        if (mp) {
+            FILE* f = fopen(_rtname, "wb");
+            if (f) {
+                u32 w = s_rtsave_w, h = s_rtsave_h;
+                u32 rowb = (w * 3 + 3) & ~3u;
+                u32 datasz = rowb * h;
+                u8 hdr[54] = {0};
+                hdr[0]='B'; hdr[1]='M';
+                *(u32*)(hdr+2) = 54 + datasz; *(u32*)(hdr+10) = 54;
+                *(u32*)(hdr+14) = 40; *(int*)(hdr+18) = (int)w; *(int*)(hdr+22) = (int)h;
+                *(u16*)(hdr+26) = 1; *(u16*)(hdr+28) = 24; *(u32*)(hdr+34) = datasz;
+                fwrite(hdr, 1, 54, f);
+                u8* line = (u8*)malloc(rowb);
+                for (int y = (int)h - 1; y >= 0; y--) {
+                    const u8* srow = (const u8*)mp + (u64)y * s_rtsave_pitch;
+                    memset(line, 0, rowb);
+                    for (u32 x = 0; x < w; x++) {
+                        float rv, gv, bv;
+                        if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
+                            const u16* hp16 = (const u16*)(srow + (u64)x * 8);
+                            /* crude half->float: sign|exp|mant */
+                            float v[3];
+                            for (int c2 = 0; c2 < 3; c2++) {
+                                u16 hv = hp16[c2];
+                                u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
+                                float fv;
+                                if (exp == 0) fv = (float)man / 16777216.0f;
+                                else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+                                       memcpy(&fv, &fb, 4); }
+                                v[c2] = fv;
+                            }
+                            rv = v[0]; gv = v[1]; bv = v[2];
+                        } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
+                            const float* fp32 = (const float*)(srow + (u64)x * 16);
+                            rv = fp32[0]; gv = fp32[1]; bv = fp32[2];
+                        } else {
+                            const u8* p8 = srow + (u64)x * 4;
+                            rv = p8[0] / 255.0f; gv = p8[1] / 255.0f; bv = p8[2] / 255.0f;
+                        }
+                        /* RTT_SAVEA=1: show the alpha lane in RED (gates
+                         * like wave's mask.w live there). */
+                        if (getenv("RTT_SAVEA")) {
+                            float av;
+                            if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
+                                const u16* hp16 = (const u16*)(srow + (u64)x * 8);
+                                u16 hv = hp16[3];
+                                u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
+                                if (exp == 0) av = (float)man / 16777216.0f;
+                                else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+                                       memcpy(&av, &fb, 4); }
+                            } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
+                                av = ((const float*)(srow + (u64)x * 16))[3];
+                            } else {
+                                av = (srow + (u64)x * 4)[3] / 255.0f;
+                            }
+                            rv = av;
+                        }
+                        /* |v| tonemap so signed heights are visible */
+                        float ar = rv < 0 ? -rv : rv, ag = gv < 0 ? -gv : gv, ab = bv < 0 ? -bv : bv;
+                        if (ar > 1) ar = 1; if (ag > 1) ag = 1; if (ab > 1) ab = 1;
+                        line[x*3+0] = (u8)(ab * 255.0f);
+                        line[x*3+1] = (u8)(ag * 255.0f);
+                        line[x*3+2] = (u8)(ar * 255.0f);
+                    }
+                    fwrite(line, 1, rowb, f);
+                }
+                free(line);
+                fclose(f);
+                printf("[D3D12] wrote %s (%ux%u dxgi=%u)\n", _rtname, w, h, s_rtsave_dxgi);
+            }
+            gpu_buffer_unmap(s_rc_dev, s_rtsave_b, 0, s_rtsave_cap);   /* (today's NULL range: all of it) */
+        }
+        s_rtsave_state = 0;
+    }
+
+    /* rsxcap: snapshot whole frames (backbuffer + every offscreen RT + a draw
+     * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
+     * present transition would matter -- the backbuffer is in PRESENT here and
+     * is restored to PRESENT after each readback. */
+    { const char* cap = getenv("RSX_CAP");
+      if (cap) {
+        /* Re-parsed whenever the value changes, so the console can arm one
+         * capture after another in a running game (`setenv RSX_CAP=1:3`,
+         * then a different RSX_CAP_DIR and `RSX_CAP=2:3`); a start below the
+         * current frame count captures at once. */
+        static char s_cap_last[64];
+        static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
+        if (strncmp(cap, s_cap_last, sizeof s_cap_last - 1) != 0) {
+            strncpy(s_cap_last, cap, sizeof s_cap_last - 1);
+            s_cap_done = 0;
+            u32 a = 0, b = 1, c = 1;
+            int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
+            s_cap_start  = (n >= 1 && a) ? a : 200;
+            s_cap_count  = (n >= 2 && b) ? b : 1;
+            s_cap_stride = (n >= 3 && c) ? c : 1;
+        }
+        if (s_cap_done < s_cap_count) {
+            u32 target = s_cap_start + s_cap_done * s_cap_stride;
+            if (s_d3d.frame_count >= target && s_dbg_last_draws > 0) {
+                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
+                s_cap_done++;
+            }
+        }
+      } }
+
+    { static char last[400];   /* RSX_HDR_SNAP (see HDR output) */
+      const char* e = getenv("RSX_HDR_SNAP");
+      if (e && *e && strcmp(e, last) && j->present && s_hdr.active) {
+          snprintf(last, sizeof last, "%s", e);
+          s_cap_raw = 1;
+          cap_readback_write(s_rc_swap_image[s_rc_image], s_d3d.win_w, s_d3d.win_h, GPU_FORMAT_R16G16B16A16_FLOAT,
+                             GPU_STATE_PRESENT, fi, e);
+          s_cap_raw = 0;
+      } }
+
+    RF_CP(8);
+    /* Present */
+    { LARGE_INTEGER _pq0, _pq1;
+      QueryPerformanceCounter(&_pq0);
+      if (j->present && s_overlay_on && s_overlay.frame) {
+          if (s_overlay_wake) InterlockedExchange(&s_overlay_wake, 0);   /* (this call is the wake) */
+          rc_overlay_frame(s_d3d.frame_index);   /* (the menu's: rsxc_api.inc) */
+      }
+      if (j->present && knob_present() && !s_session_locked && !window_hidden())   /* skipped for an offscreen-only batch */
+          swap_present(1);
+      QueryPerformanceCounter(&_pq1);
+      if (j->present) frame_log(_pq0.QuadPart, _pq1.QuadPart);
+      if (j->present && !j->threaded) pso_lib_tick();   /* (a threaded batch: rf_handoff) */
+      RSX_MARK("present", j->present, 0); }
+    RF_CP(9); rf_slow_report();
+    if (j->present) prof_record(s_rf_cp[9]);
+
+    move_to_next_frame();
+    s_last_batch_fence = s_batch_fence[s_rf_par] = rc_last_frame_fence();
+    /* The next batch writes the other half from its first record on: the
+     * batch before this one, its last user, must be done first. (Without
+     * frames in flight the next render_frame's drain covers it too.) */
+    if (!j->threaded) batch_wait(s_rf_par ^ 1u);   /* (a threaded batch: rf_handoff) */
+    swap_resize();
+
+    s_d3d.frame_count++;
+
+    /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
+     * draw count of the last frame, and the backbuffer size. */
+    {
+        static ULONGLONG s_tt0 = 0;
+        static u64 s_tframes = 0;
+        s_tframes++;
+        ULONGLONG tnow = GetTickCount64();
+        if (s_tt0 == 0) s_tt0 = tnow;
+        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
+            extern char g_rsx_title_base[128];
+            char tb[256];
+            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+                     g_rsx_title_base,
+                     s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+#ifdef _WIN32
+            SetWindowTextA(s_d3d.hwnd, tb);
+#else
+            win_set_title(tb);
+#endif
+            /* GCM_RATES=1: the same once-a-second sample on stderr, beside
+             * the FIFO flip words decoded and how far RSX label 255 moved --
+             * the fence a title like Demon's Souls paces its frames on. */
+            { static int on = -1; static u32 fw0, l0, fr0;
+              PS3_KNOB(on, getenv("GCM_RATES") ? 1 : 0);
+              extern uint8_t* vm_base;
+              if (on && vm_base) {
+                  extern volatile u32 g_gcm_flip_words;
+                  extern unsigned cellGcm_flip_request_count(void);
+                  const u8* lp = vm_base + 0x20000FF0u;
+                  u32 fw = g_gcm_flip_words, l = ((u32)lp[0] << 24) | ((u32)lp[1] << 16) | ((u32)lp[2] << 8) | lp[3];
+                  u32 fr = cellGcm_flip_request_count();
+                  /* flips: all flip requests, in the FIFO or not (Demon's
+                   * Souls flips twice per frame it renders). */
+                  /* boundaries: at a flip (render / no display draws), at a
+                   * display clear (render / no display draws / no flip since
+                   * the last present / batch too small) */
+                  /* repaints: the overlay's frames between the game's
+                   * (rc_overlay_repaint), not counted in presents. */
+                  static u32 c0, f1, f2, k1, k2, k3, rp0;
+                  fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s flips=%u/s label255=%08X (+%u) draws=%u"
+                          " | flip:render=%u nodisp=%u clear:render=%u nodisp=%u sameflip=%u small=%u repaints=%u | rf thr=%u inl=%u join=%.1fms%c",
+                          (unsigned long long)tnow, s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                          fw - fw0, fr - fr0, l, l - l0, s_dbg_last_draws,
+                          s_pc_flip_render - f1, s_pc_flip_nodisp - f2, s_clear_presents - c0,
+                          s_pc_clear_nodisp - k1, s_pc_clear_sameflip - k2, s_pc_clear_small - k3,
+                          s_repaints - rp0, s_rf_thr, s_rf_inl, s_rf_join_ms, 10);
+                  s_rf_thr = s_rf_inl = 0; s_rf_join_ms = 0;
+                  rp0 = s_repaints;
+                  fw0 = fw; l0 = l; fr0 = fr;
+                  f1 = s_pc_flip_render; f2 = s_pc_flip_nodisp; c0 = s_clear_presents;
+                  k1 = s_pc_clear_nodisp; k2 = s_pc_clear_sameflip; k3 = s_pc_clear_small;
+              } }
+            s_tframes = 0;
+            s_tt0 = tnow;
+        }
+    }
+}
+
+/* A threaded batch's pipelines were all looked up by the pre-pass; one whose
+ * lookup failed looks again here, as the VP pass does on the FIFO thread (a
+ * lookup reads guest fragment-program code and the pipeline tables). */
+static void rf_pso_retry(RfJob* const j)
+{
+    for (u32 d = 0; d < j->n && d < MAX_DRAWS; d++) {
+        D3D12DrawRecord* const dr = &j->draws[d];
+        if (!dr->is_vp || dr->is_clear || !dr->fp_addr) continue;
+        if (dr->pso.v && dr->pso_serial == s_rf_serial) continue;
+        dr->pso = vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key, dr_num_rts(dr),
+                                dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
+                                           : GPU_FORMAT_R8G8B8A8_UNORM,
+                                dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                dr_cube_mask(dr), dr->d2c_mask,
+                                s_uvc_vs && !dr->uvc ? 0u : dr_uvclamp(dr), dr_hdrv(dr));
+        dr->pso_serial = s_rf_serial;
+    }
+}
+
+/* ZPASS reports of a threaded batch, on the FIFO thread: a batch with no
+ * counted draw stores its reports now (as the end of an inline frame does); a
+ * counted one queues them like an inline deferred batch (RSX_ZPASS_DEFER), and
+ * the replay thread issues its queries from the events copied here. zq_hook's
+ * and the next render_frame's store then wait for the replay first. */
+static void rf_zq_handoff(RfJob* const j)
+{
+    int counted = 0;
+    if (g_rsx_report_hook && (j->zq_nev || j->zq_on_start))
+        for (u32 d = 0; d < j->n && d < MAX_DRAWS && !counted; d++) {
+            const D3D12DrawRecord* const dr = &j->draws[d];
+            counted = dr->is_vp && !dr->is_clear &&
+                      zq_counted_in(j->ev, j->zq_nev, j->zq_on_start, dr->cb_slot);
+        }
+    if (counted) {
+        s_zq_pend = 1;
+        s_zq_pend_nev = j->zq_nev;
+        s_zq_pend_on = s_zq_on;
+    } else {
+        zq_finish(j->zq_nev, s_zq_on);
+        j->zq_nev = 0;
+        j->zq_on_start = 0;
+    }
+}
+
+static int rf_may_thread(const RfJob* j);
+static D3D12DrawRecord* s_rf_lists[2];   /* the two draw lists of a threaded run */
+static volatile LONG s_rf_quit, s_rf_gone, s_rf_go;
+
+/* The replay thread's work for one batch. */
+static void rf_replay(RfJob* const j)
+{
+    rf_vp_pass(j);
+    rf_tail(j);
+}
+
+static DWORD WINAPI rf_thread_main(LPVOID arg)
+{
+    (void)arg;
+    s_rf_tid = GetCurrentThreadId();   /* (what rf_join compares) */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   /* (as the FIFO thread) */
+    for (;;) {
+        AcquireSRWLockExclusive(&s_rf_lk);
+        while (!s_rf_go && !s_rf_quit)
+            SleepConditionVariableSRW(&s_rf_cv, &s_rf_lk, INFINITE, 0);
+        const LONG quit = s_rf_quit;
+        s_rf_go = 0;
+        ReleaseSRWLockExclusive(&s_rf_lk);
+        if (quit) break;
+        rf_replay(&s_rf_job);
+        AcquireSRWLockExclusive(&s_rf_lk);
+        s_rf_busy = 0;
+        ReleaseSRWLockExclusive(&s_rf_lk);
+        WakeAllConditionVariable(&s_rf_cv);
+    }
+    InterlockedExchange(&s_rf_gone, 1);
+    return 0;
+}
+
+/* The thread and the second draw list, the first time a batch can use them. */
+static int rf_thread_start(void)
+{
+    static int failed;
+    if (s_rf_thread) return 1;
+    if (failed) return 0;
+    if (!s_rf_lists[1]) s_rf_lists[1] = (D3D12DrawRecord*)calloc(MAX_DRAWS, sizeof *s_rf_lists[1]);
+    if (!s_rf_lists[1]) { failed = 1; return 0; }
+    s_rf_lists[0] = s_d3d.draws;
+    s_rf_go = s_rf_quit = s_rf_gone = 0;
+    s_rf_tid = 0;
+    HANDLE h = CreateThread(NULL, 0, rf_thread_main, NULL, 0, NULL);
+    if (!h) {
+        fprintf(stderr, "[rsx] the replay thread could not be started: rendering inline%c", 10);
+        failed = 1;
+        return 0;
+    }
+    while (!s_rf_tid) Sleep(0);     /* (it sets its id first thing, before any batch can be handed over) */
+    s_rf_thread = h;
+    fprintf(stderr, "[rsx] replay thread started (RSX_RF_THREAD)%c", 10);
+    return 1;
+}
+
+/* Hand the batch to the replay thread. */
+static void rf_go(void)
+{
+    AcquireSRWLockExclusive(&s_rf_lk);
+    s_rf_busy = 1;
+    s_rf_go = 1;
+    ReleaseSRWLockExclusive(&s_rf_lk);
+    WakeAllConditionVariable(&s_rf_cv);
+}
+
+/* The thread goes, the draw lists back to one (shutdown; a start that failed).
+ * From the replay thread itself (a menu's quit, in the overlay's frame hook)
+ * nothing is waited for: the process is on its way out. */
+static void rf_stop(void)
+{
+    if (!s_rf_thread) return;
+    printf("[rsx] replay thread stopping: %u batches threaded, %u inline\n", s_rf_thr, s_rf_inl);
+    if (GetCurrentThreadId() != s_rf_tid) {
+        for (int ms = 0; s_rf_busy && ms < 6000; ms++) Sleep(1);
+        AcquireSRWLockExclusive(&s_rf_lk);
+        s_rf_quit = 1;
+        ReleaseSRWLockExclusive(&s_rf_lk);
+        WakeAllConditionVariable(&s_rf_cv);
+        if (s_rf_thread) { WaitForSingleObject(s_rf_thread, 2000); CloseHandle(s_rf_thread); }
+    }
+    s_rf_thread = NULL;
+    s_rf_tid = 0;
+    if (s_rf_lists[1]) {
+        s_d3d.draws = s_rf_lists[0];
+        free(s_rf_lists[1]);
+        s_rf_lists[1] = NULL;
+    }
+}
+
+/* May this batch run on the replay thread? Every debug path that reads guest
+ * memory, the draw list or the FIFO thread's state from the tail keeps it on
+ * the FIFO thread: those are the inline path's, unchanged. */
+static int rf_may_thread(const RfJob* j)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("RSX_RF_THREAD", 0));
+    if (on <= 0) return 0;
+    static int dbg = -1;
+    PS3_KNOB(dbg, (getenv("RTT_SAVERT") || getenv("RSX_CAP") || getenv("GCM_GUEST_FB") ||
+                   getenv("RSX_HDR_SNAP") || getenv("VP_TESTTRI") || getenv("DRAW_SKIP") ||
+                   ps3_env_int("RSX_PSO_IN_REC", 1) != 1) ? 1 : 0);
+    /* 2 tests the worker: frames that get dumped and frames a replay presents go to
+     * it too, so an image comparison looks at a threaded frame. To play, use 1. */
+    if (dbg || perf_on() || (on < 2 && !s_rf_at_flip)) return 0;
+    if ((on < 2 && (s_d3d.dump_frames_left > 0 || s_sc_dump_pending)) || s_composite_src) return 0;
+    if (!zq_defer_on() || (write_color_on() && !write_color_defer())) return 0;
+#ifdef _WIN32
+    if (!s_window_thread) return 0;    /* (the FIFO thread pumps the window) */
+#endif
+    if (s_vb.big_off || s_vf.big_off) return 0;   /* (a piece over a chunk: the big buffer may be replaced) */
+    (void)j;
+    return rf_thread_start() ? on : 0;
+}
+
 static void render_frame(void)
 {
+    rf_join();    /* (the last batch's replay, RSX_RF_THREAD) */
     vpj_sync();   /* the batch's vertices, before anything reads vp_vb */
     double _rf0 = perf_on() ? perf_now() : 0.0;
     { LARGE_INTEGER _q; QueryPerformanceCounter(&_q); s_rf_entry_qpc = _q.QuadPart; }
@@ -624,1160 +2006,46 @@ rtt_dump_done:;
     /* (The pass of the draws recorded without a vertex program, and the font
      * atlas it sampled, are gone: step C8a. No capture draws through them.) */
 
-    RF_CP(5);
-    /* VP pass: real decompiled vertex program + atlas alpha-test PS. Feeds raw
-     * float4 attrib0 from vp_vb and the vp_c[] constant bank. */
-    if (s_d3d.vp_ready && s_d3d.draw_count > 0) {
-        int any = 0;
-        for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++)
-            if (s_d3d.draws[d].is_vp) { any = 1; break; }
-        /* The colour-only PS (untextured 3D, vkcube); the atlas's sampling PS
-         * when there is none. (With no atlas upload, step C8a, there is no
-         * atlas for that PS to sample.) */
-        gpu_pipeline vpso = s_d3d.pipeline_state_vp_color;
-        if (!vpso.v) vpso = s_d3d.pipeline_state_vp;
-        { static int cap = -1, n = 0;
-          PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
-          if (cap && n < cap) { n++;
-            u32 nvp = 0, nclr = 0;
-            for (u32 d2 = 0; d2 < s_d3d.draw_count && d2 < MAX_DRAWS; d2++) {
-                if (s_d3d.draws[d2].is_vp)    nvp++;
-                if (s_d3d.draws[d2].is_clear) nclr++;
-            }
-            fprintf(stderr, "[VPPASS] records=%u is_vp=%u clears=%u any=%d vpso=%p rootsig=%p\n",
-                    s_d3d.draw_count, nvp, nclr, any,
-                    (void*)(uintptr_t)vpso.v, (void*)(uintptr_t)s_d3d.vp_layout.id); } }
-        /* (No vertex buffer or vertex constants: RSX_VP_BUFFERS=0, or their
-         * allocation failed. The pass is skipped rather than faulting.) */
-        if (any && vpso.v && s_vb.n && s_rc_vpcb.n) {
-            s_vp_topo_strip = 0;
-            s_split_running = 0;   /* (the last batch's parts: gpu_draws_may_run) */
-            vp_pass_binds(rc, vpso);
-            const u32 split_n = submit_split_draws();
-            u32 split_from = 0;                    /* the record the part being recorded starts at */
-            u32 split_parts = 1;
-            /* The bound chunks, the first of each after vp_pass_binds. vp_vb's
-             * is the virtual [vb_lo, vb_hi); a draw in another one binds that
-             * (rare: a frame past one chunk's vertices). The fetch draws' is
-             * the virtual [vf_lo, vf_lo + vf_in) at t20 (rc_arena; vf_in 0 while
-             * t20 holds another buffer): a draw whose fdesc lies outside binds
-             * its own, so a draw costs a compare, and a bind only where the
-             * frame crossed a chunk's end. */
-            u32 vb_chunk = 0;
-            u64 vb_lo = 0, vb_hi = s_vb.half;
-            u32 vf_lo = 0, vf_in = s_vf_cap;
-            int cur_rt = -1;                       /* target A: -1 = backbuffer */
-            float vp_last_w = 0, vp_last_h = 0;    /* bound target's guest size; DRAWARGS */
-            /* its host size over guest size (RSX_SCALE). The batch starts on the display
-             * buffer, already bound: a batch that never changes target (a loading
-             * screen) draws with this ratio, and at 1.0 it drew at the guest size, in
-             * the top-left quarter of every other frame. */
-            float tgt_sx = (float)s_d3d.host_w / (float)s_d3d.width;
-            float tgt_sy = (float)s_d3d.host_h / (float)s_d3d.height;
-            float dvp_x = 0, dvp_y = 0, dvp_w = 0, dvp_h = 0;  /* per-draw, for DRAWARGS */
-            int cur_m[3] = {-1, -1, -1};           /* MRT B/C/D: -1 = unbound   */
-            int cur_z = -1;                        /* zeta: -1 = shared buffer  */
-            int cur_zro = 0;                       /* cur_z bound read-only     */
-            int cur_nocol = 0;                     /* depth-only pass bound     */
-            double _rec0 = perf_on() ? perf_now() : 0.0;
-            int seen_small_vp = 0, captured = 0;
-            /* DRAW_SKIP=a-b (live, diagnostic): leave out the frame's ops a..b
-             * (manifest op numbers), to bisect which op hides or breaks a
-             * later one. Mostly for rsx_replay. */
-            static unsigned skip_gen; static u32 skip_a = 1, skip_b = 0;
-            if (skip_gen != ps3_env_gen) { const char* e = getenv("DRAW_SKIP");
-                skip_gen = ps3_env_gen; skip_a = 1; skip_b = 0;
-                if (e && sscanf(e, "%u-%u", &skip_a, &skip_b) == 1) skip_b = skip_a; }
-            /* RSX_AA: this batch's anti-aliasing pass, on target aa_t before
-             * op aa_before (aa_pick). A batch with fewer draws than a 3D
-             * frame needs is left alone and not logged: Demon's Souls shows
-             * every other present from a one-op batch that copies the last
-             * frame out again, which would make the log alternate. */
-            hdr_mark_scan();
-            int aa_t = -1;
-            u32 aa_before = 0;
-            if (!aa_mode() || knob_aa_at_present())
-                s_aa.log_valid = 0;   /* when it comes back on, log the first choice */
-            else if (s_present_this_frame && s_d3d.draw_count >= AA_MIN_SCENE) {
-                int why = AA_RUN;
-                aa_t = aa_pick(&aa_before, &why);
-                aa_log(aa_t, aa_before, why);
-            }
-            /* Read once for the loop (step C7): the device, the texture pool and
-             * the constant buffers' addresses, made at init and fixed through a
-             * frame, so a draw's binds look nothing up (today's took gh_base and
-             * the srv_inc it was given). */
-            gpu_device* const rdev = s_rc_dev;
-            const gpu_table_pool rsrv = s_rc_srv_pool;
-            /* The constants' chunks (made at record time, none while the
-             * frame renders), this frame's half's offset in each, and how
-             * many vp_fpcb has (0: none, slot 2 is not bound). */
-            const gpu_addr* const cb_va = s_rc_vpcb.va;
-            const gpu_addr* const fpcb_va = s_rc_fpcb.va;
-            const u64 cb_par = (u64)s_d3d.vp_parity * s_rc_vpcb.half;
-            const u64 fpcb_par = (u64)s_d3d.vp_parity * s_rc_fpcb.half;
-            const u32 fpcb_n = s_rc_fpcb.n;
-            /* Step V5: what a kind-4 draw binds at t20 (uvc_table): this
-             * frame's half of vp_vb, or of vf_buf (also every fetch draw's). */
-            for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
-                const D3D12DrawRecord* dr = &draws[d];
-                if (!dr->is_vp) continue;
-                /* The pass binds its own pipeline. Then the VP pass's state
-                 * goes back: its root signature, which drops every root
-                 * argument (vf_buf's is set again here, the rest per draw
-                 * below), its topology, and the targets bound now. */
-                if (aa_t >= 0 && d >= aa_before) {
-                    if (aa_run_rt(aa_t)) {
-                        gpu_cmd_set_layout(rc, s_d3d.vp_layout);
-                        if (s_vf_cap) {   /* the chunk bound before */
-                            gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, vf_lo >> s_vf_shift));
-                            vf_in = s_vf_cap;
-                        }
-                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
-                        s_vp_topo_strip = 0;
-                        gpu_pass ap;
-                        ap.nrt = 0;
-                        if (!cur_nocol) {
-                            ap.rt[ap.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
-                            for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
-                                ap.rt[ap.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
-                        }
-                        ap.ds = cur_z < 0 ? s_rc_depth_dsv
-                              : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
-                        gpu_cmd_pass_begin(rc, &ap);
-                    }
-                    aa_t = -1;
-                }
-                if (d >= skip_a && d <= skip_b && !dr->is_clear) continue;
-                /* The reduced-viewport passes (this title's reflection, drawn
-                 * into a region of the same target) finish here -- snapshot
-                 * before the full-screen scene overwrites them. */
-                if (!dr->is_clear && dr->ctgt) {
-                    if (dr->vp_w && dr->vp_w < s_d3d.width) {
-                        seen_small_vp = 1;
-                        subvp_note(dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h);
-                    }
-                    else if (seen_small_vp && !captured &&
-                             dr->vp_w == s_d3d.width && dr->rt_off == 0) {
-                        captured = 1;
-                        screen_copy_capture(fi);
-                        subvp_capture(fi);
-                        gpu_cmd_pass_begin(rc, &disp_pass);
-                    }
-                }
-                /* Render-to-texture: retarget when this op's surfaces differ.
-                 * Depth is a single shared buffer, so clear it per switch. */
-                int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
-                /* Remember where geometry actually went: off_rt_find() matches
-                 * on offset alone and slots share offsets at different sizes,
-                 * so the composite cannot just look the source up by address. */
-                if (want >= 0) { s_last_drawn_slot = want; s_last_drawn_off = dr->rt_off; }
-                int wantm[3];
-                for (int _m = 0; _m < 3; _m++)
-                    wantm[_m] = dr->rt_mrt[_m] ? off_rt_find(dr->rt_mrt[_m]) : -1;
-                /* Depth follows the op's zeta when it has one; ops without a
-                 * depth surface (or not using depth) keep the shared buffer. */
-                int wz = dr->zfmt && ((dr->depth & 1u) || (dr->clr_flags & 3u))
-                       ? zeta_find(dr->zeta) : -1;
-                if (wz < 0 && cur_z >= 0 && !(dr->depth & 1u) && !(dr->clr_flags & 3u))
-                    wz = cur_z;   /* depth unused: don't rebind just to drop it */
-                /* A draw that samples the depth surface it is bound to and does
-                 * not write depth (Demon's Souls's light shafts test against
-                 * the scene depth and fade by it) binds it read-only, so it can
-                 * be a depth target and a texture at once, as on RSX. */
-                int wro = 0;
-                if (wz >= 0 && !(dr->depth & 2u) && !(dr->clr_flags & 3u))
-                    for (int _u = 0; _u < RSX_FP_UNITS; _u++)
-                        if (dr->tex_z[_u] == wz) { wro = 1; break; }
-                /* Colour target NONE: a depth-only pass. It binds no colour
-                 * target and takes the depth surface's size -- bound to the
-                 * backbuffer, the 2048x2048 shadow atlas was clipped to the
-                 * window and its cascade viewports fell back to full-target. */
-                const int nocol = dr->ctgt == 0;
-                if (want != cur_rt || wantm[0] != cur_m[0] ||
-                    wantm[1] != cur_m[1] || wantm[2] != cur_m[2] || wz != cur_z ||
-                    wro != cur_zro || nocol != cur_nocol) {
-                    gpu_pass tp;   /* the op's targets (views: step C5a) */
-                    tp.ds = wz < 0 ? s_rc_depth_dsv : wro ? zeta_dsv_ro(wz) : zeta_dsv(wz);
-                    if (wz >= 0) zeta_transition(wz, wro ? ZETA_READ_STATE
-                                                         : GPU_STATE_DEPTH_WRITE);
-                    tp.nrt = 1;
-                    tp.rt[0] = s_rc_rt_rtv[fi];
-                    gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
-                    float gw = (float)s_d3d.width, gh = (float)s_d3d.height;   /* the guest's size of it */
-                    if (want >= 0) {
-                        off_rt_transition(want, GPU_STATE_RENDER_TARGET);
-                        tp.rt[0] = s_d3d.off_rt[want].rtv;
-                        vp.width  = (float)s_d3d.off_rt[want].hw;
-                        vp.height = (float)s_d3d.off_rt[want].hh;
-                        gw = (float)s_d3d.off_rt[want].w;
-                        gh = (float)s_d3d.off_rt[want].h;
-                    }
-                    for (int _m = 0; _m < 3 && wantm[_m] >= 0; _m++) {
-                        off_rt_transition(wantm[_m], GPU_STATE_RENDER_TARGET);
-                        tp.rt[tp.nrt++] = s_d3d.off_rt[wantm[_m]].rtv;
-                    }
-                    if (nocol) {
-                        tp.nrt = 0;
-                        vp.width  = wz >= 0 ? (float)s_zeta[wz].hw : (float)s_d3d.host_w;
-                        vp.height = wz >= 0 ? (float)s_zeta[wz].hh : (float)s_d3d.host_h;
-                        gw = wz >= 0 ? (float)s_zeta[wz].w : (float)s_d3d.width;
-                        gh = wz >= 0 ? (float)s_zeta[wz].h : (float)s_d3d.height;
-                    }
-                    const gpu_rect sc = {0, 0, (int32_t)vp.width, (int32_t)vp.height};
-                    vp_last_w = gw; vp_last_h = gh;
-                    tgt_sx = vp.width / gw; tgt_sy = vp.height / gh;
-                    gpu_cmd_pass_begin(rc, &tp);
-                    gpu_cmd_set_viewport(rc, &vp);
-                    gpu_cmd_set_scissor(rc, &sc);
-                    /* The shared buffer stands in for "no guest depth surface",
-                     * so it starts each target fresh; a zeta keeps its content. */
-                    if (wz < 0)
-                        gpu_cmd_clear_depth(rc, s_rc_depth_dsv, GPU_CLEAR_DEPTH | GPU_CLEAR_STENCIL, 1.0f, 0,
-                                            NULL);
-                    cur_z = wz;
-                    cur_zro = wro;
-                    cur_nocol = nocol;
-                    /* RT_CLEARDBG=2: magenta-clear the surface the DRAWS bind,
-                     * at the moment they bind it. The guest's own clears may go
-                     * to a different surface entirely (they do here: clears to
-                     * 0xAB0000, draws to 0x1BE0000), so clearing on the clear
-                     * path tests the wrong target. Anything not magenta
-                     * afterwards was rasterised. */
-                    { static int cd2 = -1;
-                      PS3_KNOB(cd2, ps3_env_int("RT_CLEARDBG", 0));
-                      if (cd2 >= 2 && want >= 0) {
-                          const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-                          gpu_cmd_clear_color(rc, s_d3d.off_rt[want].rtv, mag, NULL);
-                      } }
-                    /* VP_TESTTRI=1: our own triangle, through the game's exact
-                     * pipeline -- same vpso, same root signature, same vertex
-                     * buffer, same RTV just bound. Written at vertex 1000 so it
-                     * cannot collide with the guest's data. Pair with
-                     * VP_BYPASS=1 so the shader is a trivial passthrough.
-                     *
-                     * If this renders, the GPU does read vp_vb and the fault is
-                     * in the guest draws' own state. If it does not, nothing
-                     * this backend draws reaches a render target at all. */
-                    { static int tt = -1;
-                      PS3_KNOB(tt, ps3_env_int("VP_TESTTRI", 0));
-                      if (tt && want >= 0 && s_d3d.vp_vb_mapped) {
-                          float* vtx = (float*)rc_arena_ptr(&s_vb, vb_lo + (u64)1000 * 256u);
-                          static const float tri[3][4] = {
-                              {-2.0f, -2.0f, 0.0f, 1.0f},
-                              { 2.0f, -2.0f, 0.0f, 1.0f},
-                              { 0.0f,  2.0f, 0.0f, 1.0f} };
-                          for (int _v = 0; _v < 3; _v++) {
-                              float* dstv = vtx + (size_t)_v * (256u / 4u);
-                              dstv[0] = tri[_v][0]; dstv[1] = tri[_v][1];
-                              dstv[2] = tri[_v][2]; dstv[3] = tri[_v][3];
-                          }
-                          gpu_cmd_draw(rc, 3, 1, 1000, 0);
-                          { static int _n = 0;
-                            if (_n < 3 && ++_n) fprintf(stderr, "[TESTTRI] issued on rt=%d off=0x%08X%c",
-                                                  want, s_d3d.off_rt[want].off, 10); }
-                      } }
-                    cur_rt = want;
-                    for (int _m = 0; _m < 3; _m++) cur_m[_m] = wantm[_m];
-                }
-                if (dr->is_clear && (dr->clr_flags & 3u) && cur_z >= 0) {
-                    const u32 zf = ((dr->clr_flags & 1u) ? GPU_CLEAR_DEPTH : 0) |
-                                   ((dr->clr_flags & 2u) ? GPU_CLEAR_STENCIL : 0);
-                    gpu_cmd_clear_depth(rc, zeta_dsv(cur_z), zf, dr->clr_z, (uint8_t)dr->clr_s, NULL);
-                }
-                if (dr->is_clear && (!(dr->clr_flags & 0xF0u) || nocol)) continue;   /* depth/stencil only */
-                if (dr->is_clear) {
-                    const gpu_view rh = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
-                    /* RT_CLEARDBG=1: clear offscreen targets to magenta rather
-                     * than the guest colour. "0.000% nonzero" cannot tell an
-                     * untouched surface from one written black, and that
-                     * ambiguity invalidates every read of an offscreen target.
-                     * If the surface comes back magenta the clears land and the
-                     * draws are writing black; if it stays black, nothing
-                     * reaches it at all. */
-                    { static int cd = -1;
-                      PS3_KNOB(cd, ps3_env_int("RT_CLEARDBG", 0));
-                      if (cd && cur_rt >= 0) {
-                          const float mag[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-                          gpu_cmd_clear_color(rc, rh, mag, NULL);
-                      } else
-                          gpu_cmd_clear_color(rc, rh, dr->cc, NULL); }
-                    for (int _m = 0; _m < 3; _m++)
-                        if (cur_m[_m] >= 0)
-                            gpu_cmd_clear_color(rc, s_d3d.off_rt[cur_m[_m]].rtv, dr->cc, NULL);
-                    continue;
-                }
-                /* RSX_SUBMIT_SPLIT: the part so far goes to the GPU before this
-                 * draw, and the rest goes on in the same targets, as the AA
-                 * pass's return binds them (no query is open: each draw's ends
-                 * with it). */
-                if (split_n && d - split_from >= split_n && s_d3d.draw_count - d >= split_n &&
-                    !gpu_cmd_split(rdev, rc, NULL)) {
-                    split_from = d;
-                    split_parts++;
-                    s_split_running = 1;
-                    vp_pass_binds(rc, vpso);
-                    vb_chunk = 0; vb_lo = 0; vb_hi = s_vb.half;   /* the first chunks again */
-                    vf_lo = 0; vf_in = s_vf_cap;
-                    gpu_pass sp;
-                    sp.nrt = 0;
-                    if (!cur_nocol) {
-                        sp.rt[sp.nrt++] = cur_rt >= 0 ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
-                        for (int _m = 0; _m < 3 && cur_m[_m] >= 0; _m++)
-                            sp.rt[sp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
-                    }
-                    sp.ds = cur_z < 0 ? s_rc_depth_dsv : cur_zro ? zeta_dsv_ro(cur_z) : zeta_dsv(cur_z);
-                    gpu_cmd_pass_begin(rc, &sp);
-                }
-                /* Per-draw pipeline: prefer the guest's own compiled FP; fall
-                 * back to the hardcoded atlas/colour PS pair. The pre-pass
-                 * looked it up already and kept it in the record.
-                 * RSX_PSO_IN_REC (live): 1 (default) binds the record's,
-                 * 0 looks it up again here, 2 does both and reports a
-                 * difference. A draw whose pre-pass lookup failed looks
-                 * again, as before. */
-                static int pso_in_rec = -1;
-                PS3_KNOB(pso_in_rec, ps3_env_int("RSX_PSO_IN_REC", 1));
-                gpu_pipeline dpso = {0};
-                if (dr->fp_addr) {
-                    if (pso_in_rec && dr->pso.v && dr->pso_serial == s_rf_serial) dpso = dr->pso;
-                    if (!dpso.v || pso_in_rec == 2) {
-                        const gpu_pipeline look =
-                            vp_get_fp_pso(dr->vs_idx, dr->fp_addr, dr->blend_key,
-                                          dr_num_rts(dr),
-                                          dr->rt_off ? rt_target_format(dr->rt_off, dr->rt_fmt)
-                                                     : GPU_FORMAT_R8G8B8A8_UNORM,
-                                          dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                          dr_cube_mask(dr), dr->d2c_mask,
-                                          s_uvc_vs && !dr->uvc ? 0u : dr_uvclamp(dr), dr_hdrv(dr));
-                        if (dpso.v && look.v != dpso.v) {
-                            static int n = 0;
-                            if (n < 8) {
-                                n++;
-                                fprintf(stderr, "[PSO] draw %u: the record's pipeline differs "
-                                                "from a new lookup (frame %llu)\n",
-                                        d, (unsigned long long)s_d3d.frame_count);
-                            }
-                        }
-                        dpso = look;
-                    }
-                }
-                gpu_cmd_set_pipeline(rc, dpso.v ? dpso : vpso);
-                /* Per-draw viewport: the guest rect when sane, else the
-                 * full target. Scissor tracks the same rect. */
-                {
-                    float tw = cur_nocol ? vp_last_w
-                             : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
-                    float th = cur_nocol ? vp_last_h
-                             : (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
-                    gpu_viewport dvp = {0, 0, tw, th, 0.0f, 1.0f};
-                    if (dr->vp_w >= 2 && dr->vp_h >= 2 &&
-                        (float)(dr->vp_x + dr->vp_w) <= tw + 0.5f &&
-                        (float)(dr->vp_y + dr->vp_h) <= th + 0.5f) {
-                        dvp.x      = (float)dr->vp_x;
-                        dvp.y      = (float)dr->vp_y;
-                        dvp.width  = (float)dr->vp_w;
-                        dvp.height = (float)dr->vp_h;
-                    }
-                    gpu_rect dsc = {(int32_t)dvp.x, (int32_t)dvp.y,
-                                    (int32_t)(dvp.x + dvp.width),
-                                    (int32_t)(dvp.y + dvp.height)};
-                    dvp_x = dvp.x;     dvp_y = dvp.y;
-                    dvp_w = dvp.width; dvp_h = dvp.height;
-                    if (tgt_sx != 1.0f || tgt_sy != 1.0f) {   /* RSX_SCALE: the guest rect, scaled */
-                        dvp.x *= tgt_sx; dvp.width  *= tgt_sx;
-                        dvp.y *= tgt_sy; dvp.height *= tgt_sy;
-                        dsc.left   = lroundf(dvp.x);
-                        dsc.top    = lroundf(dvp.y);
-                        dsc.right  = lroundf(dvp.x + dvp.width);
-                        dsc.bottom = lroundf(dvp.y + dvp.height);
-                    }
-                    gpu_cmd_set_viewport(rc, &dvp);
-                    gpu_cmd_set_scissor(rc, &dsc);
-                }
-                /* Per-draw textures: bind this draw's SRV window.
-                 * Any sampled offscreen RT transitions to PSR first (never
-                 * one of the currently-bound colour targets). */
-                for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
-                    int tz = dr->tex_z[_u];
-                    if (tz >= 0) {
-                        if (tz == cur_z && cur_zro)   /* bound read-only: readable */
-                            ;
-                        else if (tz == cur_z) { /* bound as this draw's depth: unreadable */
-                            srv_write(draw_srv(d) + (u32)_u, k_rc_no_tex,
-                                      GPU_FORMAT_R8G8B8A8_UNORM,
-                                      GPU_SWIZZLE_IDENTITY);
-                            fpwatch_unreadable(dr->fp_addr);
-                        }
-                        else
-                            zeta_transition(tz, GPU_STATE_PIXEL_SHADER_RESOURCE);
-                        continue;
-                    }
-                    int rt = dr->tex_rt[_u];
-                    if (rt < 0) continue;
-                    if (rt != cur_rt &&
-                        rt != cur_m[0] && rt != cur_m[1] && rt != cur_m[2]) {
-                        off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
-                        continue;
-                    }
-                    /* Sampling a bound colour target: read a copy (above). */
-                    srv_write(draw_srv(d) + (u32)_u, off_rt_snapshot(rt),
-                              (gpu_format)s_d3d.off_rt[rt].dxgi,
-                              GPU_SWIZZLE_IDENTITY);
-                }
-                gpu_cmd_bind_table(rc, 1, gpu_fast_table_ref(rdev, rsrv, draw_srv(d)));
-                vp_bind_sampler_table(dr);
-                /* Per-draw constants: this draw's vp_cb bank + FP texscale
-                 * block, each in its chunk (a shift and a mask: no divide). */
-                gpu_cmd_bind_cb(rc, 0, cb_va[dr->vcb_slot >> VP_CB_CHUNK_SHIFT] + cb_par
-                    + (u64)(dr->vcb_slot & VP_CB_CHUNK_MASK) * VP_CB_STRIDE);
-                if ((dr->cb_slot >> VP_FPCB_CHUNK_SHIFT) < fpcb_n)
-                    gpu_cmd_bind_cb(rc, 2, fpcb_va[dr->cb_slot >> VP_FPCB_CHUNK_SHIFT] + fpcb_par
-                        + (u64)(dr->cb_slot & VP_FPCB_CHUNK_MASK) * VP_FPCB_STRIDE);
-                /* DRAWARGS=<N>: the arguments actually handed to the GPU, plus
-                 * the target they are aimed at. A zero vertex count, or a start
-                 * vertex past the buffer, rasterises nothing while every other
-                 * check upstream still says the draw is fine. */
-                { static int dcap = -1, dn = 0;
-                  PS3_KNOB(dcap, ps3_env_int("DRAWARGS", 0));
-                  if (dcap && dn < dcap) { dn++;
-                      fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d rec=0x%08X bound=0x%08X"
-                              " tex0=0x%08X texrt=%d dvp=%.0f,%.0f %.0fx%.0f%c",
-                              dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
-                              dr->rt_off,
-                              (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].off : 0u,
-                              dr->tex[0].raw, dr->tex_rt[0],
-                              (double)dvp_x, (double)dvp_y,
-                              (double)dvp_w, (double)dvp_h, 10); } }
-                /* RT_REBIND=1: re-issue OMSetRenderTargets immediately before
-                 * every draw instead of only when the target changes. A clear
-                 * proves the RTV descriptor is good but not that the binding is
-                 * still live at draw time -- ClearRenderTargetView writes
-                 * through the descriptor and never consults the OM. If anything
-                 * between the retarget and here drops the binding, this restores
-                 * it. */
-                { static int rb = -1;
-                  PS3_KNOB(rb, ps3_env_int("RT_REBIND", 0));
-                  if (rb) {
-                      gpu_pass bp;
-                      bp.nrt = 1;
-                      bp.rt[0] = (cur_rt >= 0) ? s_d3d.off_rt[cur_rt].rtv : s_rc_rt_rtv[fi];
-                      for (int _m = 0; _m < 3; _m++)
-                          if (cur_m[_m] >= 0) bp.rt[bp.nrt++] = s_d3d.off_rt[cur_m[_m]].rtv;
-                      bp.ds = s_rc_depth_dsv;
-                      gpu_cmd_pass_begin(rc, &bp);
-                  } }
-                /* A fetch draw reads its descriptor's chunk at t20 (vf_lo); a
-                 * clamp draw of converted vertices leaves its vp_vb chunk there,
-                 * so the next fetch draw binds its own again. */
-                if (dr->fetch && dr->fdesc - vf_lo >= vf_in) {
-                    vf_lo = dr->fdesc >> s_vf_shift << s_vf_shift;
-                    vf_in = s_vf_cap;
-                    gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vf, dr->fdesc >> s_vf_shift));
-                } else if (dr->uvc && !dr->fetch) vf_in = 0;
-                { int zq = -1;
-                  if (g_rsx_report_hook && (s_zq_nev || s_zq_on_start) &&
-                      s_zq_n < ZQ_MAX && zq_counted(dr->cb_slot) && zq_ready()) {
-                      zq = s_zq_n++;
-                      s_zq_rec[zq] = dr->cb_slot;
-                      s_zq_area[zq] = tgt_sx * tgt_sy;
-                      /* The batch's queries are reset before its first one
-                       * (Vulkan's rule; nothing on D3D12). */
-                      if (!zq) gpu_cmd_query_reset(rc, s_zq_pool, 0, ZQ_MAX);
-                      gpu_cmd_query_begin(rc, s_zq_pool, (u32)zq);
-                  }
-                if (dr->uvc) {
-                    /* Step V5: the clamp's vertex-shader form, a list of its
-                     * triangles' corners (uvc_table); t20 as the table's ring,
-                     * and back to vf_buf for the draws after. With no
-                     * pipeline it is not drawn (the fallback reads vertices). */
-                    if (!dr->fetch)   /* (the chunk that holds the draw's vertices and table) */
-                        gpu_cmd_bind_raw(rc, 4, rc_arena_base(&s_vb, rc_arena_chunk(&s_vb, dr->vb_byte_offset)));
-                    gpu_cmd_push_const1(rc, 5, dr->uvc_tab, 0);
-                    if (s_vp_topo_strip) {
-                        s_vp_topo_strip = 0;
-                        gpu_cmd_set_topology(rc, GPU_TOPO_TRIANGLELIST);
-                    }
-                    dred_mark(d, dr);
-                    if (dpso.v && dr->uvc_n) gpu_cmd_draw(rc, dr->uvc_n, 1, 0, 0);
-                    { static u32 said;   /* the first of each kind */
-                      const u32 kind = 1u << (dr->fetch ? 1 + dr->fetch : dr->index_count ? 1 : 0);
-                      if (!(said & kind)) {
-                          said |= kind;
-                          printf("[D3D12] sprite-edge clamp in the vertex shader: a draw %s, %u vertices\n",
-                                 dr->fetch == 2 ? "of a fetch strip" : dr->fetch ? "of a fetch list"
-                                 : dr->index_count ? "indexed" : "not indexed", dr->uvc_n);
-                      } }
-                } else {
-                    if (dr->fetch)   /* the records' offset in the chunk bound */
-                        gpu_cmd_push_const1(rc, 5, dr->fdesc - vf_lo, 0);
-                    /* A strip draw's indices are a strip (vf_strip_native). */
-                    if ((dr->fetch == 2) != s_vp_topo_strip) {
-                        s_vp_topo_strip = dr->fetch == 2;
-                        gpu_cmd_set_topology(rc, s_vp_topo_strip ? GPU_TOPO_TRIANGLESTRIP : GPU_TOPO_TRIANGLELIST);
-                    }
-                    /* vp_vb's chunk with the draw's vertices, when it is
-                     * not the one bound (a compare per draw, no divide). */
-                    if (!dr->fetch && (dr->vb_byte_offset < vb_lo || dr->vb_byte_offset >= vb_hi)) {
-                        vb_chunk = rc_arena_chunk(&s_vb, dr->vb_byte_offset);
-                        vb_lo = vb_chunk >= RC_ARENA_MAX ? s_vb_big : (u64)vb_chunk * s_vb.half;
-                        vb_hi = vb_lo + rc_arena_size(&s_vb, vb_chunk);
-                        gpu_cmd_set_vb(rc, 0, rc_arena_base(&s_vb, vb_chunk), (u32)rc_arena_size(&s_vb, vb_chunk), 256);
-                    }
-                    const u32 vb_first = dr->fetch ? 0 : (u32)((dr->vb_byte_offset - vb_lo) / 256);
-                    dred_mark(d, dr);
-                    if (dr->index_count)
-                        gpu_cmd_draw_indexed(rc, dr->index_count, hang_test_instances(dr->index_count),
-                                             dr->ib_first, (int32_t)vb_first, 0);
-                    else
-                        gpu_cmd_draw(rc, dr->vertex_count, 1, vb_first, 0);
-                }
-                  if (zq >= 0)
-                      gpu_cmd_query_end(rc, s_zq_pool, (u32)zq); }
-                /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
-                 * "records exist" and "draws were submitted" are different
-                 * claims, and every blank-output investigation conflates them. */
-                { static int cap = -1, n = 0;
-                  PS3_KNOB(cap, ps3_env_int("VP_SUBMIT", 0));
-                  if (cap && n < cap) { n++;
-                    fprintf(stderr, "[VPSUBMIT] draw[%u] verts=%u pso=%s vp=%ux%u tex0=0x%X(set=%d) tex1=0x%X slot=%d fp=0x%X%c",
-                            d, dr->vertex_count, dpso.v ? "guest-fp" : "fallback",
-                            dr->vp_w, dr->vp_h, dr->tex[0].raw, dr->tex[0].set,
-                            dr->tex[1].raw, dr->tex_slot, dr->fp_addr, 10);
-                    fprintf(stderr, "            vs_idx=%d cb_slot=%u vbofs=%u cull=%u blend=%d%c",
-                            dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
-                            dr->cull, dr->blend, 10); } }
-            }
-            if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
-            fpwatch_batch();
-            { static int said;   /* RSX_SUBMIT_SPLIT: the first batch that went in parts */
-              if (split_parts > 1 && !said) {
-                  said = 1;
-                  printf("[D3D12] RSX_SUBMIT_SPLIT=%u: batch %u went to the GPU in %u parts (%u records)\n",
-                         split_n, s_rf_serial, split_parts, s_d3d.draw_count);
-              } }
-            /* Leave the backbuffer bound for the dump/present epilogue. */
-            if (cur_rt >= 0) {
-                gpu_cmd_pass_begin(rc, &disp_pass);
-                const gpu_viewport vp = {0, 0, (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 1.0f};
-                const gpu_rect sc = {0, 0, (int32_t)s_d3d.host_w, (int32_t)s_d3d.host_h};
-                gpu_cmd_set_viewport(rc, &vp);
-                gpu_cmd_set_scissor(rc, &sc);
-            }
-        }
+
+    /* The hand-off: everything before this line runs on the FIFO thread. */
+    RfJob* const j = &s_rf_job;
+    j->fi = fi;
+    j->rc = rc;
+    j->disp_pass = disp_pass;
+    j->rf0 = _rf0;
+    j->draws = draws;
+    j->n = s_d3d.draw_count;
+    j->par = (u32)s_d3d.vp_parity;
+    j->present = s_present_this_frame;
+    j->ib = s_rc_vp_ib;
+    j->icap = s_vp_icap;
+    j->zq_nev = s_zq_nev;
+    j->zq_on_start = s_zq_on_start;
+    j->ev = s_zq_ev;
+    j->threaded = rf_may_thread(j);
+    if (!j->threaded) {                    /* as before: all of it here, in this order */
+        s_rf_inl++;
+        rf_vp_pass(j);
+        rf_after1(j);
+        rf_rtsave(fi, rc);
+        rf_after2();
+        rf_tail(j);
+        return;
     }
-
-    RF_CP(6);
-    if (perf_on()) s_perf_rf += perf_now() - _rf0;
-    /* MEMPEEK=<hex addr>:<n>: n big-endian floats at a guest address each frame,
-     * with a min/max so a buffer of constants is distinguishable from real data. */
-    { const char* mp = getenv("MEMPEEK");
-      if (mp) { extern uint8_t* vm_base; static int _n = 0;
-        u32 addr = 0; int cnt = 8; sscanf(mp, "%x:%d", &addr, &cnt);
-        if (vm_base && addr && _n < 6 && ++_n) {
-            float lo = 1e30f, hi = -1e30f; u32 nz = 0;
-            for (int i = 0; i < cnt; i++) {
-                const u8* q = vm_base + addr + i * 4;
-                u32 bits = ((u32)q[0]<<24)|((u32)q[1]<<16)|((u32)q[2]<<8)|q[3];
-                float f; memcpy(&f, &bits, 4);
-                if (f == f && f < 1e30f && f > -1e30f) { if (f < lo) lo = f; if (f > hi) hi = f; }
-                if (bits) nz++;
-            }
-            fprintf(stderr, "[MEMPEEK] 0x%08X n=%d nonzero=%u range[%g..%g]%c",
-                    addr, cnt, nz, lo, hi, 10);
-        } } }
-    /* VRAMSCAN=1: which 64 KB blocks of guest memory change between frames.
-     * "nothing writes the buffer we read" is only half an answer -- this says
-     * where the producer IS writing, so the two can be matched up. */
-    { static int vs = -1; PS3_KNOB(vs, getenv("VRAMSCAN") ? 1 : 0);
-      if (vs) { extern uint8_t* vm_base;
-        static u32 prev[512]; static int have = 0; static int reported = 0;
-        u32 base = 0xC6000000u; u32 nblk = 512;          /* 32 MB window */
-        const char* bs = getenv("VRAMSCAN_BASE");
-        if (bs) base = (u32)strtoul(bs, NULL, 0);
-        if (vm_base && reported < 6) {
-            u32 changed = 0; char list[512]; int ln = 0;
-            for (u32 b = 0; b < nblk; b++) {
-                const u8* p = vm_base + base + b * 0x10000u;
-                u32 h = 2166136261u;
-                for (u32 i = 0; i < 0x10000u; i += 61) h = (h ^ p[i]) * 16777619u;
-                if (have && h != prev[b]) { changed++;
-                    if (ln < 400) ln += snprintf(list + ln, sizeof(list) - ln,
-                                                 " +0x%X", b * 0x10000u); }
-                prev[b] = h;
-            }
-            if (have && changed) { reported++;
-                fprintf(stderr, "[VRAMSCAN] base=0x%08X %u/512 blocks changed:%s%c",
-                        base, changed, list, 10); }
-            have = 1;
-        } } }
-    /* FRAME_BUDGET=1: geometry a frame asked for vs what the batch can hold.
-     * Reported from render_frame so it works under RSX_ACCUM_FRAME too -- it
-     * used to live in the clear-boundary present path, which accum bypasses, so
-     * it silently produced nothing in exactly the configuration being used. */
-    { static int fb = -1;
-      PS3_KNOB(fb, ps3_env_int("FRAME_BUDGET", 0));
-      if (fb && s_req_draws) { static int n = 0; if (n < 40 && ++n)
-        fprintf(stderr, "[BUDGET] frame: requested %llu verts / %llu draws, "
-                        "buffer holds %u verts, %llu draws truncated%c",
-                (unsigned long long)s_req_verts, (unsigned long long)s_req_draws,
-                s_vp_cap, (unsigned long long)s_drop_draws, 10); }
-      s_req_verts = 0; s_req_draws = 0; s_drop_draws = 0; }
-    if (perf_on()) {
-        static double s_t_prev = 0.0; static int s_n = 0;
-        double now = perf_now();
-        if (s_t_prev > 0.0) s_perf_frame += now - s_t_prev;
-        s_t_prev = now;
-        if (++s_n % 20 == 0) {
-            double fr = s_perf_frame > 0 ? s_perf_frame : 1;
-            gpu_sc_stats sc;   /* the shader compiles: the compile service's counters */
-            gpu_sc_stats_take(&sc, 1);
-            if (perf_print()) fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
-                            " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
-                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)"
-                            " [vs compile %.2fs, %d] [fxc %.2fs %d, disk %d | create pso %.2fs %d | misses %.2fs]%c",
-                    20.0 / fr,
-                    s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
-                    s_perf_vtx, 100.0 * s_perf_vtx / fr,
-                    (double)s_perf_nverts / 1000.0,
-                    s_perf_rf, 100.0 * s_perf_rf / fr,
-                    s_perf_pre, 100.0 * s_perf_pre / fr,
-                    s_perf_srv, 100.0 * s_perf_srv / fr,
-                    s_perf_pso, 100.0 * s_perf_pso / fr,
-                    s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
-                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr,
-                    s_perf_vs, s_perf_vs_compiles,
-                    sc.compile_s, sc.compiles, sc.cache_hits, s_perf_cpso, s_perf_cpso_n, s_perf_pmiss, 10);
-            s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
-            s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
-            s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
-            s_perf_vs_compiles = 0; s_perf_vs = 0.0;
-            s_perf_cpso = 0.0; s_perf_cpso_n = 0; s_perf_pmiss = 0.0;
-            s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
-        }
-    }
-    { static int dt = -1;
-      PS3_KNOB(dt, ps3_env_int("RSX_DBG_TRACK", 0));
-      if (dt) { static int fr = 0; fr++;
-        if (s_lock_n)
-            fprintf(stderr, "[RSX_DBG_TRACK] frame %d: %u duck draws, ndc=(%.3f,%.3f)%c",
-                    fr, s_lock_n, (float)(s_lock_sx/s_lock_n), (float)(s_lock_sy/s_lock_n), 10);
-        else if (fr % 20 == 0)
-            fprintf(stderr, "[RSX_DBG_TRACK] frame %d: NO duck draws%c", fr, 10);
-      } }
-    if (s_lock_n) {                       /* publish this frame's centroid */
-        s_lock_x = (float)(s_lock_sx / s_lock_n);
-        s_lock_y = (float)(s_lock_sy / s_lock_n);
-        s_lock_valid = 1;
-        s_lock_sx = s_lock_sy = 0.0; s_lock_n = 0;
-    }
-    s_dbg_last_draws = s_d3d.draw_count;
-    vpj_sync();           /* nothing may still write the half being reset */
-    /* The ends the banks, the b1 blocks and the fetch ring reached (they ask
-     * rc_arena_fit only for a chunk's first piece), for the chunk ahead. */
-    rc_arena_mark(&s_rc_vpcb, (u64)s_vcb_n * VP_CB_STRIDE);
-    rc_arena_mark(&s_rc_fpcb, (u64)s_d3d.draw_count * VP_FPCB_STRIDE);
-    if (s_vf_cap) rc_arena_mark(&s_vf, s_vf_off);
-    s_d3d.vb_offset  = 0; /* reset for next frame */
-    s_d3d.vp_vb_offset = 0;
-    s_vb_cursor = 0;
-    s_d3d.draw_count = 0;
-    s_d3d.vp_parity ^= 1;  /* next frame's records go to the other half */
-    s_vf_off = 0;
-    s_vf_lo = s_vf_end = 0;   /* the next frame's first descriptor finds its chunk (rc_arena_fit) */
-    s_fx.valid = 0;
-    vfo_next();
-    { static int vst = -1; static u32 fr = 0; static u64 emit = 0;
-      PS3_KNOB(vst, ps3_env_int("VP_VSTAT", 0));
-      emit += s_vp_want;
-      if (vst > 0 && ++fr >= (u32)vst) {
-          fprintf(stderr, "[VSTAT] per frame: fetched %llu emitted %llu (%.1f MB) attrs/fetch %.2f"
-                  " | uploads quad %llu tri %llu strip %llu fan %llu%c",
-                  (unsigned long long)(s_vs_fetch / fr), (unsigned long long)(emit / fr),
-                  (double)emit / fr * 256.0 / 1048576.0,
-                  s_vs_fetch ? (double)s_vs_attr / s_vs_fetch : 0.0,
-                  (unsigned long long)(s_vs_up[0] / fr), (unsigned long long)(s_vs_up[1] / fr),
-                  (unsigned long long)(s_vs_up[2] / fr), (unsigned long long)(s_vs_up[3] / fr), 10);
-          fr = 0; emit = 0; s_vs_fetch = s_vs_attr = 0; memset(s_vs_up, 0, sizeof s_vs_up);
-      } }
-    rc_arena_frame_end(&s_vb);   /* (a chunk ahead when the frame got near the last) */
-    s_vp_want = 0;
-    s_d3d.vp_ib_offset = 0;
-    s_vcb_last = ~0u;   /* the next frame's banks go to the other half */
-    s_vcb_n = 0; s_fpcb_hi = 0;   /* numbered from 0 again, their chunks marked again */
-    rc_arena_frame_end(&s_rc_vpcb);
-    rc_arena_frame_end(&s_rc_fpcb);
-    if (!GPU_VALID(s_rc_vp_ib) || s_vp_iwant > s_vp_icap) vp_ib_grow(s_vp_iwant);
-    s_vp_iwant = 0;
-    if (s_vf_cap) rc_arena_frame_end(&s_vf);   /* a chunk ahead when this frame reached the last */
-
-    /* The fragment-program debug rewrites (FP_SHOW, FP_TEX, FP_ONE, FP_KILL,
-     * FP_IDCOLOR, FP_TEX_FP) apply when a program is compiled, and a program
-     * compiles once. When any of them changes (the console's setenv), bump the
-     * pipeline generation so every program rebuilds with the new value: one
-     * live run can then look at register after register. */
-    { static char last[512] = ""; static int init = 0;
-      static const char* const knobs[] = { "FP_SHOW", "FP_TEX", "FP_ONE", "FP_KILL",
-                                           "FP_IDCOLOR", "FP_TEX_FP" };
-      char cur[512]; size_t at = 0;
-      cur[0] = 0;
-      for (int k = 0; k < 6; k++) {
-          const char* v = getenv(knobs[k]);
-          int w = snprintf(cur + at, sizeof cur - at, "%s=%s;", knobs[k], v ? v : "");
-          if (w > 0 && (size_t)w < sizeof cur - at) at += (size_t)w;
-      }
-      if (init && strcmp(cur, last)) {
-          s_d3d.vp_gen++;
-          fprintf(stderr, "[FP] debug knobs changed (%s): rebuilding pipelines%c", cur, 10);
-      }
-      init = 1;
-      memcpy(last, cur, sizeof last);
-    }
-
-    /* Debug: RTT_SAVERT=<hex raw offset>[:frame] copies that offscreen RT
-     * into a readback buffer this frame and writes rt_save_<offset>.bmp
-     * (half-float RTs are tonemapped |v| -> byte). A new value re-arms it, so
-     * the console's setenv can save one target after another in a live run. */
-    static gpu_buffer s_rtsave_b;   /* the readback buffer (step C2) */
-    static u64 s_rtsave_cap = 0;
-    static u32 s_rtsave_state = 0;   /* 1 = copy queued this frame */
-    static u32 s_rtsave_w, s_rtsave_h, s_rtsave_pitch, s_rtsave_dxgi, s_rtsave_off;
-    { const char* sv = getenv("RTT_SAVERT");
-      static int _done = 0;
-      static char _last[32] = "";
-      if (sv && strncmp(sv, _last, sizeof _last - 1) != 0) {
-          strncpy(_last, sv, sizeof _last - 1); _done = 0; }
-      static u32 _skip = 0xFFFFFFFFu;
-      if (_skip == 0xFFFFFFFFu) { const char* sk = getenv("RTT_SAVERT_SKIP");
-          _skip = sk ? (u32)strtoul(sk, NULL, 0) : 0; }   /* frame 60 is far too
-          early for a title that takes a minute to reach its menu */
-      /* RTT_SAVERT_AFTER=<seconds> triggers on wall time instead of a frame
-       * count. This title runs its menu at a few frames a second, so a frame
-       * number is not a usable way to say "once it has settled". */
-      static u32 _after = 0xFFFFFFFFu;
-      if (_after == 0xFFFFFFFFu) { const char* sa = getenv("RTT_SAVERT_AFTER");
-          _after = sa ? (u32)strtoul(sa, NULL, 0) : 0; }
-      static clock_t _t0 = 0;
-      if (!_t0) _t0 = clock();
-      const int _due = _after
-          ? ((u32)((clock() - _t0) / CLOCKS_PER_SEC) >= _after)
-          : (s_d3d.frame_count > 60 + _skip);
-      { static int _p1 = 0;
-        if (sv && _due && !_p1) { _p1 = 1;
-            printf("[RTT_SAVERT] due: want=0x%lX found_rt=%d frame=%u\n",
-                   strtoul(sv, NULL, 16), off_rt_find((u32)strtoul(sv, NULL, 16)),
-                   (unsigned)s_d3d.frame_count); fflush(stdout); } }
-      if (sv && !_done && _due) {
-        int rt = off_rt_find((u32)strtoul(sv, NULL, 16));
-        fprintf(stderr, "[RTT_SAVERT] rt=%d res=%p\n", rt,
-                rt >= 0 ? (void*)(uintptr_t)s_d3d.off_rt[rt].tex.id : NULL);
-        if (rt >= 0 && GPU_VALID(s_d3d.off_rt[rt].tex)) {
-            OffRT* r = &s_d3d.off_rt[rt];
-            u32 bpp = (r->dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) ? 8 :
-                      (r->dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) ? 16 : 4;
-            u32 pitch = (r->hw * bpp + 255) & ~255u;
-            fprintf(stderr, "[RTT_SAVERT] rt=%d w=%u h=%u bpp=%u pitch=%u dxgi=%d bytes=%llu\n",
-                    rt, r->hw, r->hh, bpp, pitch, (int)r->dxgi,
-                    (unsigned long long)((u64)pitch * r->hh));
-            if (GPU_VALID(s_rtsave_b) && s_rtsave_cap < (u64)pitch * r->hh) {   /* (the last save read it) */
-                wait_for_gpu();
-                gpu_buffer_destroy(s_rc_dev, s_rtsave_b, 0); s_rtsave_b.id = 0; }
-            if (!GPU_VALID(s_rtsave_b)) {
-                s_rtsave_cap = (u64)pitch * r->hh;
-                rc_buf_make(s_rtsave_cap, GPU_USE_COPY_DST, GPU_MEM_READBACK, &s_rtsave_b, NULL);
-            }
-            if (!GPU_VALID(s_rtsave_b)) fprintf(stderr, "[RTT_SAVERT] readback buffer alloc FAILED\n");
-            if (GPU_VALID(s_rtsave_b)) {
-                off_rt_transition(rt, GPU_STATE_COPY_SOURCE);
-                gpu_footprint cfp;
-                memset(&cfp, 0, sizeof cfp);
-                cfp.format    = (gpu_format)r->dxgi;
-                cfp.width     = r->hw;
-                cfp.height    = r->hh;
-                cfp.depth     = 1;
-                cfp.row_pitch = pitch;
-                gpu_cmd_copy_tex_to_buf(rc, s_rtsave_b, &cfp, r->tex, 0, NULL);
-                off_rt_transition(rt, GPU_STATE_PIXEL_SHADER_RESOURCE);
-                s_rtsave_state = 1;
-                s_rtsave_w = r->hw; s_rtsave_h = r->hh;
-                s_rtsave_pitch = pitch; s_rtsave_dxgi = r->dxgi;
-                s_rtsave_off = (u32)strtoul(sv, NULL, 16);
-                fprintf(stderr, "[RTT_SAVERT] copy queued: rt=%d %ux%u pitch=%u\n",
-                        rt, r->hw, r->hh, pitch);
-                _done = 1;
-            }
-        }
-      } }
-
-    /* CELLMARK_DUMP_MINDRAWS=<N>: only consider frames carrying at least N draw
-     * records. Most render_frame calls come from the guest flip with a batch the
-     * clear boundary already drained, so they present an empty backbuffer -- and
-     * sampling those wastes every dump on a black image while the frames that do
-     * hold the scene go uncaptured. */
-    { static int mind = -1;
-      if (mind < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
-                      mind = e ? atoi(e) : 0; }
-      /* draw_count is already reset by here; s_dbg_last_draws holds the
-       * count this frame actually rendered. */
-      if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
-    if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
-skip_dump_consider: ;
-    /* CELLMARK_DUMP_NOW=<n> (live): dump the next n presents, every one, from
-     * the console -- the frames around a flicker, once the game is showing it.
-     * CELLMARK_DUMP is read at init, and its skip count cannot know when a
-     * hand-driven run reaches the spot. Each dump line gives the batch's draws. */
-    /* An F9 capture started: save the presents that follow it as
-     * cap_NNN_live_XX_d<draws>.bmp, RSX_HOTKEY_LIVE of them (default 4, 0 =
-     * off). A replay rebuilds one batch from guest memory with no targets
-     * from earlier frames and no flips; these show what was on screen. */
-    { extern volatile long g_rcap_live_arm; extern char g_rcap_live_name[32];
-      static long seen;
-      if (g_rcap_live_arm != seen) {
-          seen = g_rcap_live_arm;
-          const int n = ps3_env_int("RSX_HOTKEY_LIVE", 4);
-          if (n > 0 && s_hotshot_left <= 0) {
-              snprintf(s_hotshot_name, sizeof s_hotshot_name, "%s", g_rcap_live_name);
-              s_hotshot_n = 0;
-              s_hotshot_left = n;
-              s_d3d.dump_frames_left = n; s_d3d.dump_skip_left = 0;
-              const char* hd = getenv("RSX_HOTKEY_DIR");
-              if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
-              snprintf(s_dp_prefix, sizeof s_dp_prefix, "%s/%s_draws", hd, g_rcap_live_name);
-              s_dp_left = n; s_dp_n = 0;
-          }
-      } }
-    if (s_hotshot_arm) {   /* F10, armed from the window procedure */
-        s_hotshot_arm = 0;
-        s_hotshot_name[0] = 0;
-        const int n = ps3_env_int("RSX_HOTKEY_SHOTS", 12);
-        const char* hd = getenv("RSX_HOTKEY_DIR");
-        if (!hd || !*hd) hd = "rsx_hotkey";   /* as F9 (cellGcmSys.c) */
-        CreateDirectoryA(hd, NULL);
-        char probe[512];
-        do {   /* the first burst number not already on disk */
-            s_hotshot_burst++;
-            snprintf(probe, sizeof probe, "%s%sshot_%03d_00_d*.bmp", hd ? hd : "", hd ? "/" : "",
-                     s_hotshot_burst);
-#ifdef _WIN32
-            WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(probe, &fd);
-            if (fh == INVALID_HANDLE_VALUE) break;
-            FindClose(fh);
-#else
-            glob_t g;
-            const int found = glob(probe, 0, NULL, &g) == 0 && g.gl_pathc > 0;
-            globfree(&g);
-            if (!found) break;
-#endif
-        } while (s_hotshot_burst < 999);
-        s_hotshot_n = 0;
-        s_hotshot_left = n > 0 ? n : 12;
-        s_d3d.dump_frames_left = s_hotshot_left; s_d3d.dump_skip_left = 0;
-        printf("[F10] dumping the next %d presents as shot_%03d_*%c", s_hotshot_left,
-               s_hotshot_burst, 10);
-    }
-    { static unsigned gen; static int last;
-      if (gen != ps3_env_gen) { gen = ps3_env_gen;
-          const int v = ps3_env_int("CELLMARK_DUMP_NOW", 0);
-          if (v != last) { last = v;
-              if (v > 0) { s_d3d.dump_frames_left = v; s_d3d.dump_skip_left = 0; } } } }
-    guest_fb_present(fi);
-    composite_present(fi);
-    if (!aa_mode() || !knob_aa_at_present())
-        s_aa.present_logged = 0;
-    else if (s_present_this_frame) {
-        if (s_aa.present_logged != aa_mode() && knob_aa_log() > 0)
-            printf("[AA] %s on the finished frame, HUD included (RSX_AA_AT=present)\n",
-                   aa_mode() == 2 ? "SMAA" : "FXAA");
-        s_aa.present_logged = aa_mode();
-        aa_run_display(fi);
-    }
-    int dumping = (s_d3d.dump_frames_left > 0 && GPU_VALID(s_rc_readback_buf)
-                   && s_d3d.dump_skip_left == 0);
-    { static int mind2 = -1;
-      if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
-                       mind2 = e ? atoi(e) : 0; }
-      if (mind2 > 0 && s_dbg_last_draws < (u32)mind2) dumping = 0; }
-    /* CELLMARK_DUMP_EVERY=N: after each dump, skip N-1 frames -- samples the whole
-     * run instead of one contiguous window, so a short burst of real content
-     * can't fall between the dumped frames. */
-    if (dumping) {
-        static int s_every = -1;
-        if (s_every < 0) { const char* e = getenv("CELLMARK_DUMP_EVERY");
-                           s_every = e ? atoi(e) : 0; }
-        if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
-    }
-    if (dumping) {
-        /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
-        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_COPY_SOURCE);
-
-        gpu_footprint dfp;
-        memset(&dfp, 0, sizeof dfp);
-        dfp.format    = GPU_FORMAT_R8G8B8A8_UNORM;
-        dfp.width     = s_d3d.host_w;
-        dfp.height    = s_d3d.host_h;
-        dfp.depth     = 1;
-        dfp.row_pitch = s_d3d.readback_pitch;
-        gpu_cmd_copy_tex_to_buf(rc, s_rc_readback_buf, &dfp, s_rc_rt_tex[fi], 0, NULL);
-
-        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT);
-    } else {
-        /* End-of-frame fallback snapshot: used when the frame never contained a
-         * reduced-viewport pass to capture mid-frame. */
-        screen_copy_capture(fi);
-        /* Transition render target to PRESENT state */
-        gpu_cmd_barrier(rc, s_rc_rt_tex[fi], GPU_STATE_RENDER_TARGET, GPU_STATE_PRESENT);
-    }
-
-    RF_CP(7);
-    rt_writeback_record();
-    if (s_zq_n)
-        gpu_cmd_query_resolve(rc, s_zq_pool, 0, (u32)s_zq_n, s_zq_rb_buf, 0);
-
-    /* The game's frame, scaled into the window's buffer (and held for the
-     * overlay's repaints). */
-    if (s_present_this_frame) {
-        hold_frame(fi);
-        blit_to_window(fi);
-    }
-
-    /* Close and execute */
-    frame_cmd_submit();
-
-    dred_report("frame submit");
-    if (write_color_on() && !write_color_defer()) {   /* (deferred: wb_store_done) */
-        double _g = perf_on() ? perf_now() : 0.0;
-        wb_store_all();
-        dred_report("write-back wait");
-        if (perf_on()) s_perf_gpu += perf_now() - _g;
-    }
-    if (s_zq_n && (!write_color_on() || write_color_defer())) {
-        if (zq_defer_on()) {   /* stored by zq_hook or the next render_frame */
-            s_zq_pend = 1; s_zq_pend_nev = s_zq_nev; s_zq_pend_on = s_zq_on;
-        } else { wait_for_gpu(); zq_finish(s_zq_nev, s_zq_on); }
-    } else zq_finish(s_zq_nev, s_zq_on);
-
-    /* (The drain of the debug layer's message queue is not copied:
-     * this route never enables the debug layer, so the queue holds nothing;
-     * call map G16.) */
-
-    if (s_sc_dump_pending) {
-        s_sc_dump_pending = 0;
-        wait_for_gpu();
-        s_dump_name = "screencopy";
-        dump_backbuffer_bmp();
-        s_dump_name = NULL;
-    }
-    if (dumping) {
-        wait_for_gpu();            /* ensure the copy finished before mapping */
-        dump_backbuffer_bmp();
-        s_d3d.dump_frames_left--;
-    }
-
-    if (s_rtsave_state) {
-        char _rtname[64];
-        snprintf(_rtname, sizeof _rtname, "rt_save_%08X.bmp", s_rtsave_off);
-        fprintf(stderr, "[RTT_SAVERT] writing %s %ux%u\n", _rtname, s_rtsave_w, s_rtsave_h);
-        if (!dumping) { double _g = perf_on() ? perf_now() : 0.0;
-                        wait_for_gpu();
-                        if (perf_on()) s_perf_gpu += perf_now() - _g; }
-        void* mp = gpu_buffer_map(s_rc_dev, s_rtsave_b, 0, (u64)s_rtsave_pitch * s_rtsave_h);
-        if (mp) {
-            FILE* f = fopen(_rtname, "wb");
-            if (f) {
-                u32 w = s_rtsave_w, h = s_rtsave_h;
-                u32 rowb = (w * 3 + 3) & ~3u;
-                u32 datasz = rowb * h;
-                u8 hdr[54] = {0};
-                hdr[0]='B'; hdr[1]='M';
-                *(u32*)(hdr+2) = 54 + datasz; *(u32*)(hdr+10) = 54;
-                *(u32*)(hdr+14) = 40; *(int*)(hdr+18) = (int)w; *(int*)(hdr+22) = (int)h;
-                *(u16*)(hdr+26) = 1; *(u16*)(hdr+28) = 24; *(u32*)(hdr+34) = datasz;
-                fwrite(hdr, 1, 54, f);
-                u8* line = (u8*)malloc(rowb);
-                for (int y = (int)h - 1; y >= 0; y--) {
-                    const u8* srow = (const u8*)mp + (u64)y * s_rtsave_pitch;
-                    memset(line, 0, rowb);
-                    for (u32 x = 0; x < w; x++) {
-                        float rv, gv, bv;
-                        if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
-                            const u16* hp16 = (const u16*)(srow + (u64)x * 8);
-                            /* crude half->float: sign|exp|mant */
-                            float v[3];
-                            for (int c2 = 0; c2 < 3; c2++) {
-                                u16 hv = hp16[c2];
-                                u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
-                                float fv;
-                                if (exp == 0) fv = (float)man / 16777216.0f;
-                                else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
-                                       memcpy(&fv, &fb, 4); }
-                                v[c2] = fv;
-                            }
-                            rv = v[0]; gv = v[1]; bv = v[2];
-                        } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
-                            const float* fp32 = (const float*)(srow + (u64)x * 16);
-                            rv = fp32[0]; gv = fp32[1]; bv = fp32[2];
-                        } else {
-                            const u8* p8 = srow + (u64)x * 4;
-                            rv = p8[0] / 255.0f; gv = p8[1] / 255.0f; bv = p8[2] / 255.0f;
-                        }
-                        /* RTT_SAVEA=1: show the alpha lane in RED (gates
-                         * like wave's mask.w live there). */
-                        if (getenv("RTT_SAVEA")) {
-                            float av;
-                            if (s_rtsave_dxgi == GPU_FORMAT_R16G16B16A16_FLOAT) {
-                                const u16* hp16 = (const u16*)(srow + (u64)x * 8);
-                                u16 hv = hp16[3];
-                                u32 sign = (hv >> 15) & 1, exp = (hv >> 10) & 0x1F, man = hv & 0x3FF;
-                                if (exp == 0) av = (float)man / 16777216.0f;
-                                else { u32 fb = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
-                                       memcpy(&av, &fb, 4); }
-                            } else if (s_rtsave_dxgi == GPU_FORMAT_R32G32B32A32_FLOAT) {
-                                av = ((const float*)(srow + (u64)x * 16))[3];
-                            } else {
-                                av = (srow + (u64)x * 4)[3] / 255.0f;
-                            }
-                            rv = av;
-                        }
-                        /* |v| tonemap so signed heights are visible */
-                        float ar = rv < 0 ? -rv : rv, ag = gv < 0 ? -gv : gv, ab = bv < 0 ? -bv : bv;
-                        if (ar > 1) ar = 1; if (ag > 1) ag = 1; if (ab > 1) ab = 1;
-                        line[x*3+0] = (u8)(ab * 255.0f);
-                        line[x*3+1] = (u8)(ag * 255.0f);
-                        line[x*3+2] = (u8)(ar * 255.0f);
-                    }
-                    fwrite(line, 1, rowb, f);
-                }
-                free(line);
-                fclose(f);
-                printf("[D3D12] wrote %s (%ux%u dxgi=%u)\n", _rtname, w, h, s_rtsave_dxgi);
-            }
-            gpu_buffer_unmap(s_rc_dev, s_rtsave_b, 0, s_rtsave_cap);   /* (today's NULL range: all of it) */
-        }
-        s_rtsave_state = 0;
-    }
-
-    /* rsxcap: snapshot whole frames (backbuffer + every offscreen RT + a draw
-     * manifest) at RSX_CAP=start[:count[:stride]] frame_counts. Runs before the
-     * present transition would matter -- the backbuffer is in PRESENT here and
-     * is restored to PRESENT after each readback. */
-    { const char* cap = getenv("RSX_CAP");
-      if (cap) {
-        /* Re-parsed whenever the value changes, so the console can arm one
-         * capture after another in a running game (`setenv RSX_CAP=1:3`,
-         * then a different RSX_CAP_DIR and `RSX_CAP=2:3`); a start below the
-         * current frame count captures at once. */
-        static char s_cap_last[64];
-        static u32 s_cap_start = 0, s_cap_count = 1, s_cap_stride = 1, s_cap_done = 0;
-        if (strncmp(cap, s_cap_last, sizeof s_cap_last - 1) != 0) {
-            strncpy(s_cap_last, cap, sizeof s_cap_last - 1);
-            s_cap_done = 0;
-            u32 a = 0, b = 1, c = 1;
-            int n = sscanf(cap, "%u:%u:%u", &a, &b, &c);
-            s_cap_start  = (n >= 1 && a) ? a : 200;
-            s_cap_count  = (n >= 2 && b) ? b : 1;
-            s_cap_stride = (n >= 3 && c) ? c : 1;
-        }
-        if (s_cap_done < s_cap_count) {
-            u32 target = s_cap_start + s_cap_done * s_cap_stride;
-            if (s_d3d.frame_count >= target && s_dbg_last_draws > 0) {
-                rsx_capture_frame(fi, s_dbg_last_draws, s_cap_done);
-                s_cap_done++;
-            }
-        }
-      } }
-
-    { static char last[400];   /* RSX_HDR_SNAP (see HDR output) */
-      const char* e = getenv("RSX_HDR_SNAP");
-      if (e && *e && strcmp(e, last) && s_present_this_frame && s_hdr.active) {
-          snprintf(last, sizeof last, "%s", e);
-          s_cap_raw = 1;
-          cap_readback_write(s_rc_swap_image[s_rc_image], s_d3d.win_w, s_d3d.win_h, GPU_FORMAT_R16G16B16A16_FLOAT,
-                             GPU_STATE_PRESENT, fi, e);
-          s_cap_raw = 0;
-      } }
-
-    RF_CP(8);
-    /* Present */
-    { LARGE_INTEGER _pq0, _pq1;
-      QueryPerformanceCounter(&_pq0);
-      if (s_present_this_frame && s_overlay_on && s_overlay.frame) {
-          if (s_overlay_wake) InterlockedExchange(&s_overlay_wake, 0);   /* (this call is the wake) */
-          rc_overlay_frame(s_d3d.frame_index);   /* (the menu's: rsxc_api.inc) */
-      }
-      if (s_present_this_frame && knob_present() && !s_session_locked && !window_hidden())   /* skipped for an offscreen-only batch */
-          swap_present(1);
-      QueryPerformanceCounter(&_pq1);
-      if (s_present_this_frame) frame_log(_pq0.QuadPart, _pq1.QuadPart);
-      if (s_present_this_frame) pso_lib_tick();
-      RSX_MARK("present", s_present_this_frame, 0); }
-    RF_CP(9); rf_slow_report();
-    if (s_present_this_frame) prof_record(s_rf_cp[9]);
-
-    move_to_next_frame();
-    s_last_batch_fence = s_batch_fence[s_rf_par] = rc_last_frame_fence();
+    s_rf_thr++;
+    memcpy(j->ev_copy, s_zq_ev, (size_t)s_zq_nev * sizeof j->ev_copy[0]);
+    j->ev = j->ev_copy;
+    rf_pso_retry(j);
+    rf_zq_handoff(j);
+    rf_after1(j);
+    rf_after2();
+    if (j->present) pso_lib_tick();
     /* The next batch writes the other half from its first record on: the
-     * batch before this one, its last user, must be done first. (Without
-     * frames in flight the next render_frame's drain covers it too.) */
-    batch_wait(s_rf_par ^ 1u);
-    swap_resize();
-
-    s_d3d.frame_count++;
-
-    /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
-     * draw count of the last frame, and the backbuffer size. */
-    {
-        static ULONGLONG s_tt0 = 0;
-        static u64 s_tframes = 0;
-        s_tframes++;
-        ULONGLONG tnow = GetTickCount64();
-        if (s_tt0 == 0) s_tt0 = tnow;
-        if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
-            extern char g_rsx_title_base[128];
-            char tb[256];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
-                     g_rsx_title_base,
-                     s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
-#ifdef _WIN32
-            SetWindowTextA(s_d3d.hwnd, tb);
-#else
-            win_set_title(tb);
-#endif
-            /* GCM_RATES=1: the same once-a-second sample on stderr, beside
-             * the FIFO flip words decoded and how far RSX label 255 moved --
-             * the fence a title like Demon's Souls paces its frames on. */
-            { static int on = -1; static u32 fw0, l0, fr0;
-              PS3_KNOB(on, getenv("GCM_RATES") ? 1 : 0);
-              extern uint8_t* vm_base;
-              if (on && vm_base) {
-                  extern volatile u32 g_gcm_flip_words;
-                  extern unsigned cellGcm_flip_request_count(void);
-                  const u8* lp = vm_base + 0x20000FF0u;
-                  u32 fw = g_gcm_flip_words, l = ((u32)lp[0] << 24) | ((u32)lp[1] << 16) | ((u32)lp[2] << 8) | lp[3];
-                  u32 fr = cellGcm_flip_request_count();
-                  /* flips: all flip requests, in the FIFO or not (Demon's
-                   * Souls flips twice per frame it renders). */
-                  /* boundaries: at a flip (render / no display draws), at a
-                   * display clear (render / no display draws / no flip since
-                   * the last present / batch too small) */
-                  /* repaints: the overlay's frames between the game's
-                   * (rc_overlay_repaint), not counted in presents. */
-                  static u32 c0, f1, f2, k1, k2, k3, rp0;
-                  fprintf(stderr, "[gcm-rates] t=%llu presents=%.1f/s flipwords=%u/s flips=%u/s label255=%08X (+%u) draws=%u"
-                          " | flip:render=%u nodisp=%u clear:render=%u nodisp=%u sameflip=%u small=%u repaints=%u%c",
-                          (unsigned long long)tnow, s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                          fw - fw0, fr - fr0, l, l - l0, s_dbg_last_draws,
-                          s_pc_flip_render - f1, s_pc_flip_nodisp - f2, s_clear_presents - c0,
-                          s_pc_clear_nodisp - k1, s_pc_clear_sameflip - k2, s_pc_clear_small - k3,
-                          s_repaints - rp0, 10);
-                  rp0 = s_repaints;
-                  fw0 = fw; l0 = l; fr0 = fr;
-                  f1 = s_pc_flip_render; f2 = s_pc_flip_nodisp; c0 = s_clear_presents;
-                  k1 = s_pc_clear_nodisp; k2 = s_pc_clear_sameflip; k3 = s_pc_clear_small;
-              } }
-            s_tframes = 0;
-            s_tt0 = tnow;
-        }
-    }
+     * batch before this one, its last user, must be done first. Here, since
+     * the replay thread's move to the next frame comes after the FIFO thread
+     * has gone on. (Without frames in flight it is done by now.) */
+    batch_wait(j->par ^ 1u);
+    s_d3d.draws = j->draws == s_rf_lists[0] ? s_rf_lists[1] : s_rf_lists[0];
+    rf_go();
 }
 

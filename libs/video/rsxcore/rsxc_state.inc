@@ -753,10 +753,14 @@ static inline gpu_addr rc_arena_va(const rc_arena* a, u64 off)
 /* The GPU address of chunk k's half for this frame (a whole-chunk bind; k at
  * RC_ARENA_MAX or more is the big buffer), its size, and the chunk of an
  * offset with the offset inside it. */
+static inline gpu_addr rc_arena_base_par(const rc_arena* a, u32 k, u32 par)
+{
+    if (k >= RC_ARENA_MAX) return a->big_va + (u64)par * a->big_half;
+    return a->va[k] + (u64)par * a->half;
+}
 static inline gpu_addr rc_arena_base(const rc_arena* a, u32 k)
 {
-    if (k >= RC_ARENA_MAX) return a->big_va + (u64)s_d3d.vp_parity * a->big_half;
-    return a->va[k] + (u64)s_d3d.vp_parity * a->half;
+    return rc_arena_base_par(a, k, (u32)s_d3d.vp_parity);
 }
 static inline u64 rc_arena_size(const rc_arena* a, u32 k)
 {
@@ -973,13 +977,28 @@ static double perf_now(void)
     QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
-/* A wait that began at t0 (perf_now), into one of g_rsx_waits' pairs
- * (rsx_commands.h): what a problem report says the FIFO thread waited on. */
-static void rc_wait_note(u64* us, u64* n, double t0)
+/* The replay thread's id while it runs (RSX_RF_THREAD; rsxc_sync.inc,
+ * rsxc_frame.inc), else 0. */
+static volatile DWORD s_rf_tid;
+/* The waits of the thread that waits (rsx_commands.h): the FIFO thread's,
+ * or the replay thread's, so each set has one writer. */
+static rsx_waits* rc_waits_mine(void)
 {
+    return s_rf_tid && GetCurrentThreadId() == s_rf_tid ? &g_rsx_waits_rf : &g_rsx_waits;
+}
+enum { RC_WAIT_GPU, RC_WAIT_PRESENT, RC_WAIT_ACQUIRE };
+/* A wait that began at t0 (perf_now), into one of the waits' pairs: what a
+ * problem report says the thread waited on. */
+static void rc_wait_note(int kind, double t0)
+{
+    rsx_waits* const w = rc_waits_mine();
     const double d = perf_now() - t0;
-    *us += d > 0.0 ? (u64)(d * 1e6) : 0u;
-    (*n)++;
+    const u64 us = d > 0.0 ? (u64)(d * 1e6) : 0u;
+    switch (kind) {
+    case RC_WAIT_GPU: w->gpu_us += us; w->gpu_n++; break;
+    case RC_WAIT_PRESENT: w->present_us += us; w->present_n++; break;
+    default: w->acquire_us += us; w->acquire_n++; break;
+    }
 }
 static volatile long s_prof_on;   /* a profile session is recording (rc_prof_begin) */
 extern volatile long g_rsx_prof_toggle;   /* bumped per F11 press; boot_main starts/stops */
@@ -1079,7 +1098,7 @@ static void rc_acquire(void)
     gpu_texture img;
     const double t0 = perf_now();
     s_rc_image = gpu_swap_acquire(s_rc_dev, s_rc_swap, &img);
-    rc_wait_note(&g_rsx_waits.acquire_us, &g_rsx_waits.acquire_n, t0);
+    rc_wait_note(RC_WAIT_ACQUIRE, t0);
     s_rc_have_image = GPU_VALID(img);
     if (s_rc_have_image) swap_follow(img);
     s_d3d.frame_index = rc_be_frame_slot(s_d3d.frame_index, s_rc_image);

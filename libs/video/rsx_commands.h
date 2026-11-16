@@ -480,7 +480,11 @@ rsx_backend* rsx_get_backend(void);
  * presents, and the window's next image. A problem report reads it before
  * and after its window and subtracts (ps3_diag_report). Plain counters,
  * written by the thread that waits: a read in the middle of an update is a
- * few microseconds off, which a report can live with. */
+ * few microseconds off, which a report can live with.
+ *
+ * With RSX_RF_THREAD the replay thread draws and presents a recorded frame
+ * (rsxcore's rsxc_frame.inc). Its waits go in g_rsx_waits_rf instead, so each
+ * set keeps one writer and the FIFO thread's set stays its own. */
 typedef struct rsx_waits {
     u64 measured;                 /* non-zero once a renderer that counts has drawn */
     u64 gpu_us, gpu_n;            /* waits for the GPU to finish work */
@@ -489,6 +493,7 @@ typedef struct rsx_waits {
     u64 batches;                  /* batches drawn (one or more a frame) */
 } rsx_waits;
 extern rsx_waits g_rsx_waits;
+extern rsx_waits g_rsx_waits_rf;
 
 #ifdef __cplusplus
 }

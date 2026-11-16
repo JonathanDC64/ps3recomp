@@ -2266,14 +2266,14 @@ extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
     memset(g_waits, 0, sizeof(ppu_waits_ent) * PPU_WAITS_N);
     g_waits_dropped = 0;
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
-    const rsx_waits rw0 = g_rsx_waits;            /* (the FIFO thread's, over the same window) */
+    const rsx_waits rw0 = g_rsx_waits, rf0 = g_rsx_waits_rf;   /* (the FIFO thread's and the replay thread's) */
     const long long kick0 = s_kick_wait_qpc;
     const uint64_t w0 = ppu_waits_now();
     g_waits_armed = 1;
     dbg_cpu(sample_sec);
     g_waits_armed = 0;
     const double win_ms = (double)(ppu_waits_now() - w0) * 1000.0 / (double)f.QuadPart;
-    const rsx_waits rw1 = g_rsx_waits;
+    const rsx_waits rw1 = g_rsx_waits, rf1 = g_rsx_waits_rf;
     const long long kick1 = s_kick_wait_qpc;
     Sleep(100);   /* calls in flight at the close land */
     dbg_printf("%c--- calls each guest thread finished in that time (a call still blocked is not here) ---%c", 10, 10);
@@ -2288,18 +2288,26 @@ extern "C" void ps3_diag_report(FILE* out, unsigned sample_sec)
     dbg_printf("%c--- the FIFO thread in that time (it reads the game's commands, draws and presents) ---%c", 10, 10);
     dbg_printf("  waiting for the game's commands: %.1f ms%c",
                (double)(kick1 - kick0) * 1000.0 / (double)f.QuadPart, 10);
-    if (rw1.measured) {
+    auto rsx_waits_say = [](const rsx_waits& a, const rsx_waits& b) {
         dbg_printf("  waiting for the GPU to finish work: %.1f ms in %llu waits%c",
-                   (double)(rw1.gpu_us - rw0.gpu_us) / 1000.0, (unsigned long long)(rw1.gpu_n - rw0.gpu_n), 10);
+                   (double)(b.gpu_us - a.gpu_us) / 1000.0, (unsigned long long)(b.gpu_n - a.gpu_n), 10);
         dbg_printf("  presenting: %.1f ms in %llu presents%c",
-                   (double)(rw1.present_us - rw0.present_us) / 1000.0,
-                   (unsigned long long)(rw1.present_n - rw0.present_n), 10);
+                   (double)(b.present_us - a.present_us) / 1000.0,
+                   (unsigned long long)(b.present_n - a.present_n), 10);
         dbg_printf("  getting the window's next image: %.1f ms in %llu%c",
-                   (double)(rw1.acquire_us - rw0.acquire_us) / 1000.0,
-                   (unsigned long long)(rw1.acquire_n - rw0.acquire_n), 10);
-        dbg_printf("  batches drawn: %llu%c", (unsigned long long)(rw1.batches - rw0.batches), 10);
+                   (double)(b.acquire_us - a.acquire_us) / 1000.0,
+                   (unsigned long long)(b.acquire_n - a.acquire_n), 10);
+        dbg_printf("  batches drawn: %llu%c", (unsigned long long)(b.batches - a.batches), 10);
+    };
+    if (rw1.measured || rf1.measured) {
+        rsx_waits_say(rw0, rw1);
     } else {
         dbg_printf("  (this renderer does not count its waits)%c", 10);
+    }
+    if (rf1.measured) {   /* RSX_RF_THREAD: what that thread waited on, apart from the FIFO thread's */
+        dbg_printf("%c--- the replay thread in that time (RSX_RF_THREAD: it draws and presents the frames the FIFO"
+                   " thread recorded) ---%c", 10, 10);
+        rsx_waits_say(rf0, rf1);
     }
 
     dbg_printf("%c--- host threads ---%c", 10, 10);

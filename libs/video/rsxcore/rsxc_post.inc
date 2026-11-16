@@ -512,13 +512,13 @@ static void aa_run_display(u32 fi)
 /* Where this batch's pass goes (see the top of this section): returns T's
  * off_rt slot and sets *before to the op the pass runs before, or returns -1
  * and sets *why. Needs the pre-pass's tex_rt / tex_z. */
-static int aa_pick(u32* before, int* why)
+static int aa_pick(const D3D12DrawRecord* draws, u32 ndraws, u32* before, int* why)
 {
-    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
+    const u32 n = ndraws < MAX_DRAWS ? ndraws : MAX_DRAWS;
     int t = -1;
     u32 dc = 0;
     for (u32 d = n; d-- > 0; ) {
-        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        const D3D12DrawRecord* dr = &draws[d];
         if (!dr->is_vp || dr->is_clear || dr->rt_off || !(dr->cmask & 7u)) continue;
         u64 best = 0;
         for (int u = 0; u < RSX_FP_UNITS; u++) {
@@ -539,7 +539,7 @@ static int aa_pick(u32* before, int* why)
     u32 scene = 0;
     int post = -1, named = -1;
     for (u32 d = 0; d < dc; d++) {
-        const D3D12DrawRecord* dr = &s_d3d.draws[d];
+        const D3D12DrawRecord* dr = &draws[d];
         if (!dr->is_vp || dr->is_clear) continue;
         for (int k = 0; named < 0 && k < s_aa.fp_n; k++)
             if (dr->fp_addr == s_aa.fp[k]) named = (int)d;
@@ -557,13 +557,13 @@ static int aa_pick(u32* before, int* why)
 }
 
 /* The choice, logged when it changes (RSX_AA_LOG=1) or every batch (2). */
-static void aa_log(int t, u32 before, int why)
+static void aa_log(const D3D12DrawRecord* draws, u32 ndraws, int t, u32 before, int why)
 {
     const int lv = knob_aa_log();
     if (lv <= 0) return;
-    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
-    const u32 fa = t >= 0 && before > 0 && before <= n ? s_d3d.draws[before - 1].fp_addr : 0;
-    const u32 fb = t >= 0 && before < n ? s_d3d.draws[before].fp_addr : 0;
+    const u32 n = ndraws < MAX_DRAWS ? ndraws : MAX_DRAWS;
+    const u32 fa = t >= 0 && before > 0 && before <= n ? draws[before - 1].fp_addr : 0;
+    const u32 fb = t >= 0 && before < n ? draws[before].fp_addr : 0;
     const u32 key[4] = {t >= 0 ? s_d3d.off_rt[t].off : 0u, fa, fb, (u32)why | (u32)aa_mode() << 8};
     if (lv == 1) {
         if (s_aa.log_valid && !memcmp(key, s_aa.log_key, sizeof key)) return;

@@ -12,8 +12,39 @@ static void dred_report(const char* where)
     if (s_rc_dev) gpu_fault_report(s_rc_dev, where);
 }
 
+/* The replay thread (RSX_RF_THREAD; rsxc_frame.inc): s_rf_busy from the
+ * hand-off until the replay is done. */
+static SRWLOCK s_rf_lk = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_rf_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG s_rf_busy;
+static HANDLE s_rf_thread;   /* (its id, s_rf_tid: rsxc_state.inc) */
+static double s_rf_join_ms;   /* the FIFO thread's waits for the replay, for GCM_RATES */
+
+/* Until the last batch's replay is done. Every user of the GPU objects on the
+ * FIFO thread (or any other but the replay thread itself) comes through here
+ * first. Not bounded, as a Present stuck in a driver isn't on the FIFO thread
+ * either; never silent. */
+static void rf_join(void)
+{
+    if (!InterlockedCompareExchange(&s_rf_busy, 0, 0)) return;
+    if (s_rf_tid && GetCurrentThreadId() == s_rf_tid) return;
+    LARGE_INTEGER a, b, f;
+    QueryPerformanceCounter(&a);
+    AcquireSRWLockExclusive(&s_rf_lk);
+    for (int s = 0; s_rf_busy; )
+        if (!SleepConditionVariableSRW(&s_rf_cv, &s_rf_lk, 2000, 0) && s_rf_busy) {
+            s += 2;
+            printf("[rsx] waiting %d s for the replay thread\n", s);
+        }
+    ReleaseSRWLockExclusive(&s_rf_lk);
+    QueryPerformanceCounter(&b);
+    QueryPerformanceFrequency(&f);
+    s_rf_join_ms += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+
 static void wait_for_gpu(void)
 {
+    rf_join();
     const gpu_fence want = gpu_signal(s_rc_dev);
     /* NEVER wait unbounded here: this runs on the vblank ticker, which also
      * drives the guest's vblank handlers, the FIFO drain, and the fence
@@ -38,7 +69,7 @@ static void wait_for_gpu(void)
         if (rr != 0 /* S_OK: device still alive, keep waiting a bit */)
             break;
     }
-    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    rc_wait_note(RC_WAIT_GPU, t0);
 }
 
 /* RSX_FRAMES_IN_FLIGHT (read once; the default is the backend's,
@@ -91,7 +122,7 @@ static void batch_wait(u32 par)
     if (batch_done(par)) return;
     const double t0 = perf_now();
     const int late = gpu_fence_wait(s_rc_dev, s_batch_fence[par], 2000);
-    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    rc_wait_note(RC_WAIT_GPU, t0);
     if (late)
         printf("[rsx] batch wait STUCK 2s: want %llu got %llu removed=0x%08lX\n",
                (unsigned long long)s_batch_fence[par],
@@ -193,6 +224,7 @@ static void move_to_next_frame(void)
     lose_device_test();
     frame_slot_wait(s_d3d.frame_index);
     s_rc_frame_fence[prev] = mine;
-    g_rsx_waits.batches++;
-    g_rsx_waits.measured = 1;
+    rsx_waits* const w = rc_waits_mine();
+    w->batches++;
+    w->measured = 1;
 }

@@ -110,7 +110,7 @@ static u32 fpwatch_count(const FpCount* c, int n, u32 fp)
     for (int i = 0; i < n; i++) if (c[i].fp == fp) return c[i].n;
     return 0;
 }
-static void fpwatch_batch(void)
+static void fpwatch_batch(const D3D12DrawRecord* draws, u32 ndraws)
 {
     fpwatch_parse();
     if (!s_fpw_all && !s_fpw_list_n) { s_fpw_unread_n = 0; return; }
@@ -120,8 +120,8 @@ static void fpwatch_batch(void)
     const u32 full = (u32)ps3_env_int("FP_WATCH_MIN", 100);
     if (!fps) fps = (u32*)malloc(MAX_DRAWS * sizeof *fps);
     u32 n = 0;
-    for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS && fps; d++)
-        if (s_d3d.draws[d].is_vp && !s_d3d.draws[d].is_clear) fps[n++] = s_d3d.draws[d].fp_addr;
+    for (u32 d = 0; d < ndraws && d < MAX_DRAWS && fps; d++)
+        if (draws[d].is_vp && !draws[d].is_clear) fps[n++] = draws[d].fp_addr;
     for (int i = 0; i < s_fpw_unread_n && s_fpw_lines < maxl; i++, s_fpw_lines++)
         printf("[fpwatch] frame %u fp %X samples its own writable depth surface (reads 0)\n",
                (unsigned)s_d3d.frame_count, s_fpw_unread[i]);

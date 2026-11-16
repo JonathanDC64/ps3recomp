@@ -110,6 +110,7 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
 static void rc_backend_shutdown(void)
 {
     if (!s_d3d.initialized) return;
+    rf_stop();   /* (RSX_RF_THREAD: the last replay, then the thread) */
 
     /* Step C8a: the vertex jobs' queued work first. The rings they write are
      * the GPU layer's buffers, and gpu_destroy below frees them (today's
@@ -218,6 +219,7 @@ static void rc_abort_init(void)
 {
     extern void (*g_gcm_fifo_flip_hook)(void);
     extern void (*g_rcap_mark_hook)(int end);
+    rf_stop();
     g_gcm_fifo_flip_hook = NULL;
     g_rsx_report_hook = NULL;
     g_rcap_mark_hook = NULL;
@@ -420,6 +422,7 @@ static void rc_overlay_tick(void)
     if ((!s_overlay_repaint && !wake) || !s_overlay_on || !s_overlay.frame || !s_d3d.initialized ||
         !repaint_knob() || !knob_present() || s_session_locked || window_hidden())
         return;
+    rf_join();   /* (RSX_RF_THREAD: the hold, the recorders and the slots are the replay's) */
     const int held = s_hold_valid && s_hold_w == s_d3d.host_w && s_hold_h == s_d3d.host_h;
     if (!held && !wake) return;   /* (held before RSX_SCALE moved) */
     LARGE_INTEGER q, f;
@@ -560,7 +563,7 @@ static struct gpu_cmd* rc_overlay_gpu_flush(void)
     s_overlay_gpu_cmd = NULL;
     const double t0 = perf_now();
     const int late = gpu_fence_wait(s_rc_dev, f, 2000);
-    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    rc_wait_note(RC_WAIT_GPU, t0);
     if (late) {
         printf("[D3D12] overlay: the GPU has not finished its work after 2 s (fence %llu)\n", (unsigned long long)f);
         return NULL;

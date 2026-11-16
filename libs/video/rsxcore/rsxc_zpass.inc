@@ -28,7 +28,8 @@ static gpu_buffer       s_zq_rb_buf;
 static int              s_zq_made;
 static int  s_zq_on;                       /* counting enabled, as of the stream */
 static int  s_zq_on_start;                 /* ... when the current batch began */
-static struct { u32 at, kind, idx; } s_zq_ev[ZQ_EV_MAX];
+typedef struct { u32 at, kind, idx; } RcZqEv;
+static RcZqEv s_zq_ev[ZQ_EV_MAX];
 static int  s_zq_nev;
 static u32  s_zq_rec[ZQ_MAX];              /* cb_slot of each query issued */
 static float s_zq_area[ZQ_MAX];            /* its target's host/guest pixel ratio (RSX_SCALE) */
@@ -79,12 +80,12 @@ static void zq_hook(u32 method, u32 data)
     }
 }
 
-/* Was counting on when record `slot` was made? */
-static int zq_counted(u32 slot)
+/* Was counting on when record `slot` was made, by events ev[0..nev)? */
+static int zq_counted_in(const RcZqEv* ev, int nev, int on_start, u32 slot)
 {
-    int on = s_zq_on_start;
-    for (int i = 0; i < s_zq_nev && s_zq_ev[i].at <= slot; i++)
-        if (s_zq_ev[i].kind <= ZQ_ON) on = (int)s_zq_ev[i].kind;
+    int on = on_start;
+    for (int i = 0; i < nev && ev[i].at <= slot; i++)
+        if (ev[i].kind <= ZQ_ON) on = (int)ev[i].kind;
     return on;
 }
 

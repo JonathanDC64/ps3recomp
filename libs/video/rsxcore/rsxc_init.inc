@@ -21,7 +21,7 @@ static void frame_slot_wait(u32 slot)
     if (done >= want) return;
     const double t0 = perf_now();
     const int late = gpu_fence_wait(s_rc_dev, want, 2000);
-    rc_wait_note(&g_rsx_waits.gpu_us, &g_rsx_waits.gpu_n, t0);
+    rc_wait_note(RC_WAIT_GPU, t0);
     if (late) {
         const u32 rr = gpu_lost(s_rc_dev);
         printf("[D3D12] FENCE STUCK 2s: want %llu got %llu removed=0x%08lX\n",
