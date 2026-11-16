@@ -56,20 +56,42 @@
  * invalid SPIR-V for it), NoContraction and the invariant position always,
  * base vertex never (every draw starts at vertex 0, gpu_shader.h), and the
  * fetch clamp (E3) only without robustBufferAccess2, which reads 0 past t20's
- * end as D3D12 does. */
+ * end as D3D12 does.
+ *
+ * DenormPreserve is left out on Mesa's RADV for GCN GPUs (GFX6-9: Radeon HD
+ * 7000 to Vega, and Ryzen graphics up to the 5000 series), the RADV devices
+ * whose smallest subgroup is 64 (no wave32). Under it, ACO wraps each rcp,
+ * sqrt and rsq in a denormal scaling whose v_cndmask reads two SGPRs, past
+ * GCN's one-SGPR constant bus; the hardware then reads a wrong scale and lit
+ * surfaces blow out to white with a speckle pattern (issue #577, Ryzen 5
+ * 5500U on Mesa 25.2.8; ACO's own validator rejects those instructions).
+ * Mesa fixed it in 3b1fece6ff52 (26.2.7 and 26.3), but LTS distributions
+ * ship older. Without the mode, denormal handling is the driver's, as on
+ * D3D12. RSX_SPV_DENORM=0 or 1 forces it off or on (where the device keeps
+ * denormals). */
 static void rc_vk_spv_options(gpu_device* d)
 {
     VkPhysicalDeviceVulkan12Properties p12;
+    VkPhysicalDeviceVulkan13Properties p13;
     VkPhysicalDeviceProperties2 p2;
     memset(&p12, 0, sizeof p12);
+    memset(&p13, 0, sizeof p13);
     memset(&p2, 0, sizeof p2);
     p12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+    p13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES;
     p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     p2.pNext = &p12;
+    p12.pNext = &p13;
     vkGetPhysicalDeviceProperties2(GPU_VK_DEV(d)->phys, &p2);
     unsigned opts = GPU_SC_SPV_DEFAULT & ~(GPU_SC_SPV_FLOAT_PRESERVE | GPU_SC_SPV_DENORM_PRESERVE);
     if (p12.shaderSignedZeroInfNanPreserveFloat32) opts |= GPU_SC_SPV_FLOAT_PRESERVE;
-    if (p12.shaderDenormPreserveFloat32) opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    const int aco_gcn = p12.driverID == VK_DRIVER_ID_MESA_RADV && p13.minSubgroupSize >= 64;
+    const int denorm = ps3_env_int("RSX_SPV_DENORM", -1);
+    if (p12.shaderDenormPreserveFloat32 && (denorm > 0 || (denorm < 0 && !aco_gcn)))
+        opts |= GPU_SC_SPV_DENORM_PRESERVE;
+    else if (p12.shaderDenormPreserveFloat32 && denorm < 0)
+        printf("[VK] shaders without DenormPreserve: Mesa's ACO compiler before 26.2.7 miscompiles it on GCN "
+               "GPUs like this one (RSX_SPV_DENORM=1 keeps it)\n");
     if (!(d->caps.bits & GPU_CAP_ROBUST2)) opts |= GPU_SC_SPV_FETCH_CLAMP;
     gpu_sc_spv_set_options(opts);
 }
