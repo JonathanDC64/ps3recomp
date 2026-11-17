@@ -776,6 +776,19 @@ int cellPad_host_pads_on(void)
     return !ps3_no_user_input() && !pad_background_hold();
 }
 
+/* cellPad.h. The keyboard pad's own tests (pad_poll_keyboard_once, cellPad_poll): keys read while this is 0 would
+ * reach the title when the keyboard pad's do not. */
+int cellPad_host_keys_live(void)
+{
+#if PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2
+    static int off = -1;
+    PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
+    return !off && !ps3_no_user_input() && !s_host_hold && !s_keys_out && pad_host_window_focused();
+#else
+    return 0;
+#endif
+}
+
 #if PAD_BACKEND_XINPUT
 static void pad_poll_xinput(void)
 {

@@ -32,7 +32,8 @@ static DWORD test_xinput_get(DWORD i, XINPUT_STATE* s)
     return ERROR_SUCCESS;
 }
 static DWORD test_xinput_set(DWORD i, XINPUT_VIBRATION* v) { (void)i; (void)v; return ERROR_DEVICE_NOT_CONNECTED; }
-static DWORD test_window_pid(HWND w, LPDWORD pid) { (void)w; *pid = GetCurrentProcessId(); return 0; }
+static int s_behind;   /* the window in front is another process's */
+static DWORD test_window_pid(HWND w, LPDWORD pid) { (void)w; *pid = s_behind ? 0 : GetCurrentProcessId(); return 0; }
 #define GetAsyncKeyState         test_key_state
 #define GetForegroundWindow      test_foreground
 #define GetWindowThreadProcessId test_window_pid
@@ -286,9 +287,11 @@ int main(void)
     s_pad_on = 1;
     p = rd(); CHECK(p.buttons == CROSS);
     CHECK(!cellPad_host_keys_out());
+    CHECK(cellPad_host_keys_live());
     set_env("PAD_KEYBOARD_WITH_PAD", "0");
     p = rd(); CHECK(p.buttons == 0);
     CHECK(cellPad_host_keys_out());
+    CHECK(!cellPad_host_keys_live());
     cellPad_host_mouse_buttons(1);
     set_env("PAD_KEYS", "r1=mouse1");
     p = rd(); CHECK(p.buttons == 0);
@@ -299,6 +302,20 @@ int main(void)
     CHECK(!cellPad_host_keys_out());
     set_env("PAD_KEYBOARD_WITH_PAD", NULL);
     KEYS();
+
+    /* cellPad_host_keys_live: 0 whenever the keyboard pad's keys would not reach the title */
+    p = rd();
+    CHECK(cellPad_host_keys_live());
+    cellPad_set_host_hold(1);
+    CHECK(!cellPad_host_keys_live());
+    cellPad_set_host_hold(0);
+    s_behind = 1;
+    CHECK(!cellPad_host_keys_live());
+    s_behind = 0;
+    set_env("PAD_NO_KEYBOARD", "1");
+    CHECK(!cellPad_host_keys_live());
+    set_env("PAD_NO_KEYBOARD", NULL);
+    CHECK(cellPad_host_keys_live());
 
     printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
     return failures ? 1 : 0;

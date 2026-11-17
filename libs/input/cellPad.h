@@ -225,6 +225,12 @@ void cellPad_host_mouse_wheel(int notches);
  * be let go. 0 in a build without host input. */
 int cellPad_host_key_down(int vk);
 
+/* 1 while the keyboard's keys reach port 0: a window of this process is in front, no wrapper UI has the input
+ * (cellPad_set_host_hold), the keys are not kept out for a pad (cellPad_host_keys_out), and neither PAD_NO_KEYBOARD
+ * nor PS3_NO_USER_INPUT is set. For a title's own keys read with cellPad_host_key_down, so they count when the
+ * keyboard pad's keys do. 0 in a build without host input. */
+int cellPad_host_keys_live(void);
+
 /* The user's pads count now: 0 with PS3_NO_USER_INPUT, or with PAD_FOCUS_ONLY=1
  * while no window of this process is in front. For the title's own UI, which
  * reads the pads itself, so it ignores them when the title does. */
