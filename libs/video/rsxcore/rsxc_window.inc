@@ -421,6 +421,16 @@ static char        s_win_title[320];
 static volatile LONG s_refresh_hz;        /* the window's display, 0 until known */
 static volatile LONG s_win_hidden;        /* SDL_WINDOWEVENT_HIDDEN until _SHOWN (window_hidden) */
 
+/* The window is Wayland's own (SDL's wayland driver: wayland_wanted), not
+ * X11's or XWayland's. Set once it is made, before the swap chain; HDR
+ * output counts its nits by it (rsxc_hdr.inc). */
+static int s_win_wayland;
+
+/* The drawable's pixels per window point (win_size_note). SDL gives sizes and
+ * mouse positions in points; the swap chain and the overlay are in pixels.
+ * 1 on X11; more on a scaled Wayland desktop. Window-thread state. */
+static float s_win_px_x = 1.0f, s_win_px_y = 1.0f;
+
 /* Borderless fullscreen (Alt+Enter, rc_set_borderless): SDL's desktop
  * fullscreen, the window covering its display. Window-thread state. */
 static int s_borderless;
@@ -459,11 +469,17 @@ static void set_borderless(HWND hwnd, int on)
     s_borderless = !!on;
 }
 
-/* The drawable's size for swap_resize, as WM_SIZE gives it on Windows. */
+/* The drawable's size for swap_resize, as WM_SIZE gives it on Windows, and
+ * its pixels per window point. */
 static void win_size_note(void)
 {
-    int w = 0, h = 0;
+    int w = 0, h = 0, pw = 0, ph = 0;
     SDL_Vulkan_GetDrawableSize(s_sdl_window, &w, &h);
+    SDL_GetWindowSize(s_sdl_window, &pw, &ph);
+    if (w > 0 && h > 0 && pw > 0 && ph > 0) {
+        s_win_px_x = (float)w / (float)pw;
+        s_win_px_y = (float)h / (float)ph;
+    }
     if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000)
         InterlockedExchange(&s_win_req, (LONG)(((u32)w << 16) | (u32)h));
 }
@@ -578,6 +594,12 @@ static long long win_xy(int x, int y)
     return (long long)(((u32)(u16)(s16)y << 16) | (u16)(s16)x);
 }
 
+/* A mouse position, SDL's window points, in the drawable's pixels. */
+static long long win_pt(int x, int y)
+{
+    return win_xy((int)((float)x * s_win_px_x), (int)((float)y * s_win_px_y));
+}
+
 /* The overlay's messages for one SDL event, as Windows would send them; PS3_NO_USER_INPUT=1 (ps3_knob.h) keeps the
  * keyboard's and the mouse's from it. Returns 1 when the overlay took the event: a key the hot keys then skip, or
  * the close (it asks first, and posts WM_CLOSE once answered). */
@@ -614,7 +636,7 @@ static int win_overlay_event(const SDL_Event* e)
     }
     case SDL_MOUSEMOTION:
         if (!input) return 0;
-        win_overlay(WM_MOUSEMOVE, 0, win_xy(e->motion.x, e->motion.y));
+        win_overlay(WM_MOUSEMOVE, 0, win_pt(e->motion.x, e->motion.y));
         if (e->motion.xrel || e->motion.yrel)
             win_overlay(WM_RSX_MOUSE_MOTION, (unsigned long long)(long long)e->motion.xrel, (long long)e->motion.yrel);
         return 0;
@@ -635,7 +657,7 @@ static int win_overlay_event(const SDL_Event* e)
             break;
         default: return 0;
         }
-        win_overlay(msg, wp, win_xy(e->button.x, e->button.y));
+        win_overlay(msg, wp, win_pt(e->button.x, e->button.y));
         return 0;
     }
     case SDL_MOUSEWHEEL: {   /* WHEEL_DELTA (120) a notch in the high word, positive away from the user */
@@ -653,7 +675,7 @@ static int win_overlay_event(const SDL_Event* e)
         case SDL_WINDOWEVENT_RESTORED:
         case SDL_WINDOWEVENT_SIZE_CHANGED: {
             int w = 0, h = 0;
-            SDL_GetWindowSize(s_sdl_window, &w, &h);
+            SDL_Vulkan_GetDrawableSize(s_sdl_window, &w, &h);   /* (pixels, as the swap chain) */
             win_overlay(WM_SIZE, 0, win_xy(w, h));
             break;
         }
@@ -718,13 +740,45 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
     return w;
 }
 
+/* A Wayland window of its own rather than XWayland's, which has no HDR (SDL 2
+ * opens X11 first). RSX_WAYLAND (read once): unset, while RSX_HDR is on at the
+ * start on a Wayland desktop (WAYLAND_DISPLAY), but not under gamescope
+ * (GAMESCOPE_WAYLAND_DISPLAY), whose layer gives its X11 windows HDR and its
+ * Wayland ones none; 1 on any Wayland desktop; 0 never. A player's own
+ * SDL_VIDEODRIVER decides alone. */
+static int wayland_wanted(void)
+{
+    if (getenv("SDL_VIDEODRIVER") || !getenv("WAYLAND_DISPLAY")) return 0;
+    const int knob = ps3_env_int("RSX_WAYLAND", -1);
+    if (knob >= 0) return knob != 0;
+    return ps3_env_int("RSX_HDR", 0) != 0 && !getenv("GAMESCOPE_WAYLAND_DISPLAY");
+}
+
+/* SDL's video for the game's window: Wayland's when wanted and it opens, else
+ * SDL's own choice as always. The hint is put back empty (unset, to SDL)
+ * after, so a renderer started in this one's place opens its window as it
+ * always did. */
+static int video_start(void)
+{
+#ifdef SDL_HINT_VIDEODRIVER   /* (SDL 2.0.22 and later) */
+    if (wayland_wanted()) {
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland");
+        const int ok = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+        if (!ok) printf("[D3D12] no Wayland window (%s); X11's\n", SDL_GetError());
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "");
+        if (ok) return 1;
+    }
+#endif
+    return SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+}
+
 typedef struct { u32 w, h; const char* title; HANDLE ready; } window_thread_args;
 
 static DWORD WINAPI window_thread(LPVOID p)
 {
     window_thread_args* a = (window_thread_args*)p;
     SDL_Window* w = NULL;
-    const int video = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+    const int video = video_start();
     if (!video) {
         printf("[D3D12] SDL video init failed: %s\n", SDL_GetError());
     } else {
@@ -736,6 +790,9 @@ static DWORD WINAPI window_thread(LPVOID p)
     s_sdl_window = w;
     s_d3d.hwnd = w;
     if (w) {
+        const char* driver = SDL_GetCurrentVideoDriver();
+        s_win_wayland = driver && !strcmp(driver, "wayland");
+        if (s_win_wayland) printf("[D3D12] the window is Wayland's own (RSX_WAYLAND)\n");
         InterlockedExchange(&s_win_live, 1);
         win_size_note();
         win_refresh_note();
@@ -775,6 +832,9 @@ static DWORD WINAPI window_thread(LPVOID p)
                 const Uint8 ev = e.window.event;
                 if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
                 else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
+                /* What the window's surface lists may have changed (hdr_display_check), as on Windows. */
+                if (ev == SDL_WINDOWEVENT_DISPLAY_CHANGED || ev == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    InterlockedExchange(&s_hdr_requery, 1);
                 else if (ev == SDL_WINDOWEVENT_HIDDEN || ev == SDL_WINDOWEVENT_SHOWN)
                     InterlockedExchange(&s_win_hidden, ev == SDL_WINDOWEVENT_HIDDEN);
             }
