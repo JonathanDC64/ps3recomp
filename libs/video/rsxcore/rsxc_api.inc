@@ -28,9 +28,13 @@ static int rc_backend_init(u32 width, u32 height, const char* title)
     s_d3d.height = height;
     s_d3d.host_w = rt_host_dim(width, height, width);
     s_d3d.host_h = rt_host_dim(width, height, height);
+    /* The frame's clear until the title clears its display (d3d12_clear_display
+     * takes its colour from then on): black, as the window before it, so the
+     * frames before the title's first (a port's start screen fades in over
+     * them) show nothing. It was a dark blue. */
     s_d3d.clear_color[0] = 0.0f;
     s_d3d.clear_color[1] = 0.0f;
-    s_d3d.clear_color[2] = 0.1f;
+    s_d3d.clear_color[2] = 0.0f;
     s_d3d.clear_color[3] = 1.0f;
 
     /* Debug: dump the first N presented frames to BMP if CELLMARK_DUMP is set
