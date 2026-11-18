@@ -672,6 +672,7 @@ typedef struct gpu_adapter_info {
     uint64_t vram;             /* dedicated memory, bytes */
     uint8_t  luid[8];          /* Windows' adapter id: the same GPU in DXGI and Vulkan */
     uint8_t  uuid[16];         /* Vulkan's pipeline-cache id; zero on D3D12 */
+    uint8_t  integrated;       /* 1: a GPU that shares the system's memory (D3D12's UMA, Vulkan's INTEGRATED_GPU) */
 } gpu_adapter_info;
 
 /* What gpu_native hands back. */

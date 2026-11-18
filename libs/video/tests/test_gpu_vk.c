@@ -2418,8 +2418,9 @@ int main(void)
     g_vk = GPU_VK_DEV(g_d);
     gpu_adapter_info ai;
     gpu_adapter(g_d, &ai);
-    printf("GPU Vulkan test on %s (driver %s), caps 0x%08X, RSX_VK_MASK %s, validation %s\n", ai.name, ai.driver,
-           g_d->caps.bits, mask && mask[0] ? mask : "none", g_vk->validation ? "on" : "off");
+    printf("GPU Vulkan test on %s (%sdriver %s), caps 0x%08X, RSX_VK_MASK %s, validation %s\n", ai.name,
+           ai.integrated ? "integrated, " : "", ai.driver, g_d->caps.bits, mask && mask[0] ? mask : "none",
+           g_vk->validation ? "on" : "off");
     CHECK(g_d->caps.api == GPU_API_VULKAN);
     if (validate && !g_vk->validation) {
         printf("GPU Vulkan: the validation layer is not here (GPU_TEST_VALIDATION=0 runs without it)\n");
