@@ -285,6 +285,7 @@ int           gpu_d3d12_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on);
 int           gpu_d3d12_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out);
 int           gpu_d3d12_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space,
                                  const gpu_hdr_metadata* meta);
+int           gpu_d3d12_swap_hdr_offered(gpu_device* d, gpu_swapchain sc, uint32_t colour_space);
 
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */
 #endif /* PS3RECOMP_GPU_D3D12_INTERNAL_H */

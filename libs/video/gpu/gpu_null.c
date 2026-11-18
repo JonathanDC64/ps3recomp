@@ -3639,6 +3639,12 @@ static int nl_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, c
     return (colour_space == GPU_COLOR_SCRGB || colour_space == GPU_COLOR_HDR10) && (d->caps.bits & GPU_CAP_HDR_SCRGB);
 }
 
+/* What nl_swap_hdr would take. */
+static int nl_swap_hdr_offered(gpu_device* d, gpu_swapchain sc, uint32_t colour_space)
+{
+    return nl_swap_hdr(d, sc, colour_space, NULL);
+}
+
 /* ---------------------------------------------------------------------------
  * The rest of the table
  * -------------------------------------------------------------------------*/

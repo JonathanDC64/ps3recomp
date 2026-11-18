@@ -1011,4 +1011,22 @@ int gpu_vk_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, cons
     return 1;
 }
 
+/* The surface's own list. Off Windows that is the whole answer: Mesa's
+ * Wayland windows list scRGB when the compositor manages colour (whether or
+ * not the display is in HDR); gamescope's layer, for its X11 windows, only
+ * while its output is HDR. */
+int gpu_vk_swap_hdr_offered(gpu_device* d, gpu_swapchain sc, uint32_t colour_space)
+{
+    gpu_vk_device* const dd = GPU_VK_DEV(d);
+    const gpu_vk_swap* const s = swap_of(dd, sc);
+    if (!s || !s->surface) return 0;
+    if (colour_space == GPU_COLOR_SRGB) return 1;
+    if (!(dd->base.caps.bits & GPU_CAP_HDR_SCRGB)) return 0;
+    if (colour_space == GPU_COLOR_SCRGB)
+        return surface_has(dd, s, VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT);
+    if (colour_space == GPU_COLOR_HDR10)
+        return surface_has(dd, s, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT);
+    return 0;
+}
+
 #endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN */

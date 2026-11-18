@@ -274,4 +274,14 @@ int gpu_d3d12_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, c
     return 1;
 }
 
+/* DXGI answers for the buffers' format now (CheckColorSpaceSupport), not
+ * for the one the colour space goes with. The core asks only off Windows. */
+int gpu_d3d12_swap_hdr_offered(gpu_device* d, gpu_swapchain sc, uint32_t colour_space)
+{
+    gpu_d3d12_swap* const s = swap_of(GPU_D3D12_DEV(d), sc);
+    UINT sup = 0;
+    return s && SUCCEEDED(s->sc->lpVtbl->CheckColorSpaceSupport(s->sc, (DXGI_COLOR_SPACE_TYPE)colour_space, &sup)) &&
+           (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
+}
+
 #endif /* PS3RECOMP_RSX_HAL && _WIN32 */
