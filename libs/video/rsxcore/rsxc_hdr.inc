@@ -694,6 +694,11 @@ static void swap_present(int game_frame)
     } else if (pr) {
         check_device("present");
     }
+#ifdef _WIN32
+    else if (!s_window_presented) {
+        InterlockedExchange(&s_window_presented, 1);   /* (the window stops painting itself black: rsxc_window.inc) */
+    }
+#endif
     rc_be_presented(s_rc_dev);   /* (the instance file's: null prints the stream's hash) */
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
