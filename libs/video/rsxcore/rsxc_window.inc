@@ -30,6 +30,15 @@ static void session_lock_init(HWND hwnd)
 static void session_lock_init(HWND hwnd) { (void)hwnd; }   /* (Windows only) */
 #endif
 
+#ifdef _WIN32
+/* A frame has reached the window (swap_present). Until then the window paints
+ * itself black (WM_ERASEBKGND): its class has no background, so for the
+ * quarter second or so the device takes to start it showed unpainted, white
+ * or whatever was under it. Written by the render thread, read by the window
+ * thread. */
+static volatile LONG s_window_presented;
+#endif
+
 /* rc_set_overlay. Set from one thread, read by the window and render
  * threads: the hooks are swapped in whole and then flagged. */
 static rsx_d3d12_overlay s_overlay;
@@ -140,6 +149,13 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         ((MINMAXINFO*)lp)->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
     }
+    case WM_ERASEBKGND:        /* black until the first frame (s_window_presented); then as before, nothing */
+        if (!s_window_presented) {
+            RECT r;
+            if (GetClientRect(hwnd, &r)) FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            return 1;
+        }
+        break;
     case WM_DPICHANGED: {      /* moved to a display of another scale: take the size Windows suggests */
         const RECT* r = (const RECT*)lp;
         SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
