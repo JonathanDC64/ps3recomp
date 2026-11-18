@@ -1779,6 +1779,7 @@ static void* d12_native(gpu_device* d, uint32_t kind, uint64_t handle)
 #define d12_swap_exclusive      gpu_d3d12_swap_exclusive
 #define d12_swap_stats          gpu_d3d12_swap_stats
 #define d12_swap_hdr            gpu_d3d12_swap_hdr
+#define d12_swap_hdr_offered    gpu_d3d12_swap_hdr_offered
 
 #define D12_VT_INIT(name, form, ret, params, args) d12_##name,
 static const gpu_vt k_d3d12_vt = { GPU_VT_FUNCS(D12_VT_INIT) };

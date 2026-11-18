@@ -779,6 +779,7 @@ int           gpu_vk_swap_present(gpu_device* d, gpu_swapchain sc, uint32_t inte
 int           gpu_vk_swap_exclusive(gpu_device* d, gpu_swapchain sc, int on);
 int           gpu_vk_swap_stats(gpu_device* d, gpu_swapchain sc, gpu_present_stats* out);
 int           gpu_vk_swap_hdr(gpu_device* d, gpu_swapchain sc, uint32_t colour_space, const gpu_hdr_metadata* meta);
+int           gpu_vk_swap_hdr_offered(gpu_device* d, gpu_swapchain sc, uint32_t colour_space);
 /* Under qlock, in a submit: the waits and signals its swap chain options ask. */
 void          gpu_vk_swap_submit_sems(gpu_vk_device* dd, const gpu_submit_desc* how, VkSemaphoreSubmitInfo* wait,
                                       uint32_t* nwait, VkSemaphoreSubmitInfo* sig, uint32_t* nsig);

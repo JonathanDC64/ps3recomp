@@ -80,7 +80,7 @@ static void cap_write_raw(const char* path, const void* mapped, u32 w, u32 h, u3
         for (u32 y = 0; y < h; y++) fwrite((const u8*)mapped + (u64)y * pitch, 8, w, f);
         fclose(f);
     }
-    const float white = hdr_white_nits() / 80.0f;
+    const float white = hdr_white_nits() / hdr_unit_nits();
     float top = 0.0f;
     u64 over = 0;
     for (u32 y = 0; y < h; y++) {

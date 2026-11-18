@@ -2130,6 +2130,7 @@ static void* vkb_native(gpu_device* d, uint32_t kind, uint64_t handle)
 #define vkb_swap_exclusive       gpu_vk_swap_exclusive
 #define vkb_swap_stats           gpu_vk_swap_stats
 #define vkb_swap_hdr             gpu_vk_swap_hdr
+#define vkb_swap_hdr_offered     gpu_vk_swap_hdr_offered
 
 #define VKB_VT_INIT(name, form, ret, params, args) vkb_##name,
 static const gpu_vt k_vk_vt = { GPU_VT_FUNCS(VKB_VT_INIT) };

@@ -851,6 +851,9 @@ typedef struct gpu_device_desc {
     /* The colour space (GPU_COLOR_*) and, when not NULL, HDR10 metadata. 1 if the display took it. \
      * On Vulkan a new colour space makes the swap chain again: as for swap_resize. */ \
     X(swap_hdr,          R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t colour_space, const gpu_hdr_metadata* meta), (d, sc, colour_space, meta)) \
+    /* 1 if the window takes the colour space now, with the format DXGI pairs it with (scRGB on RGBA16F, \
+     * HDR10 on R10G10B10A2); changes nothing. Off Windows, the core's only word on a display's HDR. */ \
+    X(swap_hdr_offered,  R, int,            (gpu_device* d, gpu_swapchain sc, uint32_t colour_space), (d, sc, colour_space)) \
     /* On a lost device, prints what the API says of where the GPU was (DRED, device fault). */ \
     X(fault_report,      V, void,           (gpu_device* d, const char* where), (d, where)) \
     /* The API's own object (GPU_NATIVE_*), for the few things that stay per backend. */ \

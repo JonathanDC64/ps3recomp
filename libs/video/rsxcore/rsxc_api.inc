@@ -628,7 +628,7 @@ static unsigned rc_back_buffer_format(void)
 }
 static int rc_hdr(float* ui_scale, int* srgb)
 {
-    if (ui_scale) *ui_scale = s_hdr.active ? hdr_white_nits() / 80.0f : 1.0f;
+    if (ui_scale) *ui_scale = s_hdr.active ? hdr_white_nits() / hdr_unit_nits() : 1.0f;
     if (srgb) *srgb = knob_hdr_gamma() != 0;
     return s_hdr.active;
 }

@@ -8,7 +8,9 @@
  * RSX_HDR_WHITE nits (0, the default: Windows' SDR white level on that
  * display), and anything brighter rolled off towards RSX_HDR_PEAK nits (0: the
  * display's peak). Otherwise the swap chain is RGBA8 and the blit is the one
- * it always was.
+ * it always was. Off Windows, while the window's surface lists scRGB: under
+ * gamescope as on Windows; on a Wayland window (RSX_WAYLAND) with 1.0 at the
+ * desktop's own white (hdr_display_check).
  *
  * The game's own highlights: RSX_HDR_SCENE_FP=<fp>[:<limit>][,...] names the
  * program that clamps the finished scene to white (Demon's Souls: its
@@ -34,13 +36,14 @@
 static struct {
     int   disp_hdr;              /* the window's display has HDR on */
     float disp_peak, disp_white; /* its peak, Windows' SDR white level there; nits, 0 = not known */
+    float unit;                  /* the nits scRGB 1.0 shows at (hdr_unit_nits) */
     int   active;                /* the swap chain is FP16 scRGB */
     int   failed;                /* refused there: RGBA8 until the display is asked again */
     int   stage_b;               /* active, and a scene program is named */
     u32   t_off, x_off[4];       /* the targets promoted in this batch */
     u32   next_t, next_x[4];     /* what hdr_mark_scan found, for the next batch */
     int   frame_t;               /* T's slot for this batch's blit, -1: none */
-} s_hdr = { .frame_t = -1 };
+} s_hdr = { .unit = 80.0f, .frame_t = -1 };
 
 #include "rsxc_display.h"
 
@@ -62,6 +65,12 @@ static float hdr_peak_nits(void)
     if (k > 0) return (float)k;
     return s_hdr.disp_peak >= 100.0f ? s_hdr.disp_peak : 1000.0f;
 }
+
+/* The nits scRGB 1.0 shows at, by which paper white and the peak become
+ * scRGB values. 80 as Windows has it, and gamescope too. On a Wayland
+ * window (off Windows, below) 1.0 shows at the desktop's own white, taken as
+ * 203 nits. */
+static float hdr_unit_nits(void) { return s_hdr.unit; }
 
 #ifdef _WIN32
 /* What the display the window is on reports (step C8b: the system's
@@ -93,6 +102,34 @@ static void hdr_display_check(void)
     printf("[D3D12] HDR: the window's display has HDR %s (peak %.0f nits, SDR white %.0f nits)\n",
            s_hdr.disp_hdr ? "on" : "off", s_hdr.disp_peak, s_hdr.disp_white);
 }
+#else
+/* Off Windows the window is the only word on HDR: whether its surface lists
+ * scRGB (gpu_swap_hdr_offered).
+ *   - gamescope's layer lists it for its X11 windows only while its output
+ *     is HDR, and shows scRGB as Windows does (1.0 = 80 nits).
+ *   - Mesa lists it for a Wayland window whenever the compositor manages
+ *     colour (wp_color_manager_v1 with extended range), an SDR display too,
+ *     which the compositor then maps. Mesa gives no luminances, so the
+ *     protocol's defaults for a linear description hold: 1.0 is its reference
+ *     white, which the compositor shows at the desktop's own white. Paper
+ *     white is then that white (RSX_HDR_WHITE=0), and nits count with it
+ *     taken as 203 (BT.2408's reference white, the protocol's suggestion).
+ *   - XWayland and plain X11 list none.
+ * Nothing here tells the display's peak: RSX_HDR_PEAK, else 1000 nits.
+ * Asked again as on Windows: when the window is focused or moves to another
+ * display (s_hdr_requery). */
+static void hdr_display_check(void)
+{
+    if (!InterlockedExchange(&s_hdr_requery, 0)) return;
+    s_hdr.disp_hdr = gpu_swap_hdr_offered(s_rc_dev, s_rc_swap, GPU_COLOR_SCRGB);
+    s_hdr.unit = s_win_wayland ? 203.0f : 80.0f;
+    s_hdr.disp_white = s_win_wayland ? 203.0f : 0.0f;
+    s_hdr.disp_peak = 0.0f;
+    s_hdr.failed = 0;
+    printf("[D3D12] HDR: the %s window %s\n", s_win_wayland ? "Wayland" : "X11",
+           s_hdr.disp_hdr ? "takes scRGB" : "takes no scRGB: SDR (no HDR on the desktop for it)");
+}
+#endif
 
 /* The swap chain's colour space: scRGB for FP16 buffers (hdr), sRGB for RGBA8
  * ones. 0 if it was refused. */
@@ -100,11 +137,6 @@ static int swap_color_space(int hdr)
 {
     return gpu_swap_hdr(s_rc_dev, s_rc_swap, hdr ? GPU_COLOR_SCRGB : GPU_COLOR_SRGB, NULL);
 }
-#else
-/* Off Windows no display reports HDR here: the swap chain stays RGBA8. */
-static void hdr_display_check(void) { s_hdr.disp_hdr = 0; }
-static int swap_color_space(int hdr) { return !hdr; }
-#endif
 
 static int hdr_blit_ready(void);
 
@@ -458,7 +490,7 @@ static void blit_to_window(u32 fi)
     if (hdr) {   /* paper white in scRGB units, peak / paper white, the knee, the curve, T */
         const float white = hdr_white_nits(), ratio = hdr_peak_nits() / white;
         const float knee = ratio <= 1.25f ? 0.8f * ratio : (0.6f * ratio > 1.0f ? 0.6f * ratio : 1.0f);
-        const float hc[8] = {white / 80.0f, ratio, knee, knob_hdr_gamma() ? 1.0f : 0.0f,
+        const float hc[8] = {white / hdr_unit_nits(), ratio, knee, knob_hdr_gamma() ? 1.0f : 0.0f,
                              (float)use_t, 0.0f, 0.0f, 0.0f};
         gpu_cmd_push_const(c, 2, 8, hc, 0);
     }

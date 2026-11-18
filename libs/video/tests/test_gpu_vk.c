@@ -1894,6 +1894,9 @@ static void test_swapchain(void)
                n, t->width, t->height, sr ? "not yet" : "read", st.last_present_count, st.present_count,
                gpu_swap_hdr(g_d, sc, GPU_COLOR_SRGB, NULL) ? "taken" : "refused");
         CHECK(gpu_swap_hdr(g_d, sc, GPU_COLOR_SCRGB, NULL) == 0);   /* an RGBA8 swap chain */
+        /* What the window would take, whatever the swap chain's format now. */
+        CHECK(gpu_swap_hdr_offered(g_d, sc, GPU_COLOR_SRGB) == 1);
+        printf("  the window %s scRGB\n", gpu_swap_hdr_offered(g_d, sc, GPU_COLOR_SCRGB) ? "takes" : "takes no");
 
         gpu_wait_idle(g_d);
         SetWindowPos(w, NULL, 0, 0, 200, 150, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
