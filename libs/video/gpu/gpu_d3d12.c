@@ -617,6 +617,11 @@ static void d12_adapter(gpu_device* d, gpu_adapter_info* out)
     out->revision = ad.Revision;
     out->vram = (uint64_t)ad.DedicatedVideoMemory;
     memcpy(out->luid, &ad.AdapterLuid, sizeof out->luid);
+    D3D12_FEATURE_DATA_ARCHITECTURE arch;
+    memset(&arch, 0, sizeof arch);
+    if (dd->device &&
+        SUCCEEDED(dd->device->lpVtbl->CheckFeatureSupport(dd->device, D3D12_FEATURE_ARCHITECTURE, &arch, sizeof arch)))
+        out->integrated = arch.UMA ? 1 : 0;
     LARGE_INTEGER umd;
     if (SUCCEEDED(dd->adapter->lpVtbl->CheckInterfaceSupport(dd->adapter, &IID_IDXGIDevice, &umd))) {
         out->driver_version = (uint64_t)umd.QuadPart;

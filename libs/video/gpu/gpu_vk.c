@@ -966,6 +966,7 @@ static void vkb_adapter(gpu_device* d, gpu_adapter_info* out)
             out->vram = dd->mem.memoryHeaps[i].size;
     memcpy(out->luid, dd->luid, sizeof out->luid);
     memcpy(out->uuid, dd->props.pipelineCacheUUID, sizeof out->uuid);
+    out->integrated = dd->props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 }
 
 /* The first VkResult that said the device was lost; Vulkan tells it only

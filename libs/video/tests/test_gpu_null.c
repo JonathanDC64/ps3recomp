@@ -760,6 +760,7 @@ static void test_device(void)
     gpu_adapter_info info;
     gpu_adapter(d, &info);
     CHECK(!strncmp(info.name, "null", 4));
+    CHECK(!info.integrated);
     CHECK(d->caps.api == GPU_API_NULL && d->caps.cb_align == 256 && (d->caps.bits & GPU_CAP_BC));
     CHECK(gpu_native(d, 0, 0) == NULL);
     CHECK(gpu_native(d, GPU_NATIVE_PIPELINE, 1) == NULL);

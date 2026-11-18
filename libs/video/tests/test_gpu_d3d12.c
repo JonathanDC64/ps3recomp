@@ -1790,8 +1790,8 @@ int main(void)
     g_dd = GPU_D3D12_DEV(g_d);
     gpu_adapter_info ai;
     gpu_adapter(g_d, &ai);
-    printf("GPU D3D12 test on %s (%s, driver %s), caps 0x%08X\n", ai.name, on_hw ? "hardware" : "WARP",
-           ai.driver, g_d->caps.bits);
+    printf("GPU D3D12 test on %s (%s%s, driver %s), caps 0x%08X\n", ai.name, on_hw ? "hardware" : "WARP",
+           ai.integrated ? ", integrated" : "", ai.driver, g_d->caps.bits);
 
     test_buffers();
     test_host_import();
