@@ -995,28 +995,41 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
         memset(&a, 0, sizeof a);
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(cfg->bind_loopback ? INADDR_LOOPBACK : INADDR_ANY);
-        /* With port 0 the TCP side picks; UDP then takes the same number (a few tries if it is busy). */
-        for (int tries = 0; tries < 8 && h->udp == PH_BAD; tries++) {
-            if (h->lis != PH_BAD) { ph_close(h->lis); h->lis = PH_BAD; }
-            h->lis = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (h->lis == PH_BAD) PH_FAIL("no socket");
-#ifndef _WIN32
-            { int one = 1; setsockopt(h->lis, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one); }
-#endif
-            a.sin_port = htons(cfg->port);
-            if (bind(h->lis, (struct sockaddr*)&a, sizeof a) != 0)
-                PH_FAIL("port %u (TCP) is in use by another program", (unsigned)cfg->port);
-            ph_socklen n = (ph_socklen)sizeof a;
-            getsockname(h->lis, (struct sockaddr*)&a, &n);
-            h->port = ntohs(a.sin_port);
+        /* With port 0, a number free for both: the TCP side picks one, then the UDP side does, then numbers drawn
+         * from the dynamic range. (Windows hands its picks out in order, and a whole block of them can be reserved
+         * for the other protocol: on a CI runner, eight TCP picks in a row were all refused for UDP.) */
+        for (int tries = 0; tries < (cfg->port ? 1 : 64) && h->udp == PH_BAD; tries++) {
+            ph_sock t = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             ph_sock u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-            if (u == PH_BAD) PH_FAIL("no socket");
-            if (bind(u, (struct sockaddr*)&a, sizeof a) != 0) {
+            if (t == PH_BAD || u == PH_BAD) {
+                if (t != PH_BAD) ph_close(t);
+                if (u != PH_BAD) ph_close(u);
+                PH_FAIL("no socket");
+            }
+#ifndef _WIN32
+            { int one = 1; setsockopt(t, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one); }
+#endif
+            const int udp_first = !cfg->port && tries == 1;
+            const ph_sock first = udp_first ? u : t, second = udp_first ? t : u;
+            uint16_t want = cfg->port;
+            if (!want && tries >= 2) want = (uint16_t)(49152 + ph_rand(h) % 16384);
+            a.sin_port = htons(want);
+            ph_socklen n = (ph_socklen)sizeof a;
+            if (bind(first, (struct sockaddr*)&a, sizeof a) != 0 || getsockname(first, (struct sockaddr*)&a, &n) != 0) {
+                ph_close(t);
+                ph_close(u);
+                if (cfg->port) PH_FAIL("port %u (TCP) is in use by another program", (unsigned)cfg->port);
+                continue;
+            }
+            if (bind(second, (struct sockaddr*)&a, sizeof a) != 0) {
+                ph_close(t);
                 ph_close(u);
                 if (cfg->port) PH_FAIL("port %u (UDP) is in use by another program", (unsigned)cfg->port);
                 continue;
             }
+            h->lis = t;
             h->udp = u;
+            h->port = ntohs(a.sin_port);
         }
         if (h->udp == PH_BAD) PH_FAIL("no free port for both TCP and UDP");
         if (listen(h->lis, 8) != 0) PH_FAIL("listen failed");
