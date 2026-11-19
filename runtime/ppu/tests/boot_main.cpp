@@ -104,6 +104,7 @@ void     ps3_title_window_only_init(void) {}
 #include <signal.h>
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/net_upnp.h"   /* net_upnp_unmap_bounded: a router forward, removed at the window's close */
+#include "ps3emu/psnr_host.h"  /* psnr_host_unregister_all: a hosted room, unregistered then too */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -861,7 +862,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                 /* A router forward the game asked for (net_upnp, a hosted game's port):
                  * removed now, as TerminateProcess runs no atexit handlers. A router that
                  * doesn't answer within 1.5 s keeps it until its lease ends. Nothing to do
-                 * without one. */
+                 * without one. A room a hosted game registered with the endpoint (seamless
+                 * co-op without a port forward) is unregistered first: two datagrams, at once,
+                 * so its room code finds nothing (otherwise the endpoint forgets it in 60 s). */
+                psnr_host_unregister_all();
                 net_upnp_unmap_bounded(1500);
                 fflush(stdout); fflush(stderr);
                 TerminateProcess(GetCurrentProcess(), 0);
