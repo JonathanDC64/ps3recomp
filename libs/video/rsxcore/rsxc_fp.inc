@@ -440,8 +440,8 @@ static u32 fp_units_at(u32 off) { return rsxc_fp_units_at(off); }
  * then a candidate, as all targets are 1:1. The margin is still half a guest
  * pixel: for art drawn at half size that is one texel, which keeps the
  * filter inside the sprite, and for art drawn 1:1 it is the edge texel's
- * centre, where 1:1 already samples. Art drawn larger than 1:1 is not helped
- * (its margin stays under half a texel).
+ * centre, where 1:1 already samples. Art drawn larger than 1:1 keeps half a
+ * texel instead (rsx_texscale[unit].zw, uvclamp_margin).
  *
  * The scale reaches the shader as a constant (rsx_alphatest.w, vp_record_cb),
  * not in its text: one shader and one pipeline serve every scale, so a

@@ -238,6 +238,23 @@ static inline float uvclamp_k(void) { return (float)rsx_scale_pct() / 200.0f; }
  * pieces on them each showed a line along their edges. Half of one of the
  * image's texels more keeps the sample clear of those: k (1 + 1/s). */
 static inline float uvclamp_k_image(float s) { return s > 1.0f ? uvclamp_k() * (1.0f + 1.0f / s) : uvclamp_k(); }
+/* The sprite-edge clamp's least margin for unit t, in its coordinate's own
+ * units (rsx_texscale[u].zw, fp_inject_uvclamp): half a texel, and half of
+ * one of the port's image's texels more when the unit holds one (s its scale,
+ * as in uvclamp_k_image). k alone is half a guest pixel, which is half a texel
+ * only for art drawn 1:1: art drawn larger, a HUD at 150%, put the sample a
+ * third of a texel inside its edge, and the filter read a sixth of the next
+ * sprite (a faint line), more on the port's enlarged pages. A unit addressed
+ * in texels (format bit 0x40) has its coordinates in texels. 0 (no margin)
+ * for a unit not set. */
+static inline void uvclamp_margin(const RcTexUnit* t, float s, float* m)
+{
+    const float f = s > 1.0f ? 0.5f * (1.0f + 1.0f / s) : 0.5f;
+    if (!t->set || !t->w || !t->h) { m[0] = m[1] = 0.0f; return; }
+    if (t->fmt & 0x40) { m[0] = m[1] = f; return; }
+    m[0] = f / (float)t->w;
+    m[1] = f / (float)t->h;
+}
 
 /* Returns the vp_cb bank the draw binds (its vcb_slot): always in a chunk
  * that is there, so the draw loop binds it unchecked. `slot` is the draw. */
@@ -263,6 +280,9 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 sy = 1.0f / (float)dr->tex[_u].h;
             }
             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
+            /* zw: the clamp's least margin for this unit's art (uvclamp_margin;
+             * render_frame redoes it for a unit that gets the port's image) */
+            if (dr) uvclamp_margin(&dr->tex[_u], 1.0f, &ts[_u*4+2]);
         }
         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
          * has no fixed alpha test; guest FPs discard on it dynamically

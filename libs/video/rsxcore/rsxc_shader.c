@@ -346,7 +346,11 @@ static u32 fp_units_at(u32 off)
  * shader then keeps each coordinate half a guest pixel inside those bounds,
  * which is where the 1x pixel centre nearest the edge samples. Half a guest
  * pixel in texture units is half the coordinate's change over one guest pixel:
- * fwidth over a host pixel times the scale. A quad split into two triangles
+ * fwidth over a host pixel times the scale. For art drawn larger than 1:1 that
+ * is less than half a texel, so a coordinate the program samples a unit with
+ * keeps at least that unit's rsx_texscale[unit].zw from the edge: half a texel,
+ * plus half an image texel on a port's enlarged image (uvclamp_margin). Art
+ * drawn 1:1 or smaller keeps the half guest pixel. A quad split into two triangles
  * gives both the quad's bounds, so its diagonal is not clamped. Interiors are
  * untouched. RSX_SCALE_UVCLAMP=0 turns it off. Below 100% the draw also
  * reads its mipmapped textures at their 1x level of detail (dr_lod_pct). At
@@ -400,10 +404,32 @@ static const char* uvclamp_gs_src(size_t* len)
     return src;
 }
 
+/* The unit a program samples with input.tc<i> itself as the coordinate (the
+ * decompiler's "rsx_samp[U], ((input.tcI)." or "rsx_sampU, ((input.tcI)."),
+ * or -1. A coordinate first worked on in a temporary, or read with a modifier,
+ * is not followed: its clamp keeps the half guest pixel alone. */
+static int fp_tc_unit(const char* hlsl, int i)
+{
+    char tc[24];
+    const int tl = snprintf(tc, sizeof tc, "((input.tc%d).", i);
+    for (const char* p = strstr(hlsl, "rsx_samp"); p; p = strstr(p + 1, "rsx_samp")) {
+        const char* q = p + 8;
+        if (*q == '[') q++;
+        if (*q < '0' || *q > '9') continue;
+        char* e;
+        const long u = strtol(q, &e, 10);
+        if (*e == ']') e++;
+        if (strncmp(e, ", ", 2) || strncmp(e + 2, tc, (size_t)tl)) continue;
+        if (u >= 0 && u < RSX_FP_UNITS) return (int)u;
+    }
+    return -1;
+}
+
 /* The pixel-shader half of the above, on a translated program's HLSL: the
  * bounds as inputs after TEXCOORD9 (declared here if the program did not read
  * it, so the inputs line up with the geometry shader's outputs), and the clamp
- * at the top of main, half the scale from rsx_alphatest.w. Returns 0, leaving
+ * at the top of main, half the scale from rsx_alphatest.w, and at least the
+ * sampled unit's rsx_texscale[unit].zw (uvclamp_margin). Returns 0, leaving
  * hlsl as it was, if an anchor is missing or the buffer is too small. */
 static int fp_inject_uvclamp(char* hlsl, size_t cap)
 {
@@ -426,13 +452,21 @@ static int fp_inject_uvclamp(char* hlsl, size_t cap)
         "    nointerpolation float4 uvb4:UVBOUND4; nointerpolation float4 uvb5:UVBOUND5;\n"
         "    nointerpolation float4 uvb6:UVBOUND6; nointerpolation float4 uvb7:UVBOUND7;\n",
         has9 ? "" : "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
-    char code[2048];
+    char code[2560];
+    const int has_ts = strstr(hlsl, "float4 rsx_texscale[16];") != NULL;
     int n = snprintf(code, sizeof code, "\n    { const float k = rsx_alphatest.w;   /* half the scale: half a guest pixel, in host pixels */\n");
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 8; i++) {
+        const int u = has_ts ? fp_tc_unit(hlsl, i) : -1;
+        char h[96];
+        if (u >= 0)
+            snprintf(h, sizeof h, "max(k * fwidth(input.tc%d.xy), rsx_texscale[%d].zw)", i, u);
+        else
+            snprintf(h, sizeof h, "k * fwidth(input.tc%d.xy)", i);
         n += snprintf(code + n, sizeof code - (size_t)n,
-            "      { const float2 h = k * fwidth(input.tc%d.xy);"
+            "      { const float2 h = %s;"
             " input.tc%d.xy = clamp(input.tc%d.xy, input.uvb%d.xy + h, input.uvb%d.zw - h); }\n",
-            i, i, i, i, i);
+            h, i, i, i, i);
+    }
     snprintf(code + n, sizeof code - (size_t)n, "    }\n");
     const size_t len = strlen(hlsl), dl = strlen(decl), cl = strlen(code);
     if (len + dl + cl + 1 > cap) return 0;

@@ -1919,6 +1919,10 @@ rtt_dump_done:;
                          * guest's swizzle: rsx_texture_override.h.) */
                         const VPTexSlot* _ts = &s_d3d.vp_tex[ts];
                         if (_ts->tov_lv && _ts->tov_scale > _tov_s) _tov_s = _ts->tov_scale;
+                        /* this unit's least clamp margin with the image's extra half texel */
+                        if (_ts->tov_lv && _ts->tov_scale > 1.0f && fpcb_has(dr->cb_slot) && dr->cb_slot < MAX_DRAWS)
+                            uvclamp_margin(&dr->tex[_u], _ts->tov_scale,
+                                           &((float*)fpcb_ptr(dr->cb_slot, s_rf_par))[_u * 4 + 2]);
                         srv_write_ex(wslot, _ts->tex,
                                   _ts->tov_lv ? GPU_FORMAT_R8G8B8A8_UNORM : rsx_texfmt_format(_tfmt),
                                   (_bf == 0x81) ? 0x1000

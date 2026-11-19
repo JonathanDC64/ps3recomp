@@ -5673,11 +5673,35 @@ static ID3DBlob* uvclamp_gs(void)
     return gs;
 }
 
+/* The unit a program samples with input.tc<i> itself as the coordinate (the
+ * decompiler's "rsx_samp[U], ((input.tcI)." or "rsx_sampU, ((input.tcI)."),
+ * or -1. A coordinate first worked on in a temporary, or read with a modifier,
+ * is not followed: its clamp keeps the half guest pixel alone. (The core's
+ * copy: rsxcore/rsxc_shader.c; the shader texts stay the same.) */
+static int fp_tc_unit(const char* hlsl, int i)
+{
+    char tc[24];
+    const int tl = snprintf(tc, sizeof tc, "((input.tc%d).", i);
+    for (const char* p = strstr(hlsl, "rsx_samp"); p; p = strstr(p + 1, "rsx_samp")) {
+        const char* q = p + 8;
+        if (*q == '[') q++;
+        if (*q < '0' || *q > '9') continue;
+        char* e;
+        const long u = strtol(q, &e, 10);
+        if (*e == ']') e++;
+        if (strncmp(e, ", ", 2) || strncmp(e + 2, tc, (size_t)tl)) continue;
+        if (u >= 0 && u < RSX_FP_UNITS) return (int)u;
+    }
+    return -1;
+}
+
 /* The pixel-shader half of the above, on a translated program's HLSL: the
  * bounds as inputs after TEXCOORD9 (declared here if the program did not read
  * it, so the inputs line up with the geometry shader's outputs), and the clamp
- * at the top of main, half the scale from rsx_alphatest.w. Returns 0, leaving
- * hlsl as it was, if an anchor is missing or the buffer is too small. */
+ * at the top of main, half the scale from rsx_alphatest.w, and at least the
+ * sampled unit's rsx_texscale[unit].zw: half a texel, for art drawn larger
+ * than 1:1 (vp_record_cb). Returns 0, leaving hlsl as it was, if an anchor is
+ * missing or the buffer is too small. */
 static int fp_inject_uvclamp(char* hlsl, size_t cap)
 {
     static const char tc7[] =
@@ -5699,13 +5723,21 @@ static int fp_inject_uvclamp(char* hlsl, size_t cap)
         "    nointerpolation float4 uvb4:UVBOUND4; nointerpolation float4 uvb5:UVBOUND5;\n"
         "    nointerpolation float4 uvb6:UVBOUND6; nointerpolation float4 uvb7:UVBOUND7;\n",
         has9 ? "" : "    float4 tc8:TEXCOORD8; float4 tc9:TEXCOORD9;\n");
-    char code[2048];
+    char code[2560];
+    const int has_ts = strstr(hlsl, "float4 rsx_texscale[16];") != NULL;
     int n = snprintf(code, sizeof code, "\n    { const float k = rsx_alphatest.w;   /* half the scale: half a guest pixel, in host pixels */\n");
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 8; i++) {
+        const int u = has_ts ? fp_tc_unit(hlsl, i) : -1;
+        char h[96];
+        if (u >= 0)
+            snprintf(h, sizeof h, "max(k * fwidth(input.tc%d.xy), rsx_texscale[%d].zw)", i, u);
+        else
+            snprintf(h, sizeof h, "k * fwidth(input.tc%d.xy)", i);
         n += snprintf(code + n, sizeof code - (size_t)n,
-            "      { const float2 h = k * fwidth(input.tc%d.xy);"
+            "      { const float2 h = %s;"
             " input.tc%d.xy = clamp(input.tc%d.xy, input.uvb%d.xy + h, input.uvb%d.zw - h); }\n",
-            i, i, i, i, i);
+            h, i, i, i, i);
+    }
     snprintf(code + n, sizeof code - (size_t)n, "    }\n");
     const size_t len = strlen(hlsl), dl = strlen(decl), cl = strlen(code);
     if (len + dl + cl + 1 > cap) return 0;
@@ -7984,6 +8016,13 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 sy = 1.0f / (float)dr->tex[_u].h;
             }
             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
+            /* zw: the sprite-edge clamp's least margin, half a texel in the
+             * coordinate's units (fp_inject_uvclamp; the core's uvclamp_margin) */
+            if (dr && dr->tex[_u].set && dr->tex[_u].w && dr->tex[_u].h) {
+                const int texels = (dr->tex[_u].fmt & 0x40) != 0;
+                ts[_u*4+2] = texels ? 0.5f : 0.5f / (float)dr->tex[_u].w;
+                ts[_u*4+3] = texels ? 0.5f : 0.5f / (float)dr->tex[_u].h;
+            }
         }
         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
          * has no fixed alpha test; guest FPs discard on it dynamically
