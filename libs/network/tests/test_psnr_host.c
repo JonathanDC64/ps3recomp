@@ -608,6 +608,18 @@ static int e_wait(ph_sock e, int type, psnr_intro_pkt* out, uint16_t* from_port,
     return 0;
 }
 
+/* The introductions' state reaching `state` within ms (a slow runner's loop takes longer than the timers say). */
+static int intro_state_wait(psnr_host* h, int state, int ms)
+{
+    psnr_host_intro_info info;
+    for (int t = 0;; t += 10) {
+        psnr_host_intro_get(h, &info);
+        if (info.state == state) return 1;
+        if (t >= ms) return 0;
+        sleep_ms(10);
+    }
+}
+
 static void e_drain(ph_sock e)
 {
     uint8_t buf[256];
@@ -667,9 +679,9 @@ static void test_intro(void)
     uint8_t pkt[PSNR_INTRO_REQ_LEN];
     const psnr_cand seen = psnr_cand_of((const uint8_t[4]){127, 0, 0, 1}, s_hport);
     udp_send(e, pkt, psnr_intro_registered(pkt, psnr_host_room(h), PSNR_INTRO_OK, &seen, 20), s_hport);
-    sleep_ms(150);
+    CHECK(intro_state_wait(h, PSNR_HOST_INTRO_REGISTERED, 2000));
     psnr_host_intro_get(h, &info);
-    CHECK(info.state == PSNR_HOST_INTRO_REGISTERED && info.seen_port == s_hport && !memcmp(info.seen_ip, lo, 4));
+    CHECK(info.seen_port == s_hport && !memcmp(info.seen_ip, lo, 4));
     e_drain(e);
     CHECK(!e_wait(e, PSNR_PKT_REGISTER, &in, NULL, 400));   /* (answered: the next one in 20 s) */
 
@@ -799,15 +811,11 @@ static void test_intro(void)
     CHECK(psnr_host_players(h) == 1);
     /* no place for another room */
     udp_send(e, pkt, psnr_intro_registered(pkt, room3, PSNR_INTRO_FULL, &seen, 20), s_hport);
-    sleep_ms(100);
-    psnr_host_intro_get(h, &info);
-    CHECK(info.state == PSNR_HOST_INTRO_LIMITED);
+    CHECK(intro_state_wait(h, PSNR_HOST_INTRO_LIMITED, 2000));
 
-    /* the endpoint stops answering: unreachable after three */
+    /* the endpoint stops answering: unreachable after three (about PH_REG_RETRY_MS * PH_REG_LOST) */
     psnr_host_set_intro(h, &in_cfg);   /* (asks again now) */
-    sleep_ms(PH_REG_RETRY_MS * (PH_REG_LOST + 2));
-    psnr_host_intro_get(h, &info);
-    CHECK(info.state == PSNR_HOST_INTRO_UNREACHABLE);
+    CHECK(intro_state_wait(h, PSNR_HOST_INTRO_UNREACHABLE, 3000));
 
     /* the window's close: UNREGISTER at once, and nothing after it */
     e_drain(e);
