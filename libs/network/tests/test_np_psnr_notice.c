@@ -256,6 +256,58 @@ int main(void)
         env("PSNR_REDIAL_MS", "");
     }
 
+    /* A hosted join in the background (PSNR_BACKGROUND): the context start doesn't wait; a host that isn't there
+     * yet is tried again (PSNR_RETRY_MS: 50 ms here, then 150, then 300), and joined once it is; a connection the
+     * host drops is dialled again; a key the host turns away stops it, with the notice. */
+    {
+        char dead[64], live[64];
+        snprintf(live, sizeof live, "%s", getenv("PSNR_SERVER"));
+        sock_t none = socket(AF_INET, SOCK_STREAM, 0);
+        snprintf(dead, sizeof dead, "127.0.0.1:%u", loopback_port(none));
+        sock_close(none);   /* (nothing listens there now) */
+        env("PSNR_SERVER", dead);
+        env("PSNR_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+        env("PSNR_BACKGROUND", "1");
+        env("PSNR_RETRY_MS", "50");
+        s_error = 0;
+        s_tried = 0;
+        assert(np_psnr_background());
+        assert(np_psnr_connect("NPWR00881_00") == 0 && !np_psnr_connected());   /* started, not connected */
+        for (int i = 0; i < 500 && psnr_join_state() != PSNR_JOIN_UNREACHABLE; i++) nap_ms(10);
+        assert(psnr_join_state() == PSNR_JOIN_UNREACHABLE && !np_psnr_connected());
+        int hellos = s_hellos;
+        s_kick = 1;   /* the host is up now, and drops the first connection right after its welcome */
+        env("PSNR_SERVER", live);
+        for (int i = 0; i < 500 && !np_psnr_connected(); i++) nap_ms(10);
+        assert(np_psnr_connected() && psnr_join_state() == PSNR_JOIN_CONNECTED && s_hellos == hellos + 1);
+        assert(np_psnr_connect("NPWR00881_00") == 0);   /* (a second context start: the same connection) */
+        for (int i = 0; i < 500 && np_psnr_connected(); i++) { np_psnr_pump(); nap_ms(10); }
+        assert(!np_psnr_connected());   /* dropped: dialled again in 2 s */
+        for (int i = 0; i < 500 && !np_psnr_connected(); i++) nap_ms(10);
+        assert(np_psnr_connected() && s_hellos == hellos + 2);
+        /* The host's game started again with a new key: the next try is turned away, and that is the last one. */
+        s_error = PSNR_E_REFUSED;
+        s_kick = 1;
+        hellos = s_hellos;
+        LOCK();   /* (as if the host's game closed, and the pump had found it gone) */
+        psnr_close(s_client);
+        s_client = NULL;
+        UNLOCK();
+        for (int i = 0; i < 500 && psnr_join_state() != PSNR_JOIN_REFUSED; i++) nap_ms(10);
+        assert(psnr_join_state() == PSNR_JOIN_REFUSED && !np_psnr_connected() && s_hellos == hellos + 1);
+        assert(ps3_net_signin_notice(notice, sizeof notice) && strstr(notice, "did not accept this invite code"));
+        for (int i = 0; i < 500 && s_bg_running; i++) nap_ms(10);
+        assert(!s_bg_running);
+        nap_ms(400);
+        assert(s_hellos == hellos + 1);   /* (no more tries) */
+        s_kick = 0;
+        s_error = 0;
+        env("PSNR_BACKGROUND", "");
+        env("PSNR_RETRY_MS", "");
+        env("PSNR_KEY", "");
+        env("PSNR_SERVER", live);
+    }
+
     /* A hosted game (PSNR_KEY, psnr_host.h): the host's game closed and
      * started again with a new key, and its room server turns this key away.
      * The redial tries once, tells the player, and stops: an old key never

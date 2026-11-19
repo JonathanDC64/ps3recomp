@@ -33,9 +33,17 @@ int np_psnr_enabled(void);
  * servers (cellHttp) can be reached. */
 int np_psnr_signed_in(void);
 
-/* Connect (once) as this title. 0 if connected, -1 if not. */
+/* Connect (once) as this title. 0 if connected, -1 if not. With PSNR_BACKGROUND
+ * (a game one player hosts, ps3emu/psnr_host.h) it connects on a thread of its
+ * own and returns 0 at once: the context counts as started, and requests that
+ * need the server fail with SERVER_NOT_AVAILABLE until np_psnr_connected(). */
 int np_psnr_connect(const char* comm_id);
 int np_psnr_connected(void);
+
+/* PSNR_BACKGROUND=1: a hosted join connects in the background (above). Only the
+ * port that hosts its games sets it; the runtime's other users keep the one
+ * try at the context start. */
+int np_psnr_background(void);
 
 /* Which connection this is: one more at each dial that connects (a redial
  * too), 0 while there is none. Rooms last only as long as the connection

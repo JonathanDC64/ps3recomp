@@ -214,6 +214,8 @@ static psnr_client* dial(const char* comm_id, const char* host, uint16_t port, u
     return c;
 }
 
+static int bg_start(const char* comm_id);
+
 int np_psnr_connect(const char* comm_id)
 {
     char host[256];
@@ -222,6 +224,7 @@ int np_psnr_connect(const char* comm_id)
     uint8_t ip[4] = {0};
 
     if (!np_psnr_enabled()) return -1;
+    if (np_psnr_background()) return bg_start(comm_id);
     LOCK();
     if (s_client || s_tried) {
         int r = s_client ? 0 : -1;
@@ -780,10 +783,169 @@ static void* redial_main(void* arg)
     return 0;
 }
 
+/* ---- A hosted join in the background (PSNR_BACKGROUND, ps3emu/psnr_host.h) ----
+ *
+ * A friend's game joining a game one player hosts connects on a thread of its own from the start: a context start
+ * doesn't wait for it, and Matching2's local answers (server and world lists) work before it is up. A try that fails
+ * is made again after 10 s, then 30 s, then every 60 s; a connection that was up and is lost, after 2 s. It stops
+ * for good when the host's game turns the invite code away (the host started again, with a new code). */
+static volatile int s_join_state;   /* PSNR_JOIN_*, for the port's window */
+static int s_bg_running;            /* (LOCK) */
+static volatile int s_bg_lost;      /* the pump lost the connection: the thread dials again soon */
+
+int np_psnr_background(void)
+{
+    const char* e = getenv("PSNR_BACKGROUND");
+    return e && atoi(e) != 0;
+}
+
+int psnr_join_state(void)
+{
+    return s_join_state;
+}
+
+static void set_join_state(int st)
+{
+    s_join_state = st;
+}
+
+/* The wait before try n+1 after n failed tries in a row (PSNR_RETRY_MS scales it, for tests). */
+static unsigned bg_wait_ms(int failed)
+{
+    const char* t = getenv("PSNR_RETRY_MS");
+    const unsigned first = t && atoi(t) > 0 ? (unsigned)atoi(t) : 10000u;
+    return failed <= 1 ? first : failed == 2 ? first * 3u : first * 6u;
+}
+
+/* One try at the host's game: a direct code's TCP connection and HELLO. The client, or NULL with *err (as dial()'s)
+ * and the state to show. */
+static psnr_client* bg_try(const char* comm, uint32_t* user, uint8_t ip[4], int* err, int* state)
+{
+    char host[256];
+    uint16_t port;
+    int signed_in = 0;
+    server_addr(host, &port);
+    set_join_state(PSNR_JOIN_REACHING);
+    psnr_client* c = dial(comm, host, port, user, ip, &signed_in, err);
+    *state = c ? PSNR_JOIN_CONNECTED : *err == PSNR_E_REFUSED ? PSNR_JOIN_REFUSED : PSNR_JOIN_UNREACHABLE;
+    return c;
+}
+
+/* Naps until ms have passed, the pump lost the connection, or the run went offline. */
+static void bg_nap(unsigned ms)
+{
+    for (unsigned t = 0; t < ms && !s_bg_lost && !ps3_net_locked_offline(); t += 50) nap_ms(50);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI bg_main(LPVOID arg)
+#else
+static void* bg_main(void* arg)
+#endif
+{
+    (void)arg;
+    char comm[sizeof(s_comm_id)];
+    LOCK();
+    memcpy(comm, s_comm_id, sizeof(comm));
+    UNLOCK();
+    int failed = 0, was_up = 0;
+    unsigned wait = 0;
+    for (;;) {
+        bg_nap(wait);
+        if (ps3_net_locked_offline() || !np_psnr_enabled()) break;
+        LOCK();
+        const int up = s_client != NULL;
+        UNLOCK();
+        if (up) {   /* (connected: the pump looks after it, and says when it is lost) */
+            was_up = 1;
+            wait = 200;
+            continue;
+        }
+        if (was_up) {   /* lost after it was up: again in 2 s, then as after a failed try */
+            was_up = 0;
+            s_bg_lost = 0;
+            failed = 0;
+            wait = 2000;
+            set_join_state(PSNR_JOIN_REACHING);
+            continue;
+        }
+        uint32_t user = 0;
+        uint8_t ip[4] = {0};
+        int err = 0, state = 0;
+        psnr_client* c = bg_try(comm, &user, ip, &err, &state);
+        if (c) {
+            LOCK();
+            set_join_state(PSNR_JOIN_CONNECTED);   /* (before the client: whoever sees it connected sees this) */
+            if (!s_client) {
+                s_client = c;
+                s_user_id = user;
+                s_conn++;
+                c = NULL;
+            }
+            UNLOCK();
+            if (c) psnr_close(c);
+            printf("[psnr] connected to the host's game as \"%s\" (%s), user %u%s\n", np_psnr_online_id(), comm, user,
+                   failed ? ", after trying again" : "");
+            failed = 0;
+            wait = 200;
+            continue;
+        }
+        set_join_state(state);
+        if (state == PSNR_JOIN_REFUSED) {   /* the host's game has a new code: this one never comes right */
+            printf("[psnr] the host's game did not accept this invite code -- NP stays offline\n");
+            ps3_net_signin_post_notice("The host's game did not accept this invite code. Ask the host for it again.");
+            break;
+        }
+        failed++;
+        wait = bg_wait_ms(failed);
+        if (failed == 1 || failed % 10 == 0)
+            printf("[psnr] the host's game wasn't reached (%s, try %d); trying again in %u s\n",
+                   err ? "turned away for now" : "no answer", failed, (wait + 999u) / 1000u);
+    }
+    LOCK();
+    s_bg_running = 0;
+    UNLOCK();
+    return 0;
+}
+
+/* np_psnr_connect with PSNR_BACKGROUND: the thread, once a run (unless it stopped for good); 0, the context counts
+ * as started. */
+static int bg_start(const char* comm_id)
+{
+    LOCK();
+    if (s_client || s_bg_running || s_tried) {
+        UNLOCK();
+        return 0;
+    }
+    s_tried = 1;
+    snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+    set_join_state(PSNR_JOIN_REACHING);
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, bg_main, NULL, 0, NULL);
+    const int ok = th != NULL;
+    if (th) CloseHandle(th);
+#else
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    const int ok = pthread_create(&th, &at, bg_main, NULL) == 0;
+    pthread_attr_destroy(&at);
+#endif
+    s_bg_running = ok;
+    UNLOCK();
+    printf("[psnr] joining the host's game in the background\n");
+    return ok ? 0 : -1;
+}
+
 /* Under LOCK: a redial thread, unless one runs, PSNR_REDIAL=0, or there was
  * never a connection. 1 if one runs now. */
 static int redial_start(void)
 {
+    if (s_bg_running) {   /* a hosted join's own thread dials again */
+        s_bg_lost = 1;
+        return 1;
+    }
     if (s_redialing) return 1;
     if (!redial_on() || !s_comm_id[0]) return 0;
 #ifdef _WIN32

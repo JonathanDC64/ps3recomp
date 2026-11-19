@@ -86,6 +86,25 @@ void       psnr_host_stop(psnr_host* h);
 int  psnr_app_send(const void* data, uint32_t len);
 void psnr_app_on_message(void (*fn)(uint32_t from_user, const uint8_t* data, uint32_t len));
 
+/* A friend's game joining (np_psnr.c, with PSNR_BACKGROUND=1 and PSNR_KEY): it connects on a thread of its own, and
+ * a try that fails is made again after 10 s, then 30 s, then every 60 s, until the host's game turns the key away.
+ * How it goes, for the port's window: */
+enum {
+    PSNR_JOIN_NONE = 0,       /* not a hosted join */
+    PSNR_JOIN_LOOKING,        /* a room code: asking the endpoint for the host's addresses */
+    PSNR_JOIN_REACHING,       /* connecting to the host's game */
+    PSNR_JOIN_CONNECTED,
+    PSNR_JOIN_NO_ROOM,        /* no game hosts with that room number (tried again) */
+    PSNR_JOIN_OTHER_VERSION,  /* the host's game is another network version (no more tries) */
+    PSNR_JOIN_NO_SERVER,      /* the endpoint didn't answer (tried again) */
+    PSNR_JOIN_NO_WAY,         /* found, but neither the punching nor TCP got through (tried again) */
+    PSNR_JOIN_UNREACHABLE,    /* a direct code: the host's address didn't answer (tried again) */
+    PSNR_JOIN_REFUSED,        /* the host's game turned the key away (no more tries) */
+    PSNR_JOIN_GONE,           /* no room for 2 minutes: the host stopped hosting (no more tries) */
+    PSNR_JOIN_SLOW            /* the endpoint asked to slow down (tried again) */
+};
+int psnr_join_state(void);
+
 #ifdef __cplusplus
 }
 #endif
