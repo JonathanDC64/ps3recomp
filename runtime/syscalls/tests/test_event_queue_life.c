@@ -10,6 +10,11 @@
  * already deleted: an access violation writing near 0x24, or a hang.
  *
  * Then: a live queue takes pushes up to its size, a destroyed one none.
+ *
+ * Last: a thread blocked in the guest's receive with no timeout counts as the
+ * queue's waiter until an event wakes it. SPURS posts its task completions
+ * only to queues with a waiter (spurs_notify_task_completion); on Linux the
+ * receive never counted itself, so those completions never came there.
  */
 #include "../sys_event.h"
 
@@ -31,6 +36,7 @@ const uint64_t function_table_count = 0;
   #define TH_RET return 0
 #else
   #include <pthread.h>
+  #include <time.h>
   typedef pthread_t th_t;
   static th_t th_start(void* (*fn)(void*), void* arg) { th_t t; pthread_create(&t, NULL, fn, arg); return t; }
   static void th_join(th_t t) { pthread_join(t, NULL); }
@@ -57,6 +63,30 @@ TH_FN(pusher)
 }
 
 static ppu_context s_ctx;
+
+int sys_event_queue_waiters(uint32_t qid);
+
+static ppu_context s_recv_ctx;
+static volatile int64_t s_recv_rc = 1;
+
+/* sys_event_queue_receive(qid, no event buffer, no timeout), as the guest calls it. */
+TH_FN(receiver)
+{
+    memset(&s_recv_ctx, 0, sizeof s_recv_ctx);
+    s_recv_ctx.gpr[3] = (uint64_t)(uintptr_t)arg; s_recv_ctx.gpr[4] = 0; s_recv_ctx.gpr[5] = 0;
+    __atomic_store_n(&s_recv_rc, sys_event_queue_receive(&s_recv_ctx), __ATOMIC_RELEASE);
+    TH_RET;
+}
+
+static void nap_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts = { 0, (long)ms * 1000000L };
+    nanosleep(&ts, NULL);
+#endif
+}
 
 /* sys_event_queue_create as the guest calls it (no id written back: the
  * queue is found by its key), or sys_event_queue_create_direct. */
@@ -114,6 +144,29 @@ int main(void)
     CHECK(drop_queue(qid) == CELL_OK, "destroy failed");
     CHECK(sys_event_queue_push_by_id(qid, KEY, 4, 0, 0) == -1, "a destroyed queue took a push");
     CHECK(sys_event_find_queue_by_key(KEY) == 0, "a destroyed queue is still found by its key");
+
+    /* A receiver blocked with no timeout is the queue's waiter until an event
+     * wakes it, then no longer. */
+    {
+        const uint32_t wq = make_queue(0, 4);
+        CHECK(wq != 0, "no queue");
+        CHECK(sys_event_queue_waiters(wq) == 0, "a new queue has %d waiter(s)", sys_event_queue_waiters(wq));
+        th_t r = th_start(receiver, (void*)(uintptr_t)wq);
+        int seen = 0;
+        for (int i = 0; i < 2000 && !seen; i++) {   /* up to 2 s for the receiver to block */
+            seen = sys_event_queue_waiters(wq) == 1;
+            if (!seen) nap_ms(1);
+        }
+        CHECK(seen, "a receiver blocked with no timeout is not counted as a waiter");
+        CHECK(sys_event_queue_push_by_id(wq, 0x5350550000ull, 7, 0, 0) == 0, "push to the waited queue refused");
+        th_join(r);
+        CHECK(__atomic_load_n(&s_recv_rc, __ATOMIC_ACQUIRE) == CELL_OK, "the receive returned %lld",
+              (long long)s_recv_rc);
+        CHECK(s_recv_ctx.gpr[4] == 0x5350550000ull && s_recv_ctx.gpr[5] == 7, "the receiver got a different event");
+        CHECK(sys_event_queue_waiters(wq) == 0, "%d waiter(s) left after the wake", sys_event_queue_waiters(wq));
+        CHECK(drop_queue(wq) == CELL_OK, "destroy failed");
+        printf("[evq] a blocked receiver counted as the queue's waiter: %s\n", seen ? "yes" : "no");
+    }
 
     printf(fails ? "[evq] FAIL: %d check(s)\n" : "[evq] PASS\n", fails);
     return fails ? 1 : 0;
