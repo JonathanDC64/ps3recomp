@@ -225,6 +225,20 @@ static u32 s_fpcb_hi;
 static const rsx_state* s_vcb_st;
 static float s_vcb_z[2];
 
+/* The sprite-edge clamp's k (rsx_alphatest.w, fp_inject_uvclamp): half the
+ * RSX_SCALE factor, half a guest pixel in host pixels. render_frame raises it
+ * for a draw that samples the port's image (uvclamp_k_image). */
+static inline float uvclamp_k(void) { return (float)rsx_scale_pct() / 200.0f; }
+/* k for a draw that samples the port's image (rsx_texture_override.h), s times
+ * the size of the guest's texture. A sample half a guest texel inside a
+ * sprite's edge reads the image's texels within one of theirs (1/s of a guest
+ * texel) either side, and an image made by enlarging the guest's with a filter
+ * holds some of the next texel in its texels nearer an edge than half a guest
+ * texel: Demon's Souls' port draws its button pages so, and at 2x the HUD's
+ * pieces on them each showed a line along their edges. Half of one of the
+ * image's texels more keeps the sample clear of those: k (1 + 1/s). */
+static inline float uvclamp_k_image(float s) { return s > 1.0f ? uvclamp_k() * (1.0f + 1.0f / s) : uvclamp_k(); }
+
 /* Returns the vp_cb bank the draw binds (its vcb_slot): always in a chunk
  * that is there, so the draw loop binds it unchecked. `slot` is the draw. */
 static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
@@ -256,7 +270,7 @@ static u32 vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
          * palette drew as an opaque square). w: half the RSX_SCALE factor,
          * for the sprite-edge clamp (fp_inject_uvclamp); a shader without
          * the clamp never reads it. */
-        const float half_scale = (float)rsx_scale_pct() / 200.0f;
+        const float half_scale = uvclamp_k();
         static int noat = -1;   /* knobs: this runs for every draw */
         PS3_KNOB(noat, getenv("NO_ALPHATEST") ? 1 : 0);
         if (dr && !noat) {

@@ -248,6 +248,8 @@ typedef struct {
     int used;           /* referenced this frame */
     u32 tov_lv;         /* holds the port's image in place of the guest's (rsx_texture_override.h): its
                          * levels, the texture RGBA8 at the image's size; 0: the guest's own */
+    float tov_scale;    /* with tov_lv: the image's size over the guest texture's, the larger of the two
+                         * sides (the sprite-edge clamp's margin, render_frame) */
     int tov_redo;       /* the port's image changed: ask again at the next bind */
 } VPTexSlot;
 /* Distinct textures uploadable per frame. Four was enough for a UI/atlas-style

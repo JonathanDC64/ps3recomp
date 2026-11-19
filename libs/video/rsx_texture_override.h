@@ -9,7 +9,9 @@
  *
  * The image is RGBA8, of any size: one larger than the title's draws sharper on a scaled render. The title's own
  * filters sample it, so its smaller levels are read only where the title's sampler uses mipmaps. Its channels are
- * what the title's texture holds once decoded (R, G, B, A), so the title's channel swizzle applies as it is.
+ * what the title's texture holds once decoded (R, G, B, A), so the title's channel swizzle applies as it is. On a
+ * larger one the sprite-edge clamp keeps samples half of one of the image's texels further inside each sprite, as
+ * an image enlarged with a filter blends the texels either side of every edge (rsxc_targets.inc, uvclamp_k_image).
  *
  * The answer stays with the texture until the guest's bytes change or the port calls
  * rsx_texture_override_changed (its image changed: the player picked up another pad); the texture's next bind
