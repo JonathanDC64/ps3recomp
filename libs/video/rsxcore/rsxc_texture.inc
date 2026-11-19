@@ -633,6 +633,8 @@ static int vp_upload_override(int slot, u32 key_off, u32 off, u32 w, u32 h, u32 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->cube = 0; t->used = 1; t->face_bytes = nb; t->lv = nlv;
     t->tov_lv = lv; t->tov_redo = 0;
+    { const float sx = (float)im->width / (float)w, sy = (float)im->height / (float)h;
+      t->tov_scale = sx > sy ? sx : sy; }
     tcj_order_add(slot);
     t->csum = tex_csum(vm_base + off, nb);
     t->fsum = ps3_env_int("TEX_VERIFY", 0) ? tex_csum_full(vm_base + off, nb) : 0;

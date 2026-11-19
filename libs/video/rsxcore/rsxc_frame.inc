@@ -1797,6 +1797,7 @@ rtt_dump_done:;
                                                      dr->fp_addr & ~0x3u);
               if (foff != 0xFFFFFFFFu) _used = fp_units_at(foff);
           } }
+        float _tov_s = 0.0f;   /* the largest of the port's images the draw samples (tov_scale) */
         for (int _u = 0; _u < RSX_FP_UNITS; _u++) {
             u32 wslot = draw_srv(_d) + (u32)_u;
             dr->tex_rt[_u] = -1;
@@ -1917,6 +1918,7 @@ rtt_dump_done:;
                         /* (A port's image in the slot, tov_lv: RGBA8 with its own levels, under the
                          * guest's swizzle: rsx_texture_override.h.) */
                         const VPTexSlot* _ts = &s_d3d.vp_tex[ts];
+                        if (_ts->tov_lv && _ts->tov_scale > _tov_s) _tov_s = _ts->tov_scale;
                         srv_write_ex(wslot, _ts->tex,
                                   _ts->tov_lv ? GPU_FORMAT_R8G8B8A8_UNORM : rsx_texfmt_format(_tfmt),
                                   (_bf == 0x81) ? 0x1000
@@ -1939,6 +1941,11 @@ rtt_dump_done:;
             srv_write(wslot, k_rc_no_tex, GPU_FORMAT_R8G8B8A8_UNORM,
                       GPU_SWIZZLE_IDENTITY);
         }
+        /* The sprite-edge clamp's k for the port's image, known only now that
+         * the units are bound; vp_record_cb wrote the guest texture's into the
+         * draw's b1 block, which the GPU has not read yet (uvclamp_k_image). */
+        if (_tov_s > 1.0f && fpcb_has(dr->cb_slot) && dr->cb_slot < MAX_DRAWS)
+            ((float*)fpcb_ptr(dr->cb_slot, s_rf_par))[FPCB_ALPHA * 4 + 3] = uvclamp_k_image(_tov_s);
         if (perf_on()) s_perf_srv += perf_now() - _sv0;
         double _ps0 = perf_on() ? perf_now() : 0.0;
         const int _pm0 = s_perf_pso_miss;
