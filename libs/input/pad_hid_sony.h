@@ -10,11 +10,15 @@
 
 #define PAD_HID_SONY_MAX 4
 
+/* One pad's state. A title that keeps its own copy of it, field for field, has to follow it: new fields go into
+ * the padding or at the end. */
 typedef struct {
     uint16_t buttons;   /* CELL_PAD_CTRL_* */
     uint8_t  lx, ly, rx, ry;   /* 0-255, centre 128, up = 0 */
     uint8_t  l2, r2;           /* analog triggers 0-255 */
     uint8_t  slot;             /* the pad, for pad_hid_sony_rumble */
+    uint8_t  extra;            /* the buttons beyond the PS3's (pad_map.h's PAD_EXTRA_*): a DualSense Edge's back
+                                  and Fn buttons, a DualSense's mute button */
     float    raw[4];           /* Windows: left x, y, right x, y as the pad reports them, -1 to 1, down positive */
 } PadHidSonyState;
 

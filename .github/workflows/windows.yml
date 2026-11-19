@@ -408,6 +408,16 @@ jobs:
           .\test_pad_stick.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # PAD_MAP's rules (pad_map.h): several host buttons for one of the game's, "none", and the buttons some pads
+      # have beyond the PS3's (paddles, misc, touchpad).
+      - name: Run the button mapping test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I libs/input /Fe:test_pad_map.exe libs/input/tests/test_pad_map.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_pad_map.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # sync_stress has always been the Windows-native suite; now that its
       # source also builds on POSIX through the shim, this is what proves the
       # shared source still means the same thing here.

@@ -54,6 +54,7 @@
 #include "pad_controller.h"   /* (the devices on the ports, and PAD_CONTROLLER's rules) */
 #include "pad_glyph.h"        /* (the last device used, for a title's button icons) */
 #include "pad_held.h"         /* (the log's lines for the controllers as they come and go) */
+#include "pad_map.h"          /* (PAD_MAP's rules, and the buttons some pads have beyond the PS3's) */
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -81,6 +82,7 @@ typedef struct {
     u8   press_square;
     u8   press_l1;
     u8   press_r1;
+    u8   extra;             /* the buttons beyond the PS3's (PAD_EXTRA_*, pad_map.h); PAD_MAP reads them */
 } PadHostState;
 
 static int           s_pad_initialized = 0;
@@ -827,6 +829,7 @@ static void pad_poll_xinput(void)
         if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
 
         s_host_state[i].buttons = btns;
+        s_host_state[i].extra = 0;   /* (XInput has no paddles, and no Share button) */
 
         /* Analog sticks. PS3 Y axis is inverted vs XInput (up = 0): negate it
          * before the conversion, so a centred stick stays 128. 127 would alias
@@ -858,6 +861,7 @@ static void pad_poll_hid(void)
         PadHostState* hs = &s_host_state[i];
         hs->connected  = 1;
         hs->buttons    = hid[k].buttons;
+        hs->extra      = hid[k].extra;
         hs->analog_lx  = hid[k].lx; hs->analog_ly = hid[k].ly;
         hs->analog_rx  = hid[k].rx; hs->analog_ry = hid[k].ry;
         hs->trigger_l2 = hid[k].l2; hs->trigger_r2 = hid[k].r2;
@@ -919,6 +923,18 @@ static void pad_sdl_read(SDL_GameController* gc, PadHostState* hs)
     if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
 
     hs->buttons = btns;
+
+    /* The buttons beyond the PS3's, when SDL reports them (pad_map.h). */
+    u8 extra = 0;
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE1))  extra |= PAD_EXTRA_PADDLE1;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE2))  extra |= PAD_EXTRA_PADDLE2;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE3))  extra |= PAD_EXTRA_PADDLE3;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE4))  extra |= PAD_EXTRA_PADDLE4;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_MISC1))    extra |= PAD_EXTRA_MISC;
+    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_TOUCHPAD)) extra |= PAD_EXTRA_TOUCHPAD;
+#endif
+    hs->extra = extra;
 
     /* Analog sticks */
     pad_host_stick_to_u8(0, SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
@@ -1032,6 +1048,7 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
         memset(&hs, 0, sizeof hs);
         pad_sdl_read(gc, &hs);
         out[n].buttons = hs.buttons;
+        out[n].extra = hs.extra;
         out[n].lx = hs.analog_lx; out[n].ly = hs.analog_ly;
         out[n].rx = hs.analog_rx; out[n].ry = hs.analog_ry;
         out[n].l2 = hs.trigger_l2; out[n].r2 = hs.trigger_r2;
@@ -1102,28 +1119,46 @@ static unsigned long long pad_now_ms(void)
 /* PAD_MAP: gamepad button remapping, for every host port.
  * A list of game=host pairs, e.g. "cross=circle,circle=cross,l1=r2":
  * the game's cross reads the host's circle, and so on. Names: cross circle
- * square triangle l1 r1 l2 r2 l3 r3 start select up down left right.
- * Buttons not listed read themselves. L2/R2's analog values follow the
- * mapping (a digital source gives 0 or 255). Live.
+ * square triangle l1 r1 l2 r2 l3 r3 start select up down left right, and
+ * for the host the buttons some pads have beyond those (paddle1 to paddle4,
+ * misc, touchpad: pad_map.h). A host side can name several, joined by '|'
+ * ("r1=r1|paddle1": either presses R1), or be "none" (nothing presses it).
+ * Buttons not listed read themselves, and the extra ones press nothing
+ * unless listed. L2/R2's analog values follow the mapping (a digital source
+ * gives 0 or 255). Live.
  *
- * pad_parse_map fills src[i], the host button the game's button i reads (an
- * index into s_pad_names), and returns 0 when nothing is remapped. */
-static int pad_parse_map(const char* e, signed char src[16])
+ * pad_parse_map fills src[i], the host buttons the game's button i reads (a
+ * host word, pad_map.h), and returns 0 when nothing is remapped. */
+static int pad_parse_map(const char* e, uint32_t src[PAD_MAP_GAME])
 {
     int any = 0, dst;
     const char* v;
     size_t vn;
-    for (int i = 0; i < 16; i++) src[i] = (signed char)i;
+    pad_map_identity(src);
     while (e && (e = pad_next_pair(e, &dst, &v, &vn, 0)) != NULL) {
-        const int from = dst >= 0 && vn ? pad_name_index(v, vn) : -1;
-        if (from < 0) continue;
-        src[dst] = (signed char)from;
-        if (from != dst) any = 1;
+        if (dst < 0 || !vn) continue;   /* (pad_next_pair said so) */
+        int ok = 0;
+        const uint32_t from = pad_map_value(v, vn, &ok);
+        if (!ok) {
+            fprintf(stderr, "[cellPad] PAD_MAP: ignoring \"%.*s\" for %s\n", (int)vn, v, pad_map_names[dst]);
+            continue;
+        }
+        src[dst] = from;
+        if (from != 1u << dst) any = 1;
     }
-    if (any) {
+    static uint32_t said[PAD_MAP_GAME];   /* (each new mapping once: any knob's setenv parses it again) */
+    static int have_said = 0;
+    if (!any) have_said = 0;
+    if (any && (!have_said || memcmp(said, src, sizeof said) != 0)) {
+        memcpy(said, src, sizeof said);
+        have_said = 1;
         printf("[cellPad] PAD_MAP:");
-        for (int i = 0; i < 16; i++)
-            if (src[i] != i) printf(" %s=%s", s_pad_names[i].name, s_pad_names[(int)src[i]].name);
+        for (int i = 0; i < PAD_MAP_GAME; i++) {
+            if (src[i] == 1u << i) continue;
+            char text[160];
+            pad_map_text(src[i], text, sizeof text);
+            printf(" %s=%s", pad_map_names[i], text);
+        }
         printf("\n");
         fflush(stdout);
     }
@@ -1132,26 +1167,73 @@ static int pad_parse_map(const char* e, signed char src[16])
 
 static void pad_apply_map(void)
 {
-    static signed char src[16];
+    static uint32_t src[PAD_MAP_GAME];
     static int on = -1;
     PS3_KNOB(on, pad_parse_map(getenv("PAD_MAP"), src));
     if (!on) return;
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
         PadHostState* hs = &s_host_state[p];
         if (!hs->connected) continue;
-        const u16 in = hs->buttons;
-        const u8 l2 = hs->trigger_l2, r2 = hs->trigger_r2;
-        u16 out = 0;
-        for (int i = 0; i < 16; i++)
-            if (in & s_pad_names[(int)src[i]].bit) out |= s_pad_names[i].bit;
-        hs->buttons = out;
-        /* index 8 = l2, 9 = r2 */
-        const u8 v8 = src[8] == 8 ? l2 : src[8] == 9 ? r2 : ((out & CELL_PAD_CTRL_L2) ? 255 : 0);
-        const u8 v9 = src[9] == 9 ? r2 : src[9] == 8 ? l2 : ((out & CELL_PAD_CTRL_R2) ? 255 : 0);
-        hs->trigger_l2 = v8;
-        hs->trigger_r2 = v9;
+        const uint32_t in = (uint32_t)hs->buttons | ((uint32_t)hs->extra << 16);
+        hs->buttons = pad_map_apply(src, in, hs->trigger_l2, hs->trigger_r2, &hs->trigger_l2, &hs->trigger_r2);
         pad_press_from_buttons(hs);
     }
+}
+
+/* Each host port's buttons as the last poll read them, before PAD_MAP and without the keyboard: a host word
+ * (pad_map.h), for cellPad_host_pad_raw. */
+static volatile long s_host_raw[PAD_MAX_HOST_PORTS];
+
+static void pad_keep_raw(void)
+{
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+        const PadHostState* hs = &s_host_state[p];
+        const long w = hs->connected ? (long)((uint32_t)hs->buttons | ((uint32_t)hs->extra << 16)) : 0;
+        if (s_host_raw[p] != w) InterlockedExchange(&s_host_raw[p], w);
+    }
+}
+
+/* cellPad.h */
+unsigned cellPad_host_pad_raw(int port)
+{
+    return port >= 0 && port < PAD_MAX_HOST_PORTS ? (unsigned)s_host_raw[port] : 0u;
+}
+
+/* cellPad.h */
+unsigned cellPad_host_button_bit(const char* name)
+{
+    const int i = name ? pad_map_name(name, strlen(name)) : -1;
+    return i >= 0 ? 1u << i : 0u;
+}
+
+/* PAD_HOST_HELD, for tests with PS3_NO_USER_INPUT: port 0's pad holds these buttons, PAD_MAP's host names joined by
+ * '|' ("paddle1", "square|paddle1"), as if the pad reported them. So they go through PAD_MAP and reach
+ * cellPad_host_pad_raw as a real pad's do, which the scripted inputs (PAD_SCRIPT, PAD_FILE, the title's hook)
+ * don't: those press the game's buttons. Live. */
+static uint32_t pad_parse_host_held(const char* e)
+{
+    int ok = 0;
+    const uint32_t w = e && *e ? pad_map_value(e, strlen(e), &ok) : 0;
+    static uint32_t said = 0;   /* (each change once: any knob's setenv parses it again) */
+    if (e && *e && !ok) fprintf(stderr, "[cellPad] PAD_HOST_HELD: \"%s\" isn't a list of buttons\n", e);
+    if (w != said) {
+        char text[160];
+        pad_map_text(w, text, sizeof text);
+        printf("[cellPad] PAD_HOST_HELD: port 0 holds %s\n", w ? text : "nothing");
+        fflush(stdout);
+        said = w;
+    }
+    return w;
+}
+
+static void pad_host_held(void)
+{
+    static uint32_t held = 0;
+    PS3_KNOB(held, pad_parse_host_held(getenv("PAD_HOST_HELD")));
+    if (!held) return;
+    s_host_state[0].buttons |= (u16)(held & 0xFFFFu);
+    s_host_state[0].extra |= (u8)(held >> 16);
+    pad_press_from_buttons(&s_host_state[0]);
 }
 
 /* PAD_CONTROLLER: the controller on port 0, for a game that reads only port 0 when more than one is connected.
@@ -1513,7 +1595,10 @@ static void pad_poll_backend(void)
 
     if (ps3_no_user_input()) {   /* (nothing for the host hold to hold) */
         pad_poll_none();
+        pad_host_held();
         pad_publish_devices();
+        pad_keep_raw();
+        pad_apply_map();
         return;
     }
 #if PAD_BACKEND_XINPUT
@@ -1525,6 +1610,7 @@ static void pad_poll_backend(void)
     pad_tell_devices();
     pad_apply_controller();
     pad_publish_devices();
+    pad_keep_raw();
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
     PadGlyphSample glyph;
     pad_glyph_sample(&glyph);   /* port 0's pad before the keys are merged in */

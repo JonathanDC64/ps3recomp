@@ -708,6 +708,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_pad_held PRIVATE -UNDEBUG)
     endif()
     add_test(NAME pad_held COMMAND test_pad_held)
+    # PAD_MAP's rules: several host buttons for one of the game's, "none", the extra buttons (pad_map.h).
+    add_executable(test_pad_map libs/input/tests/test_pad_map.c)
+    target_include_directories(test_pad_map PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_map PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_map PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_map COMMAND test_pad_map)
     # A port's own image in place of a title's texture: the table of hooks (rsx_texture_override.c).
     add_executable(test_rsx_texture_override libs/video/tests/test_rsx_texture_override.c
                    libs/video/rsx_texture_override.c)

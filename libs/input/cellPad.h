@@ -274,6 +274,15 @@ void cellPad_host_set_menu(int open);
  * from the mouse. Dropped while the host hold is set. */
 void cellPad_host_stick(int stick, unsigned char x, unsigned char y, unsigned reads);
 
+/* A host port's pad as the last poll read it, before PAD_MAP and without the keyboard: bit i (0-15) the PS3 button
+ * i in CELL_PAD_CTRL_* order, and from bit 16 the buttons some pads have beyond those (pad_map.h: paddle1 to
+ * paddle4, misc, touchpad). 0 for an empty port. Port 0 is the one PAD_CONTROLLER chose. For a title's own reads of
+ * a button PAD_MAP gives a game button too, such as a button the player gave a move of the port's own. Any thread. */
+unsigned cellPad_host_pad_raw(int port);
+
+/* The bit of PAD_MAP's host button `name` ("r1", "paddle1") in that word; 0 for a name that isn't one. */
+unsigned cellPad_host_button_bit(const char* name);
+
 #ifdef __cplusplus
 }
 #endif
