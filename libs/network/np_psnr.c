@@ -6,6 +6,8 @@
 #include "ps3emu/ps3_net_signin.h"
 #include "ps3emu/ps3_tls.h"
 #include "ps3emu/psnr_host.h"   /* psnr_app_send, psnr_app_on_message */
+#include "psnr/psnr_intro.h"   /* a room code's join */
+#include "psnr/psnr_rudp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,6 +216,8 @@ static psnr_client* dial(const char* comm_id, const char* host, uint16_t port, u
     return c;
 }
 
+static int bg_start(const char* comm_id);
+
 int np_psnr_connect(const char* comm_id)
 {
     char host[256];
@@ -222,6 +226,7 @@ int np_psnr_connect(const char* comm_id)
     uint8_t ip[4] = {0};
 
     if (!np_psnr_enabled()) return -1;
+    if (np_psnr_background() || getenv("PSNR_ROOM")) return bg_start(comm_id);
     LOCK();
     if (s_client || s_tried) {
         int r = s_client ? 0 : -1;
@@ -305,6 +310,7 @@ void np_psnr_on_tick(void (*fn)(void))
 #define STREAM_TIMEOUT_MS 12000
 
 static np_psnr_p2p_send_fn s_p2p_send;
+static np_psnr_p2p_open_fn s_p2p_opener;
 static np_psnr_stream_sink_fn s_stream_sink;
 static int      s_probed;
 static uint64_t s_next_probe;
@@ -395,6 +401,11 @@ void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn)
     s_next_probe = 0;
 }
 
+void np_psnr_set_p2p_opener(np_psnr_p2p_open_fn fn)
+{
+    s_p2p_opener = fn;
+}
+
 void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)
 {
     s_stream_sink = fn;
@@ -426,6 +437,8 @@ void np_psnr_peer_left(uint32_t user)
     if (p) memset(p, 0, sizeof(*p));
     UNLOCK();
 }
+
+static int rc_takes(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port);
 
 /* Says so for the first few dropped datagrams only. */
 static void dropped(const char* why, const uint8_t ip[4], uint16_t port)
@@ -463,6 +476,7 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
         }
         return 0;
     }
+    if (rc_takes(buf, *len, from_ip, *from_port)) return 1;   /* a room code's join, and its session */
     if (psnr_relay_unwrap(buf, *len, &from, &payload, &plen)) {
         /* The peer's datagram, through the relay: the title gets it as if
          * it came from the peer's usual address. Only psnr itself relays. */
@@ -780,10 +794,521 @@ static void* redial_main(void* arg)
     return 0;
 }
 
+/* ---- A hosted join in the background (PSNR_BACKGROUND, ps3emu/psnr_host.h) ----
+ *
+ * A friend's game joining a game one player hosts connects on a thread of its own from the start: a context start
+ * doesn't wait for it, and Matching2's local answers (server and world lists) work before it is up. A try that fails
+ * is made again after 10 s, then 30 s, then every 60 s; a connection that was up and is lost, after 2 s. It stops
+ * for good when the host's game turns the invite code away (the host started again, with a new code). */
+static volatile int s_join_state;   /* PSNR_JOIN_*, for the port's window */
+static int s_bg_running;            /* (LOCK) */
+static volatile int s_bg_lost;      /* the pump lost the connection: the thread dials again soon */
+
+int np_psnr_background(void)
+{
+    const char* e = getenv("PSNR_BACKGROUND");
+    return e && atoi(e) != 0;
+}
+
+int psnr_join_state(void)
+{
+    return s_join_state;
+}
+
+static void set_join_state(int st)
+{
+    s_join_state = st;
+}
+
+/* The wait before try n+1 after n failed tries in a row (PSNR_RETRY_MS scales it, for tests). */
+static unsigned bg_wait_ms(int failed)
+{
+    const char* t = getenv("PSNR_RETRY_MS");
+    const unsigned first = t && atoi(t) > 0 ? (unsigned)atoi(t) : 10000u;
+    return failed <= 1 ? first : failed == 2 ? first * 3u : first * 6u;
+}
+
+/* ---- A room code's join (PSNR_ROOM; psnr/psnr_intro.h) ----
+ *
+ * The port sets PSNR_ROOM (the room number), PSNR_KEY (as for a direct code), PSNR_SERVER (here: the endpoint) and
+ * PSNR_VERSION (the network version). One try: the P2P port is held open (sysNet's opener), LOOKUP goes from it to the
+ * endpoint every 500 ms for 3 s, and FOUND gives the host's candidates. Then at the same time: OPEN to each candidate
+ * (and to where the host's KNOCKs come from), 5 a second for 5 s, and a TCP connection to the host's room server.
+ * The first to open gets the HELLO: TCP as today, or a session over the punched path (COOKIE, OPEN2, OPENED, then
+ * psnr_rudp.h). The P2P port's thread hands this the packets (rc_takes); the background join's thread runs it. */
+#ifndef NP_RC_LOOKUP_MS
+#  define NP_RC_LOOKUP_MS     500
+#endif
+#ifndef NP_RC_LOOKUP_FOR_MS
+#  define NP_RC_LOOKUP_FOR_MS 3000
+#endif
+#ifndef NP_RC_OPEN_MS
+#  define NP_RC_OPEN_MS       200
+#endif
+#ifndef NP_RC_PUNCH_FOR_MS
+#  define NP_RC_PUNCH_FOR_MS  5000
+#endif
+#ifndef NP_RC_SETTLE_MS
+#  define NP_RC_SETTLE_MS     2000    /* after the last OPEN: an answer, or the TCP connection, may still come */
+#endif
+#ifndef NP_RC_GONE_MS
+#  define NP_RC_GONE_MS       120000  /* no room this long: the host stopped hosting */
+#endif
+#define NP_RC_SLOW_MS         5000    /* "slow down": the next try after this */
+#define NP_RC_CANDS           6
+/* This PC's address toward the endpoint (a test's virtual network replaces it). */
+#ifndef NP_PSNR_LOCAL_IP
+#  define NP_PSNR_LOCAL_IP(to, out) psnr_local_ip_toward(to, out)
+#endif
+
+static struct {
+    int       active;            /* a try is on: FOUND, KNOCK, COOKIE and OPENED are its */
+    uint64_t  room, open_nonce;  /* OPEN's nonce: the LOOKUP's in its top half (the host matches its INTRO) */
+    uint32_t  nonce;
+    uint8_t   ep[4];
+    uint16_t  ep_port;
+    int       found;
+    psnr_intro_pkt fpkt;
+    struct {
+        uint8_t  ip[4];
+        uint16_t port;
+        int      opens, open2s, has_cookie;
+        uint64_t cookie, next;
+    } c[NP_RC_CANDS];
+    int       nc;
+    int       opened;
+    uint32_t  sid;
+    uint8_t   op_ip[4];
+    uint16_t  op_port;
+    psnr_client* pend;           /* the session's client while it says HELLO */
+} s_rc;                          /* (LOCK) */
+static struct { uint8_t ip[4]; uint16_t port; } s_sess_to;   /* where the session's datagrams go */
+
+static int rc_room_code(void)
+{
+    const char* r = getenv("PSNR_ROOM");
+    return r && *r;
+}
+
+/* A candidate to open, once (LOCK). */
+static void rc_add(const uint8_t ip[4], uint16_t port)
+{
+    if (!port || !(ip[0] | ip[1] | ip[2] | ip[3])) return;
+    for (int i = 0; i < s_rc.nc; i++)
+        if (s_rc.c[i].port == port && !memcmp(s_rc.c[i].ip, ip, 4)) return;
+    if (s_rc.nc >= NP_RC_CANDS) return;
+    memset(&s_rc.c[s_rc.nc], 0, sizeof(s_rc.c[0]));
+    memcpy(s_rc.c[s_rc.nc].ip, ip, 4);
+    s_rc.c[s_rc.nc].port = port;
+    s_rc.nc++;
+}
+
+static int rc_cand(const uint8_t ip[4], uint16_t port)
+{
+    for (int i = 0; i < s_rc.nc; i++)
+        if (s_rc.c[i].port == port && !memcmp(s_rc.c[i].ip, ip, 4)) return i;
+    return -1;
+}
+
+/* From the P2P port's thread: 1 if the packet is a room code's join's or its session's (then it is taken). */
+static int rc_takes(const void* buf, uint32_t len, const uint8_t ip[4], uint16_t port)
+{
+    const int t = psnr_udp_type(buf, len);
+    if (t == PSNR_PKT_DATA || t == PSNR_PKT_CLOSE) {
+        uint8_t sip[4];
+        uint16_t sport = 0;
+        LOCK();
+        psnr_client* c = s_rc.pend ? s_rc.pend : psnr_is_session(s_client) ? s_client : NULL;
+        if (c) psnr_server_addr(c, sip, &sport);
+        if (c && sport == port && !memcmp(sip, ip, 4)) psnr_session_input(c, buf, len);
+        UNLOCK();
+        return 1;
+    }
+    if (t != PSNR_PKT_FOUND && t != PSNR_PKT_KNOCK && t != PSNR_PKT_COOKIE && t != PSNR_PKT_OPENED) return 0;
+    psnr_intro_pkt in;
+    if (!psnr_intro_read(buf, len, &in)) return 1;
+    LOCK();
+    if (!s_rc.active) { UNLOCK(); return 1; }   /* (the host's last knocks, after the join) */
+    switch (t) {
+    case PSNR_PKT_FOUND:
+        if (port == s_rc.ep_port && !memcmp(ip, s_rc.ep, 4) && in.nonce == s_rc.nonce && in.room == s_rc.room &&
+            !s_rc.found) {
+            s_rc.fpkt = in;
+            s_rc.found = 1;
+            if (in.status == PSNR_INTRO_OK)   /* (now: the host's KNOCKs may come right behind it) */
+                for (int i = 0; i < in.n; i++) rc_add(in.cands[i].ip, in.cands[i].port);
+        }
+        break;
+    case PSNR_PKT_KNOCK:   /* the host's: where its router sends from toward us, maybe a port no one gave */
+        if (in.room == s_rc.room && in.nonce == s_rc.nonce && s_rc.found && rc_cand(ip, port) < 0) {
+            rc_add(ip, port);
+            printf("[psnr] the host's game knocks from port %u: opening there too\n", port);
+        }
+        break;
+    case PSNR_PKT_COOKIE:
+        if (in.nonce64 == s_rc.open_nonce && s_rc.found) {
+            int i = rc_cand(ip, port);
+            if (i < 0) { rc_add(ip, port); i = rc_cand(ip, port); }
+            if (i >= 0 && !s_rc.c[i].has_cookie) {
+                s_rc.c[i].has_cookie = 1;
+                s_rc.c[i].cookie = in.cookie;
+                s_rc.c[i].next = 0;
+            }
+        }
+        break;
+    case PSNR_PKT_OPENED:
+        if (in.nonce64 == s_rc.open_nonce && in.session && !s_rc.opened && rc_cand(ip, port) >= 0) {
+            s_rc.opened = 1;
+            s_rc.sid = in.session;
+            memcpy(s_rc.op_ip, ip, 4);
+            s_rc.op_port = port;
+        }
+        break;
+    }
+    UNLOCK();
+    return 1;
+}
+
+static void rc_sess_send(void* ctx, const uint8_t* pkt, size_t len)
+{
+    (void)ctx;
+    if (s_p2p_send) s_p2p_send(pkt, (uint32_t)len, s_sess_to.ip, s_sess_to.port);
+}
+
+static uint32_t rc_random32(void)
+{
+    uint32_t v = 0;
+    while (!v) v = (uint32_t)psnr_intro_random();
+    return v;
+}
+
+/* Once the P2P port is open (the sender set): 1, else 0. */
+static int rc_p2p_ready(void)
+{
+    if (!s_p2p_send && s_p2p_opener) s_p2p_opener();
+    return s_p2p_send != NULL;
+}
+
+/* One try at the host's game with a room code. The client (past HELLO; a session's is still s_rc.pend, for the
+ * caller to move to s_client under LOCK), or NULL with *err and the state to show. */
+static psnr_client* rc_try(const char* comm, uint32_t* user, uint8_t ip[4], int* err, int* state)
+{
+    char host[256];
+    uint16_t port;
+    *err = 0;
+    server_addr(host, &port);
+    set_join_state(PSNR_JOIN_LOOKING);
+    if (!rc_p2p_ready()) {
+        printf("[psnr] the P2P port can't be opened: a room code can't be looked up\n");
+        *state = PSNR_JOIN_NO_WAY;
+        return NULL;
+    }
+    uint8_t ep[4], home[4] = {0};
+    if (psnr_resolve4(host, ep) != 0) {
+        *state = PSNR_JOIN_NO_SERVER;
+        return NULL;
+    }
+    NP_PSNR_LOCAL_IP(ep, home);
+    const char* home_knob = getenv("PSNR_ROOM_HOME");   /* (0: tests, no home address; np_psnr.h) */
+    if (home_knob && !strcmp(home_knob, "0")) memset(home, 0, 4);
+    const char* v = getenv("PSNR_VERSION");
+    const uint16_t version = (uint16_t)(v ? strtoul(v, NULL, 10) : 0);
+    const uint16_t p2p = np_psnr_p2p_port();
+    const psnr_cand own = psnr_cand_of(home, p2p);
+    LOCK();
+    memset(&s_rc, 0, sizeof(s_rc));
+    s_rc.room = strtoull(getenv("PSNR_ROOM"), NULL, 10);
+    s_rc.nonce = rc_random32();
+    s_rc.open_nonce = (uint64_t)s_rc.nonce << 32 | rc_random32();
+    memcpy(s_rc.ep, ep, 4);
+    s_rc.ep_port = port;
+    s_rc.active = 1;
+    const uint64_t room = s_rc.room;
+    const uint32_t nonce = s_rc.nonce;
+    const uint64_t open_nonce = s_rc.open_nonce;
+    UNLOCK();
+
+    /* LOOKUP until FOUND */
+    uint8_t pkt[PSNR_INTRO_REQ_LEN];
+    const int have_home = (home[0] | home[1] | home[2] | home[3]) != 0;
+    const size_t lk = psnr_intro_lookup(pkt, version, room, nonce, have_home ? &own : NULL);
+    int found = 0;
+    for (unsigned t = 0; t < NP_RC_LOOKUP_FOR_MS && !found; t += 20) {
+        if (t % NP_RC_LOOKUP_MS == 0) s_p2p_send(pkt, (uint32_t)lk, ep, port);
+        nap_ms(20);
+        LOCK();
+        found = s_rc.found;
+        UNLOCK();
+    }
+    psnr_intro_pkt f;
+    LOCK();
+    f = s_rc.fpkt;
+    if (!found || f.status != PSNR_INTRO_OK) s_rc.active = 0;
+    UNLOCK();
+    if (!found) { *state = PSNR_JOIN_NO_SERVER; return NULL; }
+    if (f.status != PSNR_INTRO_OK) {
+        *state = f.status == PSNR_INTRO_NO_ROOM ? PSNR_JOIN_NO_ROOM : f.status == PSNR_INTRO_VERSION
+                     ? PSNR_JOIN_OTHER_VERSION : PSNR_JOIN_SLOW;
+        return NULL;
+    }
+
+    /* OPEN to each candidate, and TCP to the room server, at the same time */
+    set_join_state(PSNR_JOIN_REACHING);
+    const int same = (f.flags & PSNR_INTRO_SAME_NETWORK) != 0;
+    psnr_dialer* d[3] = {NULL, NULL, NULL};
+    int nd = 0;
+    const char* tcp = getenv("PSNR_ROOM_TCP");   /* (0: tests, the UDP way only) */
+    if (!tcp || strcmp(tcp, "0")) {
+        /* TCP to the host as seen at the room server's port; to a candidate with that address (UPnP's) at its own
+         * port; on the same network, to the home address too */
+        uint8_t tip[3][4];
+        uint16_t tport[3];
+        for (int i = 0; i < f.n && nd < 3; i++) {
+            const psnr_cand* c = &f.cands[i];
+            if (i > 0 && memcmp(c->ip, f.cands[0].ip, 4) && !same) continue;
+            const uint16_t to = i == 0 ? f.room_port : c->port;
+            int dup = 0;
+            for (int k = 0; k < nd; k++) dup |= tport[k] == to && !memcmp(tip[k], c->ip, 4);
+            if (dup || !to || !(d[nd] = psnr_dial_start(c->ip, to))) continue;
+            memcpy(tip[nd], c->ip, 4);
+            tport[nd++] = to;
+        }
+    }
+    const uint64_t begin = nat_now_ms();
+    uint64_t start = begin;
+    int won = 0;   /* 1: the session, 2 + k: dialer k */
+    while (!won) {
+        const uint64_t now = nat_now_ms();
+        if (now - begin >= 2u * NP_RC_PUNCH_FOR_MS + NP_RC_SETTLE_MS) break;   /* (a TCP try can hang on for 21 s) */
+        int pending = 0;
+        LOCK();
+        for (int i = 0; i < s_rc.nc; i++) {
+            if (now < s_rc.c[i].next) { pending = 1; continue; }
+            if (s_rc.c[i].has_cookie && s_rc.c[i].open2s < 8) {
+                const size_t n = psnr_intro_open2(pkt, open_nonce, s_rc.c[i].cookie);
+                s_p2p_send(pkt, (uint32_t)n, s_rc.c[i].ip, s_rc.c[i].port);
+                s_rc.c[i].open2s++;
+                s_rc.c[i].next = now + 250;
+                pending = 1;
+            } else if (!s_rc.c[i].has_cookie && s_rc.c[i].opens < NP_RC_PUNCH_FOR_MS / NP_RC_OPEN_MS) {
+                const size_t n = psnr_intro_open(pkt, room, open_nonce);
+                s_p2p_send(pkt, (uint32_t)n, s_rc.c[i].ip, s_rc.c[i].port);
+                s_rc.c[i].opens++;
+                s_rc.c[i].next = now + NP_RC_OPEN_MS;
+                pending = 1;
+            }
+        }
+        if (s_rc.opened) won = 1;
+        UNLOCK();
+        for (int k = 0; k < nd && !won; k++) {
+            if (!d[k]) continue;
+            const int r = psnr_dial_poll(d[k]);
+            if (r > 0) won = 2 + k;
+            else if (r < 0) { psnr_dial_cancel(d[k]); d[k] = NULL; }
+            else pending = 1;
+        }
+        if (won) break;
+        if (pending) start = now;   /* (the settle time runs from the last thing sent or still pending) */
+        if (now - start >= NP_RC_SETTLE_MS) break;
+        nap_ms(20);
+    }
+    psnr_client* c = NULL;
+    if (won >= 2) {
+        c = psnr_dial_client(d[won - 2]);
+        d[won - 2] = NULL;
+    }
+    for (int k = 0; k < nd; k++) psnr_dial_cancel(d[k]);
+    LOCK();
+    s_rc.active = 0;
+    if (won == 1) {
+        memcpy(s_sess_to.ip, s_rc.op_ip, 4);
+        s_sess_to.port = s_rc.op_port;
+        psnr_rudp* sess = psnr_rudp_new(s_rc.sid, rc_sess_send, NULL, nat_now_ms());
+        if (sess) c = s_rc.pend = psnr_session_client(sess, s_rc.op_ip, s_rc.op_port, home);
+    }
+    UNLOCK();
+    if (!c) {
+        *state = PSNR_JOIN_NO_WAY;
+        return NULL;
+    }
+
+    /* HELLO on the one that opened */
+    uint8_t key[32];
+    const int keyed = hosted_key(key);
+    const int ok = psnr_hello(c, comm, np_psnr_online_id(), p2p, keyed ? key : NULL, user, ip) == 0;
+    memset(key, 0, sizeof(key));
+    if (!ok) {
+        *err = psnr_connect_error();
+        *state = *err == PSNR_E_REFUSED ? PSNR_JOIN_REFUSED : PSNR_JOIN_NO_WAY;
+        LOCK();
+        if (s_rc.pend == c) s_rc.pend = NULL;
+        UNLOCK();
+        psnr_close(c);
+        return NULL;
+    }
+    printf("[psnr] reached the host's game %s\n", won == 1 ? "over the punched UDP path" : "over TCP");
+    *state = PSNR_JOIN_CONNECTED;
+    return c;
+}
+
+/* One try at the host's game: a direct code's TCP connection and HELLO, or a room code's (rc_try). The client, or
+ * NULL with *err (as dial()'s) and the state to show. */
+static psnr_client* bg_try(const char* comm, uint32_t* user, uint8_t ip[4], int* err, int* state)
+{
+    char host[256];
+    uint16_t port;
+    int signed_in = 0;
+    if (rc_room_code()) return rc_try(comm, user, ip, err, state);
+    server_addr(host, &port);
+    set_join_state(PSNR_JOIN_REACHING);
+    psnr_client* c = dial(comm, host, port, user, ip, &signed_in, err);
+    *state = c ? PSNR_JOIN_CONNECTED : *err == PSNR_E_REFUSED ? PSNR_JOIN_REFUSED : PSNR_JOIN_UNREACHABLE;
+    return c;
+}
+
+/* Naps until ms have passed, the pump lost the connection, or the run went offline. */
+static void bg_nap(unsigned ms)
+{
+    for (unsigned t = 0; t < ms && !s_bg_lost && !ps3_net_locked_offline(); t += 50) nap_ms(50);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI bg_main(LPVOID arg)
+#else
+static void* bg_main(void* arg)
+#endif
+{
+    (void)arg;
+    char comm[sizeof(s_comm_id)];
+    LOCK();
+    memcpy(comm, s_comm_id, sizeof(comm));
+    UNLOCK();
+    int failed = 0, was_up = 0;
+    unsigned wait = 0;
+    uint64_t no_room_since = 0;
+    for (;;) {
+        bg_nap(wait);
+        if (ps3_net_locked_offline() || !np_psnr_enabled()) break;
+        LOCK();
+        const int up = s_client != NULL;
+        UNLOCK();
+        if (up) {   /* (connected: the pump looks after it, and says when it is lost) */
+            was_up = 1;
+            wait = 200;
+            LOCK();   /* a session's resends and keepalives: the title doesn't poll during every load */
+            if (psnr_is_session(s_client)) {
+                psnr_session_tick(s_client);
+                wait = 50;
+            }
+            UNLOCK();
+            continue;
+        }
+        if (was_up) {   /* lost after it was up: again in 2 s, then as after a failed try */
+            was_up = 0;
+            s_bg_lost = 0;
+            failed = 0;
+            wait = 2000;
+            set_join_state(PSNR_JOIN_REACHING);
+            continue;
+        }
+        uint32_t user = 0;
+        uint8_t ip[4] = {0};
+        int err = 0, state = 0;
+        psnr_client* c = bg_try(comm, &user, ip, &err, &state);
+        if (c) {
+            LOCK();
+            set_join_state(PSNR_JOIN_CONNECTED);   /* (before the client: whoever sees it connected sees this) */
+            if (s_rc.pend == c) s_rc.pend = NULL;
+            if (!s_client) {
+                s_client = c;
+                s_user_id = user;
+                s_conn++;
+                c = NULL;
+            }
+            UNLOCK();
+            if (c) psnr_close(c);
+            printf("[psnr] connected to the host's game as \"%s\" (%s), user %u%s\n", np_psnr_online_id(), comm, user,
+                   failed ? ", after trying again" : "");
+            failed = 0;
+            wait = 200;
+            continue;
+        }
+        if (state != PSNR_JOIN_NO_ROOM) no_room_since = 0;
+        else if (!no_room_since) no_room_since = nat_now_ms();
+        if (no_room_since && nat_now_ms() - no_room_since >= NP_RC_GONE_MS) state = PSNR_JOIN_GONE;
+        set_join_state(state);
+        if (state == PSNR_JOIN_REFUSED) {   /* the host's game has a new code: this one never comes right */
+            printf("[psnr] the host's game did not accept this invite code -- NP stays offline\n");
+            ps3_net_signin_post_notice("The host's game did not accept this invite code. Ask the host for it again.");
+            break;
+        }
+        if (state == PSNR_JOIN_OTHER_VERSION) {
+            printf("[psnr] the host's game is another version -- NP stays offline\n");
+            ps3_net_signin_post_notice("The host's game is another version. You both need the same version.");
+            break;
+        }
+        if (state == PSNR_JOIN_GONE) {
+            printf("[psnr] no game has hosted with this room code for %d s -- NP stays offline\n",
+                   NP_RC_GONE_MS / 1000);
+            ps3_net_signin_post_notice("No game is hosting with this code. Ask the host for its code again.");
+            break;
+        }
+        if (state == PSNR_JOIN_SLOW) {   /* the endpoint asks for a few seconds: not a failed try */
+            wait = NP_RC_SLOW_MS;
+            continue;
+        }
+        failed++;
+        wait = bg_wait_ms(failed);
+        if (failed == 1 || failed % 10 == 0)
+            printf("[psnr] the host's game wasn't reached (%s, try %d); trying again in %u s\n",
+                   state == PSNR_JOIN_NO_ROOM ? "no room with this number" : state == PSNR_JOIN_NO_SERVER
+                   ? "the endpoint doesn't answer" : state == PSNR_JOIN_NO_WAY ? "found, but nothing got through"
+                   : err ? "turned away for now" : "no answer", failed, (wait + 999u) / 1000u);
+    }
+    LOCK();
+    s_bg_running = 0;
+    UNLOCK();
+    return 0;
+}
+
+/* np_psnr_connect with PSNR_BACKGROUND: the thread, once a run (unless it stopped for good); 0, the context counts
+ * as started. */
+static int bg_start(const char* comm_id)
+{
+    LOCK();
+    if (s_client || s_bg_running || s_tried) {
+        UNLOCK();
+        return 0;
+    }
+    s_tried = 1;
+    snprintf(s_comm_id, sizeof(s_comm_id), "%s", comm_id);
+    set_join_state(PSNR_JOIN_REACHING);
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, bg_main, NULL, 0, NULL);
+    const int ok = th != NULL;
+    if (th) CloseHandle(th);
+#else
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    const int ok = pthread_create(&th, &at, bg_main, NULL) == 0;
+    pthread_attr_destroy(&at);
+#endif
+    s_bg_running = ok;
+    UNLOCK();
+    printf("[psnr] joining the host's game in the background\n");
+    return ok ? 0 : -1;
+}
+
 /* Under LOCK: a redial thread, unless one runs, PSNR_REDIAL=0, or there was
  * never a connection. 1 if one runs now. */
 static int redial_start(void)
 {
+    if (s_bg_running) {   /* a hosted join's own thread dials again */
+        s_bg_lost = 1;
+        return 1;
+    }
     if (s_redialing) return 1;
     if (!redial_on() || !s_comm_id[0]) return 0;
 #ifdef _WIN32

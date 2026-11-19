@@ -295,13 +295,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # A game one player hosts: the room server in the host's own process
-      # against the real client, and the invite code.
+      # against the real client, its introductions and UDP players, and the
+      # invite codes.
       - name: Run the hosted rooms test
         if: ${{ !cancelled() }}
         run: |
-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c ws2_32.lib
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c third_party/monocypher/monocypher.c ws2_32.lib
           if ($LASTEXITCODE -ne 0) { exit 1 }
           .\test_psnr_host.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The reliable layer over UDP for a punched path (loss, reordering,
+      # copies, large messages, keepalives) and the introductions' packets.
+      - name: Run the session layer test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_psnr_rudp.exe libs/network/tests/test_psnr_rudp.c third_party/monocypher/monocypher.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_psnr_rudp.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # A room code's join through simulated routers: the NAT matrix.
+      - name: Run the NAT matrix test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_psnr_punch.exe libs/network/tests/test_psnr_punch.c third_party/monocypher/monocypher.c ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_psnr_punch.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's

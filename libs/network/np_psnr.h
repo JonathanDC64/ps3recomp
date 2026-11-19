@@ -33,9 +33,33 @@ int np_psnr_enabled(void);
  * servers (cellHttp) can be reached. */
 int np_psnr_signed_in(void);
 
-/* Connect (once) as this title. 0 if connected, -1 if not. */
+/* Connect (once) as this title. 0 if connected, -1 if not. With PSNR_BACKGROUND
+ * (a game one player hosts, ps3emu/psnr_host.h) it connects on a thread of its
+ * own and returns 0 at once: the context counts as started, and requests that
+ * need the server fail with SERVER_NOT_AVAILABLE until np_psnr_connected(). */
 int np_psnr_connect(const char* comm_id);
 int np_psnr_connected(void);
+
+/* PSNR_BACKGROUND=1: a hosted join connects in the background (above). Only the
+ * port that hosts its games sets it; the runtime's other users keep the one
+ * try at the context start.
+ *
+ * A room code's join (seamless co-op without a port forward) is always in the
+ * background. The port sets:
+ *   PSNR_ROOM=n          the room number (decimal)
+ *   PSNR_SERVER=host[:port]  the endpoint that introduces the two games
+ *   PSNR_KEY             the key, as for a direct code (it never goes to the
+ *                        endpoint: the host checks it at HELLO)
+ *   PSNR_VERSION=n       the network version (another one is told so)
+ * Each try looks the room up from the P2P port (held open for it), then
+ * punches to the host's addresses and dials its room server at the same time;
+ * the first to open gets the HELLO. psnr_join_state (ps3emu/psnr_host.h) says
+ * how it goes. Two knobs for tests, so two games on one PC can go through
+ * simulated routers: PSNR_ROOM_TCP=0 leaves the dials out (the UDP way only,
+ * as through a router that lets no TCP in), and PSNR_ROOM_HOME=0 sends no
+ * home-network address (psnr_host's REGISTER reads it too), which would reach
+ * the other game straight past the routers. */
+int np_psnr_background(void);
 
 /* Which connection this is: one more at each dial that connects (a redial
  * too), 0 while there is none. Rooms last only as long as the connection
@@ -91,6 +115,12 @@ void np_psnr_pump(void);
 typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
                                    const uint8_t ip[4], uint16_t port);
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
+
+/* How np_psnr opens the P2P port itself and holds it open, which sysNet registers. A room-code join (PSNR_ROOM) looks
+ * up, punches and runs its session from that port before the title binds a P2P socket, and on after the title closes
+ * its last one. The function returns 0 when the port is open (the sender above is then set). */
+typedef int (*np_psnr_p2p_open_fn)(void);
+void np_psnr_set_p2p_opener(np_psnr_p2p_open_fn fn);
 
 /* A datagram that arrived on the P2P socket from from_ip:from_port. 1: it was
  * psnr's own (a probe reply, a peer's punch) -- drop it. 0: it's the title's.

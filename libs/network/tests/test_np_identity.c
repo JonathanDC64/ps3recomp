@@ -5,6 +5,8 @@
  *   cc -std=gnu17 -I include -I third_party/mbedtls/include -o test_np_identity libs/network/tests/test_np_identity.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
  */
 #include "../psnr/psnr.c"
+#include "../psnr/psnr_rudp.c"
+#include "../psnr/psnr_intro.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"

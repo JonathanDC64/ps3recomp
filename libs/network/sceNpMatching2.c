@@ -895,9 +895,17 @@ s32 sceNpMatching2RegisterLobbyMessageCallback(u16 ctxId, u32 cb, u32 arg)
     if (!c->started || !np_psnr_connected())                                \
         return (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE;
 
+/* The answers made here, with no server: a hosted join that connects in the background (np_psnr_background) has a
+ * started context before its connection is up, and the title asks for these first. */
+#define REQUIRE_STARTED_LOCAL(c, ctxId)                                     \
+    m2_ctx* c = ctx_get(ctxId);                                             \
+    if (!c) return (s32)SCE_NP_MATCHING2_ERROR_CONTEXT_NOT_FOUND;           \
+    if (!c->started || (!np_psnr_connected() && !np_psnr_background()))     \
+        return (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE;
+
 s32 sceNpMatching2GetServerIdListLocal(u16 ctxId, u32 serverId, u32 maxNum)
 {
-    REQUIRE_STARTED(c, ctxId);
+    REQUIRE_STARTED_LOCAL(c, ctxId);
     if (serverId && maxNum) vm_write16(serverId, SERVER_ID);
     return 1;   /* the number of servers */
 }
@@ -905,7 +913,7 @@ s32 sceNpMatching2GetServerIdListLocal(u16 ctxId, u32 serverId, u32 maxNum)
 /* request { u16 serverId } -> SceNpMatching2GetServerInfoResponse { u16 serverId; u8 status; u8 pad } */
 s32 sceNpMatching2GetServerInfo(u16 ctxId, u32 req, u32 opt, u32 reqId)
 {
-    REQUIRE_STARTED(c, ctxId);
+    REQUIRE_STARTED_LOCAL(c, ctxId);
     (void)req;
     rb_t img = {0};
     u32 o = rb_alloc(&img, 4, 4);
@@ -916,14 +924,14 @@ s32 sceNpMatching2GetServerInfo(u16 ctxId, u32 req, u32 opt, u32 reqId)
 
 s32 sceNpMatching2CreateServerContext(u16 ctxId, u32 req, u32 opt, u32 reqId)
 {
-    REQUIRE_STARTED(c, ctxId);
+    REQUIRE_STARTED_LOCAL(c, ctxId);
     (void)req;
     return answer_now(op_new(c, ctxId, EV_CreateServerContext, opt, reqId), 0, NULL);
 }
 
 s32 sceNpMatching2DeleteServerContext(u16 ctxId, u32 req, u32 opt, u32 reqId)
 {
-    REQUIRE_STARTED(c, ctxId);
+    REQUIRE_STARTED_LOCAL(c, ctxId);
     (void)req;
     return answer_now(op_new(c, ctxId, EV_DeleteServerContext, opt, reqId), 0, NULL);
 }
@@ -933,7 +941,7 @@ s32 sceNpMatching2DeleteServerContext(u16 ctxId, u32 req, u32 opt, u32 reqId)
  *   curNumOfRoom, curNumOfTotalRoomMember, withEntitlementId u8 + pad, entitlementId[32]) */
 s32 sceNpMatching2GetWorldInfoList(u16 ctxId, u32 req, u32 opt, u32 reqId)
 {
-    REQUIRE_STARTED(c, ctxId);
+    REQUIRE_STARTED_LOCAL(c, ctxId);
     (void)req;
     rb_t img = {0};
     u32 o = rb_alloc(&img, 8, 4);

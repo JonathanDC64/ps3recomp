@@ -46,6 +46,8 @@ static uint32_t s_conn_now = 1;   /* np_psnr_connection: 0 while there is none *
 int np_psnr_enabled(void) { return 1; }
 int np_psnr_connect(const char* comm_id) { (void)comm_id; return 0; }
 int np_psnr_connected(void) { return s_conn_now != 0; }
+static int s_background;          /* np_psnr_background: a hosted join that connects in the background */
+int np_psnr_background(void) { return s_background; }
 uint32_t np_psnr_connection(void) { return s_conn_now; }
 uint32_t np_psnr_request(uint8_t type, const void* body, uint32_t len, np_psnr_reply_fn fn, void* user)
 {
@@ -244,6 +246,22 @@ int main(void)
     s_type = 0;
     assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
     assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 9 && s_ctx[ctx].room.in);
+
+    /* No connection: the local answers fail, as before... */
+    s_conn_now = 0;
+    assert(sceNpMatching2GetServerIdListLocal(ctx, REQ, 1) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+    assert(sceNpMatching2GetWorldInfoList(ctx, REQ, OPT, REQID) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+    /* ...unless a hosted join connects in the background: then they are answered (a started context before its
+     * connection), and what needs the server still waits for it. */
+    s_background = 1;
+    assert(sceNpMatching2GetServerIdListLocal(ctx, REQ, 1) == 1 && vm_read16(REQ) == SERVER_ID);
+    s_cb_opd = 0;
+    assert(sceNpMatching2GetWorldInfoList(ctx, REQ, OPT, REQID) == 0 && s_cb_opd == 0xCB00 && s_cb[2] == 0x0002);
+    assert(sceNpMatching2GetServerInfo(ctx, REQ, OPT, REQID) == 0);
+    vm_write64(REQ, 9);
+    s_ctx[ctx].room.in = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+    s_background = 0;
 
     printf("test_np_matching2: all passed\n");
     return 0;

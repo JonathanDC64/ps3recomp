@@ -216,11 +216,25 @@ jobs:
           /tmp/test_np_identity
 
       # A game one player hosts: the room server in the host's own process
-      # against the real client, and the invite code.
+      # against the real client, its introductions and UDP players, and the
+      # invite codes.
       - name: Run the hosted rooms test
         run: |
-          clang -std=gnu17 -I include -o /tmp/test_psnr_host libs/network/tests/test_psnr_host.c -lpthread
+          clang -std=gnu17 -I include -o /tmp/test_psnr_host libs/network/tests/test_psnr_host.c third_party/monocypher/monocypher.c -lpthread
           /tmp/test_psnr_host
+
+      # The reliable layer over UDP for a punched path (loss, reordering,
+      # copies, large messages, keepalives) and the introductions' packets.
+      - name: Run the session layer test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_psnr_rudp libs/network/tests/test_psnr_rudp.c third_party/monocypher/monocypher.c
+          /tmp/test_psnr_rudp
+
+      # A room code's join through simulated routers: the NAT matrix.
+      - name: Run the NAT matrix test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_psnr_punch libs/network/tests/test_psnr_punch.c third_party/monocypher/monocypher.c -lpthread
+          /tmp/test_psnr_punch
 
       # NAT traversal: probing psnr from the P2P socket, dropping psnr's
       # packets before the title sees them, punching toward peers.
