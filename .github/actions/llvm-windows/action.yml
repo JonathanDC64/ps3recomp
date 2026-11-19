@@ -1,0 +1,66 @@
+# LLVM 22.1.8 for the jobs that compile C++ with clang-cl on Windows (windows.yml, des-release.yml, release.yml):
+# LLVM's own Windows archive (llvmorg-22.1.8), checked by its size and SHA-256, cached, and its bin folder put first
+# on the path. The job then finds clang-cl, lld-link, llvm-lib, llvm-mt and clang-scan-deps there, all of one
+# version.
+#
+# Why not the runner's own: windows-latest's clang-cl is 20.1.8, and from the windows-2025-vs2026 image of
+# 2026-11-16 on, MSVC 14.52's C++ library refuses it ("error STL1000: Unexpected compiler version, expected Clang 22
+# or newer"). A newer LLVM goes in by changing the version, the size and the SHA-256 below together, and the
+# cache key with them.
+#
+# Only what a build runs comes out of the archive: those five programs (clang-cl beside clang, lld-link beside lld,
+# llvm-lib beside llvm-ar) and clang's own headers and libraries. A pattern with no match is only reported; the check
+# after it says what is missing. Call it after ilammy/msvc-dev-cmd: that step puts the runner's LLVM on the path too.
+name: LLVM 22.1.8 (Windows)
+description: LLVM's own 22.1.8 for Windows, checked, cached and first on the path
+
+runs:
+  using: composite
+  steps:
+    - name: Restore LLVM
+      id: llvm-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ github.workspace }}/.ci-cache/llvm-win
+        key: windows-llvm-d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234-v1
+
+    - name: Download LLVM 22.1.8
+      if: steps.llvm-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        LLVM_ARCHIVE: clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz
+        LLVM_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz
+        LLVM_SIZE: '862053924'
+        LLVM_SHA256: d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234
+      run: |
+        dir="$(cygpath -u "$GITHUB_WORKSPACE")/.ci-cache/llvm-win"
+        cd "$(cygpath -u "$RUNNER_TEMP")"
+        curl -fsSL --retry 5 --retry-all-errors -o llvm.tar.xz "$LLVM_URL"
+        [ "$(stat -c %s llvm.tar.xz)" = "$LLVM_SIZE" ] || { echo "::error::llvm.tar.xz has the wrong size"; exit 1; }
+        echo "$LLVM_SHA256  llvm.tar.xz" | sha256sum -c -
+        mkdir -p "$dir"
+        top="${LLVM_ARCHIVE%.tar.xz}"
+        tar -xJf llvm.tar.xz -C "$dir" --strip-components=1 --wildcards \
+          "$top/bin/clang.exe" "$top/bin/clang-cl.exe" "$top/bin/lld.exe" "$top/bin/lld-link.exe" \
+          "$top/bin/llvm-ar.exe" "$top/bin/llvm-lib.exe" "$top/bin/llvm-mt.exe" "$top/bin/clang-scan-deps.exe" \
+          "$top/lib/clang/*" || echo "tar: some patterns had no match (exit $?)"
+        rm llvm.tar.xz
+        ls -l "$dir/bin"
+        for f in clang-cl lld-link llvm-lib llvm-mt clang-scan-deps; do
+          [ -s "$dir/bin/$f.exe" ] || { echo "::error::LLVM's archive gave no bin/$f.exe"; exit 1; }
+        done
+        ls "$dir"/lib/clang/22/include/immintrin.h || { echo "::error::no clang headers in LLVM's archive"; exit 1; }
+
+    - name: Save LLVM
+      if: steps.llvm-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ github.workspace }}/.ci-cache/llvm-win
+        key: ${{ steps.llvm-cache.outputs.cache-primary-key }}
+
+    - name: LLVM 22.1.8 first on the path
+      shell: bash
+      run: |
+        bin="$(cygpath -u "$GITHUB_WORKSPACE")/.ci-cache/llvm-win/bin"
+        "$bin/clang-cl.exe" --version
+        cygpath -w "$bin" >> "$GITHUB_PATH"
