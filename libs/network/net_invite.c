@@ -116,3 +116,81 @@ void net_invite_key_hex(uint32_t key, char out[65])
     net_invite_key_blob(key, b);
     for (int i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", b[i]);
 }
+
+/* ---- Room codes ---- */
+
+static void put_bits(uint8_t* b, int at, int n, uint64_t v)
+{
+    for (int i = 0; i < n; i++)
+        if (v >> (n - 1 - i) & 1) b[(at + i) / 8] = (uint8_t)(b[(at + i) / 8] | 0x80 >> ((at + i) % 8));
+}
+
+static uint64_t get_bits(const uint8_t* b, int at, int n)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < n; i++) v = v << 1 | (uint64_t)(b[(at + i) / 8] >> (7 - (at + i) % 8) & 1);
+    return v;
+}
+
+/* the 7-bit check over the room and the key (FNV-1a over "R", the room's 5 bytes and the key's 4, folded) */
+static unsigned room_check(uint64_t room, uint32_t key)
+{
+    uint8_t b[10];
+    b[0] = 'R';
+    for (int i = 0; i < 5; i++) b[1 + i] = (uint8_t)(room >> (32 - 8 * i));
+    for (int i = 0; i < 4; i++) b[6 + i] = (uint8_t)(key >> (24 - 8 * i));
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 10; i++) h = (h ^ b[i]) * 16777619u;
+    return (h ^ (h >> 7) ^ (h >> 14) ^ (h >> 21) ^ (h >> 28)) & 0x7Fu;
+}
+
+void net_room_encode(const net_room_code* in, char out[NET_ROOM_TEXT])
+{
+    const uint64_t room = in->room & NET_ROOM_MASK;
+    const uint32_t key = in->key & NET_INVITE_KEY_MASK;
+    uint8_t b[10] = {0};
+    put_bits(b, 0, 40, room);
+    put_bits(b, 40, 28, key);
+    put_bits(b, 68, 7, room_check(room, key));
+    int o = 0;
+    for (int i = 0; i < 15; i++) {
+        if (i && i % 5 == 0) out[o++] = '-';
+        out[o++] = kAlphabet[get_bits(b, i * 5, 5)];
+    }
+    out[o] = 0;
+}
+
+/* The code characters of a text into 5-bit values: how many (-1 for a character that isn't one). */
+static int code_symbols(const char* text, int vals[17])
+{
+    int n = 0;
+    for (const char* p = text; p && *p; p++) {
+        if (*p == '-' || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') continue;
+        const int v = symbol(*p);
+        if (v < 0) return -1;
+        if (n < 17) vals[n] = v;
+        n++;
+    }
+    return n;
+}
+
+int net_room_decode(const char* text, net_room_code* out)
+{
+    int v[17];
+    if (code_symbols(text, v) != 15) return NET_INVITE_NOT_A_CODE;
+    uint8_t b[10] = {0};
+    for (int i = 0; i < 15; i++) put_bits(b, i * 5, 5, (uint64_t)v[i]);
+    const uint64_t room = get_bits(b, 0, 40);
+    const uint32_t key = (uint32_t)get_bits(b, 40, 28);
+    if (get_bits(b, 68, 7) != room_check(room, key) || !room) return NET_INVITE_TYPO;
+    out->room = room;
+    out->key = key;
+    return 0;
+}
+
+int net_code_kind(const char* text)
+{
+    int v[17];
+    const int n = code_symbols(text, v);
+    return n == 15 ? NET_CODE_ROOM : n == 16 ? NET_CODE_DIRECT : NET_CODE_NONE;
+}

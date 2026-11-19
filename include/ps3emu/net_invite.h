@@ -13,6 +13,11 @@
  * turns away a HELLO without it (and, after a few wrong ones, the address).
  *
  * The code carries the host's address: it is for friends, not for posting.
+ *
+ * A room code (seamless co-op without a port forward) names a room the host registered with the endpoint, and the
+ * same kind of key, in 15 characters shown in groups of five: "7KQ2M-9XD0R-TB4HW". Its 75 bits: room number (40) |
+ * key (28) | check (7): about 1 typo in 128 gets through. The endpoint gives anyone with the room number the host's
+ * address (the key stays between the two games), so a room code is for friends too.
  */
 #ifndef PS3EMU_NET_INVITE_H
 #define PS3EMU_NET_INVITE_H
@@ -46,6 +51,26 @@ uint32_t net_invite_new_key(void);
  * (np_psnr.c). */
 void net_invite_key_blob(uint32_t key, uint8_t out[32]);
 void net_invite_key_hex(uint32_t key, char out[65]);
+
+/* ---- Room codes ---- */
+#define NET_ROOM_TEXT 18   /* "XXXXX-XXXXX-XXXXX" and its NUL */
+#define NET_ROOM_MASK 0xFFFFFFFFFFull   /* 40 bits */
+
+typedef struct {
+    uint64_t room;   /* 40 bits, never 0 */
+    uint32_t key;    /* 28 bits */
+} net_room_code;
+
+void net_room_encode(const net_room_code* in, char out[NET_ROOM_TEXT]);
+/* 0, or NET_INVITE_NOT_A_CODE (not 15 code characters) or NET_INVITE_TYPO (the check doesn't match). */
+int  net_room_decode(const char* text, net_room_code* out);
+
+/* Which kind of code a text holds, by its number of code characters (dashes and spaces don't count): 15 a room code,
+ * 16 a direct code, anything else none. */
+#define NET_CODE_NONE   0
+#define NET_CODE_ROOM   1
+#define NET_CODE_DIRECT 2
+int  net_code_kind(const char* text);
 
 #ifdef __cplusplus
 }

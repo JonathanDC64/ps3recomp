@@ -3,7 +3,7 @@
  * real client (psnr/psnr.c) on loopback: the key, rooms, pushes, the probe,
  * the relay, a reconnect and the ban; a spent key, a new key and connections
  * that never say HELLO; the introductions and a player over a punched UDP session (a socket of this test plays the
- * endpoint, another the friend's P2P port); and the invite code (net_invite.c).
+ * endpoint, another the friend's P2P port); and the invite codes, direct and room (net_invite.c).
  *
  *   clang-cl /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c
  *            third_party/monocypher/monocypher.c ws2_32.lib
@@ -153,6 +153,83 @@ static void test_invite(void)
     CHECK(strlen(hex) == 64);
     char two[3] = { hex[0], hex[1], 0 };
     CHECK(strtoul(two, NULL, 16) == blob[0]);
+}
+
+/* Room codes: both ways, the reading rules, typos, and telling them from direct codes. */
+static void test_room_code(void)
+{
+    net_room_code in = { 0xA5C3E1F0B7ull, 0x0ABCDEF }, out;
+    char code[NET_ROOM_TEXT];
+    net_room_encode(&in, code);
+    printf("room code: %s\n", code);
+    CHECK(strlen(code) == 17 && code[5] == '-' && code[11] == '-');
+    for (const char* p = code; *p; p++) CHECK(!strchr("ILOU", *p));
+    memset(&out, 0, sizeof out);
+    CHECK(net_room_decode(code, &out) == 0 && out.room == in.room && out.key == in.key);
+    for (int i = 0; i < 200; i++) {   /* any room and key */
+        net_room_code r = { ((uint64_t)net_invite_new_key() << 12 ^ net_invite_new_key()) & NET_ROOM_MASK,
+                            net_invite_new_key() };
+        if (!r.room) r.room = 1;
+        char t[NET_ROOM_TEXT];
+        net_room_encode(&r, t);
+        CHECK(net_room_decode(t, &out) == 0 && out.room == r.room && out.key == r.key);
+    }
+    /* lower case, other dashes and spaces, O for 0 and l for 1 */
+    char loose[40];
+    int n = 0;
+    for (const char* p = code; *p; p++) {
+        if (*p == '-') { loose[n++] = ' '; continue; }
+        const char ch = *p == '0' ? 'O' : *p == '1' ? 'l' : *p;
+        loose[n++] = (char)(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+    }
+    loose[n] = 0;
+    CHECK(net_room_decode(loose, &out) == 0 && out.room == in.room);
+    /* one character changed: 7 check bits catch nearly all */
+    int caught = 0, tries = 0;
+    for (int i = 0; i < 17; i++) {
+        if (code[i] == '-') continue;
+        for (const char* a = kAlphabet; *a; a++) {
+            if (*a == code[i]) continue;
+            char t[NET_ROOM_TEXT];
+            memcpy(t, code, sizeof t);
+            t[i] = *a;
+            tries++;
+            caught += net_room_decode(t, &out) == NET_INVITE_TYPO;
+        }
+    }
+    printf("room code: one-character typos caught: %d of %d\n", caught, tries);
+    CHECK(caught * 100 >= tries * 97);
+    /* two characters swapped */
+    caught = tries = 0;
+    for (int i = 0; i + 1 < 17; i++) {
+        if (code[i] == '-' || code[i + 1] == '-' || code[i] == code[i + 1]) continue;
+        char t[NET_ROOM_TEXT];
+        memcpy(t, code, sizeof t);
+        t[i] = code[i + 1];
+        t[i + 1] = code[i];
+        tries++;
+        caught += net_room_decode(t, &out) == NET_INVITE_TYPO;
+    }
+    CHECK(caught * 100 >= tries * 90);
+    /* the two kinds */
+    net_invite di = { {203, 0, 113, 7}, 36100, 0x0ABCDEF };
+    char direct[NET_INVITE_TEXT];
+    net_invite_encode(&di, direct);
+    CHECK(net_code_kind(code) == NET_CODE_ROOM && net_code_kind(direct) == NET_CODE_DIRECT);
+    CHECK(net_code_kind(loose) == NET_CODE_ROOM && net_code_kind("7KQ2M-9XD0R") == NET_CODE_NONE);
+    CHECK(net_code_kind("7KQ2M-9XD0R-TB4HU") == NET_CODE_NONE && net_code_kind("") == NET_CODE_NONE);
+    CHECK(net_room_decode(direct, &out) == NET_INVITE_NOT_A_CODE);
+    CHECK(net_invite_decode(code, &di) == NET_INVITE_NOT_A_CODE);
+    {   /* room 0 is no room */
+        uint8_t b[10] = {0};
+        put_bits(b, 40, 28, 5);
+        put_bits(b, 68, 7, room_check(0, 5));
+        char t[NET_ROOM_TEXT];
+        int o = 0;
+        for (int i = 0; i < 15; i++) t[o++] = kAlphabet[get_bits(b, i * 5, 5)];
+        t[o] = 0;
+        CHECK(net_room_decode(t, &out) == NET_INVITE_TYPO);
+    }
 }
 
 /* Another release of the same game (same_game): its player finds and joins the room; a third game's doesn't. */
@@ -769,6 +846,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     test_invite();
+    test_room_code();
     test_same_game();
     test_keys();
     test_full();
