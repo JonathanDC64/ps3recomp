@@ -42,7 +42,19 @@ int np_psnr_connected(void);
 
 /* PSNR_BACKGROUND=1: a hosted join connects in the background (above). Only the
  * port that hosts its games sets it; the runtime's other users keep the one
- * try at the context start. */
+ * try at the context start.
+ *
+ * A room code's join (seamless co-op without a port forward) is always in the
+ * background. The port sets:
+ *   PSNR_ROOM=n          the room number (decimal)
+ *   PSNR_SERVER=host[:port]  the endpoint that introduces the two games
+ *   PSNR_KEY             the key, as for a direct code (it never goes to the
+ *                        endpoint: the host checks it at HELLO)
+ *   PSNR_VERSION=n       the network version (another one is told so)
+ * Each try looks the room up from the P2P port (held open for it), then
+ * punches to the host's addresses and dials its room server at the same time;
+ * the first to open gets the HELLO. psnr_join_state (ps3emu/psnr_host.h) says
+ * how it goes. */
 int np_psnr_background(void);
 
 /* Which connection this is: one more at each dial that connects (a redial

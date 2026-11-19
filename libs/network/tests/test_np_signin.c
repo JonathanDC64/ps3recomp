@@ -10,6 +10,7 @@
  */
 #include "../psnr/psnr.c"
 #include "../psnr/psnr_rudp.c"
+#include "../psnr/psnr_intro.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"

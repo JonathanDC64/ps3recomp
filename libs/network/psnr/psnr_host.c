@@ -73,8 +73,9 @@
 
 /* Every datagram out of the room server's UDP socket goes through this (a test's virtual network replaces it). */
 #ifndef PH_SENDTO
-#  define PH_SENDTO(h, buf, len, to) \
-      ((void)sendto((h)->udp, (const char*)(buf), (int)(len), 0, (const struct sockaddr*)(to), (ph_socklen)sizeof *(to)))
+#  define PH_SENDTO(h, buf, len, to)                                                               \
+      ((void)sendto((h)->udp, (const char*)(buf), (int)(len), 0, (const struct sockaddr*)(to),   \
+                    (ph_socklen)sizeof *(to)))
 #endif
 
 #define PH_CLIENTS     12      /* 4 players, plus reconnects still closing */
@@ -1332,7 +1333,10 @@ static void* ph_main(void* arg)
                 psnr_rudp_tick(c->sess, now);
                 const int dead = psnr_rudp_dead(c->sess, now);
                 if (dead != PSNR_RUDP_ALIVE) {
-                    if (c->hello) printf("[psnr_host] player %u's session is over (%d)\n", c->id, dead);
+                    if (c->hello && dead != PSNR_RUDP_CLOSED)   /* (closed: the friend said bye) */
+                        printf("[psnr_host] player %u's session is over (%s)\n", c->id,
+                               dead == PSNR_RUDP_SILENT ? "nothing heard for 30 s" : dead == PSNR_RUDP_UNACKED
+                               ? "nothing acknowledged for 20 s" : "a broken stream");
                     c->closing = 2;
                 }
                 if (c->closing == 1 && !c->closing_at) c->closing_at = now;
