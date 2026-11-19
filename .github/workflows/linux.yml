@@ -657,6 +657,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I libs/input -o /tmp/test_pad_stick libs/input/tests/test_pad_stick.c -lm
           /tmp/test_pad_stick
 
+      # PAD_MAP's rules (pad_map.h): several host buttons for one of the game's, "none", and the buttons some pads
+      # have beyond the PS3's (paddles, misc, touchpad).
+      - name: Run the button mapping test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I libs/input -o /tmp/test_pad_map libs/input/tests/test_pad_map.c
+          /tmp/test_pad_map
+
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
       # and attribute slots the Metal backend binds to. The binary missing
