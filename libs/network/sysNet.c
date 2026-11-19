@@ -395,6 +395,7 @@ static uint16_t      s_p2p_bound_port;                  /* its port, host order 
 static volatile int  s_p2p_gen;                         /* bumped when it closes: its thread stops */
 static int           s_p2p_dgram = -1;                  /* the first DGRAM_P2P bound: headerless datagrams */
 static int           s_p2p_hold;                        /* np_psnr holds it open: the title's closes leave it */
+static int           s_p2p_quiet;                       /* (a failed open that is tried again says nothing) */
 #ifdef _WIN32
 static SRWLOCK s_p2p_lock = SRWLOCK_INIT;
 #  define P2P_LOCK()   AcquireSRWLockExclusive(&s_p2p_lock)
@@ -540,8 +541,9 @@ static int32_t p2p_open_port(void)
         /* The title's bind fails with it, and a game then gives up on its
          * session (Demon's Souls: "Failed to create the session."). Said each
          * time, so a report shows why: usually another program on the port. */
-        printf("[sys_net] P2P port %u (UDP) can't be opened (error %d): its sessions fail\n",
-               np_psnr_p2p_port(), e);
+        if (!s_p2p_quiet)
+            printf("[sys_net] P2P port %u (UDP) can't be opened (error %d): its sessions fail\n",
+                   np_psnr_p2p_port(), e);
         return r;
     }
     s_p2p_fd = fd;
@@ -562,11 +564,20 @@ static int32_t p2p_open_port(void)
  * title binds a P2P socket, and its session lives on after the title closes the last one. */
 static int p2p_hold(void)
 {
-    P2P_LOCK();
-    const int was = s_p2p_hold;
-    const int32_t r = p2p_open_port();
-    if (r == 0) s_p2p_hold = 1;
-    P2P_UNLOCK();
+    int was = 0;
+    int32_t r = -1;
+    /* A port the title closed a moment ago can still be bound for up to 250 ms: its thread's poll holds the socket
+     * until it returns. So a few tries, the last one saying why it failed. */
+    for (int tries = 0; tries < 4 && r != 0; tries++) {
+        if (tries) sleep_ms(100);
+        P2P_LOCK();
+        was = s_p2p_hold;
+        s_p2p_quiet = tries < 3;
+        r = p2p_open_port();
+        s_p2p_quiet = 0;
+        if (r == 0) s_p2p_hold = 1;
+        P2P_UNLOCK();
+    }
     if (r == 0 && !was) printf("[sys_net] P2P port %u held open for a room-code join\n", np_psnr_p2p_port());
     return r == 0 ? 0 : -1;
 }
