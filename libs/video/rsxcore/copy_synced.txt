@@ -13,3 +13,4 @@ d5f78243d3e72ddf570a03dbc2f55dfb51192185 ported #215: copy-once (the table and p
 948c603924d043c0ed0c236dfe96712098a9e54f ported #288: ZPASS counts scaled at any scale other than 1 (zq_finish in rsxc_zpass), in the same pull request
 b0ad491abfec5a98cbd93ce6d54bde423ceb86ce ported #293: below 100%, clamped draws read their mipmapped textures at the 1x level of detail (dr_lod_pct and samp_key_lod, the key and sampler in vp_sampler_table_key, the RSX_SAMP_SAME memo in rsxc_targets.inc), in the same pull request
 04184931b20faa9e4d3dca44e31784f9521fd7b7 ported #305: the clamp's least margin for art drawn larger than 1:1 (fp_inject_uvclamp in rsxc_shader and rsxc_fp, uvclamp_margin in rsxc_targets, redone per unit in rsxc_frame), in the same pull request
+b46cb5f5d39969977e675dcd2d55319c95eadbbb ported #305: the merge of 04184931 (above), ported in the same pull request
