@@ -98,7 +98,8 @@ typedef struct {
     uint16_t upnp_port;
 } psnr_host_intro;
 
-/* Starts (or changes) the registering; an endpoint of 0.0.0.0 unregisters and stops. */
+/* Starts (or changes) the registering; an endpoint of 0.0.0.0 unregisters and stops. PSNR_ROOM_HOME=0 (tests:
+ * np_psnr.h) leaves home_ip out. */
 void     psnr_host_set_intro(psnr_host* h, const psnr_host_intro* in);
 /* The room number now (never 0). It changes on psnr_host_new_room, and when the endpoint says another owner has it. */
 uint64_t psnr_host_room(psnr_host* h);

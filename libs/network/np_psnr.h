@@ -54,7 +54,11 @@ int np_psnr_connected(void);
  * Each try looks the room up from the P2P port (held open for it), then
  * punches to the host's addresses and dials its room server at the same time;
  * the first to open gets the HELLO. psnr_join_state (ps3emu/psnr_host.h) says
- * how it goes. */
+ * how it goes. Two knobs for tests, so two games on one PC can go through
+ * simulated routers: PSNR_ROOM_TCP=0 leaves the dials out (the UDP way only,
+ * as through a router that lets no TCP in), and PSNR_ROOM_HOME=0 sends no
+ * home-network address (psnr_host's REGISTER reads it too), which would reach
+ * the other game straight past the routers. */
 int np_psnr_background(void);
 
 /* Which connection this is: one more at each dial that connects (a redial

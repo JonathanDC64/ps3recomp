@@ -1534,6 +1534,8 @@ void psnr_host_set_intro(psnr_host* h, const psnr_host_intro* in)
     const int moved = memcmp(h->intro.ip, in->ip, 4) || h->intro.port != in->port;
     if (moved) ph_unregister(h);   /* (from the endpoint it had) */
     h->intro = *in;
+    const char* home = getenv("PSNR_ROOM_HOME");   /* (0: tests, no home address; np_psnr.h) */
+    if (home && !strcmp(home, "0")) memset(h->intro.home_ip, 0, 4);
     if (!ph_endpoint_set(h)) {
         h->reg_state = PSNR_HOST_INTRO_OFF;
     } else if (moved || h->reg_state == PSNR_HOST_INTRO_OFF) {

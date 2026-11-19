@@ -1009,6 +1009,8 @@ static psnr_client* rc_try(const char* comm, uint32_t* user, uint8_t ip[4], int*
         return NULL;
     }
     NP_PSNR_LOCAL_IP(ep, home);
+    const char* home_knob = getenv("PSNR_ROOM_HOME");   /* (0: tests, no home address; np_psnr.h) */
+    if (home_knob && !strcmp(home_knob, "0")) memset(home, 0, 4);
     const char* v = getenv("PSNR_VERSION");
     const uint16_t version = (uint16_t)(v ? strtoul(v, NULL, 10) : 0);
     const uint16_t p2p = np_psnr_p2p_port();
@@ -1055,7 +1057,9 @@ static psnr_client* rc_try(const char* comm, uint32_t* user, uint8_t ip[4], int*
     const int same = (f.flags & PSNR_INTRO_SAME_NETWORK) != 0;
     psnr_dialer* d[3] = {NULL, NULL, NULL};
     int nd = 0;
-    {   /* TCP to the host as seen at the room server's port; to a candidate with that address (UPnP's) at its own
+    const char* tcp = getenv("PSNR_ROOM_TCP");   /* (0: tests, the UDP way only) */
+    if (!tcp || strcmp(tcp, "0")) {
+        /* TCP to the host as seen at the room server's port; to a candidate with that address (UPnP's) at its own
          * port; on the same network, to the home address too */
         uint8_t tip[3][4];
         uint16_t tport[3];
