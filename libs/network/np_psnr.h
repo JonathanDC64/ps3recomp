@@ -100,6 +100,12 @@ typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
                                    const uint8_t ip[4], uint16_t port);
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
 
+/* How np_psnr opens the P2P port itself and holds it open, which sysNet registers. A room-code join (PSNR_ROOM) looks
+ * up, punches and runs its session from that port before the title binds a P2P socket, and on after the title closes
+ * its last one. The function returns 0 when the port is open (the sender above is then set). */
+typedef int (*np_psnr_p2p_open_fn)(void);
+void np_psnr_set_p2p_opener(np_psnr_p2p_open_fn fn);
+
 /* A datagram that arrived on the P2P socket from from_ip:from_port. 1: it was
  * psnr's own (a probe reply, a peer's punch) -- drop it. 0: it's the title's.
  * A datagram a peer sent through the relay is unwrapped in place: len, and

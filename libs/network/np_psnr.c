@@ -308,6 +308,7 @@ void np_psnr_on_tick(void (*fn)(void))
 #define STREAM_TIMEOUT_MS 12000
 
 static np_psnr_p2p_send_fn s_p2p_send;
+static np_psnr_p2p_open_fn s_p2p_opener;
 static np_psnr_stream_sink_fn s_stream_sink;
 static int      s_probed;
 static uint64_t s_next_probe;
@@ -396,6 +397,11 @@ void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn)
     s_p2p_send = fn;
     s_probed = 0;
     s_next_probe = 0;
+}
+
+void np_psnr_set_p2p_opener(np_psnr_p2p_open_fn fn)
+{
+    s_p2p_opener = fn;
 }
 
 void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)

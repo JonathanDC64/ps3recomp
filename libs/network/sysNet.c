@@ -394,6 +394,7 @@ static host_socket_t s_p2p_fd = HOST_INVALID_SOCKET;   /* the instance's P2P por
 static uint16_t      s_p2p_bound_port;                  /* its port, host order */
 static volatile int  s_p2p_gen;                         /* bumped when it closes: its thread stops */
 static int           s_p2p_dgram = -1;                  /* the first DGRAM_P2P bound: headerless datagrams */
+static int           s_p2p_hold;                        /* np_psnr holds it open: the title's closes leave it */
 #ifdef _WIN32
 static SRWLOCK s_p2p_lock = SRWLOCK_INIT;
 #  define P2P_LOCK()   AcquireSRWLockExclusive(&s_p2p_lock)
@@ -557,6 +558,19 @@ static int32_t p2p_open_port(void)
     return 0;
 }
 
+/* np_psnr's hold on the P2P port (np_psnr_set_p2p_opener): a room-code join punches and talks from it before the
+ * title binds a P2P socket, and its session lives on after the title closes the last one. */
+static int p2p_hold(void)
+{
+    P2P_LOCK();
+    const int was = s_p2p_hold;
+    const int32_t r = p2p_open_port();
+    if (r == 0) s_p2p_hold = 1;
+    P2P_UNLOCK();
+    if (r == 0 && !was) printf("[sys_net] P2P port %u held open for a room-code join\n", np_psnr_p2p_port());
+    return r == 0 ? 0 : -1;
+}
+
 /* A DGRAM_P2P bind: the socket takes `vport` on the P2P port. */
 static int32_t p2p_bind_dgram(int32_t s, uint16_t vport)
 {
@@ -672,7 +686,7 @@ int32_t sys_net_bnet_close(int32_t s)
             for (int i = 1; i < SYS_NET_MAX_SOCKETS && s_p2p_dgram < 0; i++)
                 if (p2p_dgram_bound(i)) s_p2p_dgram = i;
         }
-        if (s_p2p_dgram < 0) {   /* the last one: let go of the P2P port */
+        if (s_p2p_dgram < 0 && !s_p2p_hold) {   /* the last one: let go of the P2P port */
             s_p2p_gen++;
             host_closesocket(s_p2p_fd);
             s_p2p_fd = HOST_INVALID_SOCKET;
@@ -1379,6 +1393,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
     };
     s_alloc = guest_alloc;
     net_startup();
+    np_psnr_set_p2p_opener(p2p_hold);
     for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
         ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
     printf("[sys_net] PS3_NET_ONLINE: host sockets registered (%u exports)\n",

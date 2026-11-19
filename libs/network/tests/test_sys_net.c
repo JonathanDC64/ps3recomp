@@ -36,6 +36,8 @@ uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
 static np_psnr_p2p_send_fn s_sender;
 static np_psnr_stream_sink_fn s_sink;
 void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn) { s_sender = fn; }
+static np_psnr_p2p_open_fn s_opener;
+void np_psnr_set_p2p_opener(np_psnr_p2p_open_fn fn) { s_opener = fn; }
 void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn) { s_sink = fn; }
 int  np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t ip[4], uint16_t* port)
 {
@@ -427,6 +429,30 @@ int main(void)
     }
     assert(C1("socketclose", in) == 0 && C1("socketclose", out) == 0);
     assert(C1("socketclose", l2) == 0 && C1("socketclose", l1) == 0);
+
+    /* A room-code join holds the P2P port open (np_psnr_set_p2p_opener): np_psnr sends from it before the title
+     * binds a P2P socket, the title's bind shares it, and the title's last close leaves it open. */
+    {
+        const uint8_t lo[4] = { 127, 0, 0, 1 };
+        assert(s_opener && !s_sender);
+        assert(s_opener() == 0 && s_sender);
+        assert(s_sender("PSNR\x02zzzz", 9, lo, 36658) == 9);   /* (to itself: the filter takes it) */
+        int32_t held = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
+        put_sockaddr(ADDR_A, 0x0A000001u, 3658);
+        vm_write16(ADDR_A + 8, 1000);
+        assert(C3("bind", held, ADDR_A, 16) == 0);
+        put_sockaddr(ADDR_A, LOOP, 36658);
+        memcpy(vm_base + BUF, "held", 4);
+        assert(call("sendto", held, BUF, 4, 0, ADDR_A, 16) == 4);
+        vm_write32(POLLFD, (uint32_t)held);
+        vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+        assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
+        vm_write32(LEN, 16);
+        assert(call("recvfrom", held, BUF, 64, 0, ADDR_B, LEN) == 4 && !memcmp(vm_base + BUF, "held", 4));
+        assert(C1("socketclose", held) == 0);
+        assert(s_sender);              /* still open */
+        assert(s_opener() == 0 && s_sender("game", 4, lo, 36658) == 4);   /* holding again changes nothing */
+    }
 
     /* ps3_net_lock_offline: the network is down for good, even with
      * PS3_NET_ONLINE still set. Sockets that exist can still be closed. */
