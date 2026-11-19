@@ -1213,7 +1213,10 @@ static void rf_tail(RfJob* const j)
     s_d3d.frame_count++;
 
     /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,
-     * draw count of the last frame, and the backbuffer size. */
+     * draw count of the last frame, and the backbuffer size.
+     * RSX_TITLE_STATS=0 leaves the caption as the title alone (a title's
+     * build for players can set it); 1, the default, adds the numbers. Live:
+     * turned off, the caption goes back to the title at the next second. */
     {
         static ULONGLONG s_tt0 = 0;
         static u64 s_tframes = 0;
@@ -1222,16 +1225,24 @@ static void rf_tail(RfJob* const j)
         if (s_tt0 == 0) s_tt0 = tnow;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
             extern char g_rsx_title_base[128];
+            static int stats = 1, shown = -1;   /* shown: what the caption has (-1: the window's own) */
+            PS3_KNOB(stats, ps3_env_int("RSX_TITLE_STATS", 1));
             char tb[256];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
-                     g_rsx_title_base,
-                     s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+            if (stats)
+                snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+                         g_rsx_title_base,
+                         s_tframes * 1000.0 / (double)(tnow - s_tt0),
+                         s_dbg_last_draws, s_d3d.width, s_d3d.height);
+            else
+                snprintf(tb, sizeof(tb), "%s", g_rsx_title_base);
+            if (stats || shown != 0) {
 #ifdef _WIN32
-            SetWindowTextA(s_d3d.hwnd, tb);
+                SetWindowTextA(s_d3d.hwnd, tb);
 #else
-            win_set_title(tb);
+                win_set_title(tb);
 #endif
+            }
+            shown = stats ? 1 : 0;
             /* GCM_RATES=1: the same once-a-second sample on stderr, beside
              * the FIFO flip words decoded and how far RSX label 255 moved --
              * the fence a title like Demon's Souls paces its frames on. */

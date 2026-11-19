@@ -313,9 +313,12 @@ int rsx_null_backend_pump_messages(void)
     }
     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
      * live-draw frame, window size. Here on the window's own thread, so the
-     * WM_SETTEXT never blocks the renderer. */
+     * WM_SETTEXT never blocks the renderer. RSX_TITLE_STATS=0: the title
+     * alone, as the window opened with it. */
     ULONGLONG now = GetTickCount64();
-    if (s_state.hwnd && now - s_state.title_time >= 1000) {
+    static int stats = 1;
+    PS3_KNOB(stats, ps3_env_int("RSX_TITLE_STATS", 1));
+    if (stats && s_state.hwnd && now - s_state.title_time >= 1000) {
         extern u32 rsx_live_draw_get_last_draws(void);
         extern double rsx_live_draw_get_present_fps(void);
         /* Live draw owns presentation (and end_frame never runs) when enabled. */
