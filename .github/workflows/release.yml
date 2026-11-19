@@ -48,6 +48,11 @@ jobs:
         with:
           arch: x64
 
+      # LLVM's own 22.1.8, first on the path (.github/actions/llvm-windows): the runner's clang-cl is 20.1.8, which
+      # MSVC 14.52's C++ library refuses (error STL1000) from the windows-2025-vs2026 image of 2026-11-16 on.
+      - if: runner.os == 'Windows'
+        uses: ./.github/actions/llvm-windows
+
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: choco install ninja -y --no-progress
