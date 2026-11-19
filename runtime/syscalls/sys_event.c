@@ -557,9 +557,14 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     pthread_mutex_lock(&q->lock);
 
     if (timeout_us == 0) {
+        /* Counted as on Windows: sys_event_queue_waiters reads it, and SPURS
+         * posts its task completions only to queues with a waiter
+         * (spurs_notify_task_completion). Uncounted, Linux never got them. */
+        q->waiters++;
         while (q->count == 0 && q->active && !q->cancelled) {
             pthread_cond_wait(&q->not_empty, &q->lock);
         }
+        if (q->waiters > 0) q->waiters--;
     } else {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
