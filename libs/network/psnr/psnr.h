@@ -87,6 +87,37 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
                           const char* comm_id, const char* online_id, uint16_t p2p_port,
                           const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4]);
 
+/* psnr_connect in two steps: the connection (TCP, and TLS with PS3_NET_TLS), then the HELLO on it. So two ways to
+ * one server can race, and only the first to open says HELLO (a second HELLO would read as a reconnect of the first).
+ * psnr_hello: 0, or -1 with psnr_connect_error(); the client stays the caller's to close either way. */
+psnr_client* psnr_open(const char* host, uint16_t port);
+int          psnr_hello(psnr_client* c, const char* comm_id, const char* online_id, uint16_t p2p_port,
+                        const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4]);
+
+/* A TCP connection that doesn't block: start it, poll it (1 open, 0 not yet, -1 failed), then take it as a client
+ * (no HELLO yet; NULL if its TLS fails) or cancel it. psnr_dial_client and psnr_dial_cancel free the dialer. */
+typedef struct psnr_dialer psnr_dialer;
+psnr_dialer* psnr_dial_start(const uint8_t ip[4], uint16_t port);
+int          psnr_dial_poll(psnr_dialer* d);
+psnr_client* psnr_dial_client(psnr_dialer* d);
+void         psnr_dial_cancel(psnr_dialer* d);
+
+/* The second transport: psnr's byte stream over a session on a punched UDP path (psnr_rudp.h), in place of a socket.
+ * The client owns sess from here on (psnr_close sends its CLOSE and frees it). peer: the host's address on that path,
+ * which psnr_server_addr gives, so probes and relayed datagrams take the same way. The session's datagrams come in on
+ * another thread than the one that polls: psnr_session_input and psnr_session_tick (its resends and keepalives, every
+ * few tens of ms) may run beside psnr_poll and psnr_send. */
+struct psnr_rudp;
+psnr_client* psnr_session_client(struct psnr_rudp* sess, const uint8_t peer_ip[4], uint16_t peer_port,
+                                 const uint8_t local_ip[4]);
+int          psnr_is_session(const psnr_client* c);
+void         psnr_session_input(psnr_client* c, const void* pkt, size_t len);
+void         psnr_session_tick(psnr_client* c);
+
+/* A host name or dotted address as IPv4 (0, or -1); this machine's address on the way to ip (0, or -1). */
+int psnr_resolve4(const char* host, uint8_t ip[4]);
+int psnr_local_ip_toward(const uint8_t ip[4], uint8_t out[4]);
+
 /* NAT traversal (docs/api.md, "UDP"). The caller owns the P2P socket; these
  * build and read the packets it exchanges. Every one starts with "PSNR".
  *   - Send a PROBE from the P2P socket to psnr_server_addr, now and then (a

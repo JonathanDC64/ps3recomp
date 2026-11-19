@@ -14,6 +14,7 @@
  * (mbedtls.lib / libmbedtls.a: the .c files of third_party/mbedtls/library, compiled once)
  */
 #include "../psnr/psnr.c"
+#include "../psnr/psnr_rudp.c"
 #include "../np_psnr.c"
 #include "../ps3_net.c"
 #include "../ps3_net_signin.c"

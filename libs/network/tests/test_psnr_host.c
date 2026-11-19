@@ -11,6 +11,7 @@
 #  define _CRT_RAND_S   /* net_invite.c's rand_s, before the first stdlib.h of this one file */
 #endif
 #include "../psnr/psnr.c"
+#include "../psnr/psnr_rudp.c"
 /* smaller limits, so the test reaches them: wrong keys before the key is spent (and before an address is
  * ignored, a few more), and the time to say HELLO */
 #define PH_KEY_TRIES 4
@@ -387,6 +388,68 @@ static void test_early(void)
     psnr_host_stop(h);
 }
 
+/* psnr_connect in two steps, and the connection that doesn't block: a dialer opens, and only then is HELLO said on
+ * it; one to a port nobody listens on fails; a wrong key at the HELLO is the refusal it always was. */
+static void test_split(void)
+{
+    psnr_host_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.bind_loopback = 1;
+    cfg.has_key = 1;
+    net_invite_key_blob(0x0D1A1E5, cfg.key);
+    char err[128] = "";
+    psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+    CHECK(h != NULL);
+    if (!h) return;
+    const uint16_t port = psnr_host_port(h);
+    const uint8_t lo[4] = {127, 0, 0, 1};
+    psnr_dialer* d = psnr_dial_start(lo, port);
+    CHECK(d != NULL);
+    int r = 0;
+    for (int i = 0; i < 300 && d && (r = psnr_dial_poll(d)) == 0; i++) sleep_ms(10);
+    CHECK(r == 1);
+    sleep_ms(50);
+    CHECK(psnr_host_players(h) == 0);   /* open, and no HELLO yet */
+    psnr_client* c = d ? psnr_dial_client(d) : NULL;
+    uint32_t uid = 0;
+    uint8_t ip[4];
+    CHECK(c && psnr_hello(c, kComm, "Delta", 3741, cfg.key, &uid, ip) == 0 && uid != 0 && ip[0] == 127);
+    sleep_ms(50);
+    CHECK(psnr_host_players(h) == 1);
+    uint8_t sip[4];
+    uint16_t sport = 0;
+    if (c) psnr_server_addr(c, sip, &sport);
+    CHECK(sport == port && !memcmp(sip, lo, 4) && !psnr_is_session(c));
+    psnr_close(c);
+    /* nobody on the port */
+    ph_sock gone = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    uint16_t dead_port = 0;
+    {
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(gone, (struct sockaddr*)&a, sizeof a);
+        ph_socklen n = (ph_socklen)sizeof a;
+        getsockname(gone, (struct sockaddr*)&a, &n);
+        dead_port = ntohs(a.sin_port);
+        ph_close(gone);
+    }
+    d = psnr_dial_start(lo, dead_port);
+    r = d ? 0 : -1;
+    for (int i = 0; i < 500 && d && (r = psnr_dial_poll(d)) == 0; i++) sleep_ms(10);
+    CHECK(r == -1);
+    psnr_dial_cancel(d);
+    /* open, then a wrong key */
+    uint8_t wrong[32];
+    net_invite_key_blob(0x0BADBAD, wrong);
+    c = psnr_open("127.0.0.1", port);
+    CHECK(c != NULL);
+    CHECK(c && psnr_hello(c, kComm, "Echo", 3742, wrong, &uid, ip) == -1 && psnr_connect_error() == PSNR_E_REFUSED);
+    psnr_close(c);
+    psnr_host_stop(h);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -395,6 +458,7 @@ int main(void)
     test_keys();
     test_full();
     test_early();
+    test_split();
 
     psnr_host_config cfg;
     memset(&cfg, 0, sizeof cfg);

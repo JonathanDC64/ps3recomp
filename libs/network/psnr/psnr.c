@@ -1,9 +1,11 @@
 /*
  * psnr.c - see psnr.h. The socket is nonblocking after connect; psnr_poll
  * reads whatever has arrived, cuts complete frames into a FIFO, and hands
- * them out one at a time.
+ * them out one at a time. A session (psnr_rudp.h) in place of the socket
+ * gives and takes the same bytes.
  */
 #include "psnr.h"
+#include "psnr_rudp.h"
 #include "ps3emu/ps3_tls.h"   /* ps3recomp: the connection over TLS when PS3_NET_TLS is set */
 
 #include <stdio.h>
@@ -37,11 +39,32 @@
 #  include <unistd.h>
 #  include <errno.h>
 #  include <poll.h>
+#  include <pthread.h>
    typedef int sock_t;
 #  define BAD_SOCK (-1)
 #  define sock_close close
 #  define WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
    typedef struct pollfd pollfd_t;
+#endif
+
+/* A session's lock: its datagrams come in on another thread (the P2P port's) than the one that polls. */
+#ifdef _WIN32
+typedef SRWLOCK sess_lock_t;
+#  define SESS_INIT(l)   InitializeSRWLock(l)
+#  define SESS_LOCK(l)   AcquireSRWLockExclusive(l)
+#  define SESS_UNLOCK(l) ReleaseSRWLockExclusive(l)
+#  define SESS_FREE(l)   ((void)(l))
+#else
+typedef pthread_mutex_t sess_lock_t;
+#  define SESS_INIT(l)   pthread_mutex_init(l, NULL)
+#  define SESS_LOCK(l)   pthread_mutex_lock(l)
+#  define SESS_UNLOCK(l) pthread_mutex_unlock(l)
+#  define SESS_FREE(l)   pthread_mutex_destroy(l)
+#endif
+
+/* Tests: where a TCP connection to ip:port really goes (a simulated router in front of the host). 0 refuses it. */
+#ifndef PSNR_TCP_TARGET
+#  define PSNR_TCP_TARGET(ip, port) 1
 #endif
 
 #define HEARTBEAT_SECS 20
@@ -88,12 +111,22 @@ struct psnr_client {
     int      dead;
     uint32_t user_id, token;              /* from HELLO_ACK; UDP probes carry them */
     int      relay;                       /* HELLO_ACK: the server relays */
-    uint8_t  server_ip[4], local_ip[4];   /* the TCP connection's two ends */
+    uint8_t  server_ip[4], local_ip[4];   /* the TCP connection's two ends (a session's: the host's, ours) */
     uint16_t server_port;
+    psnr_rudp*  sess;                     /* the session in place of the socket, or NULL */
+    sess_lock_t sess_lock;
 };
 
 static int send_all(psnr_client* c, const uint8_t* p, size_t n)
 {
+    if (c->sess) {
+        SESS_LOCK(&c->sess_lock);
+        const int r = psnr_rudp_write(c->sess, p, n, now_ms());
+        SESS_UNLOCK(&c->sess_lock);
+        if (r) { c->dead = 1; return -1; }
+        c->last_send = time(NULL);
+        return 0;
+    }
     if (c->tls) {
         if (ps3_tls_send_all(c->tls, p, n, 30000) != 0) { c->dead = 1; return -1; }
         c->last_send = time(NULL);
@@ -136,7 +169,14 @@ static int pump(psnr_client* c)
             c->rx = (uint8_t*)realloc(c->rx, c->rx_cap);
         }
         int k;
-        if (c->tls) {
+        if (c->sess) {   /* what the session has put in order; over: as a closed connection */
+            SESS_LOCK(&c->sess_lock);
+            k = (int)psnr_rudp_read(c->sess, c->rx + c->rx_len, c->rx_cap - c->rx_len);
+            const int over = !k && psnr_rudp_dead(c->sess, now_ms()) != PSNR_RUDP_ALIVE;
+            SESS_UNLOCK(&c->sess_lock);
+            if (over) { c->dead = 1; break; }
+            if (!k) break;
+        } else if (c->tls) {
             k = ps3_tls_recv(c->tls, c->rx + c->rx_len, c->rx_cap - c->rx_len, 0);
             if (k == PS3_TLS_AGAIN) break;
             if (k <= 0) { c->dead = 1; break; }
@@ -206,6 +246,15 @@ int psnr_call(psnr_client* c, uint8_t type, const void* body, uint32_t len,
         if (take(c, reply, req)) return 1;
         if (c->dead) return -1;
         if (now_ms() >= end) return 0;
+        if (c->sess) {   /* (no socket to wait on: the session's resends are due on this thread meanwhile) */
+            psnr_session_tick(c);
+#ifdef _WIN32
+            Sleep(10);
+#else
+            { struct timespec ts = { 0, 10000000L }; nanosleep(&ts, NULL); }
+#endif
+            continue;
+        }
         pf.fd = c->s; pf.events = POLLIN; pf.revents = 0;
         poll(&pf, 1, 10);
     }
@@ -219,44 +268,25 @@ void psnr_msg_free(psnr_msg* m)
 
 static int s_connect_error;
 
-psnr_client* psnr_connect(const char* host, uint16_t port,
-                          const char* comm_id, const char* online_id, uint16_t p2p_port,
-                          const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4])
+static void set_nonblocking(sock_t s)
 {
-    struct addrinfo hints, *res = NULL, *ai;
-    char portstr[8];
-    sock_t s = BAD_SOCK;
-
-    s_connect_error = 0;   /* (this attempt's, also when it ends before the HELLO) */
 #ifdef _WIN32
-    WSADATA w;
-    WSAStartup(MAKEWORD(2, 2), &w);
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+#else
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
 #endif
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0) return NULL;
-    for (ai = res; ai; ai = ai->ai_next) {
-        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == BAD_SOCK) continue;
-        psnr_no_sigpipe(s);
-        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
-        sock_close(s);
-        s = BAD_SOCK;
-    }
-    freeaddrinfo(res);
-    if (s == BAD_SOCK) return NULL;
+}
 
+/* A connected socket as a client (no HELLO yet): nonblocking, over TLS with PS3_NET_TLS. NULL (the socket closed)
+ * if the TLS fails. */
+static psnr_client* client_of(sock_t s, const char* host, uint16_t port)
+{
     {   /* small request/reply frames: don't let Nagle sit on them */
         int one = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     }
-#ifdef _WIN32
-    { u_long nb = 1; ioctlsocket(s, FIONBIO, &nb); }
-#else
-    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-#endif
+    set_nonblocking(s);
 
     /* ps3recomp: with PS3_NET_TLS (ps3emu/ps3_tls.h) this connection, which
      * carries the session, goes over TLS or not at all. The relay streams
@@ -288,7 +318,41 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
         n = sizeof(a);
         if (getsockname(s, (struct sockaddr*)&a, &n) == 0) memcpy(c->local_ip, &a.sin_addr, 4);
     }
+    return c;
+}
 
+psnr_client* psnr_open(const char* host, uint16_t port)
+{
+    struct addrinfo hints, *res = NULL, *ai;
+    char portstr[8];
+    sock_t s = BAD_SOCK;
+
+    s_connect_error = 0;   /* (this attempt's, also when it ends before the HELLO) */
+#ifdef _WIN32
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(portstr, sizeof(portstr), "%u", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0) return NULL;
+    for (ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == BAD_SOCK) continue;
+        psnr_no_sigpipe(s);
+        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        sock_close(s);
+        s = BAD_SOCK;
+    }
+    freeaddrinfo(res);
+    if (s == BAD_SOCK) return NULL;
+    return client_of(s, host, port);
+}
+
+int psnr_hello(psnr_client* c, const char* comm_id, const char* online_id, uint16_t p2p_port,
+               const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4])
+{
     /* HELLO: comm_id [12] | online_id [16] | p2p_port u16 [| session blob] */
     uint8_t hello[30 + 2 + 32] = {0};
     uint32_t hello_len = 30;
@@ -304,10 +368,7 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     s_connect_error = 0;
     int called = psnr_call(c, PSNR_HELLO, hello, hello_len, &ack, 5000);
     memset(hello, 0, sizeof(hello));
-    if (called != 1) {
-        psnr_close(c);
-        return NULL;
-    }
+    if (called != 1) return -1;
     int ok = ack.type == PSNR_HELLO_ACK && ack.len >= 8;
     s_connect_error = (ack.type == PSNR_ERROR && ack.len >= 4) ? (int)psnr_get32(ack.data) : 0;
     if (ok) c->user_id = psnr_get32(ack.data);
@@ -316,8 +377,189 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     if (ok && out_user_id) *out_user_id = psnr_get32(ack.data);
     if (ok && out_public_ip) memcpy(out_public_ip, ack.data + 4, 4);
     psnr_msg_free(&ack);
-    if (!ok) { psnr_close(c); return NULL; }
+    return ok ? 0 : -1;
+}
+
+psnr_client* psnr_connect(const char* host, uint16_t port,
+                          const char* comm_id, const char* online_id, uint16_t p2p_port,
+                          const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4])
+{
+    psnr_client* c = psnr_open(host, port);
+    if (!c) return NULL;
+    if (psnr_hello(c, comm_id, online_id, p2p_port, session, out_user_id, out_public_ip) != 0) {
+        psnr_close(c);
+        return NULL;
+    }
     return c;
+}
+
+/* ---- A TCP connection that doesn't block (psnr_dial_*), to race it against a punched path ---- */
+
+struct psnr_dialer {
+    sock_t   s;
+    uint8_t  ip[4];
+    uint16_t port;
+};
+
+psnr_dialer* psnr_dial_start(const uint8_t ip[4], uint16_t port)
+{
+    struct sockaddr_in a;
+    uint8_t to[4];
+    uint16_t to_port = port;
+#ifdef _WIN32
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+    memcpy(to, ip, 4);
+    if (!PSNR_TCP_TARGET(to, &to_port)) return NULL;
+    sock_t s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == BAD_SOCK) return NULL;
+    psnr_no_sigpipe(s);
+    set_nonblocking(s);
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    memcpy(&a.sin_addr, to, 4);
+    a.sin_port = htons(to_port);
+    if (connect(s, (struct sockaddr*)&a, sizeof(a)) != 0) {
+#ifdef _WIN32
+        const int e = WSAGetLastError();
+        const int pending = e == WSAEWOULDBLOCK || e == WSAEINPROGRESS;
+#else
+        const int pending = errno == EINPROGRESS || errno == EWOULDBLOCK;
+#endif
+        if (!pending) {
+            sock_close(s);
+            return NULL;
+        }
+    }
+    psnr_dialer* d = (psnr_dialer*)calloc(1, sizeof(*d));
+    d->s = s;
+    memcpy(d->ip, ip, 4);
+    d->port = port;
+    return d;
+}
+
+int psnr_dial_poll(psnr_dialer* d)
+{
+    int err = 0;
+    socklen_t n = sizeof(err);
+#ifdef _WIN32
+    /* (select, not WSAPoll: WSAPoll doesn't report every failed connect) */
+    fd_set w, x;
+    struct timeval tv = { 0, 0 };
+    FD_ZERO(&w);
+    FD_ZERO(&x);
+    FD_SET(d->s, &w);
+    FD_SET(d->s, &x);
+    if (select(0, NULL, &w, &x, &tv) <= 0) return 0;
+    if (FD_ISSET(d->s, &x)) return -1;
+#else
+    pollfd_t pf;
+    pf.fd = d->s;
+    pf.events = POLLOUT;
+    pf.revents = 0;
+    if (poll(&pf, 1, 0) <= 0) return 0;
+    if (pf.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    if (!(pf.revents & POLLOUT)) return 0;
+#endif
+    if (getsockopt(d->s, SOL_SOCKET, SO_ERROR, (char*)&err, &n) != 0 || err) return -1;
+    return 1;
+}
+
+psnr_client* psnr_dial_client(psnr_dialer* d)
+{
+    char host[16];
+    snprintf(host, sizeof host, "%u.%u.%u.%u", d->ip[0], d->ip[1], d->ip[2], d->ip[3]);
+    psnr_client* c = client_of(d->s, host, d->port);
+    if (c) {   /* (the address it was asked for: a test's router stands between) */
+        memcpy(c->server_ip, d->ip, 4);
+        c->server_port = d->port;
+    }
+    free(d);
+    return c;
+}
+
+void psnr_dial_cancel(psnr_dialer* d)
+{
+    if (!d) return;
+    sock_close(d->s);
+    free(d);
+}
+
+/* ---- The session transport (psnr_rudp.h) ---- */
+
+psnr_client* psnr_session_client(psnr_rudp* sess, const uint8_t peer_ip[4], uint16_t peer_port,
+                                 const uint8_t local_ip[4])
+{
+    psnr_client* c = (psnr_client*)calloc(1, sizeof(psnr_client));
+    c->s = BAD_SOCK;
+    c->sess = sess;
+    SESS_INIT(&c->sess_lock);
+    memcpy(c->server_ip, peer_ip, 4);
+    c->server_port = peer_port;
+    if (local_ip) memcpy(c->local_ip, local_ip, 4);
+    c->last_send = time(NULL);
+    return c;
+}
+
+int psnr_is_session(const psnr_client* c)
+{
+    return c && c->sess != NULL;
+}
+
+void psnr_session_input(psnr_client* c, const void* pkt, size_t len)
+{
+    if (!c || !c->sess) return;
+    const uint64_t now = now_ms();
+    SESS_LOCK(&c->sess_lock);
+    psnr_rudp_input(c->sess, pkt, len, now);
+    psnr_rudp_tick(c->sess, now);   /* (the acks, at once) */
+    SESS_UNLOCK(&c->sess_lock);
+}
+
+void psnr_session_tick(psnr_client* c)
+{
+    if (!c || !c->sess) return;
+    SESS_LOCK(&c->sess_lock);
+    psnr_rudp_tick(c->sess, now_ms());
+    SESS_UNLOCK(&c->sess_lock);
+}
+
+/* ---- Addresses ---- */
+
+int psnr_resolve4(const char* host, uint8_t ip[4])
+{
+    struct addrinfo hints, *res = NULL;
+#ifdef _WIN32
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (!host || !*host || getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+    memcpy(ip, &((struct sockaddr_in*)res->ai_addr)->sin_addr, 4);
+    freeaddrinfo(res);
+    return 0;
+}
+
+int psnr_local_ip_toward(const uint8_t ip[4], uint8_t out[4])
+{
+    struct sockaddr_in a, me;
+    socklen_t n = sizeof(me);
+    int ok = 0;
+    sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == BAD_SOCK) return -1;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    memcpy(&a.sin_addr, ip, 4);
+    a.sin_port = htons(9);   /* (a "connected" UDP socket: nothing is sent) */
+    if (connect(s, (struct sockaddr*)&a, sizeof(a)) == 0 && getsockname(s, (struct sockaddr*)&me, &n) == 0) {
+        memcpy(out, &me.sin_addr, 4);
+        ok = out[0] || out[1] || out[2] || out[3];
+    }
+    sock_close(s);
+    return ok ? 0 : -1;
 }
 
 void psnr_server_addr(const psnr_client* c, uint8_t ip[4], uint16_t* port)
@@ -480,8 +722,16 @@ void psnr_close(psnr_client* c)
 {
     psnr_msg m;
     if (!c) return;
-    ps3_tls_close(c->tls);
-    sock_close(c->s);
+    if (c->sess) {   /* the other end hears at once, not 30 s later */
+        SESS_LOCK(&c->sess_lock);
+        psnr_rudp_close(c->sess, PSNR_RUDP_BYE);
+        SESS_UNLOCK(&c->sess_lock);
+        psnr_rudp_free(c->sess);
+        SESS_FREE(&c->sess_lock);
+    } else {
+        ps3_tls_close(c->tls);
+        sock_close(c->s);
+    }
     c->dead = 1;
     while (take(c, &m, 0)) psnr_msg_free(&m);
     free(c->rx);
