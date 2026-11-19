@@ -7,6 +7,8 @@
  */
 #include "ps3emu/psnr_host.h"
 #include "psnr.h"
+#include "psnr_intro.h"
+#include "psnr_rudp.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -38,6 +40,12 @@
 #  define PH_POLL WSAPoll
    typedef WSAPOLLFD ph_pollfd;
    typedef int ph_socklen;
+   typedef SRWLOCK ph_lock;
+#  define PH_LOCK_STATIC   SRWLOCK_INIT
+#  define PH_LOCK_INIT(l)  InitializeSRWLock(l)
+#  define PH_LOCK(l)       AcquireSRWLockExclusive(l)
+#  define PH_UNLOCK(l)     ReleaseSRWLockExclusive(l)
+#  define PH_LOCK_FREE(l)  ((void)(l))
 #else
 #  include <sys/socket.h>
 #  include <netinet/in.h>
@@ -55,6 +63,18 @@
 #  define PH_POLL poll
    typedef struct pollfd ph_pollfd;
    typedef socklen_t ph_socklen;
+   typedef pthread_mutex_t ph_lock;
+#  define PH_LOCK_STATIC   PTHREAD_MUTEX_INITIALIZER
+#  define PH_LOCK_INIT(l)  pthread_mutex_init(l, NULL)
+#  define PH_LOCK(l)       pthread_mutex_lock(l)
+#  define PH_UNLOCK(l)     pthread_mutex_unlock(l)
+#  define PH_LOCK_FREE(l)  pthread_mutex_destroy(l)
+#endif
+
+/* Every datagram out of the room server's UDP socket goes through this (a test's virtual network replaces it). */
+#ifndef PH_SENDTO
+#  define PH_SENDTO(h, buf, len, to) \
+      ((void)sendto((h)->udp, (const char*)(buf), (int)(len), 0, (const struct sockaddr*)(to), (ph_socklen)sizeof *(to)))
 #endif
 
 #define PH_CLIENTS     12      /* 4 players, plus reconnects still closing */
@@ -77,6 +97,26 @@
 #  define PH_HELLO_MS  10000
 #endif
 #define PH_EARLY_PER_IP 2
+
+/* The introductions (psnr_host_set_intro). Overridable for tests. */
+#define PH_INTROS        8        /* introductions remembered: for the knocks and psnr_host_intro_info's stuck */
+#ifndef PH_KNOCK_MS
+#  define PH_KNOCK_MS    200      /* KNOCK to each of a friend's candidates 5 times a second... */
+#endif
+#ifndef PH_KNOCK_FOR_MS
+#  define PH_KNOCK_FOR_MS 5000    /* ...for 5 s after its INTRO */
+#endif
+#ifndef PH_STUCK_MS
+#  define PH_STUCK_MS    15000    /* introduced and not connected this long after: stuck */
+#endif
+#define PH_STUCK_FOR_MS  120000   /* (said for this long after the INTRO) */
+#ifndef PH_REG_RETRY_MS
+#  define PH_REG_RETRY_MS 1000    /* an unanswered REGISTER goes again after this */
+#endif
+#define PH_REG_LOST      3        /* unanswered REGISTERs in a row: the endpoint can't be reached */
+#define PH_REG_SLOW_MS   5000     /* after "slow down", and between REGISTERs while it can't be reached */
+#define PH_REG_FULL_MS   60000    /* after "no place for another room" */
+#define PH_SESS_CLOSE_MS 3000     /* a session's last reply (a refusal) gets this long to arrive before it closes */
 
 /* A write to a connection the other end has closed fails (EPIPE) and doesn't end the process with SIGPIPE: the
  * server starts before the runtime's online switch ignores SIGPIPE (ps3_net_online). macOS: SO_NOSIGPIPE. */
@@ -103,7 +143,16 @@ typedef struct {
     uint64_t born;                /* when it connected (the HELLO's deadline counts from here) */
     ph_buf   rx, tx;
     int      closing;             /* drop once tx is out */
+    /* A player over a punched UDP path (psnr_rudp.h) has a session in place of a socket: s is PH_BAD. */
+    psnr_rudp* sess;
+    psnr_host* host;              /* (for the session's send function) */
+    uint8_t  peer_ip[4];          /* the session's other end */
+    uint16_t peer_port;
+    uint64_t nonce;               /* its OPEN's */
+    uint64_t closing_at;
 } ph_client;
+
+#define PH_USED(c) ((c)->s != PH_BAD || (c)->sess != NULL)
 
 typedef struct {
     uint16_t id;
@@ -140,6 +189,23 @@ struct psnr_host {
     atomic_int max_players;       /* the most members of a room: cfg.max_players, then psnr_host_set_max_players's */
     volatile int stop;
     int       players;            /* read by psnr_host_players */
+    /* The introductions. Set from other threads (psnr_host_set_intro, psnr_host_new_room), so under ilock. */
+    ph_lock   ilock;
+    psnr_host_intro intro;
+    uint64_t  room, owner;        /* the room number and the owner token now */
+    int       reg_state;          /* PSNR_HOST_INTRO_* */
+    uint8_t   seen_ip[4];
+    uint16_t  seen_port;
+    int       reg_waiting, reg_unanswered, reg_kick;
+    uint64_t  reg_next;
+    struct {
+        uint32_t  nonce;          /* the friend's LOOKUP's (0: a free entry) */
+        int       n, done;
+        psnr_cand c[2];
+        uint64_t  t0, next;
+    } intros[PH_INTROS];
+    uint8_t   cookie_secret[32];
+    int       udp_players;
 #ifdef _WIN32
     HANDLE    th;
 #else
@@ -249,6 +315,18 @@ static void ph_rstr(ph_rd* r, char* out, size_t n)
 
 static int ph_loopback(const uint8_t ip[4]) { return ip[0] == 127; }
 
+static int ph_ip_set(const uint8_t ip[4]) { return ip[0] || ip[1] || ip[2] || ip[3]; }
+
+static struct sockaddr_in ph_addr(const uint8_t ip[4], uint16_t port)
+{
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    memcpy(&a.sin_addr, ip, 4);
+    a.sin_port = htons(port);
+    return a;
+}
+
 /* ---- sending ---- */
 
 static void ph_flush(ph_client* c)
@@ -268,7 +346,18 @@ static void ph_flush(ph_client* c)
 
 static void ph_send(ph_client* c, uint8_t type, const ph_buf* p)
 {
-    if (c->s == PH_BAD || c->closing == 2) return;
+    if (!PH_USED(c) || c->closing == 2) return;
+    if (c->sess) {   /* the session queues it (a peer that stopped reading fills the queue) */
+        ph_buf f = {0};
+        uint8_t hdr[3];
+        hdr[0] = type;
+        psnr_put16(hdr + 1, (uint16_t)p->n);
+        ph_put(&f, hdr, 3);
+        ph_put(&f, p->b, p->n);
+        if (psnr_rudp_write(c->sess, f.b, f.n, ph_now()) != 0) c->closing = 2;
+        ph_free(&f);
+        return;
+    }
     if (c->tx.n + 3 + p->n > PH_TX_MAX) { c->closing = 2; return; }   /* a peer that stopped reading */
     uint8_t hdr[3];
     hdr[0] = type;
@@ -511,7 +600,7 @@ static void ph_hello(psnr_host* h, int ci, uint32_t req, ph_rd* r)
     /* One player per name; the same name from the same address is that player reconnecting. */
     for (int i = 0; i < PH_CLIENTS; i++) {
         ph_client* o = &h->cl[i];
-        if (i == ci || o->s == PH_BAD || !o->hello || !ph_name_eq(o->name, name)) continue;
+        if (i == ci || !PH_USED(o) || !o->hello || !ph_name_eq(o->name, name)) continue;
         if (memcmp(o->ip, c->ip, 4)) { ph_reply_err(c, req, PSNR_E_NAME_TAKEN); return; }
         printf("[psnr_host] \"%s\" reconnected\n", name);
         ph_drop(h, i);
@@ -529,11 +618,20 @@ static void ph_hello(psnr_host* h, int ci, uint32_t req, ph_rd* r)
     c->token = (uint32_t)ph_rand(h) | 1u;
     c->hello = 1;
     h->players++;
+    if (c->sess) h->udp_players++;
+    if (!ph_loopback(c->ip)) {   /* a friend that was introduced got in (either way): not stuck */
+        PH_LOCK(&h->ilock);
+        for (int i = 0; i < PH_INTROS; i++)
+            for (int k = 0; k < h->intros[i].n; k++)
+                if (!memcmp(h->intros[i].c[k].ip, c->ip, 4)) h->intros[i].done = 1;
+        PH_UNLOCK(&h->ilock);
+    }
     if (game != comm)
         printf("[psnr_host] player %u: \"%s\" (%s, in %s's rooms)%s\n", c->id, name, comm, c->comm,
                ph_loopback(c->ip) ? ", this PC" : "");
     else
-        printf("[psnr_host] player %u: \"%s\" (%s)%s\n", c->id, name, comm, ph_loopback(c->ip) ? ", this PC" : "");
+        printf("[psnr_host] player %u: \"%s\" (%s)%s\n", c->id, name, comm,
+               ph_loopback(c->ip) ? ", this PC" : c->sess ? ", over UDP" : "");
     ph_buf w = {0};
     ph_u32(&w, req);
     ph_u32(&w, c->id);
@@ -728,7 +826,7 @@ static void ph_app(psnr_host* h, int ci, uint32_t req, ph_rd* r)
     ph_u16(&w, (uint16_t)n);
     ph_put(&w, data, n);
     for (int i = 0; i < PH_CLIENTS; i++)
-        if (i != ci && h->cl[i].s != PH_BAD && h->cl[i].hello) ph_send(&h->cl[i], PSNR_APP_MSG, &w);
+        if (i != ci && PH_USED(&h->cl[i]) && h->cl[i].hello) ph_send(&h->cl[i], PSNR_APP_MSG, &w);
     ph_free(&w);
 }
 
@@ -797,8 +895,262 @@ static int ph_shares_room(psnr_host* h, int a, int b)
 static int ph_client_by_id(psnr_host* h, uint32_t id)
 {
     for (int i = 0; i < PH_CLIENTS; i++)
-        if (h->cl[i].s != PH_BAD && h->cl[i].hello && h->cl[i].id == id) return i;
+        if (PH_USED(&h->cl[i]) && h->cl[i].hello && h->cl[i].id == id) return i;
     return -1;
+}
+
+/* ---- The introductions and the sessions over UDP (psnr_intro.h, psnr_rudp.h) ---- */
+
+static void ph_frames(psnr_host* h, int ci);
+
+/* A free client slot for a player from ip (TCP or UDP), or -1: none free, two from that address still to say HELLO,
+ * or the address is ignored for wrong keys. */
+static int ph_slot(psnr_host* h, const uint8_t ip[4])
+{
+    int ci = -1, early = 0;
+    for (int i = 0; i < PH_CLIENTS; i++) {
+        if (!PH_USED(&h->cl[i])) { if (ci < 0) ci = i; }
+        else if (!h->cl[i].hello && !h->cl[i].closing && !memcmp(h->cl[i].ip, ip, 4)) early++;   /* still to say it */
+    }
+    if (ci < 0 || early >= PH_EARLY_PER_IP || ph_banned(h, ip, 0)) return -1;
+    return ci;
+}
+
+static void ph_sess_send(void* ctx, const uint8_t* pkt, size_t len)
+{
+    ph_client* c = (ph_client*)ctx;
+    const struct sockaddr_in to = ph_addr(c->peer_ip, c->peer_port);
+    PH_SENDTO(c->host, pkt, len, &to);
+}
+
+static void ph_sess_read(psnr_host* h, int ci)
+{
+    ph_client* c = &h->cl[ci];
+    uint8_t tmp[4096];
+    size_t k;
+    while ((k = psnr_rudp_read(c->sess, tmp, sizeof tmp)) > 0)
+        if (ph_put(&c->rx, tmp, k)) { c->closing = 2; return; }
+    ph_frames(h, ci);
+}
+
+static void ph_new_room(psnr_host* h)
+{
+    h->room = psnr_intro_random() & ((1ull << PSNR_HOST_ROOM_BITS) - 1);
+    if (!h->room) h->room = 1;
+    h->owner = psnr_intro_random() | 1u;
+}
+
+/* Callers hold ilock. */
+static int ph_endpoint_set(const psnr_host* h) { return ph_ip_set(h->intro.ip) && h->intro.port; }
+
+static void ph_unregister(psnr_host* h)
+{
+    if (!ph_endpoint_set(h)) return;
+    uint8_t pkt[PSNR_INTRO_REQ_LEN];
+    const size_t len = psnr_intro_unregister(pkt, h->room, h->owner);
+    const struct sockaddr_in to = ph_addr(h->intro.ip, h->intro.port);
+    PH_SENDTO(h, pkt, len, &to);   /* (twice: it has no answer, and one may be lost) */
+    PH_SENDTO(h, pkt, len, &to);
+}
+
+static void ph_register(psnr_host* h)
+{
+    psnr_cand c[2];
+    int n = 0;
+    if (ph_ip_set(h->intro.home_ip)) c[n++] = psnr_cand_of(h->intro.home_ip, h->port);
+    if (ph_ip_set(h->intro.upnp_ip) && h->intro.upnp_port) c[n++] = psnr_cand_of(h->intro.upnp_ip, h->intro.upnp_port);
+    uint8_t pkt[PSNR_INTRO_REQ_LEN];
+    const size_t len = psnr_intro_register(pkt, h->intro.version, h->room, h->owner, h->port, c, n);
+    const struct sockaddr_in to = ph_addr(h->intro.ip, h->intro.port);
+    PH_SENDTO(h, pkt, len, &to);
+}
+
+/* Each round of the loop: REGISTER when due, and the knocks. */
+static void ph_intro_tick(psnr_host* h, uint64_t now)
+{
+    PH_LOCK(&h->ilock);
+    if (ph_endpoint_set(h) && (h->reg_kick || now >= h->reg_next)) {
+        if (!h->reg_kick && h->reg_waiting && ++h->reg_unanswered >= PH_REG_LOST &&
+            h->reg_state != PSNR_HOST_INTRO_UNREACHABLE) {
+            h->reg_state = PSNR_HOST_INTRO_UNREACHABLE;
+            printf("[psnr_host] the endpoint doesn't answer: friends need the direct code (asked again every %d s)\n",
+                   PH_REG_SLOW_MS / 1000);
+        }
+        h->reg_kick = 0;
+        h->reg_waiting = 1;
+        h->reg_next = now + (h->reg_unanswered >= PH_REG_LOST ? PH_REG_SLOW_MS : PH_REG_RETRY_MS);
+        ph_register(h);
+    }
+    for (int i = 0; i < PH_INTROS; i++) {
+        if (!h->intros[i].nonce || h->intros[i].done || now - h->intros[i].t0 >= PH_KNOCK_FOR_MS ||
+            now < h->intros[i].next)
+            continue;
+        h->intros[i].next = now + PH_KNOCK_MS;
+        uint8_t pkt[32];
+        const size_t len = psnr_intro_knock(pkt, h->room, h->intros[i].nonce);
+        for (int k = 0; k < h->intros[i].n; k++) {
+            const struct sockaddr_in to = ph_addr(h->intros[i].c[k].ip, h->intros[i].c[k].port);
+            PH_SENDTO(h, pkt, len, &to);
+        }
+    }
+    PH_UNLOCK(&h->ilock);
+}
+
+/* What the endpoint says: REGISTERED and INTRO. Callers hold ilock. */
+static void ph_endpoint_in(psnr_host* h, const psnr_intro_pkt* in, uint64_t now)
+{
+    if (in->room != h->room) return;   /* (about a number this host has left) */
+    if (in->type == PSNR_PKT_REGISTERED) {
+        h->reg_waiting = 0;
+        h->reg_unanswered = 0;   /* (whatever it says, it answers) */
+        if (h->reg_state == PSNR_HOST_INTRO_UNREACHABLE) h->reg_state = PSNR_HOST_INTRO_REGISTERING;
+        switch (in->status) {
+        case PSNR_INTRO_OK: {
+            if (h->reg_state != PSNR_HOST_INTRO_REGISTERED)
+                printf("[psnr_host] the endpoint has this room: friends can join with its room code\n");
+            h->reg_state = PSNR_HOST_INTRO_REGISTERED;
+            memcpy(h->seen_ip, in->seen.ip, 4);
+            h->seen_port = in->seen.port;
+            const unsigned every = in->refresh >= 5 && in->refresh <= 60 ? in->refresh : 20;
+            h->reg_next = now + every * 1000u;
+            break;
+        }
+        case PSNR_INTRO_SLOW:   /* try again in a few seconds (not an error) */
+            h->reg_next = now + PH_REG_SLOW_MS;
+            break;
+        case PSNR_INTRO_TAKEN:   /* another owner's number: draw another */
+            ph_new_room(h);
+            memset(h->intros, 0, sizeof h->intros);
+            h->reg_state = PSNR_HOST_INTRO_REGISTERING;
+            h->reg_kick = 1;
+            printf("[psnr_host] the room number was another host's: a new one\n");
+            break;
+        case PSNR_INTRO_FULL:
+            if (h->reg_state != PSNR_HOST_INTRO_LIMITED)
+                printf("[psnr_host] the endpoint has no place for another room now (asked again in a minute)\n");
+            h->reg_state = PSNR_HOST_INTRO_LIMITED;
+            h->reg_next = now + PH_REG_FULL_MS;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    if (in->type != PSNR_PKT_INTRO || !in->nonce) return;
+    int at = -1;
+    for (int i = 0; i < PH_INTROS && at < 0; i++)
+        if (h->intros[i].nonce == in->nonce) at = i;
+    const int again = at >= 0;
+    if (!again) {   /* a free entry, else the oldest */
+        at = 0;
+        for (int i = 0; i < PH_INTROS; i++) {
+            if (!h->intros[i].nonce) { at = i; break; }
+            if (h->intros[i].t0 < h->intros[at].t0) at = i;
+        }
+        memset(&h->intros[at], 0, sizeof h->intros[at]);
+        h->intros[at].nonce = in->nonce;
+        h->intros[at].t0 = h->intros[at].next = now;
+    }
+    h->intros[at].n = 0;
+    for (int k = 0; k < in->n && h->intros[at].n < 2; k++)
+        if (in->cands[k].family == 4 && ph_ip_set(in->cands[k].ip) && in->cands[k].port)
+            h->intros[at].c[h->intros[at].n++] = in->cands[k];
+    if (!again) printf("[psnr_host] a friend's game looked this room up: knocking\n");
+}
+
+/* OPEN, OPEN2 (the session's opening), DATA and CLOSE (the session), and the endpoint's packets. */
+static void ph_intro_in(psnr_host* h, const uint8_t* pkt, size_t n, const struct sockaddr_in* from)
+{
+    const uint64_t now = ph_now();
+    uint8_t ip[4];
+    memcpy(ip, &from->sin_addr, 4);
+    const uint16_t port = ntohs(from->sin_port);
+    const int type = psnr_udp_type(pkt, n);
+
+    if (type == PSNR_PKT_DATA || type == PSNR_PKT_CLOSE) {
+        const uint32_t sid = psnr_rudp_session_of(pkt, n);
+        for (int i = 0; i < PH_CLIENTS; i++) {
+            ph_client* c = &h->cl[i];
+            if (!c->sess || psnr_rudp_session(c->sess) != sid || memcmp(c->peer_ip, ip, 4)) continue;
+            c->peer_port = port;   /* (the friend's router may have moved it) */
+            c->last_rx = now;
+            psnr_rudp_input(c->sess, pkt, n, now);
+            psnr_rudp_tick(c->sess, now);
+            ph_sess_read(h, i);
+            return;
+        }
+        if (type == PSNR_PKT_DATA && sid) {   /* a session this host doesn't have (it restarted): over */
+            uint8_t bye[10];
+            const size_t len = psnr_rudp_close_packet(bye, sid, PSNR_RUDP_BYE);
+            PH_SENDTO(h, bye, len, from);
+        }
+        return;
+    }
+
+    psnr_intro_pkt in;
+    if (!psnr_intro_read(pkt, n, &in)) return;
+    PH_LOCK(&h->ilock);
+    if (in.type == PSNR_PKT_REGISTERED || in.type == PSNR_PKT_INTRO) {
+        if (ph_endpoint_set(h) && !memcmp(ip, h->intro.ip, 4) && port == h->intro.port) ph_endpoint_in(h, &in, now);
+        PH_UNLOCK(&h->ilock);
+        return;
+    }
+    if (in.type == PSNR_PKT_OPEN) {   /* COOKIE, at its source: no state until OPEN2 brings the cookie back */
+        if (in.room == h->room) {
+            uint8_t out[32];
+            const uint64_t cookie = psnr_intro_cookie_of(h->cookie_secret, ip, port, in.nonce64, now / 60000u);
+            const size_t len = psnr_intro_cookie(out, in.nonce64, cookie);
+            PH_SENDTO(h, out, len, from);
+        }
+        PH_UNLOCK(&h->ilock);
+        return;
+    }
+    if (in.type != PSNR_PKT_OPEN2) { PH_UNLOCK(&h->ilock); return; }
+    const uint64_t minute = now / 60000u;
+    if (in.cookie != psnr_intro_cookie_of(h->cookie_secret, ip, port, in.nonce64, minute) &&
+        (!minute || in.cookie != psnr_intro_cookie_of(h->cookie_secret, ip, port, in.nonce64, minute - 1))) {
+        PH_UNLOCK(&h->ilock);
+        return;
+    }
+    for (int i = 0; i < PH_INTROS; i++)   /* (the nonce's top half is the LOOKUP's) */
+        if (h->intros[i].nonce && h->intros[i].nonce == (uint32_t)(in.nonce64 >> 32)) h->intros[i].done = 1;
+    PH_UNLOCK(&h->ilock);
+    uint8_t out[32];
+    for (int i = 0; i < PH_CLIENTS; i++) {   /* OPENED was lost: the same again */
+        ph_client* c = &h->cl[i];
+        if (c->sess && c->nonce == in.nonce64 && !memcmp(c->peer_ip, ip, 4)) {
+            c->peer_port = port;
+            const size_t len = psnr_intro_opened(out, in.nonce64, psnr_rudp_session(c->sess));
+            PH_SENDTO(h, out, len, from);
+            return;
+        }
+    }
+    const int ci = ph_slot(h, ip);
+    if (ci < 0) return;   /* (no answer: the friend's TCP try may still get in, or its retry later) */
+    uint32_t sid = 0;
+    while (!sid) {
+        sid = (uint32_t)ph_rand(h);
+        for (int i = 0; i < PH_CLIENTS; i++)
+            if (h->cl[i].sess && psnr_rudp_session(h->cl[i].sess) == sid) sid = 0;
+    }
+    ph_client* c = &h->cl[ci];
+    memset(c, 0, sizeof *c);
+    c->s = PH_BAD;
+    c->host = h;
+    c->sess = psnr_rudp_new(sid, ph_sess_send, c, now);
+    if (!c->sess) return;
+    c->id = ++h->next_id;
+    memcpy(c->ip, ip, 4);
+    memcpy(c->peer_ip, ip, 4);
+    c->peer_port = port;
+    c->nonce = in.nonce64;
+    PH_LOCK(&h->ilock);   /* (the address a guest names this host by: see ph_endpoint) */
+    memcpy(c->via, ph_ip_set(h->intro.home_ip) ? h->intro.home_ip : h->seen_ip, 4);
+    PH_UNLOCK(&h->ilock);
+    c->last_rx = c->born = now;
+    const size_t len = psnr_intro_opened(out, in.nonce64, sid);
+    PH_SENDTO(h, out, len, from);
+    printf("[psnr_host] a friend's game opened a session over UDP\n");
 }
 
 static void ph_udp_in(psnr_host* h, uint8_t* pkt, size_t n, const struct sockaddr_in* from)
@@ -816,7 +1168,7 @@ static void ph_udp_in(psnr_host* h, uint8_t* pkt, size_t n, const struct sockadd
         reply[4] = 0x81;
         memcpy(reply + 5, &from->sin_addr, 4);
         psnr_put16(reply + 9, c->udp_port);
-        sendto(h->udp, (const char*)reply, (int)sizeof reply, 0, (const struct sockaddr*)from, (ph_socklen)sizeof *from);
+        PH_SENDTO(h, reply, sizeof reply, from);
         return;
     }
     if (pkt[4] == 0x03 && n >= 17) {   /* RELAY: from u32 | token u32 | to u32 | payload -> "PSNR" 03 | from | payload */
@@ -827,14 +1179,11 @@ static void ph_udp_in(psnr_host* h, uint8_t* pkt, size_t n, const struct sockadd
             return;
         memmove(pkt + 9, pkt + 17, n - 17);
         psnr_put32(pkt + 5, fid);
-        struct sockaddr_in to;
-        memset(&to, 0, sizeof to);
-        to.sin_family = AF_INET;
-        memcpy(&to.sin_addr, h->cl[dst].udp_ip, 4);
-        to.sin_port = htons(h->cl[dst].udp_port);
-        sendto(h->udp, (const char*)pkt, (int)(n - 8), 0, (const struct sockaddr*)&to, (ph_socklen)sizeof to);
+        const struct sockaddr_in to = ph_addr(h->cl[dst].udp_ip, h->cl[dst].udp_port);
+        PH_SENDTO(h, pkt, n - 8, &to);
+        return;
     }
-    /* PUNCH and anything else: nothing to do */
+    ph_intro_in(h, pkt, n, from);   /* the introductions and the sessions; PUNCH and anything else: nothing to do */
 }
 
 /* ---- connections ---- */
@@ -852,14 +1201,20 @@ static void ph_nonblock(ph_sock s)
 static void ph_drop(psnr_host* h, int ci)
 {
     ph_client* c = &h->cl[ci];
-    if (c->s == PH_BAD) return;
+    if (!PH_USED(c)) return;
     for (int i = 0; i < PH_ROOMS; i++)
         if (h->rooms[i].used) ph_leave(h, &h->rooms[i], ci);
     if (c->hello) {
         h->players--;
+        if (c->sess) h->udp_players--;
         printf("[psnr_host] player %u (\"%s\") gone\n", c->id, c->name);
     }
-    ph_close(c->s);
+    if (c->sess) {
+        psnr_rudp_close(c->sess, PSNR_RUDP_BYE);
+        psnr_rudp_free(c->sess);
+    } else {
+        ph_close(c->s);
+    }
     ph_free(&c->rx);
     ph_free(&c->tx);
     memset(c, 0, sizeof *c);
@@ -874,12 +1229,8 @@ static void ph_accept(psnr_host* h)
     if (s == PH_BAD) return;
     uint8_t ip[4];
     memcpy(ip, &a.sin_addr, 4);
-    int ci = -1, early = 0;
-    for (int i = 0; i < PH_CLIENTS; i++) {
-        if (h->cl[i].s == PH_BAD) { if (ci < 0) ci = i; }
-        else if (!h->cl[i].hello && !h->cl[i].closing && !memcmp(h->cl[i].ip, ip, 4)) early++;   /* still to say it */
-    }
-    if (ci < 0 || early >= PH_EARLY_PER_IP || ph_banned(h, ip, 0)) { ph_close(s); return; }
+    const int ci = ph_slot(h, ip);
+    if (ci < 0) { ph_close(s); return; }
     ph_client* c = &h->cl[ci];
     memset(c, 0, sizeof *c);
     c->s = s;
@@ -908,12 +1259,19 @@ static void ph_read(psnr_host* h, int ci)
         if (ph_put(&c->rx, tmp, (size_t)k)) { c->closing = 2; return; }
         c->last_rx = ph_now();
     }
+    ph_frames(h, ci);
+}
+
+/* Handles each whole frame in a client's rx. */
+static void ph_frames(psnr_host* h, int ci)
+{
+    ph_client* c = &h->cl[ci];
     size_t off = 0;
     while (c->rx.n - off >= 3 && !c->closing) {
         const uint16_t n = psnr_get16(c->rx.b + off + 1);
         if (c->rx.n - off < 3u + n) break;
         ph_message_in(h, ci, c->rx.b[off], c->rx.b + off + 3, n);
-        if (h->cl[ci].s == PH_BAD) return;   /* (dropped as a reconnect) */
+        if (!PH_USED(&h->cl[ci])) return;   /* (dropped as a reconnect) */
         off += 3u + n;
     }
     memmove(c->rx.b, c->rx.b + off, c->rx.n - off);
@@ -929,7 +1287,7 @@ static void* ph_main(void* arg)
     psnr_host* h = (psnr_host*)arg;
     ph_pollfd fds[2 + PH_CLIENTS];
     int who[2 + PH_CLIENTS];
-    uint8_t pkt[2048];
+    uint8_t pkt[2048];   /* (>= PSNR_RUDP_DGRAM) */
     while (!h->stop) {
         ph_take_key(h);
         int n = 0;
@@ -961,16 +1319,51 @@ static void* ph_main(void* arg)
             if (fds[k].revents & POLLOUT) ph_flush(&h->cl[ci]);
             if (fds[k].revents & (POLLIN | POLLERR | POLLHUP)) ph_read(h, ci);
         }
+#ifdef PH_TEST_UDP_IN
+        PH_TEST_UDP_IN(h);   /* (a test's virtual network: its datagrams for this host) */
+#endif
         const uint64_t now = ph_now();
+        ph_intro_tick(h, now);
         for (int i = 0; i < PH_CLIENTS; i++) {
             ph_client* c = &h->cl[i];
-            if (c->s == PH_BAD) continue;
-            if (c->closing == 2 || (c->closing == 1 && !c->tx.n) || now - c->last_rx > PH_TIMEOUT_MS ||
-                (!c->hello && now - c->born > PH_HELLO_MS))
+            if (!PH_USED(c)) continue;
+            int sess_done = 0;   /* a session's closing: once its last reply was acknowledged, or after a while */
+            if (c->sess) {
+                psnr_rudp_tick(c->sess, now);
+                const int dead = psnr_rudp_dead(c->sess, now);
+                if (dead != PSNR_RUDP_ALIVE) {
+                    if (c->hello) printf("[psnr_host] player %u's session is over (%d)\n", c->id, dead);
+                    c->closing = 2;
+                }
+                if (c->closing == 1 && !c->closing_at) c->closing_at = now;
+                sess_done = c->closing == 1 && (psnr_rudp_flushed(c->sess) || now - c->closing_at > PH_SESS_CLOSE_MS);
+            }
+            if (c->closing == 2 || (c->closing == 1 && (c->sess ? sess_done : !c->tx.n)) ||
+                now - c->last_rx > PH_TIMEOUT_MS || (!c->hello && now - c->born > PH_HELLO_MS))
                 ph_drop(h, i);
         }
     }
     return 0;
+}
+
+/* The room servers running, for psnr_host_unregister_all. */
+static ph_lock    s_live_lock = PH_LOCK_STATIC;
+static psnr_host* s_live[4];
+
+static void ph_live_add(psnr_host* h)
+{
+    PH_LOCK(&s_live_lock);
+    for (int i = 0; i < 4; i++)
+        if (!s_live[i]) { s_live[i] = h; break; }
+    PH_UNLOCK(&s_live_lock);
+}
+
+static void ph_live_remove(psnr_host* h)
+{
+    PH_LOCK(&s_live_lock);
+    for (int i = 0; i < 4; i++)
+        if (s_live[i] == h) s_live[i] = NULL;
+    PH_UNLOCK(&s_live_lock);
 }
 
 psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_cap)
@@ -990,6 +1383,9 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
     h->lis = h->udp = PH_BAD;
     for (int i = 0; i < PH_CLIENTS; i++) h->cl[i].s = PH_BAD;
     h->rng = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)h;
+    PH_LOCK_INIT(&h->ilock);
+    ph_new_room(h);
+    for (int i = 0; i < 4; i++) psnr_put64(h->cookie_secret + 8 * i, psnr_intro_random());
     {
         struct sockaddr_in a;
         memset(&a, 0, sizeof a);
@@ -1051,10 +1447,12 @@ psnr_host* psnr_host_start(const psnr_host_config* cfg, char* err, size_t err_ca
 #endif
     printf("[psnr_host] rooms answered on port %u (TCP and UDP)%s\n", (unsigned)h->port,
            cfg->has_key ? ", with a key" : "");
+    ph_live_add(h);
     return h;
 fail:
     if (h->lis != PH_BAD) ph_close(h->lis);
     if (h->udp != PH_BAD) ph_close(h->udp);
+    PH_LOCK_FREE(&h->ilock);
     free(h);
     return NULL;
 #undef PH_FAIL
@@ -1102,6 +1500,7 @@ int psnr_host_members(psnr_host* h)
 void psnr_host_stop(psnr_host* h)
 {
     if (!h) return;
+    ph_live_remove(h);
     h->stop = 1;
 #ifdef _WIN32
     WaitForSingleObject(h->th, INFINITE);
@@ -1112,8 +1511,98 @@ void psnr_host_stop(psnr_host* h)
     for (int i = 0; i < PH_CLIENTS; i++) ph_drop(h, i);
     for (int i = 0; i < PH_ROOMS; i++)
         if (h->rooms[i].used) ph_room_free(&h->rooms[i]);
+    PH_LOCK(&h->ilock);
+    ph_unregister(h);
+    PH_UNLOCK(&h->ilock);
     ph_close(h->lis);
     ph_close(h->udp);
+    PH_LOCK_FREE(&h->ilock);
     printf("[psnr_host] stopped\n");
     free(h);
+}
+
+/* ---- The introductions' API ---- */
+
+void psnr_host_set_intro(psnr_host* h, const psnr_host_intro* in)
+{
+    if (!h || !in) return;
+    PH_LOCK(&h->ilock);
+    const int moved = memcmp(h->intro.ip, in->ip, 4) || h->intro.port != in->port;
+    if (moved) ph_unregister(h);   /* (from the endpoint it had) */
+    h->intro = *in;
+    if (!ph_endpoint_set(h)) {
+        h->reg_state = PSNR_HOST_INTRO_OFF;
+    } else if (moved || h->reg_state == PSNR_HOST_INTRO_OFF) {
+        h->reg_state = PSNR_HOST_INTRO_REGISTERING;
+        h->reg_unanswered = h->reg_waiting = 0;
+        memset(h->seen_ip, 0, 4);
+        h->seen_port = 0;
+    }
+    h->reg_kick = ph_endpoint_set(h);   /* (now: also when only the candidates changed) */
+    PH_UNLOCK(&h->ilock);
+}
+
+uint64_t psnr_host_room(psnr_host* h)
+{
+    if (!h) return 0;
+    PH_LOCK(&h->ilock);
+    const uint64_t r = h->room;
+    PH_UNLOCK(&h->ilock);
+    return r;
+}
+
+uint64_t psnr_host_new_room(psnr_host* h)
+{
+    if (!h) return 0;
+    PH_LOCK(&h->ilock);
+    ph_unregister(h);
+    ph_new_room(h);
+    memset(h->intros, 0, sizeof h->intros);
+    if (ph_endpoint_set(h)) {
+        h->reg_state = PSNR_HOST_INTRO_REGISTERING;
+        h->reg_unanswered = h->reg_waiting = 0;
+        h->reg_kick = 1;
+    }
+    const uint64_t r = h->room;
+    PH_UNLOCK(&h->ilock);
+    return r;
+}
+
+void psnr_host_intro_get(psnr_host* h, psnr_host_intro_info* out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!h) return;
+    const uint64_t now = ph_now();
+    PH_LOCK(&h->ilock);
+    out->state = h->reg_state;
+    out->room = h->room;
+    memcpy(out->seen_ip, h->seen_ip, 4);
+    out->seen_port = h->seen_port;
+    for (int i = 0; i < PH_INTROS; i++)
+        if (h->intros[i].nonce && !h->intros[i].done && now - h->intros[i].t0 >= PH_STUCK_MS &&
+            now - h->intros[i].t0 < PH_STUCK_FOR_MS)
+            out->stuck = 1;
+    out->udp_players = h->udp_players;
+    PH_UNLOCK(&h->ilock);
+}
+
+void psnr_host_unregister_all(void)
+{
+    PH_LOCK(&s_live_lock);
+    for (int i = 0; i < 4; i++) {
+        psnr_host* h = s_live[i];
+        if (!h) continue;
+        PH_LOCK(&h->ilock);
+        ph_unregister(h);
+        memset(h->intro.ip, 0, 4);   /* (and no REGISTER after it) */
+        h->reg_state = PSNR_HOST_INTRO_OFF;
+        PH_UNLOCK(&h->ilock);
+    }
+    PH_UNLOCK(&s_live_lock);
+}
+
+int psnr_host_resolve(const char* name, uint8_t ip[4])
+{
+    return psnr_resolve4(name, ip);
 }

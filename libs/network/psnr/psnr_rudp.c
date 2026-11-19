@@ -136,6 +136,11 @@ size_t psnr_rudp_readable(const psnr_rudp* r)
     return r->in_n - r->in_off;
 }
 
+int psnr_rudp_flushed(const psnr_rudp* r)
+{
+    return r->q_n == 0 && r->una == r->next;
+}
+
 size_t psnr_rudp_read(psnr_rudp* r, void* out, size_t cap)
 {
     size_t n = r->in_n - r->in_off;

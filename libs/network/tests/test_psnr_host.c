@@ -2,21 +2,28 @@
  * test_psnr_host - the in-process room server (psnr/psnr_host.c) against the
  * real client (psnr/psnr.c) on loopback: the key, rooms, pushes, the probe,
  * the relay, a reconnect and the ban; a spent key, a new key and connections
- * that never say HELLO; and the invite code (net_invite.c).
+ * that never say HELLO; the introductions and a player over a punched UDP session (a socket of this test plays the
+ * endpoint, another the friend's P2P port); and the invite code (net_invite.c).
  *
- *   clang-cl /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c ws2_32.lib
- *   cc -std=gnu17 -I include -o test_psnr_host libs/network/tests/test_psnr_host.c -lpthread
+ *   clang-cl /I include /Fe:test_psnr_host.exe libs/network/tests/test_psnr_host.c
+ *            third_party/monocypher/monocypher.c ws2_32.lib
+ *   cc -std=gnu17 -I include -o test_psnr_host libs/network/tests/test_psnr_host.c third_party/monocypher/monocypher.c
+ *      -lpthread
  */
 #ifdef _WIN32
 #  define _CRT_RAND_S   /* net_invite.c's rand_s, before the first stdlib.h of this one file */
 #endif
 #include "../psnr/psnr.c"
 #include "../psnr/psnr_rudp.c"
+#include "../psnr/psnr_intro.c"
 /* smaller limits, so the test reaches them: wrong keys before the key is spent (and before an address is
  * ignored, a few more), and the time to say HELLO */
 #define PH_KEY_TRIES 4
 #define PH_BAD_KEYS  8
 #define PH_HELLO_MS  300
+#define PH_REG_RETRY_MS 100
+#define PH_KNOCK_FOR_MS 600
+#define PH_STUCK_MS  300
 #include "../psnr/psnr_host.c"
 #include "../net_invite.c"
 
@@ -450,6 +457,314 @@ static void test_split(void)
     psnr_host_stop(h);
 }
 
+/* ---- The introductions, and a player over UDP ---- */
+
+static ph_sock s_fsock;            /* the friend's P2P port */
+static uint16_t s_fport, s_hport;
+static ph_lock s_flock = PH_LOCK_STATIC;
+static psnr_client* s_fc;          /* the session being read (under s_flock) */
+static volatile int s_fstop;
+static uint8_t s_mail[256];        /* the last packet that wasn't the session's */
+static volatile int s_mail_n;      /* (0: empty; the reader drops what comes while it is full) */
+
+static void f_send(void* ctx, const uint8_t* p, size_t n)
+{
+    (void)ctx;
+    udp_send(s_fsock, p, n, s_hport);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI f_reader(LPVOID u)
+#else
+static void* f_reader(void* u)
+#endif
+{
+    (void)u;
+    uint8_t buf[2048];
+    while (!s_fstop) {
+        const int n = udp_recv(s_fsock, buf, (int)sizeof buf, 20);
+        if (n <= 0) continue;
+        const int t = psnr_udp_type(buf, (size_t)n);
+        if (t == PSNR_PKT_DATA || t == PSNR_PKT_CLOSE) {
+            PH_LOCK(&s_flock);
+            if (s_fc) psnr_session_input(s_fc, buf, (size_t)n);
+            PH_UNLOCK(&s_flock);
+        } else if (!s_mail_n && n <= (int)sizeof s_mail) {
+            memcpy(s_mail, buf, (size_t)n);
+            s_mail_n = n;
+        }
+    }
+    return 0;
+}
+
+/* The next packet of this type at the friend's port within ms (others dropped): 1, with it read into out. */
+static int f_wait(int type, psnr_intro_pkt* out, int ms)
+{
+    for (int t = 0; t < ms; t += 5) {
+        if (s_mail_n) {
+            const int ok = psnr_intro_read(s_mail, (size_t)s_mail_n, out) && out->type == type;
+            s_mail_n = 0;
+            if (ok) return 1;
+            continue;
+        }
+        sleep_ms(5);
+    }
+    return 0;
+}
+
+/* The next packet at the endpoint's socket within ms: 1, read into out (and its source port). */
+static int e_wait(ph_sock e, int type, psnr_intro_pkt* out, uint16_t* from_port, int ms)
+{
+    uint8_t buf[256];
+    for (int t = 0; t < ms; t += 10) {
+        struct sockaddr_in a;
+        ph_socklen al = (ph_socklen)sizeof a;
+        ph_pollfd pf;
+        pf.fd = e; pf.events = POLLIN; pf.revents = 0;
+        if (PH_POLL(&pf, 1, 10) <= 0) continue;
+        const int n = (int)recvfrom(e, (char*)buf, (int)sizeof buf, 0, (struct sockaddr*)&a, &al);
+        if (n > 0 && psnr_intro_read(buf, (size_t)n, out) && out->type == type) {
+            if (from_port) *from_port = ntohs(a.sin_port);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void e_drain(ph_sock e)
+{
+    uint8_t buf[256];
+    while (udp_recv(e, buf, (int)sizeof buf, 0) > 0) {}
+}
+
+/* OPEN, COOKIE, OPEN2, OPENED: the session's number, or 0. */
+static uint32_t f_open(uint64_t room, uint64_t nonce)
+{
+    uint8_t pkt[PSNR_INTRO_REQ_LEN];
+    psnr_intro_pkt in;
+    udp_send(s_fsock, pkt, psnr_intro_open(pkt, room, nonce), s_hport);
+    if (!f_wait(PSNR_PKT_COOKIE, &in, 1000) || in.nonce64 != nonce) return 0;
+    udp_send(s_fsock, pkt, psnr_intro_open2(pkt, nonce, in.cookie), s_hport);
+    if (!f_wait(PSNR_PKT_OPENED, &in, 1000) || in.nonce64 != nonce) return 0;
+    return in.session;
+}
+
+static void test_intro(void)
+{
+    psnr_host_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.bind_loopback = 1;
+    cfg.has_key = 1;
+    net_invite_key_blob(0x0FA57, cfg.key);
+    char err[128] = "";
+    psnr_host* h = psnr_host_start(&cfg, err, sizeof err);
+    CHECK(h != NULL);
+    if (!h) { printf("start: %s\n", err); return; }
+    s_hport = psnr_host_port(h);
+    const uint8_t lo[4] = {127, 0, 0, 1};
+    psnr_host_intro_info info;
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_OFF && info.room != 0 && info.room < (1ull << PSNR_HOST_ROOM_BITS));
+    CHECK(psnr_host_room(h) == info.room);
+
+    /* REGISTER from the room server's own UDP port, again until answered; REGISTERED */
+    uint16_t eport = 0;
+    ph_sock e = udp_socket(&eport);
+    psnr_host_intro in_cfg;
+    memset(&in_cfg, 0, sizeof in_cfg);
+    memcpy(in_cfg.ip, lo, 4);
+    in_cfg.port = eport;
+    in_cfg.version = 7;
+    memcpy(in_cfg.home_ip, lo, 4);
+    psnr_host_set_intro(h, &in_cfg);
+    psnr_intro_pkt in;
+    uint16_t from = 0;
+    CHECK(e_wait(e, PSNR_PKT_REGISTER, &in, &from, 1000));
+    CHECK(from == s_hport && in.version == 7 && in.room == psnr_host_room(h) && in.room_port == s_hport);
+    CHECK(in.n == 1 && !memcmp(in.cands[0].ip, lo, 4) && in.cands[0].port == s_hport);
+    const uint64_t owner = in.owner;
+    CHECK(owner != 0);
+    CHECK(e_wait(e, PSNR_PKT_REGISTER, &in, &from, 1000) && in.owner == owner);   /* (not answered: again) */
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_REGISTERING);
+    uint8_t pkt[PSNR_INTRO_REQ_LEN];
+    const psnr_cand seen = psnr_cand_of((const uint8_t[4]){127, 0, 0, 1}, s_hport);
+    udp_send(e, pkt, psnr_intro_registered(pkt, psnr_host_room(h), PSNR_INTRO_OK, &seen, 20), s_hport);
+    sleep_ms(150);
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_REGISTERED && info.seen_port == s_hport && !memcmp(info.seen_ip, lo, 4));
+    e_drain(e);
+    CHECK(!e_wait(e, PSNR_PKT_REGISTER, &in, NULL, 400));   /* (answered: the next one in 20 s) */
+
+    /* INTRO: the friend's port gets KNOCKs, for a while */
+    s_fsock = udp_socket(&s_fport);
+    s_fstop = 0;
+#ifdef _WIN32
+    HANDLE rth = CreateThread(NULL, 0, f_reader, NULL, 0, NULL);
+#else
+    pthread_t rth;
+    pthread_create(&rth, NULL, f_reader, NULL);
+#endif
+    const psnr_cand fc = psnr_cand_of(lo, s_fport);
+    const uint64_t room = psnr_host_room(h);
+    udp_send(e, pkt, psnr_intro_intro(pkt, room, 0xABCD1234u, PSNR_INTRO_SAME_NETWORK, &fc, 1), s_hport);
+    CHECK(f_wait(PSNR_PKT_KNOCK, &in, 1000) && in.room == room && in.nonce == 0xABCD1234u);
+    udp_send(e, pkt, psnr_intro_intro(pkt, room ^ 1, 0x5151u, 0, &fc, 1), s_hport);   /* another room's: nothing */
+    sleep_ms(PH_KNOCK_FOR_MS + 100);
+    s_mail_n = 0;
+    CHECK(!f_wait(PSNR_PKT_KNOCK, &in, 400));   /* (stopped) */
+    udp_send(s_fsock, pkt, psnr_intro_intro(pkt, room, 0x7777u, 0, &fc, 1), s_hport);   /* (not from the endpoint) */
+    sleep_ms(50);
+    s_mail_n = 0;
+    CHECK(!f_wait(PSNR_PKT_KNOCK, &in, 300));
+
+    /* the opening: a wrong room or a wrong cookie gets nothing; OPENED once, and the same again for a copy */
+    udp_send(s_fsock, pkt, psnr_intro_open(pkt, room ^ 1, 77), s_hport);
+    CHECK(!f_wait(PSNR_PKT_COOKIE, &in, 300));
+    udp_send(s_fsock, pkt, psnr_intro_open2(pkt, 77, 12345), s_hport);
+    CHECK(!f_wait(PSNR_PKT_OPENED, &in, 300));
+    psnr_host_intro_get(h, &info);
+    CHECK(info.stuck == 1);   /* introduced, not connected */
+    const uint64_t nonce = (uint64_t)0xABCD1234u << 32 | 1;
+    const uint32_t sid = f_open(room, nonce);
+    CHECK(sid != 0);
+    CHECK(f_open(room, nonce) == sid);
+    psnr_host_intro_get(h, &info);
+    CHECK(info.stuck == 0 && info.udp_players == 0);
+    CHECK(psnr_host_players(h) == 0);
+
+    /* HELLO over the session, the probe through the same path, a push back */
+    psnr_rudp* sess = psnr_rudp_new(sid, f_send, NULL, now_ms());
+    psnr_client* c = psnr_session_client(sess, lo, s_hport, lo);
+    PH_LOCK(&s_flock);
+    s_fc = c;
+    PH_UNLOCK(&s_flock);
+    uint32_t uid = 0;
+    uint8_t ip[4];
+    CHECK(psnr_hello(c, kComm, "Foxtrot", 3743, cfg.key, &uid, ip) == 0 && uid != 0 && ip[0] == 127);
+    CHECK(psnr_host_players(h) == 1);
+    psnr_host_intro_get(h, &info);
+    CHECK(info.udp_players == 1);
+    psnr_msg m;
+    memset(&m, 0, sizeof m);
+    uint8_t cr[64];
+    memset(cr, 0, sizeof cr);
+    cr[0] = 4;   /* CREATE_ROOM: max u8 | flags u32 | ext | in | my data (empty blobs) */
+    CHECK(psnr_call(c, PSNR_CREATE_ROOM, cr, 1 + 4 + 2 + 2 + 2, &m, 3000) == 1 && m.type == PSNR_ROOM_JOINED);
+    if (m.type) psnr_msg_free(&m);
+    {   /* PROBE from the friend's port: its answer says the address the host saw */
+        uint8_t probe[17];
+        memcpy(probe, "PSNR", 4);
+        probe[4] = 0x01;
+        psnr_put32(probe + 5, uid);
+        psnr_put32(probe + 9, c->token);
+        memcpy(probe + 13, lo, 4);
+        s_mail_n = 0;
+        udp_send(s_fsock, probe, sizeof probe, s_hport);
+        int got = 0;
+        for (int t = 0; t < 1000 && !got; t += 5) {
+            if (s_mail_n >= 11 && s_mail[4] == 0x81) got = psnr_get16(s_mail + 9) == s_fport;
+            else sleep_ms(5);
+        }
+        CHECK(got);
+    }
+
+    /* a second session with a wrong key: refused, and the session closes after the answer arrived */
+    {
+        const uint32_t sid2 = f_open(room, nonce + 1);
+        CHECK(sid2 != 0 && sid2 != sid);
+        PH_LOCK(&s_flock);
+        s_fc = NULL;
+        PH_UNLOCK(&s_flock);
+        psnr_rudp* s2 = psnr_rudp_new(sid2, f_send, NULL, now_ms());
+        psnr_client* c2 = psnr_session_client(s2, lo, s_hport, lo);
+        PH_LOCK(&s_flock);
+        s_fc = c2;
+        PH_UNLOCK(&s_flock);
+        uint8_t wrong[32];
+        net_invite_key_blob(0x0BADBAD, wrong);
+        CHECK(psnr_hello(c2, kComm, "Golf", 3744, wrong, &uid, ip) == -1 && psnr_connect_error() == PSNR_E_REFUSED);
+        int closed = 0;
+        for (int t = 0; t < 2000 && !closed; t += 10) {
+            PH_LOCK(&s_flock);
+            closed = psnr_rudp_dead(s2, now_ms()) == PSNR_RUDP_CLOSED;
+            PH_UNLOCK(&s_flock);
+            if (!closed) sleep_ms(10);
+        }
+        CHECK(closed);
+        PH_LOCK(&s_flock);
+        s_fc = c;
+        PH_UNLOCK(&s_flock);
+        psnr_close(c2);
+    }
+    CHECK(psnr_host_players(h) == 1);
+
+    /* the number taken by another owner: a new one, registered at once */
+    e_drain(e);
+    udp_send(e, pkt, psnr_intro_registered(pkt, room, PSNR_INTRO_TAKEN, &seen, 20), s_hport);
+    CHECK(e_wait(e, PSNR_PKT_REGISTER, &in, NULL, 1000));
+    CHECK(in.room != room && in.room == psnr_host_room(h) && in.owner != owner);
+    const uint64_t room2 = in.room, owner2 = in.owner;
+    /* "slow down": not an error, asked again later */
+    udp_send(e, pkt, psnr_intro_registered(pkt, room2, PSNR_INTRO_SLOW, &seen, 20), s_hport);
+    sleep_ms(100);
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_REGISTERING);
+    /* New code: the old number unregistered, the new one registered; the player stays */
+    e_drain(e);
+    const uint64_t room3 = psnr_host_new_room(h);
+    CHECK(room3 != room2 && room3 == psnr_host_room(h));
+    CHECK(e_wait(e, PSNR_PKT_UNREGISTER, &in, NULL, 500) && in.room == room2 && in.owner == owner2);
+    CHECK(e_wait(e, PSNR_PKT_REGISTER, &in, NULL, 500) && in.room == room3);
+    udp_send(s_fsock, pkt, psnr_intro_open(pkt, room2, 99), s_hport);   /* the old number opens nothing */
+    s_mail_n = 0;
+    CHECK(!f_wait(PSNR_PKT_COOKIE, &in, 300));
+    CHECK(psnr_host_players(h) == 1);
+    /* no place for another room */
+    udp_send(e, pkt, psnr_intro_registered(pkt, room3, PSNR_INTRO_FULL, &seen, 20), s_hport);
+    sleep_ms(100);
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_LIMITED);
+
+    /* the endpoint stops answering: unreachable after three */
+    psnr_host_set_intro(h, &in_cfg);   /* (asks again now) */
+    sleep_ms(PH_REG_RETRY_MS * (PH_REG_LOST + 2));
+    psnr_host_intro_get(h, &info);
+    CHECK(info.state == PSNR_HOST_INTRO_UNREACHABLE);
+
+    /* the window's close: UNREGISTER at once, and nothing after it */
+    e_drain(e);
+    psnr_host_unregister_all();
+    CHECK(e_wait(e, PSNR_PKT_UNREGISTER, &in, NULL, 300) && in.room == room3);
+    e_drain(e);
+    sleep_ms(PH_REG_SLOW_MS / 10);
+    CHECK(!e_wait(e, PSNR_PKT_REGISTER, &in, NULL, 200));
+
+    /* the host stops: the session hears it */
+    psnr_host_stop(h);
+    int over = 0;
+    for (int t = 0; t < 1000 && !over; t += 10) {
+        PH_LOCK(&s_flock);
+        over = psnr_rudp_dead(sess, now_ms()) == PSNR_RUDP_CLOSED;
+        PH_UNLOCK(&s_flock);
+        if (!over) sleep_ms(10);
+    }
+    CHECK(over);
+    PH_LOCK(&s_flock);
+    s_fc = NULL;
+    PH_UNLOCK(&s_flock);
+    psnr_close(c);
+    s_fstop = 1;
+#ifdef _WIN32
+    WaitForSingleObject(rth, INFINITE);
+    CloseHandle(rth);
+#else
+    pthread_join(rth, NULL);
+#endif
+    ph_close(s_fsock);
+    ph_close(e);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -459,6 +774,7 @@ int main(void)
     test_full();
     test_early();
     test_split();
+    test_intro();
 
     psnr_host_config cfg;
     memset(&cfg, 0, sizeof cfg);

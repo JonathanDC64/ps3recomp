@@ -133,6 +133,9 @@ static void test_streams(void)
     printf("bad link (20%% lost, 10%% copied, reordered): 2 x 100000 bytes in %llu ms, %u + %u datagrams\n",
            (unsigned long long)took, s_sent[0], s_sent[1]);
     CHECK(psnr_rudp_dead(s_end[0], s_now) == PSNR_RUDP_ALIVE && psnr_rudp_dead(s_end[1], s_now) == PSNR_RUDP_ALIVE);
+    for (int i = 0; i < 200 && !(psnr_rudp_flushed(s_end[0]) && psnr_rudp_flushed(s_end[1])); i++) step(10);
+    CHECK(psnr_rudp_flushed(s_end[0]) && psnr_rudp_flushed(s_end[1]));   /* (all acknowledged, in the end) */
+    CHECK(psnr_rudp_write(s_end[0], "x", 1, s_now) == 0 && !psnr_rudp_flushed(s_end[0]));
 
     /* single bytes, and one write of a message far larger than a datagram (a psnr frame can be 64 KB) */
     fresh(0x33333333);

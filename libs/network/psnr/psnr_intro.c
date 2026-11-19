@@ -14,30 +14,30 @@
 extern int __cdecl rand_s(unsigned int* value);
 #endif
 
-static uint8_t* head(uint8_t* out, uint8_t type)
+static uint8_t* pi_head(uint8_t* out, uint8_t type)
 {
     memcpy(out, "PSNR", 4);
     out[4] = type;
     return out + 5;
 }
 
-static uint8_t* put_cand(uint8_t* p, const psnr_cand* c)
+static uint8_t* pi_put_cand(uint8_t* p, const psnr_cand* c)
 {
     *p++ = 4;
     memcpy(p, c->ip, 4);
     return psnr_put16(p + 4, c->port);
 }
 
-static uint8_t* put_cands(uint8_t* p, const psnr_cand* c, int n, int most)
+static uint8_t* pi_put_cands(uint8_t* p, const psnr_cand* c, int n, int most)
 {
     if (n < 0) n = 0;
     if (n > most) n = most;
     *p++ = (uint8_t)n;
-    for (int i = 0; i < n; i++) p = put_cand(p, &c[i]);
+    for (int i = 0; i < n; i++) p = pi_put_cand(p, &c[i]);
     return p;
 }
 
-static size_t padded(uint8_t* out, uint8_t* end)
+static size_t pi_padded(uint8_t* out, uint8_t* end)
 {
     const size_t n = (size_t)(end - out);
     if (n < PSNR_INTRO_REQ_LEN) memset(end, 0, PSNR_INTRO_REQ_LEN - n);
@@ -47,52 +47,52 @@ static size_t padded(uint8_t* out, uint8_t* end)
 size_t psnr_intro_register(uint8_t out[PSNR_INTRO_REQ_LEN], uint16_t version, uint64_t room, uint64_t owner,
                            uint16_t room_port, const psnr_cand* cands, int n)
 {
-    uint8_t* p = head(out, PSNR_PKT_REGISTER);
+    uint8_t* p = pi_head(out, PSNR_PKT_REGISTER);
     p = psnr_put16(p, version);
     p = psnr_put64(p, room);
     p = psnr_put64(p, owner);
     p = psnr_put16(p, room_port);
-    return padded(out, put_cands(p, cands, n, 2));
+    return pi_padded(out, pi_put_cands(p, cands, n, 2));
 }
 
 size_t psnr_intro_unregister(uint8_t out[PSNR_INTRO_REQ_LEN], uint64_t room, uint64_t owner)
 {
-    uint8_t* p = head(out, PSNR_PKT_UNREGISTER);
+    uint8_t* p = pi_head(out, PSNR_PKT_UNREGISTER);
     p = psnr_put64(p, room);
-    return padded(out, psnr_put64(p, owner));
+    return pi_padded(out, psnr_put64(p, owner));
 }
 
 size_t psnr_intro_lookup(uint8_t out[PSNR_INTRO_REQ_LEN], uint16_t version, uint64_t room, uint32_t nonce,
                          const psnr_cand* own)
 {
-    uint8_t* p = head(out, PSNR_PKT_LOOKUP);
+    uint8_t* p = pi_head(out, PSNR_PKT_LOOKUP);
     p = psnr_put16(p, version);
     p = psnr_put64(p, room);
     p = psnr_put32(p, nonce);
-    return padded(out, put_cands(p, own, own ? 1 : 0, 1));
+    return pi_padded(out, pi_put_cands(p, own, own ? 1 : 0, 1));
 }
 
 size_t psnr_intro_open(uint8_t out[PSNR_INTRO_REQ_LEN], uint64_t room, uint64_t nonce)
 {
-    uint8_t* p = head(out, PSNR_PKT_OPEN);
+    uint8_t* p = pi_head(out, PSNR_PKT_OPEN);
     p = psnr_put64(p, room);
-    return padded(out, psnr_put64(p, nonce));
+    return pi_padded(out, psnr_put64(p, nonce));
 }
 
 size_t psnr_intro_open2(uint8_t out[PSNR_INTRO_REQ_LEN], uint64_t nonce, uint64_t cookie)
 {
-    uint8_t* p = head(out, PSNR_PKT_OPEN2);
+    uint8_t* p = pi_head(out, PSNR_PKT_OPEN2);
     p = psnr_put64(p, nonce);
-    return padded(out, psnr_put64(p, cookie));
+    return pi_padded(out, psnr_put64(p, cookie));
 }
 
 size_t psnr_intro_registered(uint8_t* out, uint64_t room, uint8_t status, const psnr_cand* seen, uint8_t refresh_s)
 {
     static const psnr_cand none;
-    uint8_t* p = head(out, PSNR_PKT_REGISTERED);
+    uint8_t* p = pi_head(out, PSNR_PKT_REGISTERED);
     p = psnr_put64(p, room);
     *p++ = status;
-    p = put_cand(p, seen ? seen : &none);
+    p = pi_put_cand(p, seen ? seen : &none);
     *p++ = refresh_s;
     return (size_t)(p - out);
 }
@@ -101,51 +101,51 @@ size_t psnr_intro_found(uint8_t* out, uint64_t room, uint32_t nonce, uint8_t sta
                         const psnr_cand* seen, uint16_t room_port, const psnr_cand* cands, int n)
 {
     static const psnr_cand none;
-    uint8_t* p = head(out, PSNR_PKT_FOUND);
+    uint8_t* p = pi_head(out, PSNR_PKT_FOUND);
     p = psnr_put64(p, room);
     p = psnr_put32(p, nonce);
     *p++ = status;
     *p++ = flags;
-    p = put_cand(p, seen ? seen : &none);
+    p = pi_put_cand(p, seen ? seen : &none);
     p = psnr_put16(p, room_port);
-    return (size_t)(put_cands(p, cands, n, 3) - out);
+    return (size_t)(pi_put_cands(p, cands, n, 3) - out);
 }
 
 size_t psnr_intro_intro(uint8_t* out, uint64_t room, uint32_t nonce, uint8_t flags, const psnr_cand* cands, int n)
 {
-    uint8_t* p = head(out, PSNR_PKT_INTRO);
+    uint8_t* p = pi_head(out, PSNR_PKT_INTRO);
     p = psnr_put64(p, room);
     p = psnr_put32(p, nonce);
     *p++ = flags;
-    return (size_t)(put_cands(p, cands, n, 2) - out);
+    return (size_t)(pi_put_cands(p, cands, n, 2) - out);
 }
 
 size_t psnr_intro_knock(uint8_t* out, uint64_t room, uint32_t nonce)
 {
-    uint8_t* p = head(out, PSNR_PKT_KNOCK);
+    uint8_t* p = pi_head(out, PSNR_PKT_KNOCK);
     p = psnr_put64(p, room);
     return (size_t)(psnr_put32(p, nonce) - out);
 }
 
 size_t psnr_intro_cookie(uint8_t* out, uint64_t nonce, uint64_t cookie)
 {
-    uint8_t* p = head(out, PSNR_PKT_COOKIE);
+    uint8_t* p = pi_head(out, PSNR_PKT_COOKIE);
     p = psnr_put64(p, nonce);
     return (size_t)(psnr_put64(p, cookie) - out);
 }
 
 size_t psnr_intro_opened(uint8_t* out, uint64_t nonce, uint32_t session)
 {
-    uint8_t* p = head(out, PSNR_PKT_OPENED);
+    uint8_t* p = pi_head(out, PSNR_PKT_OPENED);
     p = psnr_put64(p, nonce);
     return (size_t)(psnr_put32(p, session) - out);
 }
 
 /* ---- reading ---- */
 
-typedef struct { const uint8_t* p; size_t n; int err; } rd;
+typedef struct { const uint8_t* p; size_t n; int err; } pi_rd;
 
-static const uint8_t* take(rd* r, size_t n)
+static const uint8_t* pi_take(pi_rd* r, size_t n)
 {
     static const uint8_t zero[8];
     if (r->err || r->n < n) { r->err = 1; return zero; }
@@ -154,24 +154,24 @@ static const uint8_t* take(rd* r, size_t n)
     r->n -= n;
     return p;
 }
-static uint8_t  r8(rd* r)  { return *take(r, 1); }
-static uint16_t r16(rd* r) { return psnr_get16(take(r, 2)); }
-static uint32_t r32(rd* r) { return psnr_get32(take(r, 4)); }
-static uint64_t r64(rd* r) { return psnr_get64(take(r, 8)); }
+static uint8_t  pi_r8(pi_rd* r)  { return *pi_take(r, 1); }
+static uint16_t pi_r16(pi_rd* r) { return psnr_get16(pi_take(r, 2)); }
+static uint32_t pi_r32(pi_rd* r) { return psnr_get32(pi_take(r, 4)); }
+static uint64_t pi_r64(pi_rd* r) { return psnr_get64(pi_take(r, 8)); }
 
-static void r_cand(rd* r, psnr_cand* c)
+static void pi_r_cand(pi_rd* r, psnr_cand* c)
 {
-    c->family = r8(r);
-    memcpy(c->ip, take(r, 4), 4);
-    c->port = r16(r);
+    c->family = pi_r8(r);
+    memcpy(c->ip, pi_take(r, 4), 4);
+    c->port = pi_r16(r);
     if (c->family != 4) r->err = 1;   /* (IPv4 only for now: the family byte leaves room for IPv6) */
 }
 
-static void r_cands(rd* r, psnr_intro_pkt* o, int most)
+static void pi_r_cands(pi_rd* r, psnr_intro_pkt* o, int most)
 {
-    const int n = r8(r);
+    const int n = pi_r8(r);
     if (n > most) { r->err = 1; return; }
-    for (int i = 0; i < n && !r->err; i++) r_cand(r, &o->cands[i]);
+    for (int i = 0; i < n && !r->err; i++) pi_r_cand(r, &o->cands[i]);
     o->n = r->err ? 0 : n;
 }
 
@@ -184,60 +184,60 @@ int psnr_udp_type(const void* buf, size_t len)
 int psnr_intro_read(const void* buf, size_t len, psnr_intro_pkt* o)
 {
     const int type = psnr_udp_type(buf, len);
-    rd r = { (const uint8_t*)buf + 5, len >= 5 ? len - 5 : 0, 0 };
+    pi_rd r = { (const uint8_t*)buf + 5, len >= 5 ? len - 5 : 0, 0 };
     memset(o, 0, sizeof *o);
     if (type < 0) return 0;
     o->type = (uint8_t)type;
     switch (type) {
     case PSNR_PKT_REGISTER:
         if (len < PSNR_INTRO_REQ_LEN) return 0;   /* (padded: no answer is bigger than a request) */
-        o->version = r16(&r); o->room = r64(&r); o->owner = r64(&r); o->room_port = r16(&r);
-        r_cands(&r, o, 2);
+        o->version = pi_r16(&r); o->room = pi_r64(&r); o->owner = pi_r64(&r); o->room_port = pi_r16(&r);
+        pi_r_cands(&r, o, 2);
         break;
     case PSNR_PKT_UNREGISTER:
         if (len < PSNR_INTRO_REQ_LEN) return 0;
-        o->room = r64(&r); o->owner = r64(&r);
+        o->room = pi_r64(&r); o->owner = pi_r64(&r);
         break;
     case PSNR_PKT_LOOKUP:
         if (len < PSNR_INTRO_REQ_LEN) return 0;
-        o->version = r16(&r); o->room = r64(&r); o->nonce = r32(&r);
-        r_cands(&r, o, 1);
+        o->version = pi_r16(&r); o->room = pi_r64(&r); o->nonce = pi_r32(&r);
+        pi_r_cands(&r, o, 1);
         break;
     case PSNR_PKT_REGISTERED:
-        o->room = r64(&r); o->status = r8(&r);
-        r_cand(&r, &o->seen);
-        o->refresh = r8(&r);
+        o->room = pi_r64(&r); o->status = pi_r8(&r);
+        pi_r_cand(&r, &o->seen);
+        o->refresh = pi_r8(&r);
         break;
     case PSNR_PKT_FOUND:
-        o->room = r64(&r); o->nonce = r32(&r); o->status = r8(&r);
+        o->room = pi_r64(&r); o->nonce = pi_r32(&r); o->status = pi_r8(&r);
         if (r.err) return 0;
         if (o->status != PSNR_INTRO_OK && r.n == 0) return 1;   /* (a refusal may stop after its status) */
-        o->flags = r8(&r);
-        r_cand(&r, &o->seen);
-        o->room_port = r16(&r);
-        r_cands(&r, o, 3);
+        o->flags = pi_r8(&r);
+        pi_r_cand(&r, &o->seen);
+        o->room_port = pi_r16(&r);
+        pi_r_cands(&r, o, 3);
         if (r.err && o->status != PSNR_INTRO_OK) { memset(&o->seen, 0, sizeof o->seen); o->n = 0; return 1; }
         break;
     case PSNR_PKT_INTRO:
-        o->room = r64(&r); o->nonce = r32(&r); o->flags = r8(&r);
-        r_cands(&r, o, 2);
+        o->room = pi_r64(&r); o->nonce = pi_r32(&r); o->flags = pi_r8(&r);
+        pi_r_cands(&r, o, 2);
         break;
     case PSNR_PKT_KNOCK:
-        o->room = r64(&r); o->nonce = r32(&r);
+        o->room = pi_r64(&r); o->nonce = pi_r32(&r);
         break;
     case PSNR_PKT_OPEN:
         if (len < PSNR_INTRO_REQ_LEN) return 0;
-        o->room = r64(&r); o->nonce64 = r64(&r);
+        o->room = pi_r64(&r); o->nonce64 = pi_r64(&r);
         break;
     case PSNR_PKT_OPEN2:
         if (len < PSNR_INTRO_REQ_LEN) return 0;
-        o->nonce64 = r64(&r); o->cookie = r64(&r);
+        o->nonce64 = pi_r64(&r); o->cookie = pi_r64(&r);
         break;
     case PSNR_PKT_COOKIE:
-        o->nonce64 = r64(&r); o->cookie = r64(&r);
+        o->nonce64 = pi_r64(&r); o->cookie = pi_r64(&r);
         break;
     case PSNR_PKT_OPENED:
-        o->nonce64 = r64(&r); o->session = r32(&r);
+        o->nonce64 = pi_r64(&r); o->session = pi_r32(&r);
         break;
     default:
         return 0;

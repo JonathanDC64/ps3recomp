@@ -24,6 +24,10 @@
  *   - No relay streams and no scores (ERROR replies).
  *   - Small fixed limits (a few rooms of a few players).
  *   - No player addresses in the log.
+ *   - Players who can't reach its TCP port (no port forward) can join over UDP: the endpoint (a small part of a
+ *     psnr server, on its UDP port; psnr_intro.h) tells the host's room server and the friend's game each other's
+ *     addresses, both punch through their routers, and the friend's session runs over a reliable layer on that
+ *     path (psnr_rudp.h). Such a player is a client like the others: same HELLO, key check, bans and limits.
  *
  * One thread does all of it. psnr_host_start returns once the sockets are
  * bound; psnr_host_stop closes them and joins the thread.
@@ -75,6 +79,58 @@ int        psnr_host_key_spent(psnr_host* h);
 void       psnr_host_set_max_players(psnr_host* h, int n);
 /* The members of the fullest room (a hosted game has one: the host's), 0 with none. */
 int        psnr_host_members(psnr_host* h);
+
+/* ---- The introductions (seamless co-op without a port forward) ----
+ *
+ * With an endpoint set, the room server registers a room number with it from its UDP socket, refreshes it every 20 s
+ * while hosting, and unregisters it when hosting stops. A friend's game looks the number up, the endpoint introduces
+ * the two, and the host knocks on the friend's addresses while the friend opens a session (psnr_intro.h). The room
+ * number and the owner token come from the system's random source; the owner token never leaves this process and
+ * the endpoint. */
+#define PSNR_HOST_ROOM_BITS 40
+
+typedef struct {
+    uint8_t  ip[4];            /* the endpoint (0.0.0.0: none, registering stops) */
+    uint16_t port;
+    uint16_t version;          /* the network version: a friend's game of another version is told so */
+    uint8_t  home_ip[4];       /* this PC's address on its home network (0.0.0.0: unknown) */
+    uint8_t  upnp_ip[4];       /* the internet address and port UPnP mapped to the room server (0: nothing) */
+    uint16_t upnp_port;
+} psnr_host_intro;
+
+/* Starts (or changes) the registering; an endpoint of 0.0.0.0 unregisters and stops. */
+void     psnr_host_set_intro(psnr_host* h, const psnr_host_intro* in);
+/* The room number now (never 0). It changes on psnr_host_new_room, and when the endpoint says another owner has it. */
+uint64_t psnr_host_room(psnr_host* h);
+/* A new room number and owner token (New code): the old number is unregistered, so its code finds nothing. Players
+ * already in stay. Returns the new number. */
+uint64_t psnr_host_new_room(psnr_host* h);
+
+enum {
+    PSNR_HOST_INTRO_OFF = 0,       /* no endpoint */
+    PSNR_HOST_INTRO_REGISTERING,   /* asked, no answer yet */
+    PSNR_HOST_INTRO_REGISTERED,    /* the endpoint has the room: friends can join with its number */
+    PSNR_HOST_INTRO_UNREACHABLE,   /* the endpoint doesn't answer (still asked, every few seconds) */
+    PSNR_HOST_INTRO_LIMITED        /* the endpoint has no place for another room now (asked again in a minute) */
+};
+typedef struct {
+    int      state;            /* PSNR_HOST_INTRO_* */
+    uint64_t room;             /* as psnr_host_room */
+    uint8_t  seen_ip[4];       /* this host's internet address and UDP port as the endpoint saw them (0: none yet) */
+    uint16_t seen_port;
+    int      stuck;            /* 1: a friend's game was introduced in the last 2 minutes and still hadn't connected
+                                * 15 s later (its router or this one let nothing through) */
+    int      udp_players;      /* players connected over a punched session */
+} psnr_host_intro_info;
+void psnr_host_intro_get(psnr_host* h, psnr_host_intro_info* out);
+
+/* UNREGISTER for every room server still running, from the calling thread, at once (the window's close, beside the
+ * UPnP unmap; the process ends right after). */
+void psnr_host_unregister_all(void);
+
+/* An IPv4 address for a host name or dotted address (blocking: a DNS lookup). 0, or -1 if there is none. */
+int  psnr_host_resolve(const char* name, uint8_t ip[4]);
+
 void       psnr_host_stop(psnr_host* h);
 
 /* The hosted game's own messages between its players (a port's, never the title's), from any player's game connected

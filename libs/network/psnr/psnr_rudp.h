@@ -72,6 +72,8 @@ int    psnr_rudp_write(psnr_rudp* r, const void* bytes, size_t n, uint64_t now_m
 /* Stream bytes that came, in order: up to cap of them, the number copied. */
 size_t psnr_rudp_read(psnr_rudp* r, void* out, size_t cap);
 size_t psnr_rudp_readable(const psnr_rudp* r);
+/* 1 when everything written was sent and acknowledged (a last reply arrived: the session can close). */
+int    psnr_rudp_flushed(const psnr_rudp* r);
 
 /* A datagram that came for this session (DATA or CLOSE, with its "PSNR" header). Others are ignored. */
 void psnr_rudp_input(psnr_rudp* r, const void* pkt, size_t len, uint64_t now_ms);
