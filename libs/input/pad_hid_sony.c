@@ -17,7 +17,10 @@
  *   b0: hat in the low nibble (0 = N, clockwise, 8 = centred), 0x10 square,
  *       0x20 cross, 0x40 circle, 0x80 triangle
  *   b1: L1 R1 L2 R2 create/share options L3 R3 (bit 0 up)
- *   b2: bit 0 PS, bit 1 touchpad click
+ *   b2: bit 0 PS, bit 1 touchpad click; in the DualSense's full report bit 2
+ *       the mute button, and on a DualSense Edge bits 4 to 7 its left and
+ *       right Fn buttons and left and right back buttons (the rest of a
+ *       simple report's b2 is a counter)
  * The pad's sticks are already the PS3's 0-255 with up = 0.
  *
  * One thread rescans the HID devices every 2 s (hot-plug); each pad found
@@ -54,6 +57,7 @@
 
 #include "pad_hid_sony.h"
 #include "cellPad.h"
+#include "pad_map.h"
 #include "pad_stick.h"
 #include "ps3emu/ps3_knob.h"
 
@@ -174,6 +178,18 @@ static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
     if (b1 & 0x80) btn |= CELL_PAD_CTRL_R3;
     if (b2 & 0x02) btn |= CELL_PAD_CTRL_SELECT;   /* touchpad click */
     s.buttons = btn;
+    /* The buttons beyond the PS3's, named as SDL has them (pad_map.h): its paddles 1 to 4 are the Edge's right and
+     * left back buttons, then its right and left Fn buttons. */
+    s.extra = 0;
+    if (d->kind == KIND_DS5 && full) {
+        if (b2 & 0x04) s.extra |= PAD_EXTRA_MISC;   /* mute */
+        if (d->pid == 0x0DF2) {
+            if (b2 & 0x80) s.extra |= PAD_EXTRA_PADDLE1;
+            if (b2 & 0x40) s.extra |= PAD_EXTRA_PADDLE2;
+            if (b2 & 0x20) s.extra |= PAD_EXTRA_PADDLE3;
+            if (b2 & 0x10) s.extra |= PAD_EXTRA_PADDLE4;
+        }
+    }
 
     AcquireSRWLockExclusive(&d->lock);
     d->st = s; d->have = 1;
