@@ -18,6 +18,7 @@
 #  pragma comment(lib, "ws2_32.lib")
 #  pragma comment(lib, "bcrypt.lib")   /* mbedTLS's entropy: BCryptGenRandom */
    typedef SOCKET tls_sock_t;
+#  define TLS_NO_SOCK INVALID_SOCKET
 #  define TLS_WOULD_BLOCK() (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINTR)
 static SRWLOCK tls_lock = SRWLOCK_INIT;
 #  define TLS_LOCK()   AcquireSRWLockExclusive(&tls_lock)
@@ -30,6 +31,7 @@ static SRWLOCK tls_lock = SRWLOCK_INIT;
 #  include <pthread.h>
 #  include <time.h>
    typedef int tls_sock_t;
+#  define TLS_NO_SOCK (-1)
 #  define TLS_WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 static pthread_mutex_t tls_lock = PTHREAD_MUTEX_INITIALIZER;
 #  define TLS_LOCK()   pthread_mutex_lock(&tls_lock)
@@ -389,7 +391,8 @@ int ps3_tls_send_all(ps3_tls* t, const void* p, size_t n, int timeout_ms)
         }
         if (r != MBEDTLS_ERR_SSL_WANT_READ && r != MBEDTLS_ERR_SSL_WANT_WRITE) return -1;
         unsigned long long now = tls_now_ms();
-        if (now >= end || !tls_wait(t->s, r == MBEDTLS_ERR_SSL_WANT_WRITE, (int)(end - now))) return -1;
+        const tls_sock_t s = t->s;   /* (ps3_tls_detach: none to wait on) */
+        if (s == TLS_NO_SOCK || now >= end || !tls_wait(s, r == MBEDTLS_ERR_SSL_WANT_WRITE, (int)(end - now))) return -1;
     }
     return 0;
 }
@@ -408,7 +411,8 @@ int ps3_tls_recv(ps3_tls* t, void* p, size_t n, int timeout_ms)
                                                                      server's goodbye is an error: cut short) */
         if (timeout_ms == 0) return PS3_TLS_AGAIN;
         unsigned long long now = tls_now_ms();
-        if (now >= end || !tls_wait(t->s, r == MBEDTLS_ERR_SSL_WANT_WRITE, (int)(end - now))) return -1;
+        const tls_sock_t s = t->s;   /* (ps3_tls_detach: none to wait on) */
+        if (s == TLS_NO_SOCK || now >= end || !tls_wait(s, r == MBEDTLS_ERR_SSL_WANT_WRITE, (int)(end - now))) return -1;
     }
 }
 
@@ -418,6 +422,14 @@ int ps3_tls_pending(ps3_tls* t)
     int r = mbedtls_ssl_get_bytes_avail(&t->ssl) > 0 || mbedtls_ssl_check_pending(&t->ssl);
     TLS_UNLOCK();
     return r;
+}
+
+void ps3_tls_detach(ps3_tls* t)
+{
+    if (!t) return;
+    TLS_LOCK();
+    t->s = TLS_NO_SOCK;   /* (the socket calls under mbedTLS then fail: nothing reaches that number) */
+    TLS_UNLOCK();
 }
 
 void ps3_tls_close(ps3_tls* t)
