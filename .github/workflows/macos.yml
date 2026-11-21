@@ -171,6 +171,15 @@ jobs:
           clang -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_http_loopback libs/network/tests/test_http_loopback.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
           /tmp/test_http_loopback
 
+      # cellHttp with a transaction closed from another thread while a call
+      # waits on its connection (an abort, close all, destroying the client,
+      # End), over TCP and TLS: the wait ends at once, and nothing is freed
+      # under it.
+      - name: Run the cellHttp abort test
+        run: |
+          clang -std=gnu17 -I include -I third_party/mbedtls/include -o /tmp/test_http_abort libs/network/tests/test_http_abort.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c /tmp/libmbedtls.a -lpthread
+          /tmp/test_http_abort
+
       # The sign-in to a server that has one: the key, the challenge and its
       # work, the session on cellHttp's requests to that server only. Then
       # what the player is told when psnr refuses co-op.
