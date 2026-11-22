@@ -46,6 +46,11 @@ int ps3_tls_pending(ps3_tls* t);
 /* Says goodbye to the server (no wait) and frees the connection. The socket stays open. NULL is fine. */
 void ps3_tls_close(ps3_tls* t);
 
+/* Forgets the socket: nothing more is read or sent on it, so ps3_tls_recv and ps3_tls_send_all end with -1 and
+ * ps3_tls_close only frees. For an owner that closes the socket while another thread may still be in a call (its
+ * number may be a new socket's by then). NULL is fine. */
+void ps3_tls_detach(ps3_tls* t);
+
 #ifdef __cplusplus
 }
 #endif

@@ -230,6 +230,18 @@ jobs:
           .\test_http_loopback.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # cellHttp with a transaction closed from another thread while a call
+      # waits on its connection (an abort, close all, destroying the client,
+      # End), over TCP and TLS: the wait ends at once, and nothing is freed
+      # under it.
+      - name: Run the cellHttp abort test
+        if: ${{ !cancelled() && steps.mbedtls.outcome == 'success' }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I third_party/mbedtls/include /Fe:test_http_abort.exe libs/network/tests/test_http_abort.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c mbedtls.lib ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_http_abort.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # The sign-in to a server that has one: the key, the challenge and its
       # work, the session on cellHttp's requests to that server only. Then
       # what the player is told when psnr refuses co-op.

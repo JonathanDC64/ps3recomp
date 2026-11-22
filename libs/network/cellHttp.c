@@ -39,6 +39,20 @@ typedef int http_socket_t;
 #define http_closesocket close
 #endif
 
+/* s_http_lock: a transaction's connection against a close from another thread
+ * (http_use). Held briefly, never while waiting for the network; taken before
+ * ps3_tls.c's own lock, never after it. */
+#ifdef _WIN32
+static SRWLOCK s_http_lock = SRWLOCK_INIT;
+#  define HTTP_LOCK()   AcquireSRWLockExclusive(&s_http_lock)
+#  define HTTP_UNLOCK() ReleaseSRWLockExclusive(&s_http_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t s_http_lock = PTHREAD_MUTEX_INITIALIZER;
+#  define HTTP_LOCK()   pthread_mutex_lock(&s_http_lock)
+#  define HTTP_UNLOCK() pthread_mutex_unlock(&s_http_lock)
+#endif
+
 /* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
  * pointer arguments are guest effective addresses, not host pointers. Translate
  * through vm_base before dereferencing. */
@@ -100,6 +114,8 @@ typedef struct {
     u32                  body_received;
     int                  conn_close;       /* server sent Connection: close */
     int                  eof_reached;
+    int                  busy;             /* (s_http_lock) calls using sock and tls now: http_use */
+    int                  close_pending;    /* (s_http_lock) closed while busy: the last of them closes it */
 
     /* Buffer for accumulating response header bytes */
     char                 hdr_buf[HTTP_HDR_BUF_SIZE];
@@ -169,8 +185,9 @@ static void http_apply_timeout(http_socket_t sock, int send, u32 usec)
 #endif
 }
 
-/* Close the socket in a transaction slot if open, reset state. */
-static void http_close_slot_socket(HttpTransSlot* t)
+/* Close the socket in a transaction slot if open, reset state. (s_http_lock,
+ * the slot not busy.) */
+static void http_close_now(HttpTransSlot* t)
 {
     ps3_tls_close(t->tls);
     t->tls = NULL;
@@ -189,6 +206,70 @@ static void http_close_slot_socket(HttpTransSlot* t)
     }
     t->body_overflow_len = 0;
     t->chunked = 0;
+}
+
+/* A transaction's connection is used without the lock: a receive waits for the
+ * server. A title may close it meanwhile from another thread: that is what
+ * cellHttpTransactionAbortConnection is for, and a title ending its network
+ * (cellHttpClientCloseAllConnections, cellHttpDestroyClient, cellHttpEnd) can
+ * close a connection one of its threads still waits on. Closed there and then,
+ * the waiting call went on with a freed TLS connection (a crash in Demon's
+ * Souls, in mbedtls_ssl_read under cellHttpResponseGetStatusCode), or with a
+ * socket whose number a new one may have by then. So a call that uses the
+ * connection marks the slot busy (http_use, http_done), and a close while it is
+ * busy only ends the call's wait (http_wake) and leaves the rest of the close
+ * to the last call's end. The slot isn't reused until then. */
+
+/* Ends the waits on t's connection at once, with an error (s_http_lock). POSIX:
+ * shutdown, the socket open until the close. Winsock's shutdown doesn't end a
+ * recv, select or WSAPoll already waiting, but closing the socket does: there
+ * it is closed now, after its TLS forgot it, and the slot holds it no more
+ * (its number may be a new socket's by then). */
+static void http_wake(HttpTransSlot* t)
+{
+    if (t->sock == HTTP_INVALID_SOCKET)
+        return;
+#ifdef _WIN32
+    ps3_tls_detach(t->tls);
+    http_socket_t s = t->sock;
+    t->sock = HTTP_INVALID_SOCKET;
+    closesocket(s);
+#else
+    shutdown(t->sock, SHUT_RDWR);
+#endif
+}
+
+static void http_close_slot_socket(HttpTransSlot* t)
+{
+    HTTP_LOCK();
+    if (t->busy) {
+        t->close_pending = 1;
+        http_wake(t);
+    } else {
+        http_close_now(t);
+    }
+    HTTP_UNLOCK();
+}
+
+/* 1, the slot marked busy, when its connection is open and not being closed. */
+static int http_use(HttpTransSlot* t)
+{
+    HTTP_LOCK();
+    const int ok = !t->aborted && !t->close_pending && t->sock != HTTP_INVALID_SOCKET;
+    if (ok)
+        t->busy++;
+    HTTP_UNLOCK();
+    return ok;
+}
+
+static void http_done(HttpTransSlot* t)
+{
+    HTTP_LOCK();
+    if (--t->busy == 0 && t->close_pending) {
+        t->close_pending = 0;
+        http_close_now(t);
+    }
+    HTTP_UNLOCK();
 }
 
 /* PS3_HTTP_HEADER="Name: value": one more header on every request, for a
@@ -409,13 +490,18 @@ s32 cellHttpInit(void* pool, u32 poolSize)
     }
 #endif
 
+    /* Every slot empty, its socket marked invalid; one an earlier End left to
+     * a call still ending (its receive on another thread) closes at its end */
+    HTTP_LOCK();
     memset(s_clients, 0, sizeof(s_clients));
-    memset(s_transactions, 0, sizeof(s_transactions));
-
-    /* Ensure all sockets are marked invalid */
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
-        s_transactions[i].sock = HTTP_INVALID_SOCKET;
+        HttpTransSlot* t = &s_transactions[i];
+        if (t->busy || t->close_pending)
+            continue;
+        memset(t, 0, sizeof(*t));
+        t->sock = HTTP_INVALID_SOCKET;
     }
+    HTTP_UNLOCK();
 
     s_http_initialized = 1;
     return CELL_OK;
@@ -428,19 +514,25 @@ s32 cellHttpEnd(void)
     if (!s_http_initialized)
         return CELL_HTTP_ERROR_NOT_INITIALIZED;
 
-    /* Close any open sockets */
+    /* Close any open sockets: a slot still in a call (another thread's
+     * receive) keeps its connection until the call ends (http_use), and its
+     * state until then */
+    HTTP_LOCK();
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
-        if (s_transactions[i].in_use)
-            http_close_slot_socket(&s_transactions[i]);
+        HttpTransSlot* t = &s_transactions[i];
+        if (t->busy) {
+            t->close_pending = 1;
+            http_wake(t);
+            t->in_use = 0;
+            continue;
+        }
+        if (t->in_use)
+            http_close_now(t);
+        memset(t, 0, sizeof(*t));
+        t->sock = HTTP_INVALID_SOCKET;
     }
-
     memset(s_clients, 0, sizeof(s_clients));
-    memset(s_transactions, 0, sizeof(s_transactions));
-
-    /* Re-invalidate sockets after memset */
-    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
-        s_transactions[i].sock = HTTP_INVALID_SOCKET;
-    }
+    HTTP_UNLOCK();
 
     s_http_initialized = 0;
 
@@ -535,10 +627,15 @@ s32 cellHttpCreateTransaction(CellHttpTransId* transId, CellHttpClientId clientI
         return CELL_HTTP_ERROR_BAD_CLIENT;
 
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
-        if (!s_transactions[i].in_use) {
-            HttpTransSlot* t = &s_transactions[i];
+        HttpTransSlot* t = &s_transactions[i];
+        HTTP_LOCK();
+        const int free_slot = !t->in_use && !t->busy && !t->close_pending;   /* (not one still closing) */
+        if (free_slot) {
             memset(t, 0, sizeof(*t));
-
+            t->in_use = 1;
+        }
+        HTTP_UNLOCK();
+        if (free_slot) {
             t->in_use  = 1;
             t->client  = clientId;
             t->sock    = HTTP_INVALID_SOCKET;
@@ -591,6 +688,8 @@ s32 cellHttpDestroyTransaction(CellHttpTransId transId)
     return CELL_OK;
 }
 
+static s32 http_send_request(CellHttpTransId transId, HttpTransSlot* t, const void* buf, u32 size, u32* sent);
+
 s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
                         u32* sent)
 {
@@ -612,6 +711,20 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
 
     /* Close any previously open socket (re-send scenario) */
     http_close_slot_socket(t);
+    HTTP_LOCK();
+    t->busy++;   /* (the slot isn't reused meanwhile: http_use) */
+    HTTP_UNLOCK();
+    s32 r = http_send_request(transId, t, buf, size, sent);
+    http_done(t);
+    return r;
+}
+
+/* cellHttpSendRequest's connecting and sending, its connection still its own:
+ * the slot takes it at the end, unless another thread aborted or destroyed the
+ * transaction meanwhile. */
+static s32 http_send_request(CellHttpTransId transId, HttpTransSlot* t, const void* buf, u32 size, u32* sent)
+{
+    (void)transId;
 
     /* ---- Resolve hostname ---- */
     /* Offline (PS3_NET_ONLINE unset) nothing leaves the PC, and online the
@@ -782,15 +895,28 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     printf("[cellHttp]   Request sent (%d header bytes + %u body bytes)%s\n",
            (int)req_len, size, tls ? " over TLS" : "");
 
-    /* Store socket for recv */
-    t->sock           = sock;
-    t->tls            = tls;
-    t->headers_parsed = 0;
-    t->body_received  = 0;
-    t->hdr_buf_len    = 0;
-    t->eof_reached    = 0;
-    t->body_overflow  = NULL;
-    t->body_overflow_len = 0;
+    /* Store socket for recv, unless the transaction was aborted or destroyed
+     * from another thread while this one connected and sent */
+    HTTP_LOCK();
+    const int gone = t->aborted || !t->in_use || t->close_pending;
+    if (!gone) {
+        t->sock           = sock;
+        t->tls            = tls;
+        t->headers_parsed = 0;
+        t->body_received  = 0;
+        t->hdr_buf_len    = 0;
+        t->eof_reached    = 0;
+        t->body_overflow  = NULL;
+        t->body_overflow_len = 0;
+    }
+    HTTP_UNLOCK();
+    if (gone) {
+        printf("[cellHttp]   aborted while it was sent: the connection is closed\n");
+        ps3_tls_close(tls);
+        http_closesocket(sock);
+        if (sent) vm_write32((u32)(uintptr_t)sent, (u32)0);
+        return CELL_HTTP_ERROR_ABORTED;
+    }
 
     if (sent)
         vm_write32((u32)(uintptr_t)sent, (u32)size);
@@ -900,30 +1026,11 @@ bad:
     return filled ? CELL_OK : CELL_HTTP_ERROR_RECV_FAILED;
 }
 
-s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
-                         u32* received)
+/* cellHttpRecvResponse's reading, with the slot busy (http_use): a close
+ * from another thread meanwhile ends its waits and waits for it. */
+static s32 http_recv_response(CellHttpTransId transId, HttpTransSlot* t, void* buf, u32 size,
+                              u32* received)
 {
-    if (!s_http_initialized)
-        return CELL_HTTP_ERROR_NOT_INITIALIZED;
-
-    if (!http_trans_ok(transId))
-        return CELL_HTTP_ERROR_BAD_TRANS;
-
-    HttpTransSlot* t = HTTP_TRANS(transId);
-
-    if (t->aborted) {
-        printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
-        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
-        return CELL_HTTP_ERROR_ABORTED;
-    }
-
-    if (t->sock == HTTP_INVALID_SOCKET) {
-        printf("[cellHttp] RecvResponse(trans=%u) - no socket (send first)\n",
-               transId);
-        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
-        return CELL_HTTP_ERROR_CONNECTION_FAILED;
-    }
-
     /* ---- Parse response headers on first call ---- */
     if (!t->headers_parsed) {
         printf("[cellHttp] RecvResponse(trans=%u) - reading response headers\n",
@@ -1056,6 +1163,41 @@ s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
         vm_write32((u32)(uintptr_t)received, (u32)filled);
 
     return CELL_OK;
+}
+
+s32 cellHttpRecvResponse(CellHttpTransId transId, void* buf, u32 size,
+                         u32* received)
+{
+    if (!s_http_initialized)
+        return CELL_HTTP_ERROR_NOT_INITIALIZED;
+
+    if (!http_trans_ok(transId))
+        return CELL_HTTP_ERROR_BAD_TRANS;
+
+    HttpTransSlot* t = HTTP_TRANS(transId);
+
+    if (t->aborted) {
+        printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
+        return CELL_HTTP_ERROR_ABORTED;
+    }
+
+    if (t->sock == HTTP_INVALID_SOCKET) {
+        printf("[cellHttp] RecvResponse(trans=%u) - no socket (send first)\n",
+               transId);
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
+        return CELL_HTTP_ERROR_CONNECTION_FAILED;
+    }
+
+    if (!http_use(t)) {   /* closed or aborted by another thread just now */
+        if (received) vm_write32((u32)(uintptr_t)received, (u32)0);
+        return t->aborted ? CELL_HTTP_ERROR_ABORTED : CELL_HTTP_ERROR_CONNECTION_FAILED;
+    }
+    s32 r = http_recv_response(transId, t, buf, size, received);
+    if (r != CELL_OK && t->aborted)
+        r = CELL_HTTP_ERROR_ABORTED;   /* (its wait ended by an abort from another thread) */
+    http_done(t);
+    return r;
 }
 
 /* The response getters under their SDK names (the NIDs are computed from
@@ -1401,41 +1543,53 @@ s32 cellHttpClientPollConnections(CellHttpClientId clientId, CellHttpTransId* tr
     if (!transId)
         return CELL_HTTP_ERROR_NO_BUFFER;
 
+    /* The transactions waited on are busy (http_use) until the wait ends: a
+     * close from another thread meanwhile ends the wait (its socket reads as
+     * ended) and is left to http_done. */
     fd_set rd;
     FD_ZERO(&rd);
     int nfds = 0, waiting = 0;
+    u32 ready = 0;
+    u8 polled[CELL_HTTP_MAX_TRANSACTIONS] = {0};
+    HTTP_LOCK();
     for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
         HttpTransSlot* t = &s_transactions[i];
-        if (!t->in_use || t->client != clientId || t->aborted || t->sock == HTTP_INVALID_SOCKET)
+        if (!t->in_use || t->client != clientId || t->aborted || t->close_pending ||
+            t->sock == HTTP_INVALID_SOCKET)
             continue;
         if (t->body_overflow_len > 0 || (t->tls && ps3_tls_pending(t->tls))) {
-            vm_write32((u32)(uintptr_t)transId, i + 1);
-            return CELL_OK;
+            ready = i + 1;
+            break;
         }
         FD_SET(t->sock, &rd);
         if ((int)t->sock + 1 > nfds) nfds = (int)t->sock + 1;   /* ignored by Winsock */
+        t->busy++;
+        polled[i] = 1;
         waiting++;
     }
-    vm_write32((u32)(uintptr_t)transId, 0);
-    if (!waiting)
-        return CELL_OK;
+    HTTP_UNLOCK();
 
-    struct timeval tv, *ptv = NULL;
-    if (usec >= 0) {
-        tv.tv_sec  = (long)(usec / 1000000);
-        tv.tv_usec = (long)(usec % 1000000);
-        ptv = &tv;
-    }
-    if (select(nfds, &rd, NULL, NULL, ptv) <= 0)
-        return CELL_OK;
-    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
-        HttpTransSlot* t = &s_transactions[i];
-        if (t->in_use && t->client == clientId && !t->aborted && t->sock != HTTP_INVALID_SOCKET &&
-            FD_ISSET(t->sock, &rd)) {
-            vm_write32((u32)(uintptr_t)transId, i + 1);
-            break;
+    int selected = 0;
+    if (!ready && waiting) {
+        struct timeval tv, *ptv = NULL;
+        if (usec >= 0) {
+            tv.tv_sec  = (long)(usec / 1000000);
+            tv.tv_usec = (long)(usec % 1000000);
+            ptv = &tv;
         }
+        selected = select(nfds, &rd, NULL, NULL, ptv) > 0;
     }
+    for (u32 i = 0; i < CELL_HTTP_MAX_TRANSACTIONS; i++) {
+        if (!polled[i])
+            continue;
+        HttpTransSlot* t = &s_transactions[i];
+        HTTP_LOCK();
+        if (selected && !ready && !t->aborted && !t->close_pending && FD_ISSET(t->sock, &rd))
+            ready = i + 1;
+        HTTP_UNLOCK();
+        http_done(t);
+    }
+    vm_write32((u32)(uintptr_t)transId, ready);
     return CELL_OK;
 }
 
