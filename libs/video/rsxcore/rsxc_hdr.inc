@@ -284,13 +284,14 @@ static int blit_init(void)
         s_d3d.blit_pso = rc_pipeline(&pd, NULL);
         hr = s_d3d.blit_pso.v ? S_OK : E_FAIL;
     }
-    if (SUCCEEDED(hr)) {   /* the GPU layer's table pool: frame fi's table at 2 fi (step C4) */
+    if (SUCCEEDED(hr)) {   /* the GPU layer's table pool: frame fi's table at 2 fi (step C4), the held
+                            * frame's for fi at 2 (FRAME_COUNT + fi) */
         gpu_table_pool_desc pd;
         memset(&pd, 0, sizeof pd);
         pd.kind = GPU_TABLE_TEX;
-        pd.count = FRAME_COUNT * 2;   /* the frame and T (blit_srvs_write) */
+        pd.count = FRAME_COUNT * 4;   /* the frame and T (blit_srvs_write), the held frame and T (hold_view) */
         pd.nregions = 1;
-        pd.region[0].first = 0; pd.region[0].tables = FRAME_COUNT; pd.region[0].size = 2;
+        pd.region[0].first = 0; pd.region[0].tables = 2 * FRAME_COUNT; pd.region[0].size = 2;
         s_rc_blit_pool = gpu_table_pool_create(s_rc_dev, &pd);
         if (!GPU_VALID(s_rc_blit_pool)) hr = E_FAIL;
     }
@@ -415,20 +416,21 @@ static void blit_srvs_write(void)
 
 static void off_rt_transition(int slot, gpu_state to);
 
-/* Records the scale of the game's frame fi into the window's buffer fi: the
- * largest rectangle with the frame's aspect ratio (RSX_ASPECT's, when set),
- * centred, black around it. Both resources are in PRESENT before and after.
- * On the frame's recorder (step C6): s_rc_rt_tex[fi] is render_targets[fi]'s
- * handle, s_rc_swap_image[fi] swap_buffers[fi]'s, s_rc_swap_rtv[fi] its view;
- * the pipelines and layouts bound are the passes' handles. */
-static void blit_to_window(u32 fi)
+/* Records the scale of a frame, src (read through the blit pool's table at
+ * table, T at table + 1), into the window's buffer fi: the largest rectangle
+ * with the frame's aspect ratio (RSX_ASPECT's, when set), centred, black
+ * around it. Both resources are in PRESENT (= COMMON) before and after.
+ * On the frame's recorder (step C6): s_rc_swap_image[fi] is swap_buffers[fi]'s
+ * handle, s_rc_swap_rtv[fi] its view; the pipelines and layouts bound are the
+ * passes' handles. */
+static void blit_from(u32 fi, gpu_texture src, u32 table)
 {
     if (!s_rc_have_image) return;   /* (step VC2: no image acquired, rc_acquire) */
     gpu_cmd* const c = s_rc_cmd;
     gpu_barrier b[2];
     memset(b, 0, sizeof b);
     b[0].type    = GPU_BARRIER_TRANSITION;
-    b[0].texture = s_rc_rt_tex[fi];
+    b[0].texture = src;
     b[0].sub     = GPU_SUB_ALL;
     b[0].before  = GPU_STATE_PRESENT;
     b[0].after   = GPU_STATE_PIXEL_SHADER_RESOURCE;
@@ -467,7 +469,7 @@ static void blit_to_window(u32 fi)
         gpu_cmd_set_pipeline(c, sharp ? s_of.pso : s_d3d.blit_pso);
     }
     int use_t = 0;
-    if (hdr) {   /* T's highlights at 2 fi + 1, for this frame only */
+    if (hdr) {   /* T's highlights at table + 1, for this frame only */
         const int t = s_hdr.frame_t;
         gpu_view_desc v;
         blit_srv_none(&v);
@@ -477,11 +479,11 @@ static void blit_to_window(u32 fi)
             v.texture = s_d3d.off_rt[t].tex;
             use_t = 1;
         }
-        gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, 2 * fi + 1, &v);
+        gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, table + 1, &v);
     }
     const gpu_table_pool no_pool = {0};
     gpu_cmd_set_table_pools(c, s_rc_blit_pool, no_pool);
-    gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_blit_pool, 2 * fi));   /* frame fi's table */
+    gpu_cmd_bind_table(c, 0, gpu_table_ref(s_rc_dev, s_rc_blit_pool, table));
     if (sharp) {   /* viewport origin, frame texels per window pixel, frame size */
         const float of[8] = {vp.x, vp.y, (float)s_d3d.host_w / vw, (float)s_d3d.host_h / vh,
                              (float)s_d3d.host_w, (float)s_d3d.host_h, 0.0f, 0.0f};
@@ -506,13 +508,20 @@ static void blit_to_window(u32 fi)
     gpu_cmd_barrier_n(c, 2, b);
 }
 
+/* The game's frame fi (s_rc_rt_tex[fi], render_targets[fi]'s handle), scaled
+ * into the window's buffer fi. */
+static void blit_to_window(u32 fi)
+{
+    blit_from(fi, s_rc_rt_tex[fi], 2 * fi);
+}
+
 /* rc_overlay_repaint: the last game frame shown, as blit_to_window
  * read it (render_targets[fi] is cleared by the next batch, a frame shown or
- * not). Render thread. */
+ * not); a repaint scales it into the window's buffer. Render thread. */
 static gpu_texture s_hold_tex;     /* the GPU layer's (step C6) */
 static u32 s_hold_w, s_hold_h;
 static int s_hold_valid;            /* s_hold_tex has the last frame shown */
-static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last frame shown */
+static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last game frame shown */
 static long long s_last_present_qpc;   /* the last Present, a repaint's too */
 static long long s_game_frame_qpc;     /* the last game frame shown (hold_frame) */
 static u32 s_repaints;                 /* repaints made (GCM_RATES) */
@@ -545,7 +554,8 @@ static void hold_barriers(u32 fi, gpu_state rt_before, gpu_state rt_after, gpu_s
 
 /* Records the copy of the game's frame fi into the hold. s_rc_rt_tex[fi] is
  * in PRESENT before and after. The hold is the GPU layer's (step C6):
- * today's committed RGBA8 texture with no flags, in COMMON. */
+ * today's committed RGBA8 texture with no flags, in COMMON (sampled: the
+ * repaints blit from it, and Vulkan has to be told). */
 static void hold_copy(u32 fi)
 {
     if (GPU_VALID(s_hold_tex) && (s_hold_w != s_d3d.host_w || s_hold_h != s_d3d.host_h)) {   /* RSX_SCALE moved */
@@ -557,7 +567,7 @@ static void hold_copy(u32 fi)
         memset(&td, 0, sizeof td);
         td.width = s_d3d.host_w; td.height = s_d3d.host_h; td.layers = 1; td.mips = 1;
         td.format = GPU_FORMAT_R8G8B8A8_UNORM; td.samples = 1;
-        td.use = GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
+        td.use = GPU_USE_SAMPLED | GPU_USE_COPY_SRC | GPU_USE_COPY_DST;
         td.state = GPU_STATE_COMMON;
         s_hold_tex = gpu_texture_create(s_rc_dev, &td);
         if (!GPU_VALID(s_hold_tex)) {
@@ -571,6 +581,23 @@ static void hold_copy(u32 fi)
     gpu_cmd_copy_texture_whole(s_rc_cmd, s_hold_tex, s_rc_rt_tex[fi]);
     hold_barriers(fi, GPU_STATE_COPY_SOURCE, GPU_STATE_PRESENT, GPU_STATE_COPY_DEST, GPU_STATE_COMMON);
     s_hold_valid = 1;
+}
+
+/* The hold's view for a repaint into the window's buffer fi, and no T: the
+ * blit pool's table returned and the entry after it. Written for each
+ * repaint, as blit_from writes T's: the last list that read them, the one for
+ * fi before this, is done (move_to_next_frame waited for it). */
+static u32 hold_view(u32 fi)
+{
+    const u32 table = 2 * (FRAME_COUNT + fi);
+    gpu_view_desc v, none;
+    memset(&v, 0, sizeof v);
+    v.kind = GPU_VIEW_SRV;
+    v.texture = s_hold_tex;
+    blit_srv_none(&none);
+    gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, table, &v);
+    gpu_table_write_tex(s_rc_dev, s_rc_blit_pool, table + 1, &none);
+    return table;
 }
 
 /* The copy above for each frame shown while repaints are on. */

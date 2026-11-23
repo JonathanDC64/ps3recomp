@@ -455,8 +455,9 @@ static void rc_overlay_tick(void)
      * showing never takes it) */
     if (now - s_game_frame_qpc < f.QuadPart / 4 && present_queued() == 1) return;
 
-    /* The held frame into the game's buffer for this index (cleared by the
-     * next batch anyway), then into the window's as for any frame. */
+    /* The held frame, scaled into the window's buffer as a game frame is
+     * (not copied into the game's own buffer for this index first: today's
+     * renderer's copy hung the GPU now and then, rsx_d3d12_overlay_tick). */
     const u32 fi = s_d3d.frame_index;
     frame_cmd_begin(fi);
     if (!held) {
@@ -469,14 +470,8 @@ static void rc_overlay_tick(void)
             return;
         }
     }
-    /* (On the recorder just begun, step C6: the hold's handle and the
-     * display target's.) */
-    hold_barriers(fi, GPU_STATE_PRESENT, GPU_STATE_COPY_DEST, GPU_STATE_COMMON, GPU_STATE_COPY_SOURCE);
-    gpu_cmd_copy_texture_whole(s_rc_cmd, s_rc_rt_tex[fi], s_hold_tex);
-    hold_barriers(fi, GPU_STATE_COPY_DEST, GPU_STATE_PRESENT, GPU_STATE_COPY_SOURCE, GPU_STATE_COMMON);
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
-    blit_to_window(fi);
-    s_shown_fi = fi;
+    blit_from(fi, s_hold_tex, hold_view(fi));   /* (on the recorder just begun, step C6) */
     frame_cmd_submit();
     rc_overlay_frame(fi);
     swap_present(0);

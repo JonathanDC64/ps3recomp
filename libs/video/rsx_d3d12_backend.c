@@ -1927,7 +1927,7 @@ static int blit_init(void)
     if (SUCCEEDED(hr)) {
         D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = FRAME_COUNT * 2;   /* the frame and T (blit_srvs_write) */
+        hd.NumDescriptors = FRAME_COUNT * 4;   /* the frame and T (blit_srvs_write), the held frame and T (hold_view) */
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(s_d3d.device, &hd, &IID_ID3D12DescriptorHeap,
                                                         (void**)&s_d3d.blit_srv_heap);
@@ -2059,7 +2059,8 @@ static int hdr_blit_ready(void)
 }
 
 /* The blit's descriptors: for each frame fi, the game's frame at 2 fi and T
- * or nothing at 2 fi + 1 (written by blit_to_window). */
+ * or nothing at 2 fi + 1 (written by blit_to_window). The held frame's for a
+ * repaint follow them (hold_view). */
 static void blit_srvs_write(void)
 {
     const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
@@ -2081,16 +2082,17 @@ static void blit_srvs_write(void)
 
 static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to);
 
-/* Records the scale of the game's frame fi into the window's buffer fi: the
- * largest rectangle with the frame's aspect ratio (RSX_ASPECT's, when set),
- * centred, black around it. Both resources are in PRESENT before and after. */
-static void blit_to_window(u32 fi)
+/* Records the scale of a frame, src (seen through the blit's descriptors at
+ * slot and slot + 1), into the window's buffer fi: the largest rectangle with
+ * the frame's aspect ratio (RSX_ASPECT's, when set), centred, black around it.
+ * Both resources are in PRESENT (= COMMON) before and after. */
+static void blit_from(u32 fi, ID3D12Resource* src, u32 slot)
 {
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
+    b[0].Transition.pResource   = src;
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     b[1].Transition.pResource   = s_d3d.swap_buffers[fi];
@@ -2128,10 +2130,10 @@ static void blit_to_window(u32 fi)
     const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
         s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     int use_t = 0;
-    if (hdr) {   /* T's highlights at 2 fi + 1, for this frame only */
+    if (hdr) {   /* T's highlights at slot + 1, for this frame only */
         D3D12_CPU_DESCRIPTOR_HANDLE h;
         s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
-        h.ptr += (SIZE_T)(2 * fi + 1) * inc;
+        h.ptr += (SIZE_T)(slot + 1) * inc;
         const int t = s_hdr.frame_t;
         if (t >= 0 && s_d3d.off_rt[t].res && s_d3d.off_rt[t].dxgi == DXGI_FORMAT_R16G16B16A16_FLOAT) {
             off_rt_transition(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2149,7 +2151,7 @@ static void blit_to_window(u32 fi)
     cl->lpVtbl->SetDescriptorHeaps(cl, 1, &s_d3d.blit_srv_heap);
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     s_d3d.blit_srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &g);
-    g.ptr += (u64)(2 * fi) * inc;
+    g.ptr += (u64)slot * inc;
     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, g);
     if (sharp) {   /* viewport origin, frame texels per window pixel, frame size */
         const float of[8] = {vp.TopLeftX, vp.TopLeftY, (float)s_d3d.host_w / vw, (float)s_d3d.host_h / vh,
@@ -2175,13 +2177,19 @@ static void blit_to_window(u32 fi)
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
 }
 
+/* The game's frame fi, scaled into the window's buffer fi. */
+static void blit_to_window(u32 fi)
+{
+    blit_from(fi, s_d3d.render_targets[fi], 2 * fi);
+}
+
 /* rsx_d3d12_overlay_repaint: the last game frame shown, as blit_to_window
  * read it (render_targets[fi] is cleared by the next batch, a frame shown or
- * not). Render thread. */
+ * not); a repaint scales it into the window's buffer. Render thread. */
 static ID3D12Resource* s_hold;
 static u32 s_hold_w, s_hold_h;
 static int s_hold_valid;            /* s_hold has the last frame shown */
-static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last frame shown */
+static u32 s_shown_fi = ~0u;        /* render_targets[] index of the last game frame shown */
 static long long s_last_present_qpc;   /* the last Present, a repaint's too */
 static long long s_game_frame_qpc;     /* the last game frame shown (hold_frame) */
 static u32 s_repaints;                 /* repaints made (GCM_RATES) */
@@ -2240,6 +2248,29 @@ static void hold_copy(u32 fi)
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
     s_hold_valid = 1;
+}
+
+/* s_hold's view for a repaint into the window's buffer fi, and no T: the
+ * blit's descriptors at the slot returned and the one after it. Written for
+ * each repaint, as blit_from writes T's: the last list that read them, the
+ * one for fi before this, is done (move_to_next_frame waited for it). */
+static u32 hold_view(u32 fi)
+{
+    const u32 slot = 2 * FRAME_COUNT + 2 * fi;
+    const u32 inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+        s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE h;
+    s_d3d.blit_srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.blit_srv_heap, &h);
+    h.ptr += (SIZE_T)slot * inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_hold, NULL, h);
+    D3D12_SHADER_RESOURCE_VIEW_DESC none = {0};
+    none.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    none.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    none.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    none.Texture2D.MipLevels = 1;
+    h.ptr += inc;
+    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, NULL, &none, h);
+    return slot;
 }
 
 /* The copy above for each frame shown while repaints are on. */
@@ -16595,8 +16626,11 @@ void rsx_d3d12_overlay_tick(void)
      * showing never takes it) */
     if (now - s_game_frame_qpc < f.QuadPart / 4 && present_queued() == 1) return;
 
-    /* The held frame into the game's buffer for this index (cleared by the
-     * next batch anyway), then into the window's as for any frame. */
+    /* The held frame, scaled into the window's buffer as a game frame is.
+     * Not copied into the game's own buffer for this index first: on a
+     * GeForce that copy now and then hung the GPU (DXGI_ERROR_DEVICE_HUNG,
+     * the menu open over a running co-op game; D3D12_DRED put it at the
+     * copy), and blitting from s_hold leaves the game's buffers alone. */
     const u32 fi = s_d3d.frame_index;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
@@ -16611,25 +16645,8 @@ void rsx_d3d12_overlay_tick(void)
             return;
         }
     }
-    D3D12_RESOURCE_BARRIER b[2] = {0};
-    b[0].Type = b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b[0].Transition.Subresource = b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b[0].Transition.pResource   = s_d3d.render_targets[fi];
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[1].Transition.pResource   = s_hold;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
-    cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
-    cl->lpVtbl->ResourceBarrier(cl, 2, b);
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
-    blit_to_window(fi);
-    s_shown_fi = fi;
+    blit_from(fi, s_hold, hold_view(fi));
     cl->lpVtbl->Close(cl);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
