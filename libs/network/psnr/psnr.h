@@ -95,11 +95,14 @@ int          psnr_hello(psnr_client* c, const char* comm_id, const char* online_
                         const uint8_t session[32], uint32_t* out_user_id, uint8_t out_public_ip[4]);
 
 /* A TCP connection that doesn't block: start it, poll it (1 open, 0 not yet, -1 failed), then take it as a client
- * (no HELLO yet; NULL if its TLS fails) or cancel it. psnr_dial_client and psnr_dial_cancel free the dialer. */
+ * (no HELLO yet; NULL if its TLS fails) or cancel it. psnr_dial_client and psnr_dial_cancel free the dialer.
+ * psnr_dial_client_plain never uses TLS (a hosted game's room server, psnr_host.c, has none), whatever PS3_NET_TLS
+ * says for this process's own connection. */
 typedef struct psnr_dialer psnr_dialer;
 psnr_dialer* psnr_dial_start(const uint8_t ip[4], uint16_t port);
 int          psnr_dial_poll(psnr_dialer* d);
 psnr_client* psnr_dial_client(psnr_dialer* d);
+psnr_client* psnr_dial_client_plain(psnr_dialer* d);
 void         psnr_dial_cancel(psnr_dialer* d);
 
 /* The second transport: psnr's byte stream over a session on a punched UDP path (psnr_rudp.h), in place of a socket.
@@ -117,6 +120,15 @@ void         psnr_session_tick(psnr_client* c);
 /* A host name or dotted address as IPv4 (0, or -1); this machine's address on the way to ip (0, or -1). */
 int psnr_resolve4(const char* host, uint8_t ip[4]);
 int psnr_local_ip_toward(const uint8_t ip[4], uint8_t out[4]);
+
+/* A UDP socket of the caller's own, on a port the system picks (*port: which), for np_psnr.c's join check, which mustn't
+ * touch the title's P2P port. psnr_udp_recv waits up to timeout_ms: the bytes, or 0 for none (a timeout, or an error to
+ * read past). One thread reads; any may send. Close it once no thread reads. */
+typedef struct psnr_udp psnr_udp;
+psnr_udp* psnr_udp_open(uint16_t* port);
+int       psnr_udp_send(psnr_udp* u, const void* buf, size_t len, const uint8_t ip[4], uint16_t port);
+int       psnr_udp_recv(psnr_udp* u, void* buf, size_t cap, uint8_t ip[4], uint16_t* port, int timeout_ms);
+void      psnr_udp_close(psnr_udp* u);
 
 /* NAT traversal (docs/api.md, "UDP"). The caller owns the P2P socket; these
  * build and read the packets it exchanges. Every one starts with "PSNR".
