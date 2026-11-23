@@ -8,8 +8,11 @@
  * when the host's router forwards the port). Router types: full cone, address-restricted, port-restricted, symmetric,
  * symmetric with sequential ports, and double NAT (two port-restricted layers). Every ordered pair runs a lookup,
  * punching and a HELLO with short timers, and the result must be the one docs/162 expects. Then: a host with its port
- * open (or only its TCP port), both games on one network, and the lookup's other answers. Last, the background join
- * itself: it connects, keeps the session up, dials again when the host stops, and gives up when the room is gone.
+ * open (or only its TCP port), both games on one network, and the lookup's other answers. Then the join check
+ * (psnr_join_check_*, a socket of its own at the friend's address): the same matrix, the same answers, the ask and the
+ * host's game's answers, a direct code, a name in use, and an end while it runs; the game's own join stays as it was.
+ * Last, the background join itself: it connects, keeps the session up, dials again when the host stops, and gives up
+ * when the room is gone.
  *
  *   clang-cl /I include /Fe:test_psnr_punch.exe libs/network/tests/test_psnr_punch.c
  *            third_party/monocypher/monocypher.c ws2_32.lib
@@ -44,6 +47,17 @@ static size_t vnet_host_pop(uint8_t* buf, size_t cap, struct sockaddr_in* from);
 
 static void vnet_local_ip(uint8_t out[4]);
 #define NP_PSNR_LOCAL_IP(to, out) vnet_local_ip(out)
+/* the join check's socket: a port of its own at the friend's address */
+struct psnr_udp;
+static struct psnr_udp* vnet_check_open(uint16_t* port);
+static int vnet_check_send(const void* buf, size_t len, const uint8_t ip[4], uint16_t port);
+static int vnet_check_recv(void* buf, size_t cap, uint8_t ip[4], uint16_t* port, int ms);
+#define NP_JC_UDP_OPEN(port)                     vnet_check_open(port)
+#define NP_JC_UDP_SEND(u, buf, len, ip, port)    ((void)(u), vnet_check_send((buf), (len), (ip), (port)))
+#define NP_JC_UDP_RECV(u, buf, cap, ip, port, ms) vnet_check_recv((buf), (cap), (ip), (port), (ms))
+#define NP_JC_UDP_CLOSE(u)                       ((void)(u))
+static volatile int s_checks_freed;
+#define NP_JC_FREED() (s_checks_freed++)
 #define NP_RC_LOOKUP_MS     300
 #define NP_RC_LOOKUP_FOR_MS 1500
 #define NP_RC_OPEN_MS       100
@@ -113,6 +127,7 @@ static uint16_t s_hport;          /* the room server's port (its real loopback l
 static const uint8_t kEndpoint[4] = {198, 51, 100, 1};
 #define EP_PORT 36100
 #define FRIEND_PORT 3658
+#define CHECK_PORT 3700           /* the join check's socket, at the friend's address */
 static int s_endpoint_off;        /* the endpoint drops everything (can't be reached) */
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
 
@@ -179,13 +194,15 @@ static int nat_in(router* r, const uint8_t sip[4], uint16_t sport, uint16_t dpor
 }
 
 /* Deliveries, made on the network's own thread (the P2P port's thread, for the friend). */
-enum { TO_ENDPOINT, TO_HOST, TO_FRIEND };
+enum { TO_ENDPOINT, TO_HOST, TO_FRIEND, TO_CHECK };
 #define QLEN 2048
 typedef struct { int to; uint8_t from_ip[4]; uint16_t from_port; uint16_t len; uint8_t b[1300]; } vpkt;
 static vpkt s_q[QLEN];            /* to deliver */
 static int s_qh, s_qt;
 static vpkt s_hq[QLEN];           /* the room server's, for PH_TEST_UDP_IN */
 static int s_hqh, s_hqt;
+static vpkt s_cq[QLEN];           /* the join check's socket's */
+static int s_cqh, s_cqt;
 static ph_lock s_vlock = PH_LOCK_STATIC;
 static volatile int s_net_stop;
 static ph_sock s_bell = PH_BAD;   /* a datagram to the room server's real socket wakes its loop */
@@ -219,6 +236,7 @@ static void route(router* r, const uint8_t sip0[4], uint16_t sport, const uint8_
     if (ip_eq(ip, kEndpoint) && dport == EP_PORT && !s_endpoint_off) to = TO_ENDPOINT;
     else if (ip_eq(ip, s_host_ip) && dport == s_hport) to = TO_HOST;
     else if (ip_eq(ip, s_friend_ip) && dport == FRIEND_PORT) to = TO_FRIEND;
+    else if (ip_eq(ip, s_friend_ip) && dport == CHECK_PORT) to = TO_CHECK;
     if (to < 0 || len > sizeof s_q[0].b || (s_qt + 1) % QLEN == s_qh) { s_dropped++; return; }
     vpkt* p = &s_q[s_qt];
     p->to = to;
@@ -263,6 +281,44 @@ static int vnet_friend_send(const void* buf, uint32_t len, const uint8_t ip[4], 
 }
 
 static void vnet_local_ip(uint8_t out[4]) { memcpy(out, s_friend_ip, 4); }
+
+static int s_check_sock;
+static struct psnr_udp* vnet_check_open(uint16_t* port)
+{
+    PH_LOCK(&s_vlock);
+    s_cqh = s_cqt = 0;
+    PH_UNLOCK(&s_vlock);
+    *port = CHECK_PORT;
+    return (struct psnr_udp*)&s_check_sock;
+}
+
+static int vnet_check_send(const void* buf, size_t len, const uint8_t ip[4], uint16_t port)
+{
+    PH_LOCK(&s_vlock);
+    route(s_friend_r, s_friend_ip, CHECK_PORT, ip, port, buf, len);
+    PH_UNLOCK(&s_vlock);
+    return (int)len;
+}
+
+static int vnet_check_recv(void* buf, size_t cap, uint8_t ip[4], uint16_t* port, int ms)
+{
+    for (int t = 0; t <= ms; t++) {
+        int n = 0;
+        PH_LOCK(&s_vlock);
+        if (s_cqh != s_cqt) {
+            vpkt* p = &s_cq[s_cqh];
+            n = p->len <= cap ? p->len : 0;
+            memcpy(buf, p->b, n);
+            memcpy(ip, p->from_ip, 4);
+            *port = p->from_port;
+            s_cqh = (s_cqh + 1) % QLEN;
+        }
+        PH_UNLOCK(&s_vlock);
+        if (n) return n;
+        sleep_ms(1);
+    }
+    return 0;
+}
 
 /* Where the friend's TCP connection really goes: the room server's listener, when the host's router forwards the
  * port, or when the two share a network and it goes to the host's home address. */
@@ -386,6 +442,13 @@ static void* net_main(void* u)
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = htons(s_hport);
             sendto(s_bell, "x", 1, 0, (struct sockaddr*)&a, sizeof a);   /* (wakes its poll) */
+        } else if (p.to == TO_CHECK) {
+            PH_LOCK(&s_vlock);
+            if ((s_cqt + 1) % QLEN != s_cqh) {
+                s_cq[s_cqt] = p;
+                s_cqt = (s_cqt + 1) % QLEN;
+            }
+            PH_UNLOCK(&s_vlock);
         } else {
             uint32_t n = p.len;
             uint8_t ip[4];
@@ -507,13 +570,107 @@ static int join(int htype, int ftype, int fwd, uint16_t version, const char* key
         sleep_ms(50);
         CHECK(psnr_host_players(h) == 1);   /* one HELLO, whichever opened first */
         LOCK();
-        if (s_rc.pend == c) s_rc.pend = NULL;
+        if (s_game.t.pend == c) s_game.t.pend = NULL;
         UNLOCK();
         psnr_close(c);
     }
     if (state_out) *state_out = state;
     psnr_host_stop(h);
     return r;
+}
+
+/* ---- the join check ---- */
+
+/* The host's game, for the ask: a client of the room server on this PC that answers "ROM?" as s_hg_mode says
+ * (1: "FGHT" then "ROOM", 2: "FULL", 0: nothing), on a thread of its own. */
+static psnr_client* s_hg;
+static volatile int s_hg_stop, s_hg_mode, s_hg_asked;
+
+static void hg_send(const char* tag, uint32_t v)
+{
+    uint8_t b[2 + 8];
+    psnr_put16(b, 8);
+    memcpy(b + 2, tag, 4);
+    b[6] = (uint8_t)v; b[7] = (uint8_t)(v >> 8); b[8] = (uint8_t)(v >> 16); b[9] = (uint8_t)(v >> 24);
+    psnr_send(s_hg, PSNR_APP_SEND, b, sizeof b);
+}
+
+#ifdef _WIN32
+static DWORD WINAPI hg_main(LPVOID u)
+#else
+static void* hg_main(void* u)
+#endif
+{
+    (void)u;
+    while (!s_hg_stop) {
+        psnr_msg m;
+        const int r = psnr_poll(s_hg, &m);
+        if (r < 0) break;
+        if (r == 0) { sleep_ms(5); continue; }
+        if (m.type == PSNR_APP_MSG && m.len >= 10 && !memcmp(m.data + 6, "ROM?", 4)) {
+            s_hg_asked++;
+            if (s_hg_mode == 1) { hg_send("FGHT", 1); hg_send("ROOM", 7); }
+            else if (s_hg_mode == 2) hg_send("FULL", 4);
+        }
+        psnr_msg_free(&m);
+    }
+    return 0;
+}
+
+static int room_or_full(const uint8_t* d, uint32_t n, void* user)
+{
+    (void)user;
+    return n >= 4 && (!memcmp(d, "ROOM", 4) || !memcmp(d, "FULL", 4));
+}
+
+/* One join check to its end (a room code: PSNR_ROOM's number; a direct code: the address given): its status. */
+static psnr_join_check_status check_run(const char* direct, uint16_t version, uint32_t key, int ask, int answer_ms,
+                                        const char* name)
+{
+    psnr_join_check_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    char server[64];
+    snprintf(server, sizeof server, "%s", direct ? direct : "198.51.100.1:36100");
+    cfg.server = server;
+    cfg.room = direct ? 0 : strtoull(getenv("PSNR_ROOM"), NULL, 10);
+    cfg.version = version;
+    net_invite_key_blob(key, cfg.key);
+    cfg.comm_id = kComm;
+    cfg.online_id = name;
+    if (ask) { cfg.ask = "ROM?"; cfg.ask_len = 4; }
+    cfg.answer_ms = answer_ms;
+    cfg.answered = room_or_full;
+    psnr_join_check_status st;
+    memset(&st, 0, sizeof st);
+    psnr_join_check* jc = psnr_join_check_start(&cfg);
+    CHECK(jc != NULL);
+    if (!jc) return st;
+    for (int t = 0; t < 30000; t += 10) {
+        psnr_join_check_get(jc, &st);
+        if (st.done) break;
+        sleep_ms(10);
+    }
+    CHECK(st.done);
+    if (st.answers > 0) {
+        uint8_t b[16];
+        CHECK(psnr_join_check_answer(jc, 0, b, sizeof b) == 8);
+        CHECK(!memcmp(b, ask && s_hg_mode == 2 ? "FULL" : "FGHT", 4));
+    }
+    sleep_ms(20);   /* (done is said just before its thread lets go) */
+    const int freed = s_checks_freed;
+    psnr_join_check_end(jc);
+    CHECK(s_checks_freed == freed + 1);   /* (over: the end frees it at once) */
+    return st;
+}
+
+/* The game's own join is untouched by a check: no connection, no try under way, its state as it was. */
+static void game_join_untouched(int state_before)
+{
+    LOCK();
+    const int none = s_client == NULL && s_game.t.pend == NULL && !s_game.t.active;
+    UNLOCK();
+    CHECK(none);
+    CHECK(psnr_join_state() == state_before);
 }
 
 int main(void)
@@ -608,6 +765,137 @@ int main(void)
         CHECK(join(NAT_FULL, NAT_FULL, FWD_NONE, 3, key_hex, &st) == JOIN_NO && st == PSNR_JOIN_NO_SERVER);
         s_endpoint_off = 0;
         printf("\nAnother version, a wrong key, no such room, no endpoint: the states they should be\n");
+    }
+
+    /* the join check: the same matrix (its own socket, at the friend's address), with no ask */
+    {
+        const int before = psnr_join_state();
+        int bad = 0;
+        for (int ht = 0; ht < NAT_TYPES; ht++)
+            for (int ft = 0; ft < NAT_TYPES; ft++) {
+                psnr_host* h = host_up(ht, ft, FWD_NONE);
+                if (!h) continue;
+                const psnr_join_check_status st = check_run(NULL, 3, 0x0D00D1E, 0, 0, NULL);
+                const int got = st.state == PSNR_JOIN_CONNECTED;
+                if (got != kExpect[ht][ft] || (got && !st.udp) || (!got && st.state != PSNR_JOIN_NO_WAY)) {
+                    printf("FAIL: the check, host %s, friend %s: state %d, expected %s\n", kNatName[ht], kNatName[ft],
+                           st.state, kExpect[ht][ft] ? "connected" : "not");
+                    s_fail++;
+                    bad++;
+                }
+                psnr_host_stop(h);
+            }
+        game_join_untouched(before);
+        printf("\nThe join check over the NAT matrix: %s\n", bad ? "differs" : "the same as the join");
+    }
+
+    /* the check's other answers: another version, a wrong key, no such room, no endpoint, a name in use */
+    {
+        const int before = psnr_join_state();
+        psnr_host* h = host_up(NAT_PORT, NAT_PORT, FWD_NONE);
+        psnr_join_check_status st = check_run(NULL, 4, 0x0D00D1E, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_OTHER_VERSION);
+        st = check_run(NULL, 3, 0x0BADBAD, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_REFUSED && st.err == PSNR_E_REFUSED);
+        set_env("PSNR_ROOM", "12345");
+        st = check_run(NULL, 3, 0x0D00D1E, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_NO_ROOM);
+        psnr_host_stop(h);
+        s_endpoint_off = 1;
+        h = host_up(NAT_PORT, NAT_PORT, FWD_NONE);
+        st = check_run(NULL, 3, 0x0D00D1E, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_NO_SERVER);
+        psnr_host_stop(h);
+        s_endpoint_off = 0;
+        /* "Friend" is already a player there, from this PC: the same name from another address */
+        h = host_up(NAT_PORT, NAT_PORT, FWD_NONE);
+        uint8_t key[32];
+        net_invite_key_blob(0x0D00D1E, key);
+        psnr_client* other = psnr_connect("127.0.0.1", s_hport, kComm, "Friend", 0, key, NULL, NULL);
+        CHECK(other != NULL);
+        st = check_run(NULL, 3, 0x0D00D1E, 0, 0, "Friend");
+        CHECK(st.state == PSNR_JOIN_NO_WAY && st.err == PSNR_E_NAME_TAKEN);
+        if (other) psnr_close(other);
+        psnr_host_stop(h);
+        game_join_untouched(before);
+        printf("\nThe check's other answers (another version, a wrong key, no such room, no endpoint, a name in use): "
+               "%s\n", s_fail ? "not all" : "the states they should be");
+    }
+
+    /* the ask: the host's game answers it (a boss fight, then its room), says it is full, or says nothing */
+    {
+        psnr_host* h = host_up(NAT_PORT, NAT_PORT, FWD_NONE);
+        uint8_t key[32];
+        net_invite_key_blob(0x0D00D1E, key);
+        s_hg = psnr_connect("127.0.0.1", s_hport, kComm, "Host", 0, key, NULL, NULL);
+        CHECK(s_hg != NULL);
+        s_hg_stop = 0;
+        s_hg_asked = 0;
+#ifdef _WIN32
+        HANDLE hgt = CreateThread(NULL, 0, hg_main, NULL, 0, NULL);
+#else
+        pthread_t hgt;
+        pthread_create(&hgt, NULL, hg_main, NULL);
+#endif
+        s_hg_mode = 1;
+        psnr_join_check_status st = check_run(NULL, 3, 0x0D00D1E, 1, 3000, NULL);
+        CHECK(st.state == PSNR_JOIN_CONNECTED && st.answered && st.answers == 2);
+        s_hg_mode = 2;
+        st = check_run(NULL, 3, 0x0D00D1E, 1, 3000, NULL);
+        CHECK(st.state == PSNR_JOIN_CONNECTED && st.answered && st.answers == 1);
+        s_hg_mode = 0;
+        st = check_run(NULL, 3, 0x0D00D1E, 1, 600, NULL);
+        CHECK(st.state == PSNR_JOIN_CONNECTED && !st.answered && st.answers == 0);
+        CHECK(s_hg_asked == 3);
+        s_hg_stop = 1;
+#ifdef _WIN32
+        WaitForSingleObject(hgt, INFINITE);
+        CloseHandle(hgt);
+#else
+        pthread_join(hgt, NULL);
+#endif
+        psnr_close(s_hg);
+        s_hg = NULL;
+        psnr_host_stop(h);
+        printf("\nThe check's ask: a boss fight and the room, full, and no answer, as the host's game said: %s\n",
+               s_hg_asked == 3 ? "yes" : "no");
+    }
+
+    /* a direct code: through the host's forwarded port (TCP), a wrong key, and no forward; then an end mid-check */
+    {
+        const int before = psnr_join_state();
+        psnr_host* h = host_up(NAT_PORT, NAT_PORT, FWD_BOTH);
+        char direct[32];
+        snprintf(direct, sizeof direct, "203.0.113.5:%u", s_hport);
+        psnr_join_check_status st = check_run(direct, 3, 0x0D00D1E, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_CONNECTED && !st.udp);
+        st = check_run(direct, 3, 0x0BADBAD, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_REFUSED && st.err == PSNR_E_REFUSED);
+        psnr_host_stop(h);
+        h = host_up(NAT_PORT, NAT_PORT, FWD_NONE);
+        snprintf(direct, sizeof direct, "203.0.113.5:%u", s_hport);
+        st = check_run(direct, 3, 0x0D00D1E, 0, 0, NULL);
+        CHECK(st.state == PSNR_JOIN_UNREACHABLE);
+        /* the end while it runs (the lookup, with no endpoint): it stops and frees itself */
+        s_endpoint_off = 1;
+        psnr_join_check_config cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.server = "198.51.100.1:36100";
+        cfg.room = 99;
+        cfg.version = 3;
+        const int freed = s_checks_freed;
+        psnr_join_check* jc = psnr_join_check_start(&cfg);
+        CHECK(jc != NULL);
+        sleep_ms(100);
+        psnr_join_check_end(jc);
+        int t = 0;
+        for (; t < 2000 && s_checks_freed == freed; t += 10) sleep_ms(10);
+        CHECK(s_checks_freed == freed + 1);
+        s_endpoint_off = 0;
+        psnr_host_stop(h);
+        game_join_untouched(before);
+        printf("\nThe check with a direct code (forwarded, a wrong key, no forward), and an end while it runs (freed "
+               "%d ms after): %s\n", t, s_checks_freed == freed + 1 ? "as expected" : "no");
     }
 
     /* the background join (np_psnr_connect with a room code): connected, the session kept up while the title

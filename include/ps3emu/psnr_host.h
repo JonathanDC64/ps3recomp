@@ -162,6 +162,51 @@ enum {
 };
 int psnr_join_state(void);
 
+/* The join check: a friend's game's join, tried once before the port starts the game again into co-op, so the player
+ * hears at once whether the code works (np_psnr.c). It runs on threads and a UDP socket of its own, so the title's own
+ * connection and P2P port stay as they are, and it changes nothing psnr_join_state says. A room code: the lookup at the
+ * endpoint, the punching raced against TCP, and HELLO with the key, as the join does (once more after a few seconds if
+ * the endpoint asks to slow down). A direct code: TCP to the host's room server (up to 10 s) and HELLO. Never over TLS
+ * (a room server has none). Then, if the caller gave one, an ask goes to the host's game as the hosted game's own
+ * message (psnr_app_send), and the host's game's messages back are kept until `answered` says one completes the answer,
+ * or answer_ms passes. The host's room server counts it as a player for those seconds, and a wrong key as one wrong
+ * key, as the join itself would. */
+#define PSNR_JOIN_CHECK_ANSWERS 8
+typedef struct {
+    const char* server;      /* a room code: the endpoint ("host:port", 36100 when it names none); a direct code: the
+                              * host's room server */
+    uint64_t    room;        /* a room code's number; 0: a direct code */
+    uint16_t    version;     /* a room code: the network version (the endpoint says when the host's is another) */
+    uint8_t     key[PSNR_HOST_KEY_LEN];   /* the code's key, the HELLO's session blob */
+    const char* comm_id;     /* the HELLO's communication ID (NULL: "NPWR00881_00") */
+    const char* online_id;   /* the HELLO's name (NULL: this game's, as its own join's) */
+    const void* ask;         /* sent once past HELLO (NULL, 0: none), at most PSNR_APP_MAX bytes */
+    uint32_t    ask_len;
+    int         answer_ms;   /* how long to wait for the answer (0: 5000) */
+    /* On the check's thread, with each message from the host's game after the ask: 1 when it completes the answer. */
+    int       (*answered)(const uint8_t* data, uint32_t len, void* user);
+    void*       user;
+} psnr_join_check_config;
+
+typedef struct {
+    int done;       /* 1: over, state is the result */
+    int state;      /* PSNR_JOIN_LOOKING or PSNR_JOIN_REACHING while it runs; then PSNR_JOIN_CONNECTED, or why not:
+                     * NO_ROOM, OTHER_VERSION, NO_SERVER, NO_WAY, UNREACHABLE (a direct code), REFUSED, SLOW */
+    int err;        /* why the HELLO was turned away (psnr.h's PSNR_E_*: PSNR_E_NAME_TAKEN, PSNR_E_REFUSED), else 0 */
+    int udp;        /* it got through over the punched path (0: over TCP) */
+    int answered;   /* `answered` said 1 */
+    int answers;    /* the host's game's messages after the ask, kept in order (at most PSNR_JOIN_CHECK_ANSWERS) */
+} psnr_join_check_status;
+
+typedef struct psnr_join_check psnr_join_check;
+/* NULL if it can't start (no server, an ask too long, no thread). */
+psnr_join_check* psnr_join_check_start(const psnr_join_check_config* cfg);
+void             psnr_join_check_get(psnr_join_check* jc, psnr_join_check_status* out);
+/* Answer i's bytes into buf (its length; 0 if there is none or it doesn't fit). */
+uint32_t         psnr_join_check_answer(psnr_join_check* jc, int i, uint8_t* buf, uint32_t cap);
+/* The caller is done with it: a check still running stops at its next step (within a few seconds) and frees itself. */
+void             psnr_join_check_end(psnr_join_check* jc);
+
 #ifdef __cplusplus
 }
 #endif

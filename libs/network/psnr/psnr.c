@@ -278,9 +278,9 @@ static void set_nonblocking(sock_t s)
 #endif
 }
 
-/* A connected socket as a client (no HELLO yet): nonblocking, over TLS with PS3_NET_TLS. NULL (the socket closed)
+/* A connected socket as a client (no HELLO yet): nonblocking, over TLS with tls (PS3_NET_TLS). NULL (the socket closed)
  * if the TLS fails. */
-static psnr_client* client_of(sock_t s, const char* host, uint16_t port)
+static psnr_client* client_of(sock_t s, const char* host, uint16_t port, int tls_on)
 {
     {   /* small request/reply frames: don't let Nagle sit on them */
         int one = 1;
@@ -292,7 +292,7 @@ static psnr_client* client_of(sock_t s, const char* host, uint16_t port)
      * carries the session, goes over TLS or not at all. The relay streams
      * (stream_leg) carry players' traffic and stay as they are. */
     ps3_tls* tls = NULL;
-    if (ps3_tls_enabled()) {
+    if (tls_on) {
         char name[256], why[256] = "no server name (PS3_NET_TLS, PS3_NET_SIGNIN)";
         if (ps3_tls_server_name(name, sizeof name) == 0)
             tls = ps3_tls_connect((intptr_t)s, name, 5000, why, sizeof why);
@@ -347,7 +347,7 @@ psnr_client* psnr_open(const char* host, uint16_t port)
     }
     freeaddrinfo(res);
     if (s == BAD_SOCK) return NULL;
-    return client_of(s, host, port);
+    return client_of(s, host, port, ps3_tls_enabled());
 }
 
 int psnr_hello(psnr_client* c, const char* comm_id, const char* online_id, uint16_t p2p_port,
@@ -466,17 +466,27 @@ int psnr_dial_poll(psnr_dialer* d)
     return 1;
 }
 
-psnr_client* psnr_dial_client(psnr_dialer* d)
+static psnr_client* dial_client(psnr_dialer* d, int tls)
 {
     char host[16];
     snprintf(host, sizeof host, "%u.%u.%u.%u", d->ip[0], d->ip[1], d->ip[2], d->ip[3]);
-    psnr_client* c = client_of(d->s, host, d->port);
+    psnr_client* c = client_of(d->s, host, d->port, tls);
     if (c) {   /* (the address it was asked for: a test's router stands between) */
         memcpy(c->server_ip, d->ip, 4);
         c->server_port = d->port;
     }
     free(d);
     return c;
+}
+
+psnr_client* psnr_dial_client(psnr_dialer* d)
+{
+    return dial_client(d, ps3_tls_enabled());
+}
+
+psnr_client* psnr_dial_client_plain(psnr_dialer* d)
+{
+    return dial_client(d, 0);
 }
 
 void psnr_dial_cancel(psnr_dialer* d)
@@ -560,6 +570,76 @@ int psnr_local_ip_toward(const uint8_t ip[4], uint8_t out[4])
     }
     sock_close(s);
     return ok ? 0 : -1;
+}
+
+/* ---- A UDP socket of the caller's own (np_psnr.c's join check) ---- */
+
+struct psnr_udp {
+    sock_t s;
+};
+
+psnr_udp* psnr_udp_open(uint16_t* port)
+{
+#ifdef _WIN32
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+    sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == BAD_SOCK) return NULL;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    socklen_t n = sizeof(a);
+    if (bind(s, (struct sockaddr*)&a, sizeof(a)) != 0 || getsockname(s, (struct sockaddr*)&a, &n) != 0) {
+        sock_close(s);
+        return NULL;
+    }
+#ifdef _WIN32
+    {   /* a datagram that comes back as unreachable mustn't end the socket's reads (WSAECONNRESET) */
+        BOOL off = FALSE;
+        DWORD got = 0;
+        WSAIoctl(s, _WSAIOW(IOC_VENDOR, 12), &off, sizeof(off), NULL, 0, &got, NULL, NULL);   /* SIO_UDP_CONNRESET */
+    }
+#endif
+    psnr_udp* u = (psnr_udp*)calloc(1, sizeof(psnr_udp));
+    if (!u) { sock_close(s); return NULL; }
+    u->s = s;
+    if (port) *port = ntohs(a.sin_port);
+    return u;
+}
+
+int psnr_udp_send(psnr_udp* u, const void* buf, size_t len, const uint8_t ip[4], uint16_t port)
+{
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    memcpy(&a.sin_addr, ip, 4);
+    a.sin_port = htons(port);
+    return (int)sendto(u->s, (const char*)buf, (int)len, 0, (struct sockaddr*)&a, sizeof(a));
+}
+
+int psnr_udp_recv(psnr_udp* u, void* buf, size_t cap, uint8_t ip[4], uint16_t* port, int timeout_ms)
+{
+    pollfd_t pf;
+    pf.fd = u->s;
+    pf.events = POLLIN;
+    pf.revents = 0;
+    if (poll(&pf, 1, timeout_ms) <= 0) return 0;
+    struct sockaddr_in a;
+    socklen_t n = sizeof(a);
+    const int k = (int)recvfrom(u->s, (char*)buf, (int)cap, 0, (struct sockaddr*)&a, &n);
+    if (k <= 0) return 0;   /* (an ICMP answer to an earlier datagram, or nothing: the caller just reads again) */
+    memcpy(ip, &a.sin_addr, 4);
+    *port = ntohs(a.sin_port);
+    return k;
+}
+
+void psnr_udp_close(psnr_udp* u)
+{
+    if (!u) return;
+    sock_close(u->s);
+    free(u);
 }
 
 void psnr_server_addr(const psnr_client* c, uint8_t ip[4], uint16_t* port)
