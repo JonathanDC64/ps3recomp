@@ -36,6 +36,7 @@ static int knob_present(void)   { static int v = -1; PS3_KNOB(v, ps3_env_int("RS
 #include "rsx_primitives.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -7889,11 +7890,33 @@ static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecor
     const u32 words = 3 + ((u32)n + 1 + 7) / 8;
     cl->lpVtbl->SetMarker(cl, 2, q, words * 8u);
 }
+/* SCRATCH (11-23 GPU hang): a DRED marker with free text. */
+static void dred_note(ID3D12GraphicsCommandList* cl, const char* fmt, ...)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("D3D12_DRED") ? 1 : 0;
+    if (!on) return;
+    char a[200];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(a, sizeof a, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int)sizeof a) n = (int)sizeof a - 1;
+    u64 q[3 + 256 / 8 + 1] = {0};
+    q[0] = 0x008ull << 10;
+    q[1] = 0xFF4080C0ull;
+    q[2] = (8ull << 55) | (1ull << 54);
+    memcpy(&q[3], a, (size_t)n + 1);
+    const u32 words = 3 + ((u32)n + 1 + 7) / 8;
+    cl->lpVtbl->SetMarker(cl, 2, q, words * 8u);
+}
 #else
 static void dred_mark(ID3D12GraphicsCommandList* cl, u32 d, const D3D12DrawRecord* dr)
 {
     (void)cl; (void)d; (void)dr;
 }
+static void dred_note(ID3D12GraphicsCommandList* cl, const char* fmt, ...) { (void)cl; (void)fmt; }
 #endif
 static void late_note(u32 slot, const D3D12DrawRecord* dr)
 {
@@ -16601,6 +16624,10 @@ void rsx_d3d12_overlay_tick(void)
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
+    {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        dred_note(cl, "repaint fi %u held %d wake %d shown %u since present %.1f ms since game frame %.1f ms queued %d",
+                  fi, held, wake, s_shown_fi, (double)(now - s_last_present_qpc) * 1000.0 / (double)fq.QuadPart,
+                  (double)(now - s_game_frame_qpc) * 1000.0 / (double)fq.QuadPart, present_queued()); }
     if (!held) {
         /* The last frame shown is still in its render target: a frame index
          * moves only at a Present, so every batch since has drawn into the
@@ -16621,14 +16648,18 @@ void rsx_d3d12_overlay_tick(void)
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
+    dred_note(cl, "repaint copy: hold %p -> rt[%u] %p", (void*)s_hold, fi, (void*)s_d3d.render_targets[fi]);
     cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
+    dred_note(cl, "repaint copy done");
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
+    dred_note(cl, "repaint blit to swap buffer %u %p", fi, (void*)s_d3d.swap_buffers[fi]);
     blit_to_window(fi);
+    dred_note(cl, "repaint blit done");
     s_shown_fi = fi;
     cl->lpVtbl->Close(cl);
     ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
