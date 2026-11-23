@@ -167,6 +167,7 @@ typedef struct {
     u32 def_cb, def_arg;   /* default request opt param */
     m2_room room;
     u64 kicked_from;       /* the room this member was last kicked out of (0: none) */
+    u64 lost_from;         /* the room it was in when its connection was lost (0: none) */
 } m2_ctx;
 
 static int    s_init;
@@ -1196,8 +1197,22 @@ static void on_done(void* user, const psnr_msg* m)
         /* Only the room it asked to leave. A leave of a room it isn't in (the
          * server answers "not in the room") mustn't take down the room it is
          * in now: its members' connections would go dead under the title. */
-        if (c->room.in && c->room.id == op->room)
+        if (c->room.in && c->room.id == op->room) {
+            /* No answer came: the connection was lost first (np_psnr fails
+             * what was waiting with a reply of type 0). The server let this
+             * member go when that connection closed, so the leave is done.
+             * Answered as an error, the title asks again (Demon's Souls: every
+             * 15 s, each time with a "session has ended" box), and with the
+             * room gone here the next one went to the server, which wasn't
+             * there, and failed too, for as long as the game ran. */
+            if (!m->type) {
+                err = 0;
+                c->lost_from = op->room;
+                printf("[sceNpMatching2] room %llu: left (its connection was lost before the answer)\n",
+                       (unsigned long long)op->room);
+            }
             room_gone(c);
+        }
     }
     answer(op, err, img.len ? &img : NULL);
     if (op->event == EV_SetRoomDataInternal && !err && c && c->room.in)
@@ -1230,11 +1245,28 @@ s32 sceNpMatching2LeaveRoom(u16 ctxId, u32 req, u32 opt, u32 reqId)
     if (lost && lost->started && req && lost->room.in && lost->room.conn != np_psnr_connection()) {
         printf("[sceNpMatching2] room %llu: out of it already (its connection was lost)\n",
                (unsigned long long)lost->room.id);
+        lost->lost_from = lost->room.id;
         m2_op* op = op_new(lost, ctxId, EV_LeaveRoom, opt, reqId);
         rb_t img = {0};
         u32 o = rb_alloc(&img, 8, 8);   /* SceNpMatching2LeaveRoomResponse { u64 roomId } */
         rb_64(&img, o, lost->room.id);
         room_gone(lost);
+        answer(op, 0, &img);
+        rb_free(&img);
+        free(op);
+        return CELL_OK;
+    }
+    /* The room it was in when its connection was lost, asked again: out of it
+     * already, with a connection or not (the title may ask again before the
+     * first leave's answer, or after an error it got for it). */
+    if (lost && lost->started && req && lost->lost_from && vm_read64(req) == lost->lost_from &&
+        !(lost->room.in && lost->room.id == lost->lost_from)) {
+        printf("[sceNpMatching2] room %llu: out of it already (its connection was lost)\n",
+               (unsigned long long)lost->lost_from);
+        m2_op* op = op_new(lost, ctxId, EV_LeaveRoom, opt, reqId);
+        rb_t img = {0};
+        u32 o = rb_alloc(&img, 8, 8);   /* SceNpMatching2LeaveRoomResponse { u64 roomId } */
+        rb_64(&img, o, lost->lost_from);
         answer(op, 0, &img);
         rb_free(&img);
         free(op);
@@ -1259,6 +1291,8 @@ s32 sceNpMatching2LeaveRoom(u16 ctxId, u32 req, u32 opt, u32 reqId)
         free(op);
         return CELL_OK;
     }
+    if (c->room.in && c->room.id == room && room == c->lost_from)
+        c->lost_from = 0;   /* (in that room again: its leave is the server's to answer) */
     u8 body[8];
     psnr_put64(body, room);
     m2_op* op = op_new(c, ctxId, EV_LeaveRoom, opt, reqId);

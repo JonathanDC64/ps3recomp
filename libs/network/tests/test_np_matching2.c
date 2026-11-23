@@ -9,7 +9,8 @@
  * back, and the RoomDataInternal / member structs built from a ROOM_JOINED.
  * Also: a LeaveRoom after the room's connection was lost is answered at once,
  * and so is one of a room it was kicked out of, which leaves the room it is
- * in now as it is.
+ * in now as it is. A LeaveRoom the lost connection left unanswered is answered
+ * as done, and asked again it is answered at once.
  *
  *   clang-cl /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c ws2_32.lib
  *   cc -std=gnu17 -I include -o test_np_matching2 libs/network/tests/test_np_matching2.c libs/network/psnr/psnr.c
@@ -186,8 +187,16 @@ int main(void)
     assert(s_type == 0 && !s_ctx[ctx].room.in);
     assert(s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0 && s_cb[6] == 0xA0);   /* LeaveRoom, no error */
     assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
-    /* Out of the room with no connection: as any other request. */
+    /* Asked again with no connection: out of it already, answered at once (it was an error until 11-22, which a
+     * title that asks until a leave goes through got every time). */
+    s_type = 0;
+    s_cb_opd = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    /* A room it was never in, with no connection: as any other request. */
+    vm_write64(REQ, 5);
     assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+    vm_write64(REQ, 9);
 
     /* Connected again (a redial: another connection) while the title still holds the old room: out of it
      * already, answered at once. */
@@ -204,6 +213,43 @@ int main(void)
     reply(PSNR_OK, NULL, 0);
     assert(!s_ctx[ctx].room.in && s_cb[2] == 0x0103 && s_cb[4] == 0);
     assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+
+    /* The title asks to leave just as the host's game goes, before the connection's loss is seen: np_psnr then
+     * fails that request itself (a reply of type 0). The server let the member go with the connection, so the
+     * leave is answered as done, and the title doesn't ask again. If it does (Demon's Souls asks every 15 s until
+     * a leave goes through), it is answered at once, with no connection or with one, and nothing is sent. Before,
+     * the room was gone here after the failed leave, every later one went to the server, and each failed. */
+    s_ctx[ctx].room.in = 1;
+    s_ctx[ctx].room.id = 9;
+    s_ctx[ctx].room.conn = 2;
+    vm_write64(REQ, 9);
+    s_type = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == PSNR_LEAVE_ROOM && psnr_get64(s_body) == 9 && s_ctx[ctx].room.in);
+    s_conn_now = 0;
+    s_cb_opd = 0;
+    {
+        psnr_msg dead;
+        memset(&dead, 0, sizeof(dead));
+        s_fn(s_user, &dead);
+    }
+    assert(!s_ctx[ctx].room.in && s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+    s_type = 0;
+    s_cb_opd = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    assert(sceNpMatching2GetEventData(ctx, (u32)s_cb[3], BUF, 4096) == 8 && vm_read64(BUF) == 9);
+    s_conn_now = 3;
+    s_type = 0;
+    s_cb_opd = 0;
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == 0);
+    assert(s_type == 0 && s_cb_opd == 0xCB00 && s_cb[2] == 0x0103 && s_cb[4] == 0);
+    /* A leave of another room still fails while there is no connection (as any other request). */
+    s_conn_now = 0;
+    vm_write64(REQ, 8);
+    assert(sceNpMatching2LeaveRoom(ctx, REQ, OPT, REQID) == (s32)SCE_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+    s_conn_now = 2;
 
     /* Kicked out of room 9: the room is gone here, and the title is told. */
     s_ctx[ctx].room.in = 1;
