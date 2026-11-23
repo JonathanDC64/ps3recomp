@@ -21,6 +21,7 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#include "ppu_lwmutex_slot.h"   /* the host side of a sys_lwmutex */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -161,105 +162,20 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * unlocks and relocks in a loop nearly always won that race: Demon's Souls'
  * MOMixerThread holds lwmutex 0x47800F28 for each mixing round and drops it
  * only between rounds, and on slow CPUs MOMainThread, the one other thread
- * that takes it, waited ~40-100 ms a time for it (#403, #699). A mutex made
+ * that takes it, waited ~40-100 ms a time for it (Soulbrandt #403, #699). A mutex made
  * SYS_SYNC_RETRY keeps the race (lv2 frees it and wakes a waiter to retry).
  * Waiters are served oldest first for every other protocol; lv2's priority
- * order (SYS_SYNC_PRIORITY) isn't modelled. PPU_LWM_HANDOFF=0 restores the
- * race for every mutex. */
+ * order (SYS_SYNC_PRIORITY) isn't modelled. Unlike lv2, the hand-off waits
+ * until the oldest waiter has waited 1 ms (PPU_LWM_FAIR_US; 0 hands over at
+ * every unlock): until then the race stays, because a hand-off at every
+ * unlock makes a busy lock wait on a wake and a reschedule each time, about
+ * 240x slower on Linux and 8x on Windows (tests/sync_stress/test_lwm_slot.c).
+ * PPU_LWM_HANDOFF=0 restores the race for every mutex. The lock itself is in
+ * ppu_lwmutex_slot.h. */
 #define LWM_HASH 65536u
-struct LwmWaiter { struct LwmWaiter* next; int granted; };   /* on the waiter's stack, under lk */
-static struct LwmSlot { volatile long addr;
-    volatile long cnt;               /* 1 free, 0 taken */
-    volatile long waiters;           /* lockers asleep on cv, or about to be */
-    SRWLOCK lk; CONDITION_VARIABLE cv;
-    struct LwmWaiter* qhead; struct LwmWaiter* qtail;   /* under lk: the queue, oldest first */
-    volatile long holder; volatile long long acq_us; volatile long long acq_fences;
-    volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
-static inline int lwm_try(LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
-static int lwm_handoff_on(void)
-{
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("PPU_LWM_HANDOFF"); v = (e && e[0] == '0') ? 0 : 1; }
-    return v;
-}
+static struct LwmSlot g_lwm[LWM_HASH];   /* the lock itself: ppu_lwmutex_slot.h */
 /* Whether the guest lwmutex at lwm is handed over on unlock: all but SYS_SYNC_RETRY (protocol 4). */
 static inline int lwm_fifo(uint32_t lwm) { return lwm_handoff_on() && (vm_read32(lwm + LWM_ATTR) & 0xF) != 4; }
-static void lwm_unqueue(LwmSlot* s, struct LwmWaiter* w)   /* under lk */
-{
-    struct LwmWaiter* prev = nullptr;
-    for (struct LwmWaiter* p = s->qhead; p; prev = p, p = p->next)
-        if (p == w) {
-            if (prev) prev->next = w->next; else s->qhead = w->next;
-            if (s->qtail == w) s->qtail = prev;
-            return;
-        }
-}
-/* Take the count, waiting up to ms (INFINITE: forever). 1 if taken. A fifo
- * waiter queues and is normally served by lwm_release handing it the lock
- * (granted); it still takes a count it finds free, which only an unlock that
- * found nobody asleep leaves. */
-static int lwm_wait(LwmSlot* s, DWORD ms, int fifo)
-{
-    for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
-        if (s->cnt && lwm_try(s)) return 1;
-        YieldProcessor();
-    }
-    const ULONGLONG t0 = GetTickCount64();
-    int got = 0;
-    struct LwmWaiter me = { nullptr, 0 };
-    AcquireSRWLockExclusive(&s->lk);
-    InterlockedIncrement(&s->waiters);      /* before the retry: see lwm_release */
-    if (fifo) {
-        if (s->qtail) s->qtail->next = &me; else s->qhead = &me;
-        s->qtail = &me;
-    }
-    for (;;) {
-        if (me.granted) { got = 1; break; }  /* handed over: already out of the queue */
-        if (lwm_try(s)) { got = 1; break; }
-        DWORD w = INFINITE;
-        if (ms != INFINITE) {
-            const ULONGLONG el = GetTickCount64() - t0;
-            if (el >= ms) break;
-            w = (DWORD)(ms - el);
-        }
-        SleepConditionVariableSRW(&s->cv, &s->lk, w, 0);
-    }
-    if (fifo && !me.granted) lwm_unqueue(s, &me);
-    InterlockedDecrement(&s->waiters);
-    ReleaseSRWLockExclusive(&s->lk);
-    return got;
-}
-/* Give the count back, from any thread. Over-release of a free mutex leaves
- * it free, as the kernel semaphore's max count of 1 did. A locker counts
- * itself a waiter under lk before its last try, and the exchange is a full
- * barrier: either it sees the count, or this sees it and wakes it, under lk
- * so the wake cannot fall between its try and its sleep. With a waiter
- * queued (fifo), the lock goes to the oldest one instead: under lk, so it
- * cannot leave the queue at that moment, and the count stays taken. */
-static void lwm_release(LwmSlot* s, int fifo)
-{
-    if (fifo && s->waiters) {
-        AcquireSRWLockExclusive(&s->lk);
-        struct LwmWaiter* h = s->qhead;
-        if (h) {
-            s->qhead = h->next;
-            if (!s->qhead) s->qtail = nullptr;
-            InterlockedExchange(&s->cnt, 0);
-            h->granted = 1;
-        } else {
-            InterlockedExchange(&s->cnt, 1);
-        }
-        ReleaseSRWLockExclusive(&s->lk);
-        WakeAllConditionVariable(&s->cv);   /* the one granted is among them; the rest sleep again */
-        return;
-    }
-    InterlockedExchange(&s->cnt, 1);
-    if (s->waiters) {
-        AcquireSRWLockExclusive(&s->lk);
-        ReleaseSRWLockExclusive(&s->lk);
-        WakeConditionVariable(&s->cv);
-    }
-}
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }

@@ -89,6 +89,22 @@ set_tests_properties(sync_stress PROPERTIES
     TIMEOUT 120
 )
 
+# The host side of a sys_lwmutex (runtime/ppu/ppu_lwmutex_slot.h): exclusion,
+# the hand-off to the oldest waiter, and timeouts. Every host, like sync_stress.
+add_executable(test_lwm_slot test_lwm_slot.c)
+if(NOT WIN32)
+    target_sources(test_lwm_slot PRIVATE "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_lwm_slot PRIVATE Threads::Threads)
+    target_compile_options(test_lwm_slot PRIVATE -Wall -Wextra -Wno-unused-parameter)
+else()
+    target_compile_definitions(test_lwm_slot PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+foreach(mode exclusion starve order timeout retry always)
+    add_test(NAME lwm_${mode} COMMAND test_lwm_slot ${mode})
+    set_tests_properties(lwm_${mode} PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+endforeach()
+
 # The focused condition tests use Win32 host threads. POSIX execution also
 # needs the waitable-handle implementation supplied by the native host port.
 if(WIN32)
