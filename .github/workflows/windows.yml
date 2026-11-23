@@ -443,6 +443,18 @@ jobs:
           ctest --test-dir build-sync-stress --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # The pinned SDL3 (cmake/sdl3_dep.cmake) builds with this toolchain and starts its gamepad subsystem.
+      # Nothing in the runtime uses it yet; the input moves to it next (the port's docs/173).
+      - name: Build and run the SDL3 smoke test
+        if: ${{ !cancelled() }}
+        run: |
+          cmake -S tests/sdl3_smoke -B build-sdl3 -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build build-sdl3
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ctest --test-dir build-sdl3 --output-on-failure -V
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # runtime/platform/plat.h's threads, events and mutex, and the SPU async
       # job pool on them. On Windows plat.h is the Win32 calls the pool made
       # before it moved, so this checks the same rules the other hosts do.

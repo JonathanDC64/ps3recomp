@@ -845,6 +845,16 @@ jobs:
           cmake --build build-sync-stress
           ctest --test-dir build-sync-stress --output-on-failure
 
+      # The pinned SDL3 (cmake/sdl3_dep.cmake) builds with this toolchain and starts its gamepad subsystem
+      # with no display or controller. Its X11, Wayland and audio back ends build from the headers the
+      # dependency step installs. Nothing in the runtime uses it yet (the port's docs/173).
+      - name: Build and run the SDL3 smoke test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          cmake -S tests/sdl3_smoke -B build-sdl3 -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build build-sdl3
+          ctest --test-dir build-sdl3 --output-on-failure -V
+
       # runtime/platform/plat.h's threads, events and mutex, and the SPU async
       # job pool written once on them. Off Windows the pool used to be a thread
       # per job; this shows it reuses workers, keeps no queue, lets idle ones
