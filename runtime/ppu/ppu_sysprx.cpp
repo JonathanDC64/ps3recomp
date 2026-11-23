@@ -21,6 +21,7 @@
  * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#include "ppu_lwmutex_slot.h"   /* the host side of a sys_lwmutex */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -105,7 +106,8 @@ static void sys_process_is_stack(ppu_context* ctx)
 
 struct LwmSlot;
 static LwmSlot* lwm_slot(uint32_t addr);   /* fwd (defined below) */
-static void lwm_release(LwmSlot* s);
+static void lwm_release(LwmSlot* s, int fifo);
+static inline int lwm_fifo(uint32_t lwm);
 static void sys_lwmutex_create(ppu_context* ctx)
 {
     uint32_t lwm  = (uint32_t)ctx->gpr[3];
@@ -123,7 +125,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
     /* A recreate at a reused address must not inherit a locked slot (e.g. the
      * previous holder exited while holding). Force the semaphore signaled;
      * over-release of an already-free sem fails harmlessly at max count 1. */
-    { LwmSlot* s = lwm_slot(lwm); if (s) lwm_release(s); }
+    { LwmSlot* s = lwm_slot(lwm); if (s) lwm_release(s, lwm_fifo(lwm)); }
     ctx->gpr[3] = 0;
 }
 /* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
@@ -150,54 +152,30 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * does on the console. It was a kernel semaphore, and every lock and unlock a
  * system call, waited on or not: Demon's Souls' HighGraphics thread makes
  * ~90,000 of each a second, ~0.4 us apiece, 7% of the thread the frame
- * waits on. */
+ * waits on.
+ *
+ * An unlock with threads asleep on the lock HANDS it to the one that has
+ * waited longest, as lv2 does (RPCS3 _sys_lwmutex_unlock: the owner word
+ * becomes lwmutex_reserved and reown() wakes a waiter that already owns it).
+ * The count stays taken, so nobody can take the lock in between. It used to
+ * give the count back and wake a waiter to try again, and a thread that
+ * unlocks and relocks in a loop nearly always won that race: Demon's Souls'
+ * MOMixerThread holds lwmutex 0x47800F28 for each mixing round and drops it
+ * only between rounds, and on slow CPUs MOMainThread, the one other thread
+ * that takes it, waited ~40-100 ms a time for it (Soulbrandt #403, #699). A mutex made
+ * SYS_SYNC_RETRY keeps the race (lv2 frees it and wakes a waiter to retry).
+ * Waiters are served oldest first for every other protocol; lv2's priority
+ * order (SYS_SYNC_PRIORITY) isn't modelled. Unlike lv2, the hand-off waits
+ * until the oldest waiter has waited 1 ms (PPU_LWM_FAIR_US; 0 hands over at
+ * every unlock): until then the race stays, because a hand-off at every
+ * unlock makes a busy lock wait on a wake and a reschedule each time, about
+ * 240x slower on Linux and 8x on Windows (tests/sync_stress/test_lwm_slot.c).
+ * PPU_LWM_HANDOFF=0 restores the race for every mutex. The lock itself is in
+ * ppu_lwmutex_slot.h. */
 #define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr;
-    volatile long cnt;               /* 1 free, 0 taken */
-    volatile long waiters;           /* lockers asleep on cv, or about to be */
-    SRWLOCK lk; CONDITION_VARIABLE cv;
-    volatile long holder; volatile long long acq_us; volatile long long acq_fences;
-    volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
-static inline int lwm_try(LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
-/* Take the count, waiting up to ms (INFINITE: forever). 1 if taken. */
-static int lwm_wait(LwmSlot* s, DWORD ms)
-{
-    for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
-        if (s->cnt && lwm_try(s)) return 1;
-        YieldProcessor();
-    }
-    const ULONGLONG t0 = GetTickCount64();
-    int got = 0;
-    AcquireSRWLockExclusive(&s->lk);
-    InterlockedIncrement(&s->waiters);      /* before the retry: see lwm_release */
-    for (;;) {
-        if (lwm_try(s)) { got = 1; break; }
-        DWORD w = INFINITE;
-        if (ms != INFINITE) {
-            const ULONGLONG el = GetTickCount64() - t0;
-            if (el >= ms) break;
-            w = (DWORD)(ms - el);
-        }
-        SleepConditionVariableSRW(&s->cv, &s->lk, w, 0);
-    }
-    InterlockedDecrement(&s->waiters);
-    ReleaseSRWLockExclusive(&s->lk);
-    return got;
-}
-/* Give the count back, from any thread. Over-release of a free mutex leaves
- * it free, as the kernel semaphore's max count of 1 did. A locker counts
- * itself a waiter under lk before its last try, and the exchange is a full
- * barrier: either it sees the count, or this sees it and wakes it, under lk
- * so the wake cannot fall between its try and its sleep. */
-static void lwm_release(LwmSlot* s)
-{
-    InterlockedExchange(&s->cnt, 1);
-    if (s->waiters) {
-        AcquireSRWLockExclusive(&s->lk);
-        ReleaseSRWLockExclusive(&s->lk);
-        WakeConditionVariable(&s->cv);
-    }
-}
+static struct LwmSlot g_lwm[LWM_HASH];   /* the lock itself: ppu_lwmutex_slot.h */
+/* Whether the guest lwmutex at lwm is handed over on unlock: all but SYS_SYNC_RETRY (protocol 4). */
+static inline int lwm_fifo(uint32_t lwm) { return lwm_handoff_on() && (vm_read32(lwm + LWM_ATTR) & 0xF) != 4; }
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
              unsigned ppu_thread_prof_pc(unsigned tid); }
@@ -288,7 +266,7 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
-            if (!lwm_wait(s, ms)) {             /* honor the timeout: ETIMEDOUT, no acquire */
+            if (!lwm_wait(s, ms, lwm_fifo(lwm))) {             /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
                 ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
@@ -364,7 +342,7 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
     /* Release works from ANY thread (unlike a CS) -- guest code hands
      * lwmutex ownership across threads. Over-release (unlock of a free
      * mutex) leaves it free (lwm_release). */
-    if (s) lwm_release(s);
+    if (s) lwm_release(s, lwm_fifo(lwm));
     ctx->gpr[3] = 0;
 }
 
@@ -406,9 +384,9 @@ static void sys_lwcond_wait(ppu_context* ctx)
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
-        lwm_release(s);
+        lwm_release(s, lwm_fifo(lwmutex));
         Sleep(1);
-        lwm_wait(s, INFINITE);
+        lwm_wait(s, INFINITE, lwm_fifo(lwmutex));
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
     }
