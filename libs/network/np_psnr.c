@@ -1510,6 +1510,8 @@ void psnr_app_on_message(void (*fn)(uint32_t from_user, const uint8_t* data, uin
 #  define NP_JC_UDP_RECV(u, buf, cap, ip, port, ms) psnr_udp_recv((u), (buf), (cap), (ip), (port), (ms))
 #  define NP_JC_UDP_CLOSE(u)                       psnr_udp_close(u)
 #endif
+_Static_assert(PSNR_JOIN_ERR_NAME_TAKEN == PSNR_E_NAME_TAKEN && PSNR_JOIN_ERR_REFUSED == PSNR_E_REFUSED,
+               "psnr_host.h's PSNR_JOIN_ERR_* are psnr.h's PSNR_E_*");
 #ifndef NP_JC_FREED
 #  define NP_JC_FREED() ((void)0)   /* (tests: a check freed itself) */
 #endif

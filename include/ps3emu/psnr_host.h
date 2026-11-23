@@ -192,11 +192,15 @@ typedef struct {
     int done;       /* 1: over, state is the result */
     int state;      /* PSNR_JOIN_LOOKING or PSNR_JOIN_REACHING while it runs; then PSNR_JOIN_CONNECTED, or why not:
                      * NO_ROOM, OTHER_VERSION, NO_SERVER, NO_WAY, UNREACHABLE (a direct code), REFUSED, SLOW */
-    int err;        /* why the HELLO was turned away (psnr.h's PSNR_E_*: PSNR_E_NAME_TAKEN, PSNR_E_REFUSED), else 0 */
+    int err;        /* why the HELLO was turned away (PSNR_JOIN_ERR_*, or another of psnr.h's PSNR_E_*), else 0 */
     int udp;        /* it got through over the punched path (0: over TCP) */
     int answered;   /* `answered` said 1 */
     int answers;    /* the host's game's messages after the ask, kept in order (at most PSNR_JOIN_CHECK_ANSWERS) */
 } psnr_join_check_status;
+
+/* psnr_join_check_status.err's values a port may need to tell apart (psnr.h's PSNR_E_NAME_TAKEN and PSNR_E_REFUSED) */
+#define PSNR_JOIN_ERR_NAME_TAKEN 8    /* another player there has this name, from another address */
+#define PSNR_JOIN_ERR_REFUSED    12   /* the key is wrong (the host's game has a new code) */
 
 typedef struct psnr_join_check psnr_join_check;
 /* NULL if it can't start (no server, an ask too long, no thread). */
