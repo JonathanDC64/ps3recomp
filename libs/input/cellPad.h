@@ -248,6 +248,21 @@ int cellPad_host_controllers(char* out, int n);
  * Both are always terminated. 0 when there is no i-th. */
 int cellPad_host_controller(int i, char* id, int idn, char* name, int namen);
 
+/* One of the user's pads as cellPad_host_pads reads it. */
+typedef struct {
+    char id[16];         /* its PAD_CONTROLLER name: "controller1", "playstation2", ... */
+    u16  buttons;        /* CELL_PAD_CTRL_* */
+    u8   lx, ly, rx, ry; /* 0-255, centre 128, up = 0, through the deadzones the game's pad uses */
+    u8   l2, r2;         /* the triggers, 0-255 */
+    u8   extra;          /* the buttons beyond the PS3's (pad_map.h's PAD_EXTRA_*) */
+} CellPadHostPad;
+
+/* Every pad of the user's, read here and now, whatever reads them in this build (XInput, SDL, the Sony HID reader),
+ * up to max into out. Returns how many. For a title's own menus: it works before the title has called cellPadInit
+ * and under the host hold, and gives each pad the name PAD_CONTROLLER and cellPad_host_controller use. It doesn't
+ * look at PAD_FOCUS_ONLY or PS3_NO_USER_INPUT (cellPad_host_pads_on). */
+int cellPad_host_pads(CellPadHostPad* out, int max);
+
 /* One stick (0 left, 1 right) of the pad on port 0, as the pad reports it: x and y -1 to 1 with down positive, before
  * any deadzone. Reads the devices when called, so it works before the title polls and under the host hold; for a
  * settings screen, once a frame at most. Returns which deadzone the pad goes through (for cellPad_host_stick_stage):
