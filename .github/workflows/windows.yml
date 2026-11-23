@@ -430,6 +430,16 @@ jobs:
           .\test_pad_map.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # SDL3's gamepads in the player slots (pad_sdl3_slots.h), against stand-ins for SDL: a pad keeps its slot while
+      # others come and go, a fifth waits for one, and a pad that fails to open is tried again.
+      - name: Run the SDL3 slot test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /UNDEBUG /I libs/input /Fe:test_pad_sdl3_slots.exe libs/input/tests/test_pad_sdl3_slots.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_pad_sdl3_slots.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # sync_stress has always been the Windows-native suite; now that its
       # source also builds on POSIX through the shim, this is what proves the
       # shared source still means the same thing here.

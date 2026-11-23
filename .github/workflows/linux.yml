@@ -675,6 +675,14 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I libs/input -o /tmp/test_pad_map libs/input/tests/test_pad_map.c
           /tmp/test_pad_map
 
+      # SDL3's gamepads in the player slots (pad_sdl3_slots.h), against stand-ins for SDL: a pad keeps its slot while
+      # others come and go, a fifth waits for one, and a pad that fails to open is tried again.
+      - name: Run the SDL3 slot test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I libs/input -o /tmp/test_pad_sdl3_slots libs/input/tests/test_pad_sdl3_slots.c
+          /tmp/test_pad_sdl3_slots
+
       # Guest vertex and fragment programs through the decompilers, glslang
       # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
       # and attribute slots the Metal backend binds to. The binary missing
