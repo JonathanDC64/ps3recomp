@@ -16582,6 +16582,31 @@ static int present_queued(void)
     return ahead != 0;
 }
 
+/* Before a repaint reuses this frame's allocator: the GPU may still be running
+ * the last batch recorded with it. A batch drawn without a present (offscreen
+ * work, or a batch that ran out of room: render_frame with
+ * s_present_this_frame 0) leaves frame_index where it was, and the repaint can
+ * come a refresh later while that batch is still on the GPU, slower with other
+ * games sharing it. Resetting an allocator the GPU is reading is undefined: on
+ * 11-23 it hung the GPU (DXGI_ERROR_DEVICE_HUNG; DRED: this list stopped at
+ * its copy of the held frame) with a menu open over a co-op session and two or
+ * three game copies on one GPU. render_frame and the captures wait the same
+ * way first, and the portable core's repaint waits for the slot
+ * (rsxc_init.inc, frame_cmd_begin). The first few waits that took time are
+ * logged. */
+static void repaint_wait_gpu(void)
+{
+    static u32 said;
+    LARGE_INTEGER t0, t1, f;
+    QueryPerformanceCounter(&t0);
+    wait_for_gpu();
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    const double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+    if (ms >= 0.5 && said < 5 && ++said)
+        fprintf(stderr, "[D3D12] repaint: waited %.1f ms for the GPU to finish this frame's last batch%c", ms, 10);
+}
+
 void rsx_d3d12_overlay_tick(void)
 {
     /* Woken (rsx_d3d12_overlay_wake) with repaints off: the hold is made here
@@ -16622,6 +16647,7 @@ void rsx_d3d12_overlay_tick(void)
      * next batch anyway), then into the window's as for any frame. */
     const u32 fi = s_d3d.frame_index;
     ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
+    repaint_wait_gpu();
     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
     cl->lpVtbl->Reset(cl, s_d3d.cmd_allocators[fi], NULL);
     {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
