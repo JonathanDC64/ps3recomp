@@ -263,6 +263,10 @@ typedef struct {
  * look at PAD_FOCUS_ONLY or PS3_NO_USER_INPUT (cellPad_host_pads_on). */
 int cellPad_host_pads(CellPadHostPad* out, int max);
 
+/* What reads the pads in this build, for a title's settings: 1 SDL (SDL3 on Windows by default, SDL2 elsewhere), 0
+ * XInput (Windows with PS3RECOMP_PAD_SDL3=OFF). Sony's pads on Windows are read over HID either way. */
+int cellPad_host_reader_sdl(void);
+
 /* One stick (0 left, 1 right) of the pad on port 0, as the pad reports it: x and y -1 to 1 with down positive, before
  * any deadzone. Reads the devices when called, so it works before the title polls and under the host hold; for a
  * settings screen, once a frame at most. Returns which deadzone the pad goes through (for cellPad_host_stick_stage):

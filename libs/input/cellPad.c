@@ -1844,6 +1844,12 @@ int cellPad_host_pads(CellPadHostPad* out, int max)
 }
 
 /* cellPad.h */
+int cellPad_host_reader_sdl(void)
+{
+    return PAD_BACKEND_SDL2 || PAD_BACKEND_SDL3;
+}
+
+/* cellPad.h */
 void cellPad_host_stick_stage(int path, int stick, float x, float y, unsigned char* out_x, unsigned char* out_y)
 {
 #if PAD_HID_SONY_ON
