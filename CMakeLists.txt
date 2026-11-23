@@ -229,6 +229,15 @@ if(WIN32)
         bcrypt      # BCryptGenRandom for SSL RNG
         user32 gdi32  # cellOskDialog's host text-input window
     )
+    # The pads through SDL3 (cellPad.c's SDL3 backend), built from the pinned release (cmake/sdl3_dep.cmake). Off:
+    # XInput, as before. Either way Sony's pads are read over HID (pad_hid_sony.c).
+    option(PS3RECOMP_PAD_SDL3 "Windows: read the controllers through SDL3 in place of XInput" ON)
+    if(PS3RECOMP_PAD_SDL3)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/sdl3_dep.cmake")
+        ps3recomp_sdl3_available()
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL3::SDL3-static)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_SDL3)
+    endif()
     if(PS3RECOMP_UPNP)
         # miniupnpc: GetAdaptersAddresses. net_upnp.c names it too (#pragma comment), for a host that links the
         # runtime as an imported library.
@@ -681,6 +690,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_pad_sdl_slots PRIVATE -UNDEBUG)
     endif()
     add_test(NAME pad_sdl_slots COMMAND test_pad_sdl_slots)
+    # The same for SDL3, by instance ID (pad_sdl3_slots.h).
+    add_executable(test_pad_sdl3_slots libs/input/tests/test_pad_sdl3_slots.c)
+    target_include_directories(test_pad_sdl3_slots PRIVATE libs/input)
+    if(MSVC)
+        target_compile_options(test_pad_sdl3_slots PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(test_pad_sdl3_slots PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME pad_sdl3_slots COMMAND test_pad_sdl3_slots)
     # PAD_CONTROLLER's names and the port it finds.
     add_executable(test_pad_controller libs/input/tests/test_pad_controller.c)
     target_include_directories(test_pad_controller PRIVATE libs/input)
