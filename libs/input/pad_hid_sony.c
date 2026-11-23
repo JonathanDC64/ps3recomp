@@ -88,6 +88,8 @@ typedef struct {
     SRWLOCK         lock;
     PadHidSonyState st;
     int             have;      /* a report has been parsed */
+    ULONGLONG       at;        /* when the last one was (GetTickCount64), under lock */
+    volatile LONG   quiet;     /* its silence was logged (sony_live) */
     /* Vibration: the write handle (NULL when the pad takes none) and its
      * event, under wlock; the output report's length; the DualSense's
      * Bluetooth sequence number. */
@@ -100,6 +102,23 @@ typedef struct {
 
 static SonyDev s_dev[PAD_HID_SONY_MAX];
 static volatile LONG s_started;
+
+/* A pad that has sent no report for this long is left out until it sends one. The pads report all the time, on USB
+ * and Bluetooth alike, idle or not (SDL's PS4 and PS5 drivers take 500 ms of silence for a disconnect too). A
+ * Bluetooth pad that is switched off can leave its device in place, and then the reader's ReadFile never fails: the
+ * pad stayed on its port with its last state, and in a title's list of controllers. */
+#define SONY_QUIET_MS 1000
+
+/* The pad has a state that is still its own. Under d->lock. */
+static int sony_live(const SonyDev* d, ULONGLONG now)
+{
+    return d->have && now - d->at <= SONY_QUIET_MS;
+}
+
+static const char* sony_name(const SonyDev* d)
+{
+    return d->kind == KIND_DS5 ? "DualSense" : "DualShock 4";
+}
 
 static int sony_kind(USHORT vid, USHORT pid)
 {
@@ -192,8 +211,10 @@ static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
     }
 
     AcquireSRWLockExclusive(&d->lock);
-    d->st = s; d->have = 1;
+    d->st = s; d->have = 1; d->at = GetTickCount64();
     ReleaseSRWLockExclusive(&d->lock);
+    if (InterlockedExchange(&d->quiet, 0))
+        fprintf(stderr, "[cellPad] %s (HID pad %d) reports again\n", sony_name(d), (int)(d - s_dev));
 }
 
 static unsigned __stdcall sony_reader(void* arg)
@@ -206,7 +227,7 @@ static unsigned __stdcall sony_reader(void* arg)
         if (!ReadFile(d->h, buf, len, &got, NULL)) break;   /* unplugged */
         if (got) sony_parse(d, buf, got);
     }
-    fprintf(stderr, "[cellPad] %s disconnected (HID)\n", d->kind == KIND_DS5 ? "DualSense" : "DualShock 4");
+    fprintf(stderr, "[cellPad] %s disconnected (HID)\n", sony_name(d));
     AcquireSRWLockExclusive(&d->wlock);
     if (d->wh) CloseHandle(d->wh);
     if (d->wev) CloseHandle(d->wev);
@@ -269,7 +290,8 @@ static void sony_scan(void)
         if (in_len < 10 || slot < 0) { if (slot >= 0) s_dev[slot].used = 0; CloseHandle(h); continue; }
 
         SonyDev* d = &s_dev[slot];
-        d->h = h; d->kind = kind; d->in_len = in_len; d->pid = at.ProductID; d->have = 0;
+        d->h = h; d->kind = kind; d->in_len = in_len; d->pid = at.ProductID; d->have = 0; d->at = 0;
+        InterlockedExchange(&d->quiet, 0);
         wcscpy(d->path, path);
         /* The write handle, if the pad takes output reports this long. */
         uint8_t probe[1024];
@@ -320,14 +342,20 @@ int pad_hid_sony_poll(PadHidSonyState* out, int max)
         if (t) { SetThreadDescription(t, L"cellPad HID scan"); CloseHandle(t); }
     }
     int n = 0;
+    const ULONGLONG now = GetTickCount64();
     for (int i = 0; i < PAD_HID_SONY_MAX && n < max; i++) {
-        if (!s_dev[i].used) continue;
-        AcquireSRWLockShared(&s_dev[i].lock);
-        if (s_dev[i].have) {
-            out[n] = s_dev[i].st;
+        SonyDev* d = &s_dev[i];
+        if (!d->used) continue;
+        AcquireSRWLockShared(&d->lock);
+        const int live = sony_live(d, now), had = d->have;
+        if (live) {
+            out[n] = d->st;
             out[n++].slot = (uint8_t)i;
         }
-        ReleaseSRWLockShared(&s_dev[i].lock);
+        ReleaseSRWLockShared(&d->lock);
+        if (!live && had && InterlockedCompareExchange(&d->quiet, 1, 0) == 0)
+            fprintf(stderr, "[cellPad] %s (HID pad %d) sent nothing for %d ms: left out until it reports again\n",
+                    sony_name(d), i, SONY_QUIET_MS);
     }
     return n;
 }
@@ -337,8 +365,11 @@ int pad_hid_sony_describe(int slot, char* out, size_t n)
     if (!out || !n) return 0;
     out[0] = '\0';
     if (slot < 0 || slot >= PAD_HID_SONY_MAX || !s_started) return 0;
-    const SonyDev* d = &s_dev[slot];
-    if (!d->used || !d->have) return 0;   /* (have: open, and its fields set) */
+    SonyDev* d = &s_dev[slot];
+    AcquireSRWLockShared(&d->lock);
+    const int live = d->used && sony_live(d, GetTickCount64());   /* (open, its fields set, and reporting) */
+    ReleaseSRWLockShared(&d->lock);
+    if (!live) return 0;
     const char* what = d->kind == KIND_DS4 ? "DualShock 4" : d->pid == 0x0DF2 ? "DualSense Edge" : "DualSense";
     const char* link = d->pid == 0x0BA0 ? "wireless adapter" : d->in_len > 64 ? "Bluetooth" : "USB";
     return snprintf(out, n, "%s (%s)", what, link) > 0;
@@ -350,6 +381,10 @@ int pad_hid_sony_rumble(int slot, uint8_t strong, uint8_t weak)
     SonyDev* d = &s_dev[slot];
     uint8_t r[1024];
     int ok = 0;
+    AcquireSRWLockShared(&d->lock);
+    const int live = sony_live(d, GetTickCount64());
+    ReleaseSRWLockShared(&d->lock);
+    if (!live) return 0;   /* (a pad that has gone quiet: its write would wait the 200 ms out) */
     AcquireSRWLockExclusive(&d->wlock);
     if (d->used && d->wh && d->out_len <= sizeof r &&
         pad_hid_sony_rumble_report(d->kind == KIND_DS5, d->in_len > 64, d->seq, strong, weak, r, d->out_len)) {
