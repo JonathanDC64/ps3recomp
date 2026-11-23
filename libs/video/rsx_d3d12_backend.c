@@ -16647,15 +16647,23 @@ void rsx_d3d12_overlay_tick(void)
     b[1].Transition.pResource   = s_hold;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    { static int reps = -1; PS3_KNOB(reps, ps3_env_int("RSX_SCRATCH_RCOPY", 1));
+      for (int r = 0; r < (reps > 0 ? reps : 1); r++) {
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
-    dred_note(cl, "repaint copy: hold %p -> rt[%u] %p", (void*)s_hold, fi, (void*)s_d3d.render_targets[fi]);
+    if (r == 0 || r == reps - 1)
+        dred_note(cl, "repaint copy %d: hold %p -> rt[%u] %p", r, (void*)s_hold, fi, (void*)s_d3d.render_targets[fi]);
     cl->lpVtbl->CopyResource(cl, s_d3d.render_targets[fi], s_hold);
-    dred_note(cl, "repaint copy done");
+    if (r == 0 || r == reps - 1) dred_note(cl, "repaint copy %d done", r);
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
     b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
     cl->lpVtbl->ResourceBarrier(cl, 2, b);
+      } }
     s_hdr.frame_t = -1;   /* a held frame: T may hold a later one */
     dred_note(cl, "repaint blit to swap buffer %u %p", fi, (void*)s_d3d.swap_buffers[fi]);
     blit_to_window(fi);
