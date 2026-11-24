@@ -63,6 +63,21 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     }
     return mfc_ea_range_commit_slow(ea, size);
 }
+/* Mark every 64K guest page wholly inside [base, base + len) -- a committed
+ * run VirtualQuery returned, as host addresses -- as committed. */
+static MFC_NOINLINE void mfc_mark_committed_run(uintptr_t base, uintptr_t len)
+{
+    extern uint8_t g_vm_page_bitmap[65536 / 8];
+    const uintptr_t lo = (uintptr_t)vm_base, hi = lo + 0x100000000ull;
+    uintptr_t a = base > lo ? base : lo;
+    uintptr_t b = base + len < hi ? base + len : hi;
+    if (b <= a) return;
+    a = (a - lo + 0xFFFFu) >> 16;   /* the first whole page */
+    b = (b - lo) >> 16;             /* one past the last */
+    for (uintptr_t q = a; q < b; q++)
+        if (!((g_vm_page_bitmap[q >> 3] >> (q & 7)) & 1))
+            __atomic_fetch_or(&g_vm_page_bitmap[q >> 3], (uint8_t)(1u << (q & 7)), __ATOMIC_RELAXED);
+}
 static MFC_NOINLINE int mfc_ea_range_commit_slow(uint64_t ea, uint32_t size)
 {
     /* The VM reserves the full 32-bit guest space but only commits specific
@@ -79,8 +94,18 @@ static MFC_NOINLINE int mfc_ea_range_commit_slow(uint64_t ea, uint32_t size)
      * directly (the D3D12 backend's VRAM window never faults) start unseeded
      * -- treating the bitmap as authoritative rejected every Bink decode DMA
      * (green movie). On a miss, fall back to ONE VirtualQuery and remember
-     * the answer: first touch per 64K page pays the syscall, steady state is
-     * two bit tests. (The all-syscall version was 94 CPU-s per 50 s run.) */
+     * the answer. (The all-syscall version was 94 CPU-s per 50 s run.)
+     *
+     * The answer covers more than the page asked about: VirtualQuery returns
+     * the whole run of pages in the same state, and every 64K page wholly
+     * inside a committed, accessible run is marked with it. Marking only the
+     * page asked about left the first touch of each page paying the syscall,
+     * and nothing in the runtime seeds the bitmap for what vm_init and the
+     * renderers commit directly (main memory, RSX local memory). Demon's
+     * Souls' texture-upload jobs made over 1,000 of these calls in a 3-minute
+     * walk, 0.4 ms each on average and up to 3 ms (the call waits for the
+     * process's address-space lock), and the main thread waits for the jobs.
+     * Nothing decommits guest memory, so a marked page stays committed. */
     { extern uint8_t g_vm_page_bitmap[65536 / 8];
       uint32_t last = e + size - 1;
       uint32_t pg[2] = { e >> 16, last >> 16 };
@@ -93,8 +118,10 @@ static MFC_NOINLINE int mfc_ea_range_commit_slow(uint64_t ea, uint32_t size)
               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
+          } else {
+              mfc_mark_committed_run((uintptr_t)mbi.BaseAddress, (uintptr_t)mbi.RegionSize);
           }
-          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+          __atomic_fetch_or(&g_vm_page_bitmap[pg[i] >> 3], (uint8_t)(1u << (pg[i] & 7)), __ATOMIC_RELAXED);
       }
     }
     return 1;
