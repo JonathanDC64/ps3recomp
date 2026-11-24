@@ -640,6 +640,109 @@ static DWORD WINAPI pso_prebuild_thread(LPVOID unused)
                1000.0 * (perf_now() - s_pso_pre_t0));
     return 0;
 }
+
+/* The warm-up (PS3_PSO_WARM, 1 by default): once the start's builds are
+ * done, records the loaded library already held (the ones the prebuild
+ * skips, below s_pso_lib_have) are loaded from it once on background
+ * threads, and released. A library holds a pipeline, but the driver may
+ * still compile it when it is first loaded: after a driver update, or once
+ * its own shader cache has dropped it. Measured on an RTX 5070 Ti after a
+ * driver update: 30-190 ms for one load, all of them at draws, as hitches.
+ *
+ * The cost is the shaders', not the pipelines': the first pipeline in the
+ * process with a shader took 7-25 ms to load (31-72 ms to create), any
+ * other with shaders the driver had seen 0.4 ms (0.56 ms to create). So
+ * PS3_PSO_WARM=1 loads one record per shader, the first with a vertex or
+ * pixel shader no record before it has: on the dev cache 429 of 6,333
+ * records, in 4.1 s instead of 7.4, and the regress route's draws waited no
+ * more than with all of them loaded (2 against 7; 32 with none). Each shader
+ * the driver has seen also stays in its memory (about 300 KB), and each
+ * pipeline about 10 KB: one per shader kept the game ~60 MB smaller than all
+ * of them. PS3_PSO_WARM=2 loads every record, 0 none. One the library lacks
+ * after all is built and stored, as the prebuild's. */
+static volatile LONG s_pso_warm_next, s_pso_warm_live, s_pso_warm_done, s_pso_warm_slow;
+static volatile LONG64 s_pso_warm_slow_us;
+static int s_pso_warm_started, s_pso_warm_off;   /* (off: nothing to load, or PS3_PSO_WARM=0) */
+static double s_pso_warm_t0;
+static u32* s_pso_warm_pick;   /* the records to load (PS3_PSO_WARM=1), else all below the count */
+static u32 s_pso_warm_n;
+#define PSO_WARM_SLOW_US 5000   /* a load this long or longer: the driver compiled it */
+/* Adds k to the set t (open addressing, cap a power of two, 0 an empty slot); 1 if it was not in it. */
+static int pso_warm_set_add(u64* t, u32 cap, u64 k)
+{
+    if (!k) k = 1;
+    u32 h = (u32)(k ^ (k >> 32)) & (cap - 1);
+    while (t[h]) {
+        if (t[h] == k) return 0;
+        h = (h + 1) & (cap - 1);
+    }
+    t[h] = k;
+    return 1;
+}
+static DWORD WINAPI pso_warm_thread(LPVOID unused)
+{
+    (void)unused;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    for (;;) {
+        const u32 j = (u32)(InterlockedIncrement(&s_pso_warm_next) - 1);
+        if (j >= s_pso_warm_n || s_pso_pre_abort) break;
+        const u32 i = s_pso_warm_pick ? s_pso_warm_pick[j] : j;
+        const double t0 = perf_now();
+        if (!pso_prebuild_one(&s_pso_man[i])) continue;
+        InterlockedIncrement(&s_pso_warm_done);
+        const LONG64 us = (LONG64)((perf_now() - t0) * 1e6);
+        if (us >= PSO_WARM_SLOW_US) {
+            InterlockedIncrement(&s_pso_warm_slow);
+            InterlockedAdd64(&s_pso_warm_slow_us, us);
+        }
+    }
+    if (InterlockedDecrement(&s_pso_warm_live) == 0) {
+        const u32 all = s_pso_lib_have < s_pso_man_read ? s_pso_lib_have : s_pso_man_read;
+        printf("[D3D12] pipeline warm-up: %ld of %u loaded (%s of %u records), in %.0f ms; %ld took %d ms or more "
+               "(%.0f ms in all)\n",
+               (long)s_pso_warm_done, s_pso_warm_n, s_pso_warm_pick ? "one per shader" : "all", all,
+               1000.0 * (perf_now() - s_pso_warm_t0), (long)s_pso_warm_slow, PSO_WARM_SLOW_US / 1000,
+               s_pso_warm_slow_us / 1000.0);
+        free(s_pso_warm_pick);
+        s_pso_warm_pick = NULL;
+    }
+    return 0;
+}
+static void pso_warm_start(void)
+{
+    if (s_pso_warm_started) return;
+    s_pso_warm_started = 1;
+    const int mode = ps3_env_int("PS3_PSO_WARM", 1);
+    if (!s_pso_lib_have || !s_pso_man_read || !mode) { s_pso_warm_off = 1; return; }
+    const u32 all = s_pso_lib_have < s_pso_man_read ? s_pso_lib_have : s_pso_man_read;
+    s_pso_warm_n = all;
+    if (mode == 1) {
+        u32 cap = 1024;
+        while (cap < all * 2) cap *= 2;
+        u64* vs = (u64*)calloc(cap, sizeof *vs);
+        u64* ps = (u64*)calloc(cap, sizeof *ps);
+        s_pso_warm_pick = vs && ps ? (u32*)malloc(sizeof(u32) * all) : NULL;
+        if (s_pso_warm_pick) {
+            s_pso_warm_n = 0;
+            for (u32 i = 0; i < all; i++) {
+                const int a = pso_warm_set_add(vs, cap, s_pso_man[i].vs_hash);
+                const int b = pso_warm_set_add(ps, cap, s_pso_man[i].ps_hash);
+                if (a || b) s_pso_warm_pick[s_pso_warm_n++] = i;
+            }
+        }   /* (out of memory: every record, as PS3_PSO_WARM=2) */
+        free(vs);
+        free(ps);
+    }
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    int nt = (int)si.dwNumberOfProcessors / 4;
+    if (nt < 1) nt = 1; if (nt > 4) nt = 4;
+    s_pso_warm_t0 = perf_now();
+    s_pso_warm_live = nt;
+    for (int t = 0; t < nt; t++) {
+        HANDLE h = CreateThread(NULL, 0, pso_warm_thread, NULL, 0, NULL);
+        if (h) CloseHandle(h); else InterlockedDecrement(&s_pso_warm_live);
+    }
+}
 /* Once per present, on the render thread. Starts the startup build once the
  * root signature exists, then the pipeline index's, and saves in the
  * background once those builds are done, the manifest has every record
@@ -660,7 +763,8 @@ static void pso_count_print(const char* when)
 /* The start's builds, each once the one before it is done: the manifest's
  * once the root signature exists, then the neutral manifest's (step P3S),
  * then the pipeline index's. Each builds only what the library does not
- * have by then. */
+ * have by then. The warm-up starts with the index's, after the neutral
+ * manifest's. */
 static void pso_builds_step(void)
 {
     if (!s_pso_pre_started && GPU_VALID(s_d3d.vp_layout)) {
@@ -678,7 +782,7 @@ static void pso_builds_step(void)
         }
     }
     if (s_pso_pre_started && !s_pso_pre_live) gm_build_start();
-    if (s_gmb_started && !s_gmb_live) pso_index_build_start();
+    if (s_gmb_started && !s_gmb_live) { pso_index_build_start(); pso_warm_start(); }
 }
 static void pso_lib_tick(void)
 {
@@ -708,7 +812,16 @@ static void pso_lib_tick(void)
 static gpu_pipeline pso_create_cached(const gpu_pipeline_desc* pd, const gm_rec* rec)
 {
     uint32_t how = GPU_PIPELINE_FAILED;
+    const double t0 = perf_now();
     const gpu_pipeline pso = rc_pipeline(pd, &how);
+    /* A draw that waits this long is a hitch: the first 32 are logged. */
+    { const double ms = (perf_now() - t0) * 1000.0;
+      static volatile LONG said;
+      if (ms >= 8.0 && InterlockedIncrement(&said) <= 32)
+          printf("[D3D12] a draw waited %.0f ms for a pipeline %s (warm-up %s)\n", ms,
+                 how == GPU_PIPELINE_LOADED ? "loaded from the library" : "compiled",
+                 !s_pso_warm_started ? "not started" : s_pso_warm_off ? "off"
+                                     : s_pso_warm_live ? "running" : "done"); }
     if (!s_pso_lib_on || !pso.v) return pso;
     gm_add(rec);
     if (how == GPU_PIPELINE_LOADED) { InterlockedIncrement(&s_pso_lib_hits); return pso; }

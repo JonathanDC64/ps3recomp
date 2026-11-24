@@ -511,7 +511,8 @@ static void pso_builds_finish(void)
     if (!s_pso_lib_on || !GPU_VALID(s_d3d.vp_layout)) return;
     for (;;) {
         pso_builds_step();
-        if (!s_pso_pre_live && s_gmb_started && !s_gmb_live && (!s_pxb_ready || (s_pxb_started && !s_pxb_live)))
+        if (!s_pso_pre_live && s_gmb_started && !s_gmb_live && (!s_pxb_ready || (s_pxb_started && !s_pxb_live)) &&
+            !s_pso_warm_live)
             break;
         Sleep(1);
     }
