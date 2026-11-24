@@ -125,7 +125,8 @@ static void rc_backend_shutdown(void)
     if (s_pso_lib_on) {
         if (ps3_env_int("PS3_PSO_WAIT", 0)) pso_builds_finish();   /* (step P3S) */
         InterlockedExchange(&s_pso_pre_abort, 1);
-        while (s_pso_lib_saving || s_pso_pre_live || s_gmb_live || s_pxb_live || s_gm_writing) Sleep(1);
+        while (s_pso_lib_saving || s_pso_pre_live || s_gmb_live || s_pxb_live || s_pso_warm_live || s_gm_writing)
+            Sleep(1);
         pso_manifest_flush();
         gm_flush();   /* (step P3S: the neutral manifest's records, whether or not the library is saved) */
         if (s_pso_lib_new) pso_lib_save();
