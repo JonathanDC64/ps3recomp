@@ -1799,6 +1799,7 @@ gpu_device* gpu_d3d12_create(const gpu_device_desc* desc)
     InitializeSRWLock(&dd->lock);
     InitializeSRWLock(&dd->signal_lock);
     InitializeSRWLock(&dd->lib_lock);
+    for (uint32_t i = 0; i < GPU_D3D12_LIB_STRIPES; i++) InitializeSRWLock(&dd->lib_name_lock[i]);
     InitializeSRWLock(&dd->pso_lock);
     dd->base.vt = &k_d3d12_vt;
     dd->flags = desc->flags;
@@ -2009,6 +2010,7 @@ gpu_device* gpu_d3d12_create_on(void* device, void* queue, const gpu_device_desc
     InitializeSRWLock(&dd->lock);
     InitializeSRWLock(&dd->signal_lock);
     InitializeSRWLock(&dd->lib_lock);
+    for (uint32_t i = 0; i < GPU_D3D12_LIB_STRIPES; i++) InitializeSRWLock(&dd->lib_name_lock[i]);
     InitializeSRWLock(&dd->pso_lock);
     dd->base.vt = &k_d3d12_vt;
     if (!device_init_on(dd, &none, (ID3D12Device*)device, (ID3D12CommandQueue*)queue)) {

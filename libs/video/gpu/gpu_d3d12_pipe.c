@@ -176,9 +176,22 @@ static int lib_store(gpu_d3d12_device* dd, const WCHAR* name, const D3D12_GRAPHI
     return stored;
 }
 
+/* A name's lock. The library synchronises itself, but two threads must not
+ * load the same name at once, as that may change the pipeline's state in the
+ * library (ID3D12PipelineLibrary's documentation). So a load holds lib_lock
+ * shared and its name's stripe exclusive: loads of other names go on beside
+ * it. Before, every load held lib_lock exclusive, so a draw's load waited
+ * while the start's warm-up loaded a pipeline whose shaders the driver
+ * compiles (30 to 70 ms; docs/97). A store and a new library hold lib_lock
+ * exclusive, which keeps out every load. */
+static SRWLOCK* lib_stripe(gpu_d3d12_device* dd, uint64_t name)
+{
+    return &dd->lib_name_lock[(uint32_t)(name ^ (name >> 32)) % GPU_D3D12_LIB_STRIPES];
+}
+
 /* Today's pso_create_cached: without a library, CreateGraphicsPipelineState;
- * with one, LoadGraphicsPipeline by name under the lock, else create and
- * store. GPU_PIPELINE_STORE_ONLY is today's startup and index builds
+ * with one, LoadGraphicsPipeline by name under the lock (lib_stripe), else
+ * create and store. GPU_PIPELINE_STORE_ONLY is today's startup and index builds
  * (pso_prebuild_one, pxi_build_one): the pipeline loaded or stored is
  * released at once, as theirs are, so it is not kept beside the one a draw
  * later loads from the library. */
@@ -193,13 +206,17 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
     gpu_d3d12_pipe_d3d_desc(dd, desc, &pd, il);
     ID3D12PipelineState* pso = NULL;
     WCHAR name[20];
-    swprintf(name, 20, L"%016llx", (unsigned long long)gpu_d3d12_pipe_name(dd, desc));
-    AcquireSRWLockExclusive(&dd->lib_lock);
+    const uint64_t nm = gpu_d3d12_pipe_name(dd, desc);
+    swprintf(name, 20, L"%016llx", (unsigned long long)nm);
+    SRWLOCK* const stripe = lib_stripe(dd, nm);
+    AcquireSRWLockShared(&dd->lib_lock);
+    AcquireSRWLockExclusive(stripe);
     const int have_lib = dd->lib != NULL;
     HRESULT hr = have_lib ? dd->lib->lpVtbl->LoadGraphicsPipeline(dd->lib, name, &pd,
                                 &IID_ID3D12PipelineState, (void**)&pso)
                           : E_FAIL;
-    ReleaseSRWLockExclusive(&dd->lib_lock);
+    ReleaseSRWLockExclusive(stripe);
+    ReleaseSRWLockShared(&dd->lib_lock);
     if (SUCCEEDED(hr) && pso) {
         made = GPU_PIPELINE_LOADED;
     } else {
