@@ -144,14 +144,14 @@ void cellGcm_replay_method(uint32_t mfull, uint32_t data);
  * -------------------------------------------------------------------------*/
 typedef struct { const char* scene; uint64_t pass1, pass2; } Golden;
 static const Golden k_golden[] = {
-    { "clears",    0x83f1ad48a9c74665ull, 0x05851a624588244eull },
-    { "draws",     0x41bc3a52e35ce4b0ull, 0x652a6cada934afe3ull },
-    { "states",    0x6460811fc0b79f7cull, 0xeaac6e68b18102b2ull },
-    { "textures",  0x1ecd33b81cb99730ull, 0x86ee755bbcccfc05ull },
-    { "offscreen", 0xe9797a9b9fb94278ull, 0x12365db1b92ce390ull },
-    { "zpass",     0xb442d1e1571e2f25ull, 0xcaa0420a14ec0ef6ull },
-    { "frames",    0x5a4d97011f1d52c0ull, 0x843cb180c72d5818ull },
-    { "mainmem",   0xad010a8e6da50e79ull, 0xcc5b25fa0716a93full },
+    { "clears",    0x44b4fe1f61ca9ba1ull, 0x20db81381e2112f7ull },
+    { "draws",     0x9095b08185eb1113ull, 0x10f5821a5a24593dull },
+    { "states",    0x4b912d19fdb28af0ull, 0x11508dd6003b4145ull },
+    { "textures",  0x57206b9e19abce58ull, 0x7cd704c12f4813a7ull },
+    { "offscreen", 0x917f0fc7c75e2039ull, 0xcba11142fe89a086ull },
+    { "zpass",     0xa826b97fd26b99afull, 0xe80745b7864fe288ull },
+    { "frames",    0x61c5ce21e8957b0full, 0x4233586bae80329bull },
+    { "mainmem",   0x99917af6ae070c7dull, 0x9d3668acd63f3af6ull },
 };
 
 /* ---------------------------------------------------------------------------
@@ -981,6 +981,9 @@ static void scene_frames(int k)
     layout_std(VB_AT(6));
     states_default();
     const u32 rw = k == 3 ? 256u : 128u;
+    /* The fourth frame's target is made again over bytes in guest memory, so
+     * it is filled from them; the first frame's, over zeros, is cleared. */
+    if (k == 3) bytes(LOCAL_EA + RT_A, rw * 4 * 128, 300);
     surface(RT_A, rw * 4, RT_Z, rw, 128, SURF_ARGB8 | SURF_Z24S8, CELL_GCM_SURFACE_TARGET_0, 0);
     viewport(rw, 128);
     clear(CLEAR_ALL, 0, 0xFFFFFF00u);
@@ -1036,7 +1039,7 @@ static const Scene k_scene[] = {
     { "textures",  1, scene_textures,  "copy_buf_to_tex:16 texture_create:13 table_write_sampler:16 draw:5" },
     { "offscreen", 2, scene_offscreen, "texture_create:3 pass_begin:12 draw:10" },
     { "zpass",     2, scene_zpass,     "query_begin:8 query_end:8 query_resolve:2" },
-    { "frames",    4, scene_frames,    "draw:42 draw_indexed:4 copy_buf_to_tex:5 texture_destroy:1" },
+    { "frames",    4, scene_frames,    "draw:42 draw_indexed:4 copy_buf_to_tex:4 clear_color:9 texture_destroy:1" },
     { "mainmem",   1, scene_mainmem,   "draw:2 draw_indexed:1 copy_buf_to_tex:1" },
 };
 enum { NSCENES = sizeof k_scene / sizeof k_scene[0], NPASSES = 2 };
