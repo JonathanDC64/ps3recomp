@@ -171,8 +171,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return -1;
+    /* The job's local store is built in place, in the context it runs on
+     * (spu_context_init zeroes it). Building it apart and copying it in took
+     * two more passes over 256 KB per job, longer than a small job's own work
+     * (a texture upload); a streaming frame runs dozens of them. */
+    spu_context ctx;
+    spu_context_init(&ctx, 0);
+    uint8_t* const ls = ctx.ls;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
@@ -334,10 +339,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    spu_context ctx;
-    spu_context_init(&ctx, 0);
     ctx.image_id = image_id;
-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
     ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
@@ -400,6 +402,5 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }   /* and its MFC slot */
-    free(ls);
     return 0;
 }
