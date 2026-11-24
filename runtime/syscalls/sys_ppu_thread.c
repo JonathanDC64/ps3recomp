@@ -42,7 +42,7 @@ void (*g_ds_register_shadow_hook)(unsigned long long guest_tid) = 0;
                         * returns 0 on those threads). */
 #endif
 #if defined(__linux__)
-#include <SDL2/SDL.h>     /* SDL_LinuxSetThreadPriority: nice through RealtimeKit */
+#include <SDL3/SDL.h>     /* SDL_SetLinuxThreadPriority: nice through RealtimeKit */
 #include <sys/prctl.h>    /* PR_SET_NAME: declared without _GNU_SOURCE */
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -102,7 +102,7 @@ static int ppu_host_raise_level(int32_t prio, const char* name)
 static void ppu_host_raise_self(int level)
 {
 #if defined(__linux__)
-    if (SDL_LinuxSetThreadPriority((Sint64)syscall(SYS_gettid), level > 1 ? -10 : -5) != 0) {
+    if (!SDL_SetLinuxThreadPriority((Sint64)syscall(SYS_gettid), level > 1 ? -10 : -5)) {
         static int told;
         if (!told) {
             told = 1;

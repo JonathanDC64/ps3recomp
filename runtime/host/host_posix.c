@@ -66,7 +66,7 @@
 #include "rsx_test_programs.h"
 
 #include "../syscalls/sys_ppu_thread.h"   /* --threads: the lv2 thread path */
-#include "../../libs/audio/cellAudio.h"   /* --audio-pad: the SDL2 backends */
+#include "../../libs/audio/cellAudio.h"   /* --audio-pad: the SDL backends */
 #include "../../libs/input/cellPad.h"
 
 #include <ps3emu/guest_call.h>
@@ -1025,7 +1025,7 @@ static int run_thread_check(void)
 }
 
 /* ---------------------------------------------------------------------------
- * --audio-pad: bring the SDL2 audio and pad backends up and back down
+ * --audio-pad: bring the SDL audio and pad backends up and back down
  *
  * Neither had ever been initialised off Windows -- the Windows build takes
  * WASAPI and XInput -- so nothing said whether they even run. This is not a
@@ -1037,7 +1037,7 @@ static int run_thread_check(void)
 static int run_audio_pad_check(void)
 {
     int rc = 0;
-    printf("[host] --audio-pad: SDL2 audio and pad backends\n");
+    printf("[host] --audio-pad: SDL audio and pad backends\n");
 
     /* Quit before init: the guest is entitled to do this and lv2 answers
      * NOT_INIT / NOT_OPENED rather than tearing down state that was never
@@ -1162,7 +1162,7 @@ int main(int argc, char** argv)
             free(vm_base);
             return trc;
         }
-        /* --audio-pad: no graphics either, just the SDL2 backends. */
+        /* --audio-pad: no graphics either, just the SDL backends. */
         else if (strcmp(argv[i], "--audio-pad") == 0) {
             vm_base = host_vm_alloc();
             if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }

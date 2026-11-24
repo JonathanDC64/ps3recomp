@@ -7,9 +7,9 @@
  *
  * Backend selection:
  *   - Windows default: WASAPI (via mmdeviceapi)
- *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
+ *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL defined: SDL3 audio
  *
- * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
+ * Define PS3RECOMP_AUDIO_USE_SDL to force the SDL3 backend on Windows (it needs SDL3 linked).
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
@@ -41,14 +41,14 @@ extern int      ppu_thread_named(const char* name);   /* runtime/syscalls/sys_pp
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
-  #define AUDIO_BACKEND_SDL2    1
+#if defined(PS3RECOMP_AUDIO_USE_SDL)
+  #define AUDIO_BACKEND_SDL     1
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
-  #define AUDIO_BACKEND_SDL2    0
+  #define AUDIO_BACKEND_SDL     0
   #define AUDIO_BACKEND_WASAPI  1
 #else
-  #define AUDIO_BACKEND_SDL2    1
+  #define AUDIO_BACKEND_SDL     1
   #define AUDIO_BACKEND_WASAPI  0
 #endif
 
@@ -101,8 +101,8 @@ extern int      ppu_thread_named(const char* name);   /* runtime/syscalls/sys_pp
   #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
 #endif
 
-#if AUDIO_BACKEND_SDL2
-  #include <SDL2/SDL.h>
+#if AUDIO_BACKEND_SDL
+  #include <SDL3/SDL.h>   /* (SDL3, the pinned static build: cmake/sdl3_dep.cmake) */
 #endif
 
 /* Portable threading */
@@ -205,27 +205,32 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * Host audio output backend
  * -----------------------------------------------------------------------*/
 
-#if AUDIO_BACKEND_SDL2
+#if AUDIO_BACKEND_SDL
 
-static SDL_AudioDeviceID s_sdl_audio_dev = 0;
-/* Frames SDL takes from the queue at a time (its device buffer, have.samples):
- * the queue must hold that much each time, or the device plays silence. */
+/* The mix goes into an SDL audio stream bound to the default output device;
+ * SDL's device thread takes it from there (converting it, should the device
+ * run at another rate). The stream is the queue: what was put and not yet
+ * taken, counted in the frames put in. */
+static SDL_AudioStream* s_sdl_stream = NULL;
+/* Frames SDL takes from the queue at a time (its device buffer): the queue
+ * must hold that much each time, or the device plays silence. */
 static u32 s_sdl_chunk = CELL_AUDIO_BLOCK_SAMPLES;
+
+static u32 sdl_queued_frames(void)
+{
+    const int b = s_sdl_stream ? SDL_GetAudioStreamQueued(s_sdl_stream) : 0;
+    return b > 0 ? (u32)b / (2 * sizeof(float)) : 0;
+}
 
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+        if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
             return -1;
         }
     }
 
-    SDL_AudioSpec want, have;
-    memset(&want, 0, sizeof(want));
-    want.freq     = CELL_AUDIO_SAMPLE_RATE;
-    want.format   = AUDIO_F32SYS;
-    want.channels = 2;
     /* The device's buffer. SDL hands it to PulseAudio as the stream's whole
      * target latency (tlength), and to PipeWire as the node's latency, so one
      * block (256 frames, 5.3 ms) left the server 5.3 ms to cover any late
@@ -235,41 +240,47 @@ static int audio_backend_init(void)
      * below the sound leaves about 50 ms after it is mixed (it was 15-20).
      * Beside four busy threads on two CPUs (the standalone test below), the
      * server went without data 12% of the time at 256 frames and 1-3% at
-     * 1024. AUDIO_SDL_FRAMES=<n> sets it (256 is the size before). */
+     * 1024. AUDIO_SDL_FRAMES=<n> sets it (256 is the size before); SDL reads
+     * it as a hint when the device opens. */
     { static int frames = -1;
       PS3_KNOB(frames, ps3_env_int("AUDIO_SDL_FRAMES", 1024));
-      want.samples = (Uint16)(frames < CELL_AUDIO_BLOCK_SAMPLES ? CELL_AUDIO_BLOCK_SAMPLES
-                              : frames > 8192 ? 8192 : frames); }
-    want.callback = NULL; /* We'll use SDL_QueueAudio */
+      char v[16];
+      snprintf(v, sizeof v, "%d", frames < CELL_AUDIO_BLOCK_SAMPLES ? CELL_AUDIO_BLOCK_SAMPLES
+                                  : frames > 8192 ? 8192 : frames);
+      SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, v); }
 
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (s_sdl_audio_dev == 0) {
-        printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+    const SDL_AudioSpec want = { SDL_AUDIO_F32, 2, CELL_AUDIO_SAMPLE_RATE };
+    s_sdl_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL);
+    if (!s_sdl_stream) {
+        printf("[cellAudio] SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
         return -1;
     }
 
-    s_sdl_chunk = have.samples > CELL_AUDIO_BLOCK_SAMPLES ? have.samples : CELL_AUDIO_BLOCK_SAMPLES;
+    SDL_AudioSpec have = want;
+    int have_frames = 0;
+    if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(s_sdl_stream), &have, &have_frames)) have_frames = 0;
+    s_sdl_chunk = have_frames > CELL_AUDIO_BLOCK_SAMPLES ? (u32)have_frames : CELL_AUDIO_BLOCK_SAMPLES;
     /* (stderr, unbuffered: a report made mid-session must show the driver;
      * stdout reaches des.log only when its buffer fills) */
-    fprintf(stderr, "[cellAudio] SDL audio: %s, %d Hz, %d channels, %u frames at a time\n",
+    fprintf(stderr, "[cellAudio] SDL audio: %s, %d Hz, %d channels, %d frames at a time\n",
            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?", have.freq, have.channels,
-           (unsigned)have.samples);
+           have_frames);
 
-    SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
+    SDL_ResumeAudioStreamDevice(s_sdl_stream); /* Start playback */
     return 0;
 }
 
 static void audio_backend_shutdown(void)
 {
-    if (s_sdl_audio_dev) {
-        SDL_CloseAudioDevice(s_sdl_audio_dev);
-        s_sdl_audio_dev = 0;
+    if (s_sdl_stream) {
+        SDL_DestroyAudioStream(s_sdl_stream);
+        s_sdl_stream = NULL;
     }
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    if (!s_sdl_audio_dev) return;
+    if (!s_sdl_stream) return;
     /* AUDIO_MUTE=1 (live): queue silence at the same rate, as the WASAPI
      * backend does, so the audio clock and the game's pacing are unchanged. */
     static int mute = -1;
@@ -278,12 +289,12 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
         static const float silence[256 * 2];
         for (u32 left = num_samples; left; ) {
             const u32 n = left < 256 ? left : 256;
-            SDL_QueueAudio(s_sdl_audio_dev, silence, n * 2 * sizeof(float));
+            SDL_PutAudioStreamData(s_sdl_stream, silence, (int)(n * 2 * sizeof(float)));
             left -= n;
         }
         return;
     }
-    SDL_QueueAudio(s_sdl_audio_dev, stereo_samples, num_samples * 2 * sizeof(float));
+    SDL_PutAudioStreamData(s_sdl_stream, stereo_samples, (int)(num_samples * 2 * sizeof(float)));
 }
 
 /* SDL queues without bound: keep up to two of the device's takes and two
@@ -293,8 +304,8 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
  * blocks then ran dry. */
 static int audio_backend_room(void)
 {
-    if (!s_sdl_audio_dev) return -1;
-    return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
+    if (!s_sdl_stream) return -1;
+    return sdl_queued_frames() <
            2 * s_sdl_chunk + CELL_AUDIO_BLOCK_SAMPLES * 2 ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
@@ -309,9 +320,9 @@ static int audio_backend_room(void)
  * or beside four busy threads. */
 static int audio_backend_starving(void)
 {
-    if (!s_sdl_audio_dev) return 0;
+    if (!s_sdl_stream) return 0;
     static u32 low = 0xFFFFFFFFu, seen;
-    const u32 q = SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
+    const u32 q = sdl_queued_frames();
     if (q < low) low = q;
     if (++seen < 2 * s_sdl_chunk / CELL_AUDIO_BLOCK_SAMPLES) return 0;
     const u32 margin = s_sdl_chunk / 2 > CELL_AUDIO_BLOCK_SAMPLES ? s_sdl_chunk / 2 : CELL_AUDIO_BLOCK_SAMPLES;
@@ -322,17 +333,14 @@ static int audio_backend_starving(void)
 
 static u32 audio_backend_queued_samples(void)
 {
-    if (s_sdl_audio_dev) {
-        return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
-    }
-    return 0;
+    return sdl_queued_frames();
 }
 
 /* SDL's device opened with no name is the system's default, and SDL or the
  * sound server moves it to a new default. */
 static void audio_backend_follow(void) {}
 
-#endif /* AUDIO_BACKEND_SDL2 */
+#endif /* AUDIO_BACKEND_SDL */
 
 #if AUDIO_BACKEND_WASAPI
 
@@ -1083,7 +1091,7 @@ static void* audio_mix_thread_func(void* arg)
      * and for a system monitor. */
     prctl(PR_SET_NAME, "cellAudio mix", 0, 0, 0);
 #endif
-#if AUDIO_BACKEND_SDL2
+#if AUDIO_BACKEND_SDL
     /* Off Windows there is no MMCSS. At the default priority the mixer wakes
      * late when every core is busy (a fight on a 4-core handheld), and each
      * late block is mixed with no time left for the title to write the next
@@ -1093,7 +1101,7 @@ static void* audio_mix_thread_func(void* arg)
      * thread stays in the ordinary class, not a real-time one. (macOS: SDL's
      * round-robin class, as Apple asks of audio threads.) If neither works it
      * runs as before. */
-    const int raised = SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL) == 0;
+    const int raised = SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
     fprintf(stderr, "[cellAudio] Mixing thread started (%s%s)\n", raised ? "raised priority" : "normal priority: ",
            raised ? "" : SDL_GetError());
 #else

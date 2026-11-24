@@ -244,27 +244,15 @@ if(WIN32)
         target_link_libraries(ps3recomp_runtime PRIVATE iphlpapi)
     endif()
 else()
-    # cellPad and cellAudio select their SDL2 backends unconditionally off
-    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
-    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
-    find_package(SDL2 QUIET)
-    if(SDL2_FOUND)
-        if(TARGET SDL2::SDL2)
-            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
-        else()
-            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
-            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
-        endif()
-        message(STATUS "  SDL2:         found (input + audio backends enabled)")
-    else()
-        message(FATAL_ERROR
-            "SDL2 not found. It provides the cellPad and cellAudio backends on "
-            "non-Windows hosts.\n"
-            "  macOS:  brew install sdl2\n"
-            "  Debian: apt install libsdl2-dev\n"
-            "If SDL2 is installed in a non-standard prefix, pass "
-            "-DCMAKE_PREFIX_PATH=<prefix>.")
-    endif()
+    # Off Windows SDL3 is the host: the pads (cellPad), the sound (cellAudio) and the window (the RSX backends),
+    # built from the pinned release (cmake/sdl3_dep.cmake) and linked statically. SDL opens the system's video and
+    # sound libraries (X11, Wayland, PipeWire, PulseAudio, ALSA) at run time, so the build needs only their headers.
+    # PUBLIC: a game's host that links the runtime uses this same SDL for its window and menus, never a second one
+    # (SDL2 and SDL3 share symbol names, and two SDLs in one process don't mix).
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/sdl3_dep.cmake")
+    ps3recomp_sdl3_available()
+    target_link_libraries(ps3recomp_runtime PUBLIC SDL3::SDL3-static)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_SDL3)
 
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
@@ -681,16 +669,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
-    # Controller slots must survive SDL device-index changes and non-gamepad devices.
-    add_executable(test_pad_sdl_slots libs/input/tests/test_pad_sdl_slots.c)
-    target_include_directories(test_pad_sdl_slots PRIVATE libs/input)
-    if(MSVC)
-        target_compile_options(test_pad_sdl_slots PRIVATE /UNDEBUG)
-    else()
-        target_compile_options(test_pad_sdl_slots PRIVATE -UNDEBUG)
-    endif()
-    add_test(NAME pad_sdl_slots COMMAND test_pad_sdl_slots)
-    # The same for SDL3, by instance ID (pad_sdl3_slots.h).
+    # Controller slots must survive SDL device changes and non-gamepad devices, by instance ID (pad_sdl3_slots.h).
     add_executable(test_pad_sdl3_slots libs/input/tests/test_pad_sdl3_slots.c)
     target_include_directories(test_pad_sdl3_slots PRIVATE libs/input)
     if(MSVC)
@@ -1123,7 +1102,7 @@ endif()
 # doesn't contain them, and an imported one doesn't know them.
 # ps3recomp_runtime_deps.cmake, beside the library, sets PS3RECOMP_RUNTIME_DEPS
 # to their files in link order (each before the libraries it uses). Libraries
-# from outside this build (ws2_32, SDL2, a system glslang, the frameworks)
+# from outside this build (ws2_32, a system glslang, the frameworks)
 # aren't listed: a host names those itself. This comes after every
 # target_link_libraries(ps3recomp_runtime ...).
 function(_ps3recomp_static_deps tgt stack)
@@ -1168,8 +1147,14 @@ set(_ps3_rt_files "")
 foreach(_d IN LISTS _ps3_rt_deps)
     string(APPEND _ps3_rt_files "\n    \"$<TARGET_LINKER_FILE:${_d}>\"")
 endforeach()
+# With SDL3 in them (off Windows always), also its headers, for a host's own window and menus on that same SDL.
+set(_ps3_rt_sdl3 "")
+if(TARGET SDL3-static)
+    string(APPEND _ps3_rt_sdl3 "# SDL3's headers (cmake/sdl3_dep.cmake): a host's own SDL code uses this copy, never a second SDL.\n"
+        "set(PS3RECOMP_SDL3_INCLUDE_DIRS \"$<TARGET_PROPERTY:SDL3-static,INTERFACE_INCLUDE_DIRECTORIES>\")\n")
+endif()
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:ps3recomp_runtime>/ps3recomp_runtime_deps.cmake"
-     CONTENT "# The static libraries built with this runtime that it links (written by ps3recomp's configure).\nset(PS3RECOMP_RUNTIME_DEPS${_ps3_rt_files})\n")
+     CONTENT "# The static libraries built with this runtime that it links (written by ps3recomp's configure).\nset(PS3RECOMP_RUNTIME_DEPS${_ps3_rt_files})\n${_ps3_rt_sdl3}")
 list(LENGTH _ps3_rt_deps _ps3_rt_n)
 message(STATUS "  Link:         ${_ps3_rt_n} static libraries a host links with the runtime (ps3recomp_runtime_deps.cmake)")
 

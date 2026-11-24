@@ -101,8 +101,8 @@ static float rsx_aspect(void)
  * backend's, and the display's HDR is rsxc_display_win.c's. */
 #pragma comment(lib, "wtsapi32.lib")
 #else
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <glob.h>
 #endif
 #include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */

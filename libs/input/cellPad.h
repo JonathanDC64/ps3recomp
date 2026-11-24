@@ -2,7 +2,7 @@
  * ps3recomp - cellPad HLE
  *
  * Gamepad input: initialization, reading button/analog state.
- * Backend: XInput on Windows, SDL2 GameController elsewhere.
+ * Backend: SDL3's gamepads (XInput on a Windows build without PS3RECOMP_PAD_SDL3).
  */
 
 #ifndef PS3RECOMP_CELL_PAD_H
@@ -263,7 +263,7 @@ typedef struct {
  * look at PAD_FOCUS_ONLY or PS3_NO_USER_INPUT (cellPad_host_pads_on). */
 int cellPad_host_pads(CellPadHostPad* out, int max);
 
-/* What reads the pads in this build, for a title's settings: 1 SDL (SDL3 on Windows by default, SDL2 elsewhere), 0
+/* What reads the pads in this build, for a title's settings: 1 SDL (SDL3: on Windows by default, always elsewhere), 0
  * XInput (Windows with PS3RECOMP_PAD_SDL3=OFF). Sony's pads on Windows are read over HID either way. */
 int cellPad_host_reader_sdl(void);
 

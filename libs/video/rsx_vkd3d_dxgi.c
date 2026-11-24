@@ -17,8 +17,8 @@
 #if !defined(_WIN32) && defined(PS3RECOMP_RSX_D3D12_VKD3D)
 
 #include "rsx_vkd3d_host.h"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,13 +70,14 @@ HRESULT rsx_vkd3d_create_device(IUnknown* adapter, D3D_FEATURE_LEVEL level, REFI
     *device = NULL;
     /* SDL loaded the Vulkan loader when it made the (Vulkan) window. */
     PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
-    unsigned n = 0;
+    Uint32 n = 0;
     const char* exts[16];
-    if (!gipa || !SDL_Vulkan_GetInstanceExtensions(NULL, &n, NULL) || n > 16 ||
-        !SDL_Vulkan_GetInstanceExtensions(NULL, &n, exts)) {
+    const char* const* sdl_exts = gipa ? SDL_Vulkan_GetInstanceExtensions(&n) : NULL;
+    if (!sdl_exts || n > 16) {
         LOG("no Vulkan for the window (%s)\n", SDL_GetError());
         return E_FAIL;
     }
+    for (Uint32 i = 0; i < n; i++) exts[i] = sdl_exts[i];
     static const char* const dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     struct vkd3d_instance_create_info ii;
     memset(&ii, 0, sizeof ii);
@@ -562,7 +563,7 @@ static HRESULT swap_chain_make(IUnknown* queue_unk, SDL_Window* window, const DX
     hr = E_FAIL;
     const uint32_t family = vkd3d_get_vk_queue_family_index(sc->queue);
     VkBool32 can = VK_FALSE;
-    if (!SDL_Vulkan_CreateSurface(window, vk.inst, &sc->surface)) {
+    if (!SDL_Vulkan_CreateSurface(window, vk.inst, NULL, &sc->surface)) {
         LOG("no surface for the window (%s)\n", SDL_GetError());
         goto fail;
     }

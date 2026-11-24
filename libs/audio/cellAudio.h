@@ -2,7 +2,7 @@
  * ps3recomp - cellAudio HLE
  *
  * Audio output: port management, mixing thread, event notification.
- * Backend: WASAPI on Windows, SDL2 audio elsewhere.
+ * Backend: WASAPI on Windows, SDL3 audio elsewhere.
  */
 
 #ifndef PS3RECOMP_CELL_AUDIO_H
