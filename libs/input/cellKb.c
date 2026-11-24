@@ -4,7 +4,7 @@
  * Keyboard input. Tracks key state from host keyboard events and provides
  * data in PS3 CellKbData format.
  *
- * The host input layer (SDL2 event loop, etc.) should call cellKb_keyEvent()
+ * The host input layer (the SDL event loop, etc.) should call cellKb_keyEvent()
  * whenever a key is pressed or released.
  */
 

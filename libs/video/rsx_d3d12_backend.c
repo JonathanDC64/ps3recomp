@@ -134,8 +134,8 @@ static float rsx_aspect(void)
 #else
 #define RSX_VKD3D_DEFINE_GUIDS   /* the interface GUIDs live in this file */
 #include "rsx_vkd3d_host.h"
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <glob.h>
 #endif
 #include "rsx_window_icon.h"   /* (after SDL.h: rsx_window_icon_sdl) */
@@ -1244,7 +1244,7 @@ static void win_set_title(const char* t)
 static void set_borderless(HWND hwnd, int on)
 {
     if (!!on == s_borderless) return;
-    SDL_SetWindowFullscreen((SDL_Window*)hwnd, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    SDL_SetWindowFullscreen((SDL_Window*)hwnd, on != 0);   /* (no mode set: the desktop's, borderless) */
     s_borderless = !!on;
 }
 
@@ -1252,17 +1252,16 @@ static void set_borderless(HWND hwnd, int on)
 static void win_size_note(void)
 {
     int w = 0, h = 0;
-    SDL_Vulkan_GetDrawableSize(s_sdl_window, &w, &h);
+    SDL_GetWindowSizeInPixels(s_sdl_window, &w, &h);
     if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000)
         InterlockedExchange(&s_win_req, (LONG)(((u32)w << 16) | (u32)h));
 }
 
 static void win_refresh_note(void)
 {
-    SDL_DisplayMode m;
-    const int d = SDL_GetWindowDisplayIndex(s_sdl_window);
-    if (d >= 0 && SDL_GetCurrentDisplayMode(d, &m) == 0 && m.refresh_rate > 20 && m.refresh_rate < 1000)
-        InterlockedExchange(&s_refresh_hz, (LONG)m.refresh_rate);
+    const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_sdl_window));
+    if (m && m->refresh_rate > 20.0f && m->refresh_rate < 1000.0f)
+        InterlockedExchange(&s_refresh_hz, (LONG)(m->refresh_rate + 0.5f));
 }
 
 /* The overlay's messages off Windows (rsx_d3d12_overlay): the Win32 messages it would get there, made from SDL's
@@ -1293,9 +1292,8 @@ static void win_refresh_note(void)
 
 /* An SDL key's Windows virtual-key code, or 0: letters, digits and punctuation by what the key types (Windows' codes
  * follow the keyboard layout too), the rest by what the key is. */
-static unsigned win_vk(const SDL_Keysym* k)
+static unsigned win_vk(SDL_Keycode c)
 {
-    const SDL_Keycode c = k->sym;
     if (c >= 'a' && c <= 'z') return (unsigned)(c - 0x20);
     if (c >= '0' && c <= '9') return (unsigned)c;
     if (c >= SDLK_F1 && c <= SDLK_F12) return 0x70u + (unsigned)(c - SDLK_F1);
@@ -1344,11 +1342,11 @@ static unsigned win_vk(const SDL_Keysym* k)
     case SDLK_MINUS:        return 0xBD;
     case SDLK_PERIOD:       return 0xBE;
     case SDLK_SLASH:        return 0xBF;   /* VK_OEM_2 */
-    case SDLK_BACKQUOTE:    return 0xC0;   /* VK_OEM_3 */
+    case SDLK_GRAVE:        return 0xC0;   /* VK_OEM_3 */
     case SDLK_LEFTBRACKET:  return 0xDB;   /* VK_OEM_4 */
     case SDLK_BACKSLASH:    return 0xDC;   /* VK_OEM_5 */
     case SDLK_RIGHTBRACKET: return 0xDD;   /* VK_OEM_6 */
-    case SDLK_QUOTE:        return 0xDE;   /* VK_OEM_7 */
+    case SDLK_APOSTROPHE:   return 0xDE;   /* VK_OEM_7 */
     default:                return 0;
     }
 }
@@ -1374,14 +1372,14 @@ static int win_overlay_event(const SDL_Event* e)
 {
     const int input = !ps3_no_user_input();
     switch (e->type) {
-    case SDL_KEYDOWN:
-    case SDL_KEYUP: {
-        const unsigned vk = input ? win_vk(&e->key.keysym) : 0;
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: {
+        const unsigned vk = input ? win_vk(e->key.key) : 0;
         if (!vk) return 0;
-        const int down = e->type == SDL_KEYDOWN;
-        const int alt = (e->key.keysym.mod & KMOD_ALT) != 0;
+        const int down = e->type == SDL_EVENT_KEY_DOWN;
+        const int alt = (e->key.mod & SDL_KMOD_ALT) != 0;
         const int sys = alt || vk == 0x12 || vk == 0x79;   /* Alt held, Alt itself or F10: WM_SYSKEY*, as on Windows */
-        long long lp = 1 | (long long)(e->key.keysym.scancode & 0xFF) << 16;
+        long long lp = 1 | (long long)(e->key.scancode & 0xFF) << 16;
         if (alt) lp |= 1LL << 29;
         if (!down || e->key.repeat) lp |= 1LL << 30;   /* down before this message */
         if (!down) lp |= 1LL << 31;
@@ -1390,7 +1388,7 @@ static int win_overlay_event(const SDL_Event* e)
         if (down && !sys && (vk == 0x08 || vk == 0x09 || vk == 0x0D || vk == 0x1B)) win_overlay(WM_CHAR, vk, lp);
         return took;
     }
-    case SDL_TEXTINPUT: {   /* UTF-8 to code points, a WM_CHAR each */
+    case SDL_EVENT_TEXT_INPUT: {   /* UTF-8 to code points, a WM_CHAR each */
         const unsigned char* s = (const unsigned char*)e->text.text;
         while (input && *s) {
             unsigned c = *s++;
@@ -1401,16 +1399,17 @@ static int win_overlay_event(const SDL_Event* e)
         }
         return 0;
     }
-    case SDL_MOUSEMOTION:
+    case SDL_EVENT_MOUSE_MOTION: {
         if (!input) return 0;
-        win_overlay(WM_MOUSEMOVE, 0, win_xy(e->motion.x, e->motion.y));
-        if (e->motion.xrel || e->motion.yrel)
-            win_overlay(WM_RSX_MOUSE_MOTION, (unsigned long long)(long long)e->motion.xrel, (long long)e->motion.yrel);
+        win_overlay(WM_MOUSEMOVE, 0, win_xy((int)e->motion.x, (int)e->motion.y));
+        const int dx = (int)e->motion.xrel, dy = (int)e->motion.yrel;   /* (SDL3: floats) */
+        if (dx || dy) win_overlay(WM_RSX_MOUSE_MOTION, (unsigned long long)(long long)dx, (long long)dy);
         return 0;
-    case SDL_MOUSEBUTTONDOWN:
-    case SDL_MOUSEBUTTONUP: {
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
         if (!input) return 0;
-        const int down = e->type == SDL_MOUSEBUTTONDOWN;
+        const int down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
         unsigned msg;
         unsigned long long wp = 0;
         switch (e->button.button) {
@@ -1424,31 +1423,28 @@ static int win_overlay_event(const SDL_Event* e)
             break;
         default: return 0;
         }
-        win_overlay(msg, wp, win_xy(e->button.x, e->button.y));
+        win_overlay(msg, wp, win_xy((int)e->button.x, (int)e->button.y));
         return 0;
     }
-    case SDL_MOUSEWHEEL: {   /* WHEEL_DELTA (120) a notch in the high word, positive away from the user */
-        const int notches = e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e->wheel.y : e->wheel.y;
+    case SDL_EVENT_MOUSE_WHEEL: {   /* WHEEL_DELTA (120) a notch in the high word, positive away from the user */
+        const int y = (int)e->wheel.integer_y;   /* (whole notches; SDL keeps the fractions) */
+        const int notches = e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -y : y;
         if (input && notches) win_overlay(WM_MOUSEWHEEL, (unsigned long long)(u16)(s16)(notches * 120) << 16, 0);
         return 0;
     }
-    case SDL_WINDOWEVENT:
-        switch (e->window.event) {
-        case SDL_WINDOWEVENT_CLOSE:        return win_overlay(WM_CLOSE, 0, 0);
-        case SDL_WINDOWEVENT_FOCUS_GAINED: win_overlay(WM_SETFOCUS, 0, 0); break;
-        case SDL_WINDOWEVENT_FOCUS_LOST:   win_overlay(WM_KILLFOCUS, 0, 0); break;
-        case SDL_WINDOWEVENT_LEAVE:        win_overlay(WM_MOUSELEAVE, 0, 0); break;
-        case SDL_WINDOWEVENT_MINIMIZED:    win_overlay(WM_SIZE, 1 /* SIZE_MINIMIZED */, 0); break;
-        case SDL_WINDOWEVENT_RESTORED:
-        case SDL_WINDOWEVENT_SIZE_CHANGED: {
-            int w = 0, h = 0;
-            SDL_GetWindowSize(s_sdl_window, &w, &h);
-            win_overlay(WM_SIZE, 0, win_xy(w, h));
-            break;
-        }
-        default: break;
-        }
+    /* (SDL3: each window event is an event type of its own) */
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED: return win_overlay(WM_CLOSE, 0, 0);
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:    win_overlay(WM_SETFOCUS, 0, 0); return 0;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:      win_overlay(WM_KILLFOCUS, 0, 0); return 0;
+    case SDL_EVENT_WINDOW_MOUSE_LEAVE:     win_overlay(WM_MOUSELEAVE, 0, 0); return 0;
+    case SDL_EVENT_WINDOW_MINIMIZED:       win_overlay(WM_SIZE, 1 /* SIZE_MINIMIZED */, 0); return 0;
+    case SDL_EVENT_WINDOW_RESTORED:
+    case SDL_EVENT_WINDOW_RESIZED: {
+        int w = 0, h = 0;
+        SDL_GetWindowSize(s_sdl_window, &w, &h);
+        win_overlay(WM_SIZE, 0, win_xy(w, h));
         return 0;
+    }
     default:
         return 0;
     }
@@ -1457,7 +1453,7 @@ static int win_overlay_event(const SDL_Event* e)
 /* Alt+Enter, which d3d12_wndproc takes before the overlay sees the key: 1 when this was it. */
 static int win_alt_enter(const SDL_KeyboardEvent* k)
 {
-    if (ps3_no_user_input() || k->keysym.sym != SDLK_RETURN || !(k->keysym.mod & KMOD_ALT)) return 0;
+    if (ps3_no_user_input() || k->key != SDLK_RETURN || !(k->mod & SDL_KMOD_ALT)) return 0;
     if (!k->repeat) set_borderless(s_sdl_window, !s_borderless);
     return 1;
 }
@@ -1467,7 +1463,7 @@ static int win_alt_enter(const SDL_KeyboardEvent* k)
 static void win_key(const SDL_KeyboardEvent* k)
 {
     if (ps3_no_user_input()) return;
-    const SDL_Keycode c = k->keysym.sym;
+    const SDL_Keycode c = k->key;
     if (c == SDLK_ESCAPE && !s_overlay_on) s_d3d.window_closed = 1;
     if (k->repeat || !ps3_dev_hotkeys()) return;   /* the developer keys below */
     if (c == SDLK_F9) {
@@ -1488,23 +1484,40 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
     if (rsx_aspect() > 0.0f) width = (u32)((float)height * rsx_aspect() + 0.5f);   /* the shape the frame is shown at */
     int cw = (int)width, ch = (int)height;
     SDL_Rect area;
-    if (SDL_GetDisplayUsableBounds(0, &area) == 0 && area.w > 0 && area.h > 0 && (cw > area.w || ch > area.h)) {
+    if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &area) && area.w > 0 && area.h > 0 && (cw > area.w || ch > area.h)) {
         if ((long long)area.w * ch < (long long)area.h * cw) { ch = (int)((long long)ch * area.w / cw); cw = area.w; }
         else { cw = (int)((long long)cw * area.h / ch); ch = area.h; }
     }
     /* PS3_NO_USER_INPUT=1 (ps3_knob.h): the window does not take the focus
      * when it opens, so the user's typing stays where it was. */
-    if (ps3_no_user_input()) SDL_SetHint(SDL_HINT_WINDOW_NO_ACTIVATION_WHEN_SHOWN, "1");
-    /* The close button is the window's close event alone (the overlay can ask first); SDL_QUIT is then only a
+    if (ps3_no_user_input()) SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+    /* The close button is the window's close event alone (the overlay can ask first); SDL_EVENT_QUIT is then only a
      * signal (Ctrl+C, SIGTERM), which closes at once. */
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
-    const Uint32 maximized = ps3_env_int("RSX_MAXIMIZED", 0) && !ps3_no_user_input() ? SDL_WINDOW_MAXIMIZED : 0;
-    SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", SDL_WINDOWPOS_CENTERED,
-                                     SDL_WINDOWPOS_CENTERED, cw, ch,
-                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | maximized);
-    if (w) SDL_SetWindowMinimumSize(w, 640, 360);   /* below that an overlay's text overlaps */
+    const SDL_WindowFlags maximized = ps3_env_int("RSX_MAXIMIZED", 0) && !ps3_no_user_input() ? SDL_WINDOW_MAXIMIZED : 0;
+    SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", cw, ch,
+                                     SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | maximized);
+    if (w) {
+        SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        SDL_SetWindowMinimumSize(w, 640, 360);   /* below that an overlay's text overlaps */
+        SDL_StartTextInput(w);   /* (SDL3: text input is off until asked for, per window) */
+    }
     rsx_window_icon_sdl(w);   /* the game's own icon (rsx_window_icon.h) */
     return w;
+}
+
+/* SDL's video for the window. SDL3 opens Wayland first on a Wayland desktop,
+ * SDL2 opened X11 (XWayland): keep X11's window there, as before. A player's
+ * own SDL_VIDEO_DRIVER (or SDL2's SDL_VIDEODRIVER) decides alone. */
+static int video_start(void)
+{
+    if (getenv("WAYLAND_DISPLAY") && getenv("DISPLAY") && !getenv("SDL_VIDEO_DRIVER") && !getenv("SDL_VIDEODRIVER")) {
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11");
+        const int ok = SDL_InitSubSystem(SDL_INIT_VIDEO);
+        SDL_SetHint(SDL_HINT_VIDEO_DRIVER, NULL);
+        if (ok) return 1;
+    }
+    return SDL_InitSubSystem(SDL_INIT_VIDEO);
 }
 
 typedef struct { u32 w, h; const char* title; HANDLE ready; } window_thread_args;
@@ -1513,11 +1526,10 @@ static DWORD WINAPI window_thread(LPVOID p)
 {
     window_thread_args* a = (window_thread_args*)p;
     SDL_Window* w = NULL;
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+    if (!video_start()) {
         printf("[D3D12] SDL video init failed: %s\n", SDL_GetError());
     } else {
-        s_sdl_mail = SDL_RegisterEvents(1);
-        if (s_sdl_mail == (Uint32)-1) s_sdl_mail = 0;
+        s_sdl_mail = SDL_RegisterEvents(1);   /* (0: none left) */
         w = create_window(a->w, a->h, a->title);
         if (!w) printf("[D3D12] SDL_CreateWindow failed: %s\n", SDL_GetError());
     }
@@ -1536,7 +1548,7 @@ static DWORD WINAPI window_thread(LPVOID p)
      * takes is not one. */
     SDL_Event e;
     while (SDL_WaitEvent(&e)) {
-        if (e.type == SDL_QUIT) {
+        if (e.type == SDL_EVENT_QUIT) {
             s_d3d.window_closed = 1;
         } else if (s_sdl_mail && e.type == s_sdl_mail) {
             if (e.user.code >= WIN_MAIL_MESSAGE) {   /* rsx_d3d12_post_message */
@@ -1555,18 +1567,16 @@ static DWORD WINAPI window_thread(LPVOID p)
                 SDL_SetWindowTitle(w, t);
             }
         } else {
-            if (e.type == SDL_WINDOWEVENT) {
-                const Uint8 ev = e.window.event;
-                if (ev == SDL_WINDOWEVENT_SIZE_CHANGED) win_size_note();
-                else if (ev == SDL_WINDOWEVENT_MOVED || ev == SDL_WINDOWEVENT_DISPLAY_CHANGED) win_refresh_note();
-            }
-            const int alt_enter = e.type == SDL_KEYDOWN && win_alt_enter(&e.key);
+            const Uint32 ev = e.type;
+            if (ev == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) win_size_note();
+            else if (ev == SDL_EVENT_WINDOW_MOVED || ev == SDL_EVENT_WINDOW_DISPLAY_CHANGED) win_refresh_note();
+            const int alt_enter = e.type == SDL_EVENT_KEY_DOWN && win_alt_enter(&e.key);
             const int took = !alt_enter && win_overlay_event(&e);
-            if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE && !took)
+            if (e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED && !took)
                 s_d3d.window_closed = 1;
-            if (e.type == SDL_KEYDOWN && !alt_enter && !took) win_key(&e.key);
+            if (e.type == SDL_EVENT_KEY_DOWN && !alt_enter && !took) win_key(&e.key);
         }
-        if (s_d3d.window_closed && (SDL_GetWindowFlags(w) & SDL_WINDOW_SHOWN)) SDL_HideWindow(w);
+        if (s_d3d.window_closed && !(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN)) SDL_HideWindow(w);
     }
     *(volatile int*)&s_d3d.window_closed = 1;
     s_sdl_window = NULL;

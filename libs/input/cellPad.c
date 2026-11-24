@@ -7,9 +7,8 @@
  *   - Windows with PS3RECOMP_PAD_SDL3 (the build's default): SDL3's gamepads, with Sony's pads read over HID
  *     (pad_hid_sony.c) in the ports SDL leaves empty; SDL is told to leave those pads alone
  *   - Windows without it: XInput, and the Sony pads over HID the same way
- *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
- *
- * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
+ *   - Everywhere else: SDL3's gamepads, Sony's pads included (SDL's own drivers; the window and the sound there
+ *     are SDL3's too, and one process holds one SDL)
  */
 
 #include <time.h>
@@ -27,25 +26,17 @@
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_PAD_USE_SDL2)
-  #define PAD_BACKEND_SDL2  1
-  #define PAD_BACKEND_XINPUT 0
-  #define PAD_BACKEND_SDL3  0
-#elif defined(_WIN32) && defined(PS3RECOMP_PAD_SDL3)
-  #define PAD_BACKEND_SDL2  0
-  #define PAD_BACKEND_XINPUT 0
-  #define PAD_BACKEND_SDL3  1
-#elif defined(_WIN32)
-  #define PAD_BACKEND_SDL2  0
+/* SDL3 everywhere (off Windows always: the window and the sound are SDL3's
+ * there too); XInput on a Windows build without it (PS3RECOMP_PAD_SDL3 off). */
+#if defined(_WIN32) && !defined(PS3RECOMP_PAD_SDL3)
   #define PAD_BACKEND_XINPUT 1
   #define PAD_BACKEND_SDL3  0
 #else
-  #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
-  #define PAD_BACKEND_SDL3  0
+  #define PAD_BACKEND_SDL3  1
 #endif
 /* Any host pads at all, and the Sony pads over HID (Windows, beside XInput or SDL3). */
-#define PAD_BACKEND_HOST (PAD_BACKEND_XINPUT || PAD_BACKEND_SDL2 || PAD_BACKEND_SDL3)
+#define PAD_BACKEND_HOST (PAD_BACKEND_XINPUT || PAD_BACKEND_SDL3)
 #if defined(_WIN32) && (PAD_BACKEND_XINPUT || PAD_BACKEND_SDL3)
   #define PAD_HID_SONY_ON 1
   #include "pad_hid_sony.h"
@@ -62,18 +53,15 @@
   #pragma comment(lib, "xinput.lib")
 #endif
 
-#if PAD_BACKEND_SDL2
-  #include <SDL2/SDL.h>
-  #include "pad_sdl_slots.h"
-  #include "pad_hid_sony.h"   /* (pad_hid_sony_poll off Windows: the SDL pads, below) */
-#endif
 
 #if PAD_BACKEND_SDL3
   #include <SDL3/SDL.h>
   #include "pad_sdl3_slots.h"
-  /* The system libraries the static SDL3 uses (its SDL3-static target's list). ps3recomp_runtime_deps.cmake names
-   * SDL3-static.lib for a host that links the runtime as a prebuilt library, but only libraries built here; these
-   * come with this file instead, as xinput.lib did. */
+  /* The system libraries the static SDL3 uses on Windows (its SDL3-static target's list).
+   * ps3recomp_runtime_deps.cmake names SDL3-static.lib for a host that links the runtime as a prebuilt library, but
+   * only libraries built here; these come with this file instead, as xinput.lib did. (Off Windows SDL opens its
+   * system libraries at run time.) */
+  #ifdef _WIN32
   #pragma comment(lib, "user32.lib")
   #pragma comment(lib, "gdi32.lib")
   #pragma comment(lib, "winmm.lib")
@@ -86,6 +74,7 @@
   #pragma comment(lib, "setupapi.lib")
   #pragma comment(lib, "shell32.lib")
   #pragma comment(lib, "dinput8.lib")
+  #endif
 #endif
 #include "pad_controller.h"   /* (the devices on the ports, and PAD_CONTROLLER's rules) */
 #include "pad_glyph.h"        /* (the last device used, for a title's button icons) */
@@ -224,10 +213,6 @@ static const char* pad_next_pair(const char* e, int* dst, const char** v, size_t
     return end;
 }
 
-#if PAD_BACKEND_SDL2
-static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
-static int s_sdl_inited = 0;
-#endif
 #if PAD_BACKEND_SDL3
 static SDL_Gamepad* s_sdl3_pads[PAD_MAX_HOST_PORTS];
 #endif
@@ -356,10 +341,10 @@ static int pad_host_window_focused(void)
  * as Windows' own codes follow it, and the rest by position. */
 static int pad_host_key_down(int vk)
 {
-    const Uint8* st = SDL_GetKeyboardState(NULL);
+    const bool* st = SDL_GetKeyboardState(NULL);
     SDL_Scancode a = SDL_SCANCODE_UNKNOWN, b = SDL_SCANCODE_UNKNOWN;
     if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
-        a = SDL_GetScancodeFromKey((SDL_Keycode)(vk >= 'A' ? vk + 0x20 : vk));
+        a = SDL_GetScancodeFromKey((SDL_Keycode)(vk >= 'A' ? vk + 0x20 : vk), NULL);
     else if (vk >= VK_F1 && vk < VK_F1 + 12)
         a = (SDL_Scancode)(SDL_SCANCODE_F1 + (vk - VK_F1));
     else if (vk >= VK_F1 + 12 && vk < VK_F1 + 24)
@@ -931,211 +916,7 @@ static void pad_shutdown_backend(void)
 #endif /* PAD_BACKEND_XINPUT */
 
 /* ---------------------------------------------------------------------------
- * SDL2 backend
- * -----------------------------------------------------------------------*/
-
-#if PAD_BACKEND_SDL2
-
-static u8 pad_sdl_trigger_to_u8(int raw)
-{
-    /* SDL trigger: 0..32767 -> 0..255 */
-    int val = (raw * 255) / 32767;
-    if (val < 0) val = 0;
-    if (val > 255) val = 255;
-    return (u8)val;
-}
-
-/* One controller's buttons, sticks and triggers, as the PS3 pad has them. */
-static void pad_sdl_read(SDL_GameController* gc, PadHostState* hs)
-{
-    u16 btns = 0;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK))          btns |= CELL_PAD_CTRL_SELECT;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK))     btns |= CELL_PAD_CTRL_L3;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK))    btns |= CELL_PAD_CTRL_R3;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START))         btns |= CELL_PAD_CTRL_START;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP))       btns |= CELL_PAD_CTRL_UP;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT))    btns |= CELL_PAD_CTRL_RIGHT;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN))     btns |= CELL_PAD_CTRL_DOWN;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT))     btns |= CELL_PAD_CTRL_LEFT;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER))  btns |= CELL_PAD_CTRL_L1;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) btns |= CELL_PAD_CTRL_R1;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y))             btns |= CELL_PAD_CTRL_TRIANGLE;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B))             btns |= CELL_PAD_CTRL_CIRCLE;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A))             btns |= CELL_PAD_CTRL_CROSS;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X))             btns |= CELL_PAD_CTRL_SQUARE;
-
-    /* Triggers via axis */
-    int lt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-    int rt = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-    if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
-    if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
-
-    hs->buttons = btns;
-
-    /* The buttons beyond the PS3's, when SDL reports them (pad_map.h). */
-    u8 extra = 0;
-#if SDL_VERSION_ATLEAST(2, 0, 14)
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE1))  extra |= PAD_EXTRA_PADDLE1;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE2))  extra |= PAD_EXTRA_PADDLE2;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE3))  extra |= PAD_EXTRA_PADDLE3;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_PADDLE4))  extra |= PAD_EXTRA_PADDLE4;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_MISC1))    extra |= PAD_EXTRA_MISC;
-    if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_TOUCHPAD)) extra |= PAD_EXTRA_TOUCHPAD;
-#endif
-    hs->extra = extra;
-
-    /* Analog sticks */
-    pad_host_stick_to_u8(0, SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX),
-                         SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY),
-                         &hs->analog_lx, &hs->analog_ly);
-    pad_host_stick_to_u8(1, SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX),
-                         SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY),
-                         &hs->analog_rx, &hs->analog_ry);
-
-    /* Triggers */
-    hs->trigger_l2 = pad_sdl_trigger_to_u8(lt);
-    hs->trigger_r2 = pad_sdl_trigger_to_u8(rt);
-
-    /* Pressure: SDL has digital buttons, so 0 or 255 */
-    pad_press_from_buttons(hs);
-}
-
-static const char* pad_sdl_type_name(SDL_GameControllerType t)
-{
-    switch (t) {
-    case SDL_CONTROLLER_TYPE_XBOX360:             return "Xbox 360";
-    case SDL_CONTROLLER_TYPE_XBOXONE:             return "Xbox One";
-    case SDL_CONTROLLER_TYPE_PS3:                 return "PS3";
-    case SDL_CONTROLLER_TYPE_PS4:                 return "PS4";
-    case SDL_CONTROLLER_TYPE_PS5:                 return "PS5";
-    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return "Switch Pro";
-    case SDL_CONTROLLER_TYPE_VIRTUAL:             return "virtual";
-    case SDL_CONTROLLER_TYPE_UNKNOWN:             return "unknown";
-    default:                                      return "other";
-    }
-}
-
-/* For the log when an SDL controller connects (pad_tell_devices): its IDs, where SDL reads it, and SDL's mapping of
- * its buttons, which is what a button held that nobody presses comes down to. */
-static void pad_sdl_tell(long dev)
-{
-    if ((dev & 0xFF) != RUMBLE_SDL) return;
-    const int k = pad_dev_index(dev);
-    SDL_LockJoysticks();   /* (the poll closes a controller under it) */
-    SDL_GameController* gc = k < PAD_MAX_HOST_PORTS ? s_sdl_controllers[k] : NULL;
-    if (gc) {
-        char guid[64] = "";
-        SDL_JoystickGetGUIDString(SDL_JoystickGetGUID(SDL_GameControllerGetJoystick(gc)), guid, (int)sizeof guid);
-        const char* path = NULL;
-#if SDL_VERSION_ATLEAST(2, 24, 0)
-        path = SDL_GameControllerPath(gc);
-#endif
-        printf("[cellPad] controller%d: USB ID %04X:%04X, SDL type %s, GUID %s, read from %s\n", k + 1,
-               (unsigned)SDL_GameControllerGetVendor(gc), (unsigned)SDL_GameControllerGetProduct(gc),
-               pad_sdl_type_name(SDL_GameControllerGetType(gc)), guid, path ? path : "(not given)");
-        char* map = SDL_GameControllerMapping(gc);
-        printf("[cellPad] controller%d: SDL's mapping %s\n", k + 1, map ? map : "(none)");
-        if (map) SDL_free(map);
-    }
-    SDL_UnlockJoysticks();
-}
-
-/* For the log, each time the number of SDL's joysticks changes: the ones that aren't gamepads to SDL, which cellPad
- * doesn't open (pad_sdl_sync_slots). A player's controller that does nothing in a title can be one of these. */
-static void pad_sdl_tell_others(void)
-{
-    static int s_count = -1;
-    SDL_LockJoysticks();
-    const int num = SDL_NumJoysticks();
-    if (num != s_count) {
-        s_count = num;
-        for (int d = 0; d < num; d++) {
-            if (SDL_IsGameController(d)) continue;
-            const char* name = SDL_JoystickNameForIndex(d);
-            printf("[cellPad] SDL joystick %d isn't a gamepad to SDL, so it isn't read: %s (USB ID %04X:%04X)\n", d,
-                   name ? name : "(no name)", (unsigned)SDL_JoystickGetDeviceVendor(d),
-                   (unsigned)SDL_JoystickGetDeviceProduct(d));
-        }
-        fflush(stdout);
-    }
-    SDL_UnlockJoysticks();
-}
-
-static void pad_poll_sdl2(void)
-{
-    SDL_GameControllerUpdate();
-
-    pad_sdl_sync_slots(s_sdl_controllers, PAD_MAX_HOST_PORTS);
-    pad_sdl_tell_others();
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc) {
-            s_host_state[i].connected = 0;
-            s_poll_dev[i] = RUMBLE_NONE;
-            continue;
-        }
-
-        s_host_state[i].connected = 1;
-        s_poll_dev[i] = PAD_DEV(RUMBLE_SDL, i);
-        pad_sdl_read(gc, &s_host_state[i]);
-    }
-}
-
-#ifndef _WIN32
-/* pad_hid_sony.h, off Windows: there is no HID reader there (SDL reads every pad, Sony ones too), so this reads the
- * SDL game controllers cellPad has open. For the title's window code that reads the pads itself, such as a wrapper
- * UI's menus while the game's input is held. */
-int pad_hid_sony_poll(PadHidSonyState* out, int max)
-{
-    int n = 0;
-    SDL_LockJoysticks();
-    for (int i = 0; i < PAD_MAX_HOST_PORTS && n < max; i++) {
-        SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
-        PadHostState hs;
-        memset(&hs, 0, sizeof hs);
-        pad_sdl_read(gc, &hs);
-        out[n].buttons = hs.buttons;
-        out[n].extra = hs.extra;
-        out[n].lx = hs.analog_lx; out[n].ly = hs.analog_ly;
-        out[n].rx = hs.analog_rx; out[n].ry = hs.analog_ry;
-        out[n].l2 = hs.trigger_l2; out[n].r2 = hs.trigger_r2;
-        out[n].slot = (uint8_t)i;
-        n++;
-    }
-    SDL_UnlockJoysticks();
-    return n;
-}
-#endif
-
-static void pad_init_backend(void)
-{
-    if (!s_sdl_inited) {
-        if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
-            SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-        }
-        s_sdl_inited = 1;
-    }
-    memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
-
-    pad_sdl_sync_slots(s_sdl_controllers, PAD_MAX_HOST_PORTS);
-}
-
-static void pad_shutdown_backend(void)
-{
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        if (s_sdl_controllers[i]) {
-            SDL_GameControllerClose(s_sdl_controllers[i]);
-            s_sdl_controllers[i] = NULL;
-        }
-    }
-}
-
-#endif /* PAD_BACKEND_SDL2 */
-
-/* ---------------------------------------------------------------------------
- * SDL3 backend (Windows; the other hosts move to it with their audio and
- * window, which share SDL's symbols)
+ * SDL3 backend (every host; on Windows unless PS3RECOMP_PAD_SDL3 is off)
  *
  * Any pad SDL3 knows: Xbox pads (XInput), Switch, 8BitDo and other HID pads,
  * the 2026 Steam Controller (SDL 3.4.10 on, without Steam), and DirectInput
@@ -1297,6 +1078,7 @@ static void pad_poll_sdl3(void)
     SDL_UnlockJoysticks();
 }
 
+#if PAD_HID_SONY_ON
 /* The Sony pads pad_hid_sony.c reads (its sony_kind list: DualSense, DualSense Edge, DualShock 4 v1, v2 and its USB
  * dongle). SDL takes them for no joysticks and its HID layer leaves them closed, so each is on one port only. */
 #define PAD_SDL3_SONY_HID "0x054C/0x0CE6,0x054C/0x0DF2,0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0"
@@ -1309,12 +1091,15 @@ static void pad_sdl3_add_devices(const char* hint)
     snprintf(list, sizeof list, "%s%s%s", had && *had ? had : "", had && *had ? "," : "", PAD_SDL3_SONY_HID);
     SDL_SetHintWithPriority(hint, list, SDL_HINT_OVERRIDE);
 }
+#endif
 
 static BOOL CALLBACK pad_sdl3_start_once(PINIT_ONCE once, void* arg, void** ctx)
 {
     (void)once; (void)arg; (void)ctx;
+#if PAD_HID_SONY_ON   /* (Windows: pad_hid_sony.c has them; off Windows SDL reads them too) */
     pad_sdl3_add_devices(SDL_HINT_JOYSTICK_BLACKLIST_DEVICES);
     pad_sdl3_add_devices(SDL_HINT_HIDAPI_IGNORE_DEVICES);
+#endif
     /* No SDL window here: cellPad decides itself whether a pad counts in the background (PAD_FOCUS_ONLY). */
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMEPAD) && !SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
@@ -1518,10 +1303,10 @@ static long pad_parse_controller(const char* e)
 {
 #if PAD_BACKEND_XINPUT
     const long dev = pad_controller_parse(e, 0, PAD_HID_SONY_MAX);
-#elif PAD_BACKEND_SDL3
+#elif PAD_HID_SONY_ON
     const long dev = pad_controller_parse(e, 1, PAD_HID_SONY_MAX);
 #else
-    const long dev = pad_controller_parse(e, PAD_BACKEND_SDL2, 0);
+    const long dev = pad_controller_parse(e, 1, 0);   /* (off Windows SDL has every pad, Sony's too) */
 #endif
     if (dev == RUMBLE_NONE && e && *e && strcmp(e, "auto") != 0) {
         printf("[cellPad] PAD_CONTROLLER=%s: not a controller here; the ports stay as found\n", e);
@@ -1604,18 +1389,13 @@ static void pad_device_label(long dev, char* out, size_t n)
 #if PAD_BACKEND_XINPUT
     if (dev & RUMBLE_HID)                    pad_hid_sony_describe((int)(dev & 0xF), out, n);
     else if ((dev & 0xFF) == RUMBLE_XINPUT)  pad_xinput_label(pad_dev_index(dev), out, n);
-#elif PAD_BACKEND_SDL2
-    if ((dev & 0xFF) == RUMBLE_SDL) {
-        const int k = pad_dev_index(dev);
-        SDL_LockJoysticks();   /* (the poll closes a controller under it) */
-        const char* name = k < PAD_MAX_HOST_PORTS && s_sdl_controllers[k] ? SDL_GameControllerName(s_sdl_controllers[k]) : NULL;
-        if (name) snprintf(out, n, "%s", name);
-        SDL_UnlockJoysticks();
-    }
 #elif PAD_BACKEND_SDL3
+#if PAD_HID_SONY_ON
     if (dev & RUMBLE_HID) {
         pad_hid_sony_describe((int)(dev & 0xF), out, n);
-    } else if ((dev & 0xFF) == RUMBLE_SDL) {
+    } else
+#endif
+    if ((dev & 0xFF) == RUMBLE_SDL) {
         const int k = pad_dev_index(dev);
         SDL_LockJoysticks();   /* (the poll closes a pad under it) */
         const char* name = k < PAD_MAX_HOST_PORTS && s_sdl3_pads[k] ? SDL_GetGamepadName(s_sdl3_pads[k]) : NULL;
@@ -1653,9 +1433,7 @@ static void pad_tell_devices(void)
         if (ev[k].what != PAD_HELD_GONE) pad_device_label(ev[k].dev, what, sizeof what);
         if (ev[k].what == PAD_HELD_CAME) {
             printf("[cellPad] %s connected, host port %d: %s\n", id, ev[k].port, *what ? what : "(no name)");
-#if PAD_BACKEND_SDL2
-            pad_sdl_tell(ev[k].dev);
-#elif PAD_BACKEND_SDL3
+#if PAD_BACKEND_SDL3
             pad_sdl3_tell(ev[k].dev);
 #endif
         } else if (ev[k].what == PAD_HELD_GONE) {
@@ -1724,19 +1502,6 @@ int cellPad_host_stick_raw(int stick, float* x, float* y)
         dev[i] = RUMBLE_HID | hid[k].slot;
         memcpy(v[i], hid[k].raw, sizeof v[i]);
     }
-#elif PAD_BACKEND_SDL2
-    SDL_LockJoysticks();
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
-        SDL_GameController* gc = s_sdl_controllers[i];
-        dev[i] = RUMBLE_NONE;
-        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
-        dev[i] = PAD_DEV(RUMBLE_SDL, i);
-        v[i][0] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
-        v[i][1] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
-        v[i][2] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
-        v[i][3] = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
-    }
-    SDL_UnlockJoysticks();
 #elif PAD_BACKEND_SDL3
     SDL_LockJoysticks();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
@@ -1750,6 +1515,7 @@ int cellPad_host_stick_raw(int stick, float* x, float* y)
         v[i][3] = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY) / 32767.0f;
     }
     SDL_UnlockJoysticks();
+#if PAD_HID_SONY_ON
     PadHidSonyState hid[PAD_HID_SONY_MAX];
     const int n = pad_hid_sony_poll(hid, PAD_HID_SONY_MAX);
     for (int k = 0, i = 0; k < n; k++) {      /* (the ports SDL left empty, as pad_poll_hid) */
@@ -1758,6 +1524,7 @@ int cellPad_host_stick_raw(int stick, float* x, float* y)
         dev[i] = RUMBLE_HID | hid[k].slot;
         memcpy(v[i], hid[k].raw, sizeof v[i]);
     }
+#endif
 #endif
     const int found = pad_controller_find(dev, PAD_MAX_HOST_PORTS, pad_controller_wanted());
     const int port = found > 0 ? found : 0;
@@ -1814,18 +1581,6 @@ int cellPad_host_pads(CellPadHostPad* out, int max)
         }
         SDL_UnlockJoysticks();
     }
-#elif PAD_BACKEND_SDL2
-    /* The controllers cellPad has open, as the game's poll last updated them (SDL2 shares its event loop with the
-     * window off Windows). */
-    SDL_LockJoysticks();
-    for (int i = 0; i < PAD_MAX_HOST_PORTS && n < max; i++) {
-        SDL_GameController* gc = s_sdl_controllers[i];
-        if (!gc || !SDL_GameControllerGetAttached(gc)) continue;
-        memset(&hs, 0, sizeof hs);
-        pad_sdl_read(gc, &hs);
-        pad_host_pad_out(&out[n++], PAD_DEV(RUMBLE_SDL, i), &hs);
-    }
-    SDL_UnlockJoysticks();
 #endif
 #if PAD_HID_SONY_ON
     PadHidSonyState hid[PAD_HID_SONY_MAX];
@@ -1846,7 +1601,7 @@ int cellPad_host_pads(CellPadHostPad* out, int max)
 /* cellPad.h */
 int cellPad_host_reader_sdl(void)
 {
-    return PAD_BACKEND_SDL2 || PAD_BACKEND_SDL3;
+    return PAD_BACKEND_SDL3;
 }
 
 /* cellPad.h */
@@ -1904,25 +1659,7 @@ static int pad_glyph_kind(long dev)
 {
     if (dev == RUMBLE_NONE) return PAD_GLYPH_NONE;
     if (dev & RUMBLE_HID) return PAD_GLYPH_PLAYSTATION;
-#if PAD_BACKEND_SDL2
-    if ((dev & 0xFF) == RUMBLE_SDL) {
-        const int k = pad_dev_index(dev);
-        SDL_GameController* gc = k < PAD_MAX_HOST_PORTS ? s_sdl_controllers[k] : NULL;
-        switch (gc ? SDL_GameControllerGetType(gc) : SDL_CONTROLLER_TYPE_UNKNOWN) {
-        case SDL_CONTROLLER_TYPE_PS3:
-        case SDL_CONTROLLER_TYPE_PS4:
-        case SDL_CONTROLLER_TYPE_PS5:
-            return PAD_GLYPH_PLAYSTATION;
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
-        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
-            return PAD_GLYPH_NINTENDO;
-        default:
-            return PAD_GLYPH_XBOX;
-        }
-    }
-#elif PAD_BACKEND_SDL3
+#if PAD_BACKEND_SDL3
     if ((dev & 0xFF) == RUMBLE_SDL) {
         const int k = pad_dev_index(dev);
         SDL_LockJoysticks();
@@ -2014,11 +1751,11 @@ static void pad_poll_backend(void)
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
     pad_poll_hid();
-#elif PAD_BACKEND_SDL2
-    pad_poll_sdl2();
 #elif PAD_BACKEND_SDL3
     pad_poll_sdl3();
+#if PAD_HID_SONY_ON
     pad_poll_hid();
+#endif
 #endif
     pad_tell_devices();
     pad_apply_controller();
@@ -2884,14 +2621,6 @@ static void rumble_send(long dev, long want)
     } else if (dev & RUMBLE_HID) {
         pad_hid_sony_rumble((int)(dev & 0xF), (uint8_t)strong, (uint8_t)weak);
     }
-#elif PAD_BACKEND_SDL2
-    if ((dev & 0xFF) == RUMBLE_SDL) {
-        const int k = pad_dev_index(dev);
-        SDL_LockJoysticks();   /* (the poll closes a controller under it) */
-        if (k < PAD_MAX_HOST_PORTS && s_sdl_controllers[k])
-            SDL_GameControllerRumble(s_sdl_controllers[k], (Uint16)(strong * 257), (Uint16)(weak * 257), 500);
-        SDL_UnlockJoysticks();
-    }
 #elif PAD_BACKEND_SDL3
     if ((dev & 0xFF) == RUMBLE_SDL) {
         const int k = pad_dev_index(dev);
@@ -2899,9 +2628,12 @@ static void rumble_send(long dev, long want)
         if (k < PAD_MAX_HOST_PORTS && s_sdl3_pads[k])   /* the low-frequency, strong motor, then the other */
             SDL_RumbleGamepad(s_sdl3_pads[k], (Uint16)(strong * 257), (Uint16)(weak * 257), 500);
         SDL_UnlockJoysticks();
-    } else if (dev & RUMBLE_HID) {
+    }
+#if PAD_HID_SONY_ON
+    else if (dev & RUMBLE_HID) {
         pad_hid_sony_rumble((int)(dev & 0xF), (uint8_t)strong, (uint8_t)weak);
     }
+#endif
 #else
     (void)dev; (void)strong; (void)weak;
 #endif

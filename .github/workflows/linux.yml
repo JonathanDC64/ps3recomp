@@ -79,16 +79,18 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # SDL2 is not optional off Windows: cellPad and cellAudio select their SDL2 backends unconditionally there,
-      # and CMakeLists.txt hard-fails without it. vkd3d's build needs flex, bison, Perl's JSON module and the SPIR-V
-      # headers; the Vulkan headers and loader build and run it; lavapipe is in mesa-vulkan-drivers, the validation
-      # layer is its own package; Xvfb is the display the windows open on.
+      # Off Windows the runtime builds the pinned SDL3 (cmake/sdl3_dep.cmake) for the pads, the sound and the
+      # windows; its X11, Wayland and sound back ends need only these headers (SDL opens the libraries at run
+      # time). vkd3d's build needs flex, bison, Perl's JSON module and the SPIR-V headers; the Vulkan headers and
+      # loader build and run it; lavapipe is in mesa-vulkan-drivers, the validation layer is its own package;
+      # Xvfb is the display the windows open on.
       - name: Install dependencies
         id: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config clang libsdl2-dev libvulkan-dev libvulkan1 \
-            mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb
+          sudo apt-get install -y ninja-build pkg-config clang libvulkan-dev libvulkan1 \
+            mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
 
       # sccache for the configuration a pull request runs (clang, Release): every CMake configure below takes it
       # from CMAKE_<LANG>_COMPILER_LAUNCHER. Most of the build is glslang and SPIRV-Tools, which never change
@@ -784,9 +786,10 @@ jobs:
           # host stack one frame per guest call, so the default stack is not
           # enough and nothing says so until a title dies with no diagnosis.
           ./build/ps3recomp_host --threads
-          # The SDL2 audio and pad backends, which the Windows build never
-          # reaches (it takes WASAPI and XInput). The dummy audio driver and
-          # no controller are the runner's situation and must both be fine.
+          # The SDL3 audio and pad backends, which the Windows build never
+          # reaches (it takes WASAPI, and XInput or its own SDL3 build). The dummy
+          # audio driver and no controller are the runner's situation and must
+          # both be fine.
           SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
 
       # RSX texture layout -- format class, row sizes, Morton addressing. Pure
@@ -854,8 +857,8 @@ jobs:
           ctest --test-dir build-sync-stress --output-on-failure
 
       # The pinned SDL3 (cmake/sdl3_dep.cmake) builds with this toolchain and starts its gamepad subsystem
-      # with no display or controller. Its X11, Wayland and audio back ends build from the headers the
-      # dependency step installs. Nothing in the runtime uses it yet (the port's docs/173).
+      # with no display or controller, on its own (the runtime's build above links the same copy). Its X11,
+      # Wayland and audio back ends build from the headers the dependency step installs.
       - name: Build and run the SDL3 smoke test
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |

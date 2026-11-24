@@ -55,7 +55,7 @@ jobs:
       # Metal backend's guest-shader path; without them CMake builds the
       # fixed-function backend only.
       - name: Install dependencies
-        run: brew install ninja sdl2 glslang spirv-cross
+        run: brew install ninja glslang spirv-cross
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -374,9 +374,10 @@ jobs:
           # host stack one frame per guest call, and Darwin's default thread
           # stack is 512 KB, which nothing tells you until a title dies.
           ./build/ps3recomp_host --threads
-          # The SDL2 audio and pad backends, which the Windows build never
-          # reaches (it takes WASAPI and XInput). The dummy audio driver and
-          # no controller are the runner's situation and must both be fine.
+          # The SDL3 audio and pad backends, which the Windows build never
+          # reaches (it takes WASAPI, and XInput or its own SDL3 build). The dummy
+          # audio driver and no controller are the runner's situation and must
+          # both be fine.
           SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
 
       # ...and the same modes again through the older vtable path, the one

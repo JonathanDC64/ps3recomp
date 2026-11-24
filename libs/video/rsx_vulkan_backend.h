@@ -34,7 +34,7 @@
  *                             order) instead of the first non-CPU device.
  *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
  *                             binary PPM (overwritten each present).
- *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
+ *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL3
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without
  *                             it; if the window cannot be opened the run

@@ -34,8 +34,8 @@
 #include <string.h>
 #ifndef _WIN32
 #include <time.h>
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #endif
 
 const char* const* gpu_vk_surface_extensions(void)
@@ -96,9 +96,8 @@ static int64_t refresh_ticks(void* window)
     if (m && GetMonitorInfoA(m, (MONITORINFO*)&mi) && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
         hz = (int)dm.dmDisplayFrequency;
 #else
-    SDL_DisplayMode dm;
-    const int i = SDL_GetWindowDisplayIndex((SDL_Window*)window);
-    if (i >= 0 && SDL_GetCurrentDisplayMode(i, &dm) == 0) hz = dm.refresh_rate;
+    const SDL_DisplayMode* dm = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow((SDL_Window*)window));
+    if (dm) hz = (int)(dm->refresh_rate + 0.5f);
 #endif
     return hz >= 20 && hz <= 1000 ? ticks_per_s() / hz : 0;
 }
@@ -590,7 +589,7 @@ static VkSurfaceKHR surface_make(gpu_vk_device* dd, void* window)
     wi.hwnd = (HWND)window;
     if (vkCreateWin32SurfaceKHR(dd->instance, &wi, NULL, &surface) != VK_SUCCESS) return VK_NULL_HANDLE;
 #else
-    if (!SDL_Vulkan_CreateSurface((SDL_Window*)window, dd->instance, &surface)) return VK_NULL_HANDLE;
+    if (!SDL_Vulkan_CreateSurface((SDL_Window*)window, dd->instance, NULL, &surface)) return VK_NULL_HANDLE;
 #endif
     VkBool32 ok = VK_FALSE;
     if (vkGetPhysicalDeviceSurfaceSupportKHR(dd->phys, dd->qfamily, surface, &ok) != VK_SUCCESS || !ok) {

@@ -31,9 +31,9 @@ static inline void rsx_window_icon_sdl(SDL_Window* w)
 {
     uint8_t rgba[64 * 64 * 4];
     if (!w || !rsx_window_icon(64, rgba)) return;
-    SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(rgba, 64, 64, 32, 64 * 4, SDL_PIXELFORMAT_RGBA32);
+    SDL_Surface* s = SDL_CreateSurfaceFrom(64, 64, SDL_PIXELFORMAT_RGBA32, rgba, 64 * 4);
     if (!s) return;
     SDL_SetWindowIcon(w, s);   /* SDL copies the pixels */
-    SDL_FreeSurface(s);
+    SDL_DestroySurface(s);
 }
 #endif

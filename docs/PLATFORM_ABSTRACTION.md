@@ -270,9 +270,9 @@ Note: Windows `Sleep()` has millisecond granularity. For sub-millisecond sleeps,
 
 | Platform | Primary Backend | Fallback |
 |----------|----------------|----------|
-| Windows | WASAPI | SDL2 |
-| Linux | SDL2 | PulseAudio (potential future) |
-| macOS | SDL2 | CoreAudio (potential future) |
+| Windows | WASAPI | SDL3 |
+| Linux | SDL3 | PulseAudio (potential future) |
+| macOS | SDL3 | CoreAudio (potential future) |
 
 ### WASAPI (Windows)
 

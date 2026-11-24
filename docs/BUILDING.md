@@ -47,11 +47,14 @@ Complete guide to building the ps3recomp runtime library and game projects.
 **Linux:**
 - GCC 12+ or Clang 14+
 - Development headers: `libpthread`, `libm`
-- Optional: SDL2 development package (`libsdl2-dev`) for input/audio
+- SDL3 is built from a pinned release (`cmake/sdl3_dep.cmake`) for input, audio and windows; it needs the
+  headers of its X11, Wayland and sound back ends (Ubuntu: `libx11-dev libxext-dev libxrandr-dev libxcursor-dev
+  libxfixes-dev libxi-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev
+  libgl-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev`)
 
 **macOS:**
 - Xcode 14+ (Apple Clang 14+)
-- Optional: SDL2 via Homebrew (`brew install sdl2`)
+- SDL3 is built from a pinned release (`cmake/sdl3_dep.cmake`); nothing to install
 
 ---
 
@@ -292,7 +295,7 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
 | `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
-| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL3 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 
@@ -450,7 +453,7 @@ that an NV4097 triangle covers the centre pixel. A green tick means the
 graphics bridge works, not merely that it compiled.
 
 ```bash
-brew install ninja sdl2
+brew install ninja
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
@@ -617,12 +620,11 @@ Both are single-header public domain libraries from [nothings/stb](https://githu
 `third_party/` holds the larger ones, each with a README giving its source, version and licence
 (miniupnpc 2.3.3, BSD-3-Clause, for UPnP port mapping, is one).
 
-On Linux with SDL2:
+Off Windows the runtime links the pinned SDL3 (`SDL3::SDL3-static`, from `cmake/sdl3_dep.cmake`) PUBLIC, so a
+game linking `ps3recomp_runtime` gets it too. Use that copy for the game's own window or menus, never a second
+SDL: SDL2 and SDL3 share symbol names, and two in one process don't mix.
 ```cmake
-find_package(SDL2 REQUIRED)
-target_link_libraries(my_game PRIVATE
-    SDL2::SDL2 pthread m
-)
+target_link_libraries(my_game PRIVATE ps3recomp_runtime pthread m)
 ```
 
 ---
@@ -731,13 +733,12 @@ The `__attribute__((aligned(16)))` on `u128` in a struct may warn if the alignme
 
 Make sure `ws2_32` is in your link libraries. The CMake build does this automatically for `ps3recomp_runtime`, but if you're building separately you need to add it manually.
 
-### "cannot find -lSDL2"
+### SDL3 fails to configure or download
 
-Install SDL2 development package:
-- Ubuntu/Debian: `sudo apt install libsdl2-dev`
-- Fedora: `sudo dnf install SDL2-devel`
-- macOS: `brew install sdl2`
-- Windows: Download from libsdl.org, set `SDL2_DIR` in CMake
+The runtime builds SDL3 from its release archive. Without a network, unpack the same release somewhere and pass
+`-DFETCHCONTENT_SOURCE_DIR_SDL3=<dir>`. A missing back end (no window on Wayland, no sound) means its headers
+weren't installed when SDL3 was configured: install them (see the Linux list above) and configure again from a
+clean build folder.
 
 ### Build takes too long
 

@@ -35,8 +35,8 @@ Yes, under the same principles as all clean-room recompilation projects:
 ### What platforms are supported?
 
 - **Windows** (primary) — MSVC, XInput, WASAPI
-- **Linux** — GCC/Clang, SDL2
-- **macOS** — Clang, SDL2
+- **Linux** — GCC/Clang, SDL3 (built from source)
+- **macOS** — Clang, SDL3 (built from source)
 
 Windows gets the most testing. Linux and macOS should work but may need minor fixes.
 
