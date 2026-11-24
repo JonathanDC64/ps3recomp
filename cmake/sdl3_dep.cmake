@@ -15,6 +15,9 @@
 #
 #   -DFETCHCONTENT_SOURCE_DIR_SDL3=<dir>
 #
+# On Windows, SDL gets libusb from cmake/libusb_dep.cmake (libusb-1.0.dll, opened at run time) for the Switch 2
+# controllers over USB; -DPS3RECOMP_SDL3_LIBUSB=OFF leaves it out.
+#
 # SDL2 and SDL3 export many of the same symbol names (SDL_Init, SDL_PollEvent, ...), so one Linux process
 # must not load both: whatever moves to SDL3 there moves together.
 
@@ -22,6 +25,7 @@ include_guard(GLOBAL)
 include(FetchContent)
 
 set(PS3RECOMP_SDL3_VERSION 3.4.20)
+option(PS3RECOMP_SDL3_LIBUSB "Windows: build libusb-1.0.dll for SDL3's Switch 2 controllers (cmake/libusb_dep.cmake)" ON)
 
 # FetchContent_Declare takes EXCLUDE_FROM_ALL from CMake 3.28 on; older ones would hand it to ExternalProject.
 set(_ps3_sdl3_excl "")
@@ -49,6 +53,14 @@ function(ps3recomp_sdl3_available)
     set(SDL_INSTALL OFF)
     set(SDL_DISABLE_INSTALL ON)
     set(SDL_X11_XTEST OFF)        # synthesised input and global mouse warps: unused, and one less -dev package
+    if(WIN32)
+        set(SDL_HIDAPI_LIBUSB OFF)
+        if(PS3RECOMP_SDL3_LIBUSB)
+            include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/libusb_dep.cmake")
+            set(SDL_HIDAPI_LIBUSB ON)
+            ps3recomp_libusb_available()   # (turns SDL_HIDAPI_LIBUSB off again when libusb didn't build)
+        endif()
+    endif()
     FetchContent_MakeAvailable(sdl3)
     if(NOT TARGET SDL3::SDL3-static)
         message(FATAL_ERROR "SDL3 ${PS3RECOMP_SDL3_VERSION}: no SDL3::SDL3-static target after the build was set up")
