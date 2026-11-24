@@ -16,7 +16,8 @@
  *     LX LY RX RY b0 b1 b2 L2 R2
  *   b0: hat in the low nibble (0 = N, clockwise, 8 = centred), 0x10 square,
  *       0x20 cross, 0x40 circle, 0x80 triangle
- *   b1: L1 R1 L2 R2 create/share options L3 R3 (bit 0 up)
+ *   b1: L1 R1 L2 R2 create/share options L3 R3 (bit 0 up); L2 and R2 are read from the triggers' bytes instead
+ *       (pad_trigger.h: the bits come on at the first movement)
  *   b2: bit 0 PS, bit 1 touchpad click; in the DualSense's full report bit 2
  *       the mute button, and on a DualSense Edge bits 4 to 7 its left and
  *       right Fn buttons and left and right back buttons (the rest of a
@@ -59,6 +60,7 @@
 #include "cellPad.h"
 #include "pad_map.h"
 #include "pad_stick.h"
+#include "pad_trigger.h"
 #include "ps3emu/ps3_knob.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -189,8 +191,12 @@ static void sony_parse(SonyDev* d, const uint8_t* r, DWORD n)
     if (b0 & 0x80) btn |= CELL_PAD_CTRL_TRIANGLE;
     if (b1 & 0x01) btn |= CELL_PAD_CTRL_L1;
     if (b1 & 0x02) btn |= CELL_PAD_CTRL_R1;
-    if (b1 & 0x04) btn |= CELL_PAD_CTRL_L2;
-    if (b1 & 0x08) btn |= CELL_PAD_CTRL_R2;
+    /* L2 and R2 past the threshold every reader uses (pad_trigger.h), not b1's bits: those come on at the first
+     * movement, so a trigger resting a little in held the button, and a shake pressed it. */
+    static int trig = -1;
+    PS3_KNOB(trig, pad_trigger_knob(getenv("PAD_TRIGGER_THRESHOLD")));
+    if (pad_trigger_down_255(s.l2, trig)) btn |= CELL_PAD_CTRL_L2;
+    if (pad_trigger_down_255(s.r2, trig)) btn |= CELL_PAD_CTRL_R2;
     if (b1 & 0x10) btn |= CELL_PAD_CTRL_SELECT;   /* Create / Share */
     if (b1 & 0x20) btn |= CELL_PAD_CTRL_START;    /* Options */
     if (b1 & 0x40) btn |= CELL_PAD_CTRL_L3;

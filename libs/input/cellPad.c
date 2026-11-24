@@ -15,6 +15,7 @@
 #include "ps3emu/ps3_knob.h"
 #include "cellPad.h"
 #include "pad_stick.h"
+#include "pad_trigger.h"   /* L2 and R2 past a threshold on every reader; PAD_TRIGGER_THRESHOLD, live */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -220,11 +221,6 @@ static SDL_Gamepad* s_sdl3_pads[PAD_MAX_HOST_PORTS];
 /* ---------------------------------------------------------------------------
  * XInput backend
  * -----------------------------------------------------------------------*/
-
-#if PAD_BACKEND_XINPUT
-
-#define PAD_TRIGGER_THRESHOLD 30
-#endif
 
 #if PAD_BACKEND_HOST
 /* One stick, -1 to 1 per axis with down positive, through the radial
@@ -940,8 +936,10 @@ static void pad_xinput_read(const XINPUT_GAMEPAD* gp, PadHostState* hs)
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)     btns |= CELL_PAD_CTRL_RIGHT;
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_DOWN)      btns |= CELL_PAD_CTRL_DOWN;
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_LEFT)      btns |= CELL_PAD_CTRL_LEFT;
-    if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)     btns |= CELL_PAD_CTRL_L2;
-    if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD)    btns |= CELL_PAD_CTRL_R2;
+    static int trig = -1;
+    PS3_KNOB(trig, pad_trigger_knob(getenv("PAD_TRIGGER_THRESHOLD")));
+    if (pad_trigger_down_255(gp->bLeftTrigger, trig))  btns |= CELL_PAD_CTRL_L2;
+    if (pad_trigger_down_255(gp->bRightTrigger, trig)) btns |= CELL_PAD_CTRL_R2;
     if (gp->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  btns |= CELL_PAD_CTRL_L1;
     if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) btns |= CELL_PAD_CTRL_R1;
     if (gp->wButtons & XINPUT_GAMEPAD_Y)              btns |= CELL_PAD_CTRL_TRIANGLE;
@@ -1074,8 +1072,10 @@ static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs)
     /* Triggers via axis */
     const int lt = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
     const int rt = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-    if (lt > 3000) btns |= CELL_PAD_CTRL_L2;
-    if (rt > 3000) btns |= CELL_PAD_CTRL_R2;
+    static int trig = -1;
+    PS3_KNOB(trig, pad_trigger_knob(getenv("PAD_TRIGGER_THRESHOLD")));
+    if (pad_trigger_down_32767(lt, trig)) btns |= CELL_PAD_CTRL_L2;
+    if (pad_trigger_down_32767(rt, trig)) btns |= CELL_PAD_CTRL_R2;
 
     hs->buttons = btns;
 
