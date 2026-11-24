@@ -613,6 +613,110 @@ static int pad_host_is_steam_deck(void)
     return deck;
 }
 
+/* 1 while Steam runs on this machine, looked at again every 5 s (it can start or close during play). Windows: the pid
+ * Steam leaves in the registry while it runs (0 when it closed), and that process still running. Linux: a process
+ * named steam (the client, native or Flatpak). Elsewhere 0. */
+#if defined(_WIN32)
+#pragma comment(lib, "advapi32.lib")   /* RegGetValueW */
+#elif defined(__linux__)
+#include <dirent.h>
+#include <ctype.h>
+#endif
+static int pad_host_steam_running(void)
+{
+    static int on = 0;
+    static unsigned long long next = 0;
+    const unsigned long long now = GetTickCount64();
+    if (now < next) return on;
+    next = now + 5000;
+    on = 0;
+#if defined(_WIN32)
+    DWORD pid = 0, size = sizeof pid;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", L"pid", RRF_RT_REG_DWORD, NULL, &pid,
+                     &size) == ERROR_SUCCESS &&
+        pid) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (h) {
+            DWORD code = 0;
+            on = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+            CloseHandle(h);
+        }
+    }
+#elif defined(__linux__)
+    DIR* d = opendir("/proc");
+    if (d) {
+        struct dirent* e;
+        while (!on && (e = readdir(d)) != NULL) {
+            if (!isdigit((unsigned char)e->d_name[0])) continue;
+            char path[64], comm[32] = {0};
+            snprintf(path, sizeof path, "/proc/%s/comm", e->d_name);
+            FILE* f = fopen(path, "r");
+            if (!f) continue;
+            if (fgets(comm, sizeof comm, f)) on = strcmp(comm, "steam\n") == 0;
+            fclose(f);
+        }
+        closedir(d);
+    }
+#endif
+    return on;
+}
+
+/* 1 when Steam started this program (a Steam game, or one added to Steam): it then gives the controller the
+ * program's own Steam Input settings, not its desktop layout. Steam names the game in the environment. */
+static int pad_host_started_by_steam(void)
+{
+    static int by = -1;
+    if (by < 0) {
+        const char* id = getenv("SteamGameId");
+        const char* app = getenv("SteamAppId");
+        by = (id && *id && strcmp(id, "0") != 0) || (app && *app && strcmp(app, "0") != 0);
+    }
+    return by;
+}
+
+/* The maker's USB ID of the pad on port 0 as SDL reads it; 0 for none, or a pad read another way. Looked at again
+ * when another pad takes the port, and every second. */
+static unsigned pad_host_port0_vendor(void)
+{
+#if PAD_BACKEND_SDL3
+    static long dev_seen = -1;
+    static unsigned vendor = 0;
+    static unsigned long long next = 0;
+    const long dev = s_poll_dev[0];
+    const unsigned long long now = GetTickCount64();
+    if (dev == dev_seen && now < next) return vendor;
+    dev_seen = dev;
+    next = now + 1000;
+    vendor = 0;
+    if ((dev & 0xFF) == RUMBLE_SDL) {
+        const int k = pad_dev_index(dev);
+        SDL_LockJoysticks();   /* (the poll closes a pad under it) */
+        SDL_Gamepad* gp = k < PAD_MAX_HOST_PORTS ? s_sdl3_pads[k] : NULL;
+        if (gp) vendor = SDL_GetGamepadVendor(gp);
+        SDL_UnlockJoysticks();
+    }
+    return vendor;
+#else
+    return 0;
+#endif
+}
+
+/* Whether keys and the mouse stay out of a pad on port 0 (pad_poll_keyboard_once). with_pad: PAD_KEYBOARD_WITH_PAD,
+ * 1 merge, 0 keep out, -1 not set: then out wherever Steam's desktop layout also turns the controls into keys, mouse
+ * buttons and the mouse, while the pad reports them too, so one press would count twice and some would press other
+ * buttons:
+ *   - a Steam Deck (issue #351: B is also Esc, so it would also press Start; R2 is also a left click, so R1);
+ *   - a Valve controller (USB ID 28DE: the Steam Controller) while Steam runs and didn't start this program (a
+ *     player's report: double and wrong presses with Steam in the background; with Steam closed, or the game
+ *     started from Steam, it played right).
+ * A keyboard still plays with no pad on the port. */
+static int pad_keys_out_rule(int pad, int with_pad, int deck, unsigned vendor, int steam_running, int by_steam)
+{
+    if (!pad || with_pad == 1) return 0;
+    if (with_pad == 0) return 1;
+    return deck || (vendor == 0x28DE && steam_running && !by_steam);
+}
+
 /* Keys and mouse leaving port 0 to its pad (below). */
 static volatile int s_keys_out;
 /* A bound key or mouse button went down in the keyboard poll (for pad_glyph.h: the device last used). */
@@ -622,13 +726,12 @@ int cellPad_host_keys_out(void) { return s_keys_out; }
 /* One keyboard poll (pad_poll_keyboard runs one at a time). */
 static void pad_poll_keyboard_once(void)
 {
-    /* with_pad: do keys and the mouse merge into a real pad on port 0? Not on a Steam Deck. Steam's desktop layout
-     * presses keys and mouse buttons for the Deck's controls while the pad reports them too, so one press would count
-     * twice (issue #351: B is also Esc, so it would also press Start; R2 is also a left click, so it would also press
-     * R1). PAD_KEYBOARD_WITH_PAD=1 brings them back, for a keyboard on a docked Deck; =0 does this on any PC. With no
-     * pad on port 0 the keys count as always: they may be the only input there is. */
-    static int off = -1, keys = -1, walk = -1, with_pad = -1;
-    PS3_KNOB(with_pad, ps3_env_int("PAD_KEYBOARD_WITH_PAD", pad_host_is_steam_deck() ? 0 : 1));
+    /* with_pad: do keys and the mouse merge into a real pad on port 0? Not where Steam's desktop layout presses keys
+     * and mouse buttons for the pad's controls too (pad_keys_out_rule: a Steam Deck, or a Valve controller with Steam
+     * in the background). PAD_KEYBOARD_WITH_PAD=1 always merges them (a keyboard on a docked Deck); =0 keeps them out
+     * on any PC. With no pad on port 0 the keys count as always: they may be the only input there is. */
+    static int off = -1, keys = -1, walk = -1, with_pad = -2;
+    PS3_KNOB(with_pad, ps3_env_int("PAD_KEYBOARD_WITH_PAD", -1));
     PS3_KNOB(off, getenv("PAD_NO_KEYBOARD") ? 1 : 0);
     if (off) return;
     PS3_KNOB(keys, pad_parse_keys(getenv("PAD_KEYS")));
@@ -637,16 +740,24 @@ static void pad_poll_keyboard_once(void)
 
     PadHostState* hs = &s_host_state[0];
     const int pad = hs->connected;   /* a real pad on port 0: merge into it */
-    s_keys_out = pad && !with_pad;
-    if (s_keys_out) {
-        static int said = 0;
-        if (!said) {
-            said = 1;
-            printf("[cellPad] keys and mouse stay out of port 0, which has a pad (PAD_KEYBOARD_WITH_PAD=%d)\n", with_pad);
-            fflush(stdout);
-        }
-        return;
+    const int deck = pad_host_is_steam_deck();
+    const unsigned vendor = pad && with_pad < 0 && !deck ? pad_host_port0_vendor() : 0;
+    const int steam = vendor == 0x28DE ? pad_host_steam_running() : 0;
+    s_keys_out = pad_keys_out_rule(pad, with_pad, deck, vendor, steam, pad_host_started_by_steam());
+    static int said = 0;   /* (each change, for a tester's log) */
+    if (s_keys_out != said) {
+        said = s_keys_out;
+        if (s_keys_out)
+            printf("[cellPad] keys and mouse stay out of port 0, which has a pad (%s)\n",
+                   with_pad == 0 ? "PAD_KEYBOARD_WITH_PAD=0"
+                   : deck        ? "a Steam Deck: Steam's desktop layout presses keys for its controls"
+                                 : "a Valve controller with Steam in the background: its desktop layout presses keys "
+                                   "for the controls");
+        else
+            printf("[cellPad] keys and mouse merge into port 0's pad again\n");
+        fflush(stdout);
     }
+    if (s_keys_out) return;
     if (!pad_host_window_focused()) {
         /* Release everything on focus loss, or a key held while alt-tabbing
          * would stay down forever. */

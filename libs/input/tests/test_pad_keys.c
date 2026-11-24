@@ -303,6 +303,17 @@ int main(void)
     set_env("PAD_KEYBOARD_WITH_PAD", NULL);
     KEYS();
 
+    /* pad_keys_out_rule (pad, PAD_KEYBOARD_WITH_PAD, a Deck, port 0's maker, Steam running, started by Steam): keys
+     * stay out where Steam's desktop layout presses keys for the pad's controls too. */
+    CHECK(!pad_keys_out_rule(0, -1, 1, 0x28DE, 1, 0));   /* no pad: the keys are the input */
+    CHECK(pad_keys_out_rule(1, -1, 1, 0, 0, 0));          /* a Steam Deck */
+    CHECK(pad_keys_out_rule(1, -1, 0, 0x28DE, 1, 0));     /* a Valve controller with Steam in the background */
+    CHECK(!pad_keys_out_rule(1, -1, 0, 0x28DE, 0, 0));    /* Steam closed */
+    CHECK(!pad_keys_out_rule(1, -1, 0, 0x28DE, 1, 1));    /* started from Steam: the game's own settings */
+    CHECK(!pad_keys_out_rule(1, -1, 0, 0x045E, 1, 0));    /* another maker's pad */
+    CHECK(!pad_keys_out_rule(1, 1, 1, 0x28DE, 1, 0));     /* =1 always merges */
+    CHECK(pad_keys_out_rule(1, 0, 0, 0, 0, 0));           /* =0 always keeps them out */
+
     /* cellPad_host_keys_live: 0 whenever the keyboard pad's keys would not reach the title */
     p = rd();
     CHECK(cellPad_host_keys_live());
