@@ -1322,12 +1322,64 @@ static long pad_controller_wanted(void)
     return want;
 }
 
+/* The pad on port `found` and port 0's swap places, with their devices (so its vibration and button icons go with
+ * it). */
+static void pad_to_port0(int found)
+{
+    if (found <= 0) return;
+    const PadHostState hs = s_host_state[0];
+    const long dev = s_poll_dev[0];
+    s_host_state[0] = s_host_state[found]; s_poll_dev[0] = s_poll_dev[found];
+    s_host_state[found] = hs;              s_poll_dev[found] = dev;
+}
+
+/* PAD_FOLLOW=1: with PAD_CONTROLLER auto, the controller last used is port 0, and its button icons and vibration
+ * with it. For a title that reads only port 0 (Demon's Souls: its port sets it), so any connected pad plays the
+ * moment it is used; off by default, since a title with a pad for each player must keep them on their own ports.
+ * Used: a button, a stick past about a third of its way, or a trigger past a quarter (a resting stick or a light
+ * touch doesn't take it). Nothing moves while the host or the background holds the pads. Live. */
+static int pad_follow_on(void)
+{
+    static int on = -1;
+    PS3_KNOB(on, ps3_env_int("PAD_FOLLOW", 0) != 0);
+    return on;
+}
+
+static int pad_used(const PadHostState* hs)
+{
+    if (!hs->connected) return 0;
+    if (hs->buttons || hs->extra || hs->trigger_l2 > 64 || hs->trigger_r2 > 64) return 1;
+    const int lx = hs->analog_lx - 128, ly = hs->analog_ly - 128, rx = hs->analog_rx - 128, ry = hs->analog_ry - 128;
+    return lx * lx + ly * ly > 48 * 48 || rx * rx + ry * ry > 48 * 48;
+}
+
+static void pad_follow_last(void)
+{
+    static long follow = RUMBLE_NONE;
+    if (!pad_follow_on()) return;
+    int used[PAD_MAX_HOST_PORTS];
+    const int held = s_host_hold || pad_background_hold();
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) used[p] = !held && pad_used(&s_host_state[p]);
+    const long had = follow;
+    const int found = pad_controller_follow(s_poll_dev, used, PAD_MAX_HOST_PORTS, &follow);
+    if (follow != had) {   /* (a tester's log says which pad played) */
+        char name[16] = "";
+        pad_controller_name(follow, name, sizeof name);
+        printf("[cellPad] PAD_FOLLOW: %s plays (port 0, found on port %d)\n", name, found);
+        fflush(stdout);
+    }
+    pad_to_port0(found);
+}
+
 static void pad_apply_controller(void)
 {
     static long said_want = RUMBLE_NONE;
     static int said_port = -2;   /* the port the chosen controller was on, -1 none, as last logged */
     const long want = pad_controller_wanted();
-    if (want == RUMBLE_NONE) return;
+    if (want == RUMBLE_NONE) {
+        pad_follow_last();
+        return;
+    }
     const int found = pad_controller_find(s_poll_dev, PAD_MAX_HOST_PORTS, want);
     if (found != said_port || want != said_want) {   /* (when it changes: a tester's log says which pad played) */
         said_port = found;
@@ -1338,11 +1390,7 @@ static void pad_apply_controller(void)
         else            printf("[cellPad] PAD_CONTROLLER: %s isn't connected; the ports stay as found\n", name);
         fflush(stdout);
     }
-    if (found <= 0) return;
-    const PadHostState hs = s_host_state[0];
-    const long dev = s_poll_dev[0];
-    s_host_state[0] = s_host_state[found]; s_poll_dev[0] = s_poll_dev[found];
-    s_host_state[found] = hs;              s_poll_dev[found] = dev;
+    pad_to_port0(found);
 }
 
 /* cellPad.h */

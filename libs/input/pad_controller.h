@@ -42,6 +42,23 @@ static int pad_controller_find(const long* devs, int ports, long want)
     return -1;
 }
 
+/* PAD_FOLLOW (cellPad.c): with PAD_CONTROLLER auto, the pad last used is the one that plays, for a title that
+ * reads only port 0. used[p]: port p's pad was used this sweep. *follow: the device that plays, kept between
+ * sweeps (RUMBLE_NONE until a pad is used). Returns the port it is on this sweep, or -1: none used yet, or it
+ * went away (the ports then stay as found). A pad used while the one that plays is in use too waits until that
+ * one lets go, so two pads held at once don't trade places every sweep. */
+static int pad_controller_follow(const long* devs, const int* used, int ports, long* follow)
+{
+    const int on = pad_controller_find(devs, ports, *follow);
+    if (on >= 0 && used[on]) return on;
+    for (int p = 0; p < ports; p++)
+        if (p != on && devs[p] != RUMBLE_NONE && used[p]) {
+            *follow = devs[p];
+            return p;
+        }
+    return on;
+}
+
 /* What an XInput pad is, for a title's settings, into out (n bytes). vid and
  * pid come from XInputGetCapabilitiesEx (0 when Windows doesn't give them),
  * subtype (XINPUT_DEVSUBTYPE_*) and wireless from XInputGetCapabilities.
