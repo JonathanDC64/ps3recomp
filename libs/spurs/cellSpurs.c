@@ -2961,9 +2961,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
            jc_ea, jobs);
 }
 
-static DWORD WINAPI jc_thread(LPVOID p)
+static void jc_walk(int slot)
 {
-    int slot = (int)(intptr_t)p;
     /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
      * picks up jobs as the PPU appends them + fills their descriptors. Our walk
      * is one-shot; if it reads descriptors before the PPU populates the I/O
@@ -2977,7 +2976,67 @@ static DWORD WINAPI jc_thread(LPVOID p)
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
     jc_signal_done(s_jobchains[slot].jc_ea, -1);
-    return 0;
+}
+
+/* The walkers' threads. Each run still gets a thread of its own, as when every
+ * run started one: a run takes an idle walker, or starts a new one when none
+ * is idle, so a chain that never ends (a service loop parked on its guard)
+ * holds only its own thread. A walker goes back to idle when its walk ends.
+ *
+ * Starting a thread per run cost ~100 us before the walk began: Demon's Souls
+ * runs a chain per texture upload and waits for each, dozens in a streaming
+ * frame. The queue holds a slot at most once (`running` guards it). */
+#define JC_QUEUE 64
+static int s_jc_queue[JC_QUEUE];
+static unsigned s_jc_head, s_jc_count;   /* pending runs */
+static unsigned s_jc_idle;               /* walkers waiting for one */
+#ifdef _WIN32
+static SRWLOCK s_jc_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jc_cv = CONDITION_VARIABLE_INIT;
+#define JC_LOCK()   AcquireSRWLockExclusive(&s_jc_lock)
+#define JC_UNLOCK() ReleaseSRWLockExclusive(&s_jc_lock)
+#define JC_WAIT()   SleepConditionVariableSRW(&s_jc_cv, &s_jc_lock, INFINITE, 0)
+#define JC_WAKE()   WakeConditionVariable(&s_jc_cv)
+#else
+static pthread_mutex_t s_jc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_jc_cv = PTHREAD_COND_INITIALIZER;
+#define JC_LOCK()   pthread_mutex_lock(&s_jc_lock)
+#define JC_UNLOCK() pthread_mutex_unlock(&s_jc_lock)
+#define JC_WAIT()   pthread_cond_wait(&s_jc_cv, &s_jc_lock)
+#define JC_WAKE()   pthread_cond_signal(&s_jc_cv)
+#endif
+
+static DWORD WINAPI jc_thread(LPVOID p)
+{
+    (void)p;
+    JC_LOCK();
+    for (;;) {
+        while (!s_jc_count) { s_jc_idle++; JC_WAIT(); s_jc_idle--; }
+        const int slot = s_jc_queue[s_jc_head];
+        s_jc_head = (s_jc_head + 1) % JC_QUEUE;
+        s_jc_count--;
+        JC_UNLOCK();
+        jc_walk(slot);
+        JC_LOCK();
+    }
+}
+
+/* Queue a run of `slot` for a walker; 0 when no thread could take it. */
+static int jc_post(int slot)
+{
+    int ok = 1;
+    JC_LOCK();
+    s_jc_queue[(s_jc_head + s_jc_count) % JC_QUEUE] = slot;
+    s_jc_count++;
+    if (s_jc_idle >= s_jc_count) {
+        JC_WAKE();
+    } else {
+        HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, NULL, 0, NULL);
+        if (th) CloseHandle(th);
+        else { s_jc_count--; ok = 0; }   /* the run just queued, the last one */
+    }
+    JC_UNLOCK();
+    return ok;
 }
 
 /* cellSpursRunJobChain -- start job chain execution (async, like the real one). */
@@ -3009,11 +3068,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
         }
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
         /* Coalesce: a chain already being walked must not start twice. */
-        if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
-            if (th) CloseHandle(th);
-            else s_jobchains[i].running = 0;
-        }
+        if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0 && !jc_post(i))
+            s_jobchains[i].running = 0;
         return CELL_OK;
     }
     printf("[cellSpurs] %s(jc=0x%08X) -- UNKNOWN chain (no Create seen)\n", who, (u32)jc_ea);
