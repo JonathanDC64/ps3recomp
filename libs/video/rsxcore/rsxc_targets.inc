@@ -1096,6 +1096,21 @@ static int zeta_get(u32 off, u32 w, u32 h)
     return slot;
 }
 
+/* Whether n bytes of guest memory from p are all zero (a new target's contents, off_rt_get). */
+static int guest_all_zero(const u8* p, u64 n)
+{
+    u64 i = 0, acc = 0;
+    for (; i < n && ((uintptr_t)(p + i) & 7u); i++) acc |= p[i];
+    for (; i + 64 <= n; i += 64) {
+        u64 v[8];
+        memcpy(v, p + i, sizeof v);
+        acc |= v[0] | v[1] | v[2] | v[3] | v[4] | v[5] | v[6] | v[7];
+        if (acc) return 0;
+    }
+    for (; i < n; i++) acc |= p[i];
+    return acc == 0;
+}
+
 /* Ensure an RT resource exists for this surface; (re)creates its RTV (a view
  * of the texture, step C5a) and the SRV at the SRV pool's RT_SRV_BASE+i. */
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -1170,6 +1185,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
     r->used = 1;
     r->gsum_ok = 0;
 
+    int rtv_made = 0;   /* (the all-zero clear below makes it first) */
     /* Populate the new RT from guest memory: titles CPU-initialise their
      * render-target buffers (wave fills the height fields with texels of
      * (0,0,0, 1.0f) -- the .w is 'inverse of mass'; from an all-zero GPU
@@ -1186,8 +1202,22 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
         u32 pitch = (hw * bpp + 255) & ~255u;
         u32 src = cellGcmResolveOffset(off);
         u8* wide = (hw != w) ? (u8*)malloc((size_t)w * bpp) : NULL;
+        int zero = 0;
         if (vm_base && src != 0xFFFFFFFFu) {
             wb_land_range(src, (u64)w * h * sbpp);   /* the last batch's write-backs there first */
+            zero = guest_all_zero(vm_base + src, (u64)w * h * sbpp);
+        }
+        if (zero) {
+            /* All zero: zero in every format a target takes, so a GPU clear sets it, with no staging and no
+             * copy. Half of Demon's Souls's new 1280x720 targets at a load are (11-23): at RSX_SCALE=300 the
+             * staging alone took 3-20 ms to create, and its fill 20-28 ms. */
+            static const float k0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0);   /* today's NULL description */
+            rtv_made = 1;
+            gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_COPY_DEST, GPU_STATE_RENDER_TARGET);
+            gpu_cmd_clear_color(s_rc_cmd, r->rtv, k0, NULL);
+            gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_RENDER_TARGET, GPU_STATE_PIXEL_SHADER_RESOURCE);
+        } else if (vm_base && src != 0xFFFFFFFFu) {
             /* The staging: a GPU layer upload buffer, mapped for its life
              * (step C5a). */
             gpu_buffer_desc bd;
@@ -1201,43 +1231,74 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
                 void* mp = gpu_buffer_map(s_rc_dev, r->up_buf, 0, 0);
                 if (mp) {
                     const u8* sp = vm_base + src;
-                    for (u32 y = 0; y < hh; y++) {
-                        const u8* srow = sp + (u64)((u64)y * h / hh) * w * sbpp;
-                        u8* hrow = (u8*)mp + (u64)y * pitch;
-                        u8* drow = wide ? wide : hrow;
-                        if (want_fmt != gfmt) {
-                            /* promoted (HDR): guest A8R8G8B8 -> R,G,B,A halves */
-                            for (u32 x = 0; x < w; x++) {
-                                const u16 hv[4] = {half_of_byte(srow[x*4+1]), half_of_byte(srow[x*4+2]),
-                                                   half_of_byte(srow[x*4+3]), half_of_byte(srow[x*4+0])};
-                                memcpy(drow + (u64)x * 8, hv, 8);
+                    /* Each host row is built in host memory and written to the
+                     * buffer with one copy: the buffer is write-combined, so
+                     * scattered small stores to it, and any read back, are
+                     * slow. A guest row is converted once; the host rows a
+                     * scale repeats it into (3 at RSX_SCALE=300) copy the same
+                     * built row. A 1280x720 target at scale 300 took 20-28 ms
+                     * here, texel by texel; a column map replaces the divide
+                     * per host texel. */
+                    u8* hb = (u8*)malloc((size_t)hw * bpp);
+                    u32* colx = wide ? (u32*)malloc((size_t)hw * sizeof *colx) : NULL;
+                    if (hb && (!wide || colx)) {
+                        if (colx) for (u32 x = 0; x < hw; x++) colx[x] = (u32)((u64)x * w / hw);
+                        u32 built = ~0u;   /* the guest row hb holds */
+                        for (u32 y = 0; y < hh; y++) {
+                            const u32 sy = (u32)((u64)y * h / hh);
+                            if (sy != built) {
+                                built = sy;
+                                const u8* srow = sp + (u64)sy * w * sbpp;
+                                u8* drow = wide ? wide : hb;
+                                if (want_fmt != gfmt) {
+                                    /* promoted (HDR): guest A8R8G8B8 -> R,G,B,A halves */
+                                    for (u32 x = 0; x < w; x++) {
+                                        const u16 hv[4] = {half_of_byte(srow[x*4+1]), half_of_byte(srow[x*4+2]),
+                                                           half_of_byte(srow[x*4+3]), half_of_byte(srow[x*4+0])};
+                                        memcpy(drow + (u64)x * 8, hv, 8);
+                                    }
+                                } else if (want_fmt == GPU_FORMAT_R8G8B8A8_UNORM) {
+                                    /* guest A8R8G8B8 (bytes A,R,G,B) -> R,G,B,A */
+                                    for (u32 x = 0; x < w; x++) {
+                                        drow[x*4+0] = srow[x*4+1];
+                                        drow[x*4+1] = srow[x*4+2];
+                                        drow[x*4+2] = srow[x*4+3];
+                                        drow[x*4+3] = srow[x*4+0];
+                                    }
+                                } else if (want_fmt == GPU_FORMAT_R16G16B16A16_FLOAT) {
+                                    for (u32 x = 0; x < w * 4; x++) {   /* u16 halves, BE */
+                                        drow[x*2+0] = srow[x*2+1];
+                                        drow[x*2+1] = srow[x*2+0];
+                                    }
+                                } else {                                 /* u32 floats, BE */
+                                    u32 nw = (w * bpp) / 4;
+                                    for (u32 x = 0; x < nw; x++) {
+                                        drow[x*4+0] = srow[x*4+3];
+                                        drow[x*4+1] = srow[x*4+2];
+                                        drow[x*4+2] = srow[x*4+1];
+                                        drow[x*4+3] = srow[x*4+0];
+                                    }
+                                }
+                                if (colx) {   /* nearest: host texel x is guest texel colx[x] */
+                                    if (bpp == 4) {
+                                        const u32* s4 = (const u32*)wide; u32* d4 = (u32*)hb;
+                                        for (u32 x = 0; x < hw; x++) d4[x] = s4[colx[x]];
+                                    } else if (bpp == 8) {
+                                        const u64* s8 = (const u64*)wide; u64* d8 = (u64*)hb;
+                                        for (u32 x = 0; x < hw; x++) d8[x] = s8[colx[x]];
+                                    } else {
+                                        for (u32 x = 0; x < hw; x++)
+                                            memcpy(hb + (u64)x * bpp, wide + (u64)colx[x] * bpp, bpp);
+                                    }
+                                }
                             }
-                        } else if (want_fmt == GPU_FORMAT_R8G8B8A8_UNORM) {
-                            /* guest A8R8G8B8 (bytes A,R,G,B) -> R,G,B,A */
-                            for (u32 x = 0; x < w; x++) {
-                                drow[x*4+0] = srow[x*4+1];
-                                drow[x*4+1] = srow[x*4+2];
-                                drow[x*4+2] = srow[x*4+3];
-                                drow[x*4+3] = srow[x*4+0];
-                            }
-                        } else if (want_fmt == GPU_FORMAT_R16G16B16A16_FLOAT) {
-                            for (u32 x = 0; x < w * 4; x++) {   /* u16 halves, BE */
-                                drow[x*2+0] = srow[x*2+1];
-                                drow[x*2+1] = srow[x*2+0];
-                            }
-                        } else {                                 /* u32 floats, BE */
-                            u32 nw = (w * bpp) / 4;
-                            for (u32 x = 0; x < nw; x++) {
-                                drow[x*4+0] = srow[x*4+3];
-                                drow[x*4+1] = srow[x*4+2];
-                                drow[x*4+2] = srow[x*4+1];
-                                drow[x*4+3] = srow[x*4+0];
-                            }
+                            memcpy((u8*)mp + (u64)y * pitch, hb, (size_t)hw * bpp);
                         }
-                        if (wide)
-                            for (u32 x = 0; x < hw; x++)
-                                memcpy(hrow + (u64)x * bpp, wide + (u64)((u64)x * w / hw) * bpp, bpp);
+                    } else {   /* (no memory for a row: the target starts from zero, not the buffer's leftovers) */
+                        for (u32 y = 0; y < hh; y++) memset((u8*)mp + (u64)y * pitch, 0, (size_t)hw * bpp);
                     }
+                    free(colx);
+                    free(hb);
                     /* (an upload buffer stays mapped: the unmap writes nothing) */
                     gpu_buffer_unmap(s_rc_dev, r->up_buf, 0, bd.size);
                     gpu_footprint fp;   /* the whole buffer, from offset 0 */
@@ -1260,11 +1321,12 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
             }
         }
         free(wide);
-        gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
+        if (!zero)   /* (the clear above made it a shader resource) */
+            gpu_cmd_barrier(s_rc_cmd, r->tex, GPU_STATE_COPY_DEST, GPU_STATE_PIXEL_SHADER_RESOURCE);
         r->st = GPU_STATE_PIXEL_SHADER_RESOURCE;
     }
 
-    r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0);   /* today's NULL description */
+    if (!rtv_made) r->rtv = rc_target_view(r->tex, GPU_VIEW_RTV, 0, 0);   /* today's NULL description */
 
     gpu_view_desc sv;   /* in the SRV pool (step C4) */
     memset(&sv, 0, sizeof sv);
