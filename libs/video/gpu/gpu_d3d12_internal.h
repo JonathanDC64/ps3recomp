@@ -54,6 +54,7 @@
 #define GPU_D3D12_MAX_IMAGES     8u      /* a swap chain's buffers */
 #define GPU_D3D12_CPU_HEAP_SIZE  1024u   /* RTVs or DSVs in each of the backend's CPU heaps */
 #define GPU_D3D12_CPU_HEAPS      64u
+#define GPU_D3D12_LIB_STRIPES    32u     /* the pipeline library's name locks (lib_name_lock) */
 
 /* FNV-1a 64, as today's renderer names its pipelines (fnv_bytes). */
 #define GPU_D3D12_FNV_BASIS 14695981039346656037ull
@@ -213,8 +214,11 @@ typedef struct gpu_d3d12_device {
 
     /* Pipelines: kept until the device goes (but GPU_PIPELINE_STORE_ONLY
      * ones, released once stored); the library is today's
-     * ID3D12PipelineLibrary, under its own lock. */
+     * ID3D12PipelineLibrary, under its own lock: shared for a load (with the
+     * name's stripe, exclusive), exclusive for a store and a new library
+     * (gpu_d3d12_pipe.c, lib_stripe). */
     SRWLOCK                lib_lock;
+    SRWLOCK                lib_name_lock[GPU_D3D12_LIB_STRIPES];
     ID3D12PipelineLibrary* lib;
     plat_file_map          lib_blob;         /* its file, mapped: the library reads from it while it lives */
     SRWLOCK                pso_lock;
