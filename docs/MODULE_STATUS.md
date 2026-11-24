@@ -37,7 +37,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL2 backends, analog sticks, triggers, pressure buttons, rumble |
+| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL3 backends, analog sticks, triggers, pressure buttons, rumble |
 | cellKb | Keyboard | **Complete** | Key event injection, raw/ASCII modes, modifier/LED tracking |
 | cellMouse | Mouse | **Complete** | Delta accumulation, buttons, wheel, buffered ring-buffer mode |
 
@@ -54,7 +54,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellAudio | Audio Output | **Complete** | WASAPI (Win) / SDL2 backends, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
+| cellAudio | Audio Output | **Complete** | WASAPI (Win) / SDL3 backends, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
 | cellVoice | Voice Chat | **Complete** | Port management, connect/disconnect, start/stop, read/write (no actual voice data) |
 | cellMic | Microphone | **Complete** | Init/end, all queries report no microphone attached |
 

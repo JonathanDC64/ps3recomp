@@ -502,7 +502,7 @@ cellAudio provides real audio output. Most games just need:
 
 ### Input
 
-cellPad provides real gamepad input via XInput (Windows) or SDL2.
+cellPad provides real gamepad input via XInput or SDL3 (Windows) or SDL3.
 
 **Button mapping (XInput → PS3):**
 | XInput | PS3 |

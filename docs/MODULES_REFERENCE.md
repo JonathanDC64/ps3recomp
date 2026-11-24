@@ -219,7 +219,7 @@ All filesystem operations translate PS3 paths (e.g., `/dev_hdd0/game/NPUA80001/`
 
 **Backends:**
 - **Windows**: XInput (Xbox controller API — maps naturally to DS3)
-- **Cross-platform**: SDL2 GameController API
+- **Cross-platform**: SDL3 gamepad API
 
 **Features:**
 - Up to 7 controller ports (PS3 maximum)
@@ -301,7 +301,7 @@ struct CellPadData {
 
 **Backends:**
 - **Windows**: WASAPI (Windows Audio Session API) — low-latency exclusive mode
-- **Cross-platform**: SDL2 Audio
+- **Cross-platform**: SDL3 audio streams
 
 **Implementation:**
 - Background mixing thread runs at **5.33 ms intervals** (256 samples at 48 kHz)
