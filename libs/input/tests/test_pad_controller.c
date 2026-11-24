@@ -41,6 +41,26 @@ int main(void) {
     assert(pad_controller_find(devs, 4, RUMBLE_NONE) == -1);   /* auto never moves a pad */
     puts("PASS: the chosen pad's port is found, or none");
 
+    /* PAD_FOLLOW: a Switch Pro pad (SDL) on port 0 and a DualSense (HID) on port 1, as SDL and HID found them. */
+    {
+        const long two[4] = {PAD_DEV(RUMBLE_SDL, 0), RUMBLE_HID | 0, RUMBLE_NONE, RUMBLE_NONE};
+        long follow = RUMBLE_NONE;
+        const int none[4] = {0, 0, 0, 0}, pro[4] = {1, 0, 0, 0}, ds[4] = {0, 1, 0, 0}, both[4] = {1, 1, 0, 0};
+        const int empty[4] = {0, 0, 1, 0};   /* (an empty port's "use" counts for nothing) */
+        assert(pad_controller_follow(two, none, 4, &follow) == -1 && follow == RUMBLE_NONE);   /* as found */
+        assert(pad_controller_follow(two, empty, 4, &follow) == -1 && follow == RUMBLE_NONE);
+        assert(pad_controller_follow(two, ds, 4, &follow) == 1 && follow == two[1]);   /* the DualSense plays */
+        assert(pad_controller_follow(two, none, 4, &follow) == 1);                     /* and goes on playing */
+        assert(pad_controller_follow(two, both, 4, &follow) == 1);   /* both held: the one that plays keeps it */
+        assert(pad_controller_follow(two, pro, 4, &follow) == 0 && follow == two[0]);   /* the Pro pad again */
+        assert(pad_controller_follow(two, both, 4, &follow) == 0);
+        const long gone[4] = {PAD_DEV(RUMBLE_SDL, 0), RUMBLE_NONE, RUMBLE_NONE, RUMBLE_NONE};
+        follow = RUMBLE_HID | 0;
+        assert(pad_controller_follow(gone, none, 4, &follow) == -1);   /* it went away: as found */
+        assert(pad_controller_follow(gone, pro, 4, &follow) == 0 && follow == gone[0]);
+        puts("PASS: the pad last used plays, and a held one keeps it");
+    }
+
     char name[16];
     assert(pad_controller_name(devs[0], name, sizeof name) && !strcmp(name, "controller1"));
     assert(pad_controller_name(devs[1], name, sizeof name) && !strcmp(name, "playstation1"));
