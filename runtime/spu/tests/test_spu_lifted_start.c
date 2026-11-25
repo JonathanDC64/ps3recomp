@@ -1056,7 +1056,7 @@ void ppu_guard_page(uint32_t ea)                 { (void)ea; }
 void ppu_guest_caller(char* out, size_t n)       { if (out && n) out[0] = 0; }
 void ppu_guest_callstack(const char* tag)        { (void)tag; }
 void ppu_log_host_chain(const char* tag)         { (void)tag; }
-void ps3_host_raise_current(int level)          { (void)level; }
+int ps3_host_raise_current(int level)           { (void)level; return 1; }
 void ps3_hle_register_ctx(uint32_t nid, const char* name,
                           void (*fn)(ppu_context*))
 {
