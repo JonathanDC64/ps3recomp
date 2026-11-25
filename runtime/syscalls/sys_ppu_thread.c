@@ -98,8 +98,8 @@ static int ppu_host_raise_level(int32_t prio, const char* name)
  * RealtimeKit (SDL asks it over D-Bus; desktop Linux and SteamOS run it for
  * PipeWire and PulseAudio). Elsewhere the shim's mapping (macOS: QoS
  * user-interactive). Best effort: a refusal leaves the thread as it was, and
- * the first one is logged. */
-static void ppu_host_raise_self(int level)
+ * the first one is logged. 1 if the thread went up. */
+static int ppu_host_raise_self(int level)
 {
 #if defined(__linux__)
     if (!SDL_SetLinuxThreadPriority((Sint64)syscall(SYS_gettid), level > 1 ? -10 : -5)) {
@@ -109,22 +109,26 @@ static void ppu_host_raise_self(int level)
             fprintf(stderr, "[SYS] guest threads ahead of the rest stay at normal priority: %s\n",
                     SDL_GetError());
         }
+        return 0;
     }
+    return 1;
 #else
-    SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+    return SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL)
+               ? 1 : 0;
 #endif
 }
 #endif
 
 /* The calling host thread one or two steps up, as a raised guest thread goes:
  * for a runtime thread doing a guest's work, such as an SPU group's thread
- * (lv2_register.c). */
-void ps3_host_raise_current(int level)
+ * (lv2_register.c). 1 if it went up. */
+int ps3_host_raise_current(int level)
 {
 #ifdef _WIN32
-    SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
+    return SetThreadPriority(GetCurrentThread(), level > 1 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL)
+               ? 1 : 0;
 #else
-    ppu_host_raise_self(level);
+    return ppu_host_raise_self(level);
 #endif
 }
 
