@@ -128,6 +128,12 @@ jobs:
           clang -std=gnu17 -I include                 libs/system/tests/test_sys_lang.c                       -Wl,-dead_strip -o /tmp/test_sys_lang
           /tmp/test_sys_lang
 
+      # cellAudio's peak limiter on the finished mix (libs/audio/audio_limit.h), alone.
+      - name: Run the audio limiter test
+        run: |
+          clang -std=gnu17 -I include -o /tmp/test_audio_limit libs/audio/tests/test_audio_limit.c -lm
+          /tmp/test_audio_limit
+
       - name: Run self-contained SPU helper tests
         run: |
           clang -std=gnu17 -I include -I runtime/spu \

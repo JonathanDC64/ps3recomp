@@ -461,6 +461,14 @@ jobs:
             python "$t"
           done
 
+      # cellAudio's peak limiter on the finished mix (libs/audio/audio_limit.h), alone.
+      - name: Run the audio limiter test
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -I include -o /tmp/test_audio_limit libs/audio/tests/test_audio_limit.c -lm
+          /tmp/test_audio_limit
+
       - name: Run self-contained SPU helper tests
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         run: |

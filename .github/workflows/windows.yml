@@ -167,6 +167,15 @@ jobs:
         if: ${{ !cancelled() && steps.py.outcome == 'success' }}
         run: python tools/check_ppu_scaffold.py
 
+      # cellAudio's peak limiter on the finished mix (libs/audio/audio_limit.h), alone.
+      - name: Run the audio limiter test
+        if: ${{ !cancelled() }}
+        run: |
+          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_audio_limit.exe libs/audio/tests/test_audio_limit.c
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\test_audio_limit.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
       # Linux and macOS have run these since they were written; Windows never
       # did. That gap let a broken xswd case sit red on both POSIX runners
       # while Windows reported green, which is exactly the wrong way round for
