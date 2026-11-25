@@ -111,6 +111,7 @@ static int syn_stats_on(void)
 enum { RS_END, RS_ADV2, RS_ADV3, RS_ADVN, RS_REFILL, RS_ALIAS, RS_CAP, RS_N };
 static const char* const rs_why[RS_N] = { "end", "adv2", "adv3", "adv4+", "refill", "alias", "cap" };
 static unsigned long long s_calls[SYN_N], s_passes[SYN_N], s_rs_adv[2], s_rs_stop[RS_N];
+static unsigned long long s_gain_flat;   /* the gain passes past the ramp's end */
 
 static void syn_stats_tick(void)
 {
@@ -120,7 +121,7 @@ static void syn_stats_tick(void)
     for (int i = 0; i < SYN_N; i++) fprintf(stderr, " %s %llu/%llu", syn_name[i], s_calls[i], s_passes[i]);
     fprintf(stderr, " | resample passes adv0 %llu adv1 %llu, stops:", s_rs_adv[0], s_rs_adv[1]);
     for (int i = 0; i < RS_N; i++) fprintf(stderr, " %s %llu", rs_why[i], s_rs_stop[i]);
-    fprintf(stderr, "\n");
+    fprintf(stderr, " | gain passes past the ramp %llu\n", s_gain_flat);
 }
 
 /* The test of SPU_RGOTO, and the other states a block leaves to the lifted
@@ -173,6 +174,37 @@ static inline u128 syn_sel_gt(u128 a, u128 b)
 #endif
 }
 
+/* fm and fma on one lane, for a loop that keeps word 0 alone: spu_fm_ref's
+ * and spu_fma_ref's rule and arithmetic for a lane (the SIMD forms give the
+ * same bits, tests/test_spu_simd_paths.c). Four lanes in double cost about
+ * three times as much, for three lanes the loop never reads. */
+static inline float syn_f(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
+static inline uint32_t syn_w(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
+static inline float syn_fm1(float a, float b) { return (a == 0.0f || b == 0.0f) ? 0.0f : a * b; }
+static inline float syn_fma1(float a, float b, float c) { return (a == 0.0f || b == 0.0f) ? c : SPU__FMA(a, b, c); }
+
+/* cflts(a, 165): each lane times 2^8 in double, clamped to int32, truncated.
+ * spu_cflts does it a lane at a time; on x86 SSE2 does the four at once with
+ * the same result for every input: min(MAX, x) and max(MIN, x) keep a NaN
+ * (they return their second operand then), and a NaN converts to 0x80000000
+ * as the scalar cast does. (sse2neon's min and max may not keep it: there the
+ * scalar form.) */
+static inline u128 syn_cflts165(u128 a)
+{
+#if defined(SPU_FLOAT_SIMD) && !defined(PS3_SSE2NEON)
+    const __m128 A = spu__ps(a);
+    const __m128d k = _mm_set1_pd(256.0), hi = _mm_set1_pd(2147483647.0), lo = _mm_set1_pd(-2147483648.0);
+    const __m128d d0 = _mm_max_pd(lo, _mm_min_pd(hi, _mm_mul_pd(_mm_cvtps_pd(A), k)));
+    const __m128d d1 = _mm_max_pd(lo, _mm_min_pd(hi, _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(A, A)), k)));
+    const __m128i v = _mm_unpacklo_epi64(_mm_cvttpd_epi32(d0), _mm_cvttpd_epi32(d1));
+    u128 r;
+    memcpy(&r, &v, 16);
+    return r;
+#else
+    return spu_cflts(a, 165);
+#endif
+}
+
 /* ---- 0x0AC4-0x0AE0: the 112-byte clear --------------------------------
  *   lqx r15,r5,r4 ; cbx r16,r5,r4 ; shufb r14,r7,r15,r16 ; stqx r14,r5,r4
  *   ai r5,r5,1 ; ceqi r13,r5,112 ; brz r13,0xAC4
@@ -187,7 +219,11 @@ static uint32_t fill_run(spu_context* ctx)
     const uint32_t base = r[4]._u32[0];
     const uint8_t v = (uint8_t)r[7]._u32[0];
     uint8_t* const ls = ctx->ls;
-    for (uint32_t i = x; i < 111u; i++) ls[(base + i) & SPU_LS_MASK] = v;
+    const uint32_t off = (base + x) & SPU_LS_MASK;
+    if (off + fast <= SPU_LS_MASK + 1u)
+        memset(ls + off, v, fast);
+    else
+        for (uint32_t i = x; i < 111u; i++) ls[(base + i) & SPU_LS_MASK] = v;
     add_lanes(&r[5], fast);
     ctx->steps += fast;
     return fast;
@@ -199,7 +235,11 @@ static uint32_t fill_run(spu_context* ctx)
  *   fm r27,r29,r5 ; shufb r25,r27,r32,r28 ; stqd r25,0(r7) ; ai r7,r7,4
  *   brnz r8,0x2C20
  * r5 steps by r9 up to r13 (1.0 in the game), and each word at r7 is
- * multiplied by it. Writes r5, r7 and r8. */
+ * multiplied by it. Writes r5, r7 and r8.
+ * Once a pass leaves r5 as it found it (bit for bit), every later pass does
+ * too: the ramp is done (in the game r5 has reached 1.0), and the rest of the
+ * words only take the multiply by its word 0, with no pass waiting on the
+ * last. */
 static uint32_t gain_run(spu_context* ctx)
 {
     u128* r = ctx->gpr;
@@ -212,8 +252,26 @@ static uint32_t gain_run(spu_context* ctx)
     uint8_t* const ls = ctx->ls;
     for (uint32_t i = 0; i < fast; i++, p += 4u) {
         const u128 r30 = spu_fa(r9, r5);
-        r5 = syn_sel_gt(r30, r13);
-        ls_set_w(ls, p, spu_fm(q_w0(ls_w(ls, p)), r5)._u32[0]);
+        const u128 n5 = syn_sel_gt(r30, r13);
+        if (memcmp(&n5, &r5, sizeof r5) == 0) {
+            const float g = r5._f32[0];
+            const uint32_t cnt = fast - i, off = p & SPU_LS_MASK;
+            if (off + 4u * cnt <= SPU_LS_MASK + 1u) {
+                uint8_t* const q = ls + off;
+                for (uint32_t k = 0; k < cnt; k++) {
+                    uint32_t w;
+                    memcpy(&w, q + 4u * k, 4);
+                    w = SPU_BSWAP32(syn_w(syn_fm1(syn_f(SPU_BSWAP32(w)), g)));
+                    memcpy(q + 4u * k, &w, 4);
+                }
+            } else {
+                for (uint32_t k = 0; k < cnt; k++, p += 4u) ls_set_w(ls, p, syn_w(syn_fm1(syn_f(ls_w(ls, p)), g)));
+            }
+            if (syn_stats_on()) s_gain_flat += cnt;
+            break;
+        }
+        r5 = n5;
+        ls_set_w(ls, p, syn_w(syn_fm1(syn_f(ls_w(ls, p)), r5._f32[0])));
     }
     r[5] = r5;
     add_lanes(&r[7], fast * 4u);
@@ -283,77 +341,77 @@ static uint32_t resample_run(spu_context* ctx)
     const u128 r80q = r[80], r93 = r[93];
     const uint32_t s80 = r80q._u32[0], s90 = r[90]._u32[0], s85 = r[85]._u32[0];
     const uint32_t a90 = s80 + 0x90u, q90 = a90 & SPU_LS_MASK & ~0xFu;
-    const uint32_t aA0 = s80 + 0xA0u;
-    const u128 cw0 = spu_cwd(r[1], 0);
-    u128 r81 = r[81], r82 = r[82], r83 = r[83], r86 = r[86], r87 = r[87];
-    u128 r88 = r[88], r89 = r[89], r91 = r[91], r92 = r[92];
+    const uint32_t aA0w = ((s80 + 0xA0u) & ~0xFu) + 12u;
+    /* r81 and r92 go up by 4 and 1 in every lane, so their word 0 alone here;
+     * the history r82, r83, r86, r87 enters the interpolation by word 0 but
+     * moves whole. */
+    uint32_t r81w = r[81]._u32[0], r92w = r[92]._u32[0];
+    u128 r82 = r[82], r83 = r[83], r86 = r[86], r87 = r[87];
+    u128 r88 = r[88], r89 = r[89], r91 = r[91];
     uint8_t* const ls = ctx->ls;
     uint32_t done = 0, steps = 0, adv1 = 0;
     int why = RS_CAP;
-    u128 r3, r65, r5;
+    /* Registers each pass writes and none reads before the next writes them
+     * again: the last pass's (r3 for r64, r65), the last step-1 pass's (r5 and
+     * r67, for r66-r72) and the last step-0 pass's (r3 for r75 and r43). Kept
+     * here and written once at the end. */
+    u128 r3 = r[3], r65 = r[65], r5 = r[5], r67 = r[67], r3z = r[3];
+    int any1 = 0, any0 = 0;
     for (; done < SYN_MAX_PASSES; done++) {
         /* What the pass will do, from the registers (and for a step of 1 the
          * input counter, which no store of the pass touches before its read
          * unless the output word is in its quadword). */
-        const u128 n92 = spu_ai(r92, 1);
-        if (n92._u32[0] == s85) { why = RS_END; break; }
+        if (r92w + 1u == s85) { why = RS_END; break; }
         const u128 n89 = spu_fa(r93, r89);
-        const u128 n65 = spu_cflts(n89, 165);
+        const u128 n65 = syn_cflts165(n89);
         const u128 n91 = spu_rotmai(n65, -8);
-        r3 = spu_sf(r91, n91);
-        const int32_t step = r3._s32[0];
+        const u128 t3 = spu_sf(r91, n91);
+        const int32_t step = t3._s32[0];
         if (step == 1) {
-            if ((r81._u32[0] & SPU_LS_MASK & ~0xFu) == q90) { why = RS_ALIAS; break; }
+            if ((r81w & SPU_LS_MASK & ~0xFu) == q90) { why = RS_ALIAS; break; }
             if ((int32_t)ls_w(ls, q90) > 27) { why = RS_REFILL; break; }
         } else if (step > 0) {
             why = step == 2 ? RS_ADV2 : step == 3 ? RS_ADV3 : RS_ADVN;
             break;
         }
-        /* 0x1090-0x1118 */
+        /* 0x1090-0x1118: only word 0 of the fm/fma chain is stored. */
         const uint32_t f = r88._u32[0];
         const uint32_t a8 = (f << 2) + s90, a17 = ((511u - f) << 2) + s90, a15 = ((255u - f) << 2) + s90;
-        ls_set_w(ls, (aA0 & ~0xFu) + 12u, r91._u32[0]);
-        u128 t = spu_fm(r86, q_w0(ls_w(ls, a8 + 0x400u)));
-        t = spu_fma(r87, q_w0(ls_w(ls, a8)), t);
-        t = spu_fma(r82, q_w0(ls_w(ls, a17)), t);
-        t = spu_fma(r83, q_w0(ls_w(ls, a15)), t);
-        ls_set_w(ls, r81._u32[0], t._u32[0]);
-        r92 = n92;
+        ls_set_w(ls, aA0w, r91._u32[0]);
+        float t = syn_fm1(r86._f32[0], syn_f(ls_w(ls, a8 + 0x400u)));
+        t = syn_fma1(r87._f32[0], syn_f(ls_w(ls, a8)), t);
+        t = syn_fma1(r82._f32[0], syn_f(ls_w(ls, a17)), t);
+        t = syn_fma1(r83._f32[0], syn_f(ls_w(ls, a15)), t);
+        ls_set_w(ls, r81w, syn_w(t));
+        r92w++;
         r89 = n89;
-        r81 = spu_ai(r81, 4);
+        r81w += 4u;
         /* 0x1120 */
         r65 = n65;
         r91 = n91;
         r88 = spu_andi(n65, 255);
-        r[64] = spu_ceqi(r3, 1);
+        r3 = t3;
         if (step == 1) {
-            /* 0x1138-0x1174 */
+            /* 0x1138-0x1174: r68 = (counter << 2) + r80; the quadword at
+             * r68 + 0x10 rotated by r68 is the next input sample; the counter
+             * goes up one in its word (shufb with cwd(r1, 0), r1 aligned). */
             r5 = spu_ls_read128(ctx, a90);
-            r[66] = spu_cgti(r5, 27);
-            r[70] = spu_shli(r5, 2);
-            r[71] = cw0;
-            r[72] = spu_ai(r5, 1);
+            const uint32_t c = r5._u32[0], a68 = (c << 2) + s80;
             r87 = r86;
             r86 = r82;
             r82 = r83;
-            r[68] = spu_a(r[70], r80q);
-            /* shufb with cwd(r1, 0), r1 aligned: r5 with word 0 from r72; and
-             * stored back where r5 came from, only that word changes. */
-            u128 r69 = r5;
-            r69._u32[0] = r[72]._u32[0];
-            r[69] = r69;
-            r[67] = spu_ls_read128(ctx, r[68]._u32[0] + 0x10u);
-            ls_set_w(ls, q90, r69._u32[0]);
-            r83 = spu_rotqby(r[67], r[68]);
+            r67 = spu_ls_read128(ctx, a68 + 0x10u);
+            ls_set_w(ls, q90, c + 1u);
+            r83 = spu_rotqby(r67, q_w0(a68));
+            any1 = 1;
             steps += 1;   /* the back edge to 0x1090 */
             adv1++;
         } else {
             /* 0x0FB0-0x0FC8 */
-            r[75] = spu_ceqi(r3, 2);
-            r[43] = spu_cgti(r3, 3);
+            r3z = t3;
+            any0 = 1;
             steps += 2;   /* to 0x0FB0, and back to 0x1090 */
         }
-        r[65] = r65;
     }
     if (syn_stats_on()) {
         s_rs_adv[0] += done - adv1;
@@ -361,8 +419,27 @@ static uint32_t resample_run(spu_context* ctx)
         s_rs_stop[why]++;
     }
     if (!done) return 0;
-    r[81] = r81; r[82] = r82; r[83] = r83; r[86] = r86; r[87] = r87;
-    r[88] = r88; r[89] = r89; r[91] = r91; r[92] = r92;
+    add_lanes(&r[81], 4u * done);
+    add_lanes(&r[92], done);
+    r[82] = r82; r[83] = r83; r[86] = r86; r[87] = r87;
+    r[88] = r88; r[89] = r89; r[91] = r91;
+    r[64] = spu_ceqi(r3, 1);
+    r[65] = r65;
+    if (any1) {
+        r[66] = spu_cgti(r5, 27);
+        r[70] = spu_shli(r5, 2);
+        r[71] = spu_cwd(r[1], 0);
+        r[72] = spu_ai(r5, 1);
+        r[68] = spu_a(r[70], r80q);
+        u128 r69 = r5;
+        r69._u32[0] = r[72]._u32[0];
+        r[69] = r69;
+        r[67] = r67;
+    }
+    if (any0) {
+        r[75] = spu_ceqi(r3z, 2);
+        r[43] = spu_cgti(r3z, 3);
+    }
     ctx->steps += steps;
     return done;
 }

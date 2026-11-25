@@ -280,21 +280,26 @@ static void test_gain(void)
     static spu_context a;
     int bad = 0;
     unsigned long long total = 0;
-    for (int t = 0; t < 400; t++) {
+    /* 400-519: the ramp already done (r5 at r13, a step up), so every pass is
+     * past its end; from 460 the buffer also runs past the end of the LS. */
+    for (int t = 0; t < 520; t++) {
         fresh(&a);
         a.gpr[8] = splat(t < 20 ? (uint32_t)t : 1 + rnd() % 300);
         a.gpr[7] = splat(((rnd() % (SPU_LS_SIZE - 0x2000)) & ~3u) | (t % 50 == 0 ? 1u : 0u));
+        if (t >= 460) a.gpr[7] = splat(SPU_LS_SIZE - 4u * (1u + rnd() % 200));
         a.gpr[13] = splat_f(1.0f);
         for (int k = 0; k < 4; k++) {
-            a.gpr[5]._u32[k] = f_bits(rnd_f(0.0f, 1.2f));
-            a.gpr[9]._u32[k] = t % 7 == 0 ? rnd_sample() : f_bits(rnd_f(-0.01f, 0.02f));
+            a.gpr[5]._u32[k] = f_bits(t >= 400 ? 1.0f : rnd_f(0.0f, 1.2f));
+            a.gpr[9]._u32[k] = t >= 400 ? f_bits(rnd_f(0.001f, 0.02f))
+                             : t % 7 == 0 ? rnd_sample() : f_bits(rnd_f(-0.01f, 0.02f));
         }
         for (uint32_t i = 0; i < 1300; i++) ls_put_w(s_ls_a, a.gpr[7]._u32[0] + 4 * i, rnd_sample());
         uint32_t n;
         bad += run_one(&a, "gain", t, gain_run, gain_ref, &n);
         total += n;
     }
-    printf("gain: %llu native passes\n", total);
+    printf("gain: %llu native passes, %llu of them past the ramp's end\n", total, s_gain_flat);
+    if (!s_gain_flat) { bad++; fprintf(stderr, "  gain: no pass past the ramp's end\n"); }
     if (bad) { g_fail++; fprintf(stderr, "FAIL: gain: %d mismatches\n", bad); } else g_pass++;
 }
 
@@ -373,11 +378,38 @@ static void test_resample(void)
     if (bad) { g_fail++; fprintf(stderr, "FAIL: resample: %d mismatches\n", bad); } else g_pass++;
 }
 
+/* syn_cflts165 against spu_cflts(a, 165), which the lifted code calls: random
+ * bits (NaNs, infinities, denormals and all), then values at and around the
+ * int32 limits once scaled by 256. */
+static void test_cflts(void)
+{
+    static const uint32_t edge[] = { 0x7FC00000u, 0xFFC00000u, 0x7F800001u, 0x7F800000u, 0xFF800000u, 0x00000001u,
+                                     0x80000001u, 0x007FFFFFu, 0x00000000u, 0x80000000u, 0x4AFFFFFFu, 0x4B000000u,
+                                     0x4B000001u, 0xCB000000u, 0xCB000001u, 0xCAFFFFFFu, 0x3F000000u, 0xBF7FFFFFu };
+    int bad = 0;
+    for (int t = 0; t < 1000000 + (int)(sizeof edge / sizeof edge[0]); t++) {
+        u128 a = rnd_q();
+        if (t >= 1000000) a = splat(edge[t - 1000000]);
+        const u128 x = syn_cflts165(a), y = spu_cflts(a, 165);
+        if (memcmp(&x, &y, 16) && bad++ < 3)
+            fprintf(stderr, "  cflts: %08X -> %08X, lifted %08X\n", a._u32[0], x._u32[0], y._u32[0]);
+    }
+    printf("cflts(165): 1M random quadwords and the edges\n");
+    if (bad) { g_fail++; fprintf(stderr, "FAIL: cflts: %d mismatches\n", bad); } else g_pass++;
+}
+
 int main(void)
 {
     s_ls_a = (uint8_t*)malloc(SPU_LS_SIZE);
     s_ls_b = (uint8_t*)malloc(SPU_LS_SIZE);
     if (!s_ls_a || !s_ls_b) return 1;
+    /* The blocks' counters (s_gain_flat) count with the stats on. */
+#ifdef _WIN32
+    _putenv_s("SPU_NATIVE_SYNTH_STATS", "1");
+#else
+    setenv("SPU_NATIVE_SYNTH_STATS", "1", 1);
+#endif
+    test_cflts();
     test_fill();
     test_gain();
     test_pan();
