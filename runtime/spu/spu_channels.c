@@ -1326,11 +1326,26 @@ static int channel_is_mfc(uint32_t ch)
  * gave it: the number to compare between builds. Ticks from spu_wrch_full,
  * the clock is read once per 1024 calls. */
 static SPU_THREAD_LOCAL unsigned long long t_nap_ticks;   /* QPC ticks in spu_llar_idle_wait */
+/* The calling thread's CPU time (user + kernel), in ns: what the image's host
+ * thread really costs, beside the steps it ran. */
+static unsigned long long spu_rate_thread_cpu_ns(void)
+{
+#ifdef _WIN32
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    return ((((unsigned long long)k.dwHighDateTime << 32) | k.dwLowDateTime) +
+            (((unsigned long long)u.dwHighDateTime << 32) | u.dwLowDateTime)) * 100ull;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+#endif
+}
 static void spu_rate_tick(spu_context* ctx)
 {
     const int s_img = spu_rate_img();
     if (s_img < 0 || ctx->image_id != s_img) return;
-    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0, pt0, lu0, ls0;
+    static SPU_THREAD_LOCAL unsigned long long wr, t0, st0, wr0, x0, ll0, nt0, pt0, lu0, ls0, cpu0;
     static SPU_THREAD_LOCAL long nap0;
     extern volatile long g_spu_llar_naps;
     if ((++wr & 1023u) != 0) return;
@@ -1341,7 +1356,7 @@ static void spu_rate_tick(spu_context* ctx)
 #endif
     if (!t0) { t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
                ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks;
-               pt0 = t_poll_ticks; lu0 = t_llu_n; ls0 = t_llu_same; return; }
+               pt0 = t_poll_ticks; lu0 = t_llu_n; ls0 = t_llu_same; cpu0 = spu_rate_thread_cpu_ns(); return; }
     if (now - t0 < 2ull * (unsigned long long)f.QuadPart) return;
     const double s = (double)(now - t0) / (double)f.QuadPart;
     const double nap_s = (double)(t_nap_ticks - nt0) / (double)f.QuadPart;
@@ -1349,12 +1364,16 @@ static void spu_rate_tick(spu_context* ctx)
     double poll_s = (double)(t_poll_ticks - pt0) / (double)f.QuadPart - nap_s;
     if (poll_s < 0) poll_s = 0;
     const double steps = (double)(uint32_t)(ctx->steps - (uint32_t)st0);
+    const unsigned long long cpu = spu_rate_thread_cpu_ns();
+    const double cpu_s = (double)(cpu - cpu0) / 1e9;
     fprintf(stderr, "[spu-rate] img=%d per s: steps=%.0f wrch_full=%.0f dma=%.0f getllar=%.0f"
-                    " naps=%.0f napping=%.0f%% polling=%.0f%% putllc=%.0f (same %.0f) | %.0f steps per busy ms%c",
+                    " naps=%.0f napping=%.0f%% polling=%.0f%% putllc=%.0f (same %.0f) | %.0f steps per busy ms"
+                    " | thread cpu %.1f%%, %.2f ns per step%c",
             s_img, steps / s, (wr - wr0) / s, (t_spu_xfers - x0) / s,
             (ctx->dbg_getllar - ll0) / s, (g_spu_llar_naps - nap0) / s, 100.0 * nap_s / s,
             100.0 * poll_s / s, (t_llu_n - lu0) / s, (t_llu_same - ls0) / s,
-            s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0, 10);
+            s > nap_s ? steps / ((s - nap_s) * 1000.0) : 0.0,
+            100.0 * cpu_s / s, steps > 0 ? cpu_s * 1e9 / steps : 0.0, 10);
 #ifdef SPU_HAVE_MXCSR
     /* The thread's float mode and sticky flags since the last line: a
      * denormal operand (DE) or an underflow (UE) in its code. With SPU_FTZ=0
@@ -1365,7 +1384,7 @@ static void spu_rate_tick(spu_context* ctx)
 #endif
     t0 = now; st0 = ctx->steps; wr0 = wr; x0 = t_spu_xfers;
     ll0 = ctx->dbg_getllar; nap0 = g_spu_llar_naps; nt0 = t_nap_ticks; pt0 = t_poll_ticks;
-    lu0 = t_llu_n; ls0 = t_llu_same;
+    lu0 = t_llu_n; ls0 = t_llu_same; cpu0 = cpu;
 }
 
 #if defined(_MSC_VER)
@@ -1908,6 +1927,54 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 static SPU_NOINLINE u128 spu_rdch_full(spu_context* ctx, uint32_t channel);
 
+/* SPU_SLOW_CPU=<image>:<factor> (live), a test knob: that image's code as on
+ * a CPU <factor> times slower. Before each channel read that takes the full
+ * path (the mailbox, signal and event reads a program waits on between its
+ * rounds of work), its thread spins for (factor - 1) times the CPU time it
+ * used since the previous such read returned. The spin follows the thread's
+ * own CPU clock, so time it waits or is preempted doesn't count, and a faster
+ * build of the code gets a proportionally shorter spin. For checking on a
+ * fast PC how much headroom a program has before it falls behind (Demon's
+ * Souls' synth: its sound repeats when it does). -1 if unset. */
+static int spu_slow_cpu_img(double* factor)
+{
+    const char* e = getenv("SPU_SLOW_CPU");
+    if (!e) return -1;
+    char* end;
+    const long img = strtol(e, &end, 0);
+    if (end == e || *end != ':') return -1;
+    const double f = strtod(end + 1, NULL);
+    if (!(f > 1.0) || f > 100.0) return -1;
+    *factor = f;
+    return (int)img;
+}
+
+static unsigned long long spu_slow_thread_clock(void)   /* the calling thread's CPU time, in its own units */
+{
+#ifdef _WIN32
+    ULONG64 c = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &c);
+    return (unsigned long long)c;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+#endif
+}
+
+static SPU_NOINLINE u128 spu_rdch_slow_cpu(spu_context* ctx, uint32_t channel, double factor)
+{
+    static SPU_THREAD_LOCAL unsigned long long base;
+    const unsigned long long now = spu_slow_thread_clock();
+    if (base && now > base) {
+        const unsigned long long until = now + (unsigned long long)((double)(now - base) * (factor - 1.0));
+        while (spu_slow_thread_clock() < until) YieldProcessor();
+    }
+    const u128 v = spu_rdch_full(ctx, channel);
+    base = spu_slow_thread_clock();
+    return v;
+}
+
 /* The MFC status reads that follow each DMA and atomic (see spu_wrch). */
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
@@ -1919,6 +1986,11 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         default: break;
         }
     }
+    static int s_slow_img = -1;
+    static double s_slow_f = 1.0;
+    PS3_KNOB(s_slow_img, spu_slow_cpu_img(&s_slow_f));
+    if (__builtin_expect(s_slow_img >= 0, 0) && ctx->image_id == s_slow_img)
+        return spu_rdch_slow_cpu(ctx, channel, s_slow_f);
     return spu_rdch_full(ctx, channel);
 }
 
