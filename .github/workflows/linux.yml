@@ -474,6 +474,11 @@ jobs:
             -std=gnu17 -msse4.1 -I include -I runtime/spu \
             -o /tmp/test_spu_simd_paths runtime/spu/tests/test_spu_simd_paths.c -lm
           /tmp/test_spu_simd_paths
+          # The synth's native blocks against the lifted statements.
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+            -std=gnu17 -msse4.1 -I include -I runtime/spu \
+            -o /tmp/test_spu_synth_hook runtime/spu/tests/test_spu_synth_hook.c -lm
+          /tmp/test_spu_synth_hook
 
       # libs/system/tests: the dialog callbacks and the savedata suites. They leave runtime symbols they never call
       # undefined, so each function and object gets its own section and the linker drops the ones nothing reaches
