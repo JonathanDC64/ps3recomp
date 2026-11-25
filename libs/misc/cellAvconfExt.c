@@ -187,10 +187,18 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
 
 /* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
  * audio output mode. We accept any config and report success (request id 0);
- * the title queries availability separately. NID 0x4692AB35. */
+ * the title queries availability separately. NID 0x4692AB35. The log line
+ * has what the title asked for: CellAudioOutConfiguration { u8 channel;
+ * u8 encoder; u8 reserved[10]; u32 downMixer; } at a guest address (the host
+ * plays stereo whatever it asks; cellAudio.c's mix). */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    (void)option; (void)waitForEvent;
+    const uint32_t ea = (uint32_t)(uintptr_t)config;
+    if (ea)
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, channel=%u, encoder=%u, downMixer=%u) -> ok\n",
+               audioOut, (unsigned)vm_read8(ea + 0), (unsigned)vm_read8(ea + 1), (unsigned)vm_read32(ea + 12));
+    else
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
     return 0;
 }

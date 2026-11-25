@@ -15,6 +15,7 @@
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "ps3emu/ps3_knob.h"
 #include "cellAudio.h"
+#include "audio_limit.h"      /* the peak limiter on the finished mix */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
 #include "../../runtime/ppu/ppu_context.h"  /* cellAudioSetPortLevel's context handler */
 #include "../../include/ps3emu/nid.h"       /* ps3_compute_nid */
@@ -715,10 +716,24 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+/* The finished stereo mix into [-1, 1]: a peak limiter with 1 ms of
+ * look-ahead (audio_limit.h). AUDIO_LIMITER=0 (live): the hard clip at +-1
+ * instead, with no delay. */
+static void audio_limit(float* mix)
+{
+    static int on = 1;
+    PS3_KNOB(on, ps3_env_int("AUDIO_LIMITER", 1));
+    audio_limit_block(mix, CELL_AUDIO_BLOCK_SAMPLES, on);
+}
+_Static_assert(CELL_AUDIO_BLOCK_SAMPLES <= AUDIO_LIMIT_MAX_FRAMES, "a block fits the limiter");
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+    static int s_dmx = 1;
+    PS3_KNOB(s_dmx, ps3_env_int("AUDIO_DOWNMIX", 1));
+    const int dm_type_a = s_dmx != 0;
 
     mutex_lock(&s_audio_mutex);
 
@@ -854,8 +869,19 @@ static void audio_mix_one_block(void)
                 left = right = ld_be_f32(&src[s]) * level;
             }
 
-            /* If 7.1, mix center and other channels into stereo */
-            if (nch == 8) {
+            /* If 7.1, mix center and other channels into stereo. The host
+             * plays stereo, so as a PS3 does for a stereo output: the system's
+             * TYPE_A downmix, as RPCS3 has it (cellAudio.cpp's mix): the fronts
+             * at -3 dB, the centre and both surround pairs at half, no LFE. At
+             * most 2.2x full scale a side, against 3x with the mix below, the
+             * one before it. (A title asking for 5.1 or 7.1 still gets this:
+             * there are no more speakers. AUDIO_DOWNMIX=0, live: the mix
+             * below.) */
+            if (nch == 8 && dm_type_a) {
+                const float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.5f;
+                left  = left  * 0.707f + center + (ld_be_f32(&src[s * 8 + 4]) + ld_be_f32(&src[s * 8 + 6])) * level * 0.5f;
+                right = right * 0.707f + center + (ld_be_f32(&src[s * 8 + 5]) + ld_be_f32(&src[s * 8 + 7])) * level * 0.5f;
+            } else if (nch == 8) {
                 float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
                 float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
                 float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
@@ -891,11 +917,7 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
-    /* Clip to [-1.0, 1.0] */
-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
-    }
+    audio_limit(s_mix_buffer);
 }
 
 /* ---------------------------------------------------------------------------
