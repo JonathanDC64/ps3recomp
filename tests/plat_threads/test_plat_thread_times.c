@@ -5,10 +5,13 @@
  * On Linux: plat_threads_list has the calling thread and one it started;
  * plat_thread_times counts about 60 ms on a CPU for a thread that spun that
  * long and almost none for one that slept, never goes backwards, and gives 0
- * for a thread that has ended; plat_thread_name reads back the name a thread
- * set. Built twice: as the runtime has it (schedstat, so both times: 2, or 1
- * on a kernel without schedstat) and with PLAT_THREAD_TIMES_NO_SCHEDSTAT (the
- * stat file alone: 1, a wait of 0). Off Linux all three give 0.
+ * for a thread that has ended; plat_thread_runs counts the times two threads
+ * sharing one CPU were put on it; plat_thread_name reads back the name a
+ * thread set; plat_system_cpu counts the machine's CPUs and its busy time
+ * going up while this thread spins. Built twice: as the runtime has it
+ * (schedstat, so both times: 2, or 1 on a kernel without schedstat) and with
+ * PLAT_THREAD_TIMES_NO_SCHEDSTAT (the stat file alone: 1, a wait of 0, no
+ * runs). Off Linux all of them give 0.
  *
  * Exit code 0 if every check passed; each failure prints a line.
  */
@@ -114,14 +117,24 @@ int main(void)
 
     /* The times: about 60 ms spun here, next to nothing for the sleeper. */
     uint64_t r0 = 0, w0 = 0, r1 = 0, w1 = 0, o0 = 0, ow0 = 0, o1 = 0, ow1 = 0;
+    uint64_t sb0 = 0, st0 = 0, sb1 = 0, st1 = 0;
     const int k = plat_thread_times(me, &r0, &w0);
     CHECK(KIND_OK(k));
     CHECK(plat_thread_times(other, &o0, &ow0) == k);
+    const int cpus = plat_system_cpu(&sb0, &st0);
     const double start = thread_cpu_ms();
     volatile unsigned long x = 0;
     while (thread_cpu_ms() - start < 60.0) x++;
     CHECK(plat_thread_times(me, &r1, &w1) == k);
     CHECK(plat_thread_times(other, &o1, &ow1) == k);
+    /* The machine: as many CPUs as the system has online, and the 60 ms spun
+     * here in its busy time (counted to the clock tick, 10 ms). */
+    CHECK(cpus >= 1 && cpus == (int)sysconf(_SC_NPROCESSORS_ONLN));
+    CHECK(plat_system_cpu(&sb1, &st1) == cpus);
+    CHECK(sb0 <= st0 && sb1 <= st1 && sb1 >= sb0 && st1 > st0);
+    CHECK(sb1 - sb0 >= 2);
+    printf("the machine: %d CPUs, %llu of %llu ticks busy while this thread spun 60 ms\n", cpus,
+           (unsigned long long)(sb1 - sb0), (unsigned long long)(st1 - st0));
     const double spun = (double)(r1 - r0) / 1e6, slept = (double)(o1 - o0) / 1e6;
     printf("kind %d: spun 60 ms of CPU -> %.1f ms counted; the sleeper %.1f ms; waits %llu ns / %llu ns\n",
            k, spun, slept, (unsigned long long)(w1 - w0), (unsigned long long)(ow1 - ow0));
@@ -142,20 +155,27 @@ int main(void)
         pthread_t ts;
         CHECK(pthread_create(&ts, NULL, spinner, NULL) == 0);
         while (!g_spinner_tid) sched_yield();
-        uint64_t a0 = 0, aw0 = 0, b0 = 0, bw0 = 0, a1 = 0, aw1 = 0, b1 = 0, bw1 = 0;
+        uint64_t a0 = 0, aw0 = 0, b0 = 0, bw0 = 0, a1 = 0, aw1 = 0, b1 = 0, bw1 = 0, n0 = 0, n1 = 0, m0 = 0, m1 = 0;
         CHECK(plat_thread_times(me, &a0, &aw0) == 2 && plat_thread_times(g_spinner_tid, &b0, &bw0) == 2);
+        const int runs_known = plat_thread_runs(me, &n0);
+        CHECK(plat_thread_runs(g_spinner_tid, &m0) == runs_known);
         const double t0 = wall_ms();
         volatile unsigned long y = 0;
         while (wall_ms() - t0 < 200.0) y++;
         CHECK(plat_thread_times(me, &a1, &aw1) == 2 && plat_thread_times(g_spinner_tid, &b1, &bw1) == 2);
+        CHECK(plat_thread_runs(me, &n1) == runs_known && plat_thread_runs(g_spinner_tid, &m1) == runs_known);
         g_spin_stop = 1;
         pthread_join(ts, NULL);
         sched_setaffinity(0, sizeof was, &was);
         const double ran = (double)((a1 - a0) + (b1 - b0)) / 1e6, waited = (double)((aw1 - aw0) + (bw1 - bw0)) / 1e6;
-        printf("two spinners on one CPU for 200 ms: %.1f ms on it, %.1f ms waiting for it\n", ran, waited);
+        printf("two spinners on one CPU for 200 ms: %.1f ms on it, %.1f ms waiting for it, %llu and %llu runs\n",
+               ran, waited, (unsigned long long)(n1 - n0), (unsigned long long)(m1 - m0));
         CHECK(ran <= 260.0);                /* one CPU between them */
         CHECK(ran + waited >= 300.0);       /* each was running or ready all along */
         CHECK(waited >= 60.0);
+        /* Taking turns, each was put on the CPU again and again. */
+        CHECK(runs_known == 1);
+        if (runs_known) CHECK(n1 >= n0 + 2 && m1 >= m0 + 2);
         (void)y;
     }
 
@@ -164,10 +184,11 @@ int main(void)
     pthread_t tq;
     CHECK(pthread_create(&tq, NULL, quick, (void*)&gone) == 0);
     CHECK(pthread_join(tq, NULL) == 0);
-    uint64_t gr = 1, gw = 1;
+    uint64_t gr = 1, gw = 1, gn = 1;
     CHECK(gone != 0);
     CHECK(plat_thread_times(gone, &gr, &gw) == 0);
     CHECK(gr == 0 && gw == 0);
+    CHECK(plat_thread_runs(gone, &gn) == 0 && gn == 0);
 
     /* The name: what the thread set, cut to the kernel's 15 characters. */
     char nm[32];
@@ -185,10 +206,12 @@ int main(void)
     (void)x;
 #else
     long tids[4];
-    uint64_t r = 1, w = 1;
+    uint64_t r = 1, w = 1, b = 1, t = 1;
     char nm[8] = "x";
     CHECK(plat_threads_list(tids, 4) == 0);
     CHECK(plat_thread_times(1, &r, &w) == 0 && r == 0 && w == 0);
+    CHECK(plat_thread_runs(1, &r) == 0 && r == 0);
+    CHECK(plat_system_cpu(&b, &t) == 0 && b == 0 && t == 0);
     CHECK(plat_thread_name(1, nm, sizeof nm) == 0 && nm[0] == 0);
 #endif
     if (g_fail) { fprintf(stderr, "%d check(s) failed\n", g_fail); return 1; }
