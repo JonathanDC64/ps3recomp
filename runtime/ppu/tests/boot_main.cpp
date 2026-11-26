@@ -2388,25 +2388,37 @@ static DWORD WINAPI hang_watchdog(LPVOID)
  * ready to run with no CPU free (the kernel's own counts, plat_thread_times),
  * the most of both first. A thread that answers late while it waited long for
  * a CPU was held up by the others; one that waited little, by what it waited
- * on. Each by the name the kernel has for it: a guest thread's host thread
- * carries the guest thread's name, an SPU group's its group's, cut to 15
- * characters (the main thread keeps the program's). macOS has no table yet. */
+ * on. runs/s is how often it was put on a CPU, and wait/run its wait each
+ * time: up to a few hundred microseconds is about what a CPU takes to wake;
+ * milliseconds, a CPU busy with other work. The line above the table has the
+ * whole machine (plat_system_cpu): CPUs busy beyond this process's are other
+ * programs'. Each thread by the name the kernel has for it: a guest thread's
+ * host thread carries the guest thread's name, an SPU group's its group's,
+ * cut to 15 characters (the main thread keeps the program's). macOS has no
+ * table yet. */
 static void dbg_cpu_posix(unsigned sec)
 {
     enum { MAXT = 512, ROWS = 32 };
     static long tid[MAXT];
-    static uint64_t run0[MAXT], wait0[MAXT], run1[MAXT], wait1[MAXT];
-    static int kind[MAXT], ord[MAXT];
+    static uint64_t run0[MAXT], wait0[MAXT], run1[MAXT], wait1[MAXT], runs0[MAXT], runs1[MAXT];
+    static int kind[MAXT], ord[MAXT], counted[MAXT];
     const int nt = plat_threads_list(tid, MAXT);
-    for (int i = 0; i < nt; i++) kind[i] = plat_thread_times(tid[i], &run0[i], &wait0[i]);
+    for (int i = 0; i < nt; i++) {
+        kind[i] = plat_thread_times(tid[i], &run0[i], &wait0[i]);
+        counted[i] = plat_thread_runs(tid[i], &runs0[i]);
+    }
+    uint64_t sb0 = 0, st0 = 0, sb1 = 0, st1 = 0;
+    const int cpus = plat_system_cpu(&sb0, &st0);
     const int64_t t0 = plat_clock_now();
     plat_sleep_us((uint64_t)sec * 1000000u);
     const double wall_ns = (double)(plat_clock_now() - t0) * 1e9 / (double)plat_clock_freq();
+    const int cpus1 = plat_system_cpu(&sb1, &st1);
     if (nt <= 0) { dbg_printf("  (not on this platform yet)%c", 10); return; }
     int n = 0, waits_known = 1;
     double busy = 0;
     for (int i = 0; i < nt; i++) {
         if (!kind[i] || plat_thread_times(tid[i], &run1[i], &wait1[i]) != kind[i]) continue;   /* gone */
+        if (counted[i] && !plat_thread_runs(tid[i], &runs1[i])) counted[i] = 0;
         if (kind[i] < 2) waits_known = 0;
         busy += (double)(run1[i] - run0[i]);
         ord[n++] = i;
@@ -2419,7 +2431,12 @@ static void dbg_cpu_posix(unsigned sec)
         }
     dbg_printf("  %d threads, %.2f cores busy over %.1f s (cpu%% and waited%% = of one core)%s%c", n,
                busy / wall_ns, wall_ns / 1e9, waits_known ? "" : "; this kernel does not count waits", 10);
-    dbg_printf("  %-7s %6s %8s  %s%c", "host", "cpu%", "waited%", "thread", 10);
+    if (cpus > 0 && cpus1 == cpus && st1 > st0 && sb1 >= sb0) {
+        const double all = (double)(sb1 - sb0) / (double)(st1 - st0) * cpus, ours = busy / wall_ns;
+        dbg_printf("  the whole machine: %.2f of its %d CPUs busy, so other programs about %.2f%c", all, cpus,
+                   all > ours ? all - ours : 0.0, 10);
+    }
+    dbg_printf("  %-7s %6s %8s %7s %9s  %s%c", "host", "cpu%", "waited%", "runs/s", "wait/run", "thread", 10);
     for (int r = 0; r < n && r < ROWS; r++) {
         const int i = ord[r];
         const double cpu = 100.0 * (double)(run1[i] - run0[i]) / wall_ns;
@@ -2428,10 +2445,21 @@ static void dbg_cpu_posix(unsigned sec)
         char nm[32], who[64];
         snprintf(who, sizeof who, "%s%s", plat_thread_name(tid[i], nm, sizeof nm) ? nm : "?",
                  tid[i] == (long)getpid() ? " (the main thread)" : "");
-        char wcol[16];
+        char wcol[16], rcol[16], pcol[16];
         if (kind[i] == 2) snprintf(wcol, sizeof wcol, "%.1f", waited);
         else snprintf(wcol, sizeof wcol, "-");
-        dbg_printf("  %-7ld %6.1f %8s  %s%c", tid[i], cpu, wcol, who, 10);
+        const uint64_t runs = counted[i] && runs1[i] >= runs0[i] ? runs1[i] - runs0[i] : 0;
+        if (runs) {
+            const double per_us = (double)(wait1[i] - wait0[i]) / (double)runs / 1e3;
+            snprintf(rcol, sizeof rcol, "%.0f", (double)runs * 1e9 / wall_ns);
+            if (kind[i] != 2) snprintf(pcol, sizeof pcol, "-");
+            else if (per_us < 1000.0) snprintf(pcol, sizeof pcol, "%.0f us", per_us);
+            else snprintf(pcol, sizeof pcol, "%.1f ms", per_us / 1e3);
+        } else {
+            snprintf(rcol, sizeof rcol, "-");
+            snprintf(pcol, sizeof pcol, "-");
+        }
+        dbg_printf("  %-7ld %6.1f %8s %7s %9s  %s%c", tid[i], cpu, wcol, rcol, pcol, who, 10);
     }
 }
 

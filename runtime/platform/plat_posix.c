@@ -416,6 +416,26 @@ int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns)
     return 1;
 }
 
+int plat_thread_runs(long tid, uint64_t* runs)
+{
+    *runs = 0;
+#ifndef PLAT_THREAD_TIMES_NO_SCHEDSTAT
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%ld/schedstat", tid);
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long run = 0, wait = 0, n = 0;
+    const int got = fscanf(f, "%llu %llu %llu", &run, &wait, &n);
+    fclose(f);
+    if (got != 3) return 0;
+    *runs = n;
+    return 1;
+#else
+    (void)tid;
+    return 0;
+#endif
+}
+
 int plat_thread_name(long tid, char* out, size_t cap)
 {
     if (!cap) return 0;
@@ -429,6 +449,34 @@ int plat_thread_name(long tid, char* out, size_t cap)
     if (!got) { out[0] = 0; return 0; }
     out[strcspn(out, "\n")] = 0;
     return out[0] != 0;
+}
+
+/* /proc/stat's first line is the machine's "cpu  user nice system idle iowait
+ * irq softirq steal guest guest_nice" (guest time is in user and nice
+ * already, so the first eight); a "cpuN" line follows for each CPU. */
+int plat_system_cpu(uint64_t* busy, uint64_t* total)
+{
+    *busy = 0;
+    *total = 0;
+    FILE* f = fopen("/proc/stat", "r");
+    if (!f) return 0;
+    char line[512];
+    int cpus = 0, ok = 0;
+    while (fgets(line, sizeof line, f) && strncmp(line, "cpu", 3) == 0) {
+        if (line[3] >= '0' && line[3] <= '9') { cpus++; continue; }
+        unsigned long long v[8] = { 0 };
+        const int n = sscanf(line + 3, "%llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3],
+                             &v[4], &v[5], &v[6], &v[7]);
+        if (n < 4) continue;
+        unsigned long long all = 0;
+        for (int i = 0; i < n; i++) all += v[i];
+        *total = all;
+        *busy = all - v[3] - (n > 4 ? v[4] : 0);   /* less idle and iowait */
+        ok = 1;
+    }
+    fclose(f);
+    if (!ok || !cpus) { *busy = 0; *total = 0; return 0; }
+    return cpus;
 }
 #endif
 

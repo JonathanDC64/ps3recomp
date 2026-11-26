@@ -402,19 +402,27 @@ static inline void plat_core_keep(void) {}
  * and its time ready to run but waiting for one, in nanoseconds since it
  * started: 2 when both are known (the kernel's schedstat), 1 when only the
  * time on a CPU is (its stat file, to the clock tick; *wait_ns is 0), 0 when
- * neither (the thread has ended). plat_thread_name gives the thread's name
- * (15 characters at most), 0 if it has none to read. Off Linux all three
- * give 0. */
+ * neither (the thread has ended). plat_thread_runs gives how many times the
+ * thread has been put on a CPU (schedstat's third count): 1 when known, else
+ * 0 with *runs 0. plat_thread_name gives the thread's name (15 characters at
+ * most), 0 if it has none to read. plat_system_cpu gives the whole machine's
+ * time busy and its time in all, summed over its CPUs, in clock ticks since
+ * the system started (/proc/stat), and how many CPUs it has; 0 when unknown.
+ * Off Linux all of them give 0. */
 #if defined(__linux__)
 int plat_threads_list(long* tids, int max);
 int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns);
+int plat_thread_runs(long tid, uint64_t* runs);
 int plat_thread_name(long tid, char* out, size_t cap);
+int plat_system_cpu(uint64_t* busy, uint64_t* total);
 #else
 static inline int plat_threads_list(long* tids, int max) { (void)tids; (void)max; return 0; }
 static inline int plat_thread_times(long tid, uint64_t* run_ns, uint64_t* wait_ns)
 { (void)tid; *run_ns = 0; *wait_ns = 0; return 0; }
+static inline int plat_thread_runs(long tid, uint64_t* runs) { (void)tid; *runs = 0; return 0; }
 static inline int plat_thread_name(long tid, char* out, size_t cap)
 { (void)tid; if (cap) out[0] = 0; return 0; }
+static inline int plat_system_cpu(uint64_t* busy, uint64_t* total) { *busy = 0; *total = 0; return 0; }
 #endif
 
 #ifdef __cplusplus
