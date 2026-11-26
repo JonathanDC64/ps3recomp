@@ -127,6 +127,13 @@ const char* rsx_out_renderer(void);
  * swap chain could not be made (swap chain)"). */
 const char* rsx_out_renderer_info(const char** why);
 
+/* For a crash handler, on the crashing thread: when that thread crashed
+ * inside the new path's D3D12 pipeline library, a note beside its file makes
+ * the next start begin a new library (gpu.h, gpu_d3d12_crash_note). 1 then,
+ * with a sentence for the report in line; 0 with line empty otherwise, on
+ * every other route and system. Picks no route; no lock, no heap. */
+int rsx_out_crash_note(char* line, size_t cap);
+
 /* A renderer of the new path, as a table of the functions above. The core
  * defines one per backend it is compiled for: rsxc_route_d3d12
  * (libs/video/rsxcore/rsxc_d3d12.c, Windows), rsxc_route_null (rsxc_null.c,

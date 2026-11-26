@@ -169,6 +169,19 @@ const char* rsx_out_renderer_info(const char** why)
     return route_name(r);
 }
 
+#if defined(_WIN32)
+int gpu_d3d12_crash_note(char* line, size_t cap);   /* (gpu/gpu.h) */
+#endif
+int rsx_out_crash_note(char* line, size_t cap)
+{
+#if defined(_WIN32)
+    return gpu_d3d12_crash_note(line, cap);   /* (only a thread inside its library notes one) */
+#else
+    if (line && cap) line[0] = 0;
+    return 0;
+#endif
+}
+
 /* The new path's table on d3d12, null and vulkan, NULL on legacy. One load
  * and up to three compares once the route is picked. */
 static const rsx_route* route_table(void)
