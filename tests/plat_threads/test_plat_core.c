@@ -1,7 +1,9 @@
 /* tests/plat_threads -- runtime/platform/plat.h's core kept for one thread
  * (RSX_CORE).
  *
- * Mode 0 changes nothing. On Linux, where the machine has a core to spare
+ * Mode 0 changes nothing, and so does mode 2 (auto) with fewer than 6 cores:
+ * checked held to 4 cores with SMT where the machine has them, and as it is
+ * when it has fewer than 6. On Linux, where the machine has a core to spare
  * (plat_core_reserve(1) gives a CPU): the calling thread runs on that CPU
  * alone; a thread started before runs off its core; a thread the reserved
  * thread starts after begins on its CPU and is off the core after
@@ -70,6 +72,28 @@ static void core_of(int cpu, cpu_set_t* core)
     fclose(f);
 }
 
+/* Up to `max` cores all of whose CPUs are in `allowed`, each once, into
+ * `out`; *smt is 1 if one of them has two CPUs or more. Gives how many. */
+static int cores_in(const cpu_set_t* allowed, int max, cpu_set_t* out, int* smt)
+{
+    cpu_set_t seen, sib, in;
+    CPU_ZERO(&seen);
+    CPU_ZERO(out);
+    *smt = 0;
+    int n = 0;
+    for (int c = 0; c < CPU_SETSIZE && n < max; c++) {
+        if (!CPU_ISSET(c, allowed) || CPU_ISSET(c, &seen)) continue;
+        core_of(c, &sib);
+        CPU_OR(&seen, &seen, &sib);
+        CPU_AND(&in, &sib, allowed);
+        if (!CPU_EQUAL(&in, &sib)) continue;
+        CPU_OR(out, out, &sib);
+        if (CPU_COUNT(&sib) > 1) *smt = 1;
+        n++;
+    }
+    return n;
+}
+
 /* 1 if the thread's CPUs are some, and none of them on the core. */
 static int off_core(long tid, const cpu_set_t* core)
 {
@@ -84,6 +108,18 @@ int main(void)
 {
     CHECK(plat_core_reserve(0) == -1);
 #if defined(__linux__)
+    {
+        cpu_set_t was, set;
+        int smt = 0;
+        CHECK(sched_getaffinity(0, sizeof was, &was) == 0);
+        if (cores_in(&was, 4, &set, &smt) == 4 && smt) {
+            CHECK(sched_setaffinity(0, sizeof set, &set) == 0);
+            CHECK(plat_core_reserve(2) == -1);
+            CHECK(sched_setaffinity(0, sizeof was, &was) == 0);
+            printf("plat_core: auto on 4 cores with SMT: left alone%c", 10);
+        }
+        if (cores_in(&was, CPU_SETSIZE, &set, &smt) < 6 || !smt) CHECK(plat_core_reserve(2) == -1);
+    }
     pthread_t before, after;
     volatile long before_tid, after_tid;
     CHECK(start(&before, &before_tid));

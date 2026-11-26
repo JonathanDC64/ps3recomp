@@ -378,8 +378,9 @@ void plat_file_unmap(plat_file_map* m);
  * beside it on that core, its second hardware thread (SMT) included. The core
  * is the fastest by the system's own figures, not the first one when others
  * tie (CPU 0 takes most interrupts). mode 1: whenever another core is left
- * for the rest; mode 2: only with SMT and at least 4 cores. Gives the CPU, or
- * -1 when it changed nothing (mode 0, no topology to read, or not Linux).
+ * for the rest; mode 2: only with SMT and at least 6 cores, so that 5 are
+ * left for the rest. Gives the CPU, or -1 when it changed nothing (mode 0, no
+ * topology to read, or not Linux).
  *
  * A new thread starts on its starter's CPUs, so one the reserved thread
  * starts would share its CPU. plat_core_keep moves such threads to the other
