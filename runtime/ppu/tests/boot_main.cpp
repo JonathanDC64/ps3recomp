@@ -746,9 +746,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     /* RSX_CORE: this thread, which runs the FIFO and draws, alone on one CPU
      * of a core, and the rest of the process off that core, its second
      * hardware thread included (plat_core_reserve). 1: on; auto: only with
-     * SMT and at least 4 cores; 0 or unset: where the system puts it. Linux
+     * SMT and at least 6 cores; 0 or unset: where the system puts it. Linux
      * only for now. On a Steam Deck this thread holds the frame, and it ran
-     * 4-8% faster so.
+     * 4-8% faster so (RSX_CORE=1 there: auto leaves 4 cores alone, as a
+     * 4-core laptop's sound fell behind with only 3 for the rest).
      * It starts at the guest's first flip, not here: until then this thread
      * starts the pipeline builders the title's startup work feeds, and a
      * thread starts on its starter's CPUs, so they would all have shared its
@@ -908,7 +909,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             core_on = cpu >= 0;
             core_mode = 0;
             if (core_on) fprintf(stderr, "[rsx] RSX_CORE=%s: this thread on CPU %d, the rest off its core%c", core_env, cpu, 10);
-            else fprintf(stderr, "[rsx] RSX_CORE=%s: not used here (Linux with SMT and 4 cores for auto)%c", core_env, 10);
+            else fprintf(stderr, "[rsx] RSX_CORE=%s: not used here (Linux with SMT and 6 cores for auto)%c", core_env, 10);
         }
     }
     return 0;

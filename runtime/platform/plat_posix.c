@@ -324,7 +324,11 @@ int plat_core_reserve(int mode)
             best_perf = perf;
         }
     }
-    if (best < 0 || (mode == 2 && (!smt || cores < 4))) return -1;
+    /* Mode 2 wants 6 cores. With 4, the reserved one is a quarter of the
+     * machine and the 3 left can be too few for the rest: on a 4-core laptop
+     * (Demon's Souls on Linux) every other thread, the sound's included,
+     * waited for a CPU while the reserved CPU was busy a third of the time. */
+    if (best < 0 || (mode == 2 && (!smt || cores < 6))) return -1;
     snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", best);
     if (!read_cpu_list(path, &s_core_cpus)) return -1;
     CPU_ZERO(&s_core_rest);
