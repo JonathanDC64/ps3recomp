@@ -896,6 +896,16 @@ gpu_device* gpu_d3d12_create(const gpu_device_desc* desc);
 gpu_device* gpu_vk_create(const gpu_device_desc* desc);
 gpu_device* gpu_null_create(const gpu_device_desc* desc);
 
+/* For a crash handler, on the crashing thread; in builds with the D3D12
+ * backend. When that thread was inside the D3D12 pipeline library (loading
+ * or storing a pipeline, reading the file or saving it: D3D12 throws at a
+ * damaged pipeline, and the throw ends the process), it writes a note beside
+ * the library's file, so the next pipeline_cache_load starts a new library
+ * and makes that pipeline without it from then on. 1 then, with a sentence
+ * for the report in line (cap bytes; line may be NULL); 0 with line empty on
+ * any other thread, or a second time. Only OS calls: no lock, no heap. */
+int gpu_d3d12_crash_note(char* line, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

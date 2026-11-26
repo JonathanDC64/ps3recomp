@@ -18,6 +18,7 @@
 
 #include "gpu_d3d12_internal.h"
 
+#include <io.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,24 +154,98 @@ void gpu_d3d12_pipe_release(gpu_d3d12_device* dd)
     plat_file_unmap(&dd->lib_blob);
 }
 
+/* A crash inside the library. D3D12 throws at a damaged pipeline in it (seen
+ * 2026-11-26: a C++ exception from LoadGraphicsPipeline, which ends the
+ * process, as D3D12's own code lets no exception out), and every start after
+ * it crashed the same way, since the start's warm-up loads that pipeline. So
+ * a thread marks what it does in the library around each call to it; a crash
+ * handler that finds a mark on its thread (gpu_d3d12_crash_note) writes the
+ * note <library file>.bad. The next pipeline_cache_load deletes the file,
+ * starts a new library, and adds the pipeline's name to <library file>.skip:
+ * those are never loaded from the library or stored in it again, so neither
+ * a damaged file nor a driver that crashes on one good pipeline ends a run
+ * twice. */
+enum { LIB_IN_NONE = 0, LIB_IN_LOAD, LIB_IN_STORE, LIB_IN_OPEN, LIB_IN_SAVE };
+static __declspec(thread) volatile uint32_t t_lib_in;     /* LIB_IN_* */
+static __declspec(thread) volatile uint64_t t_lib_name;   /* the pipeline's name, for a load or a store */
+static char          s_lib_path[MAX_PATH + 32];          /* the library's file (pipeline_cache_load), or "" */
+static volatile LONG s_lib_noted;                        /* a note written */
+static int           s_lib_crash_test;                   /* RSX_PSO_LIB_CRASH_TEST=1 */
+
+static void lib_in(uint32_t what, uint64_t name)
+{
+    t_lib_name = name;
+    t_lib_in = what;
+}
+
+static int lib_skipped(const gpu_d3d12_device* dd, uint64_t name)
+{
+    for (uint32_t i = 0; i < dd->nlib_skip; i++)
+        if (dd->lib_skip[i] == name) return 1;
+    return 0;
+}
+
+/* RSX_PSO_LIB_CRASH_TEST=1: the first pipeline loaded from the library ends
+ * the process inside the load, through abort, as the throw above did. For
+ * testing the note and the start after it (run that one without the knob). */
+static void lib_crash_test(uint64_t name)
+{
+    fprintf(stderr, "[D3D12] RSX_PSO_LIB_CRASH_TEST=1: ending the process inside the load of pipeline %016llx"
+            " (test)\n", (unsigned long long)name);
+    fflush(stderr);
+    abort();
+}
+
+int gpu_d3d12_crash_note(char* line, size_t cap)
+{
+    if (line && cap) line[0] = 0;
+    const uint32_t in = t_lib_in;
+    const unsigned long long name = t_lib_name;
+    if (in == LIB_IN_NONE || in > LIB_IN_SAVE || !s_lib_path[0] || InterlockedExchange(&s_lib_noted, 1)) return 0;
+    static const char* const k_in[] = { "", "load", "store", "open", "save" };
+    char p[sizeof s_lib_path + 8], text[48];
+    snprintf(p, sizeof p, "%s.bad", s_lib_path);
+    const int n = snprintf(text, sizeof text, "%s %016llx\n", k_in[in], name);
+    const HANDLE h = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD wrote = 0;
+    const int ok = h != INVALID_HANDLE_VALUE && n > 0 && WriteFile(h, text, (DWORD)n, &wrote, NULL) &&
+                   wrote == (DWORD)n && FlushFileBuffers(h);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    if (line && cap) {
+        const char* const next = ok ? "the next start makes a new library"
+                                    : "its note for the next start could not be written";
+        if (in == LIB_IN_LOAD || in == LIB_IN_STORE)
+            snprintf(line, cap, "D3D12 pipeline library: crashed %s pipeline %016llx; %s%s",
+                     in == LIB_IN_LOAD ? "loading" : "storing", name, next,
+                     ok ? ", and makes that pipeline without it" : "");
+        else
+            snprintf(line, cap, "D3D12 pipeline library: crashed %s its file; %s",
+                     in == LIB_IN_OPEN ? "reading" : "saving", next);
+    }
+    return 1;
+}
+
 /* Store a pipeline under its name, unless the library has that name. Storing
  * a name the library held (from the file, or stored by another thread in the
  * meantime) made the library's next Serialize read past a buffer in
  * D3D12Core (seen 2026-10-23), so the name is looked up first, under the
  * same lock. 1 if stored. Today's pso_lib_store. */
-static int lib_store(gpu_d3d12_device* dd, const WCHAR* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
-                     ID3D12PipelineState* pso)
+static int lib_store(gpu_d3d12_device* dd, const WCHAR* name, uint64_t nm,
+                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState* pso)
 {
     ID3D12PipelineState* had = NULL;
     int stored = 0;
     AcquireSRWLockExclusive(&dd->lib_lock);
-    if (!dd->lib) {
-        /* (the library went in the meantime) */
-    } else if (SUCCEEDED(dd->lib->lpVtbl->LoadGraphicsPipeline(dd->lib, name, pd,
-                             &IID_ID3D12PipelineState, (void**)&had))) {
-        had->lpVtbl->Release(had);
-    } else if (SUCCEEDED(dd->lib->lpVtbl->StorePipeline(dd->lib, name, pso))) {
-        stored = 1;
+    if (dd->lib) {   /* (else the library went in the meantime) */
+        lib_in(LIB_IN_LOAD, nm);
+        if (SUCCEEDED(dd->lib->lpVtbl->LoadGraphicsPipeline(dd->lib, name, pd,
+                          &IID_ID3D12PipelineState, (void**)&had))) {
+            had->lpVtbl->Release(had);
+        } else {
+            lib_in(LIB_IN_STORE, nm);
+            stored = SUCCEEDED(dd->lib->lpVtbl->StorePipeline(dd->lib, name, pso));
+        }
+        lib_in(LIB_IN_NONE, 0);
     }
     ReleaseSRWLockExclusive(&dd->lib_lock);
     return stored;
@@ -191,10 +266,10 @@ static SRWLOCK* lib_stripe(gpu_d3d12_device* dd, uint64_t name)
 
 /* Today's pso_create_cached: without a library, CreateGraphicsPipelineState;
  * with one, LoadGraphicsPipeline by name under the lock (lib_stripe), else
- * create and store. GPU_PIPELINE_STORE_ONLY is today's startup and index builds
- * (pso_prebuild_one, pxi_build_one): the pipeline loaded or stored is
- * released at once, as theirs are, so it is not kept beside the one a draw
- * later loads from the library. */
+ * create and store; a name in lib_skip as without one. GPU_PIPELINE_STORE_ONLY
+ * is today's startup and index builds (pso_prebuild_one, pxi_build_one): the
+ * pipeline loaded or stored is released at once, as theirs are, so it is not
+ * kept beside the one a draw later loads from the library. */
 gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* desc, uint32_t flags, uint32_t* how)
 {
     gpu_d3d12_device* const dd = GPU_D3D12_DEV(d);
@@ -209,12 +284,17 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
     const uint64_t nm = gpu_d3d12_pipe_name(dd, desc);
     swprintf(name, 20, L"%016llx", (unsigned long long)nm);
     SRWLOCK* const stripe = lib_stripe(dd, nm);
+    const int skip = dd->nlib_skip && lib_skipped(dd, nm);
     AcquireSRWLockShared(&dd->lib_lock);
     AcquireSRWLockExclusive(stripe);
-    const int have_lib = dd->lib != NULL;
-    HRESULT hr = have_lib ? dd->lib->lpVtbl->LoadGraphicsPipeline(dd->lib, name, &pd,
-                                &IID_ID3D12PipelineState, (void**)&pso)
-                          : E_FAIL;
+    const int have_lib = dd->lib != NULL && !skip;
+    HRESULT hr = E_FAIL;
+    if (have_lib) {
+        lib_in(LIB_IN_LOAD, nm);
+        hr = dd->lib->lpVtbl->LoadGraphicsPipeline(dd->lib, name, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+        if (s_lib_crash_test && SUCCEEDED(hr)) lib_crash_test(nm);
+        lib_in(LIB_IN_NONE, 0);
+    }
     ReleaseSRWLockExclusive(stripe);
     ReleaseSRWLockShared(&dd->lib_lock);
     if (SUCCEEDED(hr) && pso) {
@@ -224,7 +304,7 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
         hr = dd->device->lpVtbl->CreateGraphicsPipelineState(dd->device, &pd, &IID_ID3D12PipelineState,
                                                              (void**)&pso);
         if (FAILED(hr) || !pso) return r;
-        made = have_lib && lib_store(dd, name, &pd, pso) ? GPU_PIPELINE_STORED : GPU_PIPELINE_COMPILED;
+        made = have_lib && lib_store(dd, name, nm, &pd, pso) ? GPU_PIPELINE_STORED : GPU_PIPELINE_COMPILED;
     }
     if (how) *how = made;
     if (flags & GPU_PIPELINE_STORE_ONLY) {   /* (nothing has recorded it) */
@@ -240,7 +320,10 @@ gpu_pipeline gpu_d3d12_pipeline_create(gpu_device* d, const gpu_pipeline_desc* d
  * leaves a half-written file under the real name. Today's pso_write_file.
  * The rename also replaces the file the library is mapped from (plat.h: a
  * rename over a mapped file is allowed), and the library goes on reading
- * the old one's bytes. */
+ * the old one's bytes. The bytes are on the disk before the rename, and the
+ * rename before it returns: after a power cut or a hard reset the real name
+ * could otherwise hold a file of the right size whose pages were never
+ * written, and D3D12 throws at a damaged pipeline (lib_in). */
 static int write_file(const char* path, const void* p, size_t n)
 {
     char tmp[MAX_PATH + 64];
@@ -249,13 +332,76 @@ static int write_file(const char* path, const void* p, size_t n)
     FILE* f = fopen(tmp, "wb");
     if (!f) return 0;
     int ok = fwrite(p, 1, n, f) == n;
+    if (ok && (fflush(f) || _commit(_fileno(f)))) ok = 0;   /* (_commit: FlushFileBuffers) */
     if (fclose(f)) ok = 0;
-    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { DeleteFileA(tmp); return 0; }
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp);
+        return 0;
+    }
+    return 1;
+}
+
+/* pipeline_cache_load's half of the crash note (lib_in): the names made
+ * without the library (<path>.skip), and the note a crash left (<path>.bad),
+ * whose pipeline joins them; then the file and the note go, and the library
+ * is made new. 1 when there was a note. */
+static int lib_note_take(gpu_d3d12_device* dd, const char* path)
+{
+    dd->nlib_skip = 0;
+    s_lib_path[0] = 0;
+    InterlockedExchange(&s_lib_noted, 0);
+    if (!path || strlen(path) >= sizeof s_lib_path) return 0;
+    memcpy(s_lib_path, path, strlen(path) + 1);
+    char p[sizeof s_lib_path + 8];
+    snprintf(p, sizeof p, "%s.skip", path);
+    FILE* f = fopen(p, "rb");
+    if (f) {
+        unsigned long long v;
+        while (dd->nlib_skip < GPU_D3D12_LIB_SKIP_MAX && fscanf(f, "%llx", &v) == 1)
+            if (!lib_skipped(dd, v)) dd->lib_skip[dd->nlib_skip++] = v;
+        fclose(f);
+    }
+    snprintf(p, sizeof p, "%s.bad", path);
+    f = fopen(p, "rb");
+    if (!f) {
+        if (dd->nlib_skip)
+            printf("[D3D12] pipeline library: %u pipeline%s made without it (%s.skip)\n", dd->nlib_skip,
+                   dd->nlib_skip == 1 ? "" : "s", path);
+        return 0;
+    }
+    char what[8] = "";
+    unsigned long long name = 0;
+    const int got = fscanf(f, "%7s %llx", what, &name);
+    fclose(f);
+    const int named = got == 2 && (!strcmp(what, "load") || !strcmp(what, "store"));
+    int kept = named && lib_skipped(dd, name);
+    if (named && !kept && dd->nlib_skip < GPU_D3D12_LIB_SKIP_MAX) {
+        dd->lib_skip[dd->nlib_skip++] = name;
+        kept = 1;
+        char txt[GPU_D3D12_LIB_SKIP_MAX * 17 + 1];
+        size_t n = 0;
+        for (uint32_t i = 0; i < dd->nlib_skip; i++)
+            n += (size_t)snprintf(txt + n, sizeof txt - n, "%016llx\n", (unsigned long long)dd->lib_skip[i]);
+        char sp[sizeof p];
+        snprintf(sp, sizeof sp, "%s.skip", path);
+        if (!write_file(sp, txt, n)) printf("[D3D12] pipeline library: could not write %s\n", sp);
+    }
+    if (named)
+        printf("[D3D12] pipeline library: the last run crashed %s pipeline %016llx; a new library, %s (%u so)\n",
+               what[0] == 'l' ? "loading" : "storing", name,
+               kept ? "and that pipeline made without it from now on" : "the list of such is full", dd->nlib_skip);
+    else
+        printf("[D3D12] pipeline library: the last run crashed %s %s; a new library\n",
+               !strcmp(what, "open") ? "reading" : "saving", path);
+    fflush(stdout);
+    DeleteFileA(path);   /* (not loaded: the next save writes a new one) */
+    DeleteFileA(p);      /* (the note, once its name is kept) */
     return 1;
 }
 
 /* Today's pso_lib_open, its library half: the file's library, or, when the
- * file is another driver's or GPU's (or there is none), a new empty one.
+ * file is another driver's or GPU's (or there is none, or the last run
+ * crashed in the library: lib_note_take), a new empty one.
  * Called before pipelines are made (it replaces the library).
  * GPU_PIPELINE_CACHE_LOADED when the file's library is used, _NEW for an
  * empty one, _NONE when there can be none (no ID3D12Device1, the cap masked,
@@ -270,13 +416,18 @@ int gpu_d3d12_pipeline_cache_load(gpu_device* d, const char* path)
     if (!(d->caps.bits & GPU_CAP_PIPELINE_CACHE) ||
         FAILED(dd->device->lpVtbl->QueryInterface(dd->device, &IID_ID3D12Device1, (void**)&d1)))
         return GPU_PIPELINE_CACHE_NONE;
+    const char* const t = getenv("RSX_PSO_LIB_CRASH_TEST");
+    s_lib_crash_test = t && t[0] == '1';
+    const int noted = lib_note_take(dd, path);
     plat_file_map blob = { NULL, 0 };
-    if (path) plat_file_map_read(path, &blob);
+    if (path && !noted) plat_file_map_read(path, &blob);
     ID3D12PipelineLibrary* lib = NULL;
     HRESULT hr = E_FAIL;
     if (blob.p) {
+        lib_in(LIB_IN_OPEN, 0);
         hr = d1->lpVtbl->CreatePipelineLibrary(d1, blob.p, (SIZE_T)blob.n,
                  &IID_ID3D12PipelineLibrary, (void**)&lib);
+        lib_in(LIB_IN_NONE, 0);
         if (FAILED(hr)) {
             printf("[D3D12] pipeline library: '%s' is from another driver or GPU (0x%08lX); rebuilding it\n",
                    path, (unsigned long)hr);
@@ -309,9 +460,12 @@ int gpu_d3d12_pipeline_cache_save(gpu_device* d, const char* path)
     ID3D12PipelineLibrary* const lib = dd->lib;
     if (!lib || !path) return 0;
     for (int tries = 0; tries < 3; tries++) {
+        lib_in(LIB_IN_SAVE, 0);
         const SIZE_T n = lib->lpVtbl->GetSerializedSize(lib);
         void* buf = malloc(n ? n : 1);
-        if (buf && SUCCEEDED(lib->lpVtbl->Serialize(lib, buf, n))) {
+        const int got = buf && SUCCEEDED(lib->lpVtbl->Serialize(lib, buf, n));
+        lib_in(LIB_IN_NONE, 0);
+        if (got) {
             const int ok = write_file(path, buf, n);
             free(buf);
             return ok;

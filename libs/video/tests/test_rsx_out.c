@@ -185,6 +185,12 @@ static void test_hal_pso_index_game(const char* game)
     snprintf(g_hal.game, sizeof g_hal.game, "%s", game ? game : "");
 }
 const char* rsxc_d3d12_start_failed(void) { return g_hal_failed; }
+/* (the GPU layer's, which rsx_out_crash_note calls: no crash here) */
+int gpu_d3d12_crash_note(char* line, size_t cap)
+{
+    if (line && cap) line[0] = 0;
+    return 0;
+}
 #endif
 
 /* The Vulkan stand-in's start notes whether the start mark was there while

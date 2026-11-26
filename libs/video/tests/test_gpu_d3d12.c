@@ -17,7 +17,8 @@
  *   - root signatures and pipeline descriptions against today's, byte for
  *     byte (its recipes are copied here: rsx_d3d12_backend.c);
  *   - the pipeline cache across two devices, pipelines made only for it
- *     (GPU_PIPELINE_STORE_ONLY) and a device without one, a swap chain on a
+ *     (GPU_PIPELINE_STORE_ONLY) and a device without one, a crash inside it
+ *     (a child process) and the starts after it, a swap chain on a
  *     hidden window, and the conversion's bridges (gpu_d3d12_bridge.h);
  *   - DRED (GPU_DEVICE_BREADCRUMBS) and, on WARP, a device lost on purpose.
  */
@@ -30,6 +31,7 @@
 
 #include <limits.h>
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1336,6 +1338,151 @@ static void test_pipeline_cache(void)
     DeleteFileA(path);
 }
 
+/* ---- A crash inside the pipeline library: its note, and the starts after it ----
+ *
+ * A child process (this test, with --crash-in-library <file>) loads a
+ * pipeline from the library with RSX_PSO_LIB_CRASH_TEST=1, which ends it
+ * inside the load through abort, as D3D12's throw at a damaged pipeline
+ * does; its abort handler calls gpu_d3d12_crash_note, as the port's crash
+ * handler does. */
+static void crash_child_abort(int sig)
+{
+    (void)sig;
+    char line[256];
+    const int noted = gpu_d3d12_crash_note(line, sizeof line);
+    printf("  pipeline crash note: child: %s\n", noted ? line : "(none)");
+    fflush(stdout);
+    _exit(noted ? 3 : 4);
+}
+
+static int crash_child(const char* path)
+{
+    signal(SIGABRT, crash_child_abort);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _putenv("RSX_PSO_LIB_CRASH_TEST=1");
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags;
+    dd.cmd_slots = 1;
+    gpu_device* const d = gpu_d3d12_create(&dd);
+    if (!d) return 5;
+    if (gpu_pipeline_cache_load(d, path) != GPU_PIPELINE_CACHE_LOADED) return 6;
+    const gpu_layout l = guest_layout(d);
+    const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+    const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+    gpu_pipeline_desc pd;
+    draw_desc(&pd, l, vs, ps);
+    uint32_t how = 7;
+    gpu_pipeline_create(d, &pd, 0, &how);   /* (ends the process when it loads) */
+    return 2;
+}
+
+static int file_text(const char* path, char* out, size_t cap)
+{
+    out[0] = 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    const size_t n = fread(out, 1, cap - 1, f);
+    out[n] = 0;
+    fclose(f);
+    return 1;
+}
+
+static void test_pipeline_crash_note(void)
+{
+    char path[MAX_PATH], skip[MAX_PATH + 8], bad[MAX_PATH + 8], text[256], want[64];
+    const DWORD n = GetTempPathA(MAX_PATH - 48, path);
+    if (!n || n >= MAX_PATH - 48) { CHECK(!"no temporary directory"); return; }
+    snprintf(path + n, MAX_PATH - n, "ps3r_test_gpu_d3d12_note_%lu.lib", (unsigned long)GetCurrentProcessId());
+    snprintf(skip, sizeof skip, "%s.skip", path);
+    snprintf(bad, sizeof bad, "%s.bad", path);
+    DeleteFileA(path);
+    DeleteFileA(skip);
+    DeleteFileA(bad);
+    char line[64] = "x";
+    CHECK(gpu_d3d12_crash_note(line, sizeof line) == 0 && line[0] == 0);   /* (this thread is in no library call) */
+    gpu_device_desc dd;
+    memset(&dd, 0, sizeof dd);
+    dd.flags = g_flags;
+    dd.cmd_slots = 1;
+    uint64_t name = 0;
+    for (int run_no = 0; run_no < 4; run_no++) {
+        gpu_device* d = gpu_d3d12_create(&dd);
+        CHECK(d != NULL);
+        if (!d) break;
+        const int loaded = gpu_pipeline_cache_load(d, path);
+        if (loaded == GPU_PIPELINE_CACHE_NONE) {
+            printf("  pipeline crash note: skipped (no pipeline library on this device)\n");
+            gpu_destroy(d);
+            break;
+        }
+        const gpu_d3d12_device* const g = GPU_D3D12_DEV(d);
+        const gpu_layout l = guest_layout(d);
+        const gpu_shader vs = sh_make(d, GPU_SC_VS, GPU_STAGE_VS, k_vs, "test_vs");
+        const gpu_shader ps = sh_make(d, GPU_SC_PS, GPU_STAGE_PS, k_ps, "test_ps");
+        gpu_pipeline_desc pd, pd2;
+        draw_desc(&pd, l, vs, ps);
+        pd2 = pd;
+        pd2.front_ccw = 1;
+        name = gpu_d3d12_pipe_name(GPU_D3D12_DEV(d), &pd);
+        uint32_t how = 7, how2 = 7;
+        CHECK(gpu_pipeline_create(d, &pd, 0, &how).v != 0);
+        CHECK(gpu_pipeline_create(d, &pd2, 0, &how2).v != 0);
+        if (run_no == 0) {
+            CHECK(loaded == GPU_PIPELINE_CACHE_NEW && g->nlib_skip == 0);
+            CHECK(how == GPU_PIPELINE_STORED && how2 == GPU_PIPELINE_STORED);
+        } else if (run_no == 1) {
+            /* After the child's crash: a new library, its file and the note
+             * gone, and pd made without it (never stored), pd2 stored. */
+            CHECK(loaded == GPU_PIPELINE_CACHE_NEW && g->nlib_skip == 1 && g->lib_skip[0] == name);
+            CHECK(how == GPU_PIPELINE_COMPILED && how2 == GPU_PIPELINE_STORED);
+            CHECK(GetFileAttributesA(bad) == INVALID_FILE_ATTRIBUTES);
+        } else if (run_no == 2) {
+            /* The file's library again; pd still made without it. */
+            CHECK(loaded == GPU_PIPELINE_CACHE_LOADED && g->nlib_skip == 1);
+            CHECK(how == GPU_PIPELINE_COMPILED && how2 == GPU_PIPELINE_LOADED);
+        } else {
+            /* After a note of a crash in a save: a new library, no new name. */
+            CHECK(loaded == GPU_PIPELINE_CACHE_NEW && g->nlib_skip == 1);
+            CHECK(how == GPU_PIPELINE_COMPILED && how2 == GPU_PIPELINE_STORED);
+            CHECK(GetFileAttributesA(bad) == INVALID_FILE_ATTRIBUTES);
+        }
+        gpu_shader_destroy(d, vs);
+        gpu_shader_destroy(d, ps);
+        CHECK(gpu_pipeline_cache_save(d, path) == 1);
+        gpu_destroy(d);
+        if (run_no == 0) {
+            char exe[MAX_PATH], cmd[3 * MAX_PATH];
+            GetModuleFileNameA(NULL, exe, MAX_PATH);
+            snprintf(cmd, sizeof cmd, "\"%s\" --crash-in-library \"%s\"", exe, path);
+            STARTUPINFOA si;
+            memset(&si, 0, sizeof si);
+            si.cb = sizeof si;
+            PROCESS_INFORMATION pi;
+            DWORD code = 99;
+            fflush(stdout);
+            if (CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 120000);
+                GetExitCodeProcess(pi.hProcess, &code);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+            }
+            CHECK(code == 3);   /* (ended in the load, and the note written) */
+            snprintf(want, sizeof want, "load %016llx\n", (unsigned long long)name);
+            CHECK(file_text(bad, text, sizeof text) && !strcmp(text, want));
+        } else if (run_no == 2) {
+            FILE* f = fopen(bad, "wb");
+            if (f) { fputs("save 0000000000000000\n", f); fclose(f); }
+        }
+    }
+    snprintf(want, sizeof want, "%016llx\n", (unsigned long long)name);
+    if (GetFileAttributesA(skip) != INVALID_FILE_ATTRIBUTES)
+        CHECK(file_text(skip, text, sizeof text) && !strcmp(text, want));
+    DeleteFileA(path);
+    DeleteFileA(skip);
+    DeleteFileA(bad);
+}
+
 /* ---- A swap chain on a hidden window ---- */
 
 static void test_swapchain(void)
@@ -1772,12 +1919,14 @@ static void test_breadcrumbs(void)
     gpu_destroy(d);
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
     _putenv("PS3_SHADER_CACHE=0");   /* the compile service writes no cache */
     const char* hw = getenv("GPU_TEST_HW");
     const int on_hw = hw && hw[0] == '1';
     g_flags = on_hw ? 0u : GPU_DEVICE_WARP;
+    if (argc == 3 && !strcmp(argv[1], "--crash-in-library"))   /* (test_pipeline_crash_note's child) */
+        return crash_child(argv[2]);
     gpu_device_desc dd;
     memset(&dd, 0, sizeof dd);
     dd.flags = g_flags;
@@ -1816,6 +1965,7 @@ int main(void)
     CHECK(gpu_lost(g_d) == 0);
     gpu_destroy(g_d);
     test_pipeline_cache();
+    test_pipeline_crash_note();
     test_breadcrumbs();
 
     if (g_fail) {
