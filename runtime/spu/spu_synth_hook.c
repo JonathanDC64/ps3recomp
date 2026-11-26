@@ -205,6 +205,17 @@ static inline u128 syn_cflts165(u128 a)
 #endif
 }
 
+/* syn_cflts165's word 0 alone, by the same instructions on one lane. */
+static inline int32_t syn_cflts165_w0(u128 a)
+{
+#if defined(SPU_FLOAT_SIMD) && !defined(PS3_SSE2NEON)
+    const __m128d v = _mm_mul_sd(_mm_cvtss_sd(_mm_setzero_pd(), spu__ps(a)), _mm_set_sd(256.0));
+    return _mm_cvttsd_si32(_mm_max_sd(_mm_set_sd(-2147483648.0), _mm_min_sd(_mm_set_sd(2147483647.0), v)));
+#else
+    return spu_cflts(a, 165)._s32[0];
+#endif
+}
+
 /* ---- 0x0AC4-0x0AE0: the 112-byte clear --------------------------------
  *   lqx r15,r5,r4 ; cbx r16,r5,r4 ; shufb r14,r7,r15,r16 ; stqx r14,r5,r4
  *   ai r5,r5,1 ; ceqi r13,r5,112 ; brz r13,0xAC4
@@ -336,79 +347,95 @@ static uint32_t resample_run(spu_context* ctx)
 {
     u128* r = ctx->gpr;
     /* The stack pointer's quadword slots (cwd r1,0 and cwd r1,12) are words 0
-     * and 3, and the table's words are aligned, as the rotates read them. */
-    if ((r[1]._u32[0] & 0xFu) || (r[90]._u32[0] & 3u)) return 0;
-    const u128 r80q = r[80], r93 = r[93];
+     * and 3, the table's words are aligned, as the rotates read them, and so
+     * is r80, so an input sample is the word at its own address. */
+    if ((r[1]._u32[0] & 0xFu) || (r[90]._u32[0] & 3u) || (r[80]._u32[0] & 3u)) return 0;
+    const u128 r80q = r[80];
     const uint32_t s80 = r80q._u32[0], s90 = r[90]._u32[0], s85 = r[85]._u32[0];
     const uint32_t a90 = s80 + 0x90u, q90 = a90 & SPU_LS_MASK & ~0xFu;
     const uint32_t aA0w = ((s80 + 0xA0u) & ~0xFu) + 12u;
-    /* r81 and r92 go up by 4 and 1 in every lane, so their word 0 alone here;
-     * the history r82, r83, r86, r87 enters the interpolation by word 0 but
-     * moves whole. */
-    uint32_t r81w = r[81]._u32[0], r92w = r[92]._u32[0];
-    u128 r82 = r[82], r83 = r[83], r86 = r[86], r87 = r[87];
-    u128 r88 = r[88], r89 = r[89], r91 = r[91];
     uint8_t* const ls = ctx->ls;
+    /* In the loop, word 0 alone of what the loop reads, as lanes of their
+     * own: the phase moves all four lanes (one addps, its other lanes are
+     * registers the block leaves), the rest is word 0. The registers are
+     * made whole once at the end, from the last passes' phases and the
+     * last four input quadwords, exactly as the passes leave them. Kept
+     * whole, the history and the lanes did not fit the CPU's registers and
+     * went to the stack and back every pass. */
+    const u128 r91_in = r[91];
+    u128 r89 = r[89], r89_prev = r[89];
+    const u128 r93 = r[93];
+    uint32_t r81w = r[81]._u32[0], r92w = r[92]._u32[0];
+    uint32_t f88 = r[88]._u32[0];
+    int32_t p91 = (int32_t)r91_in._u32[0];
+    float h86 = r[86]._f32[0], h87 = r[87]._f32[0], h82 = r[82]._f32[0], h83 = r[83]._f32[0];
+    /* The input counter's quadword, as a step-1 pass reads it. Kept here: read
+     * back right after the 4-byte store of the counter, a 16-byte load waits
+     * for that store to reach the cache. Read again when an output store
+     * lands in it. */
+    u128 q90v = spu_ls_read128(ctx, a90);
+    /* The last four step-1 passes' input quadwords and their r68, newest at
+     * (m - 1) & 3, and the last such pass's r5. */
+    u128 qin[4];
+    uint32_t qa68[4] = { 0, 0, 0, 0 };
+    u128 r5 = r[5];
+    uint32_t m = 0;
+    /* The last step-0 pass's phases before and after it, and whether it was
+     * the first pass (its r91 before is then the register's). */
+    u128 z89_before = r89, z89_after = r89;
+    int z_first = 0;
     uint32_t done = 0, steps = 0, adv1 = 0;
-    int why = RS_CAP;
-    /* Registers each pass writes and none reads before the next writes them
-     * again: the last pass's (r3 for r64, r65), the last step-1 pass's (r5 and
-     * r67, for r66-r72) and the last step-0 pass's (r3 for r75 and r43). Kept
-     * here and written once at the end. */
-    u128 r3 = r[3], r65 = r[65], r5 = r[5], r67 = r[67], r3z = r[3];
-    int any1 = 0, any0 = 0;
+    int why = RS_CAP, any0 = 0;
     for (; done < SYN_MAX_PASSES; done++) {
-        /* What the pass will do, from the registers (and for a step of 1 the
-         * input counter, which no store of the pass touches before its read
-         * unless the output word is in its quadword). */
         if (r92w + 1u == s85) { why = RS_END; break; }
         const u128 n89 = spu_fa(r93, r89);
-        const u128 n65 = syn_cflts165(n89);
-        const u128 n91 = spu_rotmai(n65, -8);
-        const u128 t3 = spu_sf(r91, n91);
-        const int32_t step = t3._s32[0];
+        const int32_t n65w = syn_cflts165_w0(n89);
+        const int32_t n91w = n65w >> 8;
+        const int32_t step = (int32_t)((uint32_t)n91w - (uint32_t)p91);
         if (step == 1) {
             if ((r81w & SPU_LS_MASK & ~0xFu) == q90) { why = RS_ALIAS; break; }
-            if ((int32_t)ls_w(ls, q90) > 27) { why = RS_REFILL; break; }
+            if ((int32_t)q90v._u32[0] > 27) { why = RS_REFILL; break; }
         } else if (step > 0) {
             why = step == 2 ? RS_ADV2 : step == 3 ? RS_ADV3 : RS_ADVN;
             break;
         }
         /* 0x1090-0x1118: only word 0 of the fm/fma chain is stored. */
-        const uint32_t f = r88._u32[0];
-        const uint32_t a8 = (f << 2) + s90, a17 = ((511u - f) << 2) + s90, a15 = ((255u - f) << 2) + s90;
-        ls_set_w(ls, aA0w, r91._u32[0]);
-        float t = syn_fm1(r86._f32[0], syn_f(ls_w(ls, a8 + 0x400u)));
-        t = syn_fma1(r87._f32[0], syn_f(ls_w(ls, a8)), t);
-        t = syn_fma1(r82._f32[0], syn_f(ls_w(ls, a17)), t);
-        t = syn_fma1(r83._f32[0], syn_f(ls_w(ls, a15)), t);
+        const uint32_t a8 = (f88 << 2) + s90, a17 = ((511u - f88) << 2) + s90, a15 = ((255u - f88) << 2) + s90;
+        ls_set_w(ls, aA0w, (uint32_t)p91);
+        float t = syn_fm1(h86, syn_f(ls_w(ls, a8 + 0x400u)));
+        t = syn_fma1(h87, syn_f(ls_w(ls, a8)), t);
+        t = syn_fma1(h82, syn_f(ls_w(ls, a17)), t);
+        t = syn_fma1(h83, syn_f(ls_w(ls, a15)), t);
         ls_set_w(ls, r81w, syn_w(t));
+        if ((r81w & SPU_LS_MASK & ~0xFu) == q90) q90v = spu_ls_read128(ctx, a90);
         r92w++;
-        r89 = n89;
         r81w += 4u;
-        /* 0x1120 */
-        r65 = n65;
-        r91 = n91;
-        r88 = spu_andi(n65, 255);
-        r3 = t3;
+        r89_prev = r89;
+        r89 = n89;
+        p91 = n91w;
+        f88 = (uint32_t)n65w & 255u;
         if (step == 1) {
             /* 0x1138-0x1174: r68 = (counter << 2) + r80; the quadword at
-             * r68 + 0x10 rotated by r68 is the next input sample; the counter
-             * goes up one in its word (shufb with cwd(r1, 0), r1 aligned). */
-            r5 = spu_ls_read128(ctx, a90);
-            const uint32_t c = r5._u32[0], a68 = (c << 2) + s80;
-            r87 = r86;
-            r86 = r82;
-            r82 = r83;
-            r67 = spu_ls_read128(ctx, a68 + 0x10u);
+             * r68 + 0x10 rotated by r68 is the next input sample, its word 0
+             * the word at r68 + 0x10; the counter goes up one in its word. */
+            r5 = q90v;
+            const uint32_t c = q90v._u32[0], a68 = (c << 2) + s80;
+            qin[m & 3] = spu_ls_read128(ctx, a68 + 0x10u);
+            qa68[m & 3] = a68;
+            m++;
+            h87 = h86;
+            h86 = h82;
+            h82 = h83;
+            h83 = syn_f(ls_w(ls, a68 + 0x10u));
             ls_set_w(ls, q90, c + 1u);
-            r83 = spu_rotqby(r67, q_w0(a68));
-            any1 = 1;
+            q90v._u32[0] = c + 1u;
             steps += 1;   /* the back edge to 0x1090 */
             adv1++;
         } else {
             /* 0x0FB0-0x0FC8 */
-            r3z = t3;
+            z89_before = r89_prev;
+            z89_after = n89;
+            z_first = done == 0;
             any0 = 1;
             steps += 2;   /* to 0x0FB0, and back to 0x1090 */
         }
@@ -421,11 +448,26 @@ static uint32_t resample_run(spu_context* ctx)
     if (!done) return 0;
     add_lanes(&r[81], 4u * done);
     add_lanes(&r[92], done);
-    r[82] = r82; r[83] = r83; r[86] = r86; r[87] = r87;
-    r[88] = r88; r[89] = r89; r[91] = r91;
-    r[64] = spu_ceqi(r3, 1);
-    r[65] = r65;
-    if (any1) {
+    /* The history moves up one a step-1 pass: r87 = r86, r86 = r82,
+     * r82 = r83, r83 = the input quadword rotated by its r68. */
+    {
+        u128 h[4] = { r[87], r[86], r[82], r[83] };   /* oldest first */
+        const uint32_t n = m < 4 ? m : 4u;
+        for (uint32_t k = 0; k < 4 - n; k++) h[k] = h[k + n];
+        for (uint32_t k = 0; k < n; k++) {
+            const uint32_t s = (m - n + k) & 3u;
+            h[4 - n + k] = spu_rotqby(qin[s], q_w0(qa68[s]));
+        }
+        r[87] = h[0]; r[86] = h[1]; r[82] = h[2]; r[83] = h[3];
+    }
+    const u128 n65 = syn_cflts165(r89), n91 = spu_rotmai(n65, -8);
+    const u128 b91 = done == 1 ? r91_in : spu_rotmai(syn_cflts165(r89_prev), -8);
+    r[88] = spu_andi(n65, 255);
+    r[89] = r89;
+    r[91] = n91;
+    r[64] = spu_ceqi(spu_sf(b91, n91), 1);
+    r[65] = n65;
+    if (m) {
         r[66] = spu_cgti(r5, 27);
         r[70] = spu_shli(r5, 2);
         r[71] = spu_cwd(r[1], 0);
@@ -434,9 +476,11 @@ static uint32_t resample_run(spu_context* ctx)
         u128 r69 = r5;
         r69._u32[0] = r[72]._u32[0];
         r[69] = r69;
-        r[67] = r67;
+        r[67] = qin[(m - 1) & 3];
     }
     if (any0) {
+        const u128 zb = z_first ? r91_in : spu_rotmai(syn_cflts165(z89_before), -8);
+        const u128 r3z = spu_sf(zb, spu_rotmai(syn_cflts165(z89_after), -8));
         r[75] = spu_ceqi(r3z, 2);
         r[43] = spu_cgti(r3z, 3);
     }

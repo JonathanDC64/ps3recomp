@@ -361,6 +361,10 @@ static void test_resample(void)
         a.gpr[91] = spu_rotmai(a.gpr[65], -8);
         a.gpr[88] = spu_andi(a.gpr[65], 255);
         if (t % 13 == 0) a.gpr[88] = rnd_q();
+        /* r91 as another path into the loop may leave it (a refill, a longer
+         * step): its other lanes not the phase's, now and then word 0 off by one */
+        if (t % 7 == 0) for (int k = 1; k < 4; k++) a.gpr[91]._u32[k] = rnd_w();
+        if (t % 19 == 0) a.gpr[91]._u32[0] += rnd() % 3u - 1u;
         for (int k = 0; k < 4; k++) {
             a.gpr[86]._u32[k] = rnd_sample(); a.gpr[87]._u32[k] = rnd_sample();
             a.gpr[82]._u32[k] = rnd_sample(); a.gpr[83]._u32[k] = rnd_sample();
