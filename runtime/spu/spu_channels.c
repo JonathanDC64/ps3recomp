@@ -532,18 +532,25 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
 static SPU_TLS int t_mfc_slot = -1;
 static int g_spu_mfc_hint = 1;
 static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx);
+/* A slot's owner, read with acquire: a thread that finds its context there (another's too: the PPU's proxy
+ * commands) sees the engine as the claim initialized it. On x86 a plain load; on arm64 a plain load could see the
+ * owner before the engine's reset. */
+static inline spu_context* mfc_slot_owner(int i)
+{
+    return (spu_context*)ReadPointerAcquire((PVOID const volatile*)&s_mfc_slots[i].ctx);
+}
 static inline mfc_engine* mfc_for(spu_context* ctx)
 {
     const uint32_t h = ctx->mfc_slot1 - 1u;
-    if (h < SPU_MAX_CONTEXTS && g_spu_mfc_hint && s_mfc_slots[h].ctx == ctx) return &s_mfc_slots[h].mfc;
+    if (h < SPU_MAX_CONTEXTS && g_spu_mfc_hint && mfc_slot_owner((int)h) == ctx) return &s_mfc_slots[h].mfc;
     const int s = t_mfc_slot;
-    if (s >= 0 && s_mfc_slots[s].ctx == ctx) { ctx->mfc_slot1 = (uint32_t)s + 1u; return &s_mfc_slots[s].mfc; }
+    if (s >= 0 && mfc_slot_owner(s) == ctx) { ctx->mfc_slot1 = (uint32_t)s + 1u; return &s_mfc_slots[s].mfc; }
     return mfc_for_slow(ctx);
 }
 static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx)
 {
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
-        if (s_mfc_slots[i].ctx == ctx) {
+        if (mfc_slot_owner(i) == ctx) {
             t_mfc_slot = i;
             ctx->mfc_slot1 = (uint32_t)i + 1u;
             return &s_mfc_slots[i].mfc;
@@ -556,7 +563,7 @@ static MFC_NOINLINE mfc_engine* mfc_for_slow(spu_context* ctx)
     for (int i = 0; i < SPU_MAX_CONTEXTS && !e; i++) {
         if (s_mfc_slots[i].ctx != NULL) continue;
         mfc_engine_init(&s_mfc_slots[i].mfc);
-        s_mfc_slots[i].ctx = ctx;
+        WritePointerRelease((PVOID volatile*)&s_mfc_slots[i].ctx, ctx);   /* (after the reset: mfc_slot_owner) */
         e = &s_mfc_slots[i].mfc;
     }
     if (!e) {
@@ -596,12 +603,12 @@ void spu_mfc_release(spu_context* ctx)
     /* Only this thread puts ctx in a slot, so a scan without the lock that
      * does not find it is final: a job that never did a DMA skips the lock. */
     int in = 0;
-    for (int i = 0; i < SPU_MAX_CONTEXTS && !in; i++) in = s_mfc_slots[i].ctx == ctx;
+    for (int i = 0; i < SPU_MAX_CONTEXTS && !in; i++) in = mfc_slot_owner(i) == ctx;
     if (!in) return;
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++) {
         if (s_mfc_slots[i].ctx != ctx) continue;
-        s_mfc_slots[i].ctx = NULL;
+        WritePointerRelease((PVOID volatile*)&s_mfc_slots[i].ctx, NULL);
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
@@ -615,7 +622,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
 {
     int any = 0;
     for (int i = 0; i < SPU_MAX_CONTEXTS && !any; i++) {
-        const uintptr_t c = (uintptr_t)s_mfc_slots[i].ctx;
+        const uintptr_t c = (uintptr_t)mfc_slot_owner(i);
         any = c >= lo && c < hi;
     }
     if (!any) return;
@@ -627,7 +634,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         if (n < 16 && ++n)
             fprintf(stderr, "[SPU] MFC slot of ctx %p (img=%d) given back after its job%c",
                     (void*)c, s_mfc_slots[i].ctx->image_id, 10);
-        s_mfc_slots[i].ctx = NULL;
+        WritePointerRelease((PVOID volatile*)&s_mfc_slots[i].ctx, NULL);
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
