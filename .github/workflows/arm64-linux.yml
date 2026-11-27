@@ -1,0 +1,159 @@
+# The runtime's thread tests on arm64, on every pull request: GitHub's arm64 Linux machines, which are plentiful
+# where its Macs are not (macos.yml runs the same tests nightly on Apple silicon).
+#
+# x86-64 orders every store before the next and every load before the next (TSO), so a handoff between threads
+# that has no barrier works there by luck. arm64 does not: a flag can be seen before the data it publishes. These
+# are the tests whose threads hand work to each other through the runtime's own code: the lv2 sync primitives,
+# plat.h's threads and the SPU job pool, the PPU/SPU and SPU/SPU lock-line coherence, the SPURS task wake, the
+# lifted SPU thread-group start and the MFC engine slots.
+#
+# Each runs twice: built as the runtime is (-O2), so arm64's own reordering can show; then under ThreadSanitizer
+# (-fsanitize=thread), which reports two threads touching the same memory with no ordering between them, whether
+# or not this run happened to see it go wrong. The second set does not fail the job yet: its reports are the list
+# of handoffs to give a barrier or an atomic (the port's docs/178, step M4). Its log is kept as an artifact.
+name: arm64 Linux
+
+on:
+  push:
+    branches: [ master ]
+    paths-ignore: [ 'docs/**', '**.md' ]
+  pull_request:
+    paths:
+      - 'runtime/**'
+      - 'include/**'
+      - 'libs/sync/**'
+      - 'tests/sync_stress/**'
+      - 'tests/plat_threads/**'
+      - '.github/workflows/arm64-linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arm64-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  threads:
+    name: arm64 Linux (thread tests${{ matrix.tsan && ', ThreadSanitizer' || '' }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        tsan: [false, true]
+    env:
+      CC: clang
+      CXX: clang++
+      # -O2 as the runtime's Release build; under TSan -O1 and -g, as its documentation advises.
+      CFLAGS_TEST: ${{ matrix.tsan && '-O1 -g -fno-omit-frame-pointer -fsanitize=thread' || '-O2' }}
+      # A report is printed and the run goes on; the exit status is the test's own.
+      TSAN_OPTIONS: halt_on_error=0 exitcode=0 second_deadlock_stack=1 history_size=4
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build clang
+          clang --version
+          uname -m
+
+      # TSan's memory layout needs the kernel's address randomisation at 28 bits or less: newer kernels use more,
+      # and every sanitized program then stops at start with "unexpected memory mapping".
+      - name: Address randomisation for ThreadSanitizer
+        if: matrix.tsan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Build and run sync_stress
+        continue-on-error: ${{ matrix.tsan }}
+        run: |
+          set -o pipefail
+          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_C_FLAGS=$CFLAGS_TEST" "-DCMAKE_CXX_FLAGS=$CFLAGS_TEST" \
+            "-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.tsan && '-fsanitize=thread' || '' }}"
+          cmake --build build-sync-stress
+          ctest --test-dir build-sync-stress --output-on-failure ${{ matrix.tsan && '-V' || '' }} 2>&1 | tee -a tsan.log
+
+      - name: Build and run plat_threads
+        continue-on-error: ${{ matrix.tsan }}
+        run: |
+          set -o pipefail
+          cmake -S tests/plat_threads -B build-plat-threads -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_C_FLAGS=$CFLAGS_TEST" "-DCMAKE_CXX_FLAGS=$CFLAGS_TEST" \
+            "-DCMAKE_EXE_LINKER_FLAGS=${{ matrix.tsan && '-fsanitize=thread' || '' }}"
+          cmake --build build-plat-threads
+          ctest --test-dir build-plat-threads --output-on-failure ${{ matrix.tsan && '-V' || '' }} 2>&1 | tee -a tsan.log
+
+      # The SPU tests: each a test file and the runtime's sources it needs, as macos.yml builds them.
+      - name: Build and run the SPU thread tests
+        continue-on-error: ${{ matrix.tsan }}
+        run: |
+          set -o pipefail
+          spu="runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c
+               runtime/spu/spu_workload.c runtime/spu/spurs_policy.c runtime/spu/spurs_job.c
+               runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c
+               runtime/spu/spu_interp.c runtime/spu/spu_async_pool.c runtime/platform/plat_posix.c
+               runtime/platform/win32_compat.c"
+          build() {   # build <name> <extra sources...>
+            local name=$1; shift
+            # shellcheck disable=SC2086
+            clang -std=gnu17 $CFLAGS_TEST -I include -I runtime/spu -I runtime/platform -o "/tmp/$name" \
+              "runtime/spu/tests/$name.c" "$@" -lpthread -lm
+          }
+          clang -std=gnu17 $CFLAGS_TEST -I include -I runtime/spu -o /tmp/test_spu_coherency \
+            runtime/spu/tests/test_spu_coherency.c
+          # shellcheck disable=SC2086
+          build test_spu_lockline_peer $spu
+          # shellcheck disable=SC2086
+          build test_spu_taskset_wake $spu
+          # shellcheck disable=SC2086
+          build test_spu_mfc_slots $spu
+          # shellcheck disable=SC2086
+          build test_spu_lifted_start runtime/spu/spu_channels.c runtime/spu/spu_lifted_thread.c \
+            runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c $spu
+          rc=0
+          for t in test_spu_coherency test_spu_lockline_peer test_spu_taskset_wake test_spu_mfc_slots \
+                   test_spu_lifted_start; do
+            echo "::group::$t"
+            "/tmp/$t" 2>&1 | tee -a tsan.log || { echo "::error::$t failed"; rc=1; }
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      # ThreadSanitizer's reports, counted and kept: one line per report, with the first frame of each of its two
+      # accesses, so the list reads as the handoffs to fix.
+      - name: ThreadSanitizer's reports
+        if: ${{ matrix.tsan && !cancelled() }}
+        run: |
+          touch tsan.log
+          n=$(grep -c "WARNING: ThreadSanitizer" tsan.log || true)
+          echo "ThreadSanitizer reports: $n"
+          python3 - <<'EOF'
+          import re
+          text = open("tsan.log", encoding="utf-8", errors="replace").read()
+          seen = {}
+          for block in text.split("==================")[1:]:
+              m = re.search(r"WARNING: ThreadSanitizer: ([^\n(]+)", block)
+              if not m:
+                  continue
+              frames = re.findall(r"#0 (\S+) (\S+)", block)
+              key = (m.group(1).strip(), tuple(f"{f} {loc.split('/')[-1]}" for f, loc in frames[:2]))
+              seen[key] = seen.get(key, 0) + 1
+          with open("tsan_summary.txt", "w", encoding="utf-8") as out:
+              for (kind, frames), count in sorted(seen.items(), key=lambda kv: -kv[1]):
+                  line = f"{count:4}x {kind}: " + " | ".join(frames)
+                  print(line)
+                  out.write(line + "\n")
+          EOF
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ matrix.tsan && !cancelled() }}
+        with:
+          name: tsan-arm64-${{ github.sha }}
+          path: |
+            tsan.log
+            tsan_summary.txt
+          if-no-files-found: ignore
+          retention-days: 14
