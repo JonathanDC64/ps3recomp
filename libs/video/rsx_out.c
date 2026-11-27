@@ -20,7 +20,7 @@
  * path's on Windows, the legacy renderer off it), the new path's D3D12 the
  * legacy renderer.
  */
-#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D) || \n                                   (defined(__APPLE__) && defined(PS3RECOMP_RSX_HAL_VULKAN)))
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D) || (defined(__APPLE__) && defined(PS3RECOMP_RSX_HAL_VULKAN)))
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS   /* getenv */
