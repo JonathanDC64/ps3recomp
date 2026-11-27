@@ -30,6 +30,11 @@
  * cheap as the DLL's. glibc keeps some static TLS spare for a library opened
  * later; these three pointers take 24 bytes of it, and if none were left the
  * dlopen would fail with glibc's message.
+ *
+ * On macOS (a Mach-O dylib) the names are private extern, the same thing. The
+ * thread-locals are Mach-O's thread-local variables, which dyld sets up at the
+ * dlopen. macOS has the one TLS model: each access calls through the
+ * variable's descriptor, as it does in a single exe there.
  */
 #ifndef PS3_GAME_MODULE
 #define PS3_GAME_MODULE 1
@@ -39,8 +44,8 @@
 #include "ps3emu/ps3_knob.h"     /* ps3_env_gen: this module's own copy */
 #include "ps3emu/game_module.h"
 
-#if !defined(_WIN64) && !(defined(__x86_64__) && defined(__ELF__))
-#error "game_module.c: the split build is for Windows x64 and x86-64 Linux"
+#if !defined(_WIN64) && !(defined(__x86_64__) && defined(__ELF__)) && !(defined(__aarch64__) && defined(__APPLE__))
+#error "game_module.c: the split build is for Windows x64, x86-64 Linux and arm64 macOS"
 #endif
 
 /* --- Runtime functions: one slot and one thunk each ----------------------- */
@@ -70,7 +75,8 @@ int ps3_game_libc_run_ctors(void);   /* game_libc.c: the C++ dynamic initialiser
 
 /* Whether the loader has set up this module's thread-locals. Windows: the loader writes the module's TLS slot into
  * _tls_index (game_libc.c's TLS directory), and leaves it unset for a DLL with no import table. Linux: the two
- * initial-exec thread-locals are part of the static TLS block, without which the dlopen itself fails. */
+ * initial-exec thread-locals are part of the static TLS block, without which the dlopen itself fails. macOS: dyld
+ * sets up the thread-local variables of every image it loads. */
 #ifdef _WIN64
 extern unsigned int _tls_index;
 static int tls_ready(void) { return _tls_index != PS3_GAME_TLS_INDEX_UNSET; }

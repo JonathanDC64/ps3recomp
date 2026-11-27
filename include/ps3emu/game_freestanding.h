@@ -33,11 +33,12 @@
  *
  * On Linux the module is an ELF shared object, compiled with clang
  * -nostdlibinc (clang's own headers and game_libc/ only) and linked with
- * ld.lld -nostdlib. There this header sets:
+ * ld.lld -nostdlib; on arm64 macOS a Mach-O dylib, built the same way and
+ * linked with ld64.lld. There this header sets:
  *
  *   - PPU_FENCE as the compiler's __atomic_thread_fence, which is what
- *     libstdc++'s std::atomic_thread_fence and clang's <stdatomic.h> both
- *     are, so the fences compile as in the single Linux exe;
+ *     libstdc++'s and libc++'s std::atomic_thread_fence and clang's
+ *     <stdatomic.h> all are, so the fences compile as in the single exe;
  *   - hidden visibility for every name declared or defined after it: see
  *     game_module.h. The module's one export, the title's init, says
  *     visibility("default") itself.

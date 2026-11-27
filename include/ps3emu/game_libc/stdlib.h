@@ -8,7 +8,12 @@
  *   - the byte swaps: compiler builtins once declared (spu_context.h's
  *     SPU_BSWAP32 uses _byteswap_ulong);
  *   - malloc and free: for clang's <mm_malloc.h> only, which <intrin.h>
- *     includes. Nothing calls them, and the module has no heap.
+ *     includes, and on arm64 with posix_memalign for sse2neon's _mm_malloc
+ *     (ps3emu/ps3_sse.h). Nothing calls them, and the module has no heap;
+ *   - abort: sse2neon's _mm_clmulepi64_si128 names it for an immediate it
+ *     cannot take. Nothing calls it.
+ * None of these four is in PS3_GAME_HOST_CRT_FUNCS: a source that called one
+ * would fail to link.
  */
 #ifndef PS3_GAME_LIBC_STDLIB_H
 #define PS3_GAME_LIBC_STDLIB_H
@@ -30,6 +35,8 @@ unsigned long long _byteswap_uint64(unsigned long long v);
 
 void*              malloc(size_t size);
 void               free(void* block);
+int                posix_memalign(void** out, size_t alignment, size_t size);
+void               abort(void) __attribute__((noreturn));
 
 #ifdef __cplusplus
 }

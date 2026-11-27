@@ -1,0 +1,18 @@
+--- !tapi-tbd
+# ps3recomp - the one name a freestanding Mach-O game module imports
+# (runtime/ppu/game_libc.c), as a text stub of libSystem for ld64.lld. (The
+# line above has to be the file's first: the linker knows a stub by it.)
+#
+# Mach-O names each thread-local through a descriptor whose first word is
+# dyld's __tlv_bootstrap until dyld fills it in at the load, so a module with
+# thread-locals (the trampolines, game_module.c) has to import it. libSystem
+# re-exports it from libdyld. The stub lets the link name it without an Xcode
+# SDK on the player's Mac, as game_libc_kernel32.def does on Windows.
+tbd-version:     4
+targets:         [ arm64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1351
+exports:
+  - targets:         [ arm64-macos ]
+    symbols:         [ __tlv_bootstrap ]
+...

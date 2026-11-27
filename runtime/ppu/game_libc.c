@@ -36,9 +36,19 @@
  * the C library would crash there. The lift has none (docs/84 measured
  * Windows' objects), so ps3_game_libc_run_ctors has nothing to run.
  *
+ * On arm64 macOS (a Mach-O dylib linked with ld64.lld -nostdlib) the same as
+ * on Linux, with the copies written as plain loops (there is no rep movsb),
+ * and memset_pattern16, which the compiler calls there on its own as well.
+ * dyld runs the module's initialisers at the dlopen, as Linux's loader does.
+ * Mach-O names a thread-local through a descriptor that points at dyld's
+ * __tlv_bootstrap until dyld fills it in, so the link reads
+ * game_libc_system.tbd: a stub of libSystem with that one name, so it needs
+ * no SDK either.
+ *
  * Compiled only into a freestanding module; elsewhere it is empty.
  */
-#if defined(PS3_GAME_FREESTANDING) && (defined(_WIN64) || (defined(__x86_64__) && defined(__ELF__)))
+#if defined(PS3_GAME_FREESTANDING) && \
+    (defined(_WIN64) || (defined(__x86_64__) && defined(__ELF__)) || (defined(__aarch64__) && defined(__APPLE__)))
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +57,7 @@
 /* --- Memory and strings ------------------------------------------------- */
 #define PS3_GL_FN __attribute__((no_builtin))
 
+#if defined(__x86_64__) || defined(_M_X64)
 PS3_GL_FN void* memcpy(void* dst, const void* src, size_t n)
 {
     void* d = dst;
@@ -79,6 +90,84 @@ PS3_GL_FN void* memset(void* dst, int c, size_t n)
     __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
     return dst;
 }
+#else
+/* arm64: 16 bytes a step as two unaligned 8-byte words, both read before
+ * either is written, then single bytes. */
+typedef uint64_t __attribute__((aligned(1), may_alias)) ps3_gl_u64u;
+
+PS3_GL_FN void* memcpy(void* dst, const void* src, size_t n)
+{
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    for (; n >= 16; n -= 16, d += 16, s += 16) {
+        const uint64_t a = ((const ps3_gl_u64u*)s)[0], b = ((const ps3_gl_u64u*)s)[1];
+        ((ps3_gl_u64u*)d)[0] = a;
+        ((ps3_gl_u64u*)d)[1] = b;
+    }
+    for (; n; n--) *d++ = *s++;
+    return dst;
+}
+
+PS3_GL_FN void* memmove(void* dst, const void* src, size_t n)
+{
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    if (n == 0 || d == s) return dst;
+    if ((uintptr_t)d - (uintptr_t)s >= n) {
+        /* d below s, or at or past its end: forwards. A step reads its 16
+         * bytes before it writes, so it never reads a byte already written. */
+        for (; n >= 16; n -= 16, d += 16, s += 16) {
+            const uint64_t a = ((const ps3_gl_u64u*)s)[0], b = ((const ps3_gl_u64u*)s)[1];
+            ((ps3_gl_u64u*)d)[0] = a;
+            ((ps3_gl_u64u*)d)[1] = b;
+        }
+        for (; n; n--) *d++ = *s++;
+    } else {
+        /* d inside [s, s + n): backwards, from the end. */
+        d += n;
+        s += n;
+        for (; n >= 16; n -= 16) {
+            d -= 16;
+            s -= 16;
+            const uint64_t a = ((const ps3_gl_u64u*)s)[0], b = ((const ps3_gl_u64u*)s)[1];
+            ((ps3_gl_u64u*)d)[0] = a;
+            ((ps3_gl_u64u*)d)[1] = b;
+        }
+        for (; n; n--) *--d = *--s;
+    }
+    return dst;
+}
+
+PS3_GL_FN void* memset(void* dst, int c, size_t n)
+{
+    unsigned char* d = (unsigned char*)dst;
+    const uint64_t v = 0x0101010101010101ull * (unsigned char)c;
+    for (; n >= 16; n -= 16, d += 16) {
+        ((ps3_gl_u64u*)d)[0] = v;
+        ((ps3_gl_u64u*)d)[1] = v;
+    }
+    for (; n; n--) *d++ = (unsigned char)c;
+    return dst;
+}
+
+#if defined(__APPLE__)
+/* Darwin's: the compiler turns a loop that stores a repeating pattern of 16
+ * bytes (or a shorter one, repeated to 16) into a call to this, and the lift
+ * has some hundreds. n is in bytes; the last copy of the pattern may be cut
+ * short. */
+PS3_GL_FN void memset_pattern16(void* dst, const void* pattern, size_t n)
+{
+    unsigned char* d = (unsigned char*)dst;
+    const uint64_t a = ((const ps3_gl_u64u*)pattern)[0], b = ((const ps3_gl_u64u*)pattern)[1];
+    for (; n >= 16; n -= 16, d += 16) {
+        ((ps3_gl_u64u*)d)[0] = a;
+        ((ps3_gl_u64u*)d)[1] = b;
+    }
+    const unsigned char* p = (const unsigned char*)pattern;
+    for (size_t i = 0; i < n; i++) d[i] = p[i];
+}
+#endif
+#endif /* x86-64, arm64 */
 
 PS3_GL_FN int memcmp(const void* a, const void* b, size_t n)
 {
@@ -97,7 +186,7 @@ PS3_GL_FN size_t strlen(const char* s)
 }
 
 #ifndef _WIN64
-/* ELF: the dynamic loader runs any static constructor itself (see the top). */
+/* ELF and Mach-O: the dynamic loader runs any static constructor itself (see the top). */
 int ps3_game_libc_run_ctors(void)
 {
     return 0;
@@ -158,4 +247,4 @@ const ps3_gl_tls_directory _tls_used = { &_tls_start, &_tls_end, &_tls_index, s_
 #pragma comment(linker, "/include:__imp_GetCurrentThreadId")
 #endif /* _WIN64 */
 
-#endif /* PS3_GAME_FREESTANDING, Windows x64 or x86-64 ELF */
+#endif /* PS3_GAME_FREESTANDING, Windows x64, x86-64 ELF or arm64 Mach-O */

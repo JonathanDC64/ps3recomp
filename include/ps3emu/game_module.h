@@ -33,6 +33,11 @@
  * game_libc.c, game_freestanding.h). There the module is always freestanding:
  * built with clang's own headers only and no C library, so the player's PC
  * needs no libc headers to build it.
+ *
+ * And on arm64 macOS: the module is a Mach-O dylib (des_game.dylib), opened
+ * with dlopen as on Linux and freestanding as there, so the player's Mac needs
+ * no Xcode or SDK to build it. Its one import is dyld's __tlv_bootstrap, which
+ * every Mach-O image with thread-locals names (runtime/ppu/game_libc.c).
  */
 #ifndef PS3EMU_GAME_MODULE_H
 #define PS3EMU_GAME_MODULE_H
@@ -78,8 +83,8 @@ enum { PS3_GAME_HOST_FUNCS(PS3_GAME_HOST_FN_INDEX_) PS3_GH_COUNT };
  * A new one goes at the end, with PS3_GAME_ABI raised.
  *
  * The module's stdin, stdout and stderr are __acrt_iob_func(0, 1, 2), as in
- * the UCRT (ps3emu/game_libc/stdio.h). glibc's are variables, which a module
- * with no C library cannot import, so on Linux the host passes
+ * the UCRT (ps3emu/game_libc/stdio.h). glibc's and macOS's are variables,
+ * which a module with no C library cannot import, so there the host passes
  * ps3_gh_iob (game_host.c), which returns them. */
 #ifdef _WIN32
 #define PS3_GAME_HOST_IOB __acrt_iob_func
@@ -170,7 +175,14 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game);
  * the host defines the same names (the runtime's vm_read32 and the rest), and
  * a default-visibility one in the module could be bound to the host's
  * instead. Hidden, the slot is read relative to the instruction pointer, as
- * in the DLL. */
+ * in the DLL.
+ *
+ * On arm64 Mach-O the thunk is private extern (Mach-O's hidden) and reads its
+ * slot by page and offset into x16, which the arm64 calling convention gives
+ * to exactly this: a veneer between a call and its target may use x16 and x17,
+ * and dyld's own stubs do. The link register is untouched, so the function at
+ * the end returns straight to the lifted caller, and _setjmp sees that caller
+ * as its own, as on x86. C names take a leading underscore there. */
 #if defined(PS3_GAME_MODULE) && defined(_WIN64)
 #define PS3_GAME_THUNK(name)                                                     \
     __asm__(".att_syntax prefix\n\t.text\n\t.globl " #name "\n"                    \
@@ -182,6 +194,13 @@ int ps3_game_module_init(const ps3_host_api* host, ps3_game_api* game);
             "\t.type " #name ", @function\n"                                        \
             "\t.p2align 4\n" #name ":\n\tjmpq *ps3_gt_" #name "(%rip)\n"             \
             "\t.size " #name ", . - " #name "\n");
+#elif defined(PS3_GAME_MODULE) && defined(__aarch64__) && defined(__APPLE__)
+#define PS3_GAME_THUNK(name)                                                     \
+    __asm__(".text\n\t.globl _" #name "\n\t.private_extern _" #name "\n"        \
+            "\t.p2align 2\n_" #name ":\n"                                         \
+            "\tadrp x16, _ps3_gt_" #name "@PAGE\n"                                 \
+            "\tldr x16, [x16, _ps3_gt_" #name "@PAGEOFF]\n"                        \
+            "\tbr x16\n");
 #endif
 
 #ifdef __cplusplus
