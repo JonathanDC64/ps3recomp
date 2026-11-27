@@ -10,11 +10,15 @@
 # never got a machine ("not acquired by Runner"), with no step run. macos-15
 # picked jobs up in seconds when measured, but on November 2 and 3, 2026 macos-15
 # jobs went unacquired too, each failing after 15 minutes and holding its pull
-# request red until a rerun. So the job no longer runs on pull requests or
-# pushes: it runs once a night on master, and by hand (gh workflow run macos.yml
-# --ref <branch>) for a change that needs it before it merges. It is not a
-# required check. A newer run cancels the one it supersedes, and a job that
-# hangs stops at the timeout instead of holding a machine.
+# request red until a rerun. So the job doesn't run on pull requests: it runs
+# after each merge (a push to master, as linux.yml does), and by hand (gh
+# workflow run macos.yml --ref <branch>) for a change that needs it before it
+# merges. It is not a required check. A newer run cancels the one it supersedes,
+# and a job that hangs stops at the timeout instead of holding a machine.
+#
+# It ran once a night until November 2026, but GitHub started that scheduled run
+# 10 to 12 hours late and then no Mac took its jobs, so every night was red
+# while every run started by hand passed.
 #
 # What only this job runs: the sse2neon check of the SPU SIMD paths, and the
 # Metal backend's scenes, smoke title and game template. The sysutil and
@@ -22,8 +26,9 @@
 name: macOS
 
 on:
-  schedule:
-    - cron: '23 8 * * *'   # once a night (08:23 UTC), on master
+  push:
+    branches: [ master ]
+    paths-ignore: [ 'docs/**', '**.md' ]
   workflow_dispatch:
     inputs:
       runner:

@@ -445,7 +445,7 @@ library, runs all eight lifter suites plus the SPU helper tests, and drives
 ### macOS
 
 Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
-Release once a night on master, and by hand). That workflow builds the runtime library, runs all
+Release after each merge to master, and by hand). That workflow builds the runtime library, runs all
 eight lifter test suites — including the 1300+ instruction conformance checks,
 which compile and *execute* lifted code — and then runs `ps3recomp_host`
 headlessly, asserting the presented pixel matches the guest clear colour and
