@@ -744,6 +744,17 @@ static SDL_Window* create_window(u32 width, u32 height, const char* title)
      * signal (Ctrl+C, SIGTERM), which closes at once. */
     SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     const SDL_WindowFlags maximized = ps3_env_int("RSX_MAXIMIZED", 0) && !ps3_no_user_input() ? SDL_WINDOW_MAXIMIZED : 0;
+#if defined(__APPLE__) && defined(PS3RECOMP_GPU_VK_INTERNAL_H)
+    /* A Mac app's own Vulkan loader (gpu_vk_app_loader): a Vulkan window makes
+     * SDL load a loader, and it must be the instance's. Left to itself SDL
+     * looks for libvulkan.1.dylib in the current folder and the system's: none
+     * for an app opened from the Finder (no window), or another copy, whose
+     * surface for this instance crashes. */
+    {
+        const char* own = gpu_vk_app_loader();
+        if (own) SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, own);
+    }
+#endif
     SDL_Window* w = SDL_CreateWindow(title ? title : "ps3recomp (D3D12)", cw, ch,
                                      SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | maximized);
     if (w) {

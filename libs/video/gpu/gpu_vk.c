@@ -23,7 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #if defined(__APPLE__)
-#include <dlfcn.h>   /* an app's own Vulkan loader (volk_ready) */
+#include <dlfcn.h>     /* an app's own Vulkan loader (gpu_vk_app_loader) */
+#include <pthread.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -170,18 +171,32 @@ static void messenger_info(gpu_vk_device* dd, VkDebugUtilsMessengerCreateInfoEXT
     mi->pUserData = dd;
 }
 
+#if defined(__APPLE__)
+/* A Mac app carries its own Vulkan loader, in Contents/Frameworks beside the
+ * program's Contents/MacOS. dlopen takes the @executable_path form, and the
+ * same string from SDL opens the same image. */
+#define GPU_VK_APP_LOADER "@executable_path/../Frameworks/libvulkan.1.dylib"
+static void* s_app_loader;   /* (stays loaded for the process) */
+static pthread_once_t s_app_loader_once = PTHREAD_ONCE_INIT;
+static void app_loader_open(void) { s_app_loader = dlopen(GPU_VK_APP_LOADER, RTLD_NOW | RTLD_LOCAL); }
+
+const char* gpu_vk_app_loader(void)
+{
+    pthread_once(&s_app_loader_once, app_loader_open);
+    return s_app_loader ? GPU_VK_APP_LOADER : NULL;
+}
+#endif
+
 static int volk_ready(void)
 {
     static int done = 0;   /* (the library stays loaded for the process) */
 #if defined(__APPLE__)
-    /* A Mac app carries its own Vulkan loader, in Contents/Frameworks beside
-     * the program's Contents/MacOS: that one first. volk's own search names
-     * libvulkan.dylib alone, then /usr/local/lib and MoltenVK, none of which
-     * is in the app; dlopen takes the @executable_path form. Outside an app
-     * (a build folder) there is no such file and volk searches as before. */
-    if (!done) {
-        void* lib = dlopen("@executable_path/../Frameworks/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
-        PFN_vkGetInstanceProcAddr gipa = lib ? (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr") : NULL;
+    /* The app's own loader first. volk's own search names libvulkan.dylib
+     * alone, then /usr/local/lib and MoltenVK, none of which is in the app.
+     * Outside an app (a build folder) there is no such file and volk searches
+     * as before. */
+    if (!done && gpu_vk_app_loader()) {
+        PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)dlsym(s_app_loader, "vkGetInstanceProcAddr");
         if (gipa) {
             volkInitializeCustom(gipa);
             printf("[VK] the app's own Vulkan loader (Contents/Frameworks)\n");

@@ -683,6 +683,13 @@ extern volatile uint32_t gpu_vk_n_validation_all;
 extern const gpu_cmd_ops gpu_vk_cmd_ops;
 
 /* ---- gpu_vk.c ---- */
+#if defined(__APPLE__)
+/* The path of a Mac app's own Vulkan loader (Contents/Frameworks), opened once
+ * and kept, when this program runs from an app that carries one; else NULL.
+ * The device's instance comes from it, and the window code hands it to SDL
+ * (rsxc_window.inc), so the window's surface comes from the same loader. */
+const char* gpu_vk_app_loader(void);
+#endif
 int         gpu_vk_slot_valid(const gpu_vk_slots* s, uint32_t id);
 uint32_t    gpu_vk_slot_alloc(gpu_vk_slots* s);                 /* under lock; 0 when full */
 void        gpu_vk_slot_free(gpu_vk_slots* s, uint32_t id);    /* under lock */
