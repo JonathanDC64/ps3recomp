@@ -829,17 +829,32 @@ static void test_stop_inside_call(void)
 }
 
 /* The SPU's single precision has no denormals, so lifted code runs with DAZ
- * and FTZ, and whoever called it gets its own float mode back (#403). x86
- * only: that is where the mode is MXCSR. */
+ * and FTZ, and whoever called it gets its own float mode back (#403). x86's
+ * mode is MXCSR; arm64's is FPCR, whose FZ bit does both. */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <xmmintrin.h>
-static unsigned mode_inside;
+#define FM_GET() _mm_getcsr()
+#define FM_SET(v) _mm_setcsr(v)
+#define FM_BITS 0x8040u   /* FTZ (bit 15) and DAZ (bit 6) */
+typedef unsigned fm_t;
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+static uint64_t fm_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static void fm_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" : : "r"(v) : "memory"); }
+#define FM_GET() fm_get()
+#define FM_SET(v) fm_set(v)
+#define FM_BITS (1ull << 24)   /* FZ */
+typedef uint64_t fm_t;
+#endif
+#ifdef FM_BITS
+static fm_t mode_inside;
 static volatile float tiny_a = 1e-20f, tiny_b = 1e-20f, tiny_product = -1.0f;
+static volatile float denormal = 1e-40f, denormal_read = -1.0f;
 static void reads_float_mode(spu_context* ctx)
 {
     (void)ctx;
-    mode_inside  = _mm_getcsr();
-    tiny_product = tiny_a * tiny_b;   /* 1e-40: a denormal, or zero */
+    mode_inside   = FM_GET();
+    tiny_product  = tiny_a * tiny_b;   /* 1e-40: a denormal, or zero */
+    denormal_read = denormal * 1.0f;   /* a denormal read: itself, or zero */
 }
 static void test_float_mode(void)
 {
@@ -847,14 +862,15 @@ static void test_float_mode(void)
     if (!ctx) { check(0, "allocate float-mode context"); return; }
     spu_context_init(ctx, 0);
     ctx->image_id = 92;
-    const unsigned before = _mm_getcsr();
-    _mm_setcsr(before & ~0x8040u);    /* the host default: neither flag */
+    const fm_t before = FM_GET();
+    FM_SET(before & ~(fm_t)FM_BITS);   /* the host default: no flushing */
     spu_run_with_halt(reads_float_mode, ctx);
-    const unsigned after = _mm_getcsr();
-    check((mode_inside & 0x8040u) == 0x8040u, "SPU code runs with DAZ and FTZ");
+    const fm_t after = FM_GET();
+    check((mode_inside & FM_BITS) == FM_BITS, "SPU code runs with denormals flushed (DAZ and FTZ, or FZ)");
     check(tiny_product == 0.0f, "a product too small to be normal is zero, as on the SPU");
-    check((after & 0x8040u) == 0, "the caller's float mode is back afterwards");
-    _mm_setcsr(before);
+    check(denormal_read == 0.0f, "a denormal read is zero, as on the SPU");
+    check((after & FM_BITS) == 0, "the caller's float mode is back afterwards");
+    FM_SET(before);
     free(ctx);
 }
 #else
