@@ -20,7 +20,7 @@
  * path's on Windows, the legacy renderer off it), the new path's D3D12 the
  * legacy renderer.
  */
-#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D))
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D) || (defined(__APPLE__) && defined(PS3RECOMP_RSX_HAL_VULKAN)))
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS   /* getenv */
@@ -472,4 +472,4 @@ int rsx_out_backend_init(uint32_t width, uint32_t height, const char* title)
 }
 #endif /* RSX_OUT_FALLS_BACK */
 
-#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || PS3RECOMP_RSX_D3D12_VKD3D) */
+#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || PS3RECOMP_RSX_D3D12_VKD3D || (__APPLE__ && PS3RECOMP_RSX_HAL_VULKAN)) */

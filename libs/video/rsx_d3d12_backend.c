@@ -16973,5 +16973,29 @@ u64      rsx_d3d12_program_hash64(int fragment, const u8* ucode, u32 ucode_len)
     (void)fragment; (void)ucode; (void)ucode_len;
     return 0;
 }
+/* And the rest of what the route switch's legacy column names (rsx_out.h's
+ * RSX_OUT_FUNCS), for a Mac: rsx_out.c is built there with the Vulkan backend
+ * alone, and its legacy route is these stubs. */
+int rsx_d3d12_shader_hlsl(int fragment, const u8* ucode, u32 ucode_len, u32 vp_start_slot,
+                          int exp32, u32 cube_mask, u32 d2c_mask, char* out, u32 cap)
+{
+    (void)fragment; (void)ucode; (void)ucode_len; (void)vp_start_slot; (void)exp32; (void)cube_mask;
+    (void)d2c_mask;
+    if (out && cap) out[0] = 0;
+    return 0;
+}
+int      rsx_d3d12_shader_hdr(char* hlsl, u32 cap, u32 hdrv) { (void)hlsl; (void)cap; (void)hdrv; return 0; }
+int      rsx_d3d12_shader_cache_put(int fragment, const char* hlsl) { (void)fragment; (void)hlsl; return 0; }
+const char* rsx_d3d12_shader_cache_path(void) { return NULL; }
+int      rsx_d3d12_shader_fp_variants(const u8* ucode, u32 ucode_len, u32* out, int max)
+{
+    (void)ucode; (void)ucode_len; (void)out; (void)max;
+    return 0;
+}
+u64      rsx_d3d12_shader_key(int fragment, const char* hlsl) { (void)fragment; (void)hlsl; return 0; }
+void     rsx_d3d12_composite_from_offscreen(u32 raw_off) { (void)raw_off; }
+void     rsx_prof_begin(const char* prefix) { (void)prefix; }
+int      rsx_prof_end(char* digest, size_t cap) { if (digest && cap) digest[0] = 0; return 0; }
+void     rsx_prof_title(const char* note) { (void)note; }
 
 #endif /* _WIN32 || PS3RECOMP_RSX_D3D12_VKD3D */

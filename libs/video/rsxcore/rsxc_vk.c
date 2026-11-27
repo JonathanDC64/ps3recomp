@@ -35,7 +35,7 @@
  * later. Built with PS3RECOMP_RSX_HAL_VULKAN; the route needs the spv target
  * (PS3RECOMP_RSX_HAL_SPV) at run time, and says so when it is not built.
  */
-#if defined(PS3RECOMP_RSX_HAL) && defined(PS3RECOMP_RSX_HAL_VULKAN) && (defined(_WIN32) || defined(__linux__))
+#if defined(PS3RECOMP_RSX_HAL) && defined(PS3RECOMP_RSX_HAL_VULKAN) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
 
 #ifndef _WIN32
 #include "../../../runtime/platform/win32_compat.h"
@@ -294,4 +294,4 @@ const char* rsxc_vk_start_failed(void) { return s_rc_start_failed; }
  * the rest above have nothing for a D3D12 one. */
 const rsx_route_gpu rsxc_route_gpu_vk = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
 
-#endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && (_WIN32 || __linux__) */
+#endif /* PS3RECOMP_RSX_HAL && PS3RECOMP_RSX_HAL_VULKAN && (_WIN32 || __linux__ || __APPLE__) */

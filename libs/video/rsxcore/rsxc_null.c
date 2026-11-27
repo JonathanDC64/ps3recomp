@@ -30,7 +30,7 @@
  * locks, files, timing), which win32_compat.h gives it on Linux; the
  * platform module (Phase 5) takes those.
  */
-#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__))
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
 
 #ifndef _WIN32
 #include "../../../runtime/platform/win32_compat.h"
@@ -170,4 +170,4 @@ const rsx_route rsxc_route_null = {
 /* The overlay v2's calls (rsx_out.h; rsxc_api.inc). */
 const rsx_route_gpu rsxc_route_gpu_null = { rc_set_overlay_gpu, rc_gpu_device, rc_overlay_gpu_flush };
 
-#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || __linux__) */
+#endif /* PS3RECOMP_RSX_HAL && (_WIN32 || __linux__ || __APPLE__) */

@@ -60,9 +60,9 @@ FetchContent_Declare(spirv_cross
 
 # The shader compile service's spv target (libs/video/gpu/gpu_shader_spv*.cpp): HLSL -> SPIR-V through glslang's
 # HLSL front end, with SPIRV-Tools' legalization passes and validator. On by default where the Vulkan backend is
-# (Windows and Linux). SPIRV-Headers, SPIRV-Tools and glslang come from their pins above, built static, libraries
+# (Windows, Linux and macOS). SPIRV-Headers, SPIRV-Tools and glslang come from their pins above, built static, libraries
 # only: no tests, tools or install rules. Their build runs Python 3 (grammar tables, glslang's build_info.h).
-if(WIN32 OR (UNIX AND NOT APPLE))
+if(WIN32 OR UNIX)
     set(_ps3_gpu_spv_default ON)
 else()
     set(_ps3_gpu_spv_default OFF)
@@ -105,11 +105,11 @@ endif()
 
 message(STATUS "  Renderer:     GPU layer dependencies declared (Vulkan SDK 1.4.363.0 pins)")
 
-# The Vulkan backend (libs/video/gpu/gpu_vk*): on by default on the systems with a Vulkan driver to run it today,
-# Windows and Linux (the Mac's comes later). It builds against the pinned Vulkan-Headers, fetched here, and volk,
+# The Vulkan backend (libs/video/gpu/gpu_vk*): on by default on Windows, Linux and macOS (on a Mac through
+# MoltenVK or KosmicKrisp, the Vulkan drivers on Metal). It builds against the pinned Vulkan-Headers, fetched here, and volk,
 # vendored in third_party/volk at the same pin; it loads the Vulkan library at run time, so nothing is linked.
 # -DFETCHCONTENT_SOURCE_DIR_VULKAN_HEADERS=<a Vulkan-Headers checkout of that commit> builds without the download.
-if(WIN32 OR (UNIX AND NOT APPLE))
+if(WIN32 OR UNIX)
     set(_ps3_gpu_vk_default ON)
 else()
     set(_ps3_gpu_vk_default OFF)
