@@ -425,6 +425,30 @@ static inline int plat_thread_name(long tid, char* out, size_t cap)
 static inline int plat_system_cpu(uint64_t* busy, uint64_t* total) { *busy = 0; *total = 0; return 0; }
 #endif
 
+/* ---- The first thread (macOS) ------------------------------------------- */
+
+/* macOS makes windows, and runs their events, on a process's first thread
+ * only (AppKit; SDL's Cocoa video will not start on another). There
+ * plat_main runs body(argc, argv) on a new thread with a stack as large as
+ * the first thread's, and keeps the first thread for the work that
+ * plat_on_first_thread hands it (the game window's thread, rsxc_window.inc),
+ * until body returns: its value ends the process. Between pieces of work the
+ * first thread runs its run loop, so what other threads hand macOS's main
+ * queue (SDL's message boxes do) still runs. Elsewhere, and if the thread
+ * cannot start, plat_main is body(argc, argv) on this thread.
+ *
+ * plat_on_first_thread hands fn(arg) to the first thread and returns at
+ * once: 1 when it will run there, 0 when nothing serves the first thread
+ * (off macOS, or not under plat_main), and the caller does the work its own
+ * way. */
+#if defined(__APPLE__)
+int plat_main(int (*body)(int, char**), int argc, char** argv);
+int plat_on_first_thread(void (*fn)(void*), void* arg);
+#else
+static inline int plat_main(int (*body)(int, char**), int argc, char** argv) { return body(argc, argv); }
+static inline int plat_on_first_thread(void (*fn)(void*), void* arg) { (void)fn; (void)arg; return 0; }
+#endif
+
 #ifdef __cplusplus
 }
 #endif

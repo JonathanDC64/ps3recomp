@@ -42,6 +42,8 @@ const char* const* gpu_vk_surface_extensions(void)
 {
 #ifdef _WIN32
     static const char* const k[] = {"VK_KHR_win32_surface", NULL};
+#elif defined(__APPLE__)
+    static const char* const k[] = {"VK_EXT_metal_surface", NULL};   /* (SDL's, on a Mac) */
 #else
     static const char* const k[] = {"VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface", NULL};
 #endif
@@ -577,6 +579,18 @@ static int chain_again(gpu_vk_device* dd, gpu_vk_swap* s)
     return chain_make(dd, s);
 }
 
+#if defined(__APPLE__)
+/* A Mac's surface is a Metal view that SDL puts in the window, which AppKit
+ * makes on the window's thread only (the first one, plat.h's plat_main):
+ * SDL runs it there, and this waits. */
+typedef struct { SDL_Window* window; VkInstance instance; VkSurfaceKHR surface; bool made; } surface_on_window;
+static void SDLCALL surface_make_there(void* p)
+{
+    surface_on_window* c = (surface_on_window*)p;
+    c->made = SDL_Vulkan_CreateSurface(c->window, c->instance, NULL, &c->surface);
+}
+#endif
+
 /* The window's surface, one the queue can present to; none on failure. */
 static VkSurfaceKHR surface_make(gpu_vk_device* dd, void* window)
 {
@@ -588,6 +602,10 @@ static VkSurfaceKHR surface_make(gpu_vk_device* dd, void* window)
     wi.hinstance = GetModuleHandleA(NULL);
     wi.hwnd = (HWND)window;
     if (vkCreateWin32SurfaceKHR(dd->instance, &wi, NULL, &surface) != VK_SUCCESS) return VK_NULL_HANDLE;
+#elif defined(__APPLE__)
+    surface_on_window c = {(SDL_Window*)window, dd->instance, VK_NULL_HANDLE, false};
+    if (!SDL_RunOnMainThread(surface_make_there, &c, true) || !c.made) return VK_NULL_HANDLE;
+    surface = c.surface;
 #else
     if (!SDL_Vulkan_CreateSurface((SDL_Window*)window, dd->instance, NULL, &surface)) return VK_NULL_HANDLE;
 #endif
