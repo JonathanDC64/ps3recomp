@@ -27,6 +27,22 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <xmmintrin.h>   /* _mm_getcsr / _mm_setcsr: the SPU's float mode, spu_run_with_halt */
 #define SPU_HAVE_MXCSR 1
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+/* arm64: the float mode is FPCR. Its FZ bit (24) flushes denormal inputs and
+ * results to zero alike, for scalar and Advanced SIMD (NEON) single and double
+ * precision: x86's DAZ and FTZ together. */
+#define SPU_HAVE_FPCR 1
+#define SPU_FPCR_FZ (1ull << 24)
+static inline uint64_t spu_fpcr_get(void)
+{
+    uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    return v;
+}
+static inline void spu_fpcr_set(uint64_t v)
+{
+    __asm__ volatile("msr fpcr, %0" : : "r"(v) : "memory");
+}
 #endif
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
@@ -355,7 +371,7 @@ static int spu_interp_img(uint32_t* entry_lsa);
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
 {
     int halted = 0;
-#ifdef SPU_HAVE_MXCSR
+#if defined(SPU_HAVE_MXCSR) || defined(SPU_HAVE_FPCR)
     /* The SPU's single precision has no denormals: one read is zero, and a
      * result too small to be normal is zero. RPCS3 runs its SPU threads with
      * DAZ and FTZ for that (gv_set_zeroing_denormals). Without them x86 does
@@ -365,11 +381,18 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * denormal and underflow flags in every 2 s window. Its mixer fell behind
      * and the sound looped (#403). The caller's mode comes back on the way
      * out, as a PPU thread can run a job inline; a halt's longjmp restores the
-     * mode setjmp saw, which is this one. SPU_FTZ=0 keeps the host's mode. */
+     * mode setjmp saw, which is this one. SPU_FTZ=0 keeps the host's mode.
+     * On arm64 the same is FPCR's FZ bit (above); the mode comes back at the
+     * end in both cases, after a halt too. */
     static int s_ftz = -1;
     PS3_KNOB(s_ftz, ps3_env_int("SPU_FTZ", 1));
+#endif
+#ifdef SPU_HAVE_MXCSR
     const unsigned csr_in = _mm_getcsr();
     if (s_ftz) _mm_setcsr(csr_in | 0x8040u);   /* FTZ (bit 15) and DAZ (bit 6) */
+#elif defined(SPU_HAVE_FPCR)
+    const uint64_t fpcr_in = spu_fpcr_get();
+    if (s_ftz) spu_fpcr_set(fpcr_in | SPU_FPCR_FZ);
 #endif
     /* Job-args probe: image-1 (the WWS job binary) entries arrive at the crt
      * with r3/r4 zeroed in SOME runs while the jm2 runner sets them -- count
@@ -451,6 +474,8 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     if (outer_armed) memcpy(s_spu_halt_env, outer_env, sizeof(jmp_buf));
 #ifdef SPU_HAVE_MXCSR
     if (s_ftz) _mm_setcsr(csr_in);
+#elif defined(SPU_HAVE_FPCR)
+    if (s_ftz) spu_fpcr_set(fpcr_in);
 #endif
     return halted;
 }
