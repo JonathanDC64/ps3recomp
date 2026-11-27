@@ -190,6 +190,9 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 
+/* For a title's host, not the title: 1 while a movie plays (cellSail.c). */
+int cellSail_host_movie_playing(void);
+
 #ifdef __cplusplus
 }
 #endif

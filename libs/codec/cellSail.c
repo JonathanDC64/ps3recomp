@@ -439,6 +439,17 @@ static void sail_check_end(int slot, int eos)
     }
 }
 
+/* For a title's host (cellSail.h): 1 while a player plays a movie, from its start until its end is reported or it
+ * is closed (a stream skipped or not playable here ends at once, and counts not). Read without the lock: a hint
+ * for input, such as a host letting a mouse click skip the movie as the title's own button does. */
+int cellSail_host_movie_playing(void)
+{
+    for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
+        if (s_sail_players[i].in_use && s_sail_players[i].playing && s_sail_players[i].movie) return 1;
+    }
+    return 0;
+}
+
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 {
     printf("[cellSail] PlayerBoot(0x%08X, user=0x%llX)\n", handle, (unsigned long long)userParam);
