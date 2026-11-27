@@ -235,10 +235,19 @@ static SDL_Gamepad* s_sdl3_pads[PAD_MAX_HOST_PORTS];
  * PAD_DEADZONE_ANTI (percent, default 0) where the distance starts from there
  * (pad_stick_tilt_to_u8). Unset or empty: the deadzone above, unchanged. Live.
  *
- * stick: 0 left, 1 right, -1 the deadzone above whatever those say. */
+ * PAD_AXIAL_LEFT and PAD_AXIAL_RIGHT: an axial deadzone for that stick before
+ * the others, percent of travel (pad_stick_axial), for a stick that wavers
+ * sideways while pushed straight. Unset, empty or 0: off. Live.
+ *
+ * stick: 0 left, 1 right, -1 the deadzone above whatever those say (and no
+ * axial deadzone). */
 static void pad_host_stick_stage(int stick, float x, float y, u8* out_x, u8* out_y)
 {
-    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0;
+    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0, xl = -1, xr = -1;
+    PS3_KNOB(xl, pad_stick_zone_percent(getenv("PAD_AXIAL_LEFT")));
+    PS3_KNOB(xr, pad_stick_zone_percent(getenv("PAD_AXIAL_RIGHT")));
+    const int axial = stick == 0 ? xl : stick == 1 ? xr : -1;
+    if (axial > 0) pad_stick_axial(&x, &y, axial / 100.0f);
     PS3_KNOB(d, ps3_env_int("PAD_STICK_DEADZONE", 7849));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
     PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));
@@ -1284,6 +1293,59 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* Seconds, to the microsecond, for the stick smoothing's time steps (GetTickCount64 moves in steps of about 16 ms on
+ * Windows, as long as two polls at 120 frames a second). */
+static double pad_now_s(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart / (double)f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+#endif
+}
+
+/* PAD_SMOOTH_LEFT and PAD_SMOOTH_RIGHT: smoothing of that stick on every pad, 0 off (the default), 1 light, 2 medium,
+ * 3 strong (pad_stick_smooth, a One-Euro filter). It runs on each port's stick after the deadzones and before the
+ * keyboard's keys are merged in, so a key that moves a stick moves it at once. Live. */
+static void pad_smooth_sticks(void)
+{
+    static int sl = 0, sr = 0, on = 0;
+    static PadStickSmooth s_f[PAD_MAX_HOST_PORTS][2];
+    static double s_t;
+    PS3_KNOB(sl, ps3_env_int("PAD_SMOOTH_LEFT", 0));
+    PS3_KNOB(sr, ps3_env_int("PAD_SMOOTH_RIGHT", 0));
+    const double now = pad_now_s();
+    const float dt = s_t > 0.0 ? (float)(now - s_t) : 0.0f;
+    s_t = now;
+    if ((sl < 1 || sl > 3) && (sr < 1 || sr > 3)) {
+        if (on) memset(s_f, 0, sizeof s_f), on = 0;
+        return;
+    }
+    on = 1;
+    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+        PadHostState* hs = &s_host_state[p];
+        for (int k = 0; k < 2; k++) {
+            PadStickSmooth* f = &s_f[p][k];
+            if (!hs->connected) {
+                f->primed = 0;
+                continue;
+            }
+            u8* bx = k ? &hs->analog_rx : &hs->analog_lx;
+            u8* by = k ? &hs->analog_ry : &hs->analog_ly;
+            float x = (*bx - 128) / 128.0f, y = (*by - 128) / 128.0f;
+            pad_stick_smooth(f, k ? sr : sl, dt, &x, &y);
+            *bx = pad_stick_axis_u8(x);
+            *by = pad_stick_axis_u8(y);
+        }
+    }
+}
+
 /* PAD_MAP: gamepad button remapping, for every host port.
  * A list of game=host pairs, e.g. "cross=circle,circle=cross,l1=r2":
  * the game's cross reads the host's circle, and so on. Names: cross circle
@@ -1918,6 +1980,7 @@ static void pad_poll_backend(void)
 #endif
     pad_tell_devices();
     pad_apply_controller();
+    pad_smooth_sticks();
     pad_publish_devices();
     pad_keep_raw();
     pad_apply_map();   /* the pads only: the keyboard has its own keys */
