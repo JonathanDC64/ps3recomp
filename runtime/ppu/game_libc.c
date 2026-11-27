@@ -38,7 +38,8 @@
  *
  * On arm64 macOS (a Mach-O dylib linked with ld64.lld -nostdlib) the same as
  * on Linux, with the copies written as plain loops (there is no rep movsb),
- * and memset_pattern16, which the compiler calls there on its own as well.
+ * and memset_pattern16 and bzero, which the compiler calls there on its own
+ * as well.
  * dyld runs the module's initialisers at the dlopen, as Linux's loader does.
  * Mach-O names a thread-local through a descriptor that points at dyld's
  * __tlv_bootstrap until dyld fills it in, so the link reads
@@ -165,6 +166,13 @@ PS3_GL_FN void memset_pattern16(void* dst, const void* pattern, size_t n)
     }
     const unsigned char* p = (const unsigned char*)pattern;
     for (size_t i = 0; i < n; i++) d[i] = p[i];
+}
+
+/* Darwin's too: the compiler may turn a zeroing of unknown size into a call to
+ * this (LLVM 23 does; 22 did not, in the lift). */
+PS3_GL_FN void bzero(void* dst, size_t n)
+{
+    memset(dst, 0, n);
 }
 #endif
 #endif /* x86-64, arm64 */
