@@ -359,8 +359,10 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
  * PS3RECOMP_RSX_D3D12_VKD3D), Metal on Apple, and the null backend's headless
  * software path anywhere else -- the same selection runtime/host/host_posix.c
  * makes, so the ticker below is backend-agnostic and a POSIX host gets a
- * frame clock instead of no clock at all. */
-#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D)
+ * frame clock instead of no clock at all. A Mac built with the portable
+ * renderer goes through its route switch too (rsx_out.c has it there with the
+ * Vulkan backend alone). */
+#if defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D) || (defined(__APPLE__) && defined(PS3RECOMP_RSX_HAL))
 #if defined(PS3RECOMP_RSX_HAL)
 /* Built with the portable renderer: the route switch picks the new path (its
  * D3D12 the default on Windows) or the legacy renderer at run time
@@ -2070,7 +2072,7 @@ extern "C" volatile long g_rsx_prof_toggle;
 extern "C" void rsx_prof_begin(const char* prefix);
 extern "C" int  rsx_prof_end(char* digest, size_t cap);
 extern "C" void rsx_prof_title(const char* note);
-#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D))
+#if defined(PS3RECOMP_RSX_HAL) && (defined(_WIN32) || defined(PS3RECOMP_RSX_D3D12_VKD3D) || defined(__APPLE__))
 /* Built with the portable renderer: the session is the picked renderer's. */
 #  define rsx_prof_begin rsx_out_prof_begin
 #  define rsx_prof_end   rsx_out_prof_end
