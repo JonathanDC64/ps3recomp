@@ -22,6 +22,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <dlfcn.h>   /* an app's own Vulkan loader (volk_ready) */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Handle slots (gpu_d3d12.c's rules)
@@ -170,6 +173,22 @@ static void messenger_info(gpu_vk_device* dd, VkDebugUtilsMessengerCreateInfoEXT
 static int volk_ready(void)
 {
     static int done = 0;   /* (the library stays loaded for the process) */
+#if defined(__APPLE__)
+    /* A Mac app carries its own Vulkan loader, in Contents/Frameworks beside
+     * the program's Contents/MacOS: that one first. volk's own search names
+     * libvulkan.dylib alone, then /usr/local/lib and MoltenVK, none of which
+     * is in the app; dlopen takes the @executable_path form. Outside an app
+     * (a build folder) there is no such file and volk searches as before. */
+    if (!done) {
+        void* lib = dlopen("@executable_path/../Frameworks/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+        PFN_vkGetInstanceProcAddr gipa = lib ? (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr") : NULL;
+        if (gipa) {
+            volkInitializeCustom(gipa);
+            printf("[VK] the app's own Vulkan loader (Contents/Frameworks)\n");
+            done = 1;
+        }
+    }
+#endif
     if (!done && volkInitialize() == VK_SUCCESS) done = 1;
     return done;
 }
