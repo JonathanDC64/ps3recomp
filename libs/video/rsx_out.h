@@ -153,7 +153,7 @@ extern const rsx_route rsxc_route_d3d12;
 /* The step a failed start stopped at (rsxc_d3d12.c), NULL after none. */
 const char* rsxc_d3d12_start_failed(void);
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 extern const rsx_route rsxc_route_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern const rsx_route rsxc_route_vk;   /* rsxc_vk.c */
@@ -227,7 +227,7 @@ typedef struct rsx_route_gpu {
 #if defined(_WIN32)
 extern const rsx_route_gpu rsxc_route_gpu_d3d12;
 #endif
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
 extern const rsx_route_gpu rsxc_route_gpu_null;
 #if defined(PS3RECOMP_RSX_HAL_VULKAN)
 extern const rsx_route_gpu rsxc_route_gpu_vk;
