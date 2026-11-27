@@ -16,6 +16,8 @@
  * keeps those layouts stable within a major version, so the library opened is
  * the major the headers describe (libavcodec.so.63 / avcodec-63.dll for
  * FFmpeg 9.0) and is rejected if avcodec_version() reports another one.
+ * On a Mac it is looked for in an app's Contents/Frameworks, then beside the
+ * program, then by dyld's own search for the bare name.
  *
  * Run-time switches:
  *   PS3RECOMP_FFMPEG=0          never load FFmpeg (callback-only behaviour)

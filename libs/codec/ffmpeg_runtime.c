@@ -43,10 +43,30 @@ static void   ff_close(ff_lib l) { dlclose(l); }
 static PS3FFmpeg s_ff;
 static int s_state;   /* 0 not tried, 1 loaded, -1 unavailable */
 
-static const char* env_or(const char* name, const char* dflt)
+/* Where the libraries are looked for, in order; "" is the system's own search for the bare name. A Mac app
+ * carries them in Contents/Frameworks beside the program's Contents/MacOS, and a Mac program folder beside the
+ * program: dyld's search for a bare name (the current folder, /usr/local/lib, /usr/lib) finds neither. */
+#if defined(__APPLE__)
+static const char* const ff_dirs[] = { "@executable_path/../Frameworks/", "@executable_path/", "" };
+#else
+static const char* const ff_dirs[] = { "" };
+#endif
+
+/* The library named by the environment variable `env` when it is set (that path alone), else `name` in ff_dirs'
+ * places. *used is the path tried last, for the message when none opens. */
+static ff_lib ff_open_lib(const char* env, const char* name, char* used, size_t cap)
 {
-    const char* v = getenv(name);
-    return (v && *v) ? v : dflt;
+    const char* v = getenv(env);
+    if (v && *v) {
+        snprintf(used, cap, "%s", v);
+        return ff_open(used);
+    }
+    for (size_t i = 0; i < sizeof ff_dirs / sizeof ff_dirs[0]; i++) {
+        snprintf(used, cap, "%s%s", ff_dirs[i], name);
+        ff_lib l = ff_open(used);
+        if (l) return l;
+    }
+    return NULL;
 }
 
 static int ff_load(void)
@@ -56,12 +76,12 @@ static int ff_load(void)
         printf("[ffmpeg] disabled by PS3RECOMP_FFMPEG=0\n");
         return -1;
     }
-    const char* util_path  = env_or("PS3RECOMP_FFMPEG_AVUTIL", FF_AVUTIL_NAME);
-    const char* codec_path = env_or("PS3RECOMP_FFMPEG_AVCODEC", FF_AVCODEC_NAME);
+    char util_path[512], codec_path[512];
     /* avutil first: avcodec depends on it, and on Windows the loader finds an
      * already-loaded avutil by name. */
-    ff_lib util = ff_open(util_path);
-    ff_lib codec = util ? ff_open(codec_path) : NULL;
+    ff_lib util = ff_open_lib("PS3RECOMP_FFMPEG_AVUTIL", FF_AVUTIL_NAME, util_path, sizeof util_path);
+    ff_lib codec = util ? ff_open_lib("PS3RECOMP_FFMPEG_AVCODEC", FF_AVCODEC_NAME, codec_path, sizeof codec_path)
+                        : NULL;
     if (!util || !codec) {
         printf("[ffmpeg] %s not found; decoders stay callback-only\n",
                util ? codec_path : util_path);
