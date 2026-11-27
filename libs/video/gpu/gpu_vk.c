@@ -204,6 +204,12 @@ static int instance_make(gpu_vk_device* dd, int validation)
         }
         dd->has_surface = platform != 0;
     }
+#if defined(__APPLE__)
+    /* A Mac's Vulkan drivers (MoltenVK, KosmicKrisp) are "portability"
+     * drivers: the loader lists them only to an instance that asks. */
+    const int portability = ext_has(ep, n, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    if (portability) list_add(&ext, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+#endif
     if (dd->has_surface && ext_has(ep, n, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
         list_add(&ext, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
         dd->has_colorspace = 1;
@@ -280,6 +286,9 @@ static int instance_make(gpu_vk_device* dd, int validation)
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = ext.n;
     ci.ppEnabledExtensionNames = ext.name;
+#if defined(__APPLE__)
+    if (portability) ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
     if (validation) {
         ci.enabledLayerCount = 1;
         ci.ppEnabledLayerNames = &layer;
@@ -465,6 +474,10 @@ static int device_make(gpu_vk_device* dd, const gpu_device_desc* desc, uint32_t 
 #ifdef _WIN32
     const int e_fse = e_swap && dd->has_surface_caps2 && ext_has(ep, n, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
 #endif
+#if defined(__APPLE__)
+    /* (a portability driver's device: made with the extension that says so, as Vulkan requires) */
+    const int e_port = ext_has(ep, n, "VK_KHR_portability_subset");
+#endif
     free(ep);
     {
         void** tail = &a2.pNext;
@@ -589,6 +602,9 @@ static int device_make(gpu_vk_device* dd, const gpu_device_desc* desc, uint32_t 
     if (use_hdr) list_add(&ext, VK_EXT_HDR_METADATA_EXTENSION_NAME);
 #ifdef _WIN32
     if (e_fse) list_add(&ext, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+#endif
+#if defined(__APPLE__)
+    if (e_port) list_add(&ext, "VK_KHR_portability_subset");
 #endif
 
     const float prio = 1.0f;

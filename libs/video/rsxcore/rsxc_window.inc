@@ -872,9 +872,24 @@ static DWORD WINAPI window_thread(LPVOID p)
     return 0;
 }
 
+#if defined(__APPLE__)
+#include "../../../runtime/platform/plat.h"   /* plat_on_first_thread */
+/* macOS: the window's thread is the first one (plat.h, plat_main): AppKit,
+ * and so SDL's Cocoa video, run windows there only. */
+static void window_on_first_thread(void* p) { (void)window_thread(p); }
+#endif
+
 static HWND open_window(u32 width, u32 height, const char* title)
 {
     window_thread_args a = {width, height, title, CreateEventA(NULL, TRUE, FALSE, NULL)};
+#if defined(__APPLE__)
+    if (a.ready && plat_on_first_thread(window_on_first_thread, &a)) {
+        WaitForSingleObject(a.ready, INFINITE);
+        CloseHandle(a.ready);
+        return s_d3d.hwnd;
+    }
+    printf("[D3D12] nothing serves the first thread (plat_main): the window's own thread, where macOS opens none\n");
+#endif
     HANDLE t = a.ready ? CreateThread(NULL, 0, window_thread, &a, 0, NULL) : NULL;
     if (!t) {
         if (a.ready) CloseHandle(a.ready);

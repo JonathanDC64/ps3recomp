@@ -2648,7 +2648,16 @@ static void start_test_stops(void)
     }
 }
 
+#if defined(__APPLE__)
+/* macOS runs windows on the first thread only: the body below goes to a
+ * thread of its own, and the first thread runs the game window's (plat.h,
+ * plat_main). */
+static int boot_main(int argc, char** argv);
+int main(int argc, char** argv) { return plat_main(boot_main, argc, argv); }
+static int boot_main(int argc, char** argv)
+#else
 int main(int argc, char** argv)
+#endif
 {
 #ifdef _WIN32
     /* A DLL loaded by name comes from this program's folder or System32 only, never from the working folder or
