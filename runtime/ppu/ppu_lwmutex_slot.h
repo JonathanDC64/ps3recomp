@@ -35,6 +35,17 @@ struct LwmSlot { volatile long addr;
 
 static inline int lwm_try(struct LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
 
+/* A relaxed read of one of the slot's words, for a hint that the exchange or the path after it settles. (Not
+ * ReadNoFence: that takes Windows' 32-bit LONG, and these are long, 64-bit on Linux and macOS.) */
+static inline long lwm_peek(volatile long* p)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return *p;
+#else
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+#endif
+}
+
 /* The waiters count, read after this thread's exchange of the count (lwm_release). With lwm_wait's increment and
  * retry it is a Dekker handshake: each side writes its own word and then reads the other's, and one of them must see
  * the other's write, or a locker sleeps on a free lock with nobody to wake it. x86's locked exchange is a full fence,
@@ -95,7 +106,7 @@ static inline void lwm_unqueue(struct LwmSlot* s, struct LwmWaiter* w)   /* unde
 static inline int lwm_wait(struct LwmSlot* s, DWORD ms, int fifo)
 {
     for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
-        if (ReadNoFence(&s->cnt) && lwm_try(s)) return 1;   /* (a hint: the exchange decides) */
+        if (lwm_peek(&s->cnt) && lwm_try(s)) return 1;   /* (a hint: the exchange decides) */
         YieldProcessor();
     }
     const ULONGLONG t0 = GetTickCount64();
@@ -135,7 +146,7 @@ static inline int lwm_wait(struct LwmSlot* s, DWORD ms, int fifo)
  * taken. */
 static inline void lwm_release(struct LwmSlot* s, int fifo)
 {
-    if (fifo && ReadNoFence(&s->waiters)) {   /* (a hint: missed, the path below still wakes them) */
+    if (fifo && lwm_peek(&s->waiters)) {   /* (a hint: missed, the path below still wakes them) */
         AcquireSRWLockExclusive(&s->lk);
         struct LwmWaiter* h = s->qhead;
         if (h && lwm_qpc() - h->since >= lwm_fair_ticks()) {
