@@ -1,0 +1,66 @@
+# Re-runs the jobs of a macOS run (macos.yml) that no Mac ever took.
+#
+# GitHub gives a hosted job about 15 minutes to get a machine. When its macOS arm64 runners are short ("Due to
+# capacity constraints, jobs targeting macOS arm64 runners may experience longer queue times"), a job is "not acquired
+# by Runner of type hosted even after multiple attempts": it is cancelled with no step run, and its run stays red until
+# someone re-runs it. No setting in a workflow makes that wait longer (timeout-minutes counts from when a machine has
+# the job), so this waits for the run to end and re-runs only those jobs, up to three times: a job can wait about an
+# hour in all.
+#
+# It never re-runs a job that ran and failed, or one cancelled for another reason (only the "not acquired" note
+# counts), nor a run that a newer one on the same branch replaced: a re-run of that would cancel the newer one.
+# It runs from master's copy of this file, for runs on any branch.
+name: macOS retry
+
+on:
+  workflow_run:
+    workflows: [ "macOS" ]
+    types: [ completed ]
+
+permissions:
+  actions: write   # the re-run
+  checks: read     # the jobs' notes
+
+concurrency:
+  group: macos-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    if: github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN: ${{ github.event.workflow_run.id }}
+      WORKFLOW: ${{ github.event.workflow_run.path }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - name: Re-run the jobs no Mac took
+        run: |
+          while :; do
+            attempt=$(gh api "repos/$REPO/actions/runs/$RUN" --jq .run_attempt)
+            ids=$(gh api --paginate "repos/$REPO/actions/runs/$RUN/attempts/$attempt/jobs" \
+                    --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "cancelled") | .id')
+            if [ -z "$ids" ]; then echo "Run $RUN has no failed job."; exit 0; fi
+            for id in $ids; do
+              if ! gh api "repos/$REPO/check-runs/$id/annotations" --jq '.[].message' | grep -q 'not acquired by Runner'; then
+                echo "Job $id ran (or was cancelled for another reason): not re-run."
+                exit 0
+              fi
+            done
+            if [ "$attempt" -ge 4 ]; then echo "Still no Mac after three re-runs of run $RUN."; exit 1; fi
+            newest=$(gh run list --repo "$REPO" --workflow "${WORKFLOW##*/}" --branch "$BRANCH" --limit 1 \
+                       --json databaseId --jq '.[0].databaseId')
+            if [ "$newest" != "$RUN" ]; then echo "Run $newest replaced run $RUN: not re-run."; exit 0; fi
+            echo "Attempt $attempt had no Mac for: $(echo $ids). Re-running them."
+            gh run rerun "$RUN" --repo "$REPO" --failed
+            until [ "$(gh api "repos/$REPO/actions/runs/$RUN" --jq .run_attempt)" -gt "$attempt" ]; do sleep 10; done
+            sleep 30
+            while [ "$(gh api "repos/$REPO/actions/runs/$RUN" --jq .status)" != completed ]; do sleep 60; done
+            if [ "$(gh api "repos/$REPO/actions/runs/$RUN" --jq .conclusion)" = success ]; then
+              echo "Run $RUN passed."
+              exit 0
+            fi
+          done

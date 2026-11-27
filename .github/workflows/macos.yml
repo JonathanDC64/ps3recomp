@@ -15,6 +15,8 @@
 # workflow run macos.yml --ref <branch>) for a change that needs it before it
 # merges. It is not a required check. A newer run cancels the one it supersedes,
 # and a job that hangs stops at the timeout instead of holding a machine.
+# A job that never gets a machine (GitHub gives up after about 15 minutes) is
+# re-run by macos-retry.yml, up to three times.
 #
 # It ran once a night until November 2026, but GitHub started that scheduled run
 # 10 to 12 hours late and then no Mac took its jobs, so every night was red
