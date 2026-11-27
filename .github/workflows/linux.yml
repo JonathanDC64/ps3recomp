@@ -88,7 +88,7 @@ jobs:
         id: deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config clang libvulkan-dev libvulkan1 \
+          sudo apt-get install -y ninja-build pkg-config clang lld libvulkan-dev libvulkan1 \
             mesa-vulkan-drivers vulkan-validationlayers flex bison libjson-perl spirv-headers xvfb \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
 
@@ -487,6 +487,13 @@ jobs:
             -std=gnu17 -msse4.1 -I include -I runtime/spu \
             -o /tmp/test_spu_synth_hook runtime/spu/tests/test_spu_synth_hook.c -lm
           /tmp/test_spu_synth_hook
+
+      # The game module split (include/ps3emu/game_module.h): a small freestanding module built as a split build's
+      # is (clang and lld, whatever compiles the host), and a host that loads it through runtime/ppu/game_host.c
+      # (runtime/ppu/tests/game_split/run.sh says what it checks).
+      - name: Run the split test (a freestanding game module)
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: HOST_CC=${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} bash runtime/ppu/tests/game_split/run.sh
 
       # libs/system/tests: the dialog callbacks and the savedata suites. They leave runtime symbols they never call
       # undefined, so each function and object gets its own section and the linker drops the ones nothing reaches

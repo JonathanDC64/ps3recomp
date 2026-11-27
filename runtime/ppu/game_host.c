@@ -18,9 +18,9 @@
  * The C library functions a freestanding module calls (PS3_GAME_HOST_CRT_FUNCS)
  * are this exe's own, declared by the C runtime's headers.
  *
- * Windows loads a DLL, Linux an ELF shared object with dlopen. What differs
- * is five small functions below (gh_exe_dir, gh_open, gh_symbol, gh_error,
- * gh_ms); ps3_game_load is the same on both.
+ * Windows loads a DLL, Linux an ELF shared object and macOS a Mach-O dylib,
+ * both with dlopen. What differs is five small functions below (gh_exe_dir,
+ * gh_open, gh_symbol, gh_error, gh_ms); ps3_game_load is the same on all.
  */
 #if defined(PS3_GAME_SPLIT)
 #include <math.h>
@@ -36,14 +36,19 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath */
+#endif
 #endif
 #include "ps3emu/ps3_knob.h"
 #include "ps3emu/game_module.h"
 #include "ps3emu/game_split.h"   /* force-included as well; the guard makes that harmless */
 
 #ifndef PS3_GAME_MODULE_NAME
-#ifdef _WIN32
+#if defined(_WIN32)
 #define PS3_GAME_MODULE_NAME "game.dll"
+#elif defined(__APPLE__)
+#define PS3_GAME_MODULE_NAME "game.dylib"
 #else
 #define PS3_GAME_MODULE_NAME "game.so"
 #endif
@@ -92,6 +97,23 @@ static uint64_t gh_ms(void)
     return (uint64_t)GetTickCount64();
 }
 #else
+#ifdef __APPLE__
+/* The path the exe was started by, with its links and dots resolved, as
+ * /proc/self/exe is on Linux. */
+static int gh_exe_dir(char* out, size_t size)
+{
+    char raw[PS3_GH_PATH_MAX];
+    uint32_t n = (uint32_t)sizeof raw;
+    if (_NSGetExecutablePath(raw, &n) != 0) return 0;
+    char* path = realpath(raw, NULL);
+    if (!path) return 0;
+    char* slash = strrchr(path, 47);
+    if (slash) slash[1] = 0; else path[0] = 0;
+    const int ok = snprintf(out, size, "%s", path) < (int)size;
+    free(path);
+    return ok;
+}
+#else
 static int gh_exe_dir(char* out, size_t size)
 {
     char path[PS3_GH_PATH_MAX];
@@ -102,6 +124,7 @@ static int gh_exe_dir(char* out, size_t size)
     if (slash) slash[1] = 0; else path[0] = 0;
     return snprintf(out, size, "%s", path) < (int)size;
 }
+#endif
 /* RTLD_LOCAL: the module's names stay out of the global scope (it exports
  * only its init anyway). RTLD_NOW: an unresolved name fails here, not at a
  * first call in the middle of play. */

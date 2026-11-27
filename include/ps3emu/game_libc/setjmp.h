@@ -3,7 +3,7 @@
  * ps3emu/game_freestanding.h).
  *
  * The type as the host's C library defines it (MSVC's header on x64, glibc's on
- * x86-64 Linux), and _setjmp and longjmp, which are jump thunks to the host's
+ * x86-64 Linux, macOS's on arm64), and _setjmp and longjmp, which are jump thunks to the host's
  * (PS3_GAME_HOST_CRT_FUNCS). The lift calls them for the guest setjmp and
  * longjmp (ppu_lifter.py, SJLJ_SUPPORT). The runtime's own longjmp (thread
  * exit, spu_halt) unwinds through the module's frames with their unwind tables,
@@ -28,6 +28,14 @@ typedef _JBTYPE jmp_buf[_JBLEN];
 
 int __cdecl _setjmp(jmp_buf);
 __declspec(noreturn) void __cdecl longjmp(jmp_buf, int);
+#elif defined(__APPLE__) && defined(__aarch64__)
+/* macOS's, arm64 (its <arm/_setjmp.h>): x19-x28, fp, lr and sp, d8-d15, and
+ * two words for the signal mask, as ints. */
+#define _JBLEN ((14 + 8 + 2) * 2)
+typedef int jmp_buf[_JBLEN];
+
+int _setjmp(jmp_buf) __attribute__((returns_twice));
+void longjmp(jmp_buf, int) __attribute__((noreturn));
 #else
 /* glibc's, x86-64: the registers, then whether a signal mask was saved and the
  * mask (a sigset_t, 1024 bits). _setjmp saves none. */
