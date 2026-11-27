@@ -149,6 +149,15 @@ jobs:
                 -o /tmp/test_spu_synth_hook runtime/spu/tests/test_spu_synth_hook.c -lm
           /tmp/test_spu_synth_hook
 
+      # The game module split (include/ps3emu/game_module.h) as a Mach-O dylib: a small freestanding module built
+      # with Homebrew's clang and ld64.lld and no SDK, as setup's own toolchain builds the game's, and a host that
+      # loads it through runtime/ppu/game_host.c (runtime/ppu/tests/game_split/run.sh says what it checks).
+      - name: Run the split test (a freestanding game module)
+        run: |
+          brew install llvm lld
+          export PATH="$(brew --prefix lld)/bin:$PATH"
+          MODULE_CC="$(brew --prefix llvm)/bin/clang" bash runtime/ppu/tests/game_split/run.sh
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
