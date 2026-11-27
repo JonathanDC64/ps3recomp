@@ -27,7 +27,13 @@ void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
-static uint16_t s_p2p_port = 36658;
+/* The instance's P2P port and a second instance's. Below 32768, out of every system's ephemeral ports (Linux
+ * 32768-60999, Windows and macOS 49152-65535): another program's outgoing connection can sit on a port in that
+ * range, and the P2P stream sockets' bind (which shares the port with SO_REUSEADDR) then falls back to an
+ * ephemeral one, so the connect below found no listener now and then on CI's Linux runners. */
+#define P2P_PORT  23658
+#define P2P_PORT2 23659
+static uint16_t s_p2p_port = P2P_PORT;
 uint16_t np_psnr_p2p_port(void) { return s_p2p_port; }
 
 /* np_psnr's side of NAT traversal (tested for real in test_np_nat.c): here,
@@ -238,7 +244,7 @@ int main(void)
         memset(&o, 0, sizeof(o));
         o.sin_family = AF_INET;
         o.sin_addr.s_addr = htonl(INADDR_ANY);
-        o.sin_port = htons(36658);
+        o.sin_port = htons(P2P_PORT);
         assert(bind(other, (struct sockaddr*)&o, sizeof(o)) == 0);
         int32_t busy = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
         put_sockaddr(ADDR_A, 0x0A000001u, 3658);
@@ -257,8 +263,8 @@ int main(void)
     assert(C3("bind", p2p, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
     assert(C3("getsockname", p2p, ADDR_B, LEN) == 0);
-    assert(vm_read16(ADDR_B + 2) == 36658 && vm_read32(ADDR_B + 4) == 0);
-    put_sockaddr(ADDR_A, LOOP, 36658);
+    assert(vm_read16(ADDR_B + 2) == P2P_PORT && vm_read32(ADDR_B + 4) == 0);
+    put_sockaddr(ADDR_A, LOOP, P2P_PORT);
     memcpy(vm_base + BUF, "p2p", 3);
     assert(call("sendto", p2p, BUF, 3, 0, ADDR_A, 16) == 3);   /* to itself */
     assert(C3("socketpoll", POLLFD, 0, 0) == 0);
@@ -274,8 +280,8 @@ int main(void)
     {
         const uint8_t lo[4] = { 127, 0, 0, 1 };
         assert(s_sender);
-        assert(s_sender("PSNR\x02zzzz", 9, lo, 36658) == 9);
-        assert(s_sender("game", 4, lo, 36658) == 4);
+        assert(s_sender("PSNR\x02zzzz", 9, lo, P2P_PORT) == 9);
+        assert(s_sender("game", 4, lo, P2P_PORT) == 4);
         vm_write32(POLLFD, (uint32_t)p2p);
         vm_write16(POLLFD + 4, SYS_NET_POLLIN);
         assert(C3("socketpoll", POLLFD, 1, 1000) == 1);
@@ -292,7 +298,7 @@ int main(void)
         put_sockaddr(ADDR_A, 0x0A000001u, 3658);
         vm_write16(ADDR_A + 8, 2000);
         assert(C3("bind", p2, ADDR_A, 16) == 0);
-        put_sockaddr(ADDR_A, LOOP, 36658);
+        put_sockaddr(ADDR_A, LOOP, P2P_PORT);
         vm_write16(ADDR_A + 8, 2000);
         memcpy(vm_base + BUF, "to2000", 6);
         assert(call("sendto", p2p, BUF, 6, 0, ADDR_A, 16) == 6);
@@ -302,7 +308,7 @@ int main(void)
         vm_write32(LEN, 16);
         assert(call("recvfrom", p2, BUF, 64, 0, ADDR_B, LEN) == 6);
         assert(memcmp(vm_base + BUF, "to2000", 6) == 0);
-        assert(vm_read16(ADDR_B + 2) == 36658);   /* from the peer's P2P port */
+        assert(vm_read16(ADDR_B + 2) == P2P_PORT);   /* from the peer's P2P port */
         assert(vm_read16(ADDR_B + 8) == 1000);    /* and its vport */
         vm_write32(POLLFD, (uint32_t)p2p);
         vm_write16(POLLFD + 4, SYS_NET_POLLIN);
@@ -318,7 +324,7 @@ int main(void)
         assert(vm_read16(ADDR_B + 8) == 2000);
         vm_write32(LEN, 16);
         assert(C3("getsockname", p2, ADDR_B, LEN) == 0);
-        assert(vm_read16(ADDR_B + 2) == 36658 && vm_read16(ADDR_B + 8) == 2000);
+        assert(vm_read16(ADDR_B + 2) == P2P_PORT && vm_read16(ADDR_B + 8) == 2000);
         assert(C1("socketclose", p2) == 0);
         assert(s_sender);   /* the P2P port stays open while a DGRAM_P2P socket is bound */
     }
@@ -331,16 +337,16 @@ int main(void)
     int32_t l1 = C3("socket", SYS_NET_AF_INET, 10 /* SOCK_STREAM_P2P */, 0);
     put_sockaddr(ADDR_A, LOOP, 4099);
     assert(C3("bind", l1, ADDR_A, 16) == 0 && C1("listen", l1) == 0);
-    s_p2p_port = 36659;
+    s_p2p_port = P2P_PORT2;
     int32_t l2 = C3("socket", SYS_NET_AF_INET, 10, 0);
     int32_t out = C3("socket", SYS_NET_AF_INET, 10, 0);
     assert(C3("bind", l2, ADDR_A, 16) == 0 && C1("listen", l2) == 0);
     assert(C3("bind", out, ADDR_A, 16) == 0);
     vm_write32(LEN, 16);
-    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == 36659);
-    vm_write16(ADDR_A + 8, 36658);               /* vport = the peer's P2P port */
+    assert(C3("getsockname", out, ADDR_B, LEN) == 0 && vm_read16(ADDR_B + 2) == P2P_PORT2);
+    vm_write16(ADDR_A + 8, P2P_PORT);               /* vport = the peer's P2P port */
     int32_t cr = C3("connect", out, ADDR_A, 16);
-    if (cr != 0) {   /* fails now and then on CI's Linux runners: say why */
+    if (cr != 0) {   /* (say why: the listener's port, which should be P2P_PORT) */
         vm_write32(LEN, 16);
         C3("getsockname", l1, ADDR_B, LEN);
         fprintf(stderr, "P2P stream connect: 0x%08X, errno %u; the listener is on port %u\n", (uint32_t)cr,
@@ -349,8 +355,8 @@ int main(void)
     assert(cr == 0);
     vm_write32(LEN, 16);
     int32_t in = C3("accept", l1, ADDR_B, LEN);
-    assert(in >= 0 && vm_read16(ADDR_B + 2) == 36659 && vm_read16(ADDR_B + 8) == 36659);
-    s_p2p_port = 36658;
+    assert(in >= 0 && vm_read16(ADDR_B + 2) == P2P_PORT2 && vm_read16(ADDR_B + 8) == P2P_PORT2);
+    s_p2p_port = P2P_PORT;
 
     /* A stream a peer opened through psnr's relay arrives as a connected host
      * socket: the P2P listener turns readable, and accept hands it out as the
@@ -436,12 +442,12 @@ int main(void)
         const uint8_t lo[4] = { 127, 0, 0, 1 };
         assert(s_opener && !s_sender);
         assert(s_opener() == 0 && s_sender);
-        assert(s_sender("PSNR\x02zzzz", 9, lo, 36658) == 9);   /* (to itself: the filter takes it) */
+        assert(s_sender("PSNR\x02zzzz", 9, lo, P2P_PORT) == 9);   /* (to itself: the filter takes it) */
         int32_t held = C3("socket", SYS_NET_AF_INET, 6 /* SOCK_DGRAM_P2P */, 0);
         put_sockaddr(ADDR_A, 0x0A000001u, 3658);
         vm_write16(ADDR_A + 8, 1000);
         assert(C3("bind", held, ADDR_A, 16) == 0);
-        put_sockaddr(ADDR_A, LOOP, 36658);
+        put_sockaddr(ADDR_A, LOOP, P2P_PORT);
         memcpy(vm_base + BUF, "held", 4);
         assert(call("sendto", held, BUF, 4, 0, ADDR_A, 16) == 4);
         vm_write32(POLLFD, (uint32_t)held);
@@ -451,7 +457,7 @@ int main(void)
         assert(call("recvfrom", held, BUF, 64, 0, ADDR_B, LEN) == 4 && !memcmp(vm_base + BUF, "held", 4));
         assert(C1("socketclose", held) == 0);
         assert(s_sender);              /* still open */
-        assert(s_opener() == 0 && s_sender("game", 4, lo, 36658) == 4);   /* holding again changes nothing */
+        assert(s_opener() == 0 && s_sender("game", 4, lo, P2P_PORT) == 4);   /* holding again changes nothing */
     }
 
     /* ps3_net_lock_offline: the network is down for good, even with
