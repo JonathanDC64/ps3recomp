@@ -849,12 +849,15 @@ typedef uint64_t fm_t;
 static fm_t mode_inside;
 static volatile float tiny_a = 1e-20f, tiny_b = 1e-20f, tiny_product = -1.0f;
 static volatile float denormal = 1e-40f, denormal_read = -1.0f;
+/* Volatile too: gcc turns x * 1.0f into x, even at -O0, and a copy reads a
+ * denormal without flushing it, with or without DAZ or FZ. */
+static volatile float one = 1.0f;
 static void reads_float_mode(spu_context* ctx)
 {
     (void)ctx;
     mode_inside   = FM_GET();
     tiny_product  = tiny_a * tiny_b;   /* 1e-40: a denormal, or zero */
-    denormal_read = denormal * 1.0f;   /* a denormal read: itself, or zero */
+    denormal_read = denormal * one;    /* a denormal read: itself, or zero */
 }
 static void test_float_mode(void)
 {
