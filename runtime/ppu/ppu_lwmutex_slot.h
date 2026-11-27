@@ -35,6 +35,22 @@ struct LwmSlot { volatile long addr;
 
 static inline int lwm_try(struct LwmSlot* s) { return InterlockedCompareExchange(&s->cnt, 0, 1) == 1; }
 
+/* The waiters count, read after this thread's exchange of the count (lwm_release). With lwm_wait's increment and
+ * retry it is a Dekker handshake: each side writes its own word and then reads the other's, and one of them must see
+ * the other's write, or a locker sleeps on a free lock with nobody to wake it. x86's locked exchange is a full fence,
+ * so on x64 Windows a plain read does. arm64 orders a later plain load, or an acquire one (LDAPR), only after the
+ * exchange's read, not its write: the read could see 0 waiters before this thread's count is visible to the locker,
+ * whose retry then sees the count still taken. A sequentially consistent load (LDAR) cannot pass the exchange's
+ * write; on x86 it is the same plain load. */
+static inline long lwm_waiters_after_exchange(struct LwmSlot* s)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return s->waiters;
+#else
+    return __atomic_load_n(&s->waiters, __ATOMIC_SEQ_CST);
+#endif
+}
+
 /* PPU_LWM_HANDOFF=0: no hand-off for any mutex (the race above). Read once. */
 static inline int lwm_handoff_on(void)
 {
@@ -79,7 +95,7 @@ static inline void lwm_unqueue(struct LwmSlot* s, struct LwmWaiter* w)   /* unde
 static inline int lwm_wait(struct LwmSlot* s, DWORD ms, int fifo)
 {
     for (int i = 0; i < 100; i++) {          /* a short hold ends before a sleep would */
-        if (s->cnt && lwm_try(s)) return 1;
+        if (ReadNoFence(&s->cnt) && lwm_try(s)) return 1;   /* (a hint: the exchange decides) */
         YieldProcessor();
     }
     const ULONGLONG t0 = GetTickCount64();
@@ -119,7 +135,7 @@ static inline int lwm_wait(struct LwmSlot* s, DWORD ms, int fifo)
  * taken. */
 static inline void lwm_release(struct LwmSlot* s, int fifo)
 {
-    if (fifo && s->waiters) {
+    if (fifo && ReadNoFence(&s->waiters)) {   /* (a hint: missed, the path below still wakes them) */
         AcquireSRWLockExclusive(&s->lk);
         struct LwmWaiter* h = s->qhead;
         if (h && lwm_qpc() - h->since >= lwm_fair_ticks()) {
@@ -137,7 +153,7 @@ static inline void lwm_release(struct LwmSlot* s, int fifo)
         return;
     }
     InterlockedExchange(&s->cnt, 1);
-    if (s->waiters) {
+    if (lwm_waiters_after_exchange(s)) {
         AcquireSRWLockExclusive(&s->lk);
         ReleaseSRWLockExclusive(&s->lk);
         WakeConditionVariable(&s->cv);
