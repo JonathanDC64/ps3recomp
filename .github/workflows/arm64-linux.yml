@@ -1,5 +1,5 @@
 # The runtime's thread tests on arm64, on every pull request: GitHub's arm64 Linux machines, which are plentiful
-# where its Macs are not (macos.yml runs the same tests nightly on Apple silicon).
+# where its Macs are not (macos.yml runs the same tests on Apple silicon after each merge).
 #
 # x86-64 orders every store before the next and every load before the next (TSO), so a handoff between threads
 # that has no barrier works there by luck. arm64 does not: a flag can be seen before the data it publishes. These

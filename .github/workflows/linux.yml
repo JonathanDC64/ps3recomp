@@ -32,7 +32,7 @@
 #
 # The portable renderer's builds come first, before the shader tools are installed: a system glslang found at
 # configure time turns the spv target off (cmake/gpu_deps.cmake), and the configure checks below say so if it did.
-# windows.yml builds both renderer options on Windows; macos.yml runs nightly.
+# windows.yml builds both renderer options on Windows; macos.yml runs after each merge.
 name: Linux
 
 on:
