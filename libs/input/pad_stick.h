@@ -100,6 +100,76 @@ static inline void pad_stick_tilt_to_u8(float x, float y, float tilt, float anti
     *out_y = pad_stick_axis_u8(y);
 }
 
+/* An axial deadzone, for a stick that wavers a little sideways while it is pushed straight ahead (a worn or noisy
+ * stick). The radial deadzone above acts on the distance from centre, so once the stick is past it every waver goes
+ * through, and a title that turns the character to the stick direction at once shows each one, more often the higher
+ * the frame rate. Here each axis closer to centre than zone (0 to 1 of full travel) reads 0, and past it the axis runs
+ * from 0 to its end over the travel left, so a stick swept slowly across an axis has no step. It runs on the stick as
+ * the host reads it, before the radial deadzone. 0: off. */
+static inline void pad_stick_axial(float* x, float* y, float zone)
+{
+    if (zone <= 0.0f) return;
+    if (zone >= 1.0f) {
+        *x = *y = 0.0f;
+        return;
+    }
+    const float k = 1.0f / (1.0f - zone);
+    const float ax = fabsf(*x), ay = fabsf(*y);
+    *x = ax <= zone ? 0.0f : copysignf((ax - zone) * k, *x);
+    *y = ay <= zone ? 0.0f : copysignf((ay - zone) * k, *y);
+}
+
+/* Smoothing for one stick: a One-Euro filter (Casiez, Roussel and Vogel, CHI 2012). It is a low-pass filter whose
+ * cutoff rises with the stick's speed: a stick held still or moved slowly is smoothed a lot, so a noisy stick's
+ * flicker goes, and a quick push hardly at all, so a turn keeps its pace. Both axes share the cutoff, from the speed
+ * of the stick as a whole, so the filter never bends the direction. The speed comes from the last reading, as in the
+ * paper, and is itself smoothed at 1 Hz. Time is in seconds, so it smooths the same at any frame rate.
+ *
+ * level 1 light, 2 medium, 3 strong: a cutoff of 1.5, 1 and 0.5 Hz at rest, plus 6, 4 and 2 Hz for each unit of
+ * travel a second. Measured at 30, 60 and 120 readings a second (test_pad_stick.c):
+ * - held full forward with a sideways waver of up to 3% of travel at each reading, the facing that waver gives
+ *   spreads 2.5 to 9 times less (the stronger the level and the more readings, the less);
+ * - a 40 ms flick from forward to right arrives 0 to 17 ms later than unsmoothed;
+ * - a stick moved slowly and steadily (half its travel a second) trails by 35, 53 and 107 ms, the same at every rate.
+ * 0 (or anything else): off.
+ *
+ * dt: the seconds since the last call for this stick. The first call, and one after a gap of more than a quarter of a
+ * second (the title stopped reading the pad), starts from the reading as it is. */
+typedef struct {
+    float x, y;       /* the output */
+    float px, py;     /* the last reading */
+    float dx, dy;     /* the speed, smoothed */
+    int primed;
+} PadStickSmooth;
+
+static inline void pad_stick_smooth(PadStickSmooth* f, int level, float dt, float* x, float* y)
+{
+    static const float min_hz[4] = {0.0f, 1.5f, 1.0f, 0.5f}, per_speed[4] = {0.0f, 6.0f, 4.0f, 2.0f};
+    if (level < 1 || level > 3) {
+        f->primed = 0;
+        return;
+    }
+    if (!f->primed || !(dt > 0.0f) || dt > 0.25f) {
+        f->x = f->px = *x;
+        f->y = f->py = *y;
+        f->dx = f->dy = 0.0f;
+        f->primed = 1;
+        return;
+    }
+    const float two_pi = 6.28318531f;
+    const float ad = 1.0f / (1.0f + 1.0f / (two_pi * 1.0f * dt));
+    f->dx += ad * ((*x - f->px) / dt - f->dx);
+    f->dy += ad * ((*y - f->py) / dt - f->dy);
+    const float hz = min_hz[level] + per_speed[level] * sqrtf(f->dx * f->dx + f->dy * f->dy);
+    const float a = 1.0f / (1.0f + 1.0f / (two_pi * hz * dt));
+    f->px = *x;
+    f->py = *y;
+    f->x += a * (*x - f->x);
+    f->y += a * (*y - f->y);
+    *x = f->x;
+    *y = f->y;
+}
+
 /* A deadzone percent from the environment, or -1 when it isn't one (unset, empty, not a number): -1 leaves the stick
  * on pad_stick_to_u8. Above 100 counts as 100. */
 static inline int pad_stick_zone_percent(const char* e)

@@ -1,4 +1,5 @@
-/* pad_stick.h: the radial deadzone and RPCS3's squircling, one host stick to the PS3's axis bytes.
+/* pad_stick.h: the radial deadzone and RPCS3's squircling, one host stick to the PS3's axis bytes; the axial deadzone
+ * and the smoothing.
  *
  *   cc -std=gnu17 -I libs/input -o test_pad_stick libs/input/tests/test_pad_stick.c -lm
  *   clang-cl /I libs/input /Fe:test_pad_stick.exe libs/input/tests/test_pad_stick.c
@@ -239,6 +240,108 @@ int main(void)
     CHECK(bx == 255 && by == 128, "full push with no zone: (%u, %u)", bx, by);
     pad_stick_tilt_to_u8(0.5f, 0.0f, 0.0f, 0.0f, 0.0f, &bx, &by);
     CHECK(bx == 192 && by == 128, "half push with no zone: (%u, %u)", bx, by);
+
+    /* The axial deadzone. A push straight ahead with a sideways waver inside the zone reads straight ahead; 0 is off;
+     * a full diagonal keeps its corners; a slow sweep across an axis has no step and ends at 1. */
+    {
+        float x = 0.03f, y = -1.0f;
+        pad_stick_axial(&x, &y, 0.05f);
+        CHECK(x == 0.0f && y == -1.0f, "waver inside the zone: (%.3f, %.3f)", x, y);
+        x = -0.03f, y = -1.0f;
+        pad_stick_axial(&x, &y, 0.05f);
+        CHECK(x == 0.0f && y == -1.0f, "waver to the left inside the zone: (%.3f, %.3f)", x, y);
+        x = 0.3f, y = 0.02f;
+        pad_stick_axial(&x, &y, 0.0f);
+        CHECK(x == 0.3f && y == 0.02f, "off: (%.3f, %.3f)", x, y);
+        x = 1.0f, y = -1.0f;
+        pad_stick_axial(&x, &y, 0.25f);
+        CHECK(x == 1.0f && y == -1.0f, "full diagonal: (%.3f, %.3f)", x, y);
+        float last = 0.0f;
+        int smooth = 1;
+        for (int i = 0; i <= 1000; i++) {
+            float sx = i / 1000.0f, sy = -1.0f;
+            pad_stick_axial(&sx, &sy, 0.08f);
+            if (sx < last || sx - last > 0.0015f) smooth = 0;
+            last = sx;
+        }
+        CHECK(smooth && fabsf(last - 1.0f) < 1e-6f, "a sweep across the axis: steps, or ends at %.4f", last);
+        /* Through the bytes, on the DualSense's deadzone: every waver of up to 4 of 127 reads centred sideways. */
+        for (int j = -4; j <= 4; j++) {
+            float wx = j / 127.0f, wy = -1.0f;
+            pad_stick_axial(&wx, &wy, 0.05f);
+            pad_stick_to_u8(wx, wy, DZ, ANTI, 8.0f, &bx, &by);
+            CHECK(bx == 128 && by == 0, "waver %d: (%u, %u)", j, bx, by);
+        }
+    }
+
+    /* Smoothing. Off passes the stick through and keeps no state; the first reading, and one after a gap of more
+     * than a quarter of a second, comes through as it is. */
+    {
+        PadStickSmooth f = {0};
+        float x = 0.4f, y = -0.2f;
+        pad_stick_smooth(&f, 0, 0.01f, &x, &y);
+        CHECK(x == 0.4f && y == -0.2f && !f.primed, "off: (%.3f, %.3f)", x, y);
+        pad_stick_smooth(&f, 2, 0.01f, &x, &y);
+        CHECK(x == 0.4f && y == -0.2f && f.primed, "first reading: (%.3f, %.3f)", x, y);
+        x = -0.9f, y = 0.1f;
+        pad_stick_smooth(&f, 2, 0.5f, &x, &y);
+        CHECK(x == -0.9f && y == 0.1f, "after a gap: (%.3f, %.3f)", x, y);
+    }
+    for (int level = 1; level <= 3; level++)
+        for (int r = 0; r < 3; r++) {
+            const int rate = r == 0 ? 30 : r == 1 ? 60 : 120;
+            const float dt = 1.0f / rate;
+            /* Held full forward with a sideways waver of up to 4 of 127 at each reading (a noisy stick): the facing
+             * it gives spreads at least 2 times less. */
+            PadStickSmooth f = {0};
+            unsigned rng = 12345u;
+            double raw2 = 0.0, out2 = 0.0;
+            for (int i = 0; i < 4 * rate; i++) {
+                rng = rng * 1664525u + 1013904223u;
+                float x = ((int)((rng >> 8) % 9u) - 4) / 127.0f, y = -1.0f;
+                const float raw = atan2f(x, -y);
+                pad_stick_smooth(&f, level, dt, &x, &y);
+                if (i >= rate / 2) {
+                    const float out = atan2f(x, -y);
+                    raw2 += raw * raw;
+                    out2 += out * out;
+                }
+            }
+            CHECK(sqrt(out2) * 2.0 < sqrt(raw2), "level %d at %d a second: spread %.3f of the waver's %.3f", level,
+                  rate, sqrt(out2), sqrt(raw2));
+            /* A 40 ms flick from forward to right: the facing gets to 81 degrees at most 25 ms after the stick's. */
+            PadStickSmooth g = {0};
+            float t_raw = -1.0f, t_out = -1.0f;
+            for (int i = 0; i < rate; i++) {
+                const float t = i * dt, k = t < 0.3f ? 0.0f : fminf(1.0f, (t - 0.3f) / 0.04f), a = k * PI / 2.0f;
+                float x = sinf(a), y = -cosf(a);
+                if (t_raw < 0.0f && atan2f(x, -y) >= 81.0f * PI / 180.0f) t_raw = t;
+                pad_stick_smooth(&g, level, dt, &x, &y);
+                if (t_out < 0.0f && atan2f(x, -y) >= 81.0f * PI / 180.0f) t_out = t;
+            }
+            CHECK(t_out >= 0.0f && t_out - t_raw <= 0.025f, "level %d at %d a second: the flick %.0f ms late", level,
+                  rate, (t_out - t_raw) * 1000.0f);
+        }
+    /* The same smoothing at any rate: a stick moving steadily at half its travel a second trails by about the same
+     * time at 30, 60 and 120 readings a second (within 10 ms). */
+    for (int level = 1; level <= 3; level++) {
+        float lag[3];
+        for (int r = 0; r < 3; r++) {
+            const int rate = r == 0 ? 30 : r == 1 ? 60 : 120;
+            const float dt = 1.0f / rate;
+            PadStickSmooth f = {0};
+            float x = 0.0f, y = 0.0f, in = 0.0f;
+            for (int i = 0; i <= rate; i++) {
+                in = -0.5f + 0.5f * i * dt;
+                x = in, y = 0.0f;
+                pad_stick_smooth(&f, level, dt, &x, &y);
+            }
+            lag[r] = (in - x) / 0.5f;
+        }
+        CHECK(fabsf(lag[0] - lag[2]) < 0.010f && fabsf(lag[1] - lag[2]) < 0.010f,
+              "level %d: trails by %.1f, %.1f and %.1f ms", level, lag[0] * 1000.0f, lag[1] * 1000.0f,
+              lag[2] * 1000.0f);
+    }
 
     if (s_fail) { printf("%d failed\n", s_fail); return 1; }
     printf("pad_stick: all passed\n");

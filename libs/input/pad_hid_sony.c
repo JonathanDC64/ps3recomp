@@ -135,7 +135,11 @@ static int sony_kind(USHORT vid, USHORT pid)
 /* pad_hid_sony.h */
 void pad_hid_sony_stick_stage(int which, float rx, float ry, uint8_t* x, uint8_t* y)
 {
-    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0;
+    static int d = -1, a = -1, q = -1, zl = -1, zr = -1, za = 0, xl = -1, xr = -1;
+    PS3_KNOB(xl, pad_stick_zone_percent(getenv("PAD_AXIAL_LEFT")));        /* (cellPad.c, pad_host_stick_stage) */
+    PS3_KNOB(xr, pad_stick_zone_percent(getenv("PAD_AXIAL_RIGHT")));
+    const int axial = which == 0 ? xl : which == 1 ? xr : -1;
+    if (axial > 0) pad_stick_axial(&rx, &ry, axial / 100.0f);
     PS3_KNOB(d, ps3_env_int("PAD_HID_DEADZONE", 20));
     PS3_KNOB(a, ps3_env_int("PAD_STICK_ANTI_DEADZONE", 13));
     PS3_KNOB(q, ps3_env_int("PAD_STICK_SQUIRCLE", PAD_STICK_SQUIRCLE_DEFAULT));

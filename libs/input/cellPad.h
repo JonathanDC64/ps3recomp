@@ -273,8 +273,10 @@ int cellPad_host_reader_sdl(void);
  * 1 XInput's or SDL's, 2 the HID reader's for a Sony pad, 0 no pad (x and y 0). */
 int cellPad_host_stick_raw(int stick, float* x, float* y);
 
-/* What the title would read for that stick position: x and y through the deadzones in force on that path, to the
- * pad's 0-255 bytes. stick -1 gives the default deadzone whatever PAD_DEADZONE_LEFT and _RIGHT say. */
+/* What the title would read for that stick position: x and y through the deadzones in force on that path (the axial
+ * one too, PAD_AXIAL_LEFT and _RIGHT), to the pad's 0-255 bytes. Not PAD_SMOOTH_LEFT and _RIGHT's smoothing, which
+ * depends on how the stick moves over time. stick -1 gives the default deadzone whatever PAD_DEADZONE_LEFT and _RIGHT
+ * and the axial ones say. */
 void cellPad_host_stick_stage(int path, int stick, float x, float y, unsigned char* out_x, unsigned char* out_y);
 
 /* The device whose button icons the title shows: the last one used on port 0, by pad_glyph.h's rules. 0 before
