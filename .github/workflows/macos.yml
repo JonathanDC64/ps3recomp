@@ -659,3 +659,43 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
+
+  # The runtime as the port builds it for a native Mac (docs in the port: docs/178 route B): the portable renderer
+  # (PS3RECOMP_RSX_HAL) with its Vulkan backend and the compile service's spv target, the game split, no decryptor.
+  # No Homebrew glslang here: the spv target builds the pinned one, and a system one cannot share the build
+  # (cmake/gpu_deps.cmake). Ninja keeps going past a failed file (-k 0), so one run lists every error. Then the GPU
+  # layer's tests that need no GPU: the contract, the null backend (its stream hash is a golden), and the spv target
+  # over the seeded generator's programs.
+  port-runtime:
+    name: macOS arm64 (the port's runtime)
+    runs-on: ${{ inputs.runner || 'macos-15' }}   # Apple Silicon
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Configure
+        run: |
+          set -o pipefail
+          cmake -S . -B build_port -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_BUILD_TESTS=OFF \
+            -DPS3RECOMP_RSX_HAL=ON -DPS3RECOMP_GAME_SPLIT=ON -DPS3RECOMP_NO_DECRYPT=ON | tee cfg.log
+          grep -q "Renderer: *the GPU layer's Vulkan backend" cfg.log
+          grep -q "Renderer: *the compile service's spv target" cfg.log
+
+      - name: Build the runtime
+        run: cmake --build build_port --target ps3recomp_runtime -- -k 0
+
+      - name: Verify architecture
+        run: lipo -info build_port/libps3recomp_runtime.a | grep -q arm64
+
+      - name: The GPU layer's tests
+        run: |
+          cmake --build build_port --target test_gpu_contract test_gpu_null test_gpu_sc_spv -- -k 0
+          ctest --test-dir build_port -R 'gpu_contract|gpu_null|gpu_sc_spv' --output-on-failure
