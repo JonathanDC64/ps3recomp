@@ -1053,6 +1053,7 @@ void sys_memory_init(lv2_syscall_table* t)     { (void)t; }
 void sys_vm_init(lv2_syscall_table* t)         { (void)t; }
 void sys_fs_init(lv2_syscall_table* t)         { (void)t; }
 const char* np_psnr_identity(void)            { return NULL; }
+uint32_t vm_rsx_local_base(void)              { return 0xC0000000u; }   /* vm_local.c: a PS3's */
 
 int sys_event_queue_push_by_id(uint32_t q, uint64_t d0, uint64_t d1,
                                uint64_t d2, uint64_t d3)
