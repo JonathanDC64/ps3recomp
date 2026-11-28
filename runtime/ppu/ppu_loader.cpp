@@ -3402,11 +3402,11 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
                  * garbage value -> pinpoints where the leaked (truncated host)
                  * pointer is stored, so we can identify the struct + leaky HLE. */
                 { static int once = 0; if (!once) { once = 1;
-                    /* scan main RAM + the 0x40000000 object-heap region (where the
-                     * crash 'this'=0x400240A8 lives) + the 0x30000000 libsre region. */
+                    /* scan main RAM + the sys_memory window's start (0x40000000 by default; the object-heap
+                     * region where the crash 'this'=0x400240A8 lives) + the 0x30000000 libsre region. */
                     const uint32_t ranges[][2] = {
                         {0x00010000u, 0x0FF00000u}, {0x30000000u, 0x30200000u},
-                        {0x40000000u, 0x40400000u}, {0x0F800000u, 0x10000000u} };
+                        {vm_sysmem_base(), vm_sysmem_base() + 0x400000u}, {0x0F800000u, 0x10000000u} };
                     char ram[1400]; int rp = snprintf(ram, sizeof ram, "      RAMSCAN 0x%08X at:", bad);
                     int hits = 0;
                     for (int R = 0; R < 4 && rp < 1300; R++)
@@ -3606,8 +3606,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
                    * info = { u32 total_user_memory; u32 available_user_memory } */
         uint32_t info = (uint32_t)ctx->gpr[3];
-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
+        /* 256 MB total, 192 MB available; with a bigger window (PS3_SYSMEM_MB, vm.h), its size for both, so a
+         * title that checks one block against "available" may ask for most of it. */
+        const uint32_t win = vm_sysmem_size();
+        const bool big = win > 0x10000000u;
+        if (info) { vm_write32(info + 0, big ? win : 0x10000000u);
+                    vm_write32(info + 4, big ? win : 0x0C000000u); }
         ctx->gpr[3] = 0;
         return;
     }

@@ -8,6 +8,7 @@
  *   0x00010000 - 0x0FFFFFFF : User-space (main memory, 256 MB)
  *   0x10000000 - 0x1FFFFFFF : RSX mapped memory
  *   0x30000000 - 0x3FFFFFFF : SPU local store windows (raw SPU mapping)
+ *   0x40000000 - 0x4FFFFFFF : sys_memory window (from as low as 0x30100000 with PS3_SYSMEM_MB: vm_sysmem_base)
  *   0xD0000000 - 0xDFFFFFFF : Stack area
  */
 
@@ -56,7 +57,7 @@ extern "C" {
  *
  * It ends where the PPU stacks start, an address the lifted code has built in, so a bigger one starts lower: 512 MB
  * at 0xB0000000, 768 MB at 0xA0000000, 1 GB at 0x90000000, the most cellGcm's offset table covers. That is above
- * everything else the runtime places (sys_memory at 0x40000000, sys_vm at 0x60000000-0x70000000). A title only
+ * everything else the runtime places (sys_memory below 0x50000000, sys_vm at 0x60000000-0x70000000). A title only
  * learns the range through cellGcmGetConfiguration, so one whose heap sizes are constants needs its port to grow
  * them as well. Everything that places or checks local memory goes through these two. */
 #ifdef __cplusplus
@@ -64,6 +65,26 @@ extern "C" {
 #endif
 uint32_t vm_rsx_local_size(void);
 uint32_t vm_rsx_local_base(void);
+#ifdef __cplusplus
+}
+#endif
+
+/* The sys_memory window: [vm_sysmem_base(), VM_SYSMEM_END), where sys_memory_allocate and sys_mmapper hand out a
+ * title's memory (a bump, sys_memory.c). PS3_SYSMEM_MB sets its size in whole MB, 256 (the default: base
+ * 0x40000000, where a real lv2 places these blocks) to 511. Anything else is 256, and says so. Read once, at the
+ * first call.
+ *
+ * The window ends at 0x50000000 whatever its size, so a bigger one starts lower: 511 MB at 0x30100000, right above
+ * a PRX lifted at 0x30000000. That is where RPCS3 puts a title's first blocks. A title asks for its blocks by size,
+ * and gets their addresses from the syscall. One whose heap sizes are constants needs its port to grow them, and
+ * syscall 352 then reports the window's size as both total and available, so one request may use most of it.
+ * Everything that places or checks the window goes through these two. */
+#define VM_SYSMEM_END       0x50000000u
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t vm_sysmem_size(void);
+uint32_t vm_sysmem_base(void);
 #ifdef __cplusplus
 }
 #endif

@@ -23,9 +23,10 @@ uint32_t g_sys_mem_bump_ptr = 0;
 /* Guest window handed out by sys_memory_allocate / sys_mmapper.
  * 0x40000000+ matches where the real lv2 places these allocations (verified
  * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
- * the pre-committed main region, so pages are committed on demand. */
-#define SYS_MEM_ALLOC_BASE  0x40000000u
-#define SYS_MEM_ALLOC_END   0x50000000u
+ * the pre-committed main region, so pages are committed on demand.
+ * PS3_SYSMEM_MB makes it bigger, starting lower (vm.h: vm_sysmem_base). */
+#define SYS_MEM_ALLOC_BASE  vm_sysmem_base()
+#define SYS_MEM_ALLOC_END   VM_SYSMEM_END
 
 static uint32_t s_total_allocated = 0;
 
