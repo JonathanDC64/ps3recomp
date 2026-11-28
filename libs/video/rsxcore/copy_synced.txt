@@ -16,3 +16,4 @@ b0ad491abfec5a98cbd93ce6d54bde423ceb86ce ported #293: below 100%, clamped draws 
 b46cb5f5d39969977e675dcd2d55319c95eadbbb ported #305: the merge of 04184931 (above), ported in the same pull request
 f5c8e6a0c0ba7cc3c9cad0b1c33aabed5c49c230 ported SDL3 off Windows: the vkd3d window's SDL3 calls (events, keys, mouse, displays, fullscreen, the X11 choice) in rsxc_window.inc, in the same pull request
 146b86eb820c562a4ddd039900ed0605a54b19d9 n/a macOS: stubs for the route switch's legacy column, in the section built without D3D12 only (the core has its own routes), in the same pull request
+b4c501b2538a81a91e9165c00635757fa21b0c13 ported PS3_LOCAL_MB: the GPU write-back's range (WBG_BASE, WBG_SIZE) and the guest framebuffer read take local memory's base and size from vm.h, in rsxc_writeback.inc too, in the same pull request
