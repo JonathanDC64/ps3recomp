@@ -29,6 +29,8 @@ int main(int argc, char** argv)
     assert(vm_rsx_local_base() + size == VM_STACK_BASE);
     assert(vm_rsx_local_size() == size);   /* (read once) */
     if (want == 256) assert(vm_rsx_local_base() == 0xC0000000u);   /* a PS3's */
+    /* The write-back's part: all of a PS3's 256 MB, the first 256 MB of a bigger one. */
+    assert(vm_rsx_local_wb_size() == (size < 0x10000000u ? size : 0x10000000u));
     printf("test_vm_local: %s -> %u MB at 0x%08X ok\n", argc == 3 ? argv[2] : "(none)", want, vm_rsx_local_base());
     return 0;
 }

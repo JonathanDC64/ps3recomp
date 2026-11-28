@@ -251,8 +251,24 @@ static gpu_texture off_rt_downscale(int i, int argb)
  * resident. */
 extern uint32_t vm_rsx_local_base(void);   /* runtime/memory/vm.h: cellGcm's localAddress and localSize */
 extern uint32_t vm_rsx_local_size(void);
+extern uint32_t vm_rsx_local_wb_size(void);
 #define WBG_BASE vm_rsx_local_base()   /* RSX local memory: 0xC0000000, or lower with PS3_LOCAL_MB */
-#define WBG_SIZE vm_rsx_local_size()
+#ifdef _WIN32
+#define WBG_SIZE vm_rsx_local_wb_size()   /* the heap's part, at most 256 MB (vm.h); past it, the CPU store */
+#else
+#define WBG_SIZE vm_rsx_local_size()      /* a buffer per target's pages (wbg_place), so all of it */
+#endif
+/* A target in local memory past the part the GPU maps: stored on the CPU, and said once per address (8 at most). */
+static void wbg_past(u32 dst)
+{
+    static u32 seen[8]; static int n;
+    if (dst < WBG_BASE + WBG_SIZE || dst - WBG_BASE >= vm_rsx_local_size()) return;
+    for (int i = 0; i < n; i++) if (seen[i] == dst) return;
+    if (n == 8) return;
+    seen[n++] = dst;
+    fprintf(stderr, "[rsx] write-back: a target at local +0x%08X is past the %u MB the GPU maps; stored on the CPU%c",
+            dst - WBG_BASE, WBG_SIZE >> 20, 10);
+}
 /* state: 0 untried, 1 ready, -1 off. buf: the GPU layer's buffer over RSX
  * local memory (step C5b: gpu_buffer_import_host, today's heap opened on the
  * guest's pages and the buffer placed on it). */
@@ -407,6 +423,7 @@ static u32 wbg_record(int i)
     { static int lg = -1; PS3_KNOB(lg, ps3_env_int("RSX_WRITE_COLOR_LOG", 0));
       if (lg) return 0; }   /* the log compares the CPU store's bytes */
     const u32 gp = r->gpitch, dst = cellGcmResolveLocated(1, r->off);
+    wbg_past(dst);
     if (dst < WBG_BASE || dst - WBG_BASE >= WBG_SIZE || ((dst - WBG_BASE) & 511u) || (gp & 255u) ||
         gp < r->w * 4u || gp > 0x10000 || !r->h ||
         (u64)(dst - WBG_BASE) + (u64)gp * (r->h - 1) + r->w * 4u > WBG_SIZE) return 0;

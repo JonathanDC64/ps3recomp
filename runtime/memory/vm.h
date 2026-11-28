@@ -69,6 +69,20 @@ uint32_t vm_rsx_local_base(void);
 }
 #endif
 
+/* The part of RSX local memory the GPU write-back maps: its first VM_RSX_LOCAL_WB_MAX (a PS3's whole local
+ * memory), or all of it when it is smaller. The renderers open a GPU heap on it, which commits every page, so the
+ * boot reserves it as an allocation of its own and the rest separately (vm_reserve). The rest is then committed
+ * only on first touch, so a bigger local memory costs the PC only the RAM a title fills. A target placed past this
+ * part is stored by the CPU, as one the GPU copy can't address is. */
+#define VM_RSX_LOCAL_WB_MAX 0x10000000u
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t vm_rsx_local_wb_size(void);
+#ifdef __cplusplus
+}
+#endif
+
 /* The sys_memory window: [vm_sysmem_base(), VM_SYSMEM_END), where sys_memory_allocate and sys_mmapper hand out a
  * title's memory (a bump, sys_memory.c). PS3_SYSMEM_MB sets its size in whole MB, 256 (the default: base
  * 0x40000000, where a real lv2 places these blocks) to 511. Anything else is 256, and says so. Read once, at the
