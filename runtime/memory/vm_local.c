@@ -41,3 +41,9 @@ uint32_t vm_rsx_local_base(void)
 {
     return VM_STACK_BASE - vm_rsx_local_size();
 }
+
+uint32_t vm_rsx_local_wb_size(void)
+{
+    const uint32_t size = vm_rsx_local_size();
+    return size < VM_RSX_LOCAL_WB_MAX ? size : VM_RSX_LOCAL_WB_MAX;
+}

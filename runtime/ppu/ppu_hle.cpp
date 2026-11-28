@@ -22,6 +22,7 @@
 #include "ppu_waits.h"     /* console waits */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include "../../libs/spurs/libsre_trace.h" /* LIBSRE_TRACE */
+#include "../memory/vm.h"  /* vm_sysmem_base, VM_SYSMEM_END (the taskset dump) */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -727,7 +728,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                   /* The helper 0x3000b140 does a bitmap atomic on taskset(+0x74)+0xda8 --
                    * the task-slot free bitmap CreateTaskset should have initialized. Dump it. */
                   uint32_t ts = _RW(0x74);
-                  if (ts >= 0x40000000u && ts < 0x50000000u) {
+                  if (ts >= vm_sysmem_base() && ts < VM_SYSMEM_END) {
                       #define _RT(o) ((vm_base[ts+(o)]<<24)|(vm_base[ts+(o)+1]<<16)|(vm_base[ts+(o)+2]<<8)|vm_base[ts+(o)+3])
                       fprintf(stderr, "    taskset@0x%08X +0xda8 slot-bitmap: %08X %08X %08X %08X | +0x00:%08X +0x08:%08X\n",
                           ts, _RT(0xda8), _RT(0xdac), _RT(0xdb0), _RT(0xdb4), _RT(0x00), _RT(0x08));

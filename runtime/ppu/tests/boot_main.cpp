@@ -2580,6 +2580,7 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
  * pointed elsewhere, and Demon's Souls could never write a new save. */
 extern "C" uint32_t vm_rsx_local_base(void);   /* runtime/memory/vm.h */
 extern "C" uint32_t vm_rsx_local_size(void);
+extern "C" uint32_t vm_rsx_local_wb_size(void);
 
 static uint8_t* vm_reserve(void)
 {
@@ -2589,9 +2590,11 @@ static uint8_t* vm_reserve(void)
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
 #endif
     typedef PVOID (WINAPI *va2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
-    /* RSX local memory is a reservation of its own (the GPU write-back maps all of it): 0xC0000000-0xD0000000, or
-     * from lower down with PS3_LOCAL_MB (vm.h). */
+    /* RSX local memory is a reservation of its own: 0xC0000000-0xD0000000, or from lower down with PS3_LOCAL_MB
+     * (vm.h). The GPU write-back maps its first part, at most 256 MB (vm_rsx_local_wb_size), which commits every
+     * page there, so a bigger local memory is two: that part, and the rest, committed only on first touch. */
     const uint64_t lo = vm_rsx_local_base(), n = vm_rsx_local_size(), A = 0x100000000ull;
+    const uint64_t w = vm_rsx_local_wb_size();
     va2_fn va2 = (va2_fn)(void*)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2");
     /* A placeholder 4 GB bigger than needed. The part on the boundary is
      * kept, and the head and the tail go back. A placeholder splits and frees
@@ -2613,13 +2616,16 @@ static uint8_t* vm_reserve(void)
     }
     if (b && VirtualFree(b, lo + n, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
         VirtualFree(b, lo, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) &&
+        (w == n || VirtualFree(b + lo, w, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) &&
         va2(NULL, b, lo, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
-        va2(NULL, b + lo, n, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
+        va2(NULL, b + lo, w, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0) &&
+        (w == n || va2(NULL, b + lo + w, n - w, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0)) &&
         va2(NULL, b + lo + n, VM_SIZE - lo - n, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0))
         return b;
     if (b) {   /* a step failed: give back the pieces (a base not made yet fails harmlessly) */
         VirtualFree(b, 0, MEM_RELEASE);
         VirtualFree(b + lo, 0, MEM_RELEASE);
+        if (w != n) VirtualFree(b + lo + w, 0, MEM_RELEASE);
         VirtualFree(b + lo + n, 0, MEM_RELEASE);
     }
     /* One reservation: see where a 4 GB larger one lands, give it back and
