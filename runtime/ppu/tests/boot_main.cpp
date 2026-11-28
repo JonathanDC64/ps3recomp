@@ -2578,6 +2578,9 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
  * or the whole PC), it went at 0x7FFF0000. There a guest string's host
  * address is below 4 GB, so cellSaveDataAutoSave2's name, translated twice,
  * pointed elsewhere, and Demon's Souls could never write a new save. */
+extern "C" uint32_t vm_rsx_local_base(void);   /* runtime/memory/vm.h */
+extern "C" uint32_t vm_rsx_local_size(void);
+
 static uint8_t* vm_reserve(void)
 {
 #ifndef MEM_RESERVE_PLACEHOLDER
@@ -2586,7 +2589,9 @@ static uint8_t* vm_reserve(void)
 #define MEM_PRESERVE_PLACEHOLDER 0x00000002
 #endif
     typedef PVOID (WINAPI *va2_fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
-    const uint64_t lo = 0xC0000000ull, n = 0x10000000ull, A = 0x100000000ull;
+    /* RSX local memory is a reservation of its own (the GPU write-back maps all of it): 0xC0000000-0xD0000000, or
+     * from lower down with PS3_LOCAL_MB (vm.h). */
+    const uint64_t lo = vm_rsx_local_base(), n = vm_rsx_local_size(), A = 0x100000000ull;
     va2_fn va2 = (va2_fn)(void*)GetProcAddress(GetModuleHandleA("kernelbase.dll"), "VirtualAlloc2");
     /* A placeholder 4 GB bigger than needed. The part on the boundary is
      * kept, and the head and the tail go back. A placeholder splits and frees

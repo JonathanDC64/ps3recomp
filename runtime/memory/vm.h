@@ -50,6 +50,24 @@ extern "C" {
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
 
+/* RSX local (video) memory: [vm_rsx_local_base(), VM_STACK_BASE). PS3_LOCAL_MB sets its size in whole MB, 256 (a
+ * PS3's, the default: base 0xC0000000) to 1024; anything else is 256, and says so. Read once, at the first call
+ * (vm_reserve's, before any guest code runs).
+ *
+ * It ends where the PPU stacks start, an address the lifted code has built in, so a bigger one starts lower: 512 MB
+ * at 0xB0000000, 768 MB at 0xA0000000, 1 GB at 0x90000000, the most cellGcm's offset table covers. That is above
+ * everything else the runtime places (sys_memory at 0x40000000, sys_vm at 0x60000000-0x70000000). A title only
+ * learns the range through cellGcmGetConfiguration, so one whose heap sizes are constants needs its port to grow
+ * them as well. Everything that places or checks local memory goes through these two. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint32_t vm_rsx_local_size(void);
+uint32_t vm_rsx_local_base(void);
+#ifdef __cplusplus
+}
+#endif
+
 /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
  * the control register (put/get/ref) and the IO<->EA offset tables. These must
  * NOT sit inside main memory, because that is where the title's own allocator
