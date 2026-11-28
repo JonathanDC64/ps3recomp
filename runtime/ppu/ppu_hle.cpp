@@ -22,6 +22,7 @@
 #include "ppu_waits.h"     /* console waits */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include "../../libs/spurs/libsre_trace.h" /* LIBSRE_TRACE */
+#include "../memory/vm.h"  /* vm_sysmem_base, VM_SYSMEM_END (the taskset dump) */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
