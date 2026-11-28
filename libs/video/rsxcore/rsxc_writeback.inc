@@ -249,8 +249,10 @@ static gpu_texture off_rt_downscale(int i, int argb)
  * (wbg_place). Not one over all 256 MB: amdgpu checks an imported buffer's
  * pages one by one at every submit (amdgpu_cs_parser_bos), and they stay
  * resident. */
-#define WBG_BASE 0xC0000000u   /* RSX local memory (cellGcm's localAddress) */
-#define WBG_SIZE 0x10000000u
+extern uint32_t vm_rsx_local_base(void);   /* runtime/memory/vm.h: cellGcm's localAddress and localSize */
+extern uint32_t vm_rsx_local_size(void);
+#define WBG_BASE vm_rsx_local_base()   /* RSX local memory: 0xC0000000, or lower with PS3_LOCAL_MB */
+#define WBG_SIZE vm_rsx_local_size()
 /* state: 0 untried, 1 ready, -1 off. buf: the GPU layer's buffer over RSX
  * local memory (step C5b: gpu_buffer_import_host, today's heap opened on the
  * guest's pages and the buffer placed on it). */
@@ -1049,8 +1051,8 @@ static void guest_fb_present(u32 fi)
     if (!GPU_VALID(up_buf)) return;
     { extern u8* vm_base;
       if (!vm_base) return;
-      /* RSX local memory is mapped at guest 0xC0000000. */
-      const u8* srow = vm_base + 0xC0000000u + off;
+      /* RSX local memory is mapped at guest 0xC0000000, or lower with PS3_LOCAL_MB (vm.h). */
+      const u8* srow = vm_base + vm_rsx_local_base() + off;
       void* m = gpu_buffer_map(s_rc_dev, up_buf, 0, 0);
       if (!m) return;
       for (u32 y = 0; y < gh; y++) {

@@ -9192,8 +9192,10 @@ static ID3D12Resource* off_rt_downscale(int i, int argb)
  * as before. 0: every target on the CPU. 2: as 1, and the CPU store is also
  * made, into a scratch copy, and compared with what the GPU stored (a line
  * per mismatching target, and a count every 1024 stores). */
-#define WBG_BASE 0xC0000000u   /* RSX local memory (cellGcm's localAddress) */
-#define WBG_SIZE 0x10000000u
+extern uint32_t vm_rsx_local_base(void);   /* runtime/memory/vm.h: cellGcm's localAddress and localSize */
+extern uint32_t vm_rsx_local_size(void);
+#define WBG_BASE vm_rsx_local_base()   /* RSX local memory: 0xC0000000, or lower with PS3_LOCAL_MB */
+#define WBG_SIZE vm_rsx_local_size()
 static struct { int state; ID3D12Heap* heap; ID3D12Resource* buf; } s_wbg;   /* state: 0 untried, 1 ready, -1 off */
 static int wbg_mode(void)
 {
@@ -9874,8 +9876,9 @@ static void guest_fb_present(u32 fi)
     if (!up) return;
     { extern u8* vm_base;
       if (!vm_base) return;
-      /* RSX local memory is mapped at guest 0xC0000000. */
-      const u8* srow = vm_base + 0xC0000000u + off;
+      /* RSX local memory is mapped at guest 0xC0000000, or lower with PS3_LOCAL_MB (vm.h). */
+      extern uint32_t vm_rsx_local_base(void);
+      const u8* srow = vm_base + vm_rsx_local_base() + off;
       void* m = NULL; D3D12_RANGE nr = {0, 0};
       if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
       for (u32 y = 0; y < gh; y++) {

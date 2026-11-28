@@ -519,8 +519,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * Populate a plausible configuration.
      * In a real implementation these would reflect actual allocated memory.
      */
-    s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
-    s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
+    /* A PS3's 256 MB at 0xC0000000, or more below it (PS3_LOCAL_MB, vm.h). */
+    s_config.localAddress    = vm_rsx_local_base();
+    s_config.localSize       = vm_rsx_local_size();
     s_config.ioAddress       = ioAddress;
     s_config.ioSize          = ioSize;
     s_config.memoryFrequency = 650000000;   /* 650 MHz */
